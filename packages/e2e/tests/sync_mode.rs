@@ -38,9 +38,153 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const BOOTSTRAP_ROW_COUNT: usize = 513;
 const HOT_STATE_PROFILE_RECORD_PREFIX: &str = "LIX_HOT_STATE_PROFILE_JSON=";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_comment_author_join_executes_on_selected_authority_branch() {
+    let (storage, authority) = open_authority().await;
+    let main_branch_id = authority.active_branch_id().await.unwrap();
+    let comment_id = "00000000-0000-7000-8000-000000000011";
+    let conversation_id = "00000000-0000-7000-8000-000000000012";
+    authority
+        .execute(
+            "INSERT INTO lix_conversation (id) VALUES ($1)",
+            &[Value::Text(conversation_id.into())],
+        )
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_comment (id, conversation_id, body) VALUES ($1, $2, CAST($3 AS JSONB))",
+            &[
+                Value::Text(comment_id.into()),
+                Value::Text(conversation_id.into()),
+                Value::Text(r#"{"type":"doc","content":[]}"#.into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let sql = "SELECT c.id, a.id AS author_id FROM lix_comment c \
+        JOIN lix_change ch ON ch.id = c.lixcol_change_id \
+        JOIN lix_account a ON a.id = ch.account_id WHERE c.id = $1";
+    let params = [Value::Text(comment_id.into())];
+    let expected = authority.execute(sql, &params).await.unwrap();
+    assert_eq!(expected.len(), 1);
+    let expected_author = authority.active_account_id().to_owned();
+    assert_eq!(
+        expected.rows()[0].get::<String>("author_id").unwrap(),
+        expected_author
+    );
+    authority.close().await.unwrap();
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().unwrap();
+    let replica = open_replica(replica_dir.path(), &url).await;
+    let mut measurements = Vec::new();
+    for label in ["cold_author_join", "warm_author_join"] {
+        let requests_before = probe.execute_requests.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let result = replica.execute(sql, &params).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result.rows(), expected.rows());
+        assert!(
+            result
+                .notices()
+                .iter()
+                .any(|notice| notice.code == "LIX_AUTHORITY_SQL")
+        );
+        assert_eq!(
+            probe.execute_requests.load(Ordering::Relaxed) - requests_before,
+            1
+        );
+        measurements.push(json!({"operation": label, "elapsed_ns": duration_nanos(elapsed),
+            "authority_execute_requests": probe.execute_requests.load(Ordering::Relaxed) - requests_before}));
+    }
+    let batch = replica
+        .execute_batch(&[
+            ExecuteBatchStatement {
+                sql: sql.into(),
+                params: params.to_vec(),
+                label: Some("author".into()),
+            },
+            ExecuteBatchStatement {
+                sql: "SELECT count(*) AS count FROM lix_change".into(),
+                params: vec![],
+                label: Some("changes".into()),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(batch.results.len(), 2);
+    assert_eq!(batch.results[0].rows(), expected.rows());
+    assert!(batch.results[1].rows()[0].get::<i64>("count").unwrap() > 0);
+    assert!(batch.results.iter().all(|result| {
+        result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "LIX_AUTHORITY_SQL")
+    }));
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: lix::GLOBAL_BRANCH_ID.into(),
+        })
+        .await
+        .unwrap();
+    let global_result = replica.execute(sql, &params).await.unwrap();
+    assert!(global_result.is_empty());
+    assert!(
+        global_result
+            .notices()
+            .iter()
+            .any(|notice| notice.code == "LIX_AUTHORITY_SQL")
+    );
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replica.execute(sql, &params).await.unwrap().rows(),
+        expected.rows()
+    );
+    replica
+        .execute("SELECT id FROM lix_comment WHERE id = $1", &params)
+        .await
+        .unwrap();
+    let requests_before = probe.execute_requests.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let local_result = replica
+        .execute("SELECT id FROM lix_comment WHERE id = $1", &params)
+        .await
+        .unwrap();
+    assert_eq!(
+        local_result.rows()[0].get::<String>("id").unwrap(),
+        comment_id
+    );
+    assert!(
+        local_result
+            .notices()
+            .iter()
+            .all(|notice| notice.code != "LIX_AUTHORITY_SQL")
+    );
+    assert_eq!(
+        probe.execute_requests.load(Ordering::Relaxed) - requests_before,
+        0
+    );
+    measurements.push(json!({"operation": "warm_local_read", "elapsed_ns": duration_nanos(started.elapsed()),
+        "authority_execute_requests": probe.execute_requests.load(Ordering::Relaxed) - requests_before}));
+    println!(
+        "LIX_PARTIAL_READ_SCOPE_PROFILE_JSON={}",
+        json!({"schema":"lix.partial-read-scope-profile.v1", "measurements":measurements})
+    );
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
 #[derive(Debug, Default)]
 struct HttpProbe {
     attempted_requests: AtomicU64,
+    execute_requests: AtomicU64,
     response_body_bytes: AtomicU64,
     handshakes: AtomicU64,
     delta_pulls: AtomicU64,
@@ -234,7 +378,10 @@ async fn certified_hot_state_profile_scorecard() {
 async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let (authority_storage, authority) = open_authority().await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint tombstone profile baseline");
     for index in 0..churn_rows {
@@ -280,7 +427,10 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let (_, checkpoint_server_task, checkpoint_authority) =
         serve_with_authority_session(authority_storage.clone(), Arc::default()).await;
     checkpoint_authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await;
     drop(checkpoint_authority);
     stop_server(checkpoint_server_task).await;
@@ -342,7 +492,10 @@ async fn profile_certified_hot_case(
         .await;
     }
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint HOT profile baseline");
     let updates = (0..dirty_rows)
@@ -492,7 +645,10 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authority-fence", "before").await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint authoritative baseline");
     authority.close().await.expect("close authority setup");
@@ -903,7 +1059,10 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         .expect("restore local partial snapshot without an authority");
     assert_eq!(
         restored
-            .execute("SELECT value FROM lix_key_value WHERE key = 'after-abandoned'", &[])
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'after-abandoned'",
+                &[]
+            )
             .await
             .expect("restored cached row remains readable")
             .rows()
@@ -1449,8 +1608,14 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
     let checkpoint_chunk = *blake3::hash(&inherited_checkpoint).as_bytes();
     {
         let chunks = probe.fulfilled_chunk_ids.lock().unwrap();
-        assert!(!chunks.contains(&head_chunk), "branch admission must not fetch head content");
-        assert!(!chunks.contains(&checkpoint_chunk), "branch admission must not fetch checkpoint content");
+        assert!(
+            !chunks.contains(&head_chunk),
+            "branch admission must not fetch head content"
+        );
+        assert!(
+            !chunks.contains(&checkpoint_chunk),
+            "branch admission must not fetch checkpoint content"
+        );
     }
     assert_eq!(
         read_file_content(&replica, "/inherited-head.bin")
@@ -1474,8 +1639,14 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
     );
     {
         let chunks = probe.fulfilled_chunk_ids.lock().unwrap();
-        assert!(chunks.contains(&head_chunk), "requested inherited head chunk must hydrate");
-        assert!(!chunks.contains(&checkpoint_chunk), "unrequested historical chunk must stay deferred");
+        assert!(
+            chunks.contains(&head_chunk),
+            "requested inherited head chunk must hydrate"
+        );
+        assert!(
+            !chunks.contains(&checkpoint_chunk),
+            "unrequested historical chunk must stay deferred"
+        );
     }
 
     probe.set_offline(true);
@@ -1718,7 +1889,10 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         .await
         .expect("seed nested file");
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("seed checkpoint");
     authority.close().await.unwrap();
@@ -1782,7 +1956,10 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         .await.expect("create partial checkpoint offline").rows()[0]
         .get::<String>("commit_id").unwrap();
     let full = replica
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("create full checkpoint offline")
         .rows()[0]
@@ -1803,7 +1980,10 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         read_file_content(&replica, "/b/a/note.txt").await,
         Some(b"original".to_vec())
     );
-    replica.close().await.expect("close offline replica before reconnecting");
+    replica
+        .close()
+        .await
+        .expect("close offline replica before reconnecting");
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
     remote.wait_for_value("offline-marker", "durable").await;
@@ -1961,7 +2141,10 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
             .unwrap(),
         0,
     );
-    replica.close().await.expect("close offline replica before reconnecting");
+    replica
+        .close()
+        .await
+        .expect("close offline replica before reconnecting");
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
     tokio::time::timeout(WAIT_TIMEOUT, async {
@@ -2137,7 +2320,10 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
     let (storage, authority) = open_authority().await;
     put_value(&authority, "history-marker", "historical").await;
     let checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap()
         .rows()[0]
@@ -2145,7 +2331,10 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
         .unwrap();
     put_value(&authority, "history-marker", "current").await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap();
     authority.close().await.unwrap();
@@ -2241,7 +2430,10 @@ async fn partial_replica_open_profile() {
             put_value(&authority, "unopened-history", &index.to_string()).await;
         }
         authority
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap();
         for index in 0..branches {
@@ -2301,7 +2493,10 @@ async fn partial_replica_open_profile() {
                 "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p LEFT JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
             ),
         ] {
-            let parameters = if matches!(operation, "checkpoint_log_page" | "key_history_page" | "file_history_page") {
+            let parameters = if matches!(
+                operation,
+                "checkpoint_log_page" | "key_history_page" | "file_history_page"
+            ) {
                 let anchor = replica
                     .execute("SELECT lix_active_branch_commit_id() AS id", &[])
                     .await
@@ -2366,7 +2561,10 @@ async fn local_first_foreground_profile_scorecard() {
                 .unwrap();
             put_value(&authority, "profile-marker", "before").await;
             authority
-                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+                .execute(
+                    "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                    &[],
+                )
                 .await
                 .unwrap();
             authority.close().await.unwrap();
@@ -2427,7 +2625,11 @@ async fn local_first_foreground_profile_scorecard() {
 // authenticated admission. Reconnect explicitly with open_replica afterwards.
 async fn open_replica_offline(path: &Path) -> Lix<FilesystemStorage> {
     open_lix()
-        .with_storage(FilesystemStorage::new(path).open().expect("open filesystem storage"))
+        .with_storage(
+            FilesystemStorage::new(path)
+                .open()
+                .expect("open filesystem storage"),
+        )
         .await
         .expect("open existing replica offline")
 }
@@ -2850,6 +3052,9 @@ where
     let one_way_delay = Duration::from_millis(probe.one_way_delay_millis.load(Ordering::Acquire));
     tokio::time::sleep(one_way_delay).await;
     let path = parts.uri.path();
+    if parts.method == Method::POST && path.ends_with("/execute") {
+        probe.execute_requests.fetch_add(1, Ordering::Relaxed);
+    }
     let is_partial_merge = parts.method == Method::POST && path.ends_with("/sync/merge");
     let is_handshake = parts.method == Method::GET
         && path
@@ -2892,7 +3097,8 @@ where
     if parts.method == Method::POST && path.ends_with("/sync/native-metadata") {
         probe.native_metadata_reads.fetch_add(1, Ordering::Release);
     }
-    let is_read_fulfillment = parts.method == Method::POST && path.ends_with("/sync/read-fulfillment");
+    let is_read_fulfillment =
+        parts.method == Method::POST && path.ends_with("/sync/read-fulfillment");
     let is_delta_pull = parts.method == Method::GET
         && path.ends_with("/sync/pull")
         && parts
@@ -2955,15 +3161,22 @@ where
         .await;
     let (parts, body) = response.into_parts();
     let body = if is_read_fulfillment && parts.status == StatusCode::OK {
-        let bytes = body.collect().await.expect("collect bounded fulfillment").to_bytes();
+        let bytes = body
+            .collect()
+            .await
+            .expect("collect bounded fulfillment")
+            .to_bytes();
         let response: JsonValue = serde_json::from_slice(&bytes).expect("fulfillment JSON");
         for input in response["inputs"].as_array().expect("fulfillment inputs") {
             match input["address"]["kind"].as_str() {
-                Some("blob_manifest") => { probe.fulfilled_manifests.fetch_add(1, Ordering::Release); }
+                Some("blob_manifest") => {
+                    probe.fulfilled_manifests.fetch_add(1, Ordering::Release);
+                }
                 Some("blob_chunk") => {
                     probe.fulfilled_chunks.fetch_add(1, Ordering::Release);
                     probe.fulfilled_chunk_ids.lock().unwrap().insert(
-                        serde_json::from_value(input["address"]["address"].clone()).expect("chunk hash"),
+                        serde_json::from_value(input["address"]["address"].clone())
+                            .expect("chunk hash"),
                     );
                 }
                 _ => {}
@@ -3049,7 +3262,10 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /docs/handbook/inside.md");
     let first_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint seeded filesystem")
         .rows()[0]
@@ -3063,7 +3279,10 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /brand/logo.md");
     let second_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint second filesystem state")
         .rows()[0]
@@ -3428,7 +3647,10 @@ async fn existing_branch_admission_preserves_pending_work_and_restores_archived_
         Some("pending-target")
     );
     remote.switch_branch(target).await;
-    replica.close().await.expect("close offline replica before reconnecting");
+    replica
+        .close()
+        .await
+        .expect("close offline replica before reconnecting");
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
     remote
@@ -3548,7 +3770,10 @@ async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
         read_value(&replica, "creation-value").await.as_deref(),
         Some("child-offline")
     );
-    replica.close().await.expect("close offline replica before reconnecting");
+    replica
+        .close()
+        .await
+        .expect("close offline replica before reconnecting");
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
     remote

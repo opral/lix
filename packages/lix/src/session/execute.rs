@@ -1126,11 +1126,6 @@ where
         execution_disposition(&statement)
     }
 
-    pub(crate) fn is_standalone_global_history_read(&self, sql: &str) -> Result<bool, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        Ok(sql2::is_standalone_global_history_read(&statement))
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     ///
