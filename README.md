@@ -13,16 +13,20 @@
 
 Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server.
 
-**[Try Lix in the cloud →](https://lixray.com)**
-
 <img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
 
 - 📄 **Any file.** Store text, binaries, and large files, including Word, PowerPoint, CAD, and video. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV. Other formats have whole-file history.
 - 🗃️ **SQL tables.** Version rows for CRM records, logs, and other application data alongside files.
-- 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
 - 🗄️ **Designed as a database.** Files, tables, and history share one ACID OLTP database. Query millions of rows with SQL.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
+- 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
+
+## Try a hosted repository
+
+Try Lix in the cloud with [LixRay](https://lixray.com):
+
+<a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
 
 ## Co-locate code, documents, and app state
 
@@ -161,12 +165,6 @@ With `FilesystemStorage`, the file stays available on disk. Its rows are queryab
 Lix runs in-process with pluggable storage: memory, filesystem, browser OPFS, or S3. See the [Storage](https://lix.dev/docs/persistence) docs.
 
 <img src="./website/public/assets/pluggable-storage.svg" alt="Lix runs in-process inside your product, with an arrow to pluggable storage: memory, filesystem, or S3" width="760" />
-
-## Try a hosted repository
-
-Try out [lixray.com](https://lixray.com):
-
-<a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
 
 ## Learn more
 

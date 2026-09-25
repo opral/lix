@@ -255,7 +255,7 @@ const pillars = [
       "Define tables in Lix for CRM records, logs, and application data. Query rows and history with SQL.",
   },
   {
-    title: "Built to embed",
+    title: "Embeddable",
     description:
       "Run Lix in-process inside your product. Branch, diff, merge, and roll back files and tables through one API.",
   },
