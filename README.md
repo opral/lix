@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Version control for company files and tables</h3>
+<h3 align="center">Version control system for files and tables</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Give agents a branch for company work. Files of any format and SQL tables you create in Lix share one version history. People and agents can make isolated changes, inspect what changed, and merge or roll them back. Embed Lix in a product or connect to a server:
+Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server:
 
 <img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
 

@@ -308,15 +308,15 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         <section className="flex flex-wrap items-center justify-between gap-12 pt-16">
           <div className="min-w-[300px] max-w-[620px] flex-1">
             <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
-              Version control for files + SQL tables · Open source
+              Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Give agents a branch for company work
+              Version control system for files and tables
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Files of any format and SQL tables you create in Lix share one
-              version history. People and agents can inspect changes, then merge
-              or roll them back.
+              Store files of any format alongside SQL tables you define in Lix.
+              Branch, diff, merge, and roll back both in one repository. Embed
+              Lix in your product or connect to a server.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
