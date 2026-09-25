@@ -5610,6 +5610,110 @@ mod tests {
         engine.open_session().await.expect("session should open")
     }
 
+    #[tokio::test]
+    async fn filesystem_path_writes_keep_metadata_on_the_written_row() {
+        let session = open_session().await;
+        let file_metadata = Value::Jsonb(serde_json::json!({"columns": ["a"]}).into());
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("/m/n/x.md".into()),
+                    Value::Blob(b"x".to_vec().into()),
+                    file_metadata.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let directories = session
+            .execute(
+                "SELECT path, lixcol_metadata FROM lix_directory WHERE path LIKE '/m%' ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directories.rows().len(), 2);
+        for (row, path) in directories.rows().iter().zip(["/m", "/m/n"]) {
+            assert_eq!(row.get::<String>("path").unwrap(), path);
+            assert_eq!(row.value("lixcol_metadata").unwrap(), &Value::Null);
+        }
+        let file = session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_file WHERE path = '/m/n/x.md'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.rows()[0].value("lixcol_metadata").unwrap(), &file_metadata);
+
+        let directory_metadata = Value::Jsonb(serde_json::json!({"owner": "folder"}).into());
+        session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata) VALUES ($1, $2)",
+                &[
+                    Value::Text("/other/leaf".into()),
+                    directory_metadata.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+        let directories = session
+            .execute(
+                "SELECT path, lixcol_metadata FROM lix_directory WHERE path LIKE '/other%' ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directories.rows().len(), 2);
+        assert_eq!(directories.rows()[0].value("lixcol_metadata").unwrap(), &Value::Null);
+        assert_eq!(
+            directories.rows()[1].value("lixcol_metadata").unwrap(),
+            &directory_metadata
+        );
+
+        session
+            .execute(
+                "UPDATE lix_file SET path = '/u/v/y.md' WHERE path = '/m/n/x.md'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let moved_file = session
+            .execute(
+                "SELECT lixcol_metadata FROM lix_file WHERE path = '/u/v/y.md'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved_file.rows()[0].value("lixcol_metadata").unwrap(), &file_metadata);
+
+        session
+            .execute(
+                "UPDATE lix_directory SET path = '/p/q/leaf' WHERE path = '/other/leaf'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let parents = session
+            .execute(
+                "SELECT path, lixcol_metadata FROM lix_directory WHERE path LIKE '/u%' OR path LIKE '/p%' ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(parents.rows().len(), 5);
+        for row in parents.rows() {
+            let path = row.get::<String>("path").unwrap();
+            let expected = if path == "/p/q/leaf" {
+                &directory_metadata
+            } else {
+                &Value::Null
+            };
+            assert_eq!(row.value("lixcol_metadata").unwrap(), expected, "{path}");
+        }
+    }
+
     async fn active_head(session: &SessionContext<Memory>) -> String {
         session
             .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])

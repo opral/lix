@@ -487,7 +487,14 @@ impl DirectoryPathResolver {
     ) -> Result<Self, LixError> {
         let mut resolver = Self::default();
         for directory in existing_directories {
-            resolver.reserve_directory(directory.parent_id, directory.name, directory.id)?;
+            resolver.reserve_directory(
+                directory.parent_id.clone(),
+                directory.name.clone(),
+                directory.id.clone(),
+            )?;
+            resolver
+                .directories_by_id
+                .insert(directory.id.clone(), directory);
         }
         resolver.validate_directory_parent_graph()?;
         for (directory_id, entry_name, file_id) in existing_files {
@@ -682,7 +689,14 @@ impl DirectoryPathResolver {
                 context: FilesystemRowContext {
                     // Directory descriptors are their own filesystem state row,
                     // even when they are implicitly planned from a file insert.
+                    // Only the leaf of an explicit directory create owns the
+                    // caller's metadata; generated parents have none.
                     file_id: None,
+                    metadata: if is_leaf && duplicate_directory_path.is_some() {
+                        context.metadata.clone()
+                    } else {
+                        None
+                    },
                     ..context.clone()
                 },
             }
@@ -748,6 +762,9 @@ impl DirectoryPathResolver {
             context: FilesystemRowContext {
                 file_id: None,
                 untracked: false,
+                // Promotion copies the directory's own metadata, never the
+                // metadata of the file or directory whose path triggered it.
+                metadata: seed.metadata,
                 ..context.clone()
             },
         }
@@ -815,6 +832,7 @@ impl DirectoryPathResolver {
                                 id: directory_id.clone(),
                                 parent_id: key.0.clone(),
                                 name: key.1.clone(),
+                                metadata: None,
                             },
                         );
                     }
@@ -875,6 +893,7 @@ impl DirectoryPathResolver {
                 id: directory_id,
                 parent_id: new_key.0,
                 name: new_key.1,
+                metadata: existing_descriptor.metadata,
             },
         );
         next.validate_directory_parent_graph()?;
@@ -1439,6 +1458,9 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
                         id: snapshot.id,
                         parent_id: snapshot.parent_id,
                         name: snapshot.name,
+                        metadata: row.metadata().cloned().map(
+                            TransactionJson::from_certified_shared_normalized_metadata,
+                        ),
                     },
                 );
             }
@@ -1537,6 +1559,11 @@ pub(crate) fn directory_path_resolvers_from_path_index(
                         id: entry.id().to_string(),
                         parent_id: entry.parent_id.clone(),
                         name: entry.name.clone(),
+                        metadata: entry.metadata().map(|metadata| {
+                            TransactionJson::from_certified_shared_normalized_metadata(
+                                metadata.to_string().into(),
+                            )
+                        }),
                     },
                 );
             }
@@ -1619,6 +1646,11 @@ pub(crate) fn directory_path_resolvers_for_paths<'a>(
                             id: entry.id().to_string(),
                             parent_id: entry.parent_id.clone(),
                             name: entry.name.clone(),
+                            metadata: entry.metadata().map(|metadata| {
+                                TransactionJson::from_certified_shared_normalized_metadata(
+                                    metadata.to_string().into(),
+                                )
+                            }),
                         },
                     );
                 }
@@ -1691,6 +1723,7 @@ struct DirectoryDescriptorSeed {
     id: String,
     parent_id: Option<String>,
     name: String,
+    metadata: Option<TransactionJson>,
 }
 
 impl DirectoryPathRecord for DirectoryDescriptorSeed {
@@ -2685,7 +2718,7 @@ mod tests {
         assert_eq!(directory.global, true);
         assert_eq!(directory.untracked, true);
         assert_eq!(directory.file_id, None);
-        assert_eq!(directory.metadata, Some(&metadata));
+        assert_eq!(directory.metadata, None);
 
         let descriptor = plan
             .rows
