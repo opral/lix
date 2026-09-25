@@ -28,7 +28,7 @@ test("invisible credentials or different repository/epoch cannot reuse a proof",
   const cache = new SharedAdmissionCache(); cache.record(url, [], identity);
   await expect(cache.verify(url, [], identity, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
   cache.record(url, headers, identity);
-  await expect(cache.verify(url, headers, {...identity, storageEpoch: 83}, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+  await expect(cache.verify(url, headers, {...identity, storageEpoch: ADMISSION_STORAGE_EPOCH + 1}, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
 });
 test("metadata admission uses bounded GET and explicit credentials without SQL opening", async () => {
   expect(identity.protocolEpoch).toBe(ADMISSION_PROTOCOL_EPOCH);

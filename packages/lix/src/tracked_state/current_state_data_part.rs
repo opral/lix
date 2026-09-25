@@ -27,6 +27,9 @@ const CURRENT_STATE_DATA_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const RAW_MAGIC: &[u8; 7] = b"LXCSP04";
 const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ4";
 const DIGEST_CONTEXT: &str = "lix native current-state data part v4";
+const LEGACY_RAW_MAGIC: &[u8; 7] = b"LXCSP03";
+const LEGACY_ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ3";
+const LEGACY_DIGEST_CONTEXT: &str = "lix native current-state data part v3";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CurrentStateDataRow {
@@ -151,12 +154,22 @@ pub(crate) fn decode_current_state_data_part(
     expected_digest: &[u8; 32],
     encoded: &[u8],
 ) -> Result<Vec<CurrentStateDataRow>, LixError> {
-    if encoded.len() > CURRENT_STATE_DATA_PART_MAX_BYTES || &digest(encoded) != expected_digest {
+    let legacy = encoded.starts_with(LEGACY_RAW_MAGIC) || encoded.starts_with(LEGACY_ZSTD_MAGIC);
+    let context = if legacy { LEGACY_DIGEST_CONTEXT } else { DIGEST_CONTEXT };
+    if encoded.len() > CURRENT_STATE_DATA_PART_MAX_BYTES
+        || &digest_with_context(context, encoded) != expected_digest
+    {
         return Err(part_error("content digest or physical bound is invalid"));
     }
-    let payload: Cow<'_, [u8]> = if let Some(payload) = encoded.strip_prefix(RAW_MAGIC) {
+    let payload: Cow<'_, [u8]> = if let Some(payload) = encoded
+        .strip_prefix(RAW_MAGIC)
+        .or_else(|| encoded.strip_prefix(LEGACY_RAW_MAGIC))
+    {
         Cow::Borrowed(payload)
-    } else if let Some(body) = encoded.strip_prefix(ZSTD_MAGIC) {
+    } else if let Some(body) = encoded
+        .strip_prefix(ZSTD_MAGIC)
+        .or_else(|| encoded.strip_prefix(LEGACY_ZSTD_MAGIC))
+    {
         let (decoded_len, compressed) = body
             .split_at_checked(4)
             .ok_or_else(|| part_error("compressed payload is truncated"))?;
@@ -219,7 +232,11 @@ fn validate_rows(rows: &[CurrentStateDataRow]) -> Result<(), LixError> {
 }
 
 fn digest(encoded: &[u8]) -> [u8; 32] {
-    *blake3::Hasher::new_derive_key(DIGEST_CONTEXT)
+    digest_with_context(DIGEST_CONTEXT, encoded)
+}
+
+fn digest_with_context(context: &str, encoded: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(context)
         .update(encoded)
         .finalize()
         .as_bytes()
@@ -273,6 +290,24 @@ mod tests {
         let mut corrupt = parts[0].bytes.to_vec();
         *corrupt.last_mut().expect("encoded part is non-empty") ^= 1;
         assert!(decode_current_state_data_part(&parts[0].digest, &corrupt).is_err());
+    }
+
+    #[test]
+    fn v82_part_reads_with_anonymous_author() {
+        let source = row(0);
+        let mut value = super::super::codec::encode_value(&source.value);
+        value.truncate(value.len() - 2 - source.value.author_id.len());
+        let stored = vec![StoredCurrentStateDataRow {
+            encoded_key: source.encoded_key,
+            encoded_value: value,
+            metadata: source.metadata,
+            snapshot: source.snapshot,
+        }];
+        let mut legacy = LEGACY_RAW_MAGIC.to_vec();
+        legacy.extend_from_slice(&storage_codec::encode("v82 part", &stored).unwrap());
+        let digest = digest_with_context(LEGACY_DIGEST_CONTEXT, &legacy);
+        let decoded = decode_current_state_data_part(&digest, &legacy).unwrap();
+        assert_eq!(decoded[0].value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
     }
 
     #[test]

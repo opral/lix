@@ -12,6 +12,7 @@ pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
     BranchHeadControlReader, BranchHeadTrackedReachability, branch_head_control_precondition,
     encode_control_for_migration, stage_branch_head_control, stage_delete_branch_head_control,
+    canonicalize_control_for_migration,
 };
 pub(crate) use lifecycle::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 pub(crate) use stage_rows::{

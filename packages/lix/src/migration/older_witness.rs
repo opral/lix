@@ -302,6 +302,15 @@ fn independent_invariants(source: &Records, target: &Records) -> Result<(), LixE
         if ignored(*space, key) || derived.contains(space) {
             continue;
         }
+        if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id.0 {
+            let old = source.get(&(*space, key.clone()));
+            let new = target.get(&(*space, key.clone()));
+            if let (Some(old), Some(new)) = (old, new)
+                && crate::branch::canonicalize_control_for_migration(key, old)? == new.as_ref()
+            {
+                continue;
+            }
+        }
         if *space == crate::init::REPOSITORY_PROTOCOL_SPACE.id.0
             && key.as_ref() == b"checkpoint-migration.v78"
         {

@@ -150,9 +150,10 @@ const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS13";
 const COMMIT_STATE_MANIFEST_V12_FORMAT_MAGIC: &[u8] = b"LXCS12";
 const COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC: &[u8] = b"LXCS10";
-// Version 4 includes row author identity in packed mutation parts. Earlier
-// versions cannot preserve the selected row writer and are deliberately rejected.
+// Version 4 includes row author identity in packed mutation parts. Version 3
+// remains readable for repositories upgraded from the earlier storage epoch.
 const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI4";
+const COMMIT_STATE_MUTATION_INVENTORY_V3_FORMAT_MAGIC: &[u8] = b"LXMI3";
 const COMMIT_STATE_MUTATION_INVENTORY_RAW: u8 = 0;
 const COMMIT_STATE_MUTATION_INVENTORY_LZ4: u8 = 1;
 const COMMIT_STATE_MUTATION_INVENTORY_MIN_COMPRESS_BYTES: usize = 256;
@@ -17158,8 +17159,9 @@ fn decode_stored_commit_state_authority(
             "tracked_state commit mutation inventory disagrees with its authority digest",
         ));
     }
-    let Some(inventory_frame) =
-        mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
+    let Some(inventory_frame) = mutation_inventory
+        .strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
+        .or_else(|| mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_V3_FORMAT_MAGIC))
     else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,

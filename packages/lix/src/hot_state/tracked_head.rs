@@ -1250,12 +1250,23 @@ fn decode_working_diff_checkpoint(bytes: &[u8], offset: &mut usize) -> Result<Co
 fn decode_working_diff_version(
     bytes: &[u8],
     offset: &mut usize,
+    legacy: bool,
 ) -> Result<WorkingDiffVersion, LixError> {
-    let payload = take_working_diff_bytes(bytes, offset, WORKING_DIFF_VERSION_BYTES)?;
+    let payload = take_working_diff_bytes(
+        bytes,
+        offset,
+        WORKING_DIFF_VERSION_BYTES - if legacy { UUID_BYTES } else { 0 },
+    )?;
     let mut field_offset = 0usize;
-    let author_id = take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?
-        .try_into()
-        .expect("fixed working-diff author id width");
+    let author_id = if legacy {
+        *uuid::Uuid::parse_str(crate::ANONYMOUS_ACCOUNT_ID)
+            .expect("anonymous account id is a UUID")
+            .as_bytes()
+    } else {
+        take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?
+            .try_into()
+            .expect("fixed working-diff author id width")
+    };
     let change_id = ChangeId::new(uuid_from_working_diff_bytes(
         take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?,
         "change id",
@@ -1284,7 +1295,7 @@ fn decode_working_diff_version(
     .map_err(|error| working_diff_error(&format!("invalid updated_at: {error}")))?;
     let snapshot = decode_working_diff_slot(payload, &mut field_offset, "snapshot")?;
     let metadata = decode_working_diff_slot(payload, &mut field_offset, "metadata")?;
-    debug_assert_eq!(field_offset, WORKING_DIFF_VERSION_BYTES);
+    debug_assert_eq!(field_offset, payload.len());
     Ok(WorkingDiffVersion {
         author_id,
         change_id,
@@ -1940,7 +1951,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         },
         HEAD_WORKING_DIFF_BEFORE_PRESENT => WorkingDiffBaseline::BeforePresent {
             checkpoint_commit_id: decode_working_diff_checkpoint(bytes, &mut baseline_offset)?,
-            version: decode_working_diff_version(bytes, &mut baseline_offset)?,
+            version: decode_working_diff_version(bytes, &mut baseline_offset, legacy)?,
         },
         _ => unreachable!("two-bit working-diff baseline tag is exhaustive"),
     };

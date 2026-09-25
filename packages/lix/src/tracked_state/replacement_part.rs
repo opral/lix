@@ -29,9 +29,12 @@ pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI006";
 const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ006";
+const LEGACY_REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI005";
+const LEGACY_REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ005";
 const REPLACEMENT_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const REPLACEMENT_DIRECTORY_MAGIC: &[u8; 8] = b"LXRPD001";
 const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v2";
+const LEGACY_REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v1";
 const REPLACEMENT_DIRECTORY_DIGEST_CONTEXT: &str =
     "lix tracked-state replacement part directory v1";
 const DIGEST_BYTES: usize = 32;
@@ -614,13 +617,22 @@ pub(crate) fn decode_replacement_part(
             "replacement part exceeds its physical byte bound",
         ));
     }
-    if &domain_digest(REPLACEMENT_PART_DIGEST_CONTEXT, encoded) != expected_digest {
+    let legacy = encoded.starts_with(LEGACY_REPLACEMENT_PART_MAGIC)
+        || encoded.starts_with(LEGACY_REPLACEMENT_PART_COMPRESSED_MAGIC);
+    let digest_context = if legacy {
+        LEGACY_REPLACEMENT_PART_DIGEST_CONTEXT
+    } else {
+        REPLACEMENT_PART_DIGEST_CONTEXT
+    };
+    if &domain_digest(digest_context, encoded) != expected_digest {
         return Err(replacement_part_error(
             "replacement part content digest mismatch",
         ));
     }
     let logical: Cow<'_, [u8]> = if let Some(compressed) =
-        encoded.strip_prefix(REPLACEMENT_PART_COMPRESSED_MAGIC)
+        encoded
+            .strip_prefix(REPLACEMENT_PART_COMPRESSED_MAGIC)
+            .or_else(|| encoded.strip_prefix(LEGACY_REPLACEMENT_PART_COMPRESSED_MAGIC))
     {
         let (uncompressed_len, compressed) = compressed
             .split_at_checked(4)
@@ -644,7 +656,10 @@ pub(crate) fn decode_replacement_part(
     } else {
         Cow::Borrowed(encoded)
     };
-    let Some(body) = logical.strip_prefix(REPLACEMENT_PART_MAGIC) else {
+    let Some(body) = logical
+        .strip_prefix(REPLACEMENT_PART_MAGIC)
+        .or_else(|| logical.strip_prefix(LEGACY_REPLACEMENT_PART_MAGIC))
+    else {
         return Err(replacement_part_error("replacement part has invalid magic"));
     };
     let mut cursor = 0usize;
@@ -680,7 +695,11 @@ pub(crate) fn decode_replacement_part(
         let start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(start..key_arena.len());
-        authors.push(decode_author(body, &mut cursor)?);
+        authors.push(if legacy {
+            crate::ANONYMOUS_ACCOUNT_ID.to_owned()
+        } else {
+            decode_author(body, &mut cursor)?
+        });
         metadata.push(decode_jsonb(body, &mut cursor)?);
         let snapshot = decode_snapshot_slot(body, &mut cursor)?.ok_or_else(|| {
             replacement_part_error("replacement row is missing its typed payload")
@@ -714,12 +733,21 @@ pub(crate) fn decode_raw_replacement_part(
             "replacement part exceeds its physical byte bound",
         ));
     }
-    if &domain_digest(REPLACEMENT_PART_DIGEST_CONTEXT, &encoded) != expected_digest {
+    let legacy = encoded.starts_with(LEGACY_REPLACEMENT_PART_MAGIC)
+        || encoded.starts_with(LEGACY_REPLACEMENT_PART_COMPRESSED_MAGIC);
+    let digest_context = if legacy {
+        LEGACY_REPLACEMENT_PART_DIGEST_CONTEXT
+    } else {
+        REPLACEMENT_PART_DIGEST_CONTEXT
+    };
+    if &domain_digest(digest_context, &encoded) != expected_digest {
         return Err(replacement_part_error(
             "replacement part content digest mismatch",
         ));
     }
-    let logical = if encoded.starts_with(REPLACEMENT_PART_COMPRESSED_MAGIC) {
+    let logical = if encoded.starts_with(REPLACEMENT_PART_COMPRESSED_MAGIC)
+        || encoded.starts_with(LEGACY_REPLACEMENT_PART_COMPRESSED_MAGIC)
+    {
         let compressed = &encoded[REPLACEMENT_PART_COMPRESSED_MAGIC.len()..];
         let (uncompressed_len, compressed) = compressed
             .split_at_checked(4)
@@ -748,7 +776,10 @@ pub(crate) fn decode_raw_replacement_part(
     } else {
         encoded
     };
-    let Some(body) = logical.strip_prefix(REPLACEMENT_PART_MAGIC) else {
+    let Some(body) = logical
+        .strip_prefix(REPLACEMENT_PART_MAGIC)
+        .or_else(|| logical.strip_prefix(LEGACY_REPLACEMENT_PART_MAGIC))
+    else {
         return Err(replacement_part_error("replacement part has invalid magic"));
     };
     let body_start = logical.len() - body.len();
@@ -784,7 +815,11 @@ pub(crate) fn decode_raw_replacement_part(
         let key_start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(key_start..key_arena.len());
-        authors.push(decode_author(body, &mut cursor)?);
+        authors.push(if legacy {
+            crate::ANONYMOUS_ACCOUNT_ID.to_owned()
+        } else {
+            decode_author(body, &mut cursor)?
+        });
         skip_jsonb(body, &mut cursor)?;
         match *take_exact(body, &mut cursor, 1)?
             .first()
@@ -1101,6 +1136,23 @@ mod tests {
         let mut wrong_digest = *encoded.digest();
         wrong_digest[0] ^= 1;
         assert!(decode_replacement_part(&wrong_digest, encoded.bytes()).is_err());
+    }
+
+    #[test]
+    fn v82_part_reads_with_anonymous_author() {
+        let encoded = encode_replacement_part(&rows(&[b"alpha"]))
+            .expect("encode current part");
+        let mut legacy = encoded.bytes().to_vec();
+        legacy[..8].copy_from_slice(super::LEGACY_REPLACEMENT_PART_MAGIC);
+        let author_start = 8 + 2 + 2 + 2 + b"alpha".len();
+        let author_end = author_start + 2 + b"part-author".len();
+        legacy.drain(author_start..author_end);
+        let digest = super::domain_digest(super::LEGACY_REPLACEMENT_PART_DIGEST_CONTEXT, &legacy);
+        let decoded = decode_replacement_part(&digest, &legacy).expect("decode v82 part");
+        assert_eq!(decoded.author_id(0).unwrap(), Some(crate::ANONYMOUS_ACCOUNT_ID));
+        let raw = super::decode_raw_replacement_part(&digest, bytes::Bytes::from(legacy))
+            .expect("decode raw v82 part");
+        assert_eq!(raw.author_id(0), Some(crate::ANONYMOUS_ACCOUNT_ID));
     }
 
     #[test]

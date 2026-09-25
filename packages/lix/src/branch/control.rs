@@ -438,6 +438,15 @@ pub(crate) fn encode_control_for_migration(
     Ok((encode_key(branch_id)?, encode_control(branch_id, control)?))
 }
 
+pub(crate) fn canonicalize_control_for_migration(
+    key: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let key: BranchHeadControlKey = storage_codec::decode("branch-head control key", key)?;
+    let control = decode_control(&key.branch_id, value)?;
+    encode_control(&key.branch_id, &control)
+}
+
 #[cfg(test)]
 pub(crate) fn encode_v82_control_for_test(
     branch_id: &str,
