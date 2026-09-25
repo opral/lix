@@ -83,7 +83,7 @@ simulation_test!(
         assert_key_value(&main, "deleted", Some("\"before\"")).await;
         assert_key_value(&main, "private", None).await;
         assert_key_value(&global, "g-tombstone", Some("\"new\"")).await;
-        draft.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'owned')])", &[]).await.unwrap();
+        draft.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[lix_row_ref('lix_key_value', NULL, 'owned')])", &[]).await.unwrap();
         let remaining_sql = "SELECT key, diff_type, from_value FROM lix_diff('lix_key_value') WHERE key = 'deleted'";
         let remaining = draft.execute(remaining_sql, &[]).await.unwrap();
         assert_eq!(remaining.len(), 1);

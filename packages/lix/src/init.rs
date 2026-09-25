@@ -115,15 +115,19 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// v80 records complete checkpoint incorporation independently of commit membership.
 /// v81 separates explicit migration from current-format opening and fences old runtimes.
 /// v82 rebuilds declared-column indexes with exact reverse memberships and composite keys.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 82;
+/// v83 admits author-bearing current-state records while retaining v82 history readers.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 83;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v82";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v83";
+pub(crate) const REPOSITORY_PROTOCOL_V82: &[u8] = b"tracked-default-branch.v82";
 pub(crate) const REPOSITORY_PROTOCOL_V81: &[u8] = b"tracked-default-branch.v81";
 pub(crate) const REPOSITORY_PROTOCOL_V80: &[u8] = b"tracked-default-branch.v80";
 pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v83-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V82: &[u8] =
     b"tracked-default-branch.v82-partial-replica.v1";
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V81: &[u8] =
     b"tracked-default-branch.v81-partial-replica.v1";
@@ -459,6 +463,8 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
+            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                .expect("system account ID is canonical"),
             schema_presence_bloom: [0; 4],
         },
         branch_ref_change: global_branch_ref_change,
@@ -479,6 +485,8 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
+            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                .expect("system account ID is canonical"),
             schema_presence_bloom: [0; 4],
         },
         branch_ref_change: main_branch_ref_change,
@@ -664,6 +672,7 @@ where
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.global_commit.id,
+                author_id: &plan.global_commit.account_id,
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -758,6 +767,7 @@ where
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.main_commit.id,
+                author_id: &plan.main_commit.account_id,
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -862,6 +872,11 @@ where
                     row_pk: &change.row_pk,
                     change_id: Some(change.change_id),
                     commit_id: Some(commit_id),
+                    author_id: if commit_id == plan.global_commit.id {
+                        &plan.global_commit.account_id
+                    } else {
+                        &plan.main_commit.account_id
+                    },
                     untracked: false,
                     deleted: false,
                     created_at: change.created_at,
@@ -1623,11 +1638,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v82"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 82 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v83"),
-            RepositoryProtocolStatus::TooNew { found_version: 83 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v84"),
+            RepositoryProtocolStatus::TooNew { found_version: 84 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

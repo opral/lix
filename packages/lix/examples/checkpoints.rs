@@ -4,7 +4,13 @@ use lix::{LixError, Value, open_lix};
 async fn main() -> Result<(), LixError> {
     let lix = open_lix().await?;
     let initial_checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
+            &[
+                Value::Text("Start checkpoint example".into()),
+                Value::Jsonb(serde_json::json!({"_type":"zettel_doc","blocks":[]}).into()),
+            ],
+        )
         .await?
         .rows()[0]
         .get::<String>("commit_id")?;
@@ -36,7 +42,15 @@ async fn main() -> Result<(), LixError> {
         println!("{diff_type} lix_key_value {key} ({row_ref})");
     }
     let checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)", &[
+            Value::Text("Save draft key".into()),
+            Value::Jsonb(serde_json::json!({
+                "_type":"zettel_doc",
+                "blocks":[{"_type":"zettel_block","_key":"context","style":"normal","markDefs":[],"children":[
+                    {"_type":"zettel_span","_key":"summary","text":"Added checkpoint-demo as a draft; further edits remain possible.","marks":[]}
+                ]}]
+            }).into()),
+        ])
         .await?
         .rows()[0]
         .get::<String>("commit_id")?;
@@ -45,8 +59,10 @@ async fn main() -> Result<(), LixError> {
     // Checkpoint membership filters the first-parent commit log.
     let checkpoints = lix
         .execute(
-            "SELECT commit_id, position
-             FROM lix_log() WHERE is_checkpoint
+            "SELECT l.commit_id, l.position, c.title
+             FROM lix_log() AS l
+             JOIN lix_conversation AS c ON c.id = l.conversation_id
+             WHERE l.is_checkpoint
              ORDER BY position",
             &[],
         )
@@ -55,7 +71,8 @@ async fn main() -> Result<(), LixError> {
     for row in checkpoints.rows() {
         let commit_id = row.get::<String>("commit_id")?;
         let depth = row.get::<i64>("position")?;
-        println!("depth {depth}: {commit_id}");
+        let title = row.get::<String>("title")?;
+        println!("depth {depth}: {commit_id} {title}");
     }
     let remaining = lix
         .execute(

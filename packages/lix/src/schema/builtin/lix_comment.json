@@ -1,7 +1,7 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_comment",
-  "description": "A comment belonging to a conversation in the same scope. Authorship and timestamps use Lix change and row metadata.",
+  "description": "A comment belonging to a conversation in the same scope. The account that last wrote the comment is exposed through lixcol_author_id; timestamps use row metadata.",
   "columns": [
     {
       "name": "id",
@@ -20,7 +20,7 @@
       "name": "body",
       "type": "jsonb",
       "nullable": false,
-      "description": "Zettel document JSON. Applications validate the document format; the SQL column enforces JSONB storage and non-nullability."
+      "description": "Zettel document JSONB. Minimum shape: {\"_type\":\"zettel_doc\",\"blocks\":[]}. Full schema: https://github.com/opral/zettel/blob/84074511c6fffc5c67d6929365390fed7153459f/packages/zettel-ast/schema.json (vendored at packages/lix/vendor/zettel/schema.json). Applications validate the full document format; this SQL column enforces JSONB storage and non-nullability."
     }
   ],
   "primary_key": [

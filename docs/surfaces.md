@@ -22,7 +22,7 @@ History reads endpoint differences along a commit’s first-parent chain; `lix_c
 
 The engine defines a Lix logical path as an absolute `/`-separated sequence of literal UTF-8 segments. Empty segments, `.`, `..`, `/` within a segment, NUL, and a trailing slash are invalid; `/` itself is only the root directory. All other segment text is preserved exactly: the engine does not URL-decode, case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` in an array to the recovery, undo, redo, and apply functions or to the `lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
+The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` in an array to the recovery, undo, redo, and apply functions or as the optional third argument of `lix_create_checkpoint(title, comment [, row_refs])`. See [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
 
 For working changes, use `lix_diff(relation)`. Its actual baseline is exposed as `lix_branch.working_base_commit_id`; it can differ from the latest marked checkpoint after a fork.
 
@@ -106,6 +106,10 @@ WHERE done = false;
 ```
 
 Lix bookkeeping columns use the `lixcol_*` prefix. Relations are scoped to the session's active branch. Open another session to work on another branch.
+
+`lixcol_author_id` is the `lix_account.id` of the account that last wrote the row's current state. It is read-only and changes when another account edits the row. Query the account directly, for example `JOIN lix_account AS a ON a.id = c.lixcol_author_id` for a comment `c`. This does not require a `lix_change` scan.
+
+A row written with `lixcol_untracked = true` has a `lixcol_change_id` identifying its current-state write. It has no `lixcol_commit_id`, and its change ID does not identify a retained `lix_change` record. Do not join untracked rows to `lix_change` to recover write metadata.
 
 Every public history read calls `lix_history` with a relation-name text literal and an optional commit-id argument; there are no generated history functions or bare history table aliases. [History](./history.md) documents the endpoint columns, position ordering, composite-key lookups, and removals.
 

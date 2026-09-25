@@ -35,9 +35,9 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
         for path in ["/gtm/edit.txt", "/gtm/delete.txt", "/elsewhere/keep.txt"] {
             authority.upsert_file_content(path, b"before".to_vec()).await.unwrap();
         }
-        let before = authority.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let before = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         authority.upsert_file_content("/gtm/edit.txt", b"historical change".to_vec()).await.unwrap();
-        let after = authority.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let after = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         let historical_sql = format!("SELECT diff_type, from_path, to_path FROM lix_diff('lix_file', '{before}', '{after}') ORDER BY to_path");
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
         let enabled = Arc::new(AtomicBool::new(false));

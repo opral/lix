@@ -644,6 +644,39 @@ pub(crate) fn exact_filesystem_read_interest_route(
     exact_filesystem_read_route(statement, params).or_else(|| {
         exact_lix_file_point_read_with_literals(statement, params)
             .map(|(selector, column)| ExactFilesystemRead::Point(selector, column))
+    }).or_else(|| {
+        // The SQL executor still evaluates every projected expression locally.
+        // This route only seeds immutable dependencies before planning or branch
+        // resolution can miss native inputs on a cold partial replica.
+        let point = simple_point_read(statement)?;
+        if point.table_name != "lix_file" {
+            return None;
+        }
+        let (column, value) = exact_point_identity_inner(
+            point.select.selection.as_ref()?,
+            params,
+            true,
+        )?;
+        let selector = match column.as_str() {
+            "id" => sql2::ExactLixFileReadSelector::Id(value),
+            "path" => sql2::ExactLixFileReadSelector::Path(value),
+            _ => return None,
+        };
+        let content = point.select.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(expression) => expression_mentions_column(expression, "content"),
+            SelectItem::ExprWithAlias { expr, .. } | SelectItem::ExprWithAliases { expr, .. } => {
+                expression_mentions_column(expr, "content")
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+        });
+        Some(ExactFilesystemRead::Point(
+            selector,
+            if content {
+                sql2::ExactLixFileReadColumn::Content
+            } else {
+                sql2::ExactLixFileReadColumn::ChangeId
+            },
+        ))
     })
 }
 

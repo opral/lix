@@ -135,7 +135,7 @@ async fn recorded_merge_receipt_preserves_newer_local_tip_and_original_confirmat
     let mut legacy: serde_json::Value = serde_json::from_slice(&raw.unwrap()).unwrap();
     legacy["version"] = serde_json::json!(4);
     let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
-    let record_key = crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+    let record_key = StorageKey(bytes::Bytes::copy_from_slice(
         uuid::Uuid::parse_str(&request.branch_id)
             .unwrap()
             .as_bytes(),

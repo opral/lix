@@ -891,7 +891,7 @@ simulation_test!(
 
         let checkpoint = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[\
                    lix_row_ref('rr_checkpoint_child', NULL, 'c')])",
                 &[],
             )

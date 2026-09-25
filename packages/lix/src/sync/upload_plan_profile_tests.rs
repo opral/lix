@@ -384,9 +384,9 @@ mod upload_plan_profile {
                         .await;
                 }
                 let sql = if scoped {
-                    "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+                    "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
                 } else {
-                    "SELECT commit_id FROM lix_create_checkpoint()"
+                    "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"
                 };
                 let checkpoint = replica.execute(sql, &[]).await.unwrap().rows()[0]
                     .get::<String>("commit_id")

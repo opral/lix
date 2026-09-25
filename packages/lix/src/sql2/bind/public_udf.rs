@@ -86,67 +86,6 @@ pub(crate) fn statement_has_durable_runtime_function(statement: &DataFusionState
     visitor.found
 }
 
-/// Reports whether a statement reads execution-slot state from its local SQL
-/// session. Such a statement cannot be replayed wholesale against an
-/// authority because the authority has a different active branch/head.
-pub(crate) fn statement_has_session_dependent_function(statement: &DataFusionStatement) -> bool {
-    let mut visitor = SessionDependentFunctionVisitor { found: false };
-    visit_datafusion_statement_for_session_dependent_function(statement, &mut visitor);
-    visitor.found
-}
-
-struct SessionDependentFunctionVisitor {
-    found: bool,
-}
-
-impl Visitor for SessionDependentFunctionVisitor {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-        let Expr::Function(function) = expr else {
-            return ControlFlow::Continue(());
-        };
-
-        if matches!(
-            public_lix_function_name(function),
-            Some(
-                "lix_active_account_id"
-                    | "lix_active_branch_id"
-                    | "lix_active_branch_commit_id"
-                    | "lix_root_commit_id"
-            )
-        ) {
-            self.found = true;
-            return ControlFlow::Break(());
-        }
-
-        ControlFlow::Continue(())
-    }
-}
-
-fn visit_datafusion_statement_for_session_dependent_function(
-    statement: &DataFusionStatement,
-    visitor: &mut SessionDependentFunctionVisitor,
-) {
-    match statement {
-        DataFusionStatement::Statement(statement) => {
-            let _ = statement.visit(visitor);
-        }
-        DataFusionStatement::Explain(explain) => {
-            visit_datafusion_statement_for_session_dependent_function(
-                explain.statement.as_ref(),
-                visitor,
-            );
-        }
-        // Extension statements are rejected by statement routing today. Keep
-        // this conservative if a future readable statement can contain an
-        // expression that this visitor does not inspect.
-        DataFusionStatement::CreateExternalTable(_)
-        | DataFusionStatement::CopyTo(_)
-        | DataFusionStatement::Reset(_) => visitor.found = true,
-    }
-}
-
 struct DurableRuntimeFunctionVisitor {
     found: bool,
 }
@@ -262,7 +201,7 @@ mod tests {
     use datafusion::sql::parser::Statement as DataFusionStatement;
 
     use super::{
-        statement_has_durable_runtime_function, statement_has_session_dependent_function,
+        statement_has_durable_runtime_function,
         validate_public_udf_calls,
     };
 
@@ -320,22 +259,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn marks_session_dependent_execution_functions() {
-        for sql in [
-            "SELECT lix_active_account_id() FROM lix_commit",
-            "SELECT lix_active_branch_id() FROM lix_change",
-            "SELECT lix_active_branch_commit_id() FROM lix_commit",
-            "SELECT lix_root_commit_id() FROM lix_change",
-            "WITH commits AS (SELECT lix_active_branch_id() FROM lix_commit) SELECT * FROM commits",
-        ] {
-            assert!(
-                statement_has_session_dependent_function(&parse_statement(sql)),
-                "session-dependent function should be detected in: {sql}"
-            );
-        }
-        assert!(!statement_has_session_dependent_function(&parse_statement(
-            "SELECT count(*) FROM lix_commit"
-        )));
-    }
+
 }

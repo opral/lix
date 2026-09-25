@@ -19,7 +19,9 @@ The [vendored Zettel JSON Schema](../packages/lix/vendor/zettel/schema.json) def
 
 `resolved` marks a conversation as resolved. It defaults to `false`.
 
-There are no separate author, timestamp, or ordering columns, and no `resolved_by` or `resolved_at`. Use Lix row/change metadata for attribution and chronology. For live display, `ORDER BY lixcol_created_at, id` supplies a timestamp order with an ID tie-breaker; this is not a causal ordering guarantee for distributed writers.
+There are no separate author, timestamp, or ordering payload columns, and no `resolved_by` or `resolved_at`. The read-only `lixcol_author_id` system column names the account that last wrote a comment's current state; editing a comment changes it. Join it directly to `lix_account.id` for the account name and `profile_uri`. For live display, `ORDER BY lixcol_created_at, id` supplies a timestamp order with an ID tie-breaker; this is not a causal ordering guarantee for distributed writers.
+
+Untracked comments also have a `lixcol_change_id`, but that ID has no retained `lix_change` record. Their `lixcol_author_id`, `lixcol_created_at`, and `lixcol_updated_at` remain available on the current row.
 
 ## Comment on a row in the current branch
 
@@ -46,6 +48,8 @@ INSERT INTO lix_conversation DEFAULT VALUES RETURNING id;
 ```
 
 ## Discuss a commit globally
+
+For a new checkpoint, use `lix_create_checkpoint(title, comment)` instead of separate inserts. Either argument may be `NULL`. A title or comment creates a canonical conversation atomically with the checkpoint; a non-null comment creates the opening Zettel comment. `lix_log().conversation_id` identifies that conversation, and is `NULL` when both values are null. Later comments use `ORDER BY lixcol_created_at, id` for chronological display. Other conversations may also target the same commit.
 
 A repository-wide commit discussion stores both conversation and comments globally. `$1` and `$2` are fresh conversation/comment UUIDs; `$3` is an existing commit UUID; `$4` is the Zettel body.
 

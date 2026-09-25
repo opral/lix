@@ -217,6 +217,9 @@ where
             &adapter, options, &mut plan,
         ))
         .await?;
+        if before.role != RepositoryRole::PartialReplica {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         (
             "v79-canonical-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
@@ -236,17 +239,20 @@ where
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         // A current-format authority capability upgrade does not rebuild
         // storage indexes; project only mutations the migration will execute.
-        if before.format != Some(crate::init::CURRENT_FORMAT_VERSION) {
+        if before.format.is_some_and(|version| version <= 81) {
             Box::pin(super::hot_indexes::append_plan(
                 &adapter, options, &mut plan,
             ))
             .await?;
         }
+        if before.format.is_some_and(|version| version <= 82) {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         (
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81)) {
+    } else if matches!(before.format, Some(80 | 81 | 82)) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let mut plan = super::publish::PublicationPlan::bounded(
             options.max_changes,
@@ -255,12 +261,21 @@ where
         let read = super::MigrationPlanningRead::new(&adapter).await?;
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         read.finish()?;
-        Box::pin(super::hot_indexes::append_plan(
-            &adapter, options, &mut plan,
-        ))
-        .await?;
+        if before.format != Some(82) {
+            Box::pin(super::hot_indexes::append_plan(
+                &adapter, options, &mut plan,
+            ))
+            .await?;
+        }
+        if before.role != RepositoryRole::PartialReplica {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         (
-            "v82-hot-index-plan-v1",
+            if before.format == Some(82) {
+                "v83-author-storage-plan-v1"
+            } else {
+                "v82-hot-index-plan-v1"
+            },
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -541,7 +556,7 @@ mod tests {
         .await
         .unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]

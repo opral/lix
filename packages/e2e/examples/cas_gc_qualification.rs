@@ -475,7 +475,7 @@ where
             .await
             .expect("publish retention commit");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("publish retention checkpoint");
     }

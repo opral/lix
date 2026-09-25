@@ -1048,6 +1048,7 @@ mod tests {
             deleted: false,
             change_id: Some(ChangeId::for_test_label("change-registered-schema")),
             commit_id: None,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: true,
             untracked: true,
             created_at: LixTimestamp::expect_parse(

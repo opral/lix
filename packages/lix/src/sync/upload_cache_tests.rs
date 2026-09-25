@@ -22,9 +22,9 @@ async fn cached_upload_sql_checkpoint_before_first_page_preserves_source_order()
         write_key_value(&replica, "checkpoint-first-b", "working-updated").await;
         let source = upload_cache_head(&replica).await;
         replica.execute(if full {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         } else {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='checkpoint-first-a'))"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='checkpoint-first-a'))"
         }, &[]).await.unwrap();
         let target = upload_cache_head(&replica).await;
         let mut cache = None;
@@ -90,9 +90,9 @@ async fn legacy_checkpoint_known_wire_import_is_independent_of_local_nomination(
         let authority = open_lix().with_storage(memory.clone()).await.unwrap();
         write_key_value(&authority, "migration-wire", "preserved").await;
         let sql = if physical_alias {
-            "SELECT commit_id FROM lix_create_checkpoint()"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"
         } else {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         };
         let checkpoint = authority.execute(sql, &[]).await.unwrap().rows()[0]
             .get::<String>("commit_id")
@@ -147,9 +147,9 @@ async fn legacy_checkpoint_known_wire_import_is_independent_of_local_nomination(
 #[tokio::test]
 async fn snapshot_omitted_source_survives_gc_then_hydrates_normal_history() {
     for sql in [
-        "SELECT commit_id FROM lix_create_checkpoint()",
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='omitted-source'))",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='omitted-source'))",
     ] {
         let authority = open_lix().await.unwrap();
         authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('omitted-source','preserved'),('omitted-other','retained')", &[]).await.unwrap();
@@ -378,13 +378,13 @@ async fn materialized_legacy_alias_is_shared_by_incorporation_and_cycle_proofs()
 async fn authority_rejects_complete_source_cycle_through_existing_deferred_checkpoint() {
     let authority = open_lix().await.unwrap();
     write_key_value(&authority, "cycle-native", "unchanged").await;
-    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     let mut body = export_sync_commit(&authority, &checkpoint)
         .await
         .unwrap()
         .unwrap();
     let source = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -452,6 +452,7 @@ async fn checkpoint_source_certificate_rejects_modified_lifetime_and_rootless_va
                 row_pk: row.row_pk(),
                 change_id: row.change_id(),
                 commit_id: forged,
+                author_id: row.author_id(),
                 deleted: row.deleted(),
                 created_at: row.updated_at(),
                 updated_at: row.updated_at(),
@@ -522,9 +523,9 @@ async fn checkpoint_source_certificate_preserves_recreated_row_lifetimes() {
                 .await
                 .unwrap();
             replica.execute(if full {
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
             } else {
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='recreated'))"
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='recreated'))"
             }, &[]).await.unwrap();
             let target = upload_cache_head(&replica).await;
             let mut cache = None;
@@ -709,8 +710,8 @@ async fn cached_upload_checkpoint_midwave_survives_gc_and_keeps_generation() {
             .unwrap();
         let generation = cache.as_ref().unwrap().plan.generation();
         replica.execute(if scoped {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
-        } else { "SELECT commit_id FROM lix_create_checkpoint()" }, &[])
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+        } else { "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)" }, &[])
             .await.expect("checkpoint while body upload is in flight");
         let checkpoint_head = upload_cache_head(&replica).await;
         assert_ne!(checkpoint_head, captured_head);

@@ -3293,6 +3293,7 @@ mod tests {
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global,
             untracked,
             created_at: LixTimestamp::expect_parse(

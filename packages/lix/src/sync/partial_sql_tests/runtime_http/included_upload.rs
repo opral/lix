@@ -147,7 +147,7 @@ async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool)
     if checkpoint_authority {
         authority
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
                 &[],
             )
             .await
