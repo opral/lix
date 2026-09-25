@@ -91,8 +91,10 @@ const sdkLanguages = [
  */
 function CopyInstallButton({
   background = "white",
+  large = false,
 }: {
   background?: "white" | "paper";
+  large?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -105,7 +107,7 @@ function CopyInstallButton({
   return (
     <button
       onClick={copy}
-      className={`flex h-10 cursor-pointer items-center gap-3 rounded-lg border border-[#DDDBD3] px-3.5 font-mono text-[13.5px] text-ink transition-colors hover:border-cyan-bright ${
+      className={`flex cursor-pointer items-center gap-3 rounded-lg border border-[#DDDBD3] font-mono text-[13.5px] text-ink transition-colors hover:border-cyan-bright ${large ? "h-[46px] px-4" : "h-10 px-3.5"} ${
         background === "white"
           ? "bg-white shadow-[0_1px_2px_rgba(20,23,26,0.04)]"
           : "bg-paper"
@@ -126,126 +128,116 @@ type RepositoryFile = {
 } & (
   | { badge: { text: string; bg: string; fg: string } }
   | { icon: { src: string; alt: string } }
-  | { table: true }
 );
 
 /**
- * Small table glyph for application-state rows in the hero diagram.
+ * Small table glyph for SQL table previews in the hero diagram.
  *
  * @example
  * <TableIcon />
  */
 const TableIcon = () => (
   <svg
-    viewBox="0 0 22 22"
-    className="block h-[22px] w-[22px] shrink-0"
+    viewBox="0 0 16 16"
+    className="block h-[15px] w-[15px] shrink-0"
     aria-hidden="true"
+    fill="none"
+    stroke="#6B7076"
+    strokeWidth="1.2"
   >
-    <rect
-      x="2.5"
-      y="4.5"
-      width="17"
-      height="14"
-      rx="2"
-      fill="#FFFFFF"
-      stroke="#8A8F96"
-      strokeWidth="1.2"
-    />
-    <line
-      x1="2.5"
-      y1="9.5"
-      x2="19.5"
-      y2="9.5"
-      stroke="#8A8F96"
-      strokeWidth="1.2"
-    />
-    <line x1="2.5" y1="14" x2="19.5" y2="14" stroke="#C9C7BF" />
-    <line x1="8.5" y1="9.5" x2="8.5" y2="18.5" stroke="#C9C7BF" />
+    <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" />
+    <line x1="1.5" y1="6" x2="14.5" y2="6" />
+    <line x1="6" y1="6" x2="6" y2="13.5" />
   </svg>
 );
 
-/**
- * Rows shown in the hero diagram: one repository holding source code next to
- * documents, spreadsheets, media, and application tables. Familiar icons only.
- */
+const repositoryTables = [
+  { name: "orders", size: "12,400 rows", rows: [["1001", "paid"], ["1002", "shipped"]] },
+  { name: "customers", size: "3,180 rows", rows: [["c_12", "Acme GmbH"], ["c_13", "Northwind"]] },
+];
+
 const repositoryFiles: RepositoryFile[] = [
   {
-    name: "app.js",
-    size: "12 KB",
-    icon: { src: "/assets/icons/javascript.svg", alt: "JavaScript" },
+    name: "crm-sync.py",
+    size: "4 KB",
+    icon: { src: "/assets/icons/python.svg", alt: "" },
   },
   {
-    name: "contract.docx",
+    name: "handbook.docx",
     size: "840 KB",
-    icon: { src: "/assets/icons/word.svg", alt: "Word" },
+    icon: { src: "/assets/icons/word.svg", alt: "" },
   },
   {
     name: "pricing.xlsx",
     size: "1.2 MB",
-    icon: { src: "/assets/icons/excel.svg", alt: "Excel" },
+    icon: { src: "/assets/icons/excel.svg", alt: "" },
   },
   {
-    name: "train.py",
-    size: "8 KB",
-    icon: { src: "/assets/icons/python.svg", alt: "Python" },
+    name: "deck.pptx",
+    size: "18 MB",
+    icon: { src: "/assets/icons/powerpoint.svg", alt: "" },
   },
   {
-    name: "hero.psd",
-    size: "412 MB",
-    badge: { text: "Ps", bg: "#001E36", fg: "#31A8FF" },
+    name: "model.step",
+    size: "240 MB",
+    badge: { text: "3D", bg: "#E5E7EB", fg: "#374151" },
   },
-  { name: "orders", size: "12,400 rows", table: true },
-  { name: "customers", size: "3,180 rows", table: true },
+  {
+    name: "launch.mp4",
+    size: "4.8 GB",
+    badge: { text: "MP4", bg: "#6B7076", fg: "#FFFFFF" },
+  },
 ];
 
 /**
- * Hero diagram: one Lix repository holding every file format side by side.
+ * Hero diagram: files and SQL table rows side by side in one repository.
  *
  * @example
  * <OneRepositoryDiagram />
  */
 function OneRepositoryDiagram() {
   return (
-    <div className="w-[300px] shrink-0 self-center sm:w-[340px]">
-      <div
-        className="relative rounded-xl border-[1.5px] border-cyan-bright bg-[rgba(7,182,213,0.05)] px-3.5 pb-3.5 pt-[26px]"
-        role="img"
-        aria-label="One Lix repository holding source code, documents, spreadsheets, images, and the application's own database tables."
-      >
-        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-paper px-2.5 font-mono text-[11.5px] font-bold tracking-[0.09em] text-cyan-deep">
-          ONE REPOSITORY
-        </span>
-        <div className="flex flex-col gap-[7px]">
-          {repositoryFiles.map((file) => (
-            <div
-              key={file.name}
-              className="flex min-w-0 items-center gap-2.5 rounded-md border border-line bg-white px-3 py-[9px]"
-            >
-              {"table" in file ? (
-                <TableIcon />
-              ) : "badge" in file ? (
-                <span
-                  className="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[5px] font-sans text-[10px] font-bold"
-                  style={{ background: file.badge.bg, color: file.badge.fg }}
-                >
-                  {file.badge.text}
-                </span>
-              ) : (
-                <img
-                  src={file.icon.src}
-                  alt={file.icon.alt}
-                  className="block h-[22px] w-[22px] shrink-0 object-contain"
-                />
-              )}
-              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
-                {file.name}
+    <div
+      className="relative grid w-full grid-cols-1 gap-3 rounded-[14px] border-[1.5px] border-cyan-bright bg-[rgba(7,182,213,0.05)] px-4 pb-4 pt-[26px] text-left font-mono min-[721px]:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]"
+      role="img"
+      aria-label="One Lix repository holding files of any format and SQL tables with example rows."
+    >
+      <span className="absolute -top-[9px] left-1/2 -translate-x-1/2 whitespace-nowrap bg-paper px-3 text-xs font-bold tracking-[0.09em] text-cyan-deep">
+        ONE REPOSITORY
+      </span>
+      <div className="flex min-w-0 flex-col gap-2">
+        <span className="text-[11px] font-bold tracking-[0.08em] text-ink-muted">ANY FILE FORMAT</span>
+        {repositoryFiles.map((file) => (
+          <div key={file.name} className="flex min-w-0 items-center gap-[7px] rounded-[7px] border border-[#E6E4DD] bg-white px-2 py-2">
+            {"badge" in file ? (
+              <span className="inline-flex h-[17px] w-[17px] shrink-0 items-center justify-center rounded-[4px] text-[6px] font-bold" style={{ background: file.badge.bg, color: file.badge.fg }}>
+                {file.badge.text}
               </span>
-              <span className="shrink-0 font-mono text-[11px] text-ink-faint">
-                {file.size}
-              </span>
+            ) : (
+              <img src={file.icon.src} alt={file.icon.alt} className="block h-[17px] w-[17px] shrink-0 object-contain" />
+            )}
+            <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink">{file.name}</span>
+            <span className="shrink-0 text-[11px] text-ink-faint">{file.size}</span>
+          </div>
+        ))}
+      </div>
+      <div className="flex min-w-0 flex-col gap-2">
+        <span className="text-[11px] font-bold tracking-[0.08em] text-ink-muted">SQL TABLES</span>
+        {repositoryTables.map((table) => (
+          <div key={table.name} className="overflow-hidden rounded-lg border border-[#E6E4DD] bg-white">
+            <div className="flex items-center gap-2 border-b border-[#EDEBE4] px-3 py-2">
+              <TableIcon />
+              <span className="text-[13px] font-medium text-ink">{table.name}</span>
+              <span className="ml-auto text-[11px] text-ink-faint">{table.size}</span>
             </div>
-          ))}
-        </div>
+            {table.rows.map(([id, value]) => (
+              <div key={id} className="grid grid-cols-[64px_minmax(0,1fr)] border-b border-[#F3F1EC] text-[11.5px] text-ink last:border-b-0">
+                <span className="truncate px-3 py-[5px]">{id}</span>
+                <span className="truncate px-3 py-[5px]">{value}</span>
+              </div>
+            ))}
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -253,19 +245,19 @@ function OneRepositoryDiagram() {
 
 const pillars = [
   {
-    title: "Any format",
+    title: "Any file",
     description:
-      "Store text, binaries, and large files. Plugins provide structured diffs for supported formats, including Markdown and CSV.",
+      "Store code, Word, PowerPoint, CAD, and large media files. Plugins provide structured diffs for supported formats; other files have whole-file history.",
+  },
+  {
+    title: "SQL tables",
+    description:
+      "Define tables in Lix for CRM records, logs, and application data. Query rows and history with SQL.",
   },
   {
     title: "Embeddable",
     description:
-      "Runs in-process inside your product. Storage is pluggable: memory, filesystem, browser OPFS, or S3.",
-  },
-  {
-    title: "Designed as a database",
-    description:
-      "Files, app tables, and history are rows in one ACID database. Query all of it with SQL.",
+      "Run Lix in-process inside your product. Branch, diff, merge, and roll back files and tables through one API.",
   },
 ];
 
@@ -283,19 +275,29 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
       <Header width="narrow" />
       <main className="mx-auto w-full max-w-[1100px] px-8">
         {/* Hero */}
-        <section className="flex flex-wrap items-center justify-between gap-12 pt-16">
-          <div className="min-w-[300px] max-w-[620px] flex-1">
-            <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
+        <section className="grid grid-cols-1 items-center gap-12 pb-16 pt-20 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+          <div className="min-w-0">
+            <p className="mb-[22px] font-mono text-[12.5px] uppercase tracking-[0.08em] text-ink-faint">
               Open source · MIT
             </p>
-            <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Version control system for files and application data
+            <h1 className="text-balance text-[40px] font-bold leading-[1.05] tracking-[-0.035em] lg:text-[48px]">
+              Version control system for files and tables
             </h1>
-            <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Store files and SQL tables in one repository. Branch, diff,
-              merge, and roll back changes to both.
+            <p className="mt-6 max-w-[560px] text-pretty text-[18px] leading-[1.55] text-ink-secondary">
+              Store files of any format alongside SQL tables you define in Lix.
+              Branch, diff, merge, and roll back both in one repository. Embed
+              Lix in your product or connect to a server.
             </p>
-            <div className="mt-6 flex flex-wrap items-center gap-5">
+            <div className="mt-8 flex flex-wrap items-center gap-3">
+              <CopyInstallButton background="white" large />
+              <a
+                href="/docs/what-is-lix"
+                className="flex h-[46px] items-center rounded-lg bg-ink px-5 text-[14.5px] font-semibold text-paper transition-colors hover:bg-cyan-bright hover:text-[#0A2E36]"
+              >
+                Read the docs
+              </a>
+            </div>
+            <div className="mt-[18px] flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
                 <JsLogo className="h-3.5 w-3.5" />
                 JavaScript
@@ -314,21 +316,12 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </a>
               ))}
             </div>
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <CopyInstallButton background="white" />
-              <a
-                href="/docs/what-is-lix"
-                className="flex h-10 items-center rounded-lg bg-ink px-4 text-[13.5px] font-semibold text-paper transition-colors hover:text-paper"
-              >
-                Read the docs
-              </a>
-            </div>
           </div>
           <OneRepositoryDiagram />
         </section>
 
         {/* Pillars */}
-        <section className="grid grid-cols-1 gap-10 pt-20 sm:grid-cols-3">
+        <section className="grid grid-cols-1 gap-10 pt-4 sm:grid-cols-3">
           {pillars.map((pillar) => (
             <div
               key={pillar.title}
