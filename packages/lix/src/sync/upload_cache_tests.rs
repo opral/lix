@@ -452,6 +452,7 @@ async fn checkpoint_source_certificate_rejects_modified_lifetime_and_rootless_va
                 row_pk: row.row_pk(),
                 change_id: row.change_id(),
                 commit_id: forged,
+                author_id: row.author_id(),
                 deleted: row.deleted(),
                 created_at: row.updated_at(),
                 updated_at: row.updated_at(),

@@ -1,4 +1,4 @@
-use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions, Value};
+use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions, Value, open_lix};
 use serde_json::json;
 
 use super::assert_rows_eq;
@@ -26,6 +26,171 @@ const GENERATION_CONVERSATION: &str = "01950000-0000-7000-8000-000000000701";
 const GENERATION_COMMENT: &str = "01950000-0000-7000-8000-000000000702";
 
 const BODY: &str = r#"{"_type":"zettel_doc","blocks":[{"_type":"zettel_block","_key":"p1","style":"normal","markDefs":[],"children":[{"_type":"zettel_span","_key":"s1","text":"A stored reply","marks":[]}]}]}"#;
+
+#[tokio::test]
+async fn comment_author_id_tracks_the_latest_writer_without_a_change_join() {
+    const FIRST: &str = "01950000-0000-7000-8000-000000000901";
+    const SECOND: &str = "01950000-0000-7000-8000-000000000902";
+    const CONVERSATION: &str = "01950000-0000-7000-8000-000000000903";
+    const COMMENT: &str = "01950000-0000-7000-8000-000000000904";
+
+    let root = open_lix().await.expect("open repository");
+    root.ensure_account(FIRST, "First writer", "human")
+        .await
+        .expect("create first account");
+    root.ensure_account(SECOND, "Second writer", "human")
+        .await
+        .expect("create second account");
+    let first = root
+        .open_another_session()
+        .with_account(FIRST)
+        .await
+        .expect("open first writer session");
+    let second = root
+        .open_another_session()
+        .with_account(SECOND)
+        .await
+        .expect("open second writer session");
+
+    first
+        .execute(
+            "INSERT INTO lix_conversation(id) VALUES ($1)",
+            &[Value::Text(CONVERSATION.into())],
+        )
+        .await
+        .expect("create conversation");
+    let inserted = first
+        .execute(
+            "INSERT INTO lix_comment(id, conversation_id, body) VALUES ($1, $2, CAST($3 AS JSONB)) RETURNING lixcol_author_id",
+            &[
+                Value::Text(COMMENT.into()),
+                Value::Text(CONVERSATION.into()),
+                Value::Text(BODY.into()),
+            ],
+        )
+        .await
+        .expect("create comment");
+    assert_eq!(inserted.rows()[0].values(), &[Value::Text(FIRST.into())]);
+    first
+        .execute(
+            "INSERT INTO lix_comment(id, conversation_id, body, lixcol_author_id) VALUES ($1, $2, CAST($3 AS JSONB), $4)",
+            &[
+                Value::Text("01950000-0000-7000-8000-000000000905".into()),
+                Value::Text(CONVERSATION.into()),
+                Value::Text(BODY.into()),
+                Value::Text(FIRST.into()),
+            ],
+        )
+        .await
+        .expect_err("clients must not supply lixcol_author_id");
+    first
+        .execute(
+            "UPDATE lix_comment SET lixcol_author_id = $1 WHERE id = $2",
+            &[Value::Text(SECOND.into()), Value::Text(COMMENT.into())],
+        )
+        .await
+        .expect_err("clients must not update lixcol_author_id");
+
+    let updated = second
+        .execute(
+            "UPDATE lix_comment SET body = CAST($1 AS JSONB) WHERE id = $2 RETURNING lixcol_author_id",
+            &[
+                Value::Text(r#"{"_type":"zettel_doc","blocks":[]}"#.into()),
+                Value::Text(COMMENT.into()),
+            ],
+        )
+        .await
+        .expect("edit comment");
+    assert_eq!(updated.rows()[0].values(), &[Value::Text(SECOND.into())]);
+
+    let author = first
+        .execute(
+            "SELECT c.lixcol_author_id, a.name FROM lix_comment AS c JOIN lix_account AS a ON a.id = c.lixcol_author_id WHERE c.id = $1",
+            &[Value::Text(COMMENT.into())],
+        )
+        .await
+        .expect("read current author directly from comment");
+    assert_eq!(
+        author.rows()[0].values(),
+        &[Value::Text(SECOND.into()), Value::Text("Second writer".into())]
+    );
+
+    let branch = first
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "comment-author-source".into(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("fork comment branch");
+    let source = root
+        .open_another_session()
+        .with_account(SECOND)
+        .with_branch(branch.id.clone())
+        .await
+        .expect("open source writer session");
+    source
+        .execute(
+            "UPDATE lix_comment SET body = CAST($1 AS JSONB) WHERE id = $2",
+            &[
+                Value::Text(BODY.into()),
+                Value::Text(COMMENT.into()),
+            ],
+        )
+        .await
+        .expect("write source comment");
+    let source_change = source
+        .execute(
+            "SELECT lixcol_change_id FROM lix_comment WHERE id = $1",
+            &[Value::Text(COMMENT.into())],
+        )
+        .await
+        .expect("read source change");
+    first
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: branch.id,
+        })
+        .await
+        .expect("merge source comment");
+    let merged = first
+        .execute(
+            "SELECT lixcol_author_id, lixcol_change_id FROM lix_comment WHERE id = $1",
+            &[Value::Text(COMMENT.into())],
+        )
+        .await
+        .expect("read merged comment");
+    assert_eq!(merged.rows()[0].values()[0], Value::Text(SECOND.into()));
+    assert_eq!(merged.rows()[0].values()[1], source_change.rows()[0].values()[0]);
+
+    first
+        .execute(
+            "INSERT INTO lix_key_value(key, value, lixcol_untracked) VALUES ('author-untracked', 'first', true)",
+            &[],
+        )
+        .await
+        .expect("create untracked row");
+    second
+        .execute(
+            "UPDATE lix_key_value SET value = 'second' WHERE key = 'author-untracked'",
+            &[],
+        )
+        .await
+        .expect("edit untracked row");
+    let untracked = first
+        .execute(
+            "SELECT lixcol_author_id, lixcol_change_id, lixcol_commit_id FROM lix_key_value WHERE key = 'author-untracked'",
+            &[],
+        )
+        .await
+        .expect("read untracked author");
+    let [Value::Text(author_id), Value::Text(change_id), Value::Null] =
+        untracked.rows()[0].values()
+    else {
+        panic!("untracked row should have author and change IDs but no commit ID");
+    };
+    assert_eq!(author_id, SECOND);
+    assert!(uuid::Uuid::parse_str(change_id).is_ok());
+}
 
 type SimSession = crate::support::simulation_test::engine::SimSession;
 

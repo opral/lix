@@ -59,20 +59,41 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
 #[tokio::test]
 async fn joined_checkpoint_history_hydrates_active_selection_and_replays_offline() {
     let authority = open_lix().await.unwrap();
-    authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
     let mut checkpoints = Vec::new();
     for index in 0..4 {
         authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('joined-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value", &[Value::Text(index.to_string())]).await.unwrap();
         checkpoints.push(authority.create_checkpoint().await.unwrap().commit_id);
     }
-    authority.execute("SELECT commit_id FROM lix_undo($1)", &[Value::Text(checkpoints[3].clone())]).await.unwrap();
+    authority
+        .execute(
+            "SELECT commit_id FROM lix_undo($1)",
+            &[Value::Text(checkpoints[3].clone())],
+        )
+        .await
+        .unwrap();
     let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
     let sql = "SELECT l.commit_id, h.diff_type FROM lix_log() l JOIN lix_history('lix_key_value') h ON h.lixcol_to_commit_id=l.commit_id WHERE l.is_checkpoint AND h.key='joined-history' ORDER BY l.position";
     let expected = authority.execute(sql, &[]).await.unwrap();
     assert_eq!(expected.len(), 3);
-    let actual = execute_hydrating(&session, &engine.storage(), &state, &authority, sql, &[], &mut Fetches::default()).await.unwrap();
+    let actual = execute_hydrating(
+        &session,
+        &engine.storage(),
+        &state,
+        &authority,
+        sql,
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(actual.rows(), expected.rows());
-    assert_eq!(session.execute(sql, &[]).await.unwrap().rows(), expected.rows());
+    assert_eq!(
+        session.execute(sql, &[]).await.unwrap().rows(),
+        expected.rows()
+    );
 }
 
 async fn fixture_with_account(
@@ -451,9 +472,7 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
     let target_metadata = target_metadata_result.rows();
     assert_eq!(target_metadata.len(), 1);
     assert_eq!(
-        target_metadata[0]
-            .get::<bool>("is_checkpoint")
-            .unwrap(),
+        target_metadata[0].get::<bool>("is_checkpoint").unwrap(),
         false
     );
 
@@ -2178,7 +2197,7 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
             bytes: serde_json::to_vec(&legacy).unwrap().into(),
         },
     );
-    let push_key = crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+    let push_key = StorageKey(bytes::Bytes::copy_from_slice(
         &crate::storage_codec::id_string::uuid_bytes_from_canonical(branch).unwrap(),
     ));
     let mut old_push: serde_json::Value = serde_json::from_slice(&before_push).unwrap();

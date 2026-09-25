@@ -17,16 +17,16 @@ use crate::{LixError, storage_codec};
 
 pub(crate) const CURRENT_STATE_DATA_PART_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_002f),
-    "tracked_state.current_state_data_part.v1",
+    "tracked_state.current_state_data_part.v2",
     ValueSemantics::Immutable,
 );
 pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 512;
 pub(crate) const CURRENT_STATE_DATA_PART_TARGET_BYTES: usize = 64 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CURRENT_STATE_DATA_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
-const RAW_MAGIC: &[u8; 7] = b"LXCSP03";
-const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ3";
-const DIGEST_CONTEXT: &str = "lix native current-state data part v3";
+const RAW_MAGIC: &[u8; 7] = b"LXCSP04";
+const ZSTD_MAGIC: &[u8; 7] = b"LXCSPZ4";
+const DIGEST_CONTEXT: &str = "lix native current-state data part v4";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CurrentStateDataRow {
@@ -71,6 +71,7 @@ pub(crate) fn encode_current_state_data_part(
                 super::types::TrackedStateIndexValueRef {
                     change_id: row.value.change_id,
                     commit_id: row.value.commit_id,
+                    author_id: &row.value.author_id,
                     deleted: row.value.deleted,
                     created_at: row.value.created_at,
                     updated_at: row.value.updated_at,
@@ -243,6 +244,7 @@ mod tests {
             value: TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label(&format!("native-change-{index}")),
                 commit_id: CommitId::for_test_label(&format!("native-commit-{index}")),
+                author_id: format!("native-author-{index}"),
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
@@ -296,6 +298,7 @@ mod tests {
             value: TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("typed-change"),
                 commit_id: CommitId::for_test_label("typed-commit"),
+                author_id: "typed-author".to_owned(),
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),

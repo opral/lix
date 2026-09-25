@@ -678,7 +678,7 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
             });
             let owner_file_ids = file_ids.clone();
             let mut file_schema_keys = vec![FILE_DESCRIPTOR_SCHEMA_KEY.into()];
-            if ["content", "lixcol_change_id", "lixcol_updated_at"]
+            if ["content", "lixcol_change_id", "lixcol_author_id", "lixcol_updated_at"]
                 .iter()
                 .any(|column| schema.index_of(column).is_ok())
             {
@@ -1038,6 +1038,7 @@ fn tracked_to_hot(
                 updated_at: row.updated_at(),
                 global,
                 change_id: Some(row.change_id()),
+                author_id: row.author_id().to_owned(),
                 commit_id: Some(row.commit_id()),
                 untracked: false,
                 branch_id: Arc::from(storage_branch_id),
@@ -1074,6 +1075,7 @@ fn tracked_to_hot(
                 created_at,
                 updated_at,
                 change_id: Some(row.change_id),
+                author_id: row.author_id,
                 commit_id: Some(row.commit_id),
                 untracked: false,
                 branch_id: Arc::from(storage_branch_id),

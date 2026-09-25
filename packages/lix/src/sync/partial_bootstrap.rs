@@ -44,6 +44,8 @@ pub(super) fn partial_branch_control(
         updated_at: LixTimestamp::parse(&branch.updated_at).map_err(|_| invalid("updatedAt"))?,
         ref_change_id: ChangeId::parse(&branch.ref_change_id)
             .map_err(|_| invalid("refChangeId"))?,
+        author_id: BranchHeadControl::author_id_bytes(&branch.author_id)
+            .map_err(|_| invalid("authorId"))?,
         schema_presence_bloom: [u64::MAX; 4],
     })
 }

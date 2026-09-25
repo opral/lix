@@ -2047,6 +2047,7 @@ mod tests {
                 "content",
                 "lixcol_global",
                 "lixcol_change_id",
+                "lixcol_author_id",
                 "lixcol_created_at",
                 "lixcol_updated_at",
                 "lixcol_untracked",

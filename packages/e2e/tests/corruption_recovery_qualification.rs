@@ -19,7 +19,7 @@ use std::path::Path;
 // predicate in the server-protocol gate this cannot match on a prefix: it names
 // the space it reconstructs. A stale value here does not fail loudly at the
 // mismatch, it makes the inventory come back empty.
-const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v11";
+const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v12";
 const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v7";
 const TREE_CHUNK_SPACE: &str = "tracked_state.tree_chunk";
 const BINARY_CHUNK_SPACE: &str = "binary_cas.chunk";

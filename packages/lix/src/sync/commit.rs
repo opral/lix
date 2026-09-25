@@ -416,8 +416,8 @@ impl SyncCommit {
             }
         }
         parse_timestamp("sync commit createdAt", &self.created_at)?;
-        if self.account_id.is_empty() {
-            return invalid("sync commit accountId must not be empty");
+        if crate::storage_codec::id_string::uuid_bytes_from_canonical(&self.account_id).is_none() {
+            return invalid("sync commit accountId must be a canonical UUID");
         }
 
         let mut parents = BTreeSet::new();
@@ -500,8 +500,12 @@ impl SyncCommit {
             if member.schema_key.is_empty() {
                 return invalid("sync commit member schemaKey must not be empty");
             }
-            if member.change_account_id.is_empty() {
-                return invalid("sync commit member changeAccountId must not be empty");
+            if crate::storage_codec::id_string::uuid_bytes_from_canonical(
+                &member.change_account_id,
+            )
+            .is_none()
+            {
+                return invalid("sync commit member changeAccountId must be a canonical UUID");
             }
             let change_id = crate::changelog::ChangeId::parse_lix(
                 &member.change_id,
@@ -1191,6 +1195,15 @@ mod tests {
                 .contains("strictly identity ordered")
         );
         commit.members = vec![member("a", 1)];
+        let mut invalid_account = commit.clone();
+        invalid_account.account_id = "account".to_owned();
+        assert!(
+            invalid_account
+                .validate()
+                .expect_err("commit actors must be canonical UUIDs")
+                .message
+                .contains("accountId must be a canonical UUID")
+        );
         commit.members[0].change_account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
         assert!(
             commit
@@ -1205,6 +1218,15 @@ mod tests {
         commit
             .validate()
             .expect("non-merge checkpoint members are self-contained");
+        commit.members[0].change_account_id = "account".to_owned();
+        assert!(
+            commit
+                .validate()
+                .expect_err("member writers must be canonical UUIDs")
+                .message
+                .contains("changeAccountId must be a canonical UUID")
+        );
+        commit.members[0].change_account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
         commit.selected_source_commit_id = Some(CommitId::for_test_label("source").to_string());
         assert!(
             commit

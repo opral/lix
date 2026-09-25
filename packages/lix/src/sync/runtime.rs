@@ -3275,6 +3275,9 @@ mod tests {
             default_branch_id: "branch".to_owned(),
             branches: vec![super::super::SyncBranchHead {
                 branch_id: "branch".to_owned(),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                ref_change_id: crate::changelog::ChangeId::for_test_label("runtime-ref-change")
+                    .to_string(),
                 head_commit_id: Some("head".to_owned()),
                 checkpoint_commit_id: Some("head".to_owned()),
                 checkpoint_state_root_id: "0".repeat(64),

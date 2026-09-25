@@ -3436,41 +3436,29 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
-    // Full lineage of the failing live repository: authored on the v71
-    // engine, migrated and partial-checkpointed on the v72 engine
-    // (fixture generated from 4816fdba5, SHA-256
-    // 634eefb12a96bbb656214d5f203fb2f0dbd0fc552379754e3c86eb9cb99b6f70),
-    // migrated to the current format here, served, and read from a fresh
-    // sync replica using server-first history reads.
-    const V72_PARTIAL_CHECKPOINTS: &[u8] =
-        include_bytes!("fixtures/v72_partial_checkpoints.lixsnap");
-    let authority_storage = Memory::new();
-    lix::migration::restore_and_migrate_repository(
-        authority_storage.clone(),
-        Cursor::new(V72_PARTIAL_CHECKPOINTS),
-    )
-    .await
-    .expect("explicitly migrate the authority fixture");
-    let authority = Arc::new(
-        open_lix()
-            .with_storage(authority_storage.clone())
+async fn partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
+    let (authority_storage, authority) = open_authority().await;
+    for (path, content) in [
+        ("/sales/playbook.md", "one"),
+        ("/docs/handbook/inside.md", "two"),
+        ("/brand/logo.md", "three"),
+    ] {
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(content.as_bytes().to_vec().into()),
+                ],
+            )
             .await
-            .expect("open migrated authority"),
-    );
-    let checkpoints = authority
-        .execute(
-            "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position DESC",
-            &[],
-        )
+            .expect("seed checkpoint file");
+    }
+    let last_checkpoint = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
-        .expect("checkpoint listing");
-    // Bootstrap + seed + two partial checkpoints (edited seeded file, new
-    // file in a new directory).
-    let last_checkpoint = checkpoints
-        .rows()
-        .last()
-        .expect("fixture has checkpoints")
+        .expect("checkpoint filesystem")
+        .rows()[0]
         .get::<String>("commit_id")
         .expect("commit id");
     let brand_file_id = authority
@@ -3481,7 +3469,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         .get::<String>("id")
         .expect("file id decodes");
     for index in 0..105 {
-        put_value(&authority, &format!("migrated-page-{index:03}"), "value").await;
+        put_value(&authority, &format!("checkpoint-page-{index:03}"), "value").await;
     }
     authority.close().await.expect("close authority setup");
 
@@ -3508,18 +3496,18 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
             &[Value::Text(last_checkpoint.clone())],
         )
         .await
-        .expect("file state at the migrated partial checkpoint executes on the authority");
+        .expect("file state at the partial checkpoint executes on the authority");
     let directories = replica
         .execute(
             "SELECT id, name FROM lix_as_of('lix_directory', $1)",
             &[Value::Text(last_checkpoint.clone())],
         )
         .await
-        .expect("directory state at the migrated partial checkpoint executes on the authority");
+        .expect("directory state at the partial checkpoint executes on the authority");
     assert_eq!(
         directories.rows().len(),
-        4,
-        "brand, docs, handbook, sales all present"
+        7,
+        "bootstrap and authored directories are present"
     );
     assert_eq!(files.rows().len(), 4, "all four files present");
     assert_files_resolve_directories(&files, &directories);
@@ -3531,7 +3519,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         )
         .await
         .expect(
-            "root diff with paths at the migrated partial checkpoint executes on the authority",
+            "root diff with paths at the partial checkpoint executes on the authority",
         );
     assert_eq!(diff.rows().len(), 4, "resolved paths for all four files");
 

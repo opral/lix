@@ -27,11 +27,11 @@ pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 512;
 pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 512 * 1024;
 pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI005";
-const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ005";
+const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI006";
+const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ006";
 const REPLACEMENT_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const REPLACEMENT_DIRECTORY_MAGIC: &[u8; 8] = b"LXRPD001";
-const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v1";
+const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v2";
 const REPLACEMENT_DIRECTORY_DIGEST_CONTEXT: &str =
     "lix tracked-state replacement part directory v1";
 const DIGEST_BYTES: usize = 32;
@@ -41,6 +41,7 @@ const DIRECTORY_FIXED_ENTRY_BYTES: usize = DIGEST_BYTES + 4 + 2 + 4 + 4;
 pub(crate) struct ReplacementPartRowRef<'a> {
     /// Canonical bytes produced by the tracked-state key codec.
     pub(crate) encoded_key: &'a [u8],
+    pub(crate) author_id: &'a str,
     pub(crate) metadata: Option<&'a lix_schema::Jsonb>,
     pub(crate) snapshot: &'a [u8],
 }
@@ -91,6 +92,7 @@ pub(crate) struct DecodedReplacementPart {
     key_arena: Bytes,
     key_ranges: Vec<Range<usize>>,
     metadata: Vec<Option<lix_schema::Jsonb>>,
+    authors: Vec<String>,
     snapshots: Vec<Vec<u8>>,
 }
 
@@ -101,6 +103,7 @@ pub(crate) struct DecodedReplacementPart {
 pub(crate) struct DecodedRawReplacementPart {
     key_arena: Bytes,
     key_ranges: Vec<Range<usize>>,
+    authors: Vec<String>,
     payload_arena: Bytes,
     payload_ranges: Vec<Range<usize>>,
 }
@@ -114,6 +117,7 @@ pub(crate) struct DecodedRawReplacementPart {
 pub(crate) struct PreparedReplacementNativePart {
     key_arena: Bytes,
     key_ranges: Vec<Range<usize>>,
+    authors: Vec<String>,
     payloads: Arc<[crate::plugin::wire::typed::ValidatedNativePayload]>,
 }
 
@@ -132,6 +136,10 @@ impl PreparedReplacementNativePart {
         self.key_ranges
             .get(ordinal)
             .map(|range| self.key_arena.slice(range.clone()))
+    }
+
+    pub(crate) fn author_id(&self, ordinal: usize) -> Option<&str> {
+        self.authors.get(ordinal).map(String::as_str)
     }
 
     pub(crate) fn payload(
@@ -189,6 +197,10 @@ impl DecodedReplacementPart {
         Ok(self.metadata.get(ordinal).and_then(Option::as_ref))
     }
 
+    pub(crate) fn author_id(&self, ordinal: usize) -> Result<Option<&str>, LixError> {
+        Ok(self.authors.get(ordinal).map(String::as_str))
+    }
+
     pub(crate) fn snapshot(&self, ordinal: usize) -> Result<Option<&[u8]>, LixError> {
         Ok(self.snapshots.get(ordinal).map(Vec::as_slice))
     }
@@ -238,6 +250,10 @@ impl DecodedRawReplacementPart {
         self.payload_ranges
             .get(ordinal)
             .map(|range| self.payload_arena.slice(range.clone()))
+    }
+
+    pub(crate) fn author_id(&self, ordinal: usize) -> Option<&str> {
+        self.authors.get(ordinal).map(String::as_str)
     }
 }
 
@@ -515,6 +531,18 @@ pub(crate) fn encode_replacement_part_with_compressor(
                 .to_be_bytes(),
         );
         encoded.extend_from_slice(suffix);
+        let author = row.author_id.as_bytes();
+        if author.is_empty() || author.len() > 256 {
+            return Err(replacement_part_error(
+                "replacement author account id is empty or exceeds its bound",
+            ));
+        }
+        encoded.extend_from_slice(
+            &u16::try_from(author.len())
+                .map_err(|_| replacement_part_error("replacement author id exceeds u16"))?
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(author);
         if row.snapshot.is_empty() {
             return Err(replacement_part_error(
                 "replacement row is missing its typed payload",
@@ -629,6 +657,7 @@ pub(crate) fn decode_replacement_part(
     let mut key_arena = Vec::new();
     let mut key_ranges = Vec::with_capacity(row_count);
     let mut metadata = Vec::with_capacity(row_count);
+    let mut authors = Vec::with_capacity(row_count);
     let mut snapshots = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
@@ -651,6 +680,7 @@ pub(crate) fn decode_replacement_part(
         let start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(start..key_arena.len());
+        authors.push(decode_author(body, &mut cursor)?);
         metadata.push(decode_jsonb(body, &mut cursor)?);
         let snapshot = decode_snapshot_slot(body, &mut cursor)?.ok_or_else(|| {
             replacement_part_error("replacement row is missing its typed payload")
@@ -667,6 +697,7 @@ pub(crate) fn decode_replacement_part(
         key_arena: Bytes::from(key_arena),
         key_ranges,
         metadata,
+        authors,
         snapshots,
     })
 }
@@ -731,6 +762,7 @@ pub(crate) fn decode_raw_replacement_part(
     let mut key_arena = Vec::new();
     let mut key_ranges = Vec::with_capacity(row_count);
     let mut payload_ranges = Vec::with_capacity(row_count);
+    let mut authors = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
         let shared = usize::from(decode_u16(body, &mut cursor)?);
@@ -752,6 +784,7 @@ pub(crate) fn decode_raw_replacement_part(
         let key_start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(key_start..key_arena.len());
+        authors.push(decode_author(body, &mut cursor)?);
         skip_jsonb(body, &mut cursor)?;
         match *take_exact(body, &mut cursor, 1)?
             .first()
@@ -786,6 +819,7 @@ pub(crate) fn decode_raw_replacement_part(
     Ok(DecodedRawReplacementPart {
         key_arena: Bytes::from(key_arena),
         key_ranges,
+        authors,
         payload_arena: logical,
         payload_ranges,
     })
@@ -827,6 +861,7 @@ pub(crate) fn decode_native_replacement_part(
     Ok(Some(Arc::new(PreparedReplacementNativePart {
         key_arena: decoded.key_arena,
         key_ranges: decoded.key_ranges,
+        authors: decoded.authors,
         payloads: Arc::from(payloads),
     })))
 }
@@ -981,6 +1016,19 @@ fn decode_u16(encoded: &[u8], cursor: &mut usize) -> Result<u16, LixError> {
     ))
 }
 
+fn decode_author(encoded: &[u8], cursor: &mut usize) -> Result<String, LixError> {
+    let len = usize::from(decode_u16(encoded, cursor)?);
+    if len == 0 || len > 256 {
+        return Err(replacement_part_error(
+            "replacement author account id is empty or exceeds its bound",
+        ));
+    }
+    let bytes = take_exact(encoded, cursor, len)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| replacement_part_error("replacement author account id is not UTF-8"))
+}
+
 fn decode_u32(encoded: &[u8], cursor: &mut usize) -> Result<u32, LixError> {
     Ok(u32::from_be_bytes(
         take_exact(encoded, cursor, 4)?
@@ -1024,6 +1072,7 @@ mod tests {
         keys.iter()
             .map(|key| ReplacementPartRowRef {
                 encoded_key: key,
+                author_id: "part-author",
                 metadata: None,
                 snapshot: b"typed",
             })
@@ -1037,6 +1086,10 @@ mod tests {
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
             .expect("decode replacement part");
         assert_eq!(decoded.len(), 3);
+        assert_eq!(
+            decoded.author_id(0).expect("decode author").as_deref(),
+            Some("part-author")
+        );
         assert_eq!(decoded.first_key(), Some(b"alpha".as_slice()));
         assert_eq!(decoded.last_key(), Some(b"gamma".as_slice()));
         assert_eq!(
@@ -1066,6 +1119,7 @@ mod tests {
         let metadata = lix_schema::Jsonb::from_value(serde_json::json!({"source": "test"}));
         let rows = [ReplacementPartRowRef {
             encoded_key: b"alpha",
+            author_id: "metadata-author",
             metadata: Some(&metadata),
             snapshot: b"typed",
         }];
@@ -1086,6 +1140,7 @@ mod tests {
         };
         let rows = [ReplacementPartRowRef {
             encoded_key: b"typed-row",
+            author_id: "typed-author",
             metadata: None,
             snapshot: typed.durable_payload_ref().expect("typed snapshot encodes"),
         }];
@@ -1130,6 +1185,7 @@ mod tests {
                     .zip(keys)
                     .map(|(snapshot, encoded_key)| ReplacementPartRowRef {
                         encoded_key,
+                        author_id: "wire-author",
                         metadata: None,
                         snapshot,
                     })
@@ -1165,11 +1221,13 @@ mod tests {
         let rows = [
             ReplacementPartRowRef {
                 encoded_key: b"alpha",
+                author_id: "first-author",
                 metadata: None,
                 snapshot: &first,
             },
             ReplacementPartRowRef {
                 encoded_key: b"beta",
+                author_id: "second-author",
                 metadata: None,
                 snapshot: &second,
             },
@@ -1186,6 +1244,7 @@ mod tests {
             rows[0],
             ReplacementPartRowRef {
                 encoded_key: b"beta",
+                author_id: "second-author",
                 metadata: None,
                 snapshot: b"typed",
             },

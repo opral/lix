@@ -2581,6 +2581,8 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
                 ref_change_id: ChangeId::for_test_label("control-projection-ref"),
+                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                    .expect("anonymous account ID is canonical"),
                 schema_presence_bloom: [u64::MAX; 4],
             },
         )];
@@ -3812,6 +3814,7 @@ mod tests {
             value: TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("native-row-change"),
                 commit_id: owner.commit_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -3878,6 +3881,7 @@ mod tests {
                     row_pk: &snapshot_row_pk,
                     change_id: row.value.change_id,
                     commit_id: row.value.commit_id,
+                    author_id: &row.value.author_id,
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -4118,6 +4122,8 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tree-sweep-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
             schema_presence_bloom: [0; 4],
         };
         let mut writes = storage.new_write_set();
@@ -5117,6 +5123,7 @@ mod tests {
                     row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("corrupt-plugin-registry")),
                     commit_id: Some(control.head_commit_id),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     untracked: false,
                     deleted: false,
                     created_at: timestamp,
@@ -6047,6 +6054,8 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id,
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
             schema_presence_bloom: [0; 4],
         }
     }
@@ -6077,6 +6086,7 @@ mod tests {
                 schema_key,
                 file_id: None,
                 row_pk: "row",
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 commit_id,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -6381,6 +6391,7 @@ mod tests {
                     row_pk: &change.row_pk,
                     change_id: change.change_id,
                     commit_id,
+                    author_id: &change.account_id,
                     deleted: change.snapshot.is_none(),
                     created_at: change.created_at,
                     updated_at: change.created_at,

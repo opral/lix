@@ -57,6 +57,13 @@ pub(crate) fn encoded_delta_event_len(
 #[serde(rename_all = "camelCase")]
 pub struct SyncRefUpdate {
     pub branch_id: String,
+    /// Writer of the selected branch-ref row; null only when deleting a ref.
+    pub author_id: Option<String>,
+    /// Current-state change ID of the branch-ref row; null only when deleting.
+    pub ref_change_id: Option<String>,
+    /// Optional previous branch-ref row version guard. Head/checkpoint remain
+    /// the CAS when an older partial upload has no ref-version metadata.
+    pub expected_ref_change_id: Option<String>,
     pub expected_head_commit_id: Option<String>,
     /// Checkpoint coordinate paired with `expected_head_commit_id` for CAS.
     pub expected_checkpoint_commit_id: Option<String>,
@@ -70,6 +77,9 @@ pub struct SyncRefUpdate {
 #[serde(rename_all = "camelCase")]
 struct SyncRefUpdateWire {
     branch_id: String,
+    author_id: RequiredOption<String>,
+    ref_change_id: RequiredOption<String>,
+    expected_ref_change_id: RequiredOption<String>,
     expected_head_commit_id: Option<String>,
     expected_checkpoint_commit_id: RequiredOption<String>,
     head_commit_id: Option<String>,
@@ -92,8 +102,43 @@ impl<'de> Deserialize<'de> for SyncRefUpdate {
             wire.checkpoint_commit_id.0.as_deref(),
         )
         .map_err(D::Error::custom)?;
+        if wire.author_id.0.as_deref().is_some_and(|author_id| {
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(author_id).is_none()
+        }) {
+            return Err(D::Error::custom("sync ref authorId must be a canonical UUID"));
+        }
+        if wire.head_commit_id.is_some() && wire.author_id.0.is_none() {
+            return Err(D::Error::custom("a live sync ref must carry its authorId"));
+        }
+        if wire.head_commit_id.is_some() != wire.ref_change_id.0.is_some() {
+            return Err(D::Error::custom(
+                "sync ref head and refChangeId must either both be present or both be null",
+            ));
+        }
+        if wire.expected_head_commit_id.is_none() && wire.expected_ref_change_id.0.is_some() {
+            return Err(D::Error::custom(
+                "sync ref expectedRefChangeId requires an expected head",
+            ));
+        }
+        for ref_change_id in [
+            wire.ref_change_id.0.as_deref(),
+            wire.expected_ref_change_id.0.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if crate::storage_codec::id_string::uuid_bytes_from_canonical(ref_change_id).is_none()
+            {
+                return Err(D::Error::custom(
+                    "sync ref refChangeId must be a canonical UUID",
+                ));
+            }
+        }
         Ok(Self {
             branch_id: wire.branch_id,
+            author_id: wire.author_id.0,
+            ref_change_id: wire.ref_change_id.0,
+            expected_ref_change_id: wire.expected_ref_change_id.0,
             expected_head_commit_id: wire.expected_head_commit_id,
             expected_checkpoint_commit_id: wire.expected_checkpoint_commit_id.0,
             head_commit_id: wire.head_commit_id,
@@ -188,6 +233,10 @@ pub struct SyncSnapshotRowPage {
 #[serde(rename_all = "camelCase")]
 pub struct SyncBranchHead {
     pub branch_id: String,
+    /// Account that performed the branch-ref write selected in this snapshot.
+    pub author_id: String,
+    /// Current-state change ID of the branch-ref row.
+    pub ref_change_id: String,
     pub head_commit_id: Option<String>,
     /// The branch-specific checkpoint against which working changes are read.
     /// It is null only when `head_commit_id` is null.
@@ -203,6 +252,8 @@ pub struct SyncBranchHead {
 #[serde(rename_all = "camelCase")]
 struct SyncBranchHeadWire {
     branch_id: String,
+    author_id: String,
+    ref_change_id: String,
     head_commit_id: Option<String>,
     checkpoint_commit_id: RequiredOption<String>,
     checkpoint_state_root_id: String,
@@ -220,8 +271,21 @@ impl<'de> Deserialize<'de> for SyncBranchHead {
             wire.checkpoint_commit_id.0.as_deref(),
         )
         .map_err(D::Error::custom)?;
+        if crate::storage_codec::id_string::uuid_bytes_from_canonical(&wire.author_id).is_none() {
+            return Err(D::Error::custom(
+                "sync branch authorId must be a canonical UUID",
+            ));
+        }
+        if crate::storage_codec::id_string::uuid_bytes_from_canonical(&wire.ref_change_id).is_none()
+        {
+            return Err(D::Error::custom(
+                "sync branch refChangeId must be a canonical UUID",
+            ));
+        }
         Ok(Self {
             branch_id: wire.branch_id,
+            author_id: wire.author_id,
+            ref_change_id: wire.ref_change_id,
             head_commit_id: wire.head_commit_id,
             checkpoint_commit_id: wire.checkpoint_commit_id.0,
             checkpoint_state_root_id: wire.checkpoint_state_root_id,
@@ -386,6 +450,9 @@ mod tests {
         let branches = (0..10_000)
             .map(|index| SyncBranchHead {
                 branch_id: format!("branch-{index}"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                ref_change_id: crate::changelog::ChangeId::for_test_label(&format!("ref-{index}"))
+                    .to_string(),
                 head_commit_id: Some(format!("head-{index}")),
                 checkpoint_commit_id: Some(format!("checkpoint-{index}")),
                 checkpoint_state_root_id: format!("{:064x}", index),
@@ -410,13 +477,20 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
         );
-        assert!(serde_json::to_vec(&value).unwrap().len() < 3 * 1024 * 1024);
+        assert!(serde_json::to_vec(&value).unwrap().len() < 4 * 1024 * 1024);
     }
 
     #[test]
     fn checkpoint_coordinate_is_required_and_matches_ref_presence() {
         let update = SyncRefUpdate {
             branch_id: "branch".to_owned(),
+            author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+            ref_change_id: Some(
+                crate::changelog::ChangeId::for_test_label("new-ref-change").to_string(),
+            ),
+            expected_ref_change_id: Some(
+                crate::changelog::ChangeId::for_test_label("old-ref-change").to_string(),
+            ),
             expected_head_commit_id: Some("old-head".to_owned()),
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
@@ -424,9 +498,15 @@ mod tests {
         };
         let value = serde_json::to_value(&update).expect("serialize ref update");
         assert_eq!(value["checkpointCommitId"], "checkpoint");
+        assert_eq!(value["authorId"], crate::ANONYMOUS_ACCOUNT_ID);
+        assert!(value["refChangeId"].as_str().is_some());
+        assert!(value["expectedRefChangeId"].as_str().is_some());
         assert!(
             serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
                 "branchId": "branch",
+                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
+                "refChangeId": crate::changelog::ChangeId::for_test_label("new-ref-change").to_string(),
+                "expectedRefChangeId": null,
                 "expectedHeadCommitId": null,
                 "expectedCheckpointCommitId": null,
                 "headCommitId": "head"
@@ -437,6 +517,9 @@ mod tests {
         assert!(
             serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
                 "branchId": "branch",
+                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
+                "refChangeId": crate::changelog::ChangeId::for_test_label("new-ref-change").to_string(),
+                "expectedRefChangeId": null,
                 "expectedHeadCommitId": null,
                 "expectedCheckpointCommitId": null,
                 "headCommitId": "head",
@@ -447,6 +530,9 @@ mod tests {
         );
         serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
             "branchId": "branch",
+            "authorId": null,
+            "refChangeId": null,
+            "expectedRefChangeId": crate::changelog::ChangeId::for_test_label("old-ref-change").to_string(),
             "expectedHeadCommitId": "head",
             "expectedCheckpointCommitId": "checkpoint",
             "headCommitId": null,
@@ -454,8 +540,37 @@ mod tests {
         }))
         .expect("ref deletion carries an explicit null checkpoint coordinate");
 
+        serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
+            "branchId": "branch",
+            "authorId": crate::ANONYMOUS_ACCOUNT_ID,
+            "refChangeId": crate::changelog::ChangeId::for_test_label("new-ref-change").to_string(),
+            "expectedRefChangeId": null,
+            "expectedHeadCommitId": "old-head",
+            "expectedCheckpointCommitId": "old-checkpoint",
+            "headCommitId": "head",
+            "checkpointCommitId": "checkpoint"
+        }))
+        .expect("head/checkpoint remain a valid CAS when an expected ref version is unavailable");
+        assert!(
+            serde_json::from_value::<SyncRefUpdate>(serde_json::json!({
+                "branchId": "branch",
+                "authorId": "not-a-canonical-account",
+                "refChangeId": crate::changelog::ChangeId::for_test_label("new-ref-change").to_string(),
+                "expectedRefChangeId": null,
+                "expectedHeadCommitId": null,
+                "expectedCheckpointCommitId": null,
+                "headCommitId": "head",
+                "checkpointCommitId": "checkpoint"
+            }))
+            .is_err(),
+            "live ref actor must be a canonical account UUID"
+        );
+
         let branch = SyncBranchHead {
             branch_id: "branch".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            ref_change_id: crate::changelog::ChangeId::for_test_label("branch-ref-change")
+                .to_string(),
             head_commit_id: Some("head".to_owned()),
             checkpoint_commit_id: Some("checkpoint".to_owned()),
             checkpoint_state_root_id: "1".repeat(64),
@@ -466,6 +581,8 @@ mod tests {
         assert!(
             serde_json::from_value::<SyncBranchHead>(serde_json::json!({
                 "branchId": "branch",
+                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
+                "refChangeId": crate::changelog::ChangeId::for_test_label("branch-ref-change").to_string(),
                 "headCommitId": "head",
                 "checkpointStateRootId": "1".repeat(64),
                 "hotStateRootId": "0".repeat(64)
@@ -473,12 +590,32 @@ mod tests {
             .is_err(),
             "snapshot metadata must not omit the checkpoint coordinate"
         );
+        assert!(
+            serde_json::from_value::<SyncBranchHead>(serde_json::json!({
+                "branchId": "branch",
+                "authorId": "invalid",
+                "refChangeId": crate::changelog::ChangeId::for_test_label("branch-ref-change").to_string(),
+                "headCommitId": "head",
+                "checkpointCommitId": "checkpoint",
+                "checkpointStateRootId": "1".repeat(64),
+                "hotStateRootId": "0".repeat(64)
+            }))
+            .is_err(),
+            "snapshot branch author must be canonical"
+        );
     }
 
     #[test]
     fn encoded_delta_size_includes_checkpoint_coordinate() {
         let ref_updates = vec![SyncRefUpdate {
             branch_id: "branch".to_owned(),
+            author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+            ref_change_id: Some(
+                crate::changelog::ChangeId::for_test_label("size-ref-change").to_string(),
+            ),
+            expected_ref_change_id: Some(
+                crate::changelog::ChangeId::for_test_label("size-old-ref-change").to_string(),
+            ),
             expected_head_commit_id: Some("old-head".to_owned()),
             expected_checkpoint_commit_id: Some("old-checkpoint".to_owned()),
             head_commit_id: Some("head".to_owned()),
