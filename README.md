@@ -13,6 +13,8 @@
 
 Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server:
 
+**[Try Lix in the cloud →](https://lixray.com)**
+
 <img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
 
 - 📄 **Any file.** Store text, binaries, and large files, including Word, PowerPoint, CAD, and video. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV. Other formats have whole-file history.
@@ -22,15 +24,24 @@ Lix is a version control system for files and tables. Store files of any format 
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
 
-## Why a repository for company work?
+## Co-locate code, documents, and app state
 
-Software teams use branches, change proposals, and CI checks to control changes to code. Company work also lives in files and tables: documents, media, automations, customer records, and more. Lix brings version control to both kinds of data in one repository. The goal is to run company operations from that repository, so people and agents can try changes before they become the current state.
+Code, documents, design files, and media often live in separate tools from the tables behind an app. Lix can keep those files and SQL tables in one repository with one history. A branch can hold a document edit and its related row changes, so you can review, merge, or roll back both together. This also creates a foundation for change proposals and automated checks beyond code.
 
-Early [inlang](https://inlang.com/blog/inlang-v2-release) used Git for translation files to gain pull requests and CI. As structured messages and variants grew, treating Git as the application database led to workarounds; inlang moved to SQLite and Lix. That lesson motivates Lix's shared history for files and tables. CI/CD-style checks and automations for company work are the next layer to build on it; Lix does not include a general CI/CD runner today.
+```ts
+// A script, a document, and an app table change in one transaction.
+await lix.executeBatch([
+  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/automations/report.js", source] },
+  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/docs/handbook.docx", handbook] },
+  { sql: "UPDATE orders SET status = 'shipped' WHERE id = $1", params: [1002] },
+]);
+```
 
 ## Why not Git?
 
 Git versions files well, but the tables behind an app usually live in a separate database. Committing a SQLite database to Git versions its bytes, not its rows: changes are hard to review or merge, and each database revision adds to the repository. Lix versions queryable SQL rows alongside files.
+
+Early [inlang](https://inlang.com/blog/inlang-v2-release) used Git for translation files and its pull request workflow. As its structured messages grew, it moved to SQLite and Lix so application data could have that workflow too.
 
 |                    | Git                   | Lix                                     |
 | ------------------ | --------------------- | --------------------------------------- |
@@ -84,35 +95,9 @@ Lix is in alpha.
 
 ## Prime use cases
 
-### Let agents propose changes to company work
+### Let agents propose changes
 
-An agent can work on a branch of a repository that holds files and Lix-managed SQL tables. A person can inspect the changed files and rows, then merge the branch or discard it. Lix provides the history and merge operations; your product supplies the review interface. [LixRay](https://lixray.com) is a hosted company repository built on Lix.
-
-### Co-locate code, documents, and app state
-
-Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. Lix can put those files and app tables in one repository with one history.
-
-<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
-
-```ts
-// A script, a 4.8 GB video, and an app table in one transaction.
-await lix.executeBatch([
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/automations/weekly-report.js", source],
-  },
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/media/launch.mp4", video],
-  },
-  {
-    sql: "UPDATE orders SET status = 'shipped' WHERE id = $1",
-    params: [1002],
-  },
-]);
-
-// Branch, diff, and roll back all of it together.
-```
+An agent can work on a branch of a repository that holds files and Lix-managed SQL tables. A person can inspect the changed files and rows, then merge the branch or discard it. Lix provides the history and merge operations; your product supplies the review interface. [LixRay](https://lixray.com) is a hosted repository built on Lix.
 
 ### Give each customer a repository
 

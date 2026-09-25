@@ -295,10 +295,18 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Lix in your product or connect to a server.
             </p>
             <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
+              <a
+                href="https://lixray.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex h-[46px] items-center rounded-lg bg-ink px-5 text-[14.5px] font-semibold text-paper transition-colors hover:bg-cyan-bright hover:text-[#0A2E36]"
+              >
+                Try Lix in the cloud
+              </a>
               <CopyInstallButton background="white" large />
               <a
                 href="/docs/what-is-lix"
-                className="flex h-[46px] items-center rounded-lg bg-ink px-5 text-[14.5px] font-semibold text-paper transition-colors hover:bg-cyan-bright hover:text-[#0A2E36]"
+                className="flex h-[46px] items-center rounded-lg border border-line bg-white px-5 text-[14.5px] font-semibold text-ink transition-colors hover:border-cyan-bright hover:text-cyan-deep"
               >
                 Read the docs
               </a>
@@ -341,17 +349,6 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               </p>
             </div>
           ))}
-        </section>
-
-        <section className="mt-16 rounded-xl border border-line bg-white px-6 py-7 sm:px-9">
-          <h2 className="text-[20px] font-semibold tracking-[-0.02em]">
-            Toward a repository for company work
-          </h2>
-          <p className="mt-2 max-w-[850px] text-base leading-[1.6] text-ink-secondary">
-            Lix provides branches and history for files and tables today.
-            CI/CD-style checks and automations for company work are the next
-            layer to build on that history.
-          </p>
         </section>
 
         {/* Stats */}
