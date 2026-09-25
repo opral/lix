@@ -39,7 +39,7 @@ test("metadata admission uses bounded GET and explicit credentials without SQL o
   expect(request.url).toBe(`https://example.test/lix/v1/${repositoryId}/admission`);
   expect(request.response.mode).toBe("streaming");
   expect(new Headers(request.init.headers).get("authorization")).toBe("Bearer exact-token");
-  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe(String(ADMISSION_PROTOCOL_EPOCH));
+  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("21");
   expect(request.init.credentials).toBe("omit");
 });
 test.each([401,403])("HTTP %s is authorization rejection", async status => {
