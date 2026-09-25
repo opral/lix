@@ -1382,6 +1382,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// native snapshot slot; deletes carry no row payload.
 /// There is no current-format outer-row JSON reader.
 const HEAD_VALUE_VERSION: u8 = 12;
+const LEGACY_HEAD_VALUE_VERSION: u8 = 11;
 const HEAD_VALUE_HEADER_BYTES: usize = 61;
 const HEAD_VALUE_TYPED_HEADER_BYTES: usize = HEAD_VALUE_HEADER_BYTES;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
@@ -1869,19 +1870,20 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 }
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
-    if bytes.len() < HEAD_VALUE_HEADER_BYTES {
+    if bytes.len() < 59 {
         return Err(head_value_error("row is shorter than the fixed header"));
     }
-    if bytes[0] != HEAD_VALUE_VERSION {
+    let legacy = bytes[0] == LEGACY_HEAD_VALUE_VERSION;
+    if !legacy && bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
             "unsupported row format version {}",
             bytes[0]
         )));
     }
-    if bytes.len() < HEAD_VALUE_TYPED_HEADER_BYTES {
+    if !legacy && bytes.len() < HEAD_VALUE_TYPED_HEADER_BYTES {
         return Err(head_value_error("row is shorter than the v12 fixed header"));
     }
-    let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
+    let header_bytes = if legacy { 59 } else { HEAD_VALUE_TYPED_HEADER_BYTES };
     let flags = bytes[1];
     let change_uuid = uuid_from_head_bytes(&bytes[2..18], "change id")?;
     let commit_uuid = uuid_from_head_bytes(&bytes[18..34], "commit id")?;
@@ -1898,23 +1900,23 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     };
     let typed_len = usize::try_from(read_u32(&bytes[55..59], "typed payload length")?)
         .map_err(|_| head_value_error("typed payload length exceeds usize"))?;
-    let author_len = usize::from(u16::from_be_bytes(
+    let author_len = if legacy { 0 } else { usize::from(u16::from_be_bytes(
         bytes[59..61]
             .try_into()
             .expect("fixed author length slice"),
-    ));
-    if author_len == 0 || author_len > HEAD_AUTHOR_ID_MAX_BYTES {
+    )) };
+    if !legacy && (author_len == 0 || author_len > HEAD_AUTHOR_ID_MAX_BYTES) {
         return Err(head_value_error("author account id length is invalid"));
     }
     let author_end = header_bytes
         .checked_add(author_len)
         .ok_or_else(|| head_value_error("author account id length overflow"))?;
-    let author_id = std::str::from_utf8(
+    let author_id = if legacy { crate::ANONYMOUS_ACCOUNT_ID } else { std::str::from_utf8(
         bytes
             .get(header_bytes..author_end)
             .ok_or_else(|| head_value_error("author account id is truncated"))?,
     )
-    .map_err(|_| head_value_error("author account id is not UTF-8"))?;
+    .map_err(|_| head_value_error("author account id is not UTF-8"))? };
     let metadata_end = author_end
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
@@ -2294,6 +2296,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v82_hot_value_remains_readable() {
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("v82-hot-change")),
+            commit_id: Some(CommitId::for_test_label("v82-hot-commit")),
+            author_id: crate::SYSTEM_ACCOUNT_ID,
+            untracked: false,
+            deleted: true,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            snapshot: None,
+            metadata: None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut bytes = encode_head_value(&value).unwrap();
+        bytes.drain(59..61 + crate::SYSTEM_ACCOUNT_ID.len());
+        bytes[0] = LEGACY_HEAD_VALUE_VERSION;
+        let decoded = decode_head_value(&bytes).unwrap();
+        assert_eq!(decoded.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(decoded.change_id, value.change_id);
+    }
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 

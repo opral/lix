@@ -11,7 +11,7 @@ pub(crate) use control::BRANCH_HEAD_CONTROL_SPACE;
 pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
     BranchHeadControlReader, BranchHeadTrackedReachability, branch_head_control_precondition,
-    stage_branch_head_control, stage_delete_branch_head_control,
+    encode_control_for_migration, stage_branch_head_control, stage_delete_branch_head_control,
 };
 pub(crate) use lifecycle::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 pub(crate) use stage_rows::{
@@ -21,3 +21,5 @@ pub(crate) use stage_rows::{
 pub(crate) use types::{BranchHead, BranchRefReader};
 
 pub(crate) use control::observe_branch_control_coordinate;
+#[cfg(test)]
+pub(crate) use control::encode_v82_control_for_test;

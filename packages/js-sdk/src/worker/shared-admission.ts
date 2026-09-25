@@ -4,7 +4,7 @@ import { emitOpenProgress } from "../open-progress.js";
 import type { LixOpenProgress, LixOpenReport } from "../types.js";
 
 export const ADMISSION_PROTOCOL_EPOCH = 22;
-export const ADMISSION_STORAGE_EPOCH = 82;
+export const ADMISSION_STORAGE_EPOCH = 83;
 export type AdmissionIdentity = {
   repositoryId: string;
   principalId: string;

@@ -4,7 +4,7 @@ import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH, SharedAdmissionCache
 const repositoryId = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${repositoryId}`;
 const headers: [string, string][] = [["Authorization", "Bearer exact-token"]];
-const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: ADMISSION_PROTOCOL_EPOCH, storageEpoch: 82};
+const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: ADMISSION_PROTOCOL_EPOCH, storageEpoch: ADMISSION_STORAGE_EPOCH};
 const offline = async (): Promise<AdmissionIdentity> => {throw new HttpTransportError("LIX_TRANSPORT_NETWORK", "offline");};
 
 test("new ports verify principal even with previously admitted credentials", async () => {
@@ -98,7 +98,7 @@ test("admission waits in Rust and retains authority progress and report", async 
   expect(await requestAdmission(url, headers, transport, { onProgress: progress, onReport: report })).toEqual(identity);
   expect(transport).toHaveBeenCalledTimes(2);
   expect(progress.mock.calls.some(([event]) => event.phase === "migrating" && event.scope === "authority")).toBe(true);
-  expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: 82 }]);
+  expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: ADMISSION_STORAGE_EPOCH }]);
 });
 
 test("admission bounds retries for non-migration service unavailability", async () => {

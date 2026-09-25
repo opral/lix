@@ -254,15 +254,17 @@ impl DecodedInternalNode {
     }
 }
 
+const NODE_KIND_LEAF_V4: u8 = 5;
 const NODE_KIND_LEAF_V5: u8 = 8;
 const NODE_KIND_INTERNAL_V4: u8 = 6;
 /// Packed direct-address leaves store the one shared commit id plus the first
 /// packed change ordinal. Every row's exact change id is reconstructed from
 /// that authenticated sequence instead of repeating another 16-byte UUID.
+const NODE_KIND_DIRECT_LEAF_V1: u8 = 7;
 const NODE_KIND_DIRECT_LEAF_V2: u8 = 9;
 
 pub(crate) fn leaf_uses_direct_address_layout(encoded: &[u8]) -> bool {
-    encoded.first() == Some(&NODE_KIND_DIRECT_LEAF_V2)
+    matches!(encoded.first(), Some(&NODE_KIND_DIRECT_LEAF_V1 | &NODE_KIND_DIRECT_LEAF_V2))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1194,7 +1196,7 @@ pub(crate) fn decode_visible_value(
 }
 
 fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
-    if !(VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&bytes.len()) {
+    if !(VALUE_STATE_TAIL_START + 1..=VALUE_MAX_BYTES).contains(&bytes.len()) {
         return Err(value_codec_error(format!(
             "has {} bytes; expected {VALUE_MIN_BYTES}..={VALUE_MAX_BYTES}",
             bytes.len(),
@@ -1213,6 +1215,9 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixE
     let mut offset = VALUE_STATE_TAIL_START;
     let (deleted, created_at_packed, updated_at_packed) =
         read_value_tail_fields(bytes, &mut offset, "tracked-state value")?;
+    let author_id = if offset == bytes.len() {
+        crate::ANONYMOUS_ACCOUNT_ID
+    } else {
     let author_len_end = offset
         .checked_add(2)
         .ok_or_else(|| value_codec_error("author length overflow"))?;
@@ -1236,6 +1241,8 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixE
     )
     .map_err(|_| value_codec_error("author account id is not UTF-8"))?;
     offset = author_end;
+    author_id
+    };
     if offset != bytes.len() {
         return Err(value_codec_error("has trailing bytes"));
     }
@@ -1755,7 +1762,7 @@ fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
         .map_or(0, |index| index as u64 + 1)
 }
 
-fn decode_leaf_v5(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_leaf_v5(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1806,10 +1813,12 @@ fn decode_leaf_v5(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             "tracked-state leaf node",
         )?);
     }
-    let author_dict_len = usize_from(
-        read_varint(body, &mut offset, "tracked-state leaf node")?,
-        "author dictionary length",
-    )?;
+    let author_dict_len = if legacy { 0 } else {
+        usize_from(
+            read_varint(body, &mut offset, "tracked-state leaf node")?,
+            "author dictionary length",
+        )?
+    };
     let mut author_dictionary = Vec::with_capacity(author_dict_len.min(body.len()));
     for _ in 0..author_dict_len {
         author_dictionary.push(read_value_author(
@@ -1893,20 +1902,24 @@ fn decode_leaf_v5(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             }
             tail_dictionary[tail_ref - 1]
         };
-        let author_ref = usize_from(
-            read_varint(body, &mut offset, "tracked-state leaf node")?,
-            "author dictionary ref",
-        )?;
-        let author = if author_ref == 0 {
-            read_value_author(body, &mut offset, "tracked-state leaf node")?
+        let author = if legacy {
+            crate::ANONYMOUS_ACCOUNT_ID.as_bytes()
         } else {
-            if author_ref > author_dict_len {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "tracked-state leaf node author dictionary ref is out of bounds",
-                ));
+            let author_ref = usize_from(
+                read_varint(body, &mut offset, "tracked-state leaf node")?,
+                "author dictionary ref",
+            )?;
+            if author_ref == 0 {
+                read_value_author(body, &mut offset, "tracked-state leaf node")?
+            } else {
+                if author_ref > author_dict_len {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "tracked-state leaf node author dictionary ref is out of bounds",
+                    ));
+                }
+                author_dictionary[author_ref - 1]
             }
-            author_dictionary[author_ref - 1]
         };
         let value_start = arena.len();
         arena.extend_from_slice(change_id);
@@ -1935,7 +1948,7 @@ fn decode_leaf_v5(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     })
 }
 
-fn decode_direct_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_direct_leaf_v2(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1992,10 +2005,12 @@ fn decode_direct_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             "tracked-state direct leaf node",
         )?);
     }
-    let author_dict_len = usize_from(
-        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
-        "author dictionary length",
-    )?;
+    let author_dict_len = if legacy { 0 } else {
+        usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "author dictionary length",
+        )?
+    };
     let mut author_dictionary = Vec::with_capacity(author_dict_len.min(body.len()));
     for _ in 0..author_dict_len {
         author_dictionary.push(read_value_author(
@@ -2052,20 +2067,24 @@ fn decode_direct_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             }
             tail_dictionary[tail_ref - 1]
         };
-        let author_ref = usize_from(
-            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
-            "author dictionary ref",
-        )?;
-        let author = if author_ref == 0 {
-            read_value_author(body, &mut offset, "tracked-state direct leaf node")?
+        let author = if legacy {
+            crate::ANONYMOUS_ACCOUNT_ID.as_bytes()
         } else {
-            if author_ref > author_dict_len {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "tracked-state direct leaf node author dictionary ref is out of bounds",
-                ));
+            let author_ref = usize_from(
+                read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+                "author dictionary ref",
+            )?;
+            if author_ref == 0 {
+                read_value_author(body, &mut offset, "tracked-state direct leaf node")?
+            } else {
+                if author_ref > author_dict_len {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "tracked-state direct leaf node author dictionary ref is out of bounds",
+                    ));
+                }
+                author_dictionary[author_ref - 1]
             }
-            author_dictionary[author_ref - 1]
         };
         let packed = first_packed
             .checked_add(u32::try_from(ordinal).map_err(|_| {
@@ -2383,9 +2402,11 @@ fn decode_node_ref_inner(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
-        NODE_KIND_LEAF_V5 => Ok(DecodedNodeRef::Leaf(decode_leaf_v5(body)?)),
+        NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v5(body, true)?)),
+        NODE_KIND_LEAF_V5 => Ok(DecodedNodeRef::Leaf(decode_leaf_v5(body, false)?)),
         NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
-        NODE_KIND_DIRECT_LEAF_V2 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v2(body)?)),
+        NODE_KIND_DIRECT_LEAF_V1 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v2(body, true)?)),
+        NODE_KIND_DIRECT_LEAF_V2 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v2(body, false)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -2881,6 +2902,34 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::row_pk::RowPk;
+
+    #[test]
+    fn v82_leaf_formats_remain_readable_after_author_upgrade() {
+        let mut leaf = vec![NODE_KIND_LEAF_V4, 1, 0, 0, 0, 1, b'k'];
+        leaf.extend_from_slice(&[0x11; 16]);
+        leaf.push(0);
+        leaf.extend_from_slice(&[0x22; 16]);
+        leaf.push(0);
+        write_value_tail(&mut leaf, false, 0, 0);
+        let NodeRefForLeafTests::Leaf(decoded) = decode_node_ref_for_leaf_tests(&leaf).unwrap()
+        else {
+            panic!("expected v82 leaf");
+        };
+        let value = decode_value(decoded.entry(0).unwrap().value).unwrap();
+        assert_eq!(value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+
+        let mut direct = vec![NODE_KIND_DIRECT_LEAF_V1, 1];
+        direct.extend_from_slice(&[0x33; 16]);
+        direct.extend_from_slice(&7_u32.to_be_bytes());
+        direct.extend_from_slice(&[0, 0, 1, b'k', 0]);
+        write_value_tail(&mut direct, false, 0, 0);
+        let NodeRefForLeafTests::Leaf(decoded) = decode_node_ref_for_leaf_tests(&direct).unwrap()
+        else {
+            panic!("expected v82 direct leaf");
+        };
+        let value = decode_value(decoded.entry(0).unwrap().value).unwrap();
+        assert_eq!(value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+    }
 
     fn timestamp(field: &str, value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse(field, value)

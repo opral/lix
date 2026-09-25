@@ -92,7 +92,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -213,7 +213,10 @@ where
     if from_version <= 80 {
         migration_step(|| super::runtime_epoch::migrate(&adapter, false)).await?;
     }
-    migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
+    if from_version <= 81 {
+        migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
+    }
+    migration_step(|| super::author_storage::migrate(&adapter, options, false)).await?;
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
     }
