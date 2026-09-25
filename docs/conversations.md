@@ -21,6 +21,8 @@ The [vendored Zettel JSON Schema](../packages/lix/vendor/zettel/schema.json) def
 
 There are no separate author, timestamp, or ordering columns, and no `resolved_by` or `resolved_at`. Use Lix row/change metadata for attribution and chronology. For live display, `ORDER BY lixcol_created_at, id` supplies a timestamp order with an ID tie-breaker; this is not a causal ordering guarantee for distributed writers.
 
+Untracked comments also have a `lixcol_change_id`, but that ID has no retained `lix_change` record to join for attribution. Their `lixcol_created_at` and `lixcol_updated_at` remain available on the current row.
+
 ## Comment on a row in the current branch
 
 Use one transaction for a conversation and its opening comment. The following uses parameter binding: `$1` is the conversation UUID, `$2` the comment UUID, `$3` the file UUID, `$4` the paragraph row ID, and `$5` a Zettel JSON document. The Markdown plugin must have already materialized the target row.

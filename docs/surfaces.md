@@ -107,6 +107,8 @@ WHERE done = false;
 
 Lix bookkeeping columns use the `lixcol_*` prefix. Relations are scoped to the session's active branch. Open another session to work on another branch.
 
+A row written with `lixcol_untracked = true` has a `lixcol_change_id` identifying its current-state write. It has no `lixcol_commit_id`, and its change ID does not identify a retained `lix_change` record. Do not join untracked rows to `lix_change` to recover write metadata.
+
 Every public history read calls `lix_history` with a relation-name text literal and an optional commit-id argument; there are no generated history functions or bare history table aliases. [History](./history.md) documents the endpoint columns, position ordering, composite-key lookups, and removals.
 
 ## Schema discovery and interoperability
