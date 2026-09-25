@@ -42,10 +42,6 @@ await lix.executeBatch([
 ]);
 ```
 
-### Let agents propose changes
-
-Give an agent a branch of the files and Lix-managed SQL tables it needs for a task. Your product can show the changed files and rows before merging the branch. This applies to data stored in Lix; external databases and SaaS tools are not versioned automatically. [LixRay](https://lixray.com) is a hosted repository built on Lix.
-
 ### Give each customer a repository
 
 Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive's file history does not cover your app's SQL tables. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, media, and app tables.

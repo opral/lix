@@ -28,19 +28,6 @@ Try Lix in the cloud with [LixRay](https://lixray.com):
 
 <a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
 
-## Co-locate code, documents, and app state
-
-Code, documents, design files, and media often live in separate tools from the tables behind an app. Lix can keep those files and SQL tables in one repository with one history. A branch can hold a document edit and its related row changes, so you can review, merge, or roll back both together. This also creates a foundation for change proposals and automated checks beyond code.
-
-```ts
-// A script, a document, and an app table change in one transaction.
-await lix.executeBatch([
-  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/automations/report.js", source] },
-  { sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)", params: ["/docs/handbook.docx", handbook] },
-  { sql: "UPDATE orders SET status = 'shipped' WHERE id = $1", params: [1002] },
-]);
-```
-
 ## Why not Git?
 
 Git versions files well, but the tables behind an app usually live in a separate database. Committing a SQLite database to Git versions its bytes, not its rows: changes are hard to review or merge, and each database revision adds to the repository. Lix versions queryable SQL rows alongside files.
@@ -99,9 +86,27 @@ Lix is in alpha.
 
 ## Prime use cases
 
-### Let agents propose changes
+### Co-locate code, documents, and app state
 
-An agent can work on a branch of a repository that holds files and Lix-managed SQL tables. A person can inspect the changed files and rows, then merge the branch or discard it. Lix provides the history and merge operations; your product supplies the review interface. [LixRay](https://lixray.com) is a hosted repository built on Lix.
+Code, documents, design files, and media often live in separate tools from the tables behind an app. Lix can keep those files and SQL tables in one repository with one history. A branch can hold a document edit and its related row changes, so you can review, merge, or roll back both together. This also creates a foundation for change proposals and automated checks beyond code.
+
+```ts
+// A script, a document, and an app table change in one transaction.
+await lix.executeBatch([
+  {
+    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+    params: ["/automations/report.js", source],
+  },
+  {
+    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+    params: ["/docs/handbook.docx", handbook],
+  },
+  {
+    sql: "UPDATE orders SET status = 'shipped' WHERE id = $1",
+    params: [1002],
+  },
+]);
+```
 
 ### Give each customer a repository
 
