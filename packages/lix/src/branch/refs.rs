@@ -170,8 +170,6 @@ mod tests {
                     "2026-01-01T00:00:00Z",
                 ),
                 ref_change_id: ChangeId::for_test_label("test-branch-ref-change"),
-                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                    .expect("anonymous account ID is canonical"),
             },
         )?;
         storage

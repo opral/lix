@@ -99,7 +99,6 @@ pub(crate) struct ImmutableMutationJournalChunk {
     schema_plan_id: SchemaPlanId,
     schema_key: SharedStr,
     branch_id: SharedStr,
-    author_id: String,
     origin_key: Option<SharedStr>,
     identity_arena: SharedStr,
     identity_offsets: Arc<[(u32, u32)]>,
@@ -115,7 +114,6 @@ impl PartialEq for ImmutableMutationJournalChunk {
         self.schema_plan_id == other.schema_plan_id
             && self.schema_key == other.schema_key
             && self.branch_id == other.branch_id
-            && self.author_id == other.author_id
             && self.origin_key == other.origin_key
             && self.identity_arena == other.identity_arena
             && self.identity_offsets == other.identity_offsets
@@ -143,7 +141,6 @@ impl Eq for ImmutableMutationJournalChunk {}
 
 impl ImmutableMutationJournalChunk {
     #[expect(clippy::too_many_arguments)]
-    #[cfg(test)]
     pub(crate) fn try_new_single_string_identities(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
@@ -235,7 +232,6 @@ impl ImmutableMutationJournalChunk {
             encoded_snapshot_arena,
             encoded_snapshot_offsets,
             durable_predecessors,
-            crate::ANONYMOUS_ACCOUNT_ID,
             timestamp,
         )
     }
@@ -251,7 +247,6 @@ impl ImmutableMutationJournalChunk {
         snapshot_arena: Vec<u8>,
         snapshot_offsets: Vec<(usize, usize)>,
         durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
-        author_id: &str,
         timestamp: LixTimestamp,
     ) -> Result<Self, LixError> {
         if identity_offsets.len() != snapshot_offsets.len() {
@@ -315,7 +310,6 @@ impl ImmutableMutationJournalChunk {
             schema_plan_id,
             schema_key,
             branch_id,
-            author_id.to_owned(),
             origin_key,
             identity_arena,
             offsets.into(),
@@ -331,7 +325,6 @@ impl ImmutableMutationJournalChunk {
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
         branch_id: SharedStr,
-        author_id: String,
         origin_key: Option<SharedStr>,
         identity_arena: SharedStr,
         identity_offsets: Arc<[(u32, u32)]>,
@@ -392,7 +385,6 @@ impl ImmutableMutationJournalChunk {
             schema_plan_id,
             schema_key,
             branch_id,
-            author_id,
             origin_key,
             identity_arena,
             identity_offsets,
@@ -504,7 +496,6 @@ impl ImmutableMutationJournalChunk {
                     .map(
                         |(offset, &(start, end))| crate::tracked_state::ReplacementPartRowRef {
                             encoded_key: &key_arena[start..end],
-                            author_id: self.author_id(),
                             metadata: None,
                             snapshot: self.snapshot(first + offset),
                         },
@@ -577,10 +568,6 @@ impl ImmutableMutationJournalChunk {
         self.branch_id.as_str()
     }
 
-    pub(crate) fn author_id(&self) -> &str {
-        &self.author_id
-    }
-
     pub(crate) fn origin_key(&self) -> Option<&str> {
         self.origin_key.as_deref()
     }
@@ -596,7 +583,6 @@ impl ImmutableMutationJournalChunk {
     ) -> Result<PreparedStateBatch, LixError> {
         let row_pks = self.materialized_row_pks();
         let mut rows = PreparedStateBatch::with_capacity(row_pks.len());
-        rows.set_author_id(self.author_id.clone());
         let facts = PreparedRowFacts {
             row_content_validated: true,
             requires_transaction_validation: false,
@@ -779,10 +765,6 @@ impl OrderedMutationJournal {
 
     pub(crate) fn branch_id(&self) -> &str {
         self.chunks[0].branch_id()
-    }
-
-    pub(crate) fn author_id(&self) -> &str {
-        self.chunks[0].author_id()
     }
 
     pub(crate) fn timestamp(&self) -> LixTimestamp {
@@ -1950,7 +1932,6 @@ impl TransactionWriteBuffer {
         if let Some(existing) = ordered.as_ref() {
             let compatible = existing.schema_key() == chunk.schema_key()
                 && existing.branch_id() == chunk.branch_id()
-                && existing.author_id() == chunk.author_id()
                 && existing.timestamp() == chunk.timestamp()
                 && existing.chunks[0].origin_key() == chunk.origin_key()
                 && existing
@@ -4060,7 +4041,7 @@ fn push_ordered_mutation_materialized(
             )
         })?;
     let row_pk = RowPk::from_validated_shared_string(identity);
-    let ordinal = output.push_materialized_ref_with_author(
+    let ordinal = output.push_materialized_ref(
         &row_pk,
         chunk.schema_key(),
         None,
@@ -4073,7 +4054,6 @@ fn push_ordered_mutation_materialized(
         None,
         Some(journal.commit_id()),
         false,
-        chunk.author_id(),
         chunk.branch_id(),
     );
     // Keep the journal's certified native payload as a shared range. Overlay
@@ -4563,7 +4543,7 @@ fn push_prepared_materialized(
     output: &mut MaterializedHotStateBatchBuilder,
     row: PreparedStateRowRef<'_>,
 ) -> usize {
-    let ordinal = output.push_materialized_ref_with_author(
+    let ordinal = output.push_materialized_ref(
         row.row_pk,
         row.schema_key.as_str(),
         row.file_id.map(SharedStr::as_str),
@@ -4578,7 +4558,6 @@ fn push_prepared_materialized(
             .flatten(),
         row.commit_id,
         row.untracked,
-        row.author_id,
         row.branch_id.as_str(),
     );
     output.set_raw_snapshot(ordinal, row.snapshot.map(Bytes::copy_from_slice));

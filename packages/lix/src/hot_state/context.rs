@@ -3751,7 +3751,6 @@ mod tests {
                     row_pk: &row.row_pk,
                     change_id: Some(ChangeId::for_test_label("live-state-untracked-store")),
                     commit_id: None,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     untracked: true,
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
@@ -3790,8 +3789,6 @@ mod tests {
                 created_at,
                 updated_at,
                 ref_change_id: ChangeId::for_test_label(&format!("test-branch-ref-{branch_id}")),
-                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                    .expect("anonymous account ID is canonical"),
             };
             control.note_schemas(schema_keys.iter().map(String::as_str));
             crate::branch::stage_branch_head_control(&mut writes, &branch_id, control)
@@ -3845,7 +3842,6 @@ mod tests {
                     row_pk: &row.row_pk,
                     change_id: Some(ChangeId::for_test_label("live-state-untracked-store-alt")),
                     commit_id: None,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     untracked: true,
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
@@ -4346,7 +4342,6 @@ mod tests {
                     row_pk: &change.row_pk,
                     change_id: change.change_id,
                     commit_id: typed_commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: change.snapshot.is_none(),
                     created_at: *created_at,
                     updated_at: *updated_at,
@@ -5567,7 +5562,6 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: branch_id == "ffffffff-ffff-7fff-bfff-ffffffffffff",
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(commit_id),
@@ -5673,7 +5667,6 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: true,
             change_id: Some(ChangeId::for_test_label(&format!("change-{commit_id}"))),
             commit_id: Some(commit_id),

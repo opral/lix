@@ -264,7 +264,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "released v75 control format predates authored row metadata"]
     async fn released_v75_authority_upgrades_preserving_rows_and_blob() {
         let storage = crate::Memory::new();
         let session = crate::storage_adapter::StorageSession::acquire(storage.clone())

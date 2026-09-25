@@ -517,24 +517,12 @@ async fn file_ordinary_upload_pages_aggregate_wire_bytes() {
 
 #[tokio::test]
 async fn checkpoint_publishes_cold_authority_blobs_without_hydrating_content() {
-    Box::pin(file_checkpoint_upload_case(
-        false,
-        1024 * 1024,
-        false,
-        Some(false),
-    ))
-    .await;
+    Box::pin(file_checkpoint_upload_case(false, 1024 * 1024, false, Some(false))).await;
 }
 
 #[tokio::test]
 async fn checkpoint_publishes_deferred_authority_blobs_without_hydrating_content() {
-    Box::pin(file_checkpoint_upload_case(
-        false,
-        1024 * 1024,
-        false,
-        Some(true),
-    ))
-    .await;
+    Box::pin(file_checkpoint_upload_case(false, 1024 * 1024, false, Some(true))).await;
 }
 
 async fn file_checkpoint_upload_case(

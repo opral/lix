@@ -67,7 +67,6 @@ async fn fresh_open_reports_initialization_without_migration() {
 }
 
 #[tokio::test]
-#[ignore = "released v72 snapshot predates authored row metadata"]
 async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
     let progress = Arc::new(RecordingProgress::default());
     let storage = lix::Memory::new();

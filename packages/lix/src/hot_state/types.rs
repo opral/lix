@@ -39,7 +39,6 @@ pub(crate) struct MaterializedHotStateRow {
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
-    pub(crate) author_id: String,
     pub(crate) untracked: bool,
     pub(crate) branch_id: Arc<str>,
 }
@@ -80,7 +79,7 @@ struct BranchIdId(u32);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaterializedHotStateBatch {
     singleton: Option<Box<MaterializedHotStateSingleton>>,
-    /// Schema keys, file ids, branch ids, and author ids share one contiguous UTF-8 arena,
+    /// Schema keys, file ids, and branch ids share one contiguous UTF-8 arena,
     /// so repeated batch-wide metadata costs a four-byte ordinal per row rather
     /// than another owned allocation.
     strings: StringDictionary,
@@ -98,7 +97,6 @@ pub(crate) struct MaterializedHotStateBatch {
     global: Vec<bool>,
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
-    author_ids: Vec<BranchIdId>,
     untracked: Vec<bool>,
     /// Encoded authoritative HOT predecessor resolved by a durable exact read.
     ///
@@ -596,13 +594,6 @@ impl<'a> MaterializedHotStateRowRef<'a> {
         )
     }
 
-    pub(crate) fn author_id(self) -> &'a str {
-        self.singleton().map_or_else(
-            || self.batch.strings.get(self.batch.author_ids[self.index].0),
-            |singleton| singleton.row.author_id.as_str(),
-        )
-    }
-
     pub(crate) fn untracked(self) -> bool {
         self.singleton().map_or_else(
             || self.batch.untracked[self.index],
@@ -668,7 +659,6 @@ impl<'a> MaterializedHotStateRowRef<'a> {
             global: self.global(),
             change_id: self.change_id(),
             commit_id: self.commit_id(),
-            author_id: self.author_id().to_owned(),
             untracked: self.untracked(),
             branch_id,
         }
@@ -842,7 +832,7 @@ fn retain_by_mask<T>(values: &mut Vec<T>, mask: &[bool]) {
 
 fn owned_row_dictionary_capacity(rows: &[MaterializedHotStateRow]) -> (usize, usize) {
     let mut seen = HashSet::<&str, FastHashBuilder>::with_capacity_and_hasher(
-        rows.len().saturating_mul(4),
+        rows.len().saturating_mul(3),
         fast_hash_builder(),
     );
     let mut bytes = 0_usize;
@@ -852,7 +842,6 @@ fn owned_row_dictionary_capacity(rows: &[MaterializedHotStateRow]) -> (usize, us
             account_dictionary_value(&mut seen, &mut bytes, file_id);
         }
         account_dictionary_value(&mut seen, &mut bytes, row.branch_id.as_ref());
-        account_dictionary_value(&mut seen, &mut bytes, row.author_id.as_str());
     }
     (seen.len(), bytes)
 }
@@ -893,7 +882,6 @@ pub(crate) struct MaterializedHotStateBatchBuilder {
     global: Vec<bool>,
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
-    author_ids: Vec<BranchIdId>,
     untracked: Vec<bool>,
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
     columnar_base_coordinate: Option<Vec<ColumnarBaseCoordinate>>,
@@ -934,9 +922,9 @@ impl MaterializedHotStateBatchBuilder {
             singleton_capacity,
             singleton: None,
             strings: StringDictionaryBuilder::with_capacity(
-                // Every row contributes at most a schema key, a file id, a
-                // branch id, and an author id.
-                column_capacity.saturating_mul(4),
+                // Every row contributes at most a schema key, a file id and a
+                // branch id.
+                column_capacity.saturating_mul(3),
                 if singleton_capacity {
                     0
                 } else {
@@ -963,7 +951,6 @@ impl MaterializedHotStateBatchBuilder {
             global: Vec::with_capacity(column_capacity),
             change_id: Vec::with_capacity(column_capacity),
             commit_id: Vec::with_capacity(column_capacity),
-            author_ids: Vec::with_capacity(column_capacity),
             untracked: Vec::with_capacity(column_capacity),
             durable_predecessor: Vec::with_capacity(column_capacity),
             columnar_base_coordinate: None,
@@ -1034,14 +1021,12 @@ impl MaterializedHotStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            author_id,
             untracked,
             branch_id,
         } = row;
         let schema_key = SchemaKeyId(self.intern_owned(schema_key));
         let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
         let branch_id = BranchIdId(self.intern_ref(branch_id.as_ref()));
-        let author_id = BranchIdId(self.intern_owned(author_id));
         self.push_columns(
             schema_key,
             file_id,
@@ -1055,7 +1040,6 @@ impl MaterializedHotStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            author_id,
             untracked,
         );
         *self
@@ -1106,7 +1090,6 @@ impl MaterializedHotStateBatchBuilder {
                 global,
                 change_id,
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 untracked,
                 branch_id: Arc::from(branch_id),
             });
@@ -1115,7 +1098,6 @@ impl MaterializedHotStateBatchBuilder {
         let schema_key = SchemaKeyId(self.intern_owned(schema_key));
         let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
         let branch_id = BranchIdId(self.intern_ref(branch_id));
-        let author_id = BranchIdId(self.intern_ref(crate::ANONYMOUS_ACCOUNT_ID));
         self.push_columns(
             schema_key,
             file_id,
@@ -1129,7 +1111,6 @@ impl MaterializedHotStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            author_id,
             untracked,
         );
         ordinal
@@ -1173,43 +1154,6 @@ impl MaterializedHotStateBatchBuilder {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_materialized_ref_with_author(
-        &mut self,
-        row_pk: &RowPk,
-        schema_key: &str,
-        file_id: Option<&str>,
-        snapshot_content: Option<SharedStr>,
-        metadata: Option<SharedStr>,
-        deleted: bool,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-        global: bool,
-        change_id: Option<ChangeId>,
-        commit_id: Option<CommitId>,
-        untracked: bool,
-        author_id: &str,
-        branch_id: &str,
-    ) -> usize {
-        let ordinal = self.push_materialized_ref(
-            row_pk,
-            schema_key,
-            file_id,
-            snapshot_content,
-            metadata,
-            deleted,
-            created_at,
-            updated_at,
-            global,
-            change_id,
-            commit_id,
-            untracked,
-            branch_id,
-        );
-        self.set_author_id(ordinal, author_id);
-        ordinal
-    }
-
     /// Appends a row whose identity strings are interned from borrows but
     /// whose primary key is **moved** into the column.
     ///
@@ -1250,7 +1194,6 @@ impl MaterializedHotStateBatchBuilder {
                 global,
                 change_id,
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 untracked,
                 branch_id: Arc::from(branch_id),
             });
@@ -1259,7 +1202,6 @@ impl MaterializedHotStateBatchBuilder {
         let schema_key = SchemaKeyId(self.intern_ref(schema_key));
         let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_ref(file_id)));
         let branch_id = BranchIdId(self.intern_ref(branch_id));
-        let author_id = BranchIdId(self.intern_ref(crate::ANONYMOUS_ACCOUNT_ID));
         self.push_columns(
             schema_key,
             file_id,
@@ -1273,46 +1215,8 @@ impl MaterializedHotStateBatchBuilder {
             global,
             change_id,
             commit_id,
-            author_id,
             untracked,
         );
-        ordinal
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_materialized_interned_with_author(
-        &mut self,
-        row_pk: RowPk,
-        schema_key: &str,
-        file_id: Option<&str>,
-        snapshot_content: Option<SharedStr>,
-        metadata: Option<SharedStr>,
-        deleted: bool,
-        created_at: LixTimestamp,
-        updated_at: LixTimestamp,
-        global: bool,
-        change_id: Option<ChangeId>,
-        commit_id: Option<CommitId>,
-        untracked: bool,
-        author_id: &str,
-        branch_id: &str,
-    ) -> usize {
-        let ordinal = self.push_materialized_interned(
-            row_pk,
-            schema_key,
-            file_id,
-            snapshot_content,
-            metadata,
-            deleted,
-            created_at,
-            updated_at,
-            global,
-            change_id,
-            commit_id,
-            untracked,
-            branch_id,
-        );
-        self.set_author_id(ordinal, author_id);
         ordinal
     }
 
@@ -1353,7 +1257,6 @@ impl MaterializedHotStateBatchBuilder {
             .map(|file_id| FileIdId::from_ordinal(self.intern_ref(file_id)));
         let branch_id =
             BranchIdId(self.intern_ref(branch_override.unwrap_or_else(|| row.branch_id())));
-        let author_id = BranchIdId(self.intern_ref(row.author_id()));
         self.push_columns(
             schema_key,
             file_id,
@@ -1367,7 +1270,6 @@ impl MaterializedHotStateBatchBuilder {
             row.global(),
             row.change_id(),
             row.commit_id(),
-            author_id,
             row.untracked(),
         );
         self.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
@@ -1397,7 +1299,6 @@ impl MaterializedHotStateBatchBuilder {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        author_id: BranchIdId,
         untracked: bool,
     ) {
         self.schema_keys.push(schema_key);
@@ -1414,7 +1315,6 @@ impl MaterializedHotStateBatchBuilder {
         self.global.push(global);
         self.change_id.push(change_id);
         self.commit_id.push(commit_id);
-        self.author_ids.push(author_id);
         self.untracked.push(untracked);
         self.durable_predecessor.push(None);
         if let Some(coordinates) = &mut self.columnar_base_coordinate {
@@ -1456,16 +1356,6 @@ impl MaterializedHotStateBatchBuilder {
             return;
         }
         self.metadata[row] = Some(value);
-    }
-
-    pub(crate) fn set_author_id(&mut self, row: usize, author_id: &str) {
-        if let Some(singleton) = self.singleton.as_mut() {
-            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
-            singleton.row.author_id = author_id.to_owned();
-            return;
-        }
-        assert!(row < self.len(), "live-state row ordinal out of bounds");
-        self.author_ids[row] = BranchIdId(self.intern_ref(author_id));
     }
 
     pub(crate) fn set_durable_predecessor(
@@ -1515,7 +1405,6 @@ impl MaterializedHotStateBatchBuilder {
             global: self.global,
             change_id: self.change_id,
             commit_id: self.commit_id,
-            author_ids: self.author_ids,
             untracked: self.untracked,
             durable_predecessor: self.durable_predecessor,
             columnar_base_coordinate: self.columnar_base_coordinate,
@@ -1558,7 +1447,6 @@ impl TryFrom<&MaterializedHotStateRow> for MaterializedTrackedStateRow {
             updated_at: row.updated_at.to_string(),
             change_id,
             commit_id,
-            author_id: row.author_id.to_owned(),
         })
     }
 }
@@ -1795,7 +1683,6 @@ mod batch_tests {
             deleted: false,
             created_at: timestamp,
             updated_at: timestamp,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: None,
             commit_id: None,
@@ -1812,11 +1699,10 @@ mod batch_tests {
         );
 
         assert_eq!(batch.len(), 10_000);
-        assert_eq!(batch.dictionary_entry_count(), 4);
+        assert_eq!(batch.dictionary_entry_count(), 3);
         assert_eq!(
             batch.dictionary_bytes_len(),
             "shared_schema".len() + "shared_file".len() + "shared_branch".len()
-                + crate::ANONYMOUS_ACCOUNT_ID.len()
         );
         let first = batch.row(0);
         let last = batch.row(batch.len() - 1);
@@ -1971,7 +1857,7 @@ mod batch_tests {
         let batch = MaterializedHotStateBatch::from_rows(rows);
 
         assert_eq!(batch.len(), 10_000);
-        assert_eq!(batch.dictionary_entry_count(), 10_003);
+        assert_eq!(batch.dictionary_entry_count(), 10_002);
         assert_eq!(
             size_of::<Option<FileIdId>>(),
             size_of::<u32>(),
@@ -1980,7 +1866,6 @@ mod batch_tests {
         assert_eq!(
             batch.dictionary_bytes_len(),
             "shared_schema".len() + expected_file_bytes + "shared_branch".len()
-                + crate::ANONYMOUS_ACCOUNT_ID.len()
         );
         assert_eq!(batch.dictionary_arena_buffer_count(), 1);
         assert_eq!(
@@ -2031,7 +1916,7 @@ mod batch_tests {
 
         let batch = builder.finish();
 
-        assert_eq!(batch.dictionary_entry_count(), 10_003);
+        assert_eq!(batch.dictionary_entry_count(), 10_002);
         assert_eq!(batch.dictionary_arena_buffer_count(), 1);
         assert_eq!(
             batch.dictionary_arena_allocation_count(),
@@ -2055,7 +1940,7 @@ mod batch_tests {
         let filtered = batch.filter(|_| true, None);
 
         assert_eq!(filtered.len(), 10_000);
-        assert_eq!(filtered.dictionary_entry_count(), 4);
+        assert_eq!(filtered.dictionary_entry_count(), 3);
         assert_eq!(filtered.dictionary_bytes_len(), dictionary_bytes_len);
         assert_eq!(
             filtered.row(0).schema_key().as_ptr(),
@@ -2263,7 +2148,6 @@ impl From<PreparedStateRowRef<'_>> for MaterializedHotStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            author_id: row.author_id.to_owned(),
             untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
@@ -2319,7 +2203,6 @@ impl From<TestPreparedStateRow> for MaterializedHotStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }
@@ -2349,7 +2232,6 @@ impl From<&TestPreparedStateRow> for MaterializedHotStateRow {
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: row.untracked,
             branch_id: Arc::from(row.branch_id.as_str()),
         }

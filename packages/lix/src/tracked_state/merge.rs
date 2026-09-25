@@ -969,7 +969,6 @@ mod tests {
                                 "{change_prefix}-{index:05}"
                             )),
                             commit_id,
-                            author_id: format!("{change_prefix}-author"),
                         };
                         TrackedStateDiffEntry {
                             identity,
@@ -1091,7 +1090,6 @@ mod tests {
                             updated_at: timestamp,
                             change_id,
                             commit_id,
-                            author_id: format!("{side}-author"),
                         }),
                     }
                 })
@@ -1275,7 +1273,6 @@ mod tests {
                 updated_at: timestamp,
                 change_id,
                 commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
-                author_id: "source-writer".to_owned(),
             }),
         }
     }
@@ -1359,7 +1356,6 @@ mod tests {
             ),
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(&change_id.replace("change", "commit")),
-            author_id: format!("writer-{change_id}"),
         }
     }
 

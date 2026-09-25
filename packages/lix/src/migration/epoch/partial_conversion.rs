@@ -257,8 +257,6 @@ mod tests {
                 confirmed.insert(branch, serde_json::json!({
                     "state": "headed", "headCommitId":control.head_commit_id.to_string(),
                     "checkpointCommitId":control.working_diff_checkpoint_commit_id.unwrap().to_string(),
-                    "authorId":control.author_id_string(),
-                    "refChangeId":control.ref_change_id.to_string(),
                 }));
             }
             if pending {

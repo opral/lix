@@ -1037,9 +1037,8 @@ pub(crate) async fn execute_exact_lix_file_size_batch_read(
             .expect("indexed lix_file size read should retain its descriptor")
             .blob_ref_key(&live_rows);
         let size_bytes = match rendered_plugin_bytes.get(&key) {
-            Some(bytes) => u64::try_from(bytes.len()).map_err(|_| {
-                LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64")
-            })?,
+            Some(bytes) => u64::try_from(bytes.len())
+                .map_err(|_| LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64"))?,
             None => blob_rows
                 .get(&blob_key)
                 .map(|blob_ref| match &blob_ref.inline_data {
@@ -1061,10 +1060,7 @@ pub(crate) async fn execute_exact_lix_file_size_batch_read(
     }
     Ok(SqlQueryResult {
         columns: vec!["path".to_string(), "size_bytes".to_string()],
-        column_types: vec![
-            crate::ResultColumnType::Text,
-            crate::ResultColumnType::Integer,
-        ],
+        column_types: vec![crate::ResultColumnType::Text, crate::ResultColumnType::Integer],
         rows,
         notices: Vec::new(),
     })
@@ -2644,11 +2640,7 @@ fn typed_row_string(
     }
 }
 
-fn typed_row_integer(
-    row: &lix_schema::Row,
-    schema_key: &str,
-    field: &str,
-) -> Result<u64, LixError> {
+fn typed_row_integer(row: &lix_schema::Row, schema_key: &str, field: &str) -> Result<u64, LixError> {
     match row.get(field) {
         Some(lix_schema::Value::Int8(value)) => u64::try_from(*value).map_err(|_| {
             LixError::new(
@@ -4375,7 +4367,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_author_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_updated_at")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_commit_id")?;
@@ -4959,7 +4950,7 @@ fn prepare_indexed_lix_file_rows(
             },
         );
         if let Some(blob_ref) = entry.blob_ref_live_row() {
-            let row_index = indexed_builder.push_materialized_ref_with_author(
+            let row_index = indexed_builder.push_materialized_ref(
                 &blob_ref.row_pk,
                 &blob_ref.schema_key,
                 blob_ref.file_id.as_deref(),
@@ -4972,7 +4963,6 @@ fn prepare_indexed_lix_file_rows(
                 blob_ref.change_id,
                 blob_ref.commit_id,
                 blob_ref.untracked,
-                &blob_ref.author_id,
                 &blob_ref.branch_id,
             );
             if let Some(data) = entry.cached_blob_data() {
@@ -5071,12 +5061,6 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| entry.change_id().map(|id| id.to_string()))
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_author_id" => Arc::new(StringArray::from(
-                entries
-                    .iter()
-                    .map(|entry| Some(entry.author_id()))
-                    .collect::<Vec<_>>(),
-            )),
             "lixcol_created_at" => Arc::new(StringArray::from(
                 entries
                     .iter()
@@ -5134,7 +5118,6 @@ struct LixFileRecordBatchRow {
     file_id: Option<String>,
     global: bool,
     change_id: Option<String>,
-    author_id: String,
     created_at: String,
     updated_at: String,
     commit_id: Option<String>,
@@ -5152,7 +5135,6 @@ struct LixFileRecordBatchColumns {
     file_ids: Vec<Option<String>>,
     globals: Vec<Option<bool>>,
     change_ids: Vec<Option<String>>,
-    author_ids: Vec<Option<String>>,
     created_ats: Vec<Option<String>>,
     updated_ats: Vec<Option<String>>,
     commit_ids: Vec<Option<String>>,
@@ -5170,7 +5152,6 @@ impl LixFileRecordBatchColumns {
         self.file_ids.push(row.file_id);
         self.globals.push(Some(row.global));
         self.change_ids.push(row.change_id);
-        self.author_ids.push(Some(row.author_id));
         self.created_ats.push(Some(row.created_at));
         self.updated_ats.push(Some(row.updated_at));
         self.commit_ids.push(row.commit_id);
@@ -5189,7 +5170,6 @@ impl LixFileRecordBatchColumns {
             file_ids,
             globals,
             change_ids,
-            author_ids,
             created_ats,
             updated_ats,
             commit_ids,
@@ -5209,7 +5189,6 @@ impl LixFileRecordBatchColumns {
         let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
         let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
         let change_ids: ArrayRef = Arc::new(StringArray::from(change_ids));
-        let author_ids: ArrayRef = Arc::new(StringArray::from(author_ids));
         let created_ats: ArrayRef = Arc::new(StringArray::from(created_ats));
         let updated_ats: ArrayRef = Arc::new(StringArray::from(updated_ats));
         let commit_ids: ArrayRef = Arc::new(StringArray::from(commit_ids));
@@ -5227,7 +5206,6 @@ impl LixFileRecordBatchColumns {
                 "lixcol_file_id" => Arc::clone(&file_ids),
                 "lixcol_global" => Arc::clone(&globals),
                 "lixcol_change_id" => Arc::clone(&change_ids),
-                "lixcol_author_id" => Arc::clone(&author_ids),
                 "lixcol_created_at" => Arc::clone(&created_ats),
                 "lixcol_updated_at" => Arc::clone(&updated_ats),
                 "lixcol_commit_id" => Arc::clone(&commit_ids),
@@ -5319,13 +5297,10 @@ async fn lix_file_record_batch_from_prepared(
         } else {
             Some(Vec::new())
         };
-        let projected_change_row = blob_rows
+        let projected_change_id = blob_rows
             .get(&blob_key)
-            .map(|blob_ref| live_rows.row(blob_ref.live))
-            .filter(|row| row.change_id().is_some())
-            .unwrap_or_else(|| live_rows.row(file.live));
-        let projected_change_id = projected_change_row.change_id();
-        let projected_author_id = projected_change_row.author_id();
+            .and_then(|blob_ref| live_rows.row(blob_ref.live).change_id())
+            .or_else(|| live_rows.row(file.live).change_id());
         let live = live_rows.row(file.live);
         let content_live = blob_rows
             .get(&blob_key)
@@ -5345,7 +5320,6 @@ async fn lix_file_record_batch_from_prepared(
             file_id: live.file_id().map(str::to_owned),
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
-            author_id: projected_author_id.to_owned(),
             created_at: live.created_at().to_string(),
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
@@ -6302,7 +6276,7 @@ fn scan_indexed_file_batch(
         .filter(|entry| entry.kind == FilesystemPathKind::File)
         .filter_map(FilesystemPathEntry::blob_ref_live_row)
     {
-        builder.push_materialized_ref_with_author(
+        builder.push_materialized_ref(
             &row.row_pk,
             &row.schema_key,
             row.file_id.as_deref(),
@@ -6315,7 +6289,6 @@ fn scan_indexed_file_batch(
             row.change_id,
             row.commit_id,
             row.untracked,
-            &row.author_id,
             &row.branch_id,
         );
     }
@@ -6879,7 +6852,9 @@ fn contains_column(expr: &Expr, column_name: &str) -> bool {
 /// right-hand sides before physical conversion (the framework hands `plan_update`
 /// the already-compiled physical assignments).
 fn physical_expr_contains_column(expr: &Arc<dyn PhysicalExpr>, column_name: &str) -> bool {
-    if let Some(column) = expr.downcast_ref::<datafusion::physical_expr::expressions::Column>() {
+    if let Some(column) = expr
+        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+    {
         if column.name() == column_name {
             return true;
         }
@@ -7199,7 +7174,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
-        Field::new("lixcol_author_id", DataType::Utf8, false),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
@@ -7827,7 +7801,13 @@ mod tests {
                 branch,
                 &format!(r#"{{"id":"{large_id}","directory_id":null,"name":"large.bin"}}"#),
             ),
-            live_blob_ref_row(large_id, branch, large_id, &"00".repeat(32), large_size),
+            live_blob_ref_row(
+                large_id,
+                branch,
+                large_id,
+                &"00".repeat(32),
+                large_size,
+            ),
             live_file_row(
                 empty_id,
                 branch,
@@ -7864,10 +7844,7 @@ mod tests {
             result.rows,
             vec![
                 vec![Value::Text("/empty.bin".into()), Value::Integer(0)],
-                vec![
-                    Value::Text("/large.bin".into()),
-                    Value::Integer(large_size as i64)
-                ],
+                vec![Value::Text("/large.bin".into()), Value::Integer(large_size as i64)],
             ]
         );
         assert_eq!(blob_reads.blob_reads.load(Ordering::SeqCst), 0);
@@ -7885,7 +7862,13 @@ mod tests {
                 branch,
                 &format!(r#"{{"id":"{file_id}","directory_id":null,"name":"ranged.bin"}}"#),
             ),
-            live_blob_ref_row(file_id, branch, file_id, &blob_id.to_hex(), content.len()),
+            live_blob_ref_row(
+                file_id,
+                branch,
+                file_id,
+                &blob_id.to_hex(),
+                content.len(),
+            ),
         ];
         let index = Arc::new(path_index_from_rows(rows).expect("path index should build"));
         let blob_reader = Arc::new(CapturingWriteContext {
@@ -8172,13 +8155,6 @@ mod tests {
             selected_data.len(),
         );
         selected_blob.change_id = Some(selected_change_id);
-        selected_blob.author_id = "content-author".to_string();
-        let mut selected_file = live_file_row(
-            "01920000-0000-7000-8000-0000000000e2",
-            "01920000-0000-7000-8000-0000000000b1",
-            r#"{"id":"01920000-0000-7000-8000-0000000000e2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"README.md"}"#,
-        );
-        selected_file.author_id = "descriptor-author".to_string();
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_directory_row(
@@ -8191,7 +8167,11 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000b1",
                     r#"{"id":"01920000-0000-7000-8000-000000000383","parent_id":null,"name":"Other"}"#,
                 ),
-                selected_file,
+                live_file_row(
+                    "01920000-0000-7000-8000-0000000000e2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000e2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"README.md"}"#,
+                ),
                 live_file_row(
                     "01920000-0000-7000-8000-000000000432",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -8263,9 +8243,6 @@ mod tests {
                 .index_of("lixcol_change_id")
                 .expect("change-id column"),
             base_schema
-                .index_of("lixcol_author_id")
-                .expect("author-id column"),
-            base_schema
                 .index_of("lixcol_updated_at")
                 .expect("updated-at column"),
         ];
@@ -8307,16 +8284,10 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("change-id column should be string data");
-        let author_ids = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("author-id column should be string data");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(paths.value(0), "/Docs/README.md");
         assert_eq!(names.value(0), "README.md");
         assert_eq!(change_ids.value(0), selected_change_id.to_string());
-        assert_eq!(author_ids.value(0), "content-author");
 
         let requests = hot_state_requests
             .lock()
@@ -9507,7 +9478,6 @@ mod tests {
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -9536,7 +9506,6 @@ mod tests {
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -10236,97 +10205,6 @@ mod tests {
         assert_eq!(data_column.value(0), selected_data.as_slice());
     }
 
-    #[tokio::test]
-    async fn file_author_tracks_the_row_that_supplies_projected_change_id() {
-        let branch_id = "01920000-0000-7000-8000-0000000000b1";
-        let descriptor_only_id = "01920000-0000-7000-8000-000000000521";
-        let content_id = "01920000-0000-7000-8000-000000000522";
-        let descriptor_change_id = ChangeId::for_test_label("descriptor-current");
-        let blob_change_id = ChangeId::for_test_label("blob-current");
-
-        let mut descriptor_only = live_file_row(
-            descriptor_only_id,
-            branch_id,
-            &format!(
-                r#"{{"id":"{descriptor_only_id}","directory_id":null,"name":"descriptor.md"}}"#
-            ),
-        );
-        descriptor_only.change_id = Some(descriptor_change_id);
-        descriptor_only.author_id = "descriptor-author".to_string();
-
-        let mut content_descriptor = live_file_row(
-            content_id,
-            branch_id,
-            &format!(r#"{{"id":"{content_id}","directory_id":null,"name":"content.md"}}"#),
-        );
-        content_descriptor.author_id = "older-descriptor-author".to_string();
-        let mut blob_ref = live_blob_ref_row(content_id, branch_id, content_id, &"0".repeat(64), 0);
-        blob_ref.change_id = Some(blob_change_id);
-        blob_ref.author_id = "content-author".to_string();
-
-        let prepared = super::prepare_lix_file_rows(
-            vec![descriptor_only, content_descriptor, blob_ref],
-            &super::FilePathPredicate::All,
-        )
-        .expect("descriptor and content file rows should prepare");
-        let base_schema = super::lix_file_schema();
-        let projection = ["path", "lixcol_change_id", "lixcol_author_id"]
-            .into_iter()
-            .map(|column| base_schema.index_of(column).expect("projected file column"))
-            .collect::<Vec<_>>();
-        let schema = super::projected_schema(&base_schema, Some(&projection))
-            .expect("file metadata projection should bind");
-        let blob_reader =
-            Arc::new(StaticBlobReader::from_blobs(Vec::new())) as Arc<dyn BlobDataReader>;
-        let batch = super::lix_file_record_batch_from_prepared(
-            &schema,
-            &blob_reader,
-            None,
-            false,
-            prepared,
-        )
-        .await
-        .expect("file metadata batch should build");
-
-        let paths = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("path column should be text");
-        let changes = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("change id column should be text");
-        let authors = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("author id column should be text");
-        let rows = paths
-            .iter()
-            .zip(changes.iter())
-            .zip(authors.iter())
-            .filter_map(|((path, change_id), author_id)| {
-                Some((
-                    path?.to_string(),
-                    (change_id?.to_string(), author_id?.to_string()),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            rows.get("/descriptor.md").cloned(),
-            Some((
-                descriptor_change_id.to_string(),
-                "descriptor-author".to_string(),
-            ))
-        );
-        assert_eq!(
-            rows.get("/content.md").cloned(),
-            Some((blob_change_id.to_string(), "content-author".to_string()))
-        );
-    }
-
     #[test]
     fn file_path_predicate_only_discovers_plugins_for_selected_blobless_files() {
         let blob_data = b"stored".to_vec();
@@ -11021,34 +10899,6 @@ mod tests {
             &[("path".to_string(), lit("/docs/renamed.md"))],
         )
         .expect("path should be writable for update");
-    }
-
-    #[test]
-    fn file_author_id_is_read_only_for_insert_and_update() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "lixcol_author_id",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec!["writer-account"])) as ArrayRef],
-        )
-        .expect("author insert fixture should build");
-        let insert_error =
-            super::reject_read_only_lix_file_insert_field(&batch, 0, "lixcol_author_id")
-                .expect_err("INSERT must reject an explicit author id");
-        assert!(insert_error.to_string().contains("read-only"));
-
-        let update_error = super::validate_lix_file_update_assignments(
-            &super::lix_file_schema(),
-            &[(
-                "lixcol_author_id".to_string(),
-                Expr::Column(Column::from_name("lixcol_author_id")),
-            )],
-        )
-        .expect_err("UPDATE must reject author_id assignment");
-        assert!(update_error.to_string().contains("read-only"));
     }
 
     #[test]

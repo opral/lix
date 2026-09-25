@@ -1003,7 +1003,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 22 }
+      schema: { type: integer, const: 21 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1061,7 +1061,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 22 }
+        syncProtocolVersion: { type: integer, const: 21 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1254,12 +1254,9 @@ components:
         stateRootId: { type: string, pattern: "^[0-9a-f]{64}$" }
     SyncRefUpdate:
       type: object
-      required: [branchId, authorId, refChangeId, expectedRefChangeId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]
+      required: [branchId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]
       properties:
         branchId: { type: string, minLength: 1 }
-        authorId: { type: [string, "null"], format: uuid, description: Account that performed the selected branch-ref write; null only when deleting the branch. }
-        refChangeId: { type: [string, "null"], format: uuid, description: Current-state change ID of the selected branch-ref row; null only when deleting the branch. }
-        expectedRefChangeId: { type: [string, "null"], format: uuid, description: Optional previous branch-ref row version guard. Null keeps head/checkpoint as the CAS when an older partial upload lacks this metadata. }
         expectedHeadCommitId: { type: [string, "null"] }
         expectedCheckpointCommitId: { type: [string, "null"] }
         headCommitId: { type: [string, "null"] }
@@ -1485,11 +1482,9 @@ components:
         originKey: { type: [string, "null"] }
     SyncBranchHead:
       type: object
-      required: [branchId, authorId, refChangeId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]
+      required: [branchId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]
       properties:
         branchId: { type: string }
-        authorId: { type: string, format: uuid, description: Account that performed the selected branch-ref write. }
-        refChangeId: { type: string, format: uuid, description: Current-state change ID of the selected branch-ref row. }
         headCommitId: { type: [string, "null"] }
         checkpointCommitId:
           type: [string, "null"]

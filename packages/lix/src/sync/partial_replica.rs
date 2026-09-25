@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PARTIAL_REPLICA_DESCRIPTOR_VERSION: u32 = 2;
+pub(crate) const PARTIAL_REPLICA_DESCRIPTOR_VERSION: u32 = 1;
 #[cfg(test)]
 pub(crate) const MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES: usize = 4096;
 
@@ -42,7 +42,6 @@ pub(crate) struct PartialReplicaBranch {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) ref_change_id: String,
-    pub(crate) author_id: String,
     pub(crate) head: PartialReplicaCommitRoots,
     pub(crate) checkpoint: PartialReplicaCommitRoots,
 }
@@ -121,8 +120,6 @@ impl PartialReplicaDescriptor {
                 || crate::common::LixTimestamp::parse(&branch.updated_at).is_err()
                 || crate::changelog::ChangeId::parse(&branch.ref_change_id).is_err()
                 || crate::storage_codec::id_string::uuid_bytes_from_canonical(&branch.ref_change_id)
-                    .is_none()
-                || crate::storage_codec::id_string::uuid_bytes_from_canonical(&branch.author_id)
                     .is_none()
             {
                 return Err(LixError::new(
@@ -237,7 +234,6 @@ where
                 created_at: control.created_at.to_string(),
                 updated_at: control.updated_at.to_string(),
                 ref_change_id: control.ref_change_id.to_string(),
-                author_id: control.author_id_string(),
                 head,
                 checkpoint,
             });
@@ -371,7 +367,6 @@ mod tests {
             assert_eq!(branch.created_at, control.created_at.to_string());
             assert_eq!(branch.updated_at, control.updated_at.to_string());
             assert_eq!(branch.ref_change_id, control.ref_change_id.to_string());
-            assert_eq!(branch.author_id, control.author_id_string());
             assert_eq!(
                 crate::common::LixTimestamp::parse(&branch.created_at).unwrap(),
                 control.created_at
@@ -386,9 +381,6 @@ mod tests {
         let restored: super::PartialReplicaDescriptor = serde_json::from_slice(&encoded).unwrap();
         restored.validate(lix.lix_id(), None).unwrap();
         assert_eq!(restored, descriptor);
-        let mut invalid_author = descriptor.clone();
-        invalid_author.selected_branch.author_id = "not-a-canonical-account-id".into();
-        assert!(invalid_author.validate(lix.lix_id(), None).is_err());
     }
 
     #[tokio::test]

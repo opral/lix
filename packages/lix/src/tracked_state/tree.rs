@@ -23,11 +23,11 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
-    PendingChunkBatch, TrackedStateKeyBatchBuilder, boundary_trigger, decode_key,
-    decode_key_borrowed, decode_key_shared, decode_key_with_trusted_prefix, decode_node,
-    decode_node_ref, decode_value, decode_visible_value, encode_internal_node, encode_key,
-    encode_key_ref_into, encode_leaf_node, encode_schema_file_prefix, encode_schema_key_prefix,
-    encode_value_ref, encode_value_ref_into, hash_bytes,
+    PendingChunkBatch, TrackedStateKeyBatchBuilder, boundary_trigger, decode_key, decode_key_borrowed,
+    decode_key_shared, decode_key_with_trusted_prefix, decode_node, decode_node_ref, decode_value,
+    decode_visible_value, encode_internal_node, encode_key, encode_key_ref_into, encode_leaf_node,
+    encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref, encode_value_ref_into,
+    hash_bytes,
 };
 use crate::tracked_state::diff::{TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder};
 use crate::tracked_state::storage;
@@ -1196,17 +1196,15 @@ impl TrackedStateTree {
             // Excluded keys cannot contribute a diff on either side. Prune each
             // ordered frontier independently, retaining the pending leaf windows
             // so shifted boundaries still meet in the ordinary ordered merge.
-            while left
-                .front()
-                .is_some_and(|child| !child_summary_overlaps_request(child, request, &ranges))
-            {
+            while left.front().is_some_and(|child| {
+                !child_summary_overlaps_request(child, request, &ranges)
+            }) {
                 left.pop_front();
                 left_loaded = None;
             }
-            while right
-                .front()
-                .is_some_and(|child| !child_summary_overlaps_request(child, request, &ranges))
-            {
+            while right.front().is_some_and(|child| {
+                !child_summary_overlaps_request(child, request, &ranges)
+            }) {
                 right.pop_front();
                 right_loaded = None;
             }
@@ -2303,7 +2301,6 @@ fn cascade_parent_entry(
     entry.value = encode_value_ref(TrackedStateIndexValueRef {
         change_id: cascade.change_id,
         commit_id: cascade.commit_id,
-        author_id: cascade.author_id,
         deleted: true,
         created_at: parent_value.created_at(),
         updated_at: cascade.updated_at,
@@ -2466,7 +2463,6 @@ impl<'a> OrderedTreeAssembler<'a> {
             TrackedStateIndexValueRef {
                 change_id: mutation.delta.change_id,
                 commit_id: mutation.delta.commit_id,
-                author_id: mutation.delta.author_id,
                 deleted: mutation.delta.deleted,
                 created_at,
                 updated_at: mutation.delta.updated_at,
@@ -3108,10 +3104,7 @@ fn child_summary_overlaps_request(
     }
     if !request.schema_keys.is_empty()
         || request.file_ids.is_empty()
-        || request
-            .file_ids
-            .iter()
-            .any(|owner| matches!(owner, NullableKeyFilter::Any))
+        || request.file_ids.iter().any(|owner| matches!(owner, NullableKeyFilter::Any))
     {
         return true;
     }
@@ -3132,10 +3125,7 @@ fn child_summary_overlaps_request(
             NullableKeyFilter::Value(id) => Some(id.as_str()),
             NullableKeyFilter::Any => return true,
         };
-        let range = prefix_scan_range(encode_schema_file_prefix(
-            first.schema_key.as_ref(),
-            file_id,
-        ));
+        let range = prefix_scan_range(encode_schema_file_prefix(first.schema_key.as_ref(), file_id));
         child_summary_overlaps_scan_ranges(child, std::slice::from_ref(&range))
     })
 }
@@ -3254,7 +3244,6 @@ pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES
             value: Bytes::from(encode_value_ref(TrackedStateIndexValueRef {
                 change_id: ChangeId::for_test_label("gc-fixture-change"),
                 commit_id: CommitId::for_test_label("gc-fixture-commit"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -5993,13 +5982,14 @@ mod tests {
                     }
                 };
                 if target_chunk_bytes == 128 && step == 0 {
-                    // Canonical hash for the current authored row format.
+                    // Canonical hash from the origin/main regression log:
+                    // pin the old policy, not merely agreement between paths.
                     assert_eq!(
                         canonical.root_id,
                         TrackedStateRootId::new([
-                            186, 62, 74, 187, 132, 195, 146, 56, 49, 2, 162, 244, 22, 127, 244,
-                            180, 156, 194, 11, 237, 73, 148, 113, 94, 5, 6, 245, 244, 117, 129,
-                            74, 253,
+                            225, 121, 165, 124, 156, 145, 159, 7, 211, 158, 225, 49, 234, 131, 73,
+                            175, 115, 231, 111, 210, 175, 164, 76, 152, 236, 167, 169, 49, 181,
+                            140, 226, 35,
                         ])
                     );
                 }
@@ -6282,7 +6272,6 @@ mod tests {
         TrackedStateIndexValue {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label("commit"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: snapshot_content.is_none(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",

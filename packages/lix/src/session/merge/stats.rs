@@ -196,7 +196,6 @@ mod tests {
                         updated_at: timestamp,
                         change_id,
                         commit_id,
-                        author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     };
                     TrackedStateDiffEntry {
                         identity: identity.clone(),

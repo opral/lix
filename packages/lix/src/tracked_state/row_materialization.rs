@@ -30,7 +30,6 @@ struct MaterializedTrackedStateDescriptor {
     updated_at: LixTimestamp,
     change_id: ChangeId,
     commit_id: CommitId,
-    author_id: u32,
 }
 
 /// Typed owner for historical tracked-state materialization.
@@ -96,7 +95,6 @@ impl MaterializedTrackedStateBatch {
                 TrackedStateIndexValue {
                     change_id: row.change_id,
                     commit_id: row.commit_id,
-                    author_id: row.author_id,
                     deleted: row.deleted,
                     created_at,
                     updated_at,
@@ -207,10 +205,6 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         self.descriptor().commit_id
     }
 
-    pub(crate) fn author_id(self) -> &'a str {
-        self.batch.strings.get(self.descriptor().author_id)
-    }
-
     /// Converts into the legacy DTO only at a terminal compatibility boundary.
     pub(crate) fn to_owned(self) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
@@ -225,7 +219,6 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
             updated_at: self.updated_at().to_string(),
             change_id: self.change_id(),
             commit_id: self.commit_id(),
-            author_id: self.author_id().to_owned(),
         }
     }
 }
@@ -349,12 +342,10 @@ impl MaterializedTrackedStateBatchBuilder {
     ) {
         let schema_key = self.intern_owned(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_owned(file_id));
-        let author_id = self.intern_str(value.author_id.as_str());
         self.rows.push(MaterializedTrackedStateDescriptor {
             row_pk: key.row_pk,
             schema_key,
             file_id,
-            author_id,
             snapshot_content,
             metadata,
             decoded_snapshot: None,
@@ -375,12 +366,10 @@ impl MaterializedTrackedStateBatchBuilder {
     ) {
         let schema_key = self.intern_str(key.schema_key);
         let file_id = key.file_id.map(|file_id| self.intern_str(file_id));
-        let author_id = self.intern_str(value.author_id.as_str());
         self.rows.push(MaterializedTrackedStateDescriptor {
             row_pk: key.row_pk.clone(),
             schema_key,
             file_id,
-            author_id,
             snapshot_content,
             metadata,
             decoded_snapshot: None,
@@ -796,7 +785,6 @@ mod tests {
                 TrackedStateIndexValue {
                     change_id,
                     commit_id: omitted_owner,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     deleted: false,
                     created_at: updated_at,
                     updated_at,
@@ -945,7 +933,6 @@ mod tests {
                 u128::try_from(index).expect("test index fits u128") + 1,
             )),
             commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: false,
             created_at: timestamp,
             updated_at: timestamp,
@@ -1130,8 +1117,8 @@ mod tests {
         assert_eq!(batch.len(), ROW_COUNT);
         assert_eq!(
             batch.dictionary_entry_count(),
-            3,
-            "schema, file, and author metadata must each be retained once"
+            2,
+            "schema and file metadata must each be retained once"
         );
         assert_eq!(
             batch.large_buffer_count(4 * 1024),
@@ -1187,7 +1174,7 @@ mod tests {
         let batch = builder.finish();
 
         assert_eq!(batch.len(), ROW_COUNT);
-        assert_eq!(batch.dictionary_entry_count(), ROW_COUNT + 2);
+        assert_eq!(batch.dictionary_entry_count(), ROW_COUNT + 1);
         assert_eq!(
             batch.dictionary_arena_allocation_count(),
             2,
@@ -1328,11 +1315,7 @@ mod tests {
         assert_eq!(details["commit_id"], commit_id.to_string());
         assert_eq!(
             details["row_ref"],
-            crate::row_ref::schema_identity_detail(
-                &key.schema_key,
-                key.file_id.as_deref(),
-                &key.row_pk
-            )
+            crate::row_ref::schema_identity_detail(&key.schema_key, key.file_id.as_deref(), &key.row_pk)
         );
     }
 }

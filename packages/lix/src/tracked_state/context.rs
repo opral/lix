@@ -4537,7 +4537,6 @@ where
                 encode_value_ref(TrackedStateIndexValueRef {
                     change_id: cascade.change_id,
                     commit_id: cascade.commit_id,
-                    author_id: cascade.author_id,
                     deleted: true,
                     created_at: value.created_at(),
                     updated_at: cascade.updated_at,
@@ -4975,7 +4974,6 @@ where
                         encode_value_ref(TrackedStateIndexValueRef {
                             change_id: marker.change_id,
                             commit_id: marker.commit_id,
-                            author_id: marker.author_id,
                             deleted: true,
                             created_at: value.created_at(),
                             updated_at: marker.updated_at,
@@ -5103,7 +5101,6 @@ where
             let value = TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
-                author_id: delta.author_id,
                 deleted: delta.deleted,
 
                 created_at,
@@ -5385,7 +5382,6 @@ where
             TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
-                author_id: delta.author_id,
                 deleted: delta.deleted,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
@@ -5543,7 +5539,6 @@ fn cascade_tombstone(
     TrackedStateIndexValue {
         change_id: cascade.change_id,
         commit_id: cascade.commit_id,
-        author_id: cascade.author_id.to_owned(),
         deleted: true,
         created_at: inherited.created_at,
         updated_at: cascade.updated_at,
@@ -6157,7 +6152,6 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:01Z".to_owned(),
             updated_at: "2026-01-01T00:00:01Z".to_owned(),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("replacement-marker"),
             commit_id: CommitId::for_test_label("replacement-child"),
         };
@@ -6324,7 +6318,6 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:01Z".to_owned(),
             updated_at: "2026-01-01T00:00:01Z".to_owned(),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("ordinary-marker"),
             commit_id: CommitId::for_test_label("ordinary-child"),
         };
@@ -6421,7 +6414,6 @@ mod tests {
         let value = TrackedStateIndexValue {
             change_id: delta.change_id,
             commit_id: delta.commit_id,
-            author_id: delta.author_id.to_owned(),
             deleted: delta.deleted,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
@@ -6501,7 +6493,6 @@ mod tests {
         let value = TrackedStateIndexValue {
             change_id: delta.change_id,
             commit_id: delta.commit_id,
-            author_id: delta.author_id.to_owned(),
             deleted: false,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
@@ -6641,7 +6632,6 @@ mod tests {
         let cascade_value = TrackedStateIndexValue {
             change_id: delta.change_id,
             commit_id: delta.commit_id,
-            author_id: delta.author_id.to_owned(),
             deleted: true,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
@@ -11000,7 +10990,6 @@ mod tests {
                 let value = TrackedStateIndexValue {
                     change_id: row.change_id.clone(),
                     commit_id: row.commit_id.clone(),
-                    author_id: row.author_id.clone(),
                     deleted: row.deleted,
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",
@@ -11196,7 +11185,6 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(commit_id),
         }
@@ -11209,7 +11197,6 @@ mod tests {
             row_pk: &row.row_pk,
             change_id: row.change_id,
             commit_id: row.commit_id,
-            author_id: &row.author_id,
             deleted: row.snapshot_content.is_none(),
             created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),

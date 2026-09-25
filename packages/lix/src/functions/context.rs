@@ -392,7 +392,6 @@ mod tests {
                     row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("functions-context-sequence")),
                     commit_id: None,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     untracked: true,
                     deleted: false,
                     created_at: timestamp,

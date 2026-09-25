@@ -1245,7 +1245,6 @@ trait DirectoryLiveRow {
     fn file_id(&self) -> Option<&str>;
     fn global(&self) -> bool;
     fn change_id(&self) -> Option<String>;
-    fn author_id(&self) -> String;
     fn created_at(&self) -> String;
     fn updated_at(&self) -> String;
     fn commit_id(&self) -> Option<String>;
@@ -1264,10 +1263,6 @@ impl DirectoryLiveRow for MaterializedHotStateRow {
 
     fn change_id(&self) -> Option<String> {
         self.change_id.map(|id| id.to_string())
-    }
-
-    fn author_id(&self) -> String {
-        self.author_id.clone()
     }
 
     fn created_at(&self) -> String {
@@ -1302,10 +1297,6 @@ impl DirectoryLiveRow for MaterializedHotStateRowRef<'_> {
 
     fn change_id(&self) -> Option<String> {
         (*self).change_id().map(|id| id.to_string())
-    }
-
-    fn author_id(&self) -> String {
-        (*self).author_id().to_owned()
     }
 
     fn created_at(&self) -> String {
@@ -1626,7 +1617,6 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
-            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_author_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_updated_at")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_commit_id")?;
@@ -1969,7 +1959,6 @@ where
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
     let mut change_ids = Vec::new();
-    let mut author_ids = Vec::new();
     let mut created_ats = Vec::new();
     let mut updated_ats = Vec::new();
     let mut commit_ids = Vec::new();
@@ -1984,7 +1973,6 @@ where
         file_ids.push(directory.live.file_id().map(str::to_owned));
         globals.push(Some(directory.live.global()));
         change_ids.push(directory.live.change_id());
-        author_ids.push(Some(directory.live.author_id()));
         created_ats.push(directory.live.created_at());
         updated_ats.push(directory.live.updated_at());
         commit_ids.push(directory.live.commit_id());
@@ -2002,7 +1990,6 @@ where
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
             "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
-            "lixcol_author_id" => Arc::new(StringArray::from(author_ids.clone())),
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
@@ -2235,7 +2222,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
-        Field::new("lixcol_author_id", DataType::Utf8, false),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
@@ -2608,7 +2594,6 @@ mod tests {
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{row_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{row_pk}"))),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -2745,7 +2730,7 @@ mod tests {
 
     #[test]
     fn record_batch_projects_directory_columns() {
-        let mut rows = vec![
+        let rows = vec![
             live_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2757,8 +2742,6 @@ mod tests {
                 "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
             ),
         ];
-        rows[0].author_id = "directory-author-a".to_string();
-        rows[1].author_id = "directory-author-b".to_string();
 
         let rows = MaterializedHotStateBatch::from_rows(rows);
         let batch = lix_directory_record_batch(&lix_directory_schema(), &rows)
@@ -2775,42 +2758,6 @@ mod tests {
                 .value(1),
             "/docs/guides"
         );
-        let authors = batch
-            .column_by_name("lixcol_author_id")
-            .expect("author-id column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("author ID should be text");
-        assert_eq!(authors.value(0), "directory-author-a");
-        assert_eq!(authors.value(1), "directory-author-b");
-    }
-
-    #[test]
-    fn directory_author_id_is_read_only_for_insert_and_update() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "lixcol_author_id",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec!["writer-account"])) as ArrayRef],
-        )
-        .expect("author insert fixture should build");
-        let insert_error =
-            super::reject_read_only_lix_directory_insert_field(&batch, 0, "lixcol_author_id")
-                .expect_err("INSERT must reject an explicit author id");
-        assert!(insert_error.to_string().contains("read-only"));
-
-        let update_error = super::validate_lix_directory_update_assignments(
-            &lix_directory_schema(),
-            &[(
-                "lixcol_author_id".to_string(),
-                Expr::Column(Column::from_name("lixcol_author_id")),
-            )],
-        )
-        .expect_err("UPDATE must reject author_id assignment");
-        assert!(update_error.to_string().contains("read-only"));
     }
 
     #[tokio::test]

@@ -25,11 +25,10 @@ pub(crate) enum CertifiedCurrentStatePredecessor {
     Packed(PackedHeadValue),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PackedHeadValue {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
-    pub(crate) author_id: String,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,

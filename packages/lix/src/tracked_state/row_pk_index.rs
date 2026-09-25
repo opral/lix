@@ -140,7 +140,6 @@ pub(crate) async fn stage_row_pk_index_from_members(
             TrackedStateIndexValueRef {
                 change_id: member.value.change_id,
                 commit_id: member.value.commit_id,
-                author_id: &member.value.author_id,
                 // This tree is an identity catalog, not current-state
                 // membership. Preserve deleted identities for later exact
                 // canonical resolution.
@@ -199,7 +198,6 @@ pub(crate) async fn stage_row_pk_index_from_deltas_with_base<'a>(
             TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
-                author_id: delta.author_id,
                 deleted: false,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
@@ -302,7 +300,6 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
             TrackedStateIndexValueRef {
                 change_id: row.change_id,
                 commit_id: row.commit_id,
-                author_id: &row.author_id,
                 deleted: false,
                 created_at: crate::common::LixTimestamp::parse(&row.created_at)
                     .map_err(row_pk_index_error)?,
@@ -411,7 +408,6 @@ mod tests {
         let value = TrackedStateIndexValueRef {
             change_id: ChangeId::for_test_label("row-pk-index-change"),
             commit_id: CommitId::for_test_label("row-pk-index-commit"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),

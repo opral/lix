@@ -1480,7 +1480,6 @@ mod tests {
             global: true,
             change_id: None,
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             branch_id: GLOBAL_BRANCH_ID.into(),
         }

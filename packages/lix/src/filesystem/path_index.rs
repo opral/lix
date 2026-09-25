@@ -14,11 +14,12 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
+use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
+    MaterializedHotStateBatchBuilder,
+    MaterializedHotStateRow,
 };
-use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     REVISION_KEY_FILESYSTEM_PATH, REVISION_SPACE, StorageAdapterRead, StorageValue,
     StorageWriteSet, load_revision, revision_key,
@@ -105,7 +106,6 @@ pub(crate) struct FilesystemPathEntry {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
-    author_id: String,
     commit_id: Option<CommitId>,
     blob_ref: Option<MaterializedHotStateRow>,
     cached_blob_data: Option<crate::Blob>,
@@ -151,7 +151,6 @@ impl FilesystemPathEntry {
             ),
             global: self.key.global(),
             change_id: self.change_id,
-            author_id: self.author_id.clone(),
             commit_id: self.commit_id,
             untracked: self.key.is_untracked(),
             branch_id: self.key.branch_id().into(),
@@ -177,19 +176,7 @@ impl FilesystemPathEntry {
     }
 
     pub(crate) fn change_id(&self) -> Option<ChangeId> {
-        self.blob_ref
-            .as_ref()
-            .and_then(|blob_ref| blob_ref.change_id)
-            .or(self.change_id)
-    }
-
-    pub(crate) fn author_id(&self) -> &str {
-        self.blob_ref
-            .as_ref()
-            .filter(|blob_ref| blob_ref.change_id.is_some())
-            .map_or(self.author_id.as_str(), |blob_ref| {
-                blob_ref.author_id.as_str()
-            })
+        self.change_id
     }
 
     pub(crate) fn commit_id(&self) -> Option<CommitId> {
@@ -210,14 +197,12 @@ impl FilesystemPathEntry {
             + self.name.capacity()
             + self.key.estimated_heap_bytes()
             + self.metadata.as_ref().map_or(0, String::capacity)
-            + self.author_id.capacity()
             + self.created_at.capacity()
             + self.updated_at.capacity()
             + self.blob_ref.as_ref().map_or(0, |row| {
                 row.schema_key.capacity()
                     + row.row_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
-                    + row.author_id.capacity()
                     + row
                         .snapshot_content
                         .as_ref()
@@ -384,8 +369,8 @@ impl FilesystemPathIndex {
             })?;
             match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: DirectorySnapshot =
-                        serde_json::from_value(snapshot).map_err(|error| {
+                    let snapshot: DirectorySnapshot = serde_json::from_value(snapshot)
+                        .map_err(|error| {
                             LixError::unknown(format!(
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
                             ))
@@ -402,7 +387,6 @@ impl FilesystemPathIndex {
                             created_at: row.created_at().to_string(),
                             updated_at: row.updated_at().to_string(),
                             change_id: row.change_id(),
-                            author_id: row.author_id().to_owned(),
                             commit_id: row.commit_id(),
                         },
                     );
@@ -428,7 +412,6 @@ impl FilesystemPathIndex {
                             created_at: row.created_at().to_string(),
                             updated_at: row.updated_at().to_string(),
                             change_id: row.change_id(),
-                            author_id: row.author_id().to_owned(),
                             commit_id: row.commit_id(),
                         },
                     ));
@@ -473,7 +456,6 @@ impl FilesystemPathIndex {
                 created_at: record.created_at.clone(),
                 updated_at: record.updated_at.clone(),
                 change_id: record.change_id,
-                author_id: record.author_id.clone(),
                 commit_id: record.commit_id,
                 blob_ref: None,
                 cached_blob_data: None,
@@ -522,7 +504,6 @@ impl FilesystemPathIndex {
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 change_id: record.change_id,
-                author_id: record.author_id,
                 commit_id: record.commit_id,
                 blob_ref,
                 cached_blob_data: None,
@@ -951,7 +932,6 @@ impl FilesystemPathIndex {
             created_at: row.created_at.to_string(),
             updated_at: row.updated_at.to_string(),
             change_id: row.change_id,
-            author_id: row.author_id.clone(),
             commit_id: row.commit_id,
             blob_ref: None,
             cached_blob_data: None,
@@ -1381,9 +1361,8 @@ struct CacheKey {
 
 impl CacheKey {
     fn estimated_heap_bytes(&self) -> usize {
-        self.file_ids.as_ref().map_or(0, |ids| {
-            ids.capacity() * size_of::<String>() + ids.iter().map(String::capacity).sum::<usize>()
-        }) + self.branch_ids.capacity() * size_of::<String>()
+        self.file_ids.as_ref().map_or(0, |ids| ids.capacity() * size_of::<String>() + ids.iter().map(String::capacity).sum::<usize>())
+            + self.branch_ids.capacity() * size_of::<String>()
             + self.branch_ids.iter().map(String::capacity).sum::<usize>()
             + self.revision.as_ref().map_or(0, Vec::capacity)
     }
@@ -1407,11 +1386,7 @@ impl FilesystemPathIndexCache {
     /// write checkpoint. Rebuilding from the restored overlay is cheaper and
     /// safer than cloning potentially large path indexes for an error path.
     pub(crate) fn clear(&self) {
-        self.historical
-            .entries
-            .lock()
-            .expect("historical path cache poisoned")
-            .clear();
+        self.historical.entries.lock().expect("historical path cache poisoned").clear();
         self.entries
             .lock()
             .expect("filesystem path cache lock poisoned")
@@ -1541,7 +1516,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, index) in advanced {
             let key = CacheKey {
-                file_ids: request.file_ids.clone(),
+            file_ids: request.file_ids.clone(),
                 branch_ids: request.branch_ids,
                 revision: next_revision.map(<[u8]>::to_vec),
                 include_blob_refs: request.include_blob_refs,
@@ -1587,10 +1562,7 @@ impl FilesystemPathIndexCache {
             let Some(next_revision) = next_revision_for(previous_revision) else {
                 return true;
             };
-            if invalidates_delta
-                || candidate.key.file_ids.is_some()
-                || candidate.key.branch_ids.len() != 1
-            {
+            if invalidates_delta || candidate.key.file_ids.is_some() || candidate.key.branch_ids.len() != 1 {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
@@ -1607,7 +1579,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, revision, index) in advanced {
             let key = CacheKey {
-                file_ids: request.file_ids.clone(),
+            file_ids: request.file_ids.clone(),
                 branch_ids: request.branch_ids,
                 revision: Some(revision),
                 include_blob_refs: request.include_blob_refs,
@@ -1689,7 +1661,6 @@ struct DirectoryRecord {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
-    author_id: String,
     commit_id: Option<CommitId>,
 }
 
@@ -1727,7 +1698,6 @@ struct FileRecord {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
-    author_id: String,
     commit_id: Option<CommitId>,
 }
 
@@ -1735,8 +1705,8 @@ struct FileRecord {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::hot_state::MaterializedHotStateBatchBuilder;
     use crate::row_pk::RowPk;
+    use crate::hot_state::MaterializedHotStateBatchBuilder;
 
     fn path_index_from_rows(
         rows: Vec<MaterializedHotStateRow>,
@@ -1771,77 +1741,26 @@ mod tests {
     #[tokio::test]
     async fn scoped_path_index_reads_only_selected_files_and_ancestor_closure() {
         let lix = crate::open_lix().await.unwrap();
-        for path in [
-            "/top/nested/a.bin",
-            "/top/other.bin",
-            "/elsewhere/x.bin",
-            "/root.bin",
-        ] {
-            lix.upsert_file_content(path, b"content".to_vec())
-                .await
-                .unwrap();
+        for path in ["/top/nested/a.bin", "/top/other.bin", "/elsewhere/x.bin", "/root.bin"] {
+            lix.upsert_file_content(path, b"content".to_vec()).await.unwrap();
         }
-        let id = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path='/top/nested/a.bin'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("id")
-            .unwrap();
-        let root_id = lix
-            .execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("id")
-            .unwrap();
-        let branch = lix
-            .partial_replica_descriptor(None)
-            .await
-            .unwrap()
-            .selected_branch
-            .branch_id;
-        let hot = crate::hot_state::HotStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
-        );
+        let id = lix.execute("SELECT id FROM lix_file WHERE path='/top/nested/a.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
+        let root_id = lix.execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
+        let branch = lix.partial_replica_descriptor(None).await.unwrap().selected_branch.branch_id;
+        let hot = crate::hot_state::HotStateContext::new(crate::tracked_state::TrackedStateContext::new(), crate::commit_graph::CommitGraphContext::new());
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let reader = hot.reader(&read);
         let request = FilesystemPathIndexRequest::new(vec![branch]).with_file_ids(Some(vec![id]));
         let rows = read_path_index_rows(&reader, &request).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            3,
-            "one file and its two ancestors, no siblings or blobs"
-        );
+        assert_eq!(rows.len(), 3, "one file and its two ancestors, no siblings or blobs");
         let index = reader.path_index(&request).await.unwrap();
-        assert_eq!(
-            index
-                .entries()
-                .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["/top", "/top/nested", "/top/nested/a.bin"]
-        );
-        assert!(
-            Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()),
-            "scoped reads reuse the revision cache"
-        );
+        assert_eq!(index.entries().iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["/top", "/top/nested", "/top/nested/a.bin"]);
+        assert!(Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()), "scoped reads reuse the revision cache");
         let root = request.clone().with_file_ids(Some(vec![root_id]));
         assert_eq!(read_path_index_rows(&reader, &root).await.unwrap().len(), 1);
-        let missing = request.with_file_ids(Some(vec![
-            "00000000-0000-0000-0000-000000000000".to_owned(),
-        ]));
-        assert!(
-            read_path_index_rows(&reader, &missing)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let missing = request.with_file_ids(Some(vec!["00000000-0000-0000-0000-000000000000".to_owned()]));
+        assert!(read_path_index_rows(&reader, &missing).await.unwrap().is_empty());
     }
 
     #[test]
@@ -2514,33 +2433,9 @@ mod tests {
             global,
             change_id: Some(ChangeId::for_test_label(id)),
             commit_id: Some(CommitId::for_test_label(id)),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             branch_id: branch_id.into(),
         }
-    }
-
-    #[test]
-    fn file_entry_uses_blob_ref_author_and_change_as_latest_write() {
-        let descriptor_change_id = ChangeId::for_test_label("file-descriptor-change");
-        let content_change_id = ChangeId::for_test_label("file-content-change");
-        let mut descriptor = file_row("file-id", None, "note.md", "branch-id", false);
-        descriptor.change_id = Some(descriptor_change_id);
-        descriptor.author_id = "descriptor-author".to_string();
-        let mut blob_ref = blob_row("file-id", "blob-hash", "branch-id");
-        blob_ref.change_id = Some(content_change_id);
-        blob_ref.author_id = "content-author".to_string();
-
-        let index = path_index_from_rows(vec![descriptor, blob_ref])
-            .expect("file path index should include descriptor and blob ref");
-        let entry = index
-            .exact_entries("/note.md")
-            .into_iter()
-            .next()
-            .expect("file should be indexed by path");
-
-        assert_eq!(entry.change_id(), Some(content_change_id));
-        assert_eq!(entry.author_id(), "content-author");
     }
 }
 

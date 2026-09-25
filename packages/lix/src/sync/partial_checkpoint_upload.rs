@@ -286,14 +286,6 @@ async fn prepare_checkpoint_target(
         commits,
         ref_updates: vec![SyncRefUpdate {
             branch_id: branch_id.into(),
-            author_id: Some(state.active_account_id().to_owned()),
-            ref_change_id: Some(super::partial_push_state::deterministic_ref_change_id(
-                branch_id,
-                &upload.target.head,
-                &upload.target.checkpoint,
-                state.active_account_id(),
-            )?),
-            expected_ref_change_id: None,
             expected_head_commit_id: Some(upload.expected.head.clone()),
             expected_checkpoint_commit_id: Some(upload.expected.checkpoint.clone()),
             head_commit_id: Some(upload.target.head.clone()),
@@ -301,7 +293,7 @@ async fn prepare_checkpoint_target(
         }],
         inline_blobs: Vec::new(),
     };
-    upload.append_created_ref_updates(&mut request, state.active_account_id())?;
+    upload.append_created_ref_updates(&mut request);
     let mut budget = WireBudget {
         remaining: max_wire_bytes,
         written: 0,

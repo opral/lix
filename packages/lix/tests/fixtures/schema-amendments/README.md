@@ -8,9 +8,9 @@ SHA-256 was `3f19b94fa089775a1e5b1a779a63fece373a54a823a93add10b477d518a8821b`.
 The snapshot contains three `legacy_default` rows (`a`, `b`, `c`, each with
 `value = 1`). After those rows were written, the registered schema gained a
 required `priority` column with literal default `7`. The old engine accepted the
-amendment without updating the durable row payloads. This fixture is retained
-as historical evidence. It predates the authored row format and is not loaded
-by current-format tests.
+amendment without updating the durable row payloads. This fixture ensures that
+new readers and write predicates agree on defaults for already-existing sparse
+rows; testing only a new amendment would exercise the new backfill instead.
 
 Snapshot SHA-256:
 `16e7c1db3a2130263401bbb538d226b5490251358fc3df79aec7d1d85a15423f`.

@@ -723,7 +723,6 @@ fn test_current_delta<'a>(
         row_pk: delta.row_pk,
         change_id: Some(delta.change_id),
         commit_id: Some(delta.commit_id),
-        author_id: crate::ANONYMOUS_ACCOUNT_ID,
         untracked: false,
         deleted: delta.deleted,
         created_at: delta.created_at,
@@ -2581,7 +2580,7 @@ fn push_root_current_base_row(
     branch_id: &str,
     active_checkpoint_commit_id: Option<CommitId>,
 ) {
-    let ordinal = rows.push_materialized_ref_with_author(
+    let ordinal = rows.push_materialized_ref(
         row.row_pk(),
         row.schema_key(),
         row.file_id(),
@@ -2594,7 +2593,6 @@ fn push_root_current_base_row(
         Some(row.change_id()),
         Some(row.commit_id()),
         false,
-        row.author_id(),
         branch_id,
     );
     rows.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
@@ -2611,7 +2609,6 @@ fn push_root_current_base_row(
         CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
             change_id: row.change_id(),
             commit_id: row.commit_id(),
-            author_id: row.author_id().to_owned(),
             deleted: row.deleted(),
             created_at: row.created_at(),
             updated_at: row.updated_at(),
@@ -3484,7 +3481,7 @@ async fn scan_packed_current_base_rows(
             None
         };
         let metadata = materialize_packed_slot(projection.metadata, change.metadata);
-        let ordinal = rows.push_materialized(
+        rows.push_materialized(
             key.row_pk,
             key.schema_key,
             key.file_id,
@@ -3499,7 +3496,6 @@ async fn scan_packed_current_base_rows(
             false,
             branch_id,
         );
-        rows.set_author_id(ordinal, &value.author_id);
         if decoded_snapshot.is_some() {
             rows.set_decoded_snapshot(row_index, decoded_snapshot);
         }
@@ -3568,7 +3564,7 @@ async fn scan_packed_current_base_provenance_rows(
     let mut rows = MaterializedHotStateBatchBuilder::with_capacity(row_capacity);
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     for ((schema_key, row_pk, file_id), value) in winners.into_iter().take(row_capacity) {
-        let ordinal = rows.push_materialized(
+        rows.push_materialized(
             row_pk,
             schema_key,
             file_id,
@@ -3583,7 +3579,6 @@ async fn scan_packed_current_base_provenance_rows(
             false,
             branch_id,
         );
-        rows.set_author_id(ordinal, &value.author_id);
     }
     Ok(rows.finish())
 }
@@ -3682,7 +3677,6 @@ async fn load_packed_current_base_exact(
         let durable_predecessor = CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
             change_id: value.change_id,
             commit_id: value.commit_id,
-            author_id: value.author_id.clone(),
             deleted: false,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -3709,7 +3703,7 @@ async fn load_packed_current_base_exact(
         slots.push(Some(u32::try_from(row_index).map_err(|_| {
             head_value_error("packed exact row count exceeds u32")
         })?));
-        let ordinal = rows.push_materialized(
+        rows.push_materialized(
             change_record.row_pk,
             change_record.schema_key,
             change_record.file_id,
@@ -3724,7 +3718,6 @@ async fn load_packed_current_base_exact(
             false,
             branch_id,
         );
-        rows.set_author_id(ordinal, &value.author_id);
         if decoded_snapshot.is_some() {
             rows.set_decoded_snapshot(row_index, decoded_snapshot);
         }
@@ -6224,7 +6217,6 @@ impl HotTrackedSnapshot {
             let value = HeadValueRef {
                 change_id: Some(row.change_id),
                 commit_id: Some(row.commit_id),
-                author_id: &row.author_id,
                 untracked: false,
                 deleted: row.deleted,
                 created_at: LixTimestamp::expect_parse(
@@ -7985,7 +7977,6 @@ where
             *previous = Some(CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
                 change_id: packed_value.change_id,
                 commit_id: packed_value.commit_id,
-                author_id: packed_value.author_id.clone(),
                 deleted: packed_value.deleted,
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
@@ -8464,9 +8455,6 @@ where
                         WorkingDiffBaseline::BeforePresent {
                             checkpoint_commit_id,
                             version: WorkingDiffVersion {
-                                author_id: uuid::Uuid::parse_str(row.author_id())
-                                    .expect("tracked row authors are canonical UUIDs")
-                                    .into_bytes(),
                                 change_id: row.change_id(),
                                 commit_id: row.commit_id(),
                                 deleted: row.deleted(),
@@ -8940,11 +8928,6 @@ async fn stage_incremental_file_delete_cascades(
         identities.len(),
         key_capacity,
         working_diff_capture_checkpoint_commit_id.is_some(),
-        cascades
-            .values()
-            .map(|cascade| cascade.author_id.len())
-            .max()
-            .unwrap_or(0),
     );
     let diff_scope = working_diff_capture_checkpoint_commit_id.map(|checkpoint_commit_id| {
         encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
@@ -9033,7 +9016,6 @@ async fn stage_incremental_file_delete_cascades(
             &HeadValueRef {
                 change_id: cascade.change_id,
                 commit_id: cascade.commit_id,
-                author_id: cascade.author_id,
                 untracked: false,
                 deleted: true,
                 created_at: existing.created_at,
@@ -9077,20 +9059,14 @@ struct HotCascadeMutationBuffers {
 }
 
 impl HotCascadeMutationBuffers {
-    fn with_capacity(
-        row_capacity: usize,
-        key_capacity: usize,
-        active_checkpoint: bool,
-        author_capacity: usize,
-    ) -> Self {
+    fn with_capacity(row_capacity: usize, key_capacity: usize, active_checkpoint: bool) -> Self {
         let checkpoint_bytes = if active_checkpoint {
             WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
         } else {
             0
         };
         let value_bytes_per_row = HEAD_VALUE_TYPED_HEADER_BYTES
-            .checked_add(author_capacity)
-            .and_then(|bytes| bytes.checked_add(checkpoint_bytes))
+            .checked_add(checkpoint_bytes)
             .and_then(|bytes| bytes.checked_add(COLUMNAR_BASE_COORDINATE_BYTES));
         let value_capacity = value_bytes_per_row
             .and_then(|value_bytes| row_capacity.checked_mul(value_bytes))
@@ -9478,7 +9454,6 @@ fn apply_complete_file_delete_cascade(
             Bytes::from(encode_head_value(&HeadValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
-                author_id: delta.author_id,
                 untracked: false,
                 deleted: true,
                 created_at: existing.created_at,
@@ -9766,7 +9741,6 @@ fn checked_add_hot_next_value_capacity(
         0
     };
     let encoded_len = HEAD_VALUE_TYPED_HEADER_BYTES
-        .checked_add(delta.author_id.len())?
         .checked_add(snapshot_len)?
         .checked_add(metadata_len)?
         .checked_add(baseline_len)?
@@ -10423,7 +10397,6 @@ fn stage_hot_bootstrap(
         let value = HeadValueRef {
             change_id: Some(row.change_id),
             commit_id: Some(row.commit_id),
-            author_id: &row.author_id,
             untracked: false,
             deleted: row.deleted,
             created_at: LixTimestamp::expect_parse("hot bootstrap created_at", &row.created_at),
@@ -10835,7 +10808,6 @@ impl LiveMaterializationIdentity for HotScanIdentity {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
-        author_id: &str,
         untracked: bool,
         branch_id: &str,
     ) {
@@ -10851,7 +10823,7 @@ impl LiveMaterializationIdentity for HotScanIdentity {
         } = self;
         let schema_key = schema_key.as_str(&key);
         let file_id = file_id.as_ref().map(|file_id| file_id.as_str(&key));
-        rows.push_materialized_interned_with_author(
+        rows.push_materialized_interned(
             row_pk,
             schema_key,
             file_id,
@@ -10864,7 +10836,6 @@ impl LiveMaterializationIdentity for HotScanIdentity {
             change_id,
             commit_id,
             untracked,
-            author_id,
             branch_id,
         );
     }
@@ -11280,9 +11251,6 @@ fn packed_compact_working_diff_version(
     value: &crate::tracked_state::TrackedStateIndexValue,
 ) -> WorkingDiffVersion {
     WorkingDiffVersion {
-        author_id: uuid::Uuid::parse_str(&value.author_id)
-            .expect("tracked index authors are canonical UUIDs")
-            .into_bytes(),
         change_id: value.change_id,
         commit_id: value.commit_id,
         deleted: value.deleted,
@@ -14472,7 +14440,6 @@ mod tests {
                     deleted,
                     created_at: timestamp().to_string(),
                     updated_at: timestamp().to_string(),
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     change_id: ChangeId::for_test_label(&format!("{label}-{key}-{file_id:?}")),
                     commit_id: generation,
                 };
@@ -14612,7 +14579,6 @@ mod tests {
             row_pk: &row_pk,
             change_id: ChangeId::for_test_label("packed-alias-scope-source-row"),
             commit_id: source,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             deleted: false,
             created_at: timestamp(),
             updated_at: timestamp(),
@@ -14810,7 +14776,6 @@ mod tests {
                 // commit id. That asymmetry is the whole untracked model.
                 change_id: Some(ChangeId::for_test_label("closure-change")),
                 commit_id: (!untracked).then_some(generation),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked,
                 deleted,
                 created_at: timestamp(),
@@ -15911,7 +15876,6 @@ mod tests {
             deleted: false,
             created_at: timestamp(),
             updated_at: timestamp(),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: Some(ChangeId::for_test_label(&format!("change-{commit_label}"))),
             commit_id: Some(CommitId::for_test_label(commit_label)),
@@ -15985,7 +15949,6 @@ mod tests {
                 deleted: false,
                 created_at: timestamp().to_string(),
                 updated_at: timestamp().to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label("packed-system-change"),
                 commit_id: generation,
             }],
@@ -16129,8 +16092,6 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
             ref_change_id: ChangeId::for_test_label("packed-system-ref"),
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
         };
         assert!(
             reader
@@ -16293,7 +16254,6 @@ mod tests {
                 deleted: false,
                 created_at: created_at.to_string(),
                 updated_at: created_at.to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label(&format!("corrupt-control-{index}")),
                 commit_id: parent_commit_id,
             })
@@ -16357,7 +16317,6 @@ mod tests {
                 row_pk,
                 change_id: Some(change_id),
                 commit_id: Some(new_head),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: false,
                 deleted: false,
                 created_at,
@@ -16446,7 +16405,6 @@ mod tests {
                 deleted: false,
                 created_at: created_at.to_string(),
                 updated_at: created_at.to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label("checkpoint-packed-base-change"),
                 commit_id: generation,
             }],
@@ -16513,7 +16471,6 @@ mod tests {
             row_pk: &row_pk,
             change_id: Some(checkpoint_change),
             commit_id: Some(generation),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at,
@@ -16609,8 +16566,6 @@ mod tests {
 
     fn working_diff_version(label: &str) -> WorkingDiffVersion {
         WorkingDiffVersion {
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
             change_id: ChangeId::for_test_label(&format!("{label}-change")),
             commit_id: CommitId::for_test_label(&format!("{label}-commit")),
             deleted: false,
@@ -16981,7 +16936,6 @@ mod tests {
                 false,
                 None,
                 None,
-                crate::ANONYMOUS_ACCOUNT_ID,
                 true,
                 "branch",
             );
@@ -16989,7 +16943,7 @@ mod tests {
         let rows = rows.finish();
 
         assert_eq!(rows.len(), ROW_COUNT);
-        assert_eq!(rows.dictionary_entry_count(), 4);
+        assert_eq!(rows.dictionary_entry_count(), 3);
         assert_eq!(rows.dictionary_arena_buffer_count(), 1);
         assert_eq!(
             rows.dictionary_arena_allocation_count(),
@@ -17193,7 +17147,6 @@ mod tests {
         let previous = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("coordinate-before-change")),
             commit_id: Some(CommitId::for_test_label("coordinate-before-commit")),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: timestamp(),
@@ -17221,7 +17174,6 @@ mod tests {
                 } else {
                     "coordinate-update-commit"
                 })),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: false,
                 deleted,
                 created_at: timestamp(),
@@ -17345,7 +17297,6 @@ mod tests {
             row_pk: &first_pk,
             change_id: Some(ChangeId::for_test_label("hot-mutation-first")),
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: true,
             deleted: false,
             created_at: timestamp(),
@@ -17360,7 +17311,6 @@ mod tests {
             row_pk: &second_pk,
             change_id: Some(ChangeId::for_test_label("hot-mutation-second")),
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: true,
             deleted: false,
             created_at: timestamp(),
@@ -17463,7 +17413,6 @@ mod tests {
             row_pk: &tracked_pk,
             change_id: Some(ChangeId::for_test_label("planned-value-change")),
             commit_id: Some(CommitId::for_test_label("planned-value-commit")),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: timestamp(),
@@ -17478,7 +17427,6 @@ mod tests {
             row_pk: &tombstone_pk,
             change_id: Some(ChangeId::for_test_label("planned-tombstone-change")),
             commit_id: Some(CommitId::for_test_label("planned-tombstone-commit")),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: true,
             created_at: timestamp(),
@@ -17493,7 +17441,6 @@ mod tests {
             row_pk: &untracked_pk,
             change_id: Some(ChangeId::for_test_label("hot-untracked-member")),
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: true,
             deleted: false,
             created_at: timestamp(),
@@ -17508,7 +17455,6 @@ mod tests {
             row_pk: &removed_pk,
             change_id: Some(ChangeId::for_test_label("hot-untracked-removed")),
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: true,
             deleted: true,
             created_at: timestamp(),
@@ -17555,8 +17501,6 @@ mod tests {
         }
 
         let before = WorkingDiffVersion {
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
             change_id: ChangeId::for_test_label("planned-before-change"),
             commit_id: CommitId::for_test_label("planned-before-commit"),
             deleted: false,
@@ -17660,7 +17604,6 @@ mod tests {
                 deleted: false,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label("hot-shared-value-change"),
                 commit_id: CommitId::for_test_label("hot-shared-value-commit"),
             }])
@@ -17723,7 +17666,6 @@ mod tests {
         let tombstone = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("cascade-reserve-change")),
             commit_id: Some(CommitId::for_test_label("cascade-reserve-commit")),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: true,
             created_at: timestamp(),
@@ -17741,18 +17683,12 @@ mod tests {
         assert_eq!(
             encoded_tombstone.len(),
             HEAD_VALUE_TYPED_HEADER_BYTES
-                + tombstone.author_id.len()
                 + WORKING_DIFF_CHECKPOINT_BYTES
                 + WORKING_DIFF_VERSION_BYTES,
             "the cascade value reservation must cover the largest checkpoint tombstone"
         );
 
-        let mut buffers = HotCascadeMutationBuffers::with_capacity(
-            ROW_COUNT,
-            0,
-            true,
-            tombstone.author_id.len(),
-        );
+        let mut buffers = HotCascadeMutationBuffers::with_capacity(ROW_COUNT, 0, true);
         let value_allocation = buffers.value_bytes.as_ptr();
         let row_put_allocation = buffers.row_puts.as_ptr();
         let row_delete_allocation = buffers.row_deletes.as_ptr();
@@ -17771,7 +17707,6 @@ mod tests {
             buffers.value_bytes.len(),
             ROW_COUNT
                 * (HEAD_VALUE_TYPED_HEADER_BYTES
-                    + tombstone.author_id.len()
                     + WORKING_DIFF_CHECKPOINT_BYTES
                     + WORKING_DIFF_VERSION_BYTES)
         );
@@ -18197,7 +18132,6 @@ mod tests {
             row_pk: &row_pk,
             change_id: Some(ChangeId::for_test_label("hot-ordinary-incremental")),
             commit_id: None,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: true,
             deleted: false,
             created_at: timestamp,
@@ -18254,7 +18188,6 @@ mod tests {
                 row_pk,
                 change_id: Some(ChangeId::for_test_label("hot-planned-arena")),
                 commit_id: None,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: true,
                 deleted: false,
                 created_at: timestamp,
@@ -18470,8 +18403,6 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("active-ref"),
-                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                    .expect("anonymous account ID is canonical"),
             },
         )
         .expect("stage active control");
@@ -18498,8 +18429,6 @@ mod tests {
                 created_at: timestamp(),
                 updated_at: timestamp(),
                 ref_change_id: ChangeId::for_test_label("stale-ref"),
-                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                    .expect("anonymous account ID is canonical"),
             },
         )
         .expect("stage stale control");
@@ -18643,7 +18572,6 @@ mod tests {
                 deleted: false,
                 created_at: created_at.to_string(),
                 updated_at: created_at.to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label("e45e-global-change"),
                 commit_id: global_commit,
             }],
@@ -18664,7 +18592,6 @@ mod tests {
                     deleted: false,
                     created_at: created_at.to_string(),
                     updated_at: created_at.to_string(),
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     change_id: ChangeId::for_test_label("e45e-branch-private"),
                     commit_id: generation,
                 },
@@ -18678,7 +18605,6 @@ mod tests {
                     deleted: false,
                     created_at: created_at.to_string(),
                     updated_at: created_at.to_string(),
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     change_id: ChangeId::for_test_label("e45e-branch-shadowed"),
                     commit_id: generation,
                 },
@@ -18698,7 +18624,6 @@ mod tests {
                 row_pk: &private_pk,
                 change_id: Some(ChangeId::for_test_label("e45e-delete-private")),
                 commit_id: Some(checkpoint_head),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: false,
                 deleted: true,
                 created_at,
@@ -18713,7 +18638,6 @@ mod tests {
                 row_pk: &shadowed_pk,
                 change_id: Some(ChangeId::for_test_label("e45e-delete-shadowed")),
                 commit_id: Some(checkpoint_head),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: false,
                 deleted: true,
                 created_at,

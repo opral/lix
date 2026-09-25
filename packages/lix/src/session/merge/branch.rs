@@ -1791,7 +1791,6 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             change_id: ChangeId::for_test_label("descriptor-change"),
             commit_id: CommitId::for_test_label("descriptor-commit"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 
@@ -1846,7 +1845,6 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             change_id: ChangeId::for_test_label(incarnation),
             commit_id: CommitId::for_test_label("owner-commit"),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 
@@ -1865,7 +1863,6 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
                 change_id: ChangeId::for_test_label("certified-base-change"),
                 commit_id: CommitId::for_test_label("certified-base-commit"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
         ])
         .expect("certified base fixture should materialize");

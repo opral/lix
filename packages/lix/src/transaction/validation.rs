@@ -5317,7 +5317,6 @@ mod tests {
             deleted: false,
             created_at: timestamp,
             updated_at: timestamp,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: None,
             commit_id: None,
@@ -5488,7 +5487,7 @@ mod tests {
             "a conforming constraint scan must retain the owner without an ordinal allocation"
         );
         assert_eq!(rows.batch.row_column_ptr(), original_row_column);
-        assert_eq!(rows.batch.dictionary_entry_count(), 3);
+        assert_eq!(rows.batch.dictionary_entry_count(), 2);
         let first = rows
             .first()
             .and_then(MaterializedHotStateRowRef::snapshot_content)

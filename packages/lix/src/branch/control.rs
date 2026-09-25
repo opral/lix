@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v12";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v11";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0020),
     BRANCH_HEAD_CONTROL_NAMESPACE,
@@ -27,9 +27,9 @@ pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare
 );
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
-const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC2";
+const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
 const BRANCH_HEAD_CONTROL_DIGEST_BYTES: usize = 32;
-const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v2";
+const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
 
 /// The one mutable publication record for a branch.
 ///
@@ -57,8 +57,6 @@ pub(crate) struct BranchHeadControl {
     pub(crate) updated_at: LixTimestamp,
     /// Public `lixcol_change_id` for the last head publication.
     pub(crate) ref_change_id: ChangeId,
-    /// Account that performed the last branch-ref write.
-    pub(crate) author_id: [u8; 16],
     /// Conservative schema-presence summary for this complete hot generation.
     ///
     /// Bits are only added during in-place commits. Lifecycle publications
@@ -86,21 +84,6 @@ pub(crate) struct BranchHeadTrackedReachability {
 }
 
 impl BranchHeadControl {
-    /// Convert a canonical account UUID to the compact authoritative form
-    /// stored in branch control records.
-    pub(crate) fn author_id_bytes(account_id: &str) -> Result<[u8; 16], LixError> {
-        storage_codec::id_string::uuid_bytes_from_canonical(account_id).ok_or_else(|| {
-            LixError::new(
-                "LIX_INVALID_ACCOUNT_ID",
-                "branch-ref author ID must be a canonical UUID",
-            )
-        })
-    }
-
-    pub(crate) fn author_id_string(self) -> String {
-        storage_codec::id_string::uuid_string_from_bytes(self.author_id)
-    }
-
     /// Canonical tracked projection for destructive reachability work.
     ///
     /// `tracked_generation` is the atomic serving selector, not chronology.
@@ -633,8 +616,6 @@ mod tests {
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("first-ref-change"),
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
         };
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
@@ -645,8 +626,6 @@ mod tests {
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
         };
         let branch_a = "01920000-0000-7000-8000-0000000000a1".to_string();
         let branch_b = "01920000-0000-7000-8000-0000000000b1".to_string();

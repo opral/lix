@@ -749,7 +749,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     global: branch == GLOBAL_BRANCH_ID,
                     change_id: None,
                     commit_id: None,
-                    author_id: row.author_id().to_owned(),
                     untracked: false,
                     branch_id: branch.as_str().into(),
                 });
@@ -1344,7 +1343,6 @@ fn native_file_lifecycle_pick(
             deleted: row.deleted(),
             created_at: row.created_at(),
             updated_at: row.updated_at(),
-            author_id: row.author_id().to_owned(),
         },
     })
 }

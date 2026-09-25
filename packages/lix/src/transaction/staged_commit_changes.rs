@@ -8,12 +8,11 @@
 //! `StagedCommitChangeRefs`.
 
 use std::collections::HashSet;
-use std::fmt;
 use std::sync::Arc;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::{LixTimestamp, StringDictionary, StringDictionaryBuilder};
+use crate::common::LixTimestamp;
 use crate::row_pk::RowPk;
 use crate::tracked_state::TrackedStateDiffIdentity;
 
@@ -83,11 +82,9 @@ impl StagedCommitChangeRefs {
 /// row primary keys are never lowered into row-owned transaction strings.
 /// All remaining metadata is stored in fixed typed columns allocated once per
 /// batch. Cloning this batch through transaction staging is O(1).
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct StagedCommitChangeColumns {
     identities: Vec<TrackedStateDiffIdentity>,
-    authors: StringDictionary,
-    author_ordinals: Vec<u32>,
     source_commit_ids: Vec<CommitId>,
     change_ids: Vec<ChangeId>,
     deleted: Vec<bool>,
@@ -99,7 +96,7 @@ struct StagedCommitChangeColumns {
     deleted_rows: Vec<u32>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct StagedCommitChangeBatch {
     columns: Arc<StagedCommitChangeColumns>,
     /// Every `(source_commit_id, change_id, identity)` tuple was produced by
@@ -111,20 +108,9 @@ pub(crate) struct StagedCommitChangeBatch {
     selection: Option<Arc<[u32]>>,
 }
 
-impl fmt::Debug for StagedCommitChangeBatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StagedCommitChangeBatch")
-            .field("len", &self.len())
-            .field("source_membership_certified", &self.source_membership_certified)
-            .field("has_selection", &self.selection.is_some())
-            .finish()
-    }
-}
-
+#[derive(Debug)]
 pub(crate) struct StagedCommitChangeBatchBuilder {
     columns: StagedCommitChangeColumns,
-    authors: StringDictionaryBuilder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +121,6 @@ pub(crate) struct StagedCommitChangeRef<'a> {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) author_id: &'a str,
 }
 
 impl StagedCommitChangeBatchBuilder {
@@ -143,8 +128,6 @@ impl StagedCommitChangeBatchBuilder {
         Self {
             columns: StagedCommitChangeColumns {
                 identities: Vec::with_capacity(row_count),
-                authors: StringDictionary::default(),
-                author_ordinals: Vec::with_capacity(row_count),
                 source_commit_ids: Vec::with_capacity(row_count),
                 change_ids: Vec::with_capacity(row_count),
                 deleted: Vec::with_capacity(row_count),
@@ -152,12 +135,6 @@ impl StagedCommitChangeBatchBuilder {
                 updated_at: Vec::with_capacity(row_count),
                 deleted_rows: Vec::new(),
             },
-            authors: StringDictionaryBuilder::with_capacity(
-                0,
-                row_count.min(1_024),
-                0,
-                false,
-            ),
         }
     }
 
@@ -169,7 +146,6 @@ impl StagedCommitChangeBatchBuilder {
         deleted: bool,
         created_at: LixTimestamp,
         updated_at: LixTimestamp,
-        author_id: &str,
     ) {
         if deleted {
             self.columns.deleted_rows.push(
@@ -178,7 +154,6 @@ impl StagedCommitChangeBatchBuilder {
             );
         }
         self.columns.identities.push(identity);
-        self.columns.author_ordinals.push(self.authors.intern(author_id));
         self.columns.source_commit_ids.push(source_commit_id);
         self.columns.change_ids.push(change_id);
         self.columns.deleted.push(deleted);
@@ -187,10 +162,8 @@ impl StagedCommitChangeBatchBuilder {
     }
 
     pub(crate) fn finish(self) -> StagedCommitChangeBatch {
-        let mut columns = self.columns;
-        columns.authors = self.authors.finish();
         StagedCommitChangeBatch {
-            columns: Arc::new(columns),
+            columns: Arc::new(self.columns),
             source_membership_certified: false,
             selection: None,
         }
@@ -203,10 +176,8 @@ impl StagedCommitChangeBatchBuilder {
     /// prove a complete dense source selection from coordinates alone instead
     /// of hashing all identity bytes again.
     pub(crate) fn finish_source_certified(self) -> StagedCommitChangeBatch {
-        let mut columns = self.columns;
-        columns.authors = self.authors.finish();
         StagedCommitChangeBatch {
-            columns: Arc::new(columns),
+            columns: Arc::new(self.columns),
             source_membership_certified: true,
             selection: None,
         }
@@ -280,7 +251,6 @@ impl StagedCommitChangeBatch {
             deleted: self.columns.deleted[column_index],
             created_at: self.columns.created_at[column_index],
             updated_at: self.columns.updated_at[column_index],
-            author_id: self.columns.authors.get(self.columns.author_ordinals[column_index]),
         }
     }
 
@@ -505,7 +475,6 @@ mod tests {
                 false,
                 timestamp,
                 timestamp,
-                crate::ANONYMOUS_ACCOUNT_ID,
             );
         }
         let batch = builder.finish();
@@ -561,7 +530,6 @@ mod tests {
             false,
             timestamp,
             timestamp,
-            crate::ANONYMOUS_ACCOUNT_ID,
         );
         let mut second = StagedCommitChangeBatchBuilder::with_capacity(2);
         second.push(
@@ -571,7 +539,6 @@ mod tests {
             false,
             timestamp,
             timestamp,
-            crate::ANONYMOUS_ACCOUNT_ID,
         );
         second.push(
             identities[0].clone(),
@@ -580,7 +547,6 @@ mod tests {
             false,
             timestamp,
             timestamp,
-            crate::ANONYMOUS_ACCOUNT_ID,
         );
 
         let mut staged = StagedCommitChangeRefs::default();

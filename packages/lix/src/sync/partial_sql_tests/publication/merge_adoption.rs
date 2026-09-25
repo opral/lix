@@ -416,7 +416,7 @@ async fn recorded_receipt_without_native_merge_parents_never_adopts_or_clears_lo
     let mut writes = storage.new_write_set();
     writes.put(
         crate::sync::partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE,
-        StorageKey(bytes::Bytes::copy_from_slice(
+        crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
             uuid::Uuid::parse_str(branch).unwrap().as_bytes(),
         )),
         serde_json::to_vec(&wire).unwrap(),

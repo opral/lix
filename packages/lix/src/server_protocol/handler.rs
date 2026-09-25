@@ -6254,10 +6254,10 @@ mod tests {
         assert!(openapi.contains("required: [kind, cursor, lixId, defaultBranchId, branches]"));
         assert!(
             openapi
-                .contains("required: [branchId, authorId, refChangeId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]")
+                .contains("required: [branchId, headCommitId, checkpointCommitId, checkpointStateRootId, hotStateRootId]")
         );
         assert!(openapi.contains(
-            "required: [branchId, authorId, refChangeId, expectedRefChangeId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]"
+            "required: [branchId, expectedHeadCommitId, expectedCheckpointCommitId, headCommitId, checkpointCommitId]"
         ));
         assert!(openapi.contains("required: [branchId, headCommitId, rows, continuation]"));
         assert!(openapi.contains("required: [commits, commitHeaders, boundaries]"));
@@ -6312,9 +6312,6 @@ mod tests {
             commits: Vec::new(),
             ref_updates: vec![crate::sync::SyncRefUpdate {
                 branch_id: uuid::Uuid::now_v7().to_string(),
-                author_id: None,
-                ref_change_id: None,
-                expected_ref_change_id: None,
                 expected_head_commit_id: None,
                 expected_checkpoint_commit_id: None,
                 head_commit_id: None,
@@ -10895,9 +10892,6 @@ mod tests {
             "inlineBlobs": [],
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001503",
-                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
-                "refChangeId": crate::changelog::ChangeId::for_test_label("forged-merge-ref").to_string(),
-                "expectedRefChangeId": null,
                 "expectedHeadCommitId": null,
                 "expectedCheckpointCommitId": null,
                 "headCommitId": merge_commit_id,
@@ -10927,9 +10921,6 @@ mod tests {
             "inlineBlobs": [],
             "refUpdates": [{
                 "branchId": "01920000-0000-7000-8000-000000001502",
-                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
-                "refChangeId": crate::changelog::ChangeId::for_test_label("roundtrip-merge-ref").to_string(),
-                "expectedRefChangeId": null,
                 "expectedHeadCommitId": null,
                 "expectedCheckpointCommitId": null,
                 "headCommitId": merge_commit_id,

@@ -4229,9 +4229,6 @@ pub(super) fn row_system_column_array(
             rows.iter()
                 .map(|row| row.change_id().map(|id| id.to_string())),
         )) as ArrayRef,
-        "author_id" => Arc::new(StringArray::from_iter(
-            rows.iter().map(|row| Some(row.author_id())),
-        )) as ArrayRef,
         "commit_id" => Arc::new(StringArray::from_iter(
             rows.iter()
                 .map(|row| row.commit_id().map(|id| id.to_string())),
@@ -4777,7 +4774,6 @@ mod tests {
             branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
             change_id: Some(ChangeId::for_test_label("change-a")),
             commit_id: Some(CommitId::for_test_label("commit-a")),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             untracked: false,
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
@@ -5582,7 +5578,6 @@ mod tests {
                 "lixcol_updated_at",
                 "lixcol_global",
                 "lixcol_change_id",
-                "lixcol_author_id",
                 "lixcol_commit_id",
                 "lixcol_untracked",
             ]

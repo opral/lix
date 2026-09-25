@@ -152,7 +152,6 @@ where
                     &commit.parent_commit_ids,
                     commit.base_commit_id,
                     commit.change_id,
-                    &commit.account_id,
                     commit.created_at,
                     branch_id,
                 )?);
@@ -199,7 +198,6 @@ where
                     &record.parent_commit_ids,
                     record.base_commit_id,
                     record.change_id,
-                    &record.account_id,
                     record.created_at,
                     branch_id,
                 )?);
@@ -474,7 +472,6 @@ fn commit_row(
     parent_commit_ids: &[CommitId],
     base_commit_id: Option<CommitId>,
     change_id: ChangeId,
-    author_id: &str,
     created_at: crate::common::LixTimestamp,
     branch_id: &str,
 ) -> Result<MaterializedHotStateRow, LixError> {
@@ -496,7 +493,6 @@ fn commit_row(
         global: true,
         change_id: Some(change_id),
         commit_id: Some(commit_id),
-        author_id: author_id.to_owned(),
         untracked: false,
         branch_id: branch_id.into(),
     })
@@ -533,7 +529,6 @@ fn branch_ref_row(
         global: true,
         change_id: Some(control.ref_change_id),
         commit_id: None,
-        author_id: control.author_id_string(),
         untracked: true,
         branch_id: GLOBAL_BRANCH_ID.into(),
     })

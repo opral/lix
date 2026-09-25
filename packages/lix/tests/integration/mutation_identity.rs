@@ -129,7 +129,7 @@ async fn load_reservation(
 ) -> MaterializedHotStateRow {
     let result = lix
         .execute(
-            "SELECT key, value, lixcol_author_id, lixcol_file_id, lixcol_untracked \
+            "SELECT key, value, lixcol_file_id, lixcol_untracked \
              FROM lix_key_value WHERE key = $1 AND lixcol_file_id = $2",
             &[
                 Value::Text(reservation_key.to_string()),
@@ -165,9 +165,6 @@ async fn load_reservation(
         global: false,
         change_id: None,
         commit_id: None,
-        author_id: row
-            .get::<String>("lixcol_author_id")
-            .expect("reservation author id"),
         untracked: row
             .get::<bool>("lixcol_untracked")
             .expect("reservation lane"),

@@ -49,7 +49,6 @@ fn assert_files_resolve_directories(
 }
 
 #[tokio::test]
-#[ignore = "released v72 snapshot predates authored row metadata"]
 async fn checkpointed_directories_survive_the_v74_migration() {
     let storage = lix::Memory::new();
     let report = lix::migration::restore_and_migrate_repository(

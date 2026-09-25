@@ -471,7 +471,6 @@ mod tests {
             updated_at: "2026-09-09T12:00:00.000Z".to_owned(),
             change_id: crate::changelog::ChangeId::for_test_label("legacy-marker"),
             commit_id: global,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         };
         crate::test_support::seed_branch_head_with_rows(
             adapter.clone(),

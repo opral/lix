@@ -401,7 +401,6 @@ where
                 row_pk: &row_pk,
                 change_id: Some(ChangeId::for_test_label("bench-deterministic-mode")),
                 commit_id: None,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 untracked: true,
                 deleted: false,
                 created_at: timestamp,
@@ -500,7 +499,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
                 deleted: false,
                 created_at: TIMESTAMP.to_string(),
                 updated_at: TIMESTAMP.to_string(),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 change_id: ChangeId::for_test_label(&format!("schema-fixture-{}", key.schema_key)),
                 commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
             }
@@ -632,8 +630,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: *change_id,
-            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-                .expect("anonymous account ID is canonical"),
             schema_presence_bloom: [0; 4],
         };
         control.note_schemas(rows.iter().map(|row| row.schema_key.as_str()));

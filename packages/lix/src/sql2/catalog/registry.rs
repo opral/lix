@@ -445,7 +445,6 @@ fn filesystem_schema(include_data: bool) -> SchemaRef {
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
-        Field::new("lixcol_author_id", DataType::Utf8, false),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
@@ -501,9 +500,8 @@ fn system_column_description(name: &str) -> Option<&'static str> {
             "When true the row is global, shared by every branch, rather than versioned per branch."
         }
         "lixcol_change_id" => {
-            "Identifier of the change that wrote the row's current state; untracked writes have no retained lix_change record."
+            "Identifier of the change that wrote the row's current state (references lix_change.id)."
         }
-        "lixcol_author_id" => "Account that wrote the row's current state (references lix_account.id).",
         "lixcol_created_at" => "When the row was first written.",
         "lixcol_updated_at" => "When the row's current state was written.",
         "lixcol_commit_id" => {
@@ -652,7 +650,6 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_file_id", true),
         PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
         PublicColumn::public_read_only("lixcol_change_id", true),
-        PublicColumn::public_read_only("lixcol_author_id", false),
         PublicColumn::public_read_only("lixcol_created_at", false),
         PublicColumn::public_read_only("lixcol_updated_at", false),
         PublicColumn::hidden("lixcol_commit_id", true),
@@ -673,7 +670,6 @@ fn row_system_columns(
             PublicColumn::public_read_only("lixcol_updated_at", false),
             PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
             PublicColumn::public_read_only("lixcol_change_id", true),
-            PublicColumn::public_read_only("lixcol_author_id", false),
             PublicColumn::public_read_only("lixcol_commit_id", true),
             PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
         ],

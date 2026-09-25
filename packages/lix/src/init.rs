@@ -459,8 +459,6 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
-            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
-                .expect("system account ID is canonical"),
             schema_presence_bloom: [0; 4],
         },
         branch_ref_change: global_branch_ref_change,
@@ -481,8 +479,6 @@ pub(crate) fn plan_init_seed_with_main_branch_id(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
-            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
-                .expect("system account ID is canonical"),
             schema_presence_bloom: [0; 4],
         },
         branch_ref_change: main_branch_ref_change,
@@ -668,7 +664,6 @@ where
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.global_commit.id,
-                author_id: &plan.global_commit.account_id,
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -763,7 +758,6 @@ where
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: plan.main_commit.id,
-                author_id: &plan.main_commit.account_id,
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -868,11 +862,6 @@ where
                     row_pk: &change.row_pk,
                     change_id: Some(change.change_id),
                     commit_id: Some(commit_id),
-                    author_id: if commit_id == plan.global_commit.id {
-                        &plan.global_commit.account_id
-                    } else {
-                        &plan.main_commit.account_id
-                    },
                     untracked: false,
                     deleted: false,
                     created_at: change.created_at,

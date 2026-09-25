@@ -36,7 +36,6 @@ async fn collect<R: StorageAdapterRead + ?Sized>(
         if let AuthoritativeBranchCoordinate::Headed {
             head_commit_id,
             checkpoint_commit_id,
-            ..
         } = coordinate
         {
             // The installer checked these logical certificates before recording

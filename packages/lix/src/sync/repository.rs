@@ -305,7 +305,9 @@ struct SyncLiveValueRowRef<'a> {
     updated_at: LixTimestamp,
     snapshot_json: &'a str,
     metadata_json: Option<&'a str>,
-    author_id: &'a str,
+    change_account_id: &'a str,
+    change_created_at: LixTimestamp,
+    origin_key: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -319,7 +321,9 @@ struct SyncLiveValueRow {
     updated_at: LixTimestamp,
     snapshot_json: String,
     metadata_json: Option<String>,
-    author_id: String,
+    change_account_id: String,
+    change_created_at: LixTimestamp,
+    origin_key: Option<String>,
 }
 
 impl SyncLiveValueRow {
@@ -334,7 +338,9 @@ impl SyncLiveValueRow {
             updated_at: self.updated_at,
             snapshot_json: &self.snapshot_json,
             metadata_json: self.metadata_json.as_deref(),
-            author_id: &self.author_id,
+            change_account_id: &self.change_account_id,
+            change_created_at: self.change_created_at,
+            origin_key: self.origin_key.as_deref(),
         }
     }
 }
@@ -418,7 +424,7 @@ fn sync_live_value_root<'a>(
             .map(|metadata| canonical_sync_jsonb(metadata, "row metadata"))
             .transpose()?;
         let mut member = blake3::Hasher::new();
-        member.update(b"lix.sync.live-value.row.v3\0");
+        member.update(b"lix.sync.live-value.row.v2\0");
         hash_len_prefixed(&mut member, &key);
         member.update(row.change_id.as_uuid().as_bytes());
         member.update(row.commit_id.as_uuid().as_bytes());
@@ -434,7 +440,17 @@ fn sync_live_value_root<'a>(
                 member.update(&[0]);
             }
         };
-        hash_len_prefixed(&mut member, row.author_id.as_bytes());
+        hash_len_prefixed(&mut member, row.change_account_id.as_bytes());
+        member.update(&row.change_created_at.packed().to_be_bytes());
+        match row.origin_key {
+            Some(origin_key) => {
+                member.update(&[1]);
+                hash_len_prefixed(&mut member, origin_key.as_bytes());
+            }
+            None => {
+                member.update(&[0]);
+            }
+        }
         if members.insert(key, *member.finalize().as_bytes()).is_some() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -443,7 +459,7 @@ fn sync_live_value_root<'a>(
         }
     }
     let mut root = blake3::Hasher::new();
-    root.update(b"lix.sync.live-value.root.v3\0");
+    root.update(b"lix.sync.live-value.root.v2\0");
     root.update(
         &u64::try_from(members.len())
             .unwrap_or(u64::MAX)
@@ -562,7 +578,7 @@ pub(crate) const SYNC_REPOSITORY_EVENT_SPACE: StorageSpace = StorageSpace::decla
 
 pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0014),
-    "sync.replica_state.v4",
+    "sync.replica_state.v3",
     ValueSemantics::Mutable,
 );
 
@@ -617,8 +633,6 @@ impl CachedSyncUploadPlan {
                     AuthoritativeBranchCoordinate::from_wire(
                         update.head_commit_id.clone(),
                         update.checkpoint_commit_id.clone(),
-                        update.author_id.clone(),
-                        update.ref_change_id.clone(),
                         "acknowledged upload ref",
                     )?,
                 ))
@@ -742,8 +756,6 @@ enum AuthoritativeBranchCoordinate {
     Headed {
         head_commit_id: String,
         checkpoint_commit_id: String,
-        author_id: String,
-        ref_change_id: String,
     },
 }
 
@@ -751,44 +763,17 @@ impl AuthoritativeBranchCoordinate {
     fn from_wire(
         head_commit_id: Option<String>,
         checkpoint_commit_id: Option<String>,
-        author_id: Option<String>,
-        ref_change_id: Option<String>,
         context: &str,
     ) -> Result<Self, LixError> {
-        match (
-            head_commit_id,
-            checkpoint_commit_id,
-            author_id,
-            ref_change_id,
-        ) {
-            (None, None, None, None) => Ok(Self::Deleted),
-            (
-                Some(head_commit_id),
-                Some(checkpoint_commit_id),
-                Some(author_id),
-                Some(ref_change_id),
-            )
-                if crate::storage_codec::id_string::uuid_bytes_from_canonical(&author_id)
-                    .is_some() =>
-            {
-                if crate::storage_codec::id_string::uuid_bytes_from_canonical(&ref_change_id)
-                    .is_none()
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        format!("{context} refChangeId must be a canonical UUID"),
-                    ));
-                }
-                Ok(Self::Headed {
-                    head_commit_id,
-                    checkpoint_commit_id,
-                    author_id,
-                    ref_change_id,
-                })
-            }
+        match (head_commit_id, checkpoint_commit_id) {
+            (None, None) => Ok(Self::Deleted),
+            (Some(head_commit_id), Some(checkpoint_commit_id)) => Ok(Self::Headed {
+                head_commit_id,
+                checkpoint_commit_id,
+            }),
             _ => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                format!("{context} head, checkpoint, author, and refChangeId must be paired"),
+                format!("{context} head and checkpoint must be paired"),
             )),
         }
     }
@@ -807,20 +792,6 @@ impl AuthoritativeBranchCoordinate {
                 checkpoint_commit_id,
                 ..
             } => Some(checkpoint_commit_id),
-        }
-    }
-
-    fn author_id(&self) -> Option<&str> {
-        match self {
-            Self::Deleted => None,
-            Self::Headed { author_id, .. } => Some(author_id),
-        }
-    }
-
-    fn ref_change_id(&self) -> Option<&str> {
-        match self {
-            Self::Deleted => None,
-            Self::Headed { ref_change_id, .. } => Some(ref_change_id),
         }
     }
 }
@@ -1107,8 +1078,6 @@ fn replica_controls_are_confirmed(
             AuthoritativeBranchCoordinate::Headed {
                 head_commit_id,
                 checkpoint_commit_id,
-                author_id,
-                ref_change_id,
             } => {
                 headed += 1;
                 let Some(control) = controls.get(branch) else {
@@ -1118,8 +1087,6 @@ fn replica_controls_are_confirmed(
                     || control
                         .working_diff_checkpoint_commit_id
                         .is_none_or(|id| id != checkpoint_commit_id.as_str())
-                    || control.author_id_string() != *author_id
-                    || Some(control.ref_change_id) != ChangeId::parse(ref_change_id).ok()
                 {
                     return false;
                 }
@@ -1487,7 +1454,6 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
             if let AuthoritativeBranchCoordinate::Headed {
                 head_commit_id,
                 checkpoint_commit_id,
-                ..
             } = coordinate
             {
                 known.insert(CommitId::parse_lix(
@@ -1614,7 +1580,6 @@ pub(crate) async fn stage_sync_restore_intents(
         let Some(AuthoritativeBranchCoordinate::Headed {
             head_commit_id,
             checkpoint_commit_id,
-            ..
         }) = state.authoritative_branches.get(branch_id).cloned()
         else {
             continue;
@@ -1734,7 +1699,6 @@ async fn find_restore_authority_boundary(
             if let AuthoritativeBranchCoordinate::Headed {
                 head_commit_id,
                 checkpoint_commit_id,
-                ..
             } = coordinate
             {
                 enqueue_fallback_authority(CommitId::parse_lix(
@@ -1910,7 +1874,6 @@ impl ParsedSnapshotRow {
             row_pk: &self.row_pk,
             change_id: self.change_id,
             commit_id: self.commit_id,
-            author_id: &self.change_account_id,
             deleted: false,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -1927,11 +1890,13 @@ fn sync_live_value_root_from_snapshot_rows<'a>(
         row_pk: &row.row_pk,
         change_id: row.change_id,
         commit_id: row.commit_id,
-        author_id: &row.change_account_id,
         created_at: row.created_at,
         updated_at: row.updated_at,
         snapshot_json: &row.snapshot_json,
         metadata_json: row.metadata_json.as_deref(),
+        change_account_id: &row.change_account_id,
+        change_created_at: row.change_created_at,
+        origin_key: row.origin_key.as_deref(),
     }))
 }
 
@@ -1964,7 +1929,6 @@ fn snapshot_rows_hot_snapshot<'a>(
                     updated_at: row.updated_at.to_string(),
                     change_id: row.change_id,
                     commit_id: row.commit_id,
-                    author_id: row.change_account_id.clone(),
                 })
             })
             .collect::<Result<Vec<_>, LixError>>()?,
@@ -2027,7 +1991,6 @@ impl ParsedMember {
             row_pk: &self.row_pk,
             change_id: self.change_id,
             commit_id,
-            author_id: &self.change_account_id,
             deleted: self.deleted,
             created_at: self.row_created_at,
             updated_at: self.row_updated_at,
@@ -2042,7 +2005,6 @@ impl ParsedMember {
                 row_pk: &self.row_pk,
                 change_id: self.change_id,
                 commit_id,
-                author_id: &self.change_account_id,
                 deleted: self.deleted,
                 created_at: self.row_created_at,
                 updated_at: self.row_updated_at,
@@ -2062,7 +2024,6 @@ impl ParsedMember {
             row_pk: &self.row_pk,
             change_id: Some(self.change_id),
             commit_id: Some(commit_id),
-            author_id: &self.change_account_id,
             untracked: false,
             deleted: self.deleted,
             created_at: self.row_created_at,
@@ -2149,11 +2110,10 @@ impl ParsedSyncHeader {
         } else {
             crate::tracked_state::CommitStateIncorporation::None
         };
-        if crate::storage_codec::id_string::uuid_bytes_from_canonical(&header.account_id).is_none()
-        {
+        if header.account_id.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "sync commit header accountId must be a canonical UUID",
+                "sync commit header accountId must not be empty",
             ));
         }
         let mut unique_parents = BTreeSet::new();
@@ -2988,7 +2948,9 @@ async fn materialize_sync_live_value_rows_with_imports(
                     updated_at: member.row_updated_at,
                     snapshot_json,
                     metadata_json: member.metadata_json.clone(),
-                    author_id: member.change_account_id.clone(),
+                    change_account_id: member.change_account_id.clone(),
+                    change_created_at: member.change_created_at,
+                    origin_key: member.origin_key.clone(),
                 },
             );
         }
@@ -3015,6 +2977,17 @@ async fn load_sync_live_value_rows_at_commit(
         .await?;
     let mut rows = BTreeMap::new();
     for row in tracked_rows.iter() {
+        let change = load_existing_sync_change(read, row.change_id())
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sync live-value row change '{}' is missing",
+                        row.change_id()
+                    ),
+                )
+            })?;
         let key = encode_key_ref(TrackedStateKeyRef {
             schema_key: row.schema_key(),
             file_id: row.file_id(),
@@ -3035,7 +3008,9 @@ async fn load_sync_live_value_rows_at_commit(
                     .expect("a live tracked row has snapshot content")
                     .to_string(),
                 metadata_json: row.metadata().map(ToString::to_string),
-                author_id: row.author_id().to_owned(),
+                change_account_id: change.account_id,
+                change_created_at: change.created_at,
+                origin_key: change.origin_key,
             },
         );
     }
@@ -3084,10 +3059,7 @@ fn encode_sync_snapshot_row(
         commit_id: row.commit_id().to_string(),
         created_at: row.created_at().to_string(),
         updated_at: row.updated_at().to_string(),
-        // The tracked hot row is the authority for its current writer. The
-        // retained change record supplies historical timestamps and origin,
-        // but its account must never override current row state.
-        change_account_id: row.author_id().to_owned(),
+        change_account_id: change.account_id,
         change_created_at: change.created_at.to_string(),
         origin_key: change.origin_key,
     })
@@ -3276,10 +3248,28 @@ async fn snapshot_head_contains_local_head(
     Ok(false)
 }
 
+fn sync_ref_change_id(branch_id: &str, head_commit_id: Option<CommitId>) -> ChangeId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.sync.repository_ref_change.v1");
+    hasher.update(&(branch_id.len() as u64).to_be_bytes());
+    hasher.update(branch_id.as_bytes());
+    match head_commit_id {
+        Some(commit_id) => hasher.update(commit_id.as_uuid().as_bytes()),
+        None => hasher.update(&[0; 16]),
+    };
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    // Keep the derived standalone change outside the commit-address sentinel
+    // and direct member address zero.
+    if bytes[12..] == [0; 4] {
+        bytes[15] = 1;
+    }
+    ChangeId::new(uuid::Uuid::from_bytes(bytes))
+}
+
 fn sync_ref_change_record(
     branch_id: &str,
     head: CommitId,
-    change_id: ChangeId,
     account_id: &str,
     created_at: LixTimestamp,
 ) -> Result<ChangeRecord, LixError> {
@@ -3296,7 +3286,7 @@ fn sync_ref_change_record(
     let snapshot = encode_sync_typed_snapshot(BRANCH_REF_SCHEMA_KEY, &row_pk, &snapshot)?;
     Ok(ChangeRecord {
         format_version: 2,
-        change_id,
+        change_id: sync_ref_change_id(branch_id, Some(head)),
         account_id: account_id.to_owned(),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_owned(),
         row_pk,
@@ -3442,16 +3432,12 @@ where
                 (
                     control.head_commit_id,
                     control.working_diff_checkpoint_commit_id,
-                    control.ref_change_id,
-                    control.author_id,
                 )
             });
             let after_coordinate = after.map(|control| {
                 (
                     control.head_commit_id,
                     control.working_diff_checkpoint_commit_id,
-                    control.ref_change_id,
-                    control.author_id,
                 )
             });
             if before_coordinate == after_coordinate {
@@ -3459,9 +3445,6 @@ where
             }
             Some(Ok(SyncRefUpdate {
                 branch_id,
-                author_id: after.map(|control| control.author_id_string()),
-                ref_change_id: after.map(|control| control.ref_change_id.to_string()),
-                expected_ref_change_id: before.map(|control| control.ref_change_id.to_string()),
                 expected_head_commit_id: before.map(|control| control.head_commit_id.to_string()),
                 expected_checkpoint_commit_id: before
                     .and_then(|control| control.working_diff_checkpoint_commit_id)
@@ -3732,8 +3715,6 @@ where
             let expected = AuthoritativeBranchCoordinate::from_wire(
                 branch.head_commit_id.clone(),
                 branch.checkpoint_commit_id.clone(),
-                Some(branch.author_id.clone()),
-                Some(branch.ref_change_id.clone()),
                 "sync publication snapshot branch",
             )?;
             if state.authoritative_branches.get(&branch.branch_id) != Some(&expected) {
@@ -3851,7 +3832,6 @@ where
                     if let AuthoritativeBranchCoordinate::Headed {
                         head_commit_id,
                         checkpoint_commit_id,
-                        ..
                     } = coordinate
                     {
                         known.insert(CommitId::parse_lix(
@@ -3945,18 +3925,7 @@ where
                     if let Some(boundary) = active_reset_boundary {
                         reset_known_commit_ids.insert(boundary);
                     }
-                    let local_author_id = local_control.map(|control| control.author_id_string());
-                    let local_ref_change_id =
-                        local_control.map(|control| control.ref_change_id.to_string());
-                    if local == authoritative
-                        && local_checkpoint == authoritative_checkpoint
-                        && local_author_id.as_deref()
-                            == authoritative_coordinate
-                                .and_then(AuthoritativeBranchCoordinate::author_id)
-                        && local_ref_change_id.as_deref()
-                            == authoritative_coordinate
-                                .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                    {
+                    if local == authoritative && local_checkpoint == authoritative_checkpoint {
                         continue;
                     }
                     // Authority-known ancestry is enough to make a commit payload
@@ -4031,11 +4000,6 @@ where
                     }
                     ref_updates.push(SyncRefUpdate {
                         branch_id: branch_id.clone(),
-                        author_id: local_author_id,
-                        ref_change_id: local_ref_change_id,
-                        expected_ref_change_id: authoritative_coordinate
-                            .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                            .map(str::to_owned),
                         expected_head_commit_id: authoritative.map(|head| head.to_string()),
                         expected_checkpoint_commit_id: authoritative_coordinate
                             .and_then(AuthoritativeBranchCoordinate::checkpoint_commit_id)
@@ -4089,19 +4053,6 @@ where
                         self.import_sync_repository(SyncImport::ReplicaRefRepair {
                             updates: &[SyncRefUpdate {
                                 branch_id: branch_id.clone(),
-                                author_id: state
-                                    .authoritative_branches
-                                    .get(&branch_id)
-                                    .and_then(AuthoritativeBranchCoordinate::author_id)
-                                    .map(str::to_owned),
-                                ref_change_id: state
-                                    .authoritative_branches
-                                    .get(&branch_id)
-                                    .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                                    .map(str::to_owned),
-                                expected_ref_change_id: local_controls
-                                    .get(&branch_id)
-                                    .map(|control| control.ref_change_id.to_string()),
                                 expected_head_commit_id: Some(local_head.to_string()),
                                 expected_checkpoint_commit_id: local_controls
                                     .get(&branch_id)
@@ -4574,16 +4525,7 @@ where
                                 .control
                                 .and_then(|control| control.working_diff_checkpoint_commit_id)
                                 .map(|checkpoint| checkpoint.to_string());
-                            let author_id = observation
-                                .control
-                                .map(|control| control.author_id_string());
-                            let ref_change_id = observation
-                                .control
-                                .map(|control| control.ref_change_id.to_string());
-                            (
-                                branch_id.clone(),
-                                (head, checkpoint, author_id, ref_change_id),
-                            )
+                            (branch_id.clone(), (head, checkpoint))
                         })
                         .collect::<BTreeMap<_, _>>()
                 };
@@ -4603,15 +4545,7 @@ where
                     .collect::<Result<BTreeSet<_>, _>>()?;
                 let mut commits = BTreeMap::new();
                 let mut inline_blobs = BTreeMap::new();
-                let mut branch_chains = BTreeMap::<
-                    String,
-                    (
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                    ),
-                >::new();
+                let mut branch_chains = BTreeMap::<String, (Option<String>, Option<String>)>::new();
                 let mut preserved_reset_branches = BTreeSet::new();
                 let mut retired_upload_proof_branches = BTreeSet::new();
                 for event in events {
@@ -4664,11 +4598,6 @@ where
                         if update.expected_head_commit_id.as_deref() != authoritative
                             || update.expected_checkpoint_commit_id.as_deref()
                                 != authoritative_checkpoint
-                            || update.expected_ref_change_id.as_deref().is_some_and(|expected| {
-                                Some(expected)
-                                    != authoritative_coordinate
-                                        .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                            })
                         {
                             return Err(LixError::new(
                                 LixError::CODE_INVALID_PARAM,
@@ -4681,8 +4610,6 @@ where
                         let next_authoritative = AuthoritativeBranchCoordinate::from_wire(
                             update.head_commit_id.clone(),
                             update.checkpoint_commit_id.clone(),
-                            update.author_id.clone(),
-                            update.ref_change_id.clone(),
                             "sync delta ref",
                         )?;
                         if update.head_commit_id != update.expected_head_commit_id
@@ -4743,14 +4670,10 @@ where
                                 (
                                     update.head_commit_id.clone(),
                                     update.checkpoint_commit_id.clone(),
-                                    update.author_id.clone(),
-                                    update.ref_change_id.clone(),
                                 )
                             });
                         chain.0 = update.head_commit_id.clone();
                         chain.1 = update.checkpoint_commit_id.clone();
-                        chain.2 = update.author_id.clone();
-                        chain.3 = update.ref_change_id.clone();
                         state
                             .authoritative_branches
                             .insert(update.branch_id.clone(), next_authoritative);
@@ -4771,26 +4694,14 @@ where
                 let mut reset_pending_dependents = false;
                 let adapter = self.storage_adapter();
                 let read = adapter.begin_read(StorageReadOptions::default()).await?;
-                for (branch_id, (head, checkpoint, author_id, ref_change_id)) in &branch_chains {
+                for (branch_id, (head, checkpoint)) in &branch_chains {
                     let local = local_coordinates
                         .get(branch_id)
                         .expect("folded delta branch was loaded once");
-                    let previous = previous_authoritative.get(branch_id);
-                    let local_metadata_advanced_without_head = previous.is_some_and(|previous| {
-                        local.0.as_deref()
-                            == previous.head_commit_id()
-                            && local.1.as_deref()
-                                == previous.checkpoint_commit_id()
-                            && (local.2.as_deref()
-                                != previous.author_id()
-                                || local.3.as_deref()
-                                    != previous.ref_change_id())
-                    });
                     // Own acknowledged prefixes must never roll back a newer
                     // local transaction. A competing server branch wins. Walk
                     // only the local chain; no historical network demand.
-                    let preserve_local = local_metadata_advanced_without_head
-                        || preserved_reset_branches.contains(branch_id)
+                    let preserve_local = preserved_reset_branches.contains(branch_id)
                         || match (local.0.as_deref(), head.as_deref()) {
                             (Some(local_head), Some(server_head)) if local_head != server_head => {
                                 let server_head =
@@ -4808,18 +4719,10 @@ where
                             _ => false,
                         };
                     if !preserve_local
-                        && (
-                            local.0.as_deref(),
-                            local.1.as_deref(),
-                            local.2.as_deref(),
-                            local.3.as_deref(),
-                        ) != (
-                            head.as_deref(),
-                            checkpoint.as_deref(),
-                            author_id.as_deref(),
-                            ref_change_id.as_deref(),
-                        )
+                        && (local.0.as_deref(), local.1.as_deref())
+                            != (head.as_deref(), checkpoint.as_deref())
                     {
+                        let previous = previous_authoritative.get(branch_id);
                         reset_pending_dependents |= (local.0.as_deref(), local.1.as_deref())
                             != (
                                 previous.and_then(AuthoritativeBranchCoordinate::head_commit_id),
@@ -4835,17 +4738,6 @@ where
                     // it can replace that newer coordinate.
                     applicable_refs.push(SyncRefUpdate {
                         branch_id: branch_id.clone(),
-                        author_id: if preserve_local {
-                            local.2.clone()
-                        } else {
-                            author_id.clone()
-                        },
-                        ref_change_id: if preserve_local {
-                            local.3.clone()
-                        } else {
-                            ref_change_id.clone()
-                        },
-                        expected_ref_change_id: local.3.clone(),
                         expected_head_commit_id: local.0.clone(),
                         expected_checkpoint_commit_id: local.1.clone(),
                         head_commit_id: if preserve_local {
@@ -4875,15 +4767,13 @@ where
                                 control
                                     .working_diff_checkpoint_commit_id
                                     .map(|id| id.to_string()),
-                                Some(control.author_id_string()),
-                                Some(control.ref_change_id.to_string()),
                             )
                         });
                     }
                     for branch_id in state.authoritative_branches.keys() {
                         local_coordinates
                             .entry(branch_id.clone())
-                            .or_insert((None, None, None, None));
+                            .or_insert((None, None));
                     }
                     applicable_refs = local_coordinates
                         .iter()
@@ -4891,13 +4781,6 @@ where
                             let coordinate = state.authoritative_branches.get(branch_id);
                             SyncRefUpdate {
                                 branch_id: branch_id.clone(),
-                                author_id: coordinate
-                                    .and_then(AuthoritativeBranchCoordinate::author_id)
-                                    .map(str::to_owned),
-                                ref_change_id: coordinate
-                                    .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                                    .map(str::to_owned),
-                                expected_ref_change_id: local.3.clone(),
                                 expected_head_commit_id: local.0.clone(),
                                 expected_checkpoint_commit_id: local.1.clone(),
                                 head_commit_id: coordinate
@@ -4922,7 +4805,7 @@ where
                 let adapter = self.storage_adapter();
                 let read = adapter.begin_read(StorageReadOptions::default()).await?;
                 let mut roots = BTreeMap::<CommitId, SyncLiveValueRootId>::new();
-                for (branch_id, (head, checkpoint, _, _)) in &branch_chains {
+                for (branch_id, (head, checkpoint)) in &branch_chains {
                     match (head.as_deref(), checkpoint.as_deref()) {
                         (Some(head), Some(checkpoint)) => {
                             let head = CommitId::parse_lix(head, "sync delta branch head")?;
@@ -5668,11 +5551,7 @@ where
             let change = sync_ref_change_record(
                 &branch.branch_id,
                 head,
-                ChangeId::parse_lix(
-                    &branch.ref_change_id,
-                    "sync snapshot branch ref change",
-                )?,
-                &branch.author_id,
+                &record.account_id,
                 record.created_at,
             )?;
             if changes
@@ -5715,23 +5594,6 @@ where
             &mut writes,
             &authored_locators.into_values().collect::<Vec<_>>(),
         );
-        let mut existing_change_ids = BTreeSet::new();
-        if !existing_complete.is_empty() {
-            // A hosted copy can already contain immutable changes selected by
-            // the incoming snapshot. A fresh replica has no overlapping
-            // commit bodies and skips these extra point reads entirely.
-            for change in changes.values() {
-                if let Some(existing) = load_existing_sync_change(&read, change.change_id).await? {
-                    if !sync_change_records_equal(&existing, change)? {
-                        return Err(immutable_object_mismatch("change", change.change_id));
-                    }
-                    existing_change_ids.insert(change.change_id);
-                }
-            }
-        }
-        changes.retain(|change_id, _| {
-            !existing_change_ids.contains(change_id)
-        });
         ChangelogContext::new()
             .writer(&mut &read, &mut writes)
             .stage_certified_sparse_append(ChangelogAppend {
@@ -5903,11 +5765,7 @@ where
                     .control
                     .map_or(record.created_at, |control| control.created_at),
                 updated_at: record.created_at,
-                ref_change_id: ChangeId::parse_lix(
-                    &branch.ref_change_id,
-                    "sync snapshot branch ref change",
-                )?,
-                author_id: BranchHeadControl::author_id_bytes(&branch.author_id)?,
+                ref_change_id: sync_ref_change_id(&branch.branch_id, Some(head)),
                 schema_presence_bloom: [0; 4],
             };
             control.note_schemas(schemas.iter().map(String::as_str));
@@ -5921,8 +5779,6 @@ where
                     AuthoritativeBranchCoordinate::from_wire(
                         branch.head_commit_id.clone(),
                         branch.checkpoint_commit_id.clone(),
-                        Some(branch.author_id.clone()),
-                        Some(branch.ref_change_id.clone()),
                         "sync snapshot branch",
                     )?,
                 ))
@@ -6379,30 +6235,6 @@ where
                     "sync ref head and checkpoint coordinates must be paired",
                 ));
             }
-            if update.author_id.as_deref().is_some_and(|author_id| {
-                BranchHeadControl::author_id_bytes(author_id).is_err()
-            }) || head.is_some() != update.author_id.is_some()
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync ref authorId must identify the writer for every live branch ref",
-                ));
-            }
-            for ref_change_id in [
-                update.expected_ref_change_id.as_deref(),
-                update.ref_change_id.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                ChangeId::parse_lix(ref_change_id, "sync ref change ID")?;
-            }
-            if head.is_some() != update.ref_change_id.is_some() {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync ref head and refChangeId coordinates must be paired",
-                ));
-            }
             validate_sync_baseline_transition_chain(
                 &parsed,
                 expected,
@@ -6486,39 +6318,20 @@ where
             let current_checkpoint = observation
                 .control
                 .and_then(|control| control.working_diff_checkpoint_commit_id);
-            let current_ref_change_id = observation.control.map(|control| control.ref_change_id);
-            let expected_ref_change_id = update
-                .expected_ref_change_id
-                .as_deref()
-                .map(|id| ChangeId::parse_lix(id, "sync expected ref change ID"))
-                .transpose()?;
-            let ref_change_id = update
-                .ref_change_id
-                .as_deref()
-                .map(|id| ChangeId::parse_lix(id, "sync ref change ID"))
-                .transpose()?;
-            let target_author_id = update
-                .author_id
-                .as_deref()
-                .map(BranchHeadControl::author_id_bytes)
-                .transpose()?;
-            let current_author_id = observation.control.map(|control| control.author_id);
-            if current == *head
-                && current_checkpoint == *checkpoint
-                && current_ref_change_id == ref_change_id
-                && current_author_id == target_author_id
-            {
+            if current == *head && current_checkpoint == *checkpoint {
                 continue;
             }
-            if current != *expected
-                || current_checkpoint != *expected_checkpoint
-                || expected_ref_change_id.is_some_and(|expected| {
-                    current_ref_change_id != Some(expected)
-                })
-            {
+            if current != *expected || current_checkpoint != *expected_checkpoint {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
-                    format!("sync ref '{}' changed from its expected row version", update.branch_id),
+                    format!(
+                        "sync ref '{}' expected coordinate ({:?}, {:?}), found ({:?}, {:?})",
+                        update.branch_id,
+                        expected.map(|id| id.to_string()),
+                        expected_checkpoint.map(|id| id.to_string()),
+                        current.map(|id| id.to_string()),
+                        current_checkpoint.map(|id| id.to_string()),
+                    ),
                 ));
             }
             changed_refs.push((update.clone(), *head, *checkpoint));
@@ -6892,7 +6705,6 @@ where
                 row_pk: row.row_pk(),
                 change_id: row.change_id(),
                 commit_id: row.commit_id(),
-                author_id: row.author_id(),
                 deleted: row.deleted(),
                 created_at: row.created_at(),
                 updated_at: row.updated_at(),
@@ -7565,17 +7377,7 @@ where
             let change = sync_ref_change_record(
                 &update.branch_id,
                 *head,
-                ChangeId::parse_lix(
-                    update
-                        .ref_change_id
-                        .as_deref()
-                        .expect("validated live sync ref carries refChangeId"),
-                    "sync ref change ID",
-                )?,
-                update
-                    .author_id
-                    .as_deref()
-                    .expect("validated live sync ref carries authorId"),
+                &record.account_id,
                 record.created_at,
             )?;
             match load_existing_sync_change(&read, change.change_id).await? {
@@ -7679,23 +7481,7 @@ where
             let current_checkpoint = observation
                 .control
                 .and_then(|control| control.working_diff_checkpoint_commit_id);
-            let current_ref_change_id = observation.control.map(|control| control.ref_change_id);
-            let current_author_id = observation.control.map(|control| control.author_id);
-            let ref_change_id = update
-                .ref_change_id
-                .as_deref()
-                .map(|id| ChangeId::parse_lix(id, "sync ref change ID"))
-                .transpose()?;
-            let author_id = update
-                .author_id
-                .as_deref()
-                .map(BranchHeadControl::author_id_bytes)
-                .transpose()?;
-            if current_head == *head
-                && current_checkpoint == *checkpoint
-                && current_ref_change_id == ref_change_id
-                && current_author_id == author_id
-            {
+            if current_head == *head && current_checkpoint == *checkpoint {
                 continue;
             }
             let expected_head = update
@@ -7708,16 +7494,7 @@ where
                 .as_deref()
                 .map(|id| CommitId::parse_lix(id, "sync expected checkpoint"))
                 .transpose()?;
-            let expected_ref_change_id = update
-                .expected_ref_change_id
-                .as_deref()
-                .map(|id| ChangeId::parse_lix(id, "sync expected ref change ID"))
-                .transpose()?;
-            if current_head != expected_head
-                || current_checkpoint != expected_checkpoint
-                || expected_ref_change_id
-                    .is_some_and(|expected| current_ref_change_id != Some(expected))
-            {
+            if current_head != expected_head || current_checkpoint != expected_checkpoint {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
                     format!(
@@ -7874,7 +7651,6 @@ where
                             row_pk: entry.identity.row_pk(),
                             change_id: Some(after.change_id),
                             commit_id: Some(after.commit_id),
-                            author_id: &after.author_id,
                             untracked: false,
                             deleted: after.deleted,
                             created_at: after.created_at,
@@ -7967,8 +7743,7 @@ where
                     .control
                     .map_or(head_record.created_at, |control| control.created_at),
                 updated_at: head_record.created_at,
-                ref_change_id: ref_change_id.expect("validated live sync ref carries refChangeId"),
-                author_id: author_id.expect("validated live sync ref carries authorId"),
+                ref_change_id: sync_ref_change_id(&update.branch_id, Some(*head)),
                 schema_presence_bloom: [0; 4],
             };
             control.schema_presence_bloom = [u64::MAX; 4];
@@ -8222,7 +7997,6 @@ where
             row_pk: row.row_pk(),
             change_id: row.change_id(),
             commit_id: row.commit_id(),
-            author_id: row.author_id(),
             deleted: false,
             created_at: row.created_at(),
             updated_at: row.updated_at(),
@@ -8687,8 +8461,6 @@ where
                 .await?;
             branches.push(SyncBranchHead {
                 branch_id: branch_id.clone(),
-                author_id: control.author_id_string(),
-                ref_change_id: control.ref_change_id.to_string(),
                 head_commit_id: Some(control.head_commit_id.to_string()),
                 checkpoint_commit_id: Some(checkpoint.to_string()),
                 checkpoint_state_root_id: format_sync_live_value_root_id(&checkpoint_state_root_id),
@@ -8769,8 +8541,6 @@ mod tests {
                         .working_diff_checkpoint_commit_id
                         .unwrap()
                         .to_string(),
-                    author_id: control.author_id_string(),
-                    ref_change_id: control.ref_change_id.to_string(),
                 },
             );
         }
@@ -9568,9 +9338,6 @@ mod tests {
                         AuthoritativeBranchCoordinate::Headed {
                             head_commit_id: receipt.initial_commit_id.clone(),
                             checkpoint_commit_id: receipt.initial_commit_id,
-                            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
-                            ref_change_id: ChangeId::for_test_label("empty-delta-initial-ref")
-                                .to_string(),
                         },
                     )]),
                     certified_branch_roots: BTreeMap::new(),
@@ -10662,8 +10429,6 @@ mod tests {
                     AuthoritativeBranchCoordinate::from_wire(
                         branch.head_commit_id.clone(),
                         branch.checkpoint_commit_id.clone(),
-                        Some(branch.author_id.clone()),
-                        Some(branch.ref_change_id.clone()),
                         "test snapshot branch",
                     )
                     .expect("snapshot branch coordinate should be complete"),
@@ -10854,7 +10619,6 @@ mod tests {
                         updated_at: source.created_at.to_string(),
                         change_id: source.change_id,
                         commit_id,
-                        author_id: source.account_id.clone(),
                     }
                 })
                 .collect(),
@@ -13235,9 +12999,6 @@ mod tests {
             commits: source_commits,
             ref_updates: vec![SyncRefUpdate {
                 branch_id: branch_id.clone(),
-                author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
-                ref_change_id: Some(ChangeId::for_test_label("exact-push-ref").to_string()),
-                expected_ref_change_id: None,
                 expected_head_commit_id: None,
                 expected_checkpoint_commit_id: None,
                 head_commit_id: Some(source_head.clone()),
@@ -13326,99 +13087,6 @@ mod tests {
             .expect("control should load")
             .expect("control should exist");
         assert!(control.working_diff_checkpoint_commit_id.is_some());
-    }
-
-    #[tokio::test]
-    async fn same_head_sync_ref_update_preserves_writer_and_change_id() {
-        let authority = open_lix().await.expect("authority should open");
-        let snapshot = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("snapshot should load");
-        let SyncRepositoryPullResponse::Snapshot {
-            cursor,
-            default_branch_id,
-            branches,
-            ..
-        } = snapshot
-        else {
-            panic!("initial sync should return a snapshot");
-        };
-        let before = branches
-            .iter()
-            .find(|branch| branch.branch_id == default_branch_id)
-            .expect("default branch should be present")
-            .clone();
-        let next_ref_change_id =
-            ChangeId::for_test_label("same-head-ref-writer-change").to_string();
-        let update = SyncRefUpdate {
-            branch_id: before.branch_id.clone(),
-            author_id: Some(crate::SYSTEM_ACCOUNT_ID.to_owned()),
-            ref_change_id: Some(next_ref_change_id.clone()),
-            expected_ref_change_id: Some(before.ref_change_id.clone()),
-            expected_head_commit_id: before.head_commit_id.clone(),
-            expected_checkpoint_commit_id: before.checkpoint_commit_id.clone(),
-            head_commit_id: before.head_commit_id.clone(),
-            checkpoint_commit_id: before.checkpoint_commit_id.clone(),
-        };
-        authority
-            .push_sync_repository(&SyncPushRequest {
-                commits: Vec::new(),
-                ref_updates: vec![update.clone()],
-                inline_blobs: Vec::new(),
-            })
-            .await
-            .expect("same-head ref metadata update should publish");
-
-        let after = authority
-            .pull_sync_repository(None, 1)
-            .await
-            .expect("updated snapshot should load");
-        let SyncRepositoryPullResponse::Snapshot { branches, .. } = after else {
-            panic!("snapshot remains a snapshot");
-        };
-        let current = branches
-            .iter()
-            .find(|branch| branch.branch_id == before.branch_id)
-            .expect("default branch should remain present");
-        assert_eq!(current.head_commit_id, before.head_commit_id);
-        assert_eq!(current.checkpoint_commit_id, before.checkpoint_commit_id);
-        assert_eq!(current.author_id, crate::SYSTEM_ACCOUNT_ID);
-        assert_eq!(current.ref_change_id, next_ref_change_id);
-
-        let mut stale = update;
-        stale.ref_change_id = Some(ChangeId::for_test_label("same-head-stale-target").to_string());
-        let error = authority
-            .push_sync_repository(&SyncPushRequest {
-                commits: Vec::new(),
-                ref_updates: vec![stale],
-                inline_blobs: Vec::new(),
-            })
-            .await
-            .expect_err("same-head updates must compare the previous ref row version");
-        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
-
-        let delta = authority
-            .pull_sync_repository(Some(cursor), 1)
-            .await
-            .expect("same-head ref update should be in the delta");
-        let SyncRepositoryPullResponse::Delta { events, .. } = delta else {
-            panic!("same-head update should produce a delta");
-        };
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].ref_updates,
-            vec![SyncRefUpdate {
-                branch_id: before.branch_id,
-                author_id: Some(crate::SYSTEM_ACCOUNT_ID.to_owned()),
-                ref_change_id: Some(next_ref_change_id),
-                expected_ref_change_id: Some(before.ref_change_id),
-                expected_head_commit_id: before.head_commit_id.clone(),
-                expected_checkpoint_commit_id: before.checkpoint_commit_id.clone(),
-                head_commit_id: before.head_commit_id,
-                checkpoint_commit_id: before.checkpoint_commit_id,
-            }]
-        );
     }
 
     #[tokio::test]
@@ -13545,9 +13213,6 @@ mod tests {
                 commits: vec![source_commit],
                 ref_updates: vec![SyncRefUpdate {
                     branch_id: target_branch,
-                    author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
-                    ref_change_id: Some(ChangeId::for_test_label("stale-push-ref").to_string()),
-                    expected_ref_change_id: None,
                     expected_head_commit_id: None,
                     expected_checkpoint_commit_id: None,
                     head_commit_id: Some(source_head.clone()),
@@ -13583,11 +13248,6 @@ mod tests {
                 commits: Vec::new(),
                 ref_updates: vec![SyncRefUpdate {
                     branch_id: default_branch_id.clone(),
-                    author_id: None,
-                    ref_change_id: None,
-                    expected_ref_change_id: Some(
-                        ChangeId::for_test_label("delete-default-expected-ref").to_string(),
-                    ),
                     expected_head_commit_id: Some(default_head_id.clone()),
                     expected_checkpoint_commit_id: Some(default_head_id.clone()),
                     head_commit_id: None,
@@ -14850,8 +14510,6 @@ mod tests {
                     first.ref_updates[0].head_commit_id.clone();
                 foreign.ref_updates[0].expected_checkpoint_commit_id =
                     first.ref_updates[0].checkpoint_commit_id.clone();
-                foreign.ref_updates[0].expected_ref_change_id =
-                    first.ref_updates[0].ref_change_id.clone();
                 authority
                     .push_sync_repository(&foreign)
                     .await
@@ -15321,9 +14979,6 @@ mod tests {
         drop(read);
         let update = SyncRefUpdate {
             branch_id: branch_id.clone(),
-            author_id: Some(before.author_id_string()),
-            ref_change_id: Some(ChangeId::for_test_label("repair-target-ref").to_string()),
-            expected_ref_change_id: Some(before.ref_change_id.to_string()),
             expected_head_commit_id: Some(old_head.clone()),
             expected_checkpoint_commit_id: before
                 .working_diff_checkpoint_commit_id
@@ -15604,14 +15259,6 @@ mod tests {
             AuthoritativeBranchCoordinate::Headed {
                 head_commit_id: authority_head.clone(),
                 checkpoint_commit_id,
-                author_id: published.ref_updates[0]
-                    .author_id
-                    .clone()
-                    .expect("published live ref carries an author"),
-                ref_change_id: published.ref_updates[0]
-                    .ref_change_id
-                    .clone()
-                    .expect("published live ref carries a change ID"),
             },
         );
         local
@@ -15717,14 +15364,6 @@ mod tests {
             AuthoritativeBranchCoordinate::Headed {
                 head_commit_id: authority_head,
                 checkpoint_commit_id,
-                author_id: published.ref_updates[0]
-                    .author_id
-                    .clone()
-                    .expect("published live ref carries an author"),
-                ref_change_id: published.ref_updates[0]
-                    .ref_change_id
-                    .clone()
-                    .expect("published live ref carries a change ID"),
             },
         );
         local
@@ -15786,8 +15425,6 @@ mod tests {
         let headed = AuthoritativeBranchCoordinate::from_wire(
             Some("head".to_owned()),
             Some("checkpoint".to_owned()),
-            Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
-            Some(ChangeId::for_test_label("coordinate-ref-change").to_string()),
             "test coordinate",
         )
         .expect("a complete headed coordinate should parse");
@@ -15797,8 +15434,6 @@ mod tests {
                 "state": "headed",
                 "headCommitId": "head",
                 "checkpointCommitId": "checkpoint",
-                "authorId": crate::ANONYMOUS_ACCOUNT_ID,
-                "refChangeId": ChangeId::for_test_label("coordinate-ref-change").to_string(),
             }),
         );
         assert_eq!(
@@ -15809,7 +15444,7 @@ mod tests {
             headed,
         );
         assert_eq!(
-            AuthoritativeBranchCoordinate::from_wire(None, None, None, None, "test coordinate")
+            AuthoritativeBranchCoordinate::from_wire(None, None, "test coordinate")
                 .expect("a deleted coordinate should parse"),
             AuthoritativeBranchCoordinate::Deleted,
         );
@@ -15818,13 +15453,7 @@ mod tests {
             (None, Some("checkpoint".to_owned())),
         ] {
             assert_eq!(
-                AuthoritativeBranchCoordinate::from_wire(
-                    head,
-                    checkpoint,
-                    Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
-                    Some(ChangeId::for_test_label("coordinate-ref-change").to_string()),
-                    "test coordinate",
-                )
+                AuthoritativeBranchCoordinate::from_wire(head, checkpoint, "test coordinate")
                     .expect_err("a partial coordinate must be rejected")
                     .code,
                 LixError::CODE_INVALID_PARAM,

@@ -678,11 +678,10 @@ where
 
     fn index_value_ref(
         row: &crate::tracked_state::MaterializedTrackedStateRow,
-    ) -> Result<crate::tracked_state::TrackedStateIndexValueRef<'_>, LixError> {
+    ) -> Result<crate::tracked_state::TrackedStateIndexValueRef, LixError> {
         Ok(crate::tracked_state::TrackedStateIndexValueRef {
             change_id: row.change_id,
             commit_id: row.commit_id,
-            author_id: &row.author_id,
             deleted: false,
             created_at: crate::common::LixTimestamp::parse(&row.created_at)
                 .map_err(|error| migration_error(format!("repair created_at: {error}")))?,
@@ -1896,7 +1895,6 @@ mod tests {
             updated_at: created_at.to_string(),
             change_id: crate::changelog::ChangeId::for_test_label(change_label),
             commit_id,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 

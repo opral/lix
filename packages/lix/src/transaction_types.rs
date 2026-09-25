@@ -816,7 +816,6 @@ impl CertifiedParameterBatch {
             })
             .collect();
         let mut prepared = PreparedStateBatch {
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             slots: Vec::new(),
             dense_certified_parameter: Some(DenseCertifiedParameterSlots {
                 len: row_count,
@@ -1543,7 +1542,6 @@ impl RawWriteBatch {
             });
         }
         Ok(PreparedStateBatch {
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             slots: prepared_slots,
             dense_certified_parameter: None,
             row_pks: prepared_row_pks,
@@ -2465,8 +2463,6 @@ pub(crate) struct BranchHeadTarget {
     pub(crate) source_branch_id: Option<uuid::Uuid>,
     pub(crate) head_commit_id: Option<CommitId>,
     pub(crate) ref_change_id: ChangeId,
-    /// Account that authored this branch-ref publication.
-    pub(crate) author_id: [u8; 16],
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
 }
@@ -2985,7 +2981,6 @@ impl TestPreparedStateRow {
             commit_id: self.commit_id,
             untracked: self.untracked,
             branch_id: &self.branch_id,
-            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             durable_predecessor: None,
         }
     }
@@ -3051,8 +3046,6 @@ impl StagedIndexValues {
 /// retains one underlying canonical arena while preserving row-local refs.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedStateBatch {
-    /// Account stamped at the SQL write boundary (shared by the batch).
-    author_id: String,
     slots: Vec<PreparedStateSlot>,
     /// Fixed-shape certified parameter writes keep batch-common facts once and
     /// derive identity/JSON ordinals from row position. Any operation that
@@ -3197,7 +3190,6 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: &'a SharedStr,
-    pub(crate) author_id: &'a str,
     pub(crate) durable_predecessor: Option<&'a CertifiedCurrentStatePredecessor>,
 }
 
@@ -3260,7 +3252,6 @@ impl PreparedStateBatch {
         string_capacity: usize,
     ) -> Self {
         Self {
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             slots: Vec::with_capacity(row_capacity),
             dense_certified_parameter: None,
             row_pks: Vec::with_capacity(row_capacity),
@@ -3292,10 +3283,6 @@ impl PreparedStateBatch {
     /// commit will materialize.
     pub(crate) fn set_staged_index_values(&mut self, values: StagedIndexValues) {
         self.staged_index_values = values;
-    }
-
-    pub(crate) fn set_author_id(&mut self, author_id: impl Into<String>) {
-        self.author_id = author_id.into();
     }
 
     pub(crate) fn staged_index_values(&self) -> &StagedIndexValues {
@@ -3497,7 +3484,6 @@ impl PreparedStateBatch {
                 commit_id: dense.commit_id,
                 untracked: dense.untracked,
                 branch_id: &self.strings[dense.branch_id as usize],
-                author_id: &self.author_id,
                 durable_predecessor: dense
                     .durable_predecessors
                     .as_ref()
@@ -3523,7 +3509,6 @@ impl PreparedStateBatch {
             commit_id: slot.commit_id,
             untracked: slot.untracked,
             branch_id: &self.strings[slot.branch_id as usize],
-            author_id: &self.author_id,
             durable_predecessor: slot
                 .durable_predecessor
                 .map(|index| &self.durable_predecessors[index as usize]),
@@ -4386,7 +4371,6 @@ impl PartialEq for PreparedStateRowRef<'_> {
             && self.commit_id == other.commit_id
             && self.untracked == other.untracked
             && self.branch_id == other.branch_id
-            && self.author_id == other.author_id
     }
 }
 

@@ -150,9 +150,9 @@ const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS13";
 const COMMIT_STATE_MANIFEST_V12_FORMAT_MAGIC: &[u8] = b"LXCS12";
 const COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC: &[u8] = b"LXCS10";
-// Version 4 includes row author identity in packed mutation parts. Earlier
-// versions cannot preserve the selected row writer and are deliberately rejected.
-const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI4";
+// Version 3 authenticates direct-part ownership bitmaps. LXMI1 has a
+// materially different packed shape and is deliberately rejected.
+const COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC: &[u8] = b"LXMI3";
 const COMMIT_STATE_MUTATION_INVENTORY_RAW: u8 = 0;
 const COMMIT_STATE_MUTATION_INVENTORY_LZ4: u8 = 1;
 const COMMIT_STATE_MUTATION_INVENTORY_MIN_COMPRESS_BYTES: usize = 256;
@@ -1337,10 +1337,6 @@ async fn load_current_state_values_from_descriptors(
             values[*output_index] = Some(TrackedStateIndexValue {
                 change_id: change_id_from_packed_address(owner, packed),
                 commit_id: owner,
-                author_id: decoded
-                    .author_id(usize::from(found.ordinal))?
-                    .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?
-                    .to_owned(),
                 deleted: false,
                 created_at: source.uniform_created_at,
                 updated_at: source.uniform_updated_at,
@@ -1555,7 +1551,6 @@ fn apply_columnar_identity_page(
         values[output_index] = Some(TrackedStateIndexValue {
             change_id: change_id_from_packed_address(owner, packed),
             commit_id: owner,
-            author_id: source.author_id.clone(),
             deleted: false,
             created_at: source.uniform_created_at,
             updated_at: source.uniform_updated_at,
@@ -4566,12 +4561,6 @@ async fn load_scoped_current_state_descriptor_rows(
                         value: TrackedStateIndexValue {
                             change_id: change_id_from_packed_address(owner, packed),
                             commit_id: owner,
-                            author_id: decoded
-                                .author_id(ordinal)?
-                                .ok_or_else(|| {
-                                    replacement_payload_error("replacement row omitted author")
-                                })?
-                                .to_owned(),
                             deleted: false,
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
@@ -4682,7 +4671,6 @@ async fn load_scoped_current_state_descriptor_rows(
                 row_group_set_id: source.source_id,
                 manifest_digest: descriptor.content_digest,
                 schema_key: manifest.namespace.clone(),
-                author_id: source.author_id.clone(),
                 row_count: manifest.groups.iter().map(|group| group.row_count).sum(),
                 group_row_counts: manifest
                     .groups
@@ -4723,7 +4711,7 @@ async fn load_scoped_current_state_descriptor_rows(
                         row_index,
                         &synthetic_parts,
                         change_id,
-                        &source.author_id,
+                        "",
                     )?;
                     Ok(CurrentStateDataRow {
                         encoded_key: encode_key_ref(TrackedStateKeyRef {
@@ -4734,7 +4722,6 @@ async fn load_scoped_current_state_descriptor_rows(
                         value: TrackedStateIndexValue {
                             change_id,
                             commit_id: owner,
-                            author_id: record.account_id.clone(),
                             deleted: false,
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
@@ -6162,7 +6149,6 @@ pub(crate) struct ReplacementPartInput<'a> {
     commit_id: CommitId,
     created_at: crate::common::LixTimestamp,
     updated_at: crate::common::LixTimestamp,
-    author_id: &'a str,
     metadata: Option<&'a lix_schema::Jsonb>,
     snapshot: &'a [u8],
 }
@@ -6199,7 +6185,6 @@ impl<'a> ReplacementPartInputRef<'a> for TrackedStateCommitDeltaRef<'a> {
             commit_id: self.delta.commit_id,
             created_at: self.delta.created_at,
             updated_at: self.delta.updated_at,
-            author_id: self.delta.author_id,
             metadata: self.metadata,
             snapshot: self.snapshot.ok_or_else(|| {
                 LixError::new(
@@ -6228,7 +6213,6 @@ impl<'a> ReplacementPartInputRef<'a> for TrackedStateSingleStringReplacementRef<
             commit_id: self.commit_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            author_id: self.author_id,
             metadata: self.metadata,
             snapshot: self.snapshot,
         })
@@ -6293,7 +6277,6 @@ where
         key_end: usize,
         metadata: Option<&'a lix_schema::Jsonb>,
         snapshot: &'a [u8],
-        author_id: &'a str,
     }
 
     let suffix_row_count = deltas.len();
@@ -6373,7 +6356,6 @@ where
             key_end: delta.key_end,
             metadata: delta.metadata,
             snapshot: delta.snapshot,
-            author_id: delta.author_id,
         });
         if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
             encode_replacement_part_prefix(
@@ -6405,7 +6387,6 @@ where
                 .map(
                     |row| crate::tracked_state::replacement_part::ReplacementPartRowRef {
                         encoded_key: &key_arena[row.key_start..row.key_end],
-                        author_id: row.author_id,
                         metadata: row.metadata,
                         snapshot: row.snapshot,
                     },
@@ -6767,7 +6748,6 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             TrackedStateIndexValueRef {
                 change_id,
                 commit_id,
-                author_id: delta.delta.author_id,
                 deleted: delta.delta.deleted,
                 created_at: delta.delta.created_at,
                 updated_at: delta.delta.updated_at,
@@ -6842,7 +6822,6 @@ fn stage_commit_deltas_inner(
             TrackedStateIndexValueRef {
                 change_id: delta.delta.change_id,
                 commit_id: delta.delta.commit_id,
-                author_id: delta.delta.author_id,
                 deleted: delta.delta.deleted,
                 created_at: delta.delta.created_at,
                 updated_at: delta.delta.updated_at,
@@ -6949,7 +6928,6 @@ fn stage_commit_deltas_inner(
                 entry.value = Bytes::from(encode_value_ref(TrackedStateIndexValueRef {
                     change_id,
                     commit_id: value.commit_id,
-                    author_id: &value.author_id,
                     deleted: value.deleted,
                     created_at: value.created_at,
                     updated_at: value.updated_at,
@@ -7869,6 +7847,7 @@ async fn route_direct_change_records_for_state(
             super::mutation_directory::record_direct_route_claimed_rows(owned_indices.len());
             let records = load_columnar_direct_change_records(
                 store,
+                state,
                 parts,
                 &owned_indices
                     .iter()
@@ -8021,6 +8000,7 @@ async fn route_direct_change_records_for_state(
 
 async fn load_columnar_direct_change_records(
     store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
     locators: &[CommitDeltaChangeLocator],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
@@ -8068,7 +8048,7 @@ async fn load_columnar_direct_change_records(
                     row_in_page,
                     parts,
                     locator.change_id,
-                    &parts.author_id,
+                    &state.change_account_id,
                 )?);
             }
             Ok(())
@@ -8686,7 +8666,7 @@ async fn load_selected_change_records_from_state(
         #[cfg(any(test, feature = "storage-benches"))]
         super::mutation_directory::record_direct_route_claimed_rows(unique_locators.len());
         if let Some(parts) = state.mutations.columnar_parts.as_ref() {
-            load_columnar_direct_change_records(store, parts, &unique_locators).await?
+            load_columnar_direct_change_records(store, state, parts, &unique_locators).await?
         } else {
             let routed = load_physical_direct_change_records(
                 store,
@@ -8718,7 +8698,7 @@ async fn load_selected_change_records_from_state(
                 .collect::<Result<Vec<_>, _>>()?
         }
     } else if let Some(parts) = state.mutations.columnar_parts.as_ref() {
-        load_columnar_direct_change_records(store, parts, &unique_locators).await?
+        load_columnar_direct_change_records(store, state, parts, &unique_locators).await?
     } else {
         if state.mutations.inline_part.is_empty() {
             return Err(replacement_payload_error(
@@ -9722,7 +9702,6 @@ async fn load_columnar_mutation_values_encoded(
             output[output_index] = Some(TrackedStateIndexValue {
                 change_id: change_id_from_packed_address(commit_id, packed),
                 commit_id,
-                author_id: parts.author_id.clone(),
                 deleted: false,
                 created_at: parts.uniform_created_at,
                 updated_at: parts.uniform_updated_at,
@@ -9757,6 +9736,7 @@ async fn load_columnar_owned_entries(
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     use datafusion::arrow::array::{Array, StringArray};
 
@@ -9839,18 +9819,12 @@ async fn load_columnar_owned_entries(
                 value: TrackedStateIndexValue {
                     change_id,
                     commit_id,
-                    author_id: parts.author_id.clone(),
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
                 },
                 change_record: decode_columnar_change_record(
-                    &manifest,
-                    &batch,
-                    row_index,
-                    parts,
-                    change_id,
-                    &parts.author_id,
+                    &manifest, &batch, row_index, parts, change_id, account_id,
                 )?,
                 base_coordinate: Some(TrackedStateBaseCoordinate {
                     base_commit_id: commit_id,
@@ -11977,7 +11951,7 @@ async fn load_commit_delta_members_from_manifest(
         {
             return Ok(Vec::new());
         }
-        return load_columnar_mutation_members(store, commit_id, parts).await;
+        return load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id).await;
     }
     let requested_schemas = schema_keys
         .iter()
@@ -12042,6 +12016,7 @@ async fn load_columnar_mutation_members(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
     let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
@@ -12067,12 +12042,7 @@ async fn load_columnar_mutation_members(
                 .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
             let change_id = change_id_from_packed_address(commit_id, packed);
             let change = decode_columnar_change_record(
-                &manifest,
-                &batch,
-                row_index,
-                parts,
-                change_id,
-                &parts.author_id,
+                &manifest, &batch, row_index, parts, change_id, account_id,
             )?;
             let key = TrackedStateKey {
                 schema_key: parts.schema_key.clone(),
@@ -12084,7 +12054,6 @@ async fn load_columnar_mutation_members(
                 value: TrackedStateIndexValue {
                     change_id,
                     commit_id,
-                    author_id: parts.author_id.clone(),
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
@@ -12630,7 +12599,14 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
         }
     };
     if let Some(parts) = manifest.columnar_parts.as_ref() {
-        return Box::pin(load_columnar_owned_entries(store, commit_id, keys, parts)).await;
+        return Box::pin(load_columnar_owned_entries(
+            store,
+            commit_id,
+            keys,
+            parts,
+            &manifest.account_id,
+        ))
+        .await;
     }
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
@@ -13393,7 +13369,6 @@ async fn scan_columnar_mutation_values(
                 TrackedStateIndexValue {
                     change_id: change_id_from_packed_address(commit_id, packed),
                     commit_id,
-                    author_id: parts.author_id.clone(),
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
@@ -13641,8 +13616,14 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
                 if let Some(parts) = manifest.columnar_parts.as_ref() {
                     emitted = emitted.saturating_add(
-                        visit_columnar_mutation_change_records(store, commit_id, parts, &mut visit)
-                            .await?,
+                        visit_columnar_mutation_change_records(
+                            store,
+                            commit_id,
+                            parts,
+                            &manifest.account_id,
+                            &mut visit,
+                        )
+                        .await?,
                     );
                     continue;
                 }
@@ -13754,6 +13735,7 @@ async fn visit_columnar_mutation_change_records(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
     visit: &mut impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
 ) -> Result<usize, LixError> {
     let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
@@ -13787,12 +13769,7 @@ async fn visit_columnar_mutation_change_records(
                     })?;
                 let change_id = change_id_from_packed_address(commit_id, packed);
                 visit(decode_columnar_change_record(
-                    &manifest,
-                    &batch,
-                    row_index,
-                    parts,
-                    change_id,
-                    &parts.author_id,
+                    &manifest, &batch, row_index, parts, change_id, account_id,
                 )?)?;
                 global_ordinal += 1;
             }
@@ -13917,7 +13894,8 @@ pub(crate) async fn scan_commit_delta_inventory(
                     "columnar mutation inventory has legacy external segments",
                 ));
             }
-            members = load_columnar_mutation_members(store, commit_id, parts).await?;
+            members = load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id)
+                .await?;
             parts.group_row_counts.len()
         } else if let Some(inline_segment) = manifest.inline_segment() {
             if !physical_segments.is_empty() {
@@ -16227,9 +16205,6 @@ fn decode_replacement_part_as_commit_delta(
         values.push(encode_value_ref(TrackedStateIndexValueRef {
             change_id: change_id_from_packed_address(owner_commit_id, packed),
             commit_id: owner_commit_id,
-            author_id: decoded
-                .author_id(ordinal)?
-                .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?,
             deleted: false,
             created_at: replacement.uniform_created_at,
             updated_at: replacement.uniform_updated_at,
@@ -18223,7 +18198,6 @@ mod tests {
         let rows = [
             crate::tracked_state::replacement_part::ReplacementPartRowRef {
                 encoded_key: b"cache-row",
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 metadata: None,
                 snapshot: typed.durable_payload_ref().expect("typed snapshot encodes"),
             },
@@ -18285,7 +18259,6 @@ mod tests {
                     row_pk: &fixture.row_pk,
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -18382,7 +18355,6 @@ mod tests {
                     value: TrackedStateIndexValue {
                         change_id: ChangeId::for_test_label(&format!("fragmented-source-{index}")),
                         commit_id: owner,
-                        author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                         deleted: false,
                         created_at,
                         updated_at,
@@ -18483,7 +18455,6 @@ mod tests {
                 value: TrackedStateIndexValue {
                     change_id: ChangeId::for_test_label(&format!("alternating-source-{index}")),
                     commit_id: owner,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     deleted: false,
                     created_at,
                     updated_at,
@@ -18815,7 +18786,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -18974,7 +18944,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: fixture.change_id,
                 commit_id: CommitId::for_test_label("native-projection-identity-mismatch"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -19027,7 +18996,6 @@ mod tests {
                         u32::try_from(ordinal + 1).unwrap(),
                     ),
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                     updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
@@ -19150,7 +19118,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: super::change_id_from_packed_address(commit_id, 1),
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
@@ -19249,7 +19216,6 @@ mod tests {
                             ordinal as u32 + 1,
                         ),
                         commit_id,
-                        author_id: crate::ANONYMOUS_ACCOUNT_ID,
                         deleted: false,
                         created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                         updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
@@ -19450,7 +19416,6 @@ mod tests {
             TrackedStateIndexValue {
                 change_id: self.change_id,
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: self.deleted,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
@@ -19684,7 +19649,6 @@ mod tests {
                 row_pk: &fixture.row_pk,
                 change_id: fixture.change_id,
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -20871,7 +20835,6 @@ mod tests {
                     schema_key: "compact-direct",
                     file_id: None,
                     row_pk,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     commit_id,
                     created_at,
                     updated_at: created_at,
@@ -21223,7 +21186,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: orphan_fixture.change_id,
                 commit_id: orphan_commit,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: orphan_fixture.deleted,
                 created_at: orphan_fixture.created_at,
                 updated_at: orphan_fixture.updated_at,
@@ -21730,7 +21692,6 @@ mod tests {
                     TrackedStateIndexValue {
                         change_id: ChangeId::for_test_label(&format!("source-{identity}")),
                         commit_id: source_commit,
-                        author_id: "source-author".to_owned(),
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
@@ -21747,7 +21708,6 @@ mod tests {
                     TrackedStateIndexValue {
                         change_id: ChangeId::for_test_label(&format!("local-{identity}")),
                         commit_id: alias_commit,
-                        author_id: "local-author".to_owned(),
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
@@ -21770,9 +21730,6 @@ mod tests {
             rows.iter()
                 .all(|(_, value)| value.commit_id == alias_commit)
         );
-        assert_eq!(rows[0].1.author_id, "source-author");
-        assert_eq!(rows[1].1.author_id, "local-author");
-        assert_eq!(rows[2].1.author_id, "local-author");
         assert_eq!(
             rows[2].1.change_id,
             ChangeId::for_test_label("local-c"),
@@ -22283,7 +22240,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: fixture.change_id,
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -22391,7 +22347,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: fixture.deleted,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -22503,7 +22458,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -22601,7 +22555,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -22698,7 +22651,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -22770,7 +22722,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: fixture.change_id,
                 commit_id: CommitId::for_test_label("authored-typed-invariant"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -22840,7 +22791,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -22896,7 +22846,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: fixture.change_id,
                 commit_id: CommitId::for_test_label("raw-payload-sidecar"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -22946,7 +22895,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: fixture.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: fixture.deleted,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
@@ -23091,7 +23039,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: fixture.change_id,
                 commit_id: CommitId::for_test_label("indexed-corruption"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
@@ -23635,7 +23582,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: alpha.change_id,
                     commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: alpha.deleted,
                     created_at: alpha.created_at,
                     updated_at: alpha.updated_at,
@@ -23652,7 +23598,6 @@ mod tests {
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: beta.change_id,
                     commit_id: wrong_commit_id,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: beta.deleted,
                     created_at: beta.created_at,
                     updated_at: beta.updated_at,
@@ -23922,7 +23867,6 @@ mod tests {
             value: encode_value_ref(TrackedStateIndexValueRef {
                 change_id: super::change_id_from_packed_address(commit_id, 1),
                 commit_id,
-                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,

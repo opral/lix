@@ -199,7 +199,6 @@ fn push_selected_change(
         deleted,
         created_at,
         updated_at,
-        &row.author_id,
     );
     source_membership_exact
 }
@@ -318,7 +317,6 @@ mod tests {
                 updated_at,
                 change_id: ChangeId::for_test_label("checkpoint-canonicalized-change"),
                 commit_id: CommitId::for_test_label("checkpoint-canonicalized-commit"),
-                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
             TrackedStateDiffKind::Added,
         );
