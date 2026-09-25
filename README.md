@@ -13,7 +13,7 @@
 
 Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server:
 
-<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
 
 - 📄 **Any file.** Store text, binaries, and large files, including Word, PowerPoint, CAD, and video. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV. Other formats have whole-file history.
 - 🗃️ **SQL tables.** Version rows for CRM records, logs, and other application data alongside files.
@@ -92,7 +92,7 @@ An agent can work on a branch of a repository that holds files and Lix-managed S
 
 Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. Lix can put those files and app tables in one repository with one history.
 
-<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
 
 ```ts
 // A script, a 4.8 GB video, and an app table in one transaction.

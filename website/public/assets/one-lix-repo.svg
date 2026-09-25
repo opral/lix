@@ -1,33 +1,89 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 360" role="img" aria-label="One Lix repository: versioned SQL tables for customers, orders, and events above files including CAD, Word, PowerPoint, and large video" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-  <defs>
-    <g id="table-icon" fill="none" stroke="#0891AC" stroke-width="1.4">
-      <rect x="0.7" y="0.7" width="18.6" height="18.6" rx="2"/>
-      <path d="M1 7h18M1 13h18M7 7v12"/>
-    </g>
-    <g id="file-icon" fill="none" stroke="#6B7076" stroke-width="1.4">
-      <path d="M3 1h10l5 5v13H3zM13 1v5h5" stroke-linejoin="round"/>
-      <path d="M6 10h9M6 14h9"/>
-    </g>
-    <g id="card"><rect width="194" height="40" rx="6" fill="#FFFFFF" stroke="#E6E4DD"/></g>
-  </defs>
-  <rect x="0.75" y="0.75" width="678.5" height="358.5" rx="10" fill="#F7F6F1" stroke="#EDEBE4" stroke-width="1.5"/>
-  <rect x="20" y="26" width="640" height="308" rx="12" fill="#F0FAFC" stroke="#07B6D5" stroke-width="1.5"/>
-  <rect x="272" y="18" width="136" height="17" fill="#F7F6F1"/>
-  <text x="340" y="31" text-anchor="middle" font-size="11.5" font-weight="700" letter-spacing="1" fill="#0891AC">ONE LIX REPOSITORY</text>
-  <text x="39" y="59" font-size="11" font-weight="700" letter-spacing="0.8" fill="#0891AC">SQL TABLES</text>
-  <text x="39" y="76" font-size="10.5" fill="#6B7076">CRM records, logs, application data</text>
-  <g transform="translate(38 88)"><use href="#card"/><use href="#table-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">customers</text></g>
-  <g transform="translate(243 88)"><use href="#card"/><use href="#table-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">orders</text></g>
-  <g transform="translate(448 88)"><use href="#card"/><use href="#table-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">event_log</text></g>
-  <line x1="38" y1="144" x2="642" y2="144" stroke="#BCEAF1"/>
-  <text x="39" y="168" font-size="11" font-weight="700" letter-spacing="0.8" fill="#0891AC">FILES OF ANY FORMAT</text>
-  <text x="39" y="185" font-size="10.5" fill="#6B7076">Code, documents, CAD, large media</text>
-  <g transform="translate(38 197)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">model.step</text></g>
-  <g transform="translate(243 197)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">contract.docx</text></g>
-  <g transform="translate(448 197)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">deck.pptx</text></g>
-  <g transform="translate(38 246)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">launch.mp4</text><text x="182" y="25" text-anchor="end" font-size="10" fill="#6B7076">4.8 GB</text></g>
-  <g transform="translate(243 246)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">app.js</text></g>
-  <g transform="translate(448 246)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">pricing.xlsx</text></g>
-  <rect x="38" y="300" width="604" height="22" rx="4" fill="#DDF4F8"/>
-  <text x="340" y="315" text-anchor="middle" font-size="10.5" font-weight="700" fill="#087B91">AGENT BRANCH · INSPECT CHANGES · MERGE OR ROLL BACK</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 390" role="img" aria-label="One Lix repository with files of any format beside SQL tables and example rows" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="1" y="10" width="818" height="379" rx="14" fill="#F0FAFC" stroke="#07B6D5" stroke-width="1.5"/>
+  <rect x="337" y="2" width="146" height="17" fill="#FFFFFF"/>
+  <text x="410" y="15" text-anchor="middle" font-size="12" font-weight="700" letter-spacing="1" fill="#0891AC">ONE REPOSITORY</text>
+  <text x="21" y="49" font-size="11" font-weight="700" letter-spacing="0.9" fill="#6B7076">ANY FILE FORMAT</text>
+  <text x="391" y="49" font-size="11" font-weight="700" letter-spacing="0.9" fill="#6B7076">SQL TABLES</text>
+  <g transform="translate(21 60)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#387EB8"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="700" fill="#FFFFFF">PY</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">crm-sync.py</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">4 KB</text>
+  </g>
+  <g transform="translate(21 105)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#2B579A"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="700" fill="#FFFFFF">W</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">handbook.docx</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">840 KB</text>
+  </g>
+  <g transform="translate(21 150)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#217346"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="700" fill="#FFFFFF">X</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">pricing.xlsx</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">1.2 MB</text>
+  </g>
+  <g transform="translate(21 195)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#D33B2F"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="5.8" font-weight="700" fill="#FFFFFF">PDF</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">launch-deck.pdf</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">18 MB</text>
+  </g>
+  <g transform="translate(21 240)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#5B48D6"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="700" fill="#FFFFFF">F</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">app.fig</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">96 MB</text>
+  </g>
+  <g transform="translate(21 285)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#6B7076"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="5.8" font-weight="700" fill="#FFFFFF">MP4</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">launch.mp4</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">4.8 GB</text>
+  </g>
+  <g transform="translate(21 330)">
+    <rect width="354" height="36" rx="7" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <rect x="12" y="9.5" width="17" height="17" rx="4" fill="#15171B"/>
+    <text x="20.5" y="21.2" text-anchor="middle" font-family="Arial, sans-serif" font-size="5.8" font-weight="700" fill="#FFFFFF">BIN</text>
+    <text x="38" y="23" font-size="12.5" fill="#15171B">weights.bin</text>
+    <text x="341" y="22.5" text-anchor="end" font-size="11" fill="#8A8F96">7.3 GB</text>
+  </g>
+  <g transform="translate(391 60)">
+    <rect width="408" height="94" rx="8" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <path d="M13.5 12.5h10v10h-10z M13.5 16h10 M18 16v6.5" fill="none" stroke="#6B7076" stroke-width="1.2"/>
+    <text x="32" y="23" font-size="13" font-weight="500" fill="#15171B">orders</text>
+    <text x="396" y="22" text-anchor="end" font-size="11" fill="#8A8F96">12,400 rows</text>
+    <path d="M0 34.5h408 M0 64.5h408" stroke="#EDEBE4"/>
+    <text x="12" y="54" font-size="11.5" fill="#15171B">1001</text>
+    <text x="76" y="54" font-size="11.5" fill="#15171B">paid</text>
+    <text x="12" y="84" font-size="11.5" fill="#15171B">1002</text>
+    <text x="76" y="84" font-size="11.5" fill="#15171B">shipped</text>
+  </g>
+  <g transform="translate(391 163)">
+    <rect width="408" height="94" rx="8" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <path d="M13.5 12.5h10v10h-10z M13.5 16h10 M18 16v6.5" fill="none" stroke="#6B7076" stroke-width="1.2"/>
+    <text x="32" y="23" font-size="13" font-weight="500" fill="#15171B">customers</text>
+    <text x="396" y="22" text-anchor="end" font-size="11" fill="#8A8F96">3,180 rows</text>
+    <path d="M0 34.5h408 M0 64.5h408" stroke="#EDEBE4"/>
+    <text x="12" y="54" font-size="11.5" fill="#15171B">c_12</text>
+    <text x="76" y="54" font-size="11.5" fill="#15171B">Acme GmbH</text>
+    <text x="12" y="84" font-size="11.5" fill="#15171B">c_13</text>
+    <text x="76" y="84" font-size="11.5" fill="#15171B">Northwind</text>
+  </g>
+  <g transform="translate(391 266)">
+    <rect width="408" height="94" rx="8" fill="#FFFFFF" stroke="#E6E4DD"/>
+    <path d="M13.5 12.5h10v10h-10z M13.5 16h10 M18 16v6.5" fill="none" stroke="#6B7076" stroke-width="1.2"/>
+    <text x="32" y="23" font-size="13" font-weight="500" fill="#15171B">event_log</text>
+    <text x="396" y="22" text-anchor="end" font-size="11" fill="#8A8F96">84,200 rows</text>
+    <path d="M0 34.5h408 M0 64.5h408" stroke="#EDEBE4"/>
+    <text x="12" y="54" font-size="11.5" fill="#15171B">9812</text>
+    <text x="76" y="54" font-size="11.5" fill="#15171B">order.paid</text>
+    <text x="12" y="84" font-size="11.5" fill="#15171B">9813</text>
+    <text x="76" y="84" font-size="11.5" fill="#15171B">doc.edit</text>
+  </g>
 </svg>

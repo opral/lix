@@ -12,7 +12,7 @@ Agents and tools read and write normal files. Products query and update SQL rows
 
 Lix versions tables that your app defines and writes through Lix. It does not automatically version tables in an external database. For supported file formats, plugins track changes inside files as rows. Other files still have whole-file history. See [How Lix compares to Git](./comparison-to-git.md).
 
-<img src="../website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
+<img src="../website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
 
 <img src="../website/public/assets/filesystem-database-version-control.svg" alt="Files of any format, SQL tables, version control, and embedding in one library" width="880" />
 
