@@ -8446,12 +8446,13 @@ where
         {
             let timestamp =
                 *default_timestamp.get_or_insert_with(|| self.functions.call_timestamp());
-            let prepared = rows.into_certified_prepared(
+            let mut prepared = rows.into_certified_prepared(
                 certificate,
                 self.origin_key.as_ref(),
                 timestamp,
                 &self.functions,
             )?;
+            prepared.set_author_id(self.active_account_id.clone());
             self.plugin_host
                 .record_transition_counters(typed_validation_counters);
             self.current_timestamp = default_timestamp;
@@ -8501,6 +8502,7 @@ where
                 .map(|row| usize::from(row.metadata.is_some()))
                 .sum();
             let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
+            prepared_rows.set_author_id(self.active_account_id.clone());
             for index in 0..row_count {
                 push_prepared_state_row_from_planned_parts(
                     &mut prepared_rows,
@@ -8605,6 +8607,7 @@ where
             .map(|row| usize::from(row.metadata.is_some()))
             .sum();
         let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
+        prepared_rows.set_author_id(self.active_account_id.clone());
         for (index, &scalar_ordinal) in scalar_ordinal_by_row.iter().enumerate() {
             debug_assert_ne!(scalar_ordinal, usize::MAX);
             push_prepared_state_row_from_planned_parts(
@@ -9633,6 +9636,7 @@ where
             journal.snapshot_arena,
             journal.snapshot_offsets,
             None,
+            &self.active_account_id,
             timestamp,
         )?;
         #[cfg(feature = "storage-benches")]
@@ -13292,6 +13296,7 @@ fn push_checkpoint_selected_change(
         row.deleted,
         created_at,
         row.updated_at,
+        &row.author_id,
     );
     source_membership_exact
 }
@@ -14667,6 +14672,7 @@ where
             rows.snapshot_arena,
             rows.snapshot_offsets,
             None,
+            &self.active_account_id,
             self.functions.call_timestamp(),
         )?;
         match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
@@ -17782,6 +17788,7 @@ mod tests {
             false,
             LixTimestamp::from_unix_millis_utc_lossy(0),
             LixTimestamp::from_unix_millis_utc_lossy(0),
+            crate::ANONYMOUS_ACCOUNT_ID,
         );
         selected_changes.add_selected_change_batch(batch.finish());
         let prepared_writes = PreparedWriteSet {
@@ -18059,6 +18066,7 @@ mod tests {
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: Some(ChangeId::default()),
             commit_id: None,
@@ -20380,6 +20388,7 @@ fallback={large_fallback} decoded={large_decoded}"
             deleted: false,
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("divergent-schema-registration"),
             commit_id: CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID),
         };
@@ -20869,6 +20878,7 @@ fallback={large_fallback} decoded={large_decoded}"
                     deleted: false,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     change_id: ChangeId::for_test_label(&format!(
                         "schema-fixture-{}",
                         key.schema_key

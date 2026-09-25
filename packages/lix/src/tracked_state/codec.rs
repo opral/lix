@@ -254,15 +254,15 @@ impl DecodedInternalNode {
     }
 }
 
-const NODE_KIND_LEAF_V4: u8 = 5;
+const NODE_KIND_LEAF_V5: u8 = 8;
 const NODE_KIND_INTERNAL_V4: u8 = 6;
 /// Packed direct-address leaves store the one shared commit id plus the first
 /// packed change ordinal. Every row's exact change id is reconstructed from
 /// that authenticated sequence instead of repeating another 16-byte UUID.
-const NODE_KIND_DIRECT_LEAF_V1: u8 = 7;
+const NODE_KIND_DIRECT_LEAF_V2: u8 = 9;
 
 pub(crate) fn leaf_uses_direct_address_layout(encoded: &[u8]) -> bool {
-    encoded.first() == Some(&NODE_KIND_DIRECT_LEAF_V1)
+    encoded.first() == Some(&NODE_KIND_DIRECT_LEAF_V2)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1143,6 +1143,7 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
     encode_value_ref(TrackedStateIndexValueRef {
         change_id: value.change_id,
         commit_id: value.commit_id,
+        author_id: &value.author_id,
         deleted: value.deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
@@ -1165,6 +1166,10 @@ pub(crate) fn encode_value_ref_into(out: &mut Vec<u8>, value: TrackedStateIndexV
         value.created_at.packed(),
         value.updated_at.packed(),
     );
+    let author_len = u16::try_from(value.author_id.len())
+        .expect("author account id must fit the tracked-state value bound");
+    out.extend_from_slice(&author_len.to_be_bytes());
+    out.extend_from_slice(value.author_id.as_bytes());
     debug_assert!((VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&(out.len() - start)));
 }
 
@@ -1188,7 +1193,7 @@ pub(crate) fn decode_visible_value(
     Ok(Some(tracked_value_from_storage(view)))
 }
 
-fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError> {
+fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
     if !(VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&bytes.len()) {
         return Err(value_codec_error(format!(
             "has {} bytes; expected {VALUE_MIN_BYTES}..={VALUE_MAX_BYTES}",
@@ -1208,6 +1213,29 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError
     let mut offset = VALUE_STATE_TAIL_START;
     let (deleted, created_at_packed, updated_at_packed) =
         read_value_tail_fields(bytes, &mut offset, "tracked-state value")?;
+    let author_len_end = offset
+        .checked_add(2)
+        .ok_or_else(|| value_codec_error("author length overflow"))?;
+    let author_len = bytes
+        .get(offset..author_len_end)
+        .ok_or_else(|| value_codec_error("author length is truncated"))?;
+    let author_len = usize::from(u16::from_be_bytes(
+        author_len.try_into().expect("fixed author length"),
+    ));
+    offset = author_len_end;
+    if author_len == 0 || author_len > AUTHOR_ID_MAX_BYTES {
+        return Err(value_codec_error("author account id length is invalid"));
+    }
+    let author_end = offset
+        .checked_add(author_len)
+        .ok_or_else(|| value_codec_error("author account id length overflow"))?;
+    let author_id = std::str::from_utf8(
+        bytes
+            .get(offset..author_end)
+            .ok_or_else(|| value_codec_error("author account id is truncated"))?,
+    )
+    .map_err(|_| value_codec_error("author account id is not UTF-8"))?;
+    offset = author_end;
     if offset != bytes.len() {
         return Err(value_codec_error("has trailing bytes"));
     }
@@ -1216,6 +1244,7 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError
     Ok(TrackedStateIndexValueRef {
         change_id,
         commit_id,
+        author_id,
         deleted,
         created_at,
         updated_at,
@@ -1354,6 +1383,7 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
     let TrackedStateIndexValueRef {
         change_id,
         commit_id,
+        author_id,
         deleted,
         created_at,
         updated_at,
@@ -1361,6 +1391,7 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
     TrackedStateIndexValue {
         change_id,
         commit_id,
+        author_id: author_id.to_owned(),
         deleted,
         created_at,
         updated_at,
@@ -1382,8 +1413,9 @@ const VALUE_CHANGE_ID_END: usize = 16;
 const VALUE_COMMIT_ID_START: usize = 16;
 const VALUE_COMMIT_ID_END: usize = 32;
 const VALUE_STATE_TAIL_START: usize = 32;
-const VALUE_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1;
-const VALUE_MAX_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 8 + 8;
+const VALUE_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 2 + 1;
+const AUTHOR_ID_MAX_BYTES: usize = 256;
+const VALUE_MAX_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 8 + 8 + 2 + AUTHOR_ID_MAX_BYTES;
 const VALUE_TAIL_DELETED: u8 = 0x80;
 const VALUE_TAIL_CODE_MASK: u8 = 0x7f;
 const VALUE_TIMESTAMP_MAX_WIDTH: u8 = 8;
@@ -1392,26 +1424,30 @@ const VALUE_TAIL_DISTINCT_MIN: u8 = VALUE_TIMESTAMP_WIDTH_COUNT;
 const VALUE_TAIL_DISTINCT_MAX: u8 =
     VALUE_TAIL_DISTINCT_MIN + VALUE_TIMESTAMP_WIDTH_COUNT * VALUE_TIMESTAMP_WIDTH_COUNT - 1;
 
-/// Leaf node wire format (v4):
+/// Leaf node wire format (v5):
 ///
 /// ```text
-/// [NODE_KIND_LEAF_V4]
+/// [NODE_KIND_LEAF_V5]
 /// varint entry_count
 /// varint commit_dict_len ++ commit_dict_len x 16 commit-id bytes
 /// varint tail_dict_len ++ tail_dict_len x self-delimiting state tails
+/// varint author_dict_len ++ author_dict_len x (u16 byte_len ++ UTF-8 bytes)
 /// per entry:
 ///   varint shared_key_len   bytes shared with the previous entry's key
 ///   varint key_suffix_len ++ key suffix bytes
 ///   16 change-id bytes
 ///   varint commit_ref       0 + 16 literal bytes, or dictionary slot n-1
 ///   varint tail_ref         0 + literal state tail, or dictionary slot n-1
+///   varint author_ref       0 + u16 byte_len + UTF-8 bytes, or dictionary slot n-1
 /// ```
 ///
 /// Only values repeated within the leaf enter a dictionary, so a dictionary
-/// can never expand unique commit ids or timestamp/deletion tails. Both
-/// dictionaries use first-occurrence order, keeping the encoding a
-/// deterministic function of the entries. State tails need no length prefix:
-/// their tag declares the timestamp equality and byte widths.
+/// can never expand unique commit ids or timestamp/deletion tails. Dictionaries
+/// use first-occurrence order, keeping the encoding a deterministic function
+/// of the entries. State tails need no length prefix:
+/// their tag declares the timestamp equality and byte widths. Authors are
+/// persisted separately from the state tail so both layouts preserve the full
+/// tracked-state value while sharing repeated account IDs.
 ///
 /// Entries within a node are sorted by key, so consecutive keys share the
 /// encoded schema-key/file-id prefix and most of the row-pk; front-coding
@@ -1442,28 +1478,20 @@ fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     for entry in entries {
         assert!(
             (VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&entry.value.len()),
-            "tracked-state leaf values must use the v3 value layout"
+            "tracked-state leaf values must use the author-bearing value layout"
         );
-        #[cfg(debug_assertions)]
-        {
-            let mut tail_end = VALUE_STATE_TAIL_START;
-            read_value_tail(entry.value, &mut tail_end, "tracked-state leaf value")
-                .expect("tracked-state leaf value must contain a valid v3 state tail");
-            assert_eq!(
-                tail_end,
-                entry.value.len(),
-                "tracked-state leaf value must end after its v3 state tail"
-            );
-        }
+        split_value_tail_author(entry.value, "tracked-state leaf value")
+            .expect("tracked-state leaf value must have a valid state tail and author");
     }
     if let Some((commit_id, first_packed)) = direct_leaf_sequence(entries) {
-        return encode_direct_leaf_v1(entries, commit_id, first_packed);
+        return encode_direct_leaf_v2(entries, commit_id, first_packed);
     }
     let commit_dictionary = repeated_dictionary::<16>(entries, VALUE_COMMIT_ID_START);
     let tail_dictionary = repeated_tail_dictionary(entries);
+    let author_dictionary = repeated_author_dictionary(entries);
 
-    let mut out = Vec::with_capacity(64 + entries.len() * 24);
-    out.push(NODE_KIND_LEAF_V4);
+    let mut out = Vec::with_capacity(64 + entries.len() * 28);
+    out.push(NODE_KIND_LEAF_V5);
     write_varint(&mut out, entries.len() as u64);
     write_varint(&mut out, commit_dictionary.len() as u64);
     for commit_id in &commit_dictionary {
@@ -1472,6 +1500,10 @@ fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     write_varint(&mut out, tail_dictionary.len() as u64);
     for tail in &tail_dictionary {
         out.extend_from_slice(tail);
+    }
+    write_varint(&mut out, author_dictionary.len() as u64);
+    for author in &author_dictionary {
+        append_author(&mut out, author);
     }
     let mut previous_key: &[u8] = &[];
     for entry in entries {
@@ -1488,11 +1520,17 @@ fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
         if commit_ref == 0 {
             out.extend_from_slice(&entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END]);
         }
-        let tail = &entry.value[VALUE_STATE_TAIL_START..];
+        let (tail, author) = split_value_tail_author(entry.value, "tracked-state leaf value")
+            .expect("leaf value was validated above");
         let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
         write_varint(&mut out, tail_ref);
         if tail_ref == 0 {
             out.extend_from_slice(tail);
+        }
+        let author_ref = slice_dictionary_ref(&author_dictionary, author);
+        write_varint(&mut out, author_ref);
+        if author_ref == 0 {
+            append_author(&mut out, author);
         }
         previous_key = entry.key;
     }
@@ -1532,14 +1570,15 @@ fn direct_leaf_sequence(entries: &[EncodedLeafEntryRef<'_>]) -> Option<([u8; 16]
     Some((commit_id, first_packed))
 }
 
-fn encode_direct_leaf_v1(
+fn encode_direct_leaf_v2(
     entries: &[EncodedLeafEntryRef<'_>],
     commit_id: [u8; 16],
     first_packed: u32,
 ) -> Vec<u8> {
     let tail_dictionary = repeated_tail_dictionary(entries);
-    let mut out = Vec::with_capacity(32 + entries.len() * 8);
-    out.push(NODE_KIND_DIRECT_LEAF_V1);
+    let author_dictionary = repeated_author_dictionary(entries);
+    let mut out = Vec::with_capacity(32 + entries.len() * 10);
+    out.push(NODE_KIND_DIRECT_LEAF_V2);
     write_varint(&mut out, entries.len() as u64);
     out.extend_from_slice(&commit_id);
     out.extend_from_slice(&first_packed.to_be_bytes());
@@ -1547,17 +1586,28 @@ fn encode_direct_leaf_v1(
     for tail in &tail_dictionary {
         out.extend_from_slice(tail);
     }
+    write_varint(&mut out, author_dictionary.len() as u64);
+    for author in &author_dictionary {
+        append_author(&mut out, author);
+    }
     let mut previous_key: &[u8] = &[];
     for entry in entries {
         let shared = shared_prefix_len(previous_key, entry.key);
         write_varint(&mut out, shared as u64);
         write_varint(&mut out, (entry.key.len() - shared) as u64);
         out.extend_from_slice(&entry.key[shared..]);
-        let tail = &entry.value[VALUE_STATE_TAIL_START..];
+        let (tail, author) =
+            split_value_tail_author(entry.value, "tracked-state direct leaf value")
+                .expect("leaf value was validated above");
         let tail_ref = slice_dictionary_ref(&tail_dictionary, tail);
         write_varint(&mut out, tail_ref);
         if tail_ref == 0 {
             out.extend_from_slice(tail);
+        }
+        let author_ref = slice_dictionary_ref(&author_dictionary, author);
+        write_varint(&mut out, author_ref);
+        if author_ref == 0 {
+            append_author(&mut out, author);
         }
         previous_key = entry.key;
     }
@@ -1615,7 +1665,8 @@ fn dictionary_ref<const N: usize>(dictionary: &[[u8; N]], value: &[u8]) -> u64 {
 fn repeated_tail_dictionary<'a>(entries: &[EncodedLeafEntryRef<'a>]) -> Vec<&'a [u8]> {
     let mut counts = Vec::<(&'a [u8], usize)>::new();
     for entry in entries {
-        let tail = &entry.value[VALUE_STATE_TAIL_START..];
+        let (tail, _) = split_value_tail_author(entry.value, "tracked-state leaf value")
+            .expect("leaf value was validated above");
         if let Some((_, count)) = counts.iter_mut().find(|(known, _)| *known == tail) {
             *count += 1;
         } else {
@@ -1628,6 +1679,75 @@ fn repeated_tail_dictionary<'a>(entries: &[EncodedLeafEntryRef<'a>]) -> Vec<&'a 
         .collect()
 }
 
+fn repeated_author_dictionary<'a>(entries: &[EncodedLeafEntryRef<'a>]) -> Vec<&'a [u8]> {
+    let mut counts = Vec::<(&'a [u8], usize)>::new();
+    for entry in entries {
+        let (_, author) = split_value_tail_author(entry.value, "tracked-state leaf value")
+            .expect("leaf value was validated above");
+        if let Some((_, count)) = counts.iter_mut().find(|(known, _)| *known == author) {
+            *count += 1;
+        } else {
+            counts.push((author, 1));
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(author, count)| (count > 1).then_some(author))
+        .collect()
+}
+
+fn split_value_tail_author<'a>(
+    value: &'a [u8],
+    context: &str,
+) -> Result<(&'a [u8], &'a [u8]), LixError> {
+    let mut offset = VALUE_STATE_TAIL_START;
+    read_value_tail(value, &mut offset, context)?;
+    let tail_end = offset;
+    let author = read_value_author(value, &mut offset, context)?;
+    if offset != value.len() {
+        return Err(value_codec_error(format!("{context} has trailing bytes")));
+    }
+    Ok((&value[VALUE_STATE_TAIL_START..tail_end], author))
+}
+
+fn read_value_author<'a>(
+    value: &'a [u8],
+    offset: &mut usize,
+    context: &str,
+) -> Result<&'a [u8], LixError> {
+    let len_end = offset
+        .checked_add(2)
+        .ok_or_else(|| value_codec_error(format!("{context} author length overflow")))?;
+    let len_bytes = value
+        .get(*offset..len_end)
+        .ok_or_else(|| value_codec_error(format!("{context} author length is truncated")))?;
+    let len = usize::from(u16::from_be_bytes(
+        len_bytes.try_into().expect("fixed author length"),
+    ));
+    *offset = len_end;
+    if len == 0 || len > AUTHOR_ID_MAX_BYTES {
+        return Err(value_codec_error(format!(
+            "{context} author length is invalid"
+        )));
+    }
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| value_codec_error(format!("{context} author length overflow")))?;
+    let author = value
+        .get(*offset..end)
+        .ok_or_else(|| value_codec_error(format!("{context} author is truncated")))?;
+    std::str::from_utf8(author)
+        .map_err(|_| value_codec_error(format!("{context} author is not UTF-8")))?;
+    *offset = end;
+    Ok(author)
+}
+
+fn append_author(out: &mut Vec<u8>, author: &[u8]) {
+    let len = u16::try_from(author.len()).expect("validated author length fits u16");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(author);
+}
+
 fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
     dictionary
         .iter()
@@ -1635,7 +1755,7 @@ fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
         .map_or(0, |index| index as u64 + 1)
 }
 
-fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_leaf_v5(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1681,6 +1801,18 @@ fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     let mut tail_dictionary = Vec::with_capacity(tail_dict_len.min(body.len()));
     for _ in 0..tail_dict_len {
         tail_dictionary.push(read_value_tail(
+            body,
+            &mut offset,
+            "tracked-state leaf node",
+        )?);
+    }
+    let author_dict_len = usize_from(
+        read_varint(body, &mut offset, "tracked-state leaf node")?,
+        "author dictionary length",
+    )?;
+    let mut author_dictionary = Vec::with_capacity(author_dict_len.min(body.len()));
+    for _ in 0..author_dict_len {
+        author_dictionary.push(read_value_author(
             body,
             &mut offset,
             "tracked-state leaf node",
@@ -1761,10 +1893,26 @@ fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             }
             tail_dictionary[tail_ref - 1]
         };
+        let author_ref = usize_from(
+            read_varint(body, &mut offset, "tracked-state leaf node")?,
+            "author dictionary ref",
+        )?;
+        let author = if author_ref == 0 {
+            read_value_author(body, &mut offset, "tracked-state leaf node")?
+        } else {
+            if author_ref > author_dict_len {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state leaf node author dictionary ref is out of bounds",
+                ));
+            }
+            author_dictionary[author_ref - 1]
+        };
         let value_start = arena.len();
         arena.extend_from_slice(change_id);
         arena.extend_from_slice(commit_id);
         arena.extend_from_slice(tail);
+        append_author(&mut arena, author);
         let value_end = arena.len();
         entries.push(LeafEntrySpan {
             key_start,
@@ -1787,7 +1935,7 @@ fn decode_leaf_v4(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     })
 }
 
-fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+fn decode_direct_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
     fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
         usize::try_from(value).map_err(|_| {
             LixError::new(
@@ -1844,6 +1992,18 @@ fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             "tracked-state direct leaf node",
         )?);
     }
+    let author_dict_len = usize_from(
+        read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+        "author dictionary length",
+    )?;
+    let mut author_dictionary = Vec::with_capacity(author_dict_len.min(body.len()));
+    for _ in 0..author_dict_len {
+        author_dictionary.push(read_value_author(
+            body,
+            &mut offset,
+            "tracked-state direct leaf node",
+        )?);
+    }
     let omitted_value_bytes = entry_count.min(body.len()).saturating_mul(VALUE_MAX_BYTES);
     let mut arena = Vec::with_capacity(body.len().saturating_add(omitted_value_bytes));
     let mut entries = Vec::with_capacity(entry_count.min(body.len()));
@@ -1892,6 +2052,21 @@ fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
             }
             tail_dictionary[tail_ref - 1]
         };
+        let author_ref = usize_from(
+            read_varint(body, &mut offset, "tracked-state direct leaf node")?,
+            "author dictionary ref",
+        )?;
+        let author = if author_ref == 0 {
+            read_value_author(body, &mut offset, "tracked-state direct leaf node")?
+        } else {
+            if author_ref > author_dict_len {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state direct leaf node author dictionary ref is out of bounds",
+                ));
+            }
+            author_dictionary[author_ref - 1]
+        };
         let packed = first_packed
             .checked_add(u32::try_from(ordinal).map_err(|_| {
                 LixError::new(
@@ -1910,6 +2085,7 @@ fn decode_direct_leaf_v1(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
         arena.extend_from_slice(&packed.to_be_bytes());
         arena.extend_from_slice(&commit_id);
         arena.extend_from_slice(tail);
+        append_author(&mut arena, author);
         let value_end = arena.len();
         entries.push(LeafEntrySpan {
             key_start,
@@ -2207,9 +2383,9 @@ fn decode_node_ref_inner(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
         .split_first()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
     match kind {
-        NODE_KIND_LEAF_V4 => Ok(DecodedNodeRef::Leaf(decode_leaf_v4(body)?)),
+        NODE_KIND_LEAF_V5 => Ok(DecodedNodeRef::Leaf(decode_leaf_v5(body)?)),
         NODE_KIND_INTERNAL_V4 => Ok(DecodedNodeRef::Internal(decode_internal_v4(body)?)),
-        NODE_KIND_DIRECT_LEAF_V1 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v1(body)?)),
+        NODE_KIND_DIRECT_LEAF_V2 => Ok(DecodedNodeRef::Leaf(decode_direct_leaf_v2(body)?)),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree node has unknown kind byte {other}"),
@@ -2293,6 +2469,7 @@ mod tests {
             u64::from(tail),
             u64::from(tail.wrapping_add(1)),
         );
+        append_author(&mut value, format!("account-{commit}").as_bytes());
         value
     }
 
@@ -2319,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_round_trips_representative_shapes() {
+    fn leaf_v5_round_trips_representative_shapes() {
         leaf_entries_round_trip(&[]);
         leaf_entries_round_trip(&[(b"only".to_vec(), raw_value(1, 2, 3))]);
         leaf_entries_round_trip(&[
@@ -2349,6 +2526,7 @@ mod tests {
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
                 write_value_tail(&mut value, false, 7, 7);
+                append_author(&mut value, b"author");
                 (format!("key-{ordinal:04}").into_bytes(), value)
             })
             .collect::<Vec<_>>();
@@ -2357,8 +2535,8 @@ mod tests {
             .map(|(key, value)| EncodedLeafEntryRef { key, value })
             .collect::<Vec<_>>();
         let encoded = encode_leaf_refs_for_tests(&refs);
-        assert_eq!(encoded[0], NODE_KIND_DIRECT_LEAF_V1);
-        assert!(encoded.len() < entries.len() * 8);
+        assert_eq!(encoded[0], NODE_KIND_DIRECT_LEAF_V2);
+        assert!(encoded.len() < entries.len() * 9);
         leaf_entries_round_trip(&entries);
     }
 
@@ -2374,6 +2552,7 @@ mod tests {
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
                 write_value_tail(&mut value, false, 9, 9);
+                append_author(&mut value, b"author");
                 (format!("key-{ordinal}").into_bytes(), value)
             })
             .collect::<Vec<_>>();
@@ -2384,7 +2563,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let encoded = encode_leaf_refs_for_tests(&refs);
-        assert_eq!(encoded[0], NODE_KIND_LEAF_V4);
+        assert_eq!(encoded[0], NODE_KIND_LEAF_V5);
         leaf_entries_round_trip(&entries);
     }
 
@@ -2400,6 +2579,7 @@ mod tests {
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
                 write_value_tail(&mut value, false, 9, 9);
+                append_author(&mut value, b"author");
                 (format!("key-{ordinal}").into_bytes(), value)
             })
             .collect::<Vec<_>>();
@@ -2416,7 +2596,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_round_trips_dictionaries_with_variable_tail_widths() {
+    fn leaf_v5_round_trips_dictionaries_with_variable_tail_widths() {
         leaf_entries_round_trip(&[
             (b"a".to_vec(), raw_value(1, 9, 0)),
             (b"b".to_vec(), raw_value(2, 9, 0)),
@@ -2426,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_round_trips_generated_sorted_keys() {
+    fn leaf_v5_round_trips_generated_sorted_keys() {
         // Deterministic pseudo-random keys with heavy shared prefixes,
         // mimicking encoded (schema_key, file_id, row_pk) keys.
         let mut entries = (0..512usize)
@@ -2453,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_round_trips_multibyte_key_varints() {
+    fn leaf_v5_round_trips_multibyte_key_varints() {
         // Keys long enough that shared and suffix lengths need two-byte
         // varints, with >127 entries so the count does too.
         let mut entries = Vec::new();
@@ -2477,6 +2657,7 @@ mod tests {
         let encoded = encode_value(&TrackedStateIndexValue {
             change_id,
             commit_id,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-01T00:00:00Z"),
@@ -2487,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_round_trips_repeated_and_literal_value_parts() {
+    fn leaf_v5_round_trips_repeated_and_literal_value_parts() {
         let mut entries = Vec::new();
         for index in 0..300usize {
             let key = format!("rows/{index:05}").into_bytes();
@@ -2501,8 +2682,8 @@ mod tests {
         entries.sort();
         leaf_entries_round_trip(&entries);
 
-        // Both dictionaries must actually compress the repeated commit ids
-        // and state tails.
+        // The dictionaries compress repeated commit IDs, state tails, and
+        // author IDs.
         let refs = entries
             .iter()
             .map(|(key, value)| EncodedLeafEntryRef {
@@ -2524,7 +2705,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_v4_wire_format_is_pinned() {
+    fn leaf_v5_wire_format_is_pinned() {
         let entries = [
             (b"k1".to_vec(), raw_value(0xAA, 0xCC, 0xDD)),
             (b"k2".to_vec(), raw_value(0xBB, 0xCC, 0xDD)),
@@ -2539,21 +2720,24 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = encode_leaf_refs_for_tests(&refs);
         let mut expected = vec![
-            5, // NODE_KIND_LEAF_V4
+            NODE_KIND_LEAF_V5,
             3, // entry count
             1, // commit dictionary length
         ];
         expected.extend_from_slice(&[0xCC; 16]); // dictionary slot 0
         expected.push(1); // tail dictionary length
         expected.extend_from_slice(&[0x93, 0xDD, 0xDE]); // dictionary slot 0
-        // Entry 0: full key, inline change id, both dictionary refs.
+        expected.push(1); // author dictionary length
+        expected.extend_from_slice(&[0, 11]);
+        expected.extend_from_slice(b"account-204");
+        // Entry 0: full key, inline change id, and dictionary refs.
         expected.extend_from_slice(&[0, 2, b'k', b'1']);
         expected.extend_from_slice(&[0xAA; 16]);
-        expected.extend_from_slice(&[1, 1]);
+        expected.extend_from_slice(&[1, 1, 1]);
         // Entry 1: one-byte key suffix and both dictionary refs.
         expected.extend_from_slice(&[1, 1, b'2']);
         expected.extend_from_slice(&[0xBB; 16]);
-        expected.extend_from_slice(&[1, 1]);
+        expected.extend_from_slice(&[1, 1, 1]);
         // Entry 2: literal unique commit id and tail.
         expected.extend_from_slice(&[1, 1, b'3']);
         expected.extend_from_slice(&[0xEE; 16]);
@@ -2561,52 +2745,81 @@ mod tests {
         expected.extend_from_slice(&[0xFF; 16]);
         expected.push(0);
         expected.extend_from_slice(&[0x93, 0x11, 0x12]);
-        assert_eq!(encoded, expected, "v4 wire bytes must stay stable");
+        expected.push(0);
+        expected.extend_from_slice(&[0, 11]);
+        expected.extend_from_slice(b"account-255");
+        assert_eq!(encoded, expected, "v5 wire bytes must stay stable");
     }
 
     #[test]
-    fn leaf_v4_tail_dictionary_saves_83_bytes_for_modeled_shape() {
-        let entries = (0..32usize)
+    fn leaf_v5_dictionaries_compress_authors_and_state_tails() {
+        let repeated_author_and_tail = (0..32usize)
             .map(|index| {
                 (
                     format!("rows/{index:05}").into_bytes(),
-                    raw_value(index.to_le_bytes()[0], 9, (index % 4 + 1).to_le_bytes()[0]),
+                    raw_value(index.to_le_bytes()[0], 9, 3),
                 )
             })
             .collect::<Vec<_>>();
-        let refs = entries
+        let repeated_bytes = repeated_author_and_tail
             .iter()
             .map(|(key, value)| EncodedLeafEntryRef {
                 key: key.as_ref(),
                 value: value.as_ref(),
             })
             .collect::<Vec<_>>();
-        let encoded = encode_leaf_refs_for_tests(&refs);
-        let key_section = refs
-            .iter()
-            .scan(&[][..], |previous, entry| {
-                let shared = shared_prefix_len(previous, entry.key);
-                *previous = entry.key;
-                Some(2 + entry.key.len() - shared)
-            })
-            .sum::<usize>();
-        // The v2 leaf stores a one-byte commit ref, one-byte value length,
-        // and the value after its dictionary-compressed 16-byte commit id.
-        let v2_bytes = 1
-            + 1
-            + 1
-            + 16
-            + key_section
-            + entries
-                .iter()
-                .map(|(_, value)| 2 + value.len() - 16)
-                .sum::<usize>();
+        let repeated_bytes = encode_leaf_refs_for_tests(&repeated_bytes);
 
-        assert_eq!(v2_bytes - encoded.len(), 83);
+        let unique_authors = (0..32usize)
+            .map(|index| {
+                let mut value = raw_value(index.to_le_bytes()[0], 9, 3);
+                let mut offset = VALUE_STATE_TAIL_START;
+                read_value_tail(&value, &mut offset, "test value").expect("valid tail");
+                value.truncate(offset);
+                append_author(&mut value, format!("author-{index:05}").as_bytes());
+                (format!("rows/{index:05}").into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        let unique_author_bytes = encode_leaf_refs_for_tests(
+            &unique_authors
+                .iter()
+                .map(|(key, value)| EncodedLeafEntryRef {
+                    key: key.as_ref(),
+                    value: value.as_ref(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let unique_tails = (0..32usize)
+            .map(|index| {
+                (
+                    format!("rows/{index:05}").into_bytes(),
+                    raw_value(index.to_le_bytes()[0], 9, (index + 1) as u8),
+                )
+            })
+            .collect::<Vec<_>>();
+        let unique_tail_bytes = encode_leaf_refs_for_tests(
+            &unique_tails
+                .iter()
+                .map(|(key, value)| EncodedLeafEntryRef {
+                    key: key.as_ref(),
+                    value: value.as_ref(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(
+            repeated_bytes.len() < unique_author_bytes.len(),
+            "repeated authors should be dictionary encoded"
+        );
+        assert!(
+            repeated_bytes.len() < unique_tail_bytes.len(),
+            "repeated state tails should be dictionary encoded"
+        );
     }
 
     #[test]
-    fn leaf_v4_rejects_malformed_and_legacy_bytes() {
+    fn leaf_v5_rejects_malformed_and_legacy_bytes() {
         let entries = [(b"key-a".to_vec(), raw_value(1, 2, 3))];
         let encoded = encode_leaf_refs_for_tests(
             &entries
@@ -2621,6 +2834,8 @@ mod tests {
         let mut unknown_kind = encoded.clone();
         unknown_kind[0] = 0x7f;
         assert!(decode_node_ref_for_leaf_tests(&unknown_kind).is_err());
+        assert!(decode_node_ref_for_leaf_tests(&[5, 0]).is_err()); // prior leaf v4
+        assert!(decode_node_ref_for_leaf_tests(&[7, 0]).is_err()); // prior direct leaf v1
 
         let truncated = &encoded[..encoded.len() - 1];
         assert!(decode_node_ref_for_leaf_tests(truncated).is_err());
@@ -2632,25 +2847,34 @@ mod tests {
         assert!(decode_node_ref_for_leaf_tests(&[1, 0, 0]).is_err());
         assert!(decode_node_ref_for_leaf_tests(&[]).is_err());
 
-        // A dictionary length that cannot fit in the body.
-        assert!(decode_node_ref_for_leaf_tests(&[3, 1, 2, 0]).is_err());
-
         // A state-tail dictionary entry with a reserved width tag.
-        assert!(decode_node_ref_for_leaf_tests(&[3, 0, 0, 1, 90]).is_err());
+        assert!(decode_node_ref_for_leaf_tests(&[NODE_KIND_LEAF_V5, 1, 0, 1, 90]).is_err());
+
+        // An author dictionary entry with an empty ID.
+        assert!(decode_node_ref_for_leaf_tests(&[NODE_KIND_LEAF_V5, 0, 0, 0, 1, 0, 0]).is_err());
 
         // Commit ref is non-zero while the dictionary is empty.
-        let mut bad_commit_ref = vec![3, 1, 0, 0, 0, 1, b'k'];
+        let mut bad_commit_ref = vec![NODE_KIND_LEAF_V5, 1, 0, 0, 0, 0, 1, b'k'];
         bad_commit_ref.extend_from_slice(&[0; 16]);
         bad_commit_ref.push(1);
         assert!(decode_node_ref_for_leaf_tests(&bad_commit_ref).is_err());
 
         // Tail ref is non-zero while the dictionary is empty.
-        let mut bad_tail_ref = vec![3, 1, 0, 0, 0, 1, b'k'];
+        let mut bad_tail_ref = vec![NODE_KIND_LEAF_V5, 1, 0, 0, 0, 0, 1, b'k'];
         bad_tail_ref.extend_from_slice(&[0; 16]);
         bad_tail_ref.push(0);
         bad_tail_ref.extend_from_slice(&[0; 16]);
         bad_tail_ref.push(1);
         assert!(decode_node_ref_for_leaf_tests(&bad_tail_ref).is_err());
+
+        // Author ref is non-zero while the dictionary is empty.
+        let mut bad_author_ref = vec![NODE_KIND_LEAF_V5, 1, 0, 0, 0, 0, 1, b'k'];
+        bad_author_ref.extend_from_slice(&[0; 16]);
+        bad_author_ref.push(0);
+        bad_author_ref.extend_from_slice(&[0; 16]);
+        write_value_tail(&mut bad_author_ref, false, 0, 0);
+        bad_author_ref.push(1);
+        assert!(decode_node_ref_for_leaf_tests(&bad_author_ref).is_err());
     }
 
     use super::*;
@@ -2666,6 +2890,7 @@ mod tests {
         TrackedStateIndexValue {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(commit_id),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3173,6 +3398,7 @@ mod tests {
         let value = TrackedStateIndexValue {
             change_id: ChangeId::for_test_label("change"),
             commit_id: CommitId::for_test_label("commit"),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3187,6 +3413,7 @@ mod tests {
         let value = TrackedStateIndexValue {
             change_id: ChangeId::for_test_label("other-change"),
             commit_id: CommitId::for_test_label("other-commit"),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted: true,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3201,7 +3428,10 @@ mod tests {
         let mut value = test_value("commit", "change");
         set_timestamps(&mut value, "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z");
         let epoch_equal = encode_value(&value);
-        assert_eq!(epoch_equal.len(), 33);
+        assert_eq!(
+            epoch_equal.len(),
+            33 + 2 + crate::ANONYMOUS_ACCOUNT_ID.len()
+        );
         assert_eq!(epoch_equal[VALUE_STATE_TAIL_START], 0x00);
         assert_eq!(decode_value(&epoch_equal).expect("epoch value"), value);
 
@@ -3211,23 +3441,32 @@ mod tests {
             "1970-01-01T00:00:00.001Z",
         );
         let epoch_distinct = encode_value(&value);
-        assert_eq!(epoch_distinct.len(), 35);
+        assert_eq!(
+            epoch_distinct.len(),
+            35 + 2 + crate::ANONYMOUS_ACCOUNT_ID.len()
+        );
         assert_eq!(epoch_distinct[VALUE_STATE_TAIL_START], 0x0b);
         assert_eq!(decode_value(&epoch_distinct).expect("epoch value"), value);
 
         set_timestamps(&mut value, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         let modern_equal = encode_value(&value);
-        assert_eq!(modern_equal.len(), 40);
+        assert_eq!(
+            modern_equal.len(),
+            40 + 2 + crate::ANONYMOUS_ACCOUNT_ID.len()
+        );
         assert_eq!(modern_equal[VALUE_STATE_TAIL_START], 0x07);
         assert_eq!(
-            &modern_equal[VALUE_STATE_TAIL_START + 1..],
+            &modern_equal[VALUE_STATE_TAIL_START + 1..VALUE_STATE_TAIL_START + 8],
             &[0x00, 0x00, 0x80, 0xaa, 0x6d, 0xb7, 0x19]
         );
         assert_eq!(decode_value(&modern_equal).expect("modern value"), value);
 
         set_timestamps(&mut value, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
         let modern_distinct = encode_value(&value);
-        assert_eq!(modern_distinct.len(), 47);
+        assert_eq!(
+            modern_distinct.len(),
+            47 + 2 + crate::ANONYMOUS_ACCOUNT_ID.len()
+        );
         assert_eq!(modern_distinct[VALUE_STATE_TAIL_START], 0x4f);
         assert_eq!(decode_value(&modern_distinct).expect("modern value"), value);
 
@@ -3238,6 +3477,7 @@ mod tests {
         );
 
         set_timestamps(&mut value, "3000-01-01T00:00:00Z", "3000-01-02T00:00:00Z");
+        value.author_id = "a".repeat(AUTHOR_ID_MAX_BYTES);
         let far_future = encode_value(&value);
         assert_eq!(far_future.len(), VALUE_MAX_BYTES);
         assert_eq!(decode_value(&far_future).expect("far-future value"), value);
@@ -3252,6 +3492,7 @@ mod tests {
         let compact_borrowed = encode_value_ref(TrackedStateIndexValueRef {
             change_id: compact.change_id,
             commit_id: compact.commit_id,
+            author_id: &compact.author_id,
             deleted: compact.deleted,
             created_at: compact.created_at,
             updated_at: compact.updated_at,
@@ -3273,6 +3514,7 @@ mod tests {
         let distinct_borrowed = encode_value_ref(TrackedStateIndexValueRef {
             change_id: distinct.change_id,
             commit_id: distinct.commit_id,
+            author_id: &distinct.author_id,
             deleted: distinct.deleted,
             created_at: distinct.created_at,
             updated_at: distinct.updated_at,
@@ -3316,6 +3558,7 @@ mod tests {
             TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("change"),
                 commit_id: CommitId::for_test_label("commit"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: false,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3323,6 +3566,7 @@ mod tests {
             TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("change-2"),
                 commit_id: CommitId::for_test_label("commit"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: true,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3330,6 +3574,7 @@ mod tests {
             TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("change-3"),
                 commit_id: CommitId::for_test_label("other"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: false,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
@@ -3389,6 +3634,7 @@ mod tests {
                 TrackedStateIndexValueRef {
                     change_id,
                     commit_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,

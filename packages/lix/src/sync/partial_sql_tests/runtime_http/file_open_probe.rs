@@ -92,7 +92,12 @@ impl RawHttpClient for TimedClient {
                             .map_or(0, Vec::len),
                         json.get("inputs")
                             .and_then(|v| v.as_array())
-                            .map_or(0, |inputs| inputs.iter().filter(|input| input["address"]["kind"] == "blob_chunk").count()),
+                            .map_or(0, |inputs| {
+                                inputs
+                                    .iter()
+                                    .filter(|input| input["address"]["kind"] == "blob_chunk")
+                                    .count()
+                            }),
                         json.get("profile").cloned(),
                     )
                 })
@@ -117,25 +122,89 @@ async fn synthetic_markdown_path_versus_id_probe() {
             let number = batch * 40 + index;
             values.push(format!("(${}, ${})", index * 2 + 1, index * 2 + 2));
             params.push(Value::Text(format!("/docs/file-{number:03}.md")));
-            params.push(Value::Blob(format!("# File {number}\nSmall markdown.\n").into_bytes().into()));
+            params.push(Value::Blob(
+                format!("# File {number}\nSmall markdown.\n")
+                    .into_bytes()
+                    .into(),
+            ));
         }
-        authority.execute(&format!("INSERT INTO lix_file (path, content) VALUES {}", values.join(",")), &params).await.unwrap();
+        authority
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (path, content) VALUES {}",
+                    values.join(",")
+                ),
+                &params,
+            )
+            .await
+            .unwrap();
     }
     let target_path = "/docs/file-123.md";
-    let row = authority.execute("SELECT id FROM lix_file WHERE path = $1", &[Value::Text(target_path.into())]).await.unwrap();
+    let row = authority
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(target_path.into())],
+        )
+        .await
+        .unwrap();
     target_id.push_str(&row.rows()[0].get::<String>("id").unwrap());
-    let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
     let mut cases = [
-        ("path", "SELECT content FROM lix_file WHERE path = $1", target_path),
-        ("id", "SELECT content FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("id_only", "SELECT id FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("path_only", "SELECT path FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("id_path", "SELECT id, path, content FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("id_change", "SELECT id, path, lixcol_change_id, content FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("id_commit", "SELECT id, path, lix_active_branch_commit_id() AS commit_id, content FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("id_size", "SELECT id, path, octet_length(content) AS size, content FROM lix_file WHERE id = $1", target_id.as_str()),
-        ("prepared_path", "SELECT id, path, lixcol_change_id, lix_active_branch_commit_id() AS commit_id, octet_length(content) AS size, content AS content FROM lix_file AS lix_as_of WHERE path = $1 LIMIT 1", target_path),
-        ("prepared_id", "SELECT id, path, lixcol_change_id, lix_active_branch_commit_id() AS commit_id, octet_length(content) AS size, content AS content FROM lix_file AS lix_as_of WHERE id = $1 LIMIT 1", target_id.as_str()),
+        (
+            "path",
+            "SELECT content FROM lix_file WHERE path = $1",
+            target_path,
+        ),
+        (
+            "id",
+            "SELECT content FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "id_only",
+            "SELECT id FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "path_only",
+            "SELECT path FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "id_path",
+            "SELECT id, path, content FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "id_change",
+            "SELECT id, path, lixcol_change_id, content FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "id_commit",
+            "SELECT id, path, lix_active_branch_commit_id() AS commit_id, content FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "id_size",
+            "SELECT id, path, octet_length(content) AS size, content FROM lix_file WHERE id = $1",
+            target_id.as_str(),
+        ),
+        (
+            "prepared_path",
+            "SELECT id, path, lixcol_change_id, lix_active_branch_commit_id() AS commit_id, octet_length(content) AS size, content AS content FROM lix_file AS lix_as_of WHERE path = $1 LIMIT 1",
+            target_path,
+        ),
+        (
+            "prepared_id",
+            "SELECT id, path, lixcol_change_id, lix_active_branch_commit_id() AS commit_id, octet_length(content) AS size, content AS content FROM lix_file AS lix_as_of WHERE id = $1 LIMIT 1",
+            target_id.as_str(),
+        ),
     ];
     if std::env::var_os("LIX_PROBE_ID_FIRST").is_some() {
         cases.reverse();
@@ -143,24 +212,56 @@ async fn synthetic_markdown_path_versus_id_probe() {
     for (label, sql, param) in cases {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transport = HttpSyncTransport::connect_with(
-            TimedClient { inner: Client { server: server.clone(), lose_body: Arc::new(AtomicBool::new(false)) }, log: log.clone(), delay: 0 },
+            TimedClient {
+                inner: Client {
+                    server: server.clone(),
+                    lose_body: Arc::new(AtomicBool::new(false)),
+                },
+                log: log.clone(),
+                delay: 0,
+            },
             &format!("https://example.test/lix/{}", authority.lix_id()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let leased = transport.partial_replica_descriptor(None).await.unwrap();
-        let state = Arc::new(PartialReplicaState::from_leased(
-            transport.protocol_url().into(), authority.active_account_id().into(),
-            uuid::Uuid::now_v7().to_string(), leased.wire,
-        ).unwrap());
-        transport.bind_native_baseline_lease(state.baseline_lease()).unwrap();
+        let state = Arc::new(
+            PartialReplicaState::from_leased(
+                transport.protocol_url().into(),
+                authority.active_account_id().into(),
+                uuid::Uuid::now_v7().to_string(),
+                leased.wire,
+            )
+            .unwrap(),
+        );
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
         let storage = StorageAdapter::new(Memory::new());
         let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();
         let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
         crate::init::stage_partial_repository_protocol(&mut writes);
         drop(read);
-        storage.commit_write_set(writes, StorageWriteOptions { preconditions, await_durable: true, ..Default::default() }).await.unwrap();
-        let (engine, session) = Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state).await.unwrap();
-        engine.sync_mode().admit_partial_replica(state.clone(), crate::sync::partial_replica_write_capability());
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (engine, session) =
+            Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+                .await
+                .unwrap();
+        engine.sync_mode().admit_partial_replica(
+            state.clone(),
+            crate::sync::partial_replica_write_capability(),
+        );
         storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
         log.lock().unwrap().clear();
         let started = Instant::now();
@@ -172,39 +273,65 @@ async fn synthetic_markdown_path_versus_id_probe() {
             match session.execute(sql, &[Value::Text(param.into())]).await {
                 Ok(result) => {
                     if label != "id_only" && label != "path_only" {
-                        assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), b"# File 123\nSmall markdown.\n");
+                        assert_eq!(
+                            result.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                            b"# File 123\nSmall markdown.\n"
+                        );
                     }
                     break;
                 }
                 Err(error) => {
-                    attempt_errors.push(serde_json::json!({"code":error.code,"details":error.details}));
-                    let demand = crate::sync::runtime::native_sync_demand_request_for_error(&error).unwrap().unwrap();
-                    crate::sync::partial_runtime::hydrate_demand(&storage, &state, &transport, demand).await.unwrap();
+                    attempt_errors
+                        .push(serde_json::json!({"code":error.code,"details":error.details}));
+                    let demand = crate::sync::runtime::native_sync_demand_request_for_error(&error)
+                        .unwrap()
+                        .unwrap();
+                    crate::sync::partial_runtime::hydrate_demand(
+                        &storage, &state, &transport, demand,
+                    )
+                    .await
+                    .unwrap();
                 }
             }
         }
         let cold_elapsed_ms = started.elapsed().as_secs_f64() * 1000.;
         let requests = log.lock().unwrap().clone();
-        assert_eq!(requests.len(), 1, "{label} cold read took multiple sync requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "{label} cold read took multiple sync requests"
+        );
         assert_eq!(requests[0]["operation"], "read-fulfillment");
         assert_eq!(attempts, 2, "{label} cold read required extra SQL retries");
         if label == "id" || label == "prepared_id" {
-            assert_eq!(requests[0]["blob_chunks"], 1, "exact ID read fetched unrelated file chunks");
+            assert_eq!(
+                requests[0]["blob_chunks"], 1,
+                "exact ID read fetched unrelated file chunks"
+            );
         }
         log.lock().unwrap().clear();
         let warm_started = Instant::now();
-        let warm_result = session.execute(sql, &[Value::Text(param.into())]).await.unwrap();
+        let warm_result = session
+            .execute(sql, &[Value::Text(param.into())])
+            .await
+            .unwrap();
         if label != "id_only" && label != "path_only" {
-            assert_eq!(warm_result.rows()[0].get::<Vec<u8>>("content").unwrap(), b"# File 123\nSmall markdown.\n");
+            assert_eq!(
+                warm_result.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                b"# File 123\nSmall markdown.\n"
+            );
         }
         let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1000.;
         let warm_requests = log.lock().unwrap().len();
         assert_eq!(warm_requests, 0, "{label} warm read used the network");
-        eprintln!("SYNTHETIC_MARKDOWN_PROFILE {}", serde_json::json!({
-            "query": label, "attempts": attempts, "attempt_errors": attempt_errors, "elapsed_ms": cold_elapsed_ms,
-            "request_count": requests.len(), "response_bytes": requests.iter().map(|r| r["response_bytes"].as_u64().unwrap()).sum::<u64>(),
-            "requests": requests, "warm_elapsed_ms": warm_elapsed_ms, "warm_requests": warm_requests,
-        }));
+        eprintln!(
+            "SYNTHETIC_MARKDOWN_PROFILE {}",
+            serde_json::json!({
+                "query": label, "attempts": attempts, "attempt_errors": attempt_errors, "elapsed_ms": cold_elapsed_ms,
+                "request_count": requests.len(), "response_bytes": requests.iter().map(|r| r["response_bytes"].as_u64().unwrap()).sum::<u64>(),
+                "requests": requests, "warm_elapsed_ms": warm_elapsed_ms, "warm_requests": warm_requests,
+            })
+        );
         session.close().await.unwrap();
     }
     authority.close().await.unwrap();

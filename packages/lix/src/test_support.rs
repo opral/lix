@@ -182,6 +182,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             row_pk: &row.row_pk,
             change_id: Some(row.change_id),
             commit_id: Some(row.commit_id),
+            author_id: &row.author_id,
             untracked: false,
             deleted: row.deleted,
             created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
@@ -218,6 +219,8 @@ pub(crate) async fn seed_branch_head_with_rows(
             created_at: test_timestamp(),
             updated_at: test_timestamp(),
             ref_change_id: branch_ref_change_id,
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+            .expect("anonymous account ID is canonical"),
         },
     )
     .expect("direct branch-head control should stage");
@@ -285,6 +288,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
+                author_id: &row.author_id,
                 deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
@@ -381,6 +385,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id,
+                author_id: &row.author_id,
                 deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
@@ -458,6 +463,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 row_pk: &change.row_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
+                author_id: &row.author_id,
                 deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
@@ -658,6 +664,7 @@ async fn stage_test_identity_catalog(
             crate::tracked_state::TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
+                author_id: delta.author_id,
                 deleted: false,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,

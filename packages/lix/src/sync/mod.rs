@@ -32,6 +32,8 @@ mod current_coverage;
 mod http;
 mod native_dependencies;
 mod read_fulfillment;
+#[cfg(feature = "server-protocol")]
+pub(crate) use read_fulfillment::MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES;
 mod read_interest_prepare;
 pub(crate) mod native_metadata;
 mod native_metadata_walk;
@@ -212,7 +214,7 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v19 attaches bounded authenticated native dependencies to exact metadata.
 // v20 adds operation-level read fulfillment for bounded typed dependency discovery.
 // v21 requires v2 native baseline leases, which v20 clients cannot renew.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 21;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 22;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

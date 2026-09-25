@@ -657,6 +657,7 @@ mod tests {
                 deleted: false,
                 created_at: test_timestamp(),
                 updated_at: test_timestamp(),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 global: false,
                 change_id: None,
                 commit_id: None,
@@ -680,7 +681,7 @@ mod tests {
 
         assert_eq!(batch.len(), 10_000);
         assert_eq!(batch.row_column_ptr(), source_row_column);
-        assert_eq!(batch.dictionary_entry_count(), 3);
+        assert_eq!(batch.dictionary_entry_count(), 4);
         assert_eq!(batch.row(0).schema_key(), batch.row(9_999).schema_key());
         assert_eq!(
             batch.row(0).schema_key().as_ptr(),
@@ -1382,6 +1383,7 @@ mod tests {
             deleted: false,
             created_at: test_timestamp(),
             updated_at: test_timestamp(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global,
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(CommitId::for_test_label("commit")),

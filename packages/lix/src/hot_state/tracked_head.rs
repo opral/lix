@@ -153,6 +153,7 @@ pub(crate) struct TrackedWorkingDiff {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkingDiffVersion {
+    author_id: [u8; UUID_BYTES],
     change_id: ChangeId,
     commit_id: CommitId,
     deleted: bool,
@@ -203,7 +204,7 @@ const WORKING_DIFF_SLOT_INLINE: u8 = 2;
 /// the accelerator in favor of canonical diff.
 const WORKING_DIFF_SLOT_UNRESOLVED: u8 = 3;
 const WORKING_DIFF_VERSION_BYTES: usize =
-    16 + 16 + 1 + 8 + 8 + 1 + CONTENT_HASH_BYTES + 1 + CONTENT_HASH_BYTES;
+    UUID_BYTES + 16 + 16 + 1 + 8 + 8 + 1 + CONTENT_HASH_BYTES + 1 + CONTENT_HASH_BYTES;
 const WORKING_DIFF_CHECKPOINT_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
@@ -249,6 +250,7 @@ impl HeadIdentity {
 struct HeadValue {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
+    author_id: String,
     untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
@@ -264,6 +266,7 @@ impl HeadValue {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
+            author_id: &self.author_id,
             untracked: self.untracked,
             deleted: self.deleted,
             created_at: self.created_at,
@@ -280,6 +283,7 @@ impl HeadValue {
 struct HeadValueRef<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
+    author_id: &'a str,
     untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
@@ -331,6 +335,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             row_pk: self.row_pk,
             change_id: Some(self.change_id),
             commit_id: Some(self.commit_id),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: self.deleted,
             created_at: self.created_at,
@@ -369,6 +374,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
+    pub(crate) author_id: &'a str,
     pub(crate) untracked: bool,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
@@ -400,6 +406,7 @@ impl<'a> CurrentStateDeltaRef<'a> {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
+            author_id: self.author_id,
             untracked: self.untracked,
             deleted: self.deleted,
             created_at,
@@ -738,6 +745,8 @@ fn stage_test_current_control(
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("tracked-head-test-control"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         },
     )
 }
@@ -846,6 +855,7 @@ where
                 row_pk: &row.row_pk,
                 change_id: row.change_id,
                 commit_id: Some(checkpoint_commit_id),
+                author_id: &row.author_id,
                 untracked: false,
                 deleted: true,
                 created_at: row.created_at,
@@ -1215,6 +1225,7 @@ fn key_codec_error(message: &str) -> LixError {
 /// hot row stores the first tracked before-image, which keeps the accelerator
 /// compact without requiring a second write-path point read.
 fn encode_working_diff_version(encoded: &mut Vec<u8>, version: WorkingDiffVersion) {
+    encoded.extend_from_slice(&version.author_id);
     encoded.extend_from_slice(version.change_id.as_uuid().as_bytes());
     encoded.extend_from_slice(version.commit_id.as_uuid().as_bytes());
     encoded.push(u8::from(version.deleted));
@@ -1242,6 +1253,9 @@ fn decode_working_diff_version(
 ) -> Result<WorkingDiffVersion, LixError> {
     let payload = take_working_diff_bytes(bytes, offset, WORKING_DIFF_VERSION_BYTES)?;
     let mut field_offset = 0usize;
+    let author_id = take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?
+        .try_into()
+        .expect("fixed working-diff author id width");
     let change_id = ChangeId::new(uuid_from_working_diff_bytes(
         take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?,
         "change id",
@@ -1272,6 +1286,7 @@ fn decode_working_diff_version(
     let metadata = decode_working_diff_slot(payload, &mut field_offset, "metadata")?;
     debug_assert_eq!(field_offset, WORKING_DIFF_VERSION_BYTES);
     Ok(WorkingDiffVersion {
+        author_id,
         change_id,
         commit_id,
         deleted,
@@ -1348,7 +1363,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// JSONB metadata.
 ///
 /// ```text
-///  0      format version (11; older versions are rejected)
+///  0      format version (12; older versions are rejected)
 ///  1      deleted + untracked + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
@@ -1357,7 +1372,8 @@ fn working_diff_error(message: &str) -> LixError {
 /// 50..54  metadata payload byte length (big endian u32)
 /// 54      columnar base-coordinate presence (0 or 1)
 /// 55..59  typed payload byte length (big endian u32)
-/// 59..    metadata payload, then an optional fixed
+/// 59..61 author byte length (big endian u16)
+/// 61..    author UTF-8, metadata payload, then an optional fixed
 ///          checkpoint before-image, then an optional 24-byte base coordinate
 ///          and the typed row payload
 /// ```
@@ -1365,14 +1381,15 @@ fn working_diff_error(message: &str) -> LixError {
 /// Metadata is canonical binary JSONB stored inline. Every live row uses the
 /// native snapshot slot; deletes carry no row payload.
 /// There is no current-format outer-row JSON reader.
-const HEAD_VALUE_VERSION: u8 = 11;
-const HEAD_VALUE_HEADER_BYTES: usize = 59;
+const HEAD_VALUE_VERSION: u8 = 12;
+const HEAD_VALUE_HEADER_BYTES: usize = 61;
 const HEAD_VALUE_TYPED_HEADER_BYTES: usize = HEAD_VALUE_HEADER_BYTES;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_UNTRACKED: u8 = 0b0010_0000;
 const HEAD_VALUE_WORKING_DIFF_SHIFT: u8 = 6;
 const HEAD_VALUE_WORKING_DIFF_MASK: u8 = 0b11;
+const HEAD_AUTHOR_ID_MAX_BYTES: usize = 256;
 const HEAD_WORKING_DIFF_DISABLED: u8 = 0;
 const HEAD_WORKING_DIFF_CLEAN: u8 = 1;
 const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
@@ -1384,6 +1401,7 @@ const CONTENT_HASH_BYTES: usize = 32;
 struct HeadValueView<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
+    author_id: &'a str,
     untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
@@ -1410,6 +1428,7 @@ impl CertifiedCurrentStatePredecessor {
             Self::Packed(value) => Ok(HeadValueView {
                 change_id: Some(value.change_id),
                 commit_id: Some(value.commit_id),
+                author_id: &value.author_id,
                 untracked: false,
                 deleted: value.deleted,
                 created_at: value.created_at,
@@ -1438,6 +1457,9 @@ impl CertifiedCurrentStatePredecessor {
 impl HeadValueView<'_> {
     fn working_diff_version(self) -> Option<WorkingDiffVersion> {
         Some(WorkingDiffVersion {
+            author_id: uuid::Uuid::parse_str(self.author_id)
+                .expect("head author ids are canonical UUIDs")
+                .into_bytes(),
             change_id: self.change_id?,
             commit_id: self.commit_id?,
             deleted: self.deleted,
@@ -1573,6 +1595,7 @@ impl WorkingDiffVersion {
             updated_at: self.updated_at,
             change_id: self.change_id,
             commit_id: self.commit_id,
+            author_id: uuid::Uuid::from_bytes(self.author_id).to_string(),
         }
     }
 }
@@ -1590,6 +1613,7 @@ fn working_diff_snapshot_fingerprint(payload: Option<&[u8]>) -> WorkingDiffSlotF
 struct HeadValueEncode<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
+    author_id: &'a str,
     untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
@@ -1615,6 +1639,7 @@ fn append_head_value(
         HeadValueEncode {
             change_id: value.change_id,
             commit_id: value.commit_id,
+            author_id: value.author_id,
             untracked: value.untracked,
             deleted: value.deleted,
             created_at: value.created_at,
@@ -1639,6 +1664,7 @@ fn reencode_head_value_with_baseline(
     encode_head_value_parts(HeadValueEncode {
         change_id: value.change_id,
         commit_id: value.commit_id,
+        author_id: value.author_id,
         untracked: value.untracked,
         deleted: value.deleted,
         created_at: value.created_at,
@@ -1735,9 +1761,14 @@ fn append_head_value_parts(
         ));
     }
     let metadata_len = metadata.as_deref().map_or(0, <[u8]>::len);
+    let author_id = value.author_id.as_bytes();
+    if author_id.is_empty() || author_id.len() > HEAD_AUTHOR_ID_MAX_BYTES {
+        return Err(head_value_error("author account id length is invalid"));
+    }
     let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
     let capacity = header_bytes
-        .checked_add(metadata_len)
+        .checked_add(author_id.len())
+        .and_then(|bytes| bytes.checked_add(metadata_len))
         .and_then(|bytes| {
             bytes.checked_add(match value.working_diff_baseline {
                 WorkingDiffBaseline::BeforePresent { .. } => {
@@ -1781,6 +1812,12 @@ fn append_head_value_parts(
             .map_err(|_| head_value_error("snapshot exceeds u32 limit"))?
             .to_be_bytes(),
     );
+    bytes.extend_from_slice(
+        &u16::try_from(author_id.len())
+            .map_err(|_| head_value_error("author account id exceeds u16 limit"))?
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(author_id);
     if let Some(metadata) = metadata.as_deref() {
         bytes.extend_from_slice(metadata);
     }
@@ -1842,7 +1879,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         )));
     }
     if bytes.len() < HEAD_VALUE_TYPED_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v11 fixed header"));
+        return Err(head_value_error("row is shorter than the v12 fixed header"));
     }
     let header_bytes = HEAD_VALUE_TYPED_HEADER_BYTES;
     let flags = bytes[1];
@@ -1861,14 +1898,31 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     };
     let typed_len = usize::try_from(read_u32(&bytes[55..59], "typed payload length")?)
         .map_err(|_| head_value_error("typed payload length exceeds usize"))?;
-    let metadata_end = header_bytes
+    let author_len = usize::from(u16::from_be_bytes(
+        bytes[59..61]
+            .try_into()
+            .expect("fixed author length slice"),
+    ));
+    if author_len == 0 || author_len > HEAD_AUTHOR_ID_MAX_BYTES {
+        return Err(head_value_error("author account id length is invalid"));
+    }
+    let author_end = header_bytes
+        .checked_add(author_len)
+        .ok_or_else(|| head_value_error("author account id length overflow"))?;
+    let author_id = std::str::from_utf8(
+        bytes
+            .get(header_bytes..author_end)
+            .ok_or_else(|| head_value_error("author account id is truncated"))?,
+    )
+    .map_err(|_| head_value_error("author account id is not UTF-8"))?;
+    let metadata_end = author_end
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
     let metadata = if metadata_len == 0 {
         None
     } else {
         let metadata = bytes
-            .get(header_bytes..metadata_end)
+            .get(author_end..metadata_end)
             .ok_or_else(|| head_value_error("metadata payload is truncated"))?;
         lix_schema::validate_binary(metadata)
             .map_err(|error| head_value_error(&format!("invalid JSONB metadata: {error}")))?;
@@ -1985,6 +2039,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     Ok(HeadValueView {
         change_id,
         commit_id,
+        author_id,
         untracked,
         deleted,
         created_at,
@@ -2060,6 +2115,7 @@ trait LiveMaterializationIdentity {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
+        author_id: &str,
         untracked: bool,
         branch_id: &str,
     );
@@ -2085,10 +2141,11 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
+        author_id: &str,
         untracked: bool,
         branch_id: &str,
     ) {
-        rows.push_materialized(
+        let ordinal = rows.push_materialized(
             self.row_pk,
             self.schema_key,
             self.file_id,
@@ -2103,6 +2160,7 @@ impl LiveMaterializationIdentity for HeadRowIdentity {
             untracked,
             branch_id,
         );
+        rows.set_author_id(ordinal, author_id);
     }
 }
 
@@ -2126,10 +2184,11 @@ impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
         global: bool,
         change_id: Option<ChangeId>,
         commit_id: Option<CommitId>,
+        author_id: &str,
         untracked: bool,
         branch_id: &str,
     ) {
-        rows.push_materialized_ref(
+        rows.push_materialized_ref_with_author(
             self.row_pk,
             self.schema_key,
             self.file_id,
@@ -2142,6 +2201,7 @@ impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
             change_id,
             commit_id,
             untracked,
+            author_id,
             branch_id,
         );
     }
@@ -2213,6 +2273,7 @@ where
             global,
             value.change_id,
             effective_hot_commit_id(value, active_checkpoint_commit_id),
+            value.author_id,
             value.untracked,
             branch_id,
         );
@@ -2280,6 +2341,7 @@ mod tests {
         HeadValue {
             change_id: Some(ChangeId::for_test_label(change)),
             commit_id: Some(commit_id),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2304,6 +2366,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("working-diff-branch-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         }
     }
 
@@ -2444,6 +2508,7 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("change")),
             commit_id: Some(CommitId::for_test_label("commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2487,6 +2552,7 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("typed-change")),
             commit_id: Some(CommitId::for_test_label("typed-commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2521,6 +2587,7 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("hard-cut-change")),
             commit_id: Some(CommitId::for_test_label("hard-cut-commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2548,6 +2615,7 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("shared-fields-change")),
             commit_id: Some(CommitId::for_test_label("shared-fields-commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2570,6 +2638,8 @@ mod tests {
     fn v10_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
         let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
             change_id: ChangeId::for_test_label("before-change"),
             commit_id: CommitId::for_test_label("before-commit"),
             deleted: false,
@@ -2589,6 +2659,7 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("current-change")),
             commit_id: Some(CommitId::for_test_label("current-commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -2630,6 +2701,8 @@ mod tests {
             hash: [2; CONTENT_HASH_BYTES],
         };
         let baseline = WorkingDiffVersion {
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
             change_id: ChangeId::for_test_label("same-change"),
             commit_id: CommitId::for_test_label("baseline-commit"),
             deleted: false,
@@ -3186,6 +3259,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
 
         let read = storage
@@ -3687,6 +3762,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
         let snapshot_content = r#"{"snapshot":true}"#;
         let long_metadata = format!("\"{}\"", "x".repeat(300));
@@ -3701,6 +3778,7 @@ mod tests {
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("change")),
                 commit_id: Some(head),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 untracked: false,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -3720,6 +3798,7 @@ mod tests {
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("deleted-change")),
                 commit_id: Some(head),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 untracked: false,
                 deleted: true,
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -3857,6 +3936,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
         let mut writes = StorageWriteSet::new();
         for (row, file_id) in [("a", "z-file"), ("b", "a-file")] {
@@ -3873,6 +3954,7 @@ mod tests {
                 &HeadValue {
                     change_id: Some(ChangeId::for_test_label(row)),
                     commit_id: Some(head),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     untracked: false,
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
@@ -3930,6 +4012,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
         let row_pk = RowPk::single("row");
         let second_row_pk = RowPk::single("row-2");
@@ -4313,6 +4397,7 @@ mod tests {
         let value = HeadValue {
             change_id: Some(ChangeId::for_test_label("change")),
             commit_id: Some(head),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -5083,6 +5168,7 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
             updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("parent-change"),
             commit_id: parent_head,
         }];

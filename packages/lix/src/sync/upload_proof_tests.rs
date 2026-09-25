@@ -5,6 +5,9 @@ fn upload_proof_update(label: &str) -> SyncRefUpdate {
     let target = CommitId::for_test_label(label).to_string();
     SyncRefUpdate {
         branch_id: GLOBAL_BRANCH_ID.to_owned(),
+        author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+        ref_change_id: Some(ChangeId::for_test_label(&format!("{label}-ref")).to_string()),
+        expected_ref_change_id: Some(ChangeId::for_test_label("prepared-source-ref").to_string()),
         expected_head_commit_id: Some(source.clone()),
         expected_checkpoint_commit_id: Some(source),
         head_commit_id: Some(target.clone()),
@@ -281,6 +284,12 @@ async fn authority_coordinate_aba_cannot_revive_an_old_upload_proof() {
                 inline_blobs: Vec::new(),
                 ref_updates: vec![SyncRefUpdate {
                     branch_id: prepared.branch_id.clone(),
+                    author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+                    ref_change_id: Some(
+                        ChangeId::for_test_label("proof-reverse-ref-change")
+                            .to_string(),
+                    ),
+                    expected_ref_change_id: prepared.ref_change_id.clone(),
                     expected_head_commit_id: prepared.head_commit_id.clone(),
                     expected_checkpoint_commit_id: prepared.checkpoint_commit_id.clone(),
                     head_commit_id: prepared.expected_head_commit_id.clone(),
@@ -315,13 +324,20 @@ async fn authority_coordinate_aba_cannot_revive_an_old_upload_proof() {
         reset_branch_for_test(&replica, &restore_target).await;
         // This is a new foreign A -> T, not the old request's acknowledgment.
         // Equal commit coordinates must not revive its retired proof.
+        let mut foreign_prepared = prepared;
+        foreign_prepared.expected_ref_change_id = Some(
+            ChangeId::for_test_label("proof-reverse-ref-change").to_string(),
+        );
+        foreign_prepared.ref_change_id = Some(
+            ChangeId::for_test_label("proof-foreign-ref-change").to_string(),
+        );
         frontier_apply_upload(
             &authority,
             &replica,
             &SyncPushRequest {
                 commits: Vec::new(),
                 inline_blobs: Vec::new(),
-                ref_updates: vec![prepared],
+                ref_updates: vec![foreign_prepared],
             },
         )
         .await;

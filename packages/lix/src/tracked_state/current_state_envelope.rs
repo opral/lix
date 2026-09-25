@@ -234,6 +234,7 @@ mod tests {
         CurrentStatePartSource::ColumnarPage(ColumnarPageSource {
             source_id: [2; 16],
             owner_commit_id: [3; 16],
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             part_index: PART_INDEX,
             source_page_index: PAGE_INDEX,
             uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(CREATED_AT_MS),
@@ -298,7 +299,7 @@ mod tests {
                 (v3_len(1), payload_len(native())),
                 (v3_len(2), payload_len(columnar())),
             ],
-            [(121, 72), (107, 37), (121, 90)]
+            [(121, 72), (107, 37), (121, 127)]
         );
     }
 
