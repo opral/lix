@@ -253,7 +253,7 @@ jobs:
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
     strategy:
