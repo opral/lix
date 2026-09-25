@@ -42,7 +42,7 @@ where
     /// maintenance work and cannot extend foreground checkpoint latency.
     pub(crate) async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let checkpoint = self
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await?;
         let checkpoint_row = checkpoint.rows().first().ok_or_else(|| {
             LixError::new(
@@ -199,6 +199,7 @@ fn push_selected_change(
         deleted,
         created_at,
         updated_at,
+        &row.author_id,
     );
     source_membership_exact
 }
@@ -234,7 +235,7 @@ mod tests {
             .expect("global session opens");
 
         let error = session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect_err("global branch checkpoint must be rejected");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -268,7 +269,7 @@ mod tests {
             .await
             .expect("transaction begins");
         rolled_back
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("checkpoint stages");
         assert_eq!(
@@ -288,7 +289,7 @@ mod tests {
             .await
             .expect("transaction begins");
         committed
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("checkpoint stages");
         committed.commit().await.expect("checkpoint commits");
@@ -317,6 +318,7 @@ mod tests {
                 updated_at,
                 change_id: ChangeId::for_test_label("checkpoint-canonicalized-change"),
                 commit_id: CommitId::for_test_label("checkpoint-canonicalized-commit"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
             TrackedStateDiffKind::Added,
         );

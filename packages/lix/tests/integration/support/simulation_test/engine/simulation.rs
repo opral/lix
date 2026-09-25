@@ -570,7 +570,7 @@ mod tests {
             "SELECT /* receipt */ commit_id FROM lix_revert($1)",
             "SELECT commit_id FROM lix_revert_range /* source span */ ($1, $2)",
             "SELECT commit_id FROM public.\"lix_apply\"($1, $2)",
-            "SELECT\tcommit_id\nFROM lix_create_checkpoint /* boundary */ ()",
+            "SELECT\tcommit_id\nFROM lix_create_checkpoint /* boundary */ (NULL, NULL)",
         ] {
             assert_eq!(classify_statement(sql), StatementKind::Write, "{sql}");
         }

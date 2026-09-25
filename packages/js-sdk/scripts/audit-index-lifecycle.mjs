@@ -47,7 +47,7 @@ for (const untracked of [false, true])
     const stage = `${count}:${untracked}`;
     await check(db, stage + " insert");
     const cp = (
-      await db.execute("SELECT commit_id FROM lix_create_checkpoint()")
+      await db.execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)", ["Index audit", { _type: "zettel_doc", blocks: [] }])
     ).rows[0].commit_id;
     await check(db, stage + " checkpoint");
     const reopened = await openLix.fromSnapshot(db.exportSnapshot());

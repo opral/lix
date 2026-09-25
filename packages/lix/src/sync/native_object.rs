@@ -426,7 +426,7 @@ mod tests {
             .await
             .unwrap();
         authority
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap();
         let adapter = authority.storage_adapter();

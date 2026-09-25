@@ -243,6 +243,17 @@ test("server publishing and SDK package tests use appropriately sized Ubicloud r
 		/id: publish\n\s+if: needs\.release-version\.outputs\.server_digest == ''/,
 	);
 	assert.match(publishWorkflow, /imagetools create --prefer-index=false/);
+	assert.match(publishWorkflow, /Find the server artifact from the identical tested PR tree/);
+	assert.match(publishWorkflow, /findReusableRun\(\{/);
+	assert.match(publishWorkflow, /Download the identical-tree tested server image/);
+	assert.match(publishWorkflow, /publish-lix-server:[\s\S]*?permissions:\n\s+contents: read\n\s+actions: read/);
+	assert.match(publishWorkflow, /id: reuse-download\n[\s\S]*?continue-on-error: true/);
+	assert.match(publishWorkflow, /run: node scripts\/ci-promote-server-image\.mjs/);
+	assert.match(publishWorkflow, /RELEASE_VERSION: \$\{\{ needs\.release-version\.outputs\.has_release/);
+	assert.match(publishWorkflow, /id: reuse-ready[\s\S]*?steps\.reuse-download\.outcome[\s\S]*?steps\.reuse-prepare\.outcome/);
+	assert.match(publishWorkflow, /id: reuse-publish[\s\S]*?docker push "\$sha_tag"/);
+	assert.match(publishWorkflow, /id: publish\n\s+if: needs\.release-version\.outputs\.server_digest == '' && steps\.reuse-ready\.outputs\.ready != 'true'/);
+	assert.match(publishWorkflow, /steps\.reuse-publish\.outputs\.digest \|\| steps\.publish\.outputs\.digest/);
 	assert.match(
 		publishWorkflow,
 		/name: Test @lix-js\/sdk\n\s+runs-on: ubicloud-standard-8-ubuntu-2404/,

@@ -636,7 +636,10 @@ simulation_test!(
                             .to_string(),
                     ),
                 ],
-                vec![Value::Text("lix_log".to_string()), Value::Null],
+                vec![
+                    Value::Text("lix_log".to_string()),
+                    Value::Text("First-parent commit log. Checkpoint rows expose a nullable conversation_id; join lix_conversation for the title and lix_comment for Zettel comments.".to_string()),
+                ],
             ],
         );
 
@@ -892,7 +895,7 @@ simulation_test!(
                  WHERE (\
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
-                     'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
+                     'lixcol_author_id', 'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
                      'lixcol_global', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    )\
@@ -905,6 +908,13 @@ simulation_test!(
         assert_rows_eq(
             identity_contract,
             vec![
+                vec![
+                    Value::Text("engine_column_contract".to_string()),
+                    Value::Text("lixcol_author_id".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("READ_ONLY".to_string()),
+                ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
                     Value::Text("lixcol_change_id".to_string()),
@@ -956,7 +966,7 @@ simulation_test!(
                  FROM information_schema.columns \
                  WHERE table_name IN ('lix_file', 'lix_directory') \
                    AND column_name IN (\
-                     'lixcol_created_at', 'lixcol_global', \
+                     'lixcol_author_id', 'lixcol_created_at', 'lixcol_global', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    ) \
                  ORDER BY table_name, column_name",
@@ -967,6 +977,13 @@ simulation_test!(
         let mut expected_filesystem_system_contract = Vec::new();
         for table_name in ["lix_directory", "lix_file"] {
             expected_filesystem_system_contract.extend([
+                vec![
+                    Value::Text(table_name.to_string()),
+                    Value::Text("lixcol_author_id".to_string()),
+                    Value::Text("NO".to_string()),
+                    Value::Null,
+                    Value::Text("READ_ONLY".to_string()),
+                ],
                 vec![
                     Value::Text(table_name.to_string()),
                     Value::Text("lixcol_created_at".to_string()),

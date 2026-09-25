@@ -164,7 +164,7 @@ async fn run<StorageImpl>(
     seed_rows(&session, &file_ids, rows_per_file).await;
 
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("create working-diff file-scope checkpoint");
 

@@ -8446,12 +8446,13 @@ where
         {
             let timestamp =
                 *default_timestamp.get_or_insert_with(|| self.functions.call_timestamp());
-            let prepared = rows.into_certified_prepared(
+            let mut prepared = rows.into_certified_prepared(
                 certificate,
                 self.origin_key.as_ref(),
                 timestamp,
                 &self.functions,
             )?;
+            prepared.set_author_id(self.active_account_id.clone());
             self.plugin_host
                 .record_transition_counters(typed_validation_counters);
             self.current_timestamp = default_timestamp;
@@ -8501,6 +8502,7 @@ where
                 .map(|row| usize::from(row.metadata.is_some()))
                 .sum();
             let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
+            prepared_rows.set_author_id(self.active_account_id.clone());
             for index in 0..row_count {
                 push_prepared_state_row_from_planned_parts(
                     &mut prepared_rows,
@@ -8605,6 +8607,7 @@ where
             .map(|row| usize::from(row.metadata.is_some()))
             .sum();
         let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
+        prepared_rows.set_author_id(self.active_account_id.clone());
         for (index, &scalar_ordinal) in scalar_ordinal_by_row.iter().enumerate() {
             debug_assert_ne!(scalar_ordinal, usize::MAX);
             push_prepared_state_row_from_planned_parts(
@@ -8813,6 +8816,12 @@ where
                     .intermediate_commits
                     .iter()
                     .map(|commit| commit.change_refs.commit_id),
+            )
+            .chain(
+                prepared_writes
+                    .checkpoint_publications
+                    .iter()
+                    .map(|publication| publication.recovery_ref.checkpoint_commit_id),
             )
             .collect::<BTreeSet<_>>();
         // `validation_index()` holds an immutable borrow of the write set for
@@ -9627,6 +9636,7 @@ where
             journal.snapshot_arena,
             journal.snapshot_offsets,
             None,
+            &self.active_account_id,
             timestamp,
         )?;
         #[cfg(feature = "storage-benches")]
@@ -10126,6 +10136,7 @@ where
         recovered_head_commit_id: CommitId,
         interval_has_commits: bool,
         gc_state: CheckpointGcState,
+        conversation_id: Option<String>,
     ) -> Result<String, LixError> {
         let commit_id = self.staged_writes.stage_selected_commit_change_refs(
             branch_id.clone(),
@@ -10136,6 +10147,7 @@ where
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
             .add_checkpoint_publication(CheckpointPublication {
+                conversation_id,
                 recovery_ref: CheckpointRecoveryRef {
                     branch_id,
                     recovered_head_commit_id,
@@ -10157,6 +10169,7 @@ where
         gc_state: CheckpointGcState,
         selected_changes: StagedCommitChangeBatch,
         hot_working_diff_certified: bool,
+        conversation_id: Option<String>,
     ) -> Result<String, LixError> {
         let commit_id = self
             .staged_writes
@@ -10166,6 +10179,7 @@ where
             .set_first_commit_parent(branch_id.clone(), previous_checkpoint_commit_id)?;
         self.staged_writes
             .add_checkpoint_publication(CheckpointPublication {
+                conversation_id,
                 recovery_ref: CheckpointRecoveryRef {
                     branch_id,
                     recovered_head_commit_id,
@@ -10487,9 +10501,11 @@ where
             .load_visible_exact_hot_state_batch(&request)
             .await?
             .into_rows();
-        // Only engine-owned plugin files need trusted lifecycle restoration.
-        // Plugin archives themselves have no file owner: their install/uninstall
-        // mutations must continue through ordinary plugin lifecycle validation.
+        // File-scoped engine state belongs to the file's historical snapshot.
+        // A selected file that changes its owner or create reservations must
+        // replay those rows with its content, rather than submitting them as
+        // external writes to plugin reconciliation. A plugin archive has no
+        // file-scoped owner and continues through plugin lifecycle validation.
         let plugin_owned_files = records
             .values()
             .filter_map(|record| {
@@ -10540,7 +10556,17 @@ where
             }
         }
         let mut target_change_ids = Vec::new();
-        let mut historical_files = BTreeSet::new();
+        let mut historical_files = plans
+            .iter()
+            .filter_map(|(_, (schema_key, row_pk, file_id), _, _)| {
+                let file_id = file_id.as_ref()?;
+                let key = row_pk.as_single_string().ok()?;
+                (selected_files.contains(file_id)
+                    && schema_key == KEY_VALUE_SCHEMA_KEY
+                    && (key == PLUGIN_OWNER_KEY || is_reservation_key(key)))
+                .then(|| file_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
         for ((diff_id, (schema_key, row_pk, file_id), expected, target), current) in
             plans.into_iter().zip(current)
@@ -11223,6 +11249,14 @@ where
         params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         match plan {
+            crate::sql2::CheckpointFunctionPlan::Create {
+                title_expression,
+                comment_expression,
+                selection,
+            } => {
+                self.execute_create_checkpoint(title_expression, comment_expression, *selection, params)
+                    .await
+            }
             crate::sql2::CheckpointFunctionPlan::UndoRedo {
                 redo,
                 target_query,
@@ -11239,7 +11273,7 @@ where
                 self.execute_recovery_function(command, commits_query, *selection, params)
                     .await
             }
-            crate::sql2::CheckpointFunctionPlan::Full => self.execute_checkpoint_plan(None).await,
+            crate::sql2::CheckpointFunctionPlan::Full => self.execute_checkpoint_plan(None, None).await,
             crate::sql2::CheckpointFunctionPlan::Empty => Ok(crate::sql2::DiffCommandOutcome {
                 rows_affected: 0,
                 commit_id: None,
@@ -11254,6 +11288,142 @@ where
                 .await
             }
         }
+    }
+
+    async fn execute_create_checkpoint(
+        &mut self,
+        title_expression: String,
+        comment_expression: String,
+        selection: crate::sql2::CheckpointFunctionPlan,
+        params: Vec<Value>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let query = format!("SELECT {title_expression} AS title, {comment_expression} AS comment");
+        let statement = crate::sql2::parse_statement(&query)?;
+        let query_params = recovery_query_params(&statement, &params)?;
+        let result = Box::pin(self.execute_read_sql_statement(query, statement, query_params)).await?;
+        let [row] = result.rows.as_slice() else {
+            return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint arguments must produce one row"));
+        };
+        let [title_value, comment_value] = row.as_slice() else {
+            return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint arguments must produce a title and comment"));
+        };
+        let title = match title_value {
+            Value::Text(title) => {
+                if title.trim().is_empty() || title.contains(['\n', '\r']) {
+                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint title must be nonblank and one line when present"));
+                }
+                Some(title.clone())
+            }
+            Value::Null => None,
+            _ => return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint title must be TEXT or NULL")),
+        };
+        let body = match comment_value {
+            Value::Jsonb(comment) => {
+                let body = comment.to_value();
+                if body.get("_type").and_then(JsonValue::as_str) != Some("zettel_doc")
+                    || !body.get("blocks").is_some_and(JsonValue::is_array)
+                {
+                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint comment must be a Zettel document with _type='zettel_doc' and a blocks array")
+                        .with_hint("See https://github.com/opral/zettel/blob/84074511c6fffc5c67d6929365390fed7153459f/packages/zettel-ast/schema.json"));
+                }
+                Some(body)
+            }
+            Value::Null => None,
+            _ => return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint comment must be Zettel JSONB or NULL")
+                .with_hint("Bind a JSONB value as $2, or cast a Zettel JSON literal with ::jsonb.")),
+        };
+        let conversation_id = (title.is_some() || body.is_some())
+            .then(|| uuid::Uuid::now_v7().to_string());
+        let outcome = match selection {
+            crate::sql2::CheckpointFunctionPlan::Full => {
+                self.execute_checkpoint_plan(None, conversation_id.clone()).await?
+            }
+            crate::sql2::CheckpointFunctionPlan::SelectionQuery(selection_sql) => {
+                let statement = crate::sql2::parse_statement(&selection_sql)?;
+                let selection_params = recovery_query_params(&statement, &params)?;
+                let result = Box::pin(self.execute_read_sql_statement(selection_sql, statement, selection_params)).await?;
+                if result.columns.len() != 1 {
+                    return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint selection must return one row_ref column"));
+                }
+                let mut selections = Vec::with_capacity(result.rows.len());
+                for row in result.rows {
+                    let [Value::RowRef(row_ref)] = row.as_slice() else {
+                        return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint selection must contain non-null row references"));
+                    };
+                    let resolved = crate::row_ref::decode(row_ref)?;
+                    selections.push(DiffCommandSelection {
+                        relation: resolved.relation,
+                        file_id: resolved.file_id,
+                        row_pk: resolved.row_pk,
+                        source_commits: None,
+                    });
+                }
+                if selections.is_empty() {
+                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint selection cannot be empty"));
+                }
+                let selected_rows = selections.len() as u64;
+                let diff_ids = self.resolve_diff_command_selections(DiffCommand::CreateCheckpoint, &selections).await?;
+                let mut outcome = self.execute_checkpoint_plan(Some(diff_ids), conversation_id.clone()).await?;
+                outcome.rows_affected = selected_rows;
+                outcome
+            }
+            crate::sql2::CheckpointFunctionPlan::Empty => {
+                return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint selection cannot be empty"));
+            }
+            _ => unreachable!("checkpoint selection parser emits only full, empty, or row references"),
+        };
+        let Some(conversation_id) = conversation_id else {
+            return Ok(outcome);
+        };
+        let commit_id = outcome.commit_id.as_deref().ok_or_else(|| {
+            LixError::new(LixError::CODE_INTERNAL_ERROR, "checkpoint produced no commit ID")
+        })?;
+        let target = crate::row_ref::encode(
+            "lix_commit",
+            None,
+            &RowPk::uuid_from_canonical(commit_id).map_err(|error| {
+                LixError::new(LixError::CODE_INTERNAL_ERROR, format!("invalid checkpoint commit ID: {error}"))
+            })?,
+        )?;
+        let mut rows = RawWriteBatch::new();
+        let mut description_rows = vec![("lix_conversation", conversation_id.clone(), serde_json::json!({
+                "id": conversation_id,
+                "target": target.as_str(),
+                "title": title,
+                "resolved": false,
+            }))];
+        if let Some(body) = body {
+            let comment_id = uuid::Uuid::now_v7().to_string();
+            description_rows.push(("lix_comment", comment_id.clone(), serde_json::json!({
+                "id": comment_id,
+                "conversation_id": conversation_id,
+                "body": body,
+            })));
+        }
+        for (schema_key, id, snapshot) in description_rows {
+            rows.push(TransactionWriteRow {
+                row_pk: Some(RowPk::uuid_from_canonical(&id).map_err(|error| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, format!("invalid checkpoint conversation ID: {error}"))
+                })?),
+                schema_key: schema_key.into(),
+                file_id: None,
+                snapshot: Some(TransactionJson::from_value(snapshot, "checkpoint conversation")?),
+                metadata: None,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global: true,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: GLOBAL_BRANCH_ID.into(),
+            });
+        }
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Insert,
+            rows,
+        }).await?;
+        Ok(outcome)
     }
 
     pub(crate) async fn stage_undo_baseline(
@@ -11569,7 +11739,7 @@ where
                 self.execute_recovery_patch(DiffCommand::Apply, diff_ids, selected_files)
                     .await
             }
-            CheckpointFunctionPlan::Recovery { .. } | CheckpointFunctionPlan::UndoRedo { .. } => {
+            CheckpointFunctionPlan::Recovery { .. } | CheckpointFunctionPlan::UndoRedo { .. } | CheckpointFunctionPlan::Create { .. } => {
                 unreachable!("nested recovery plans cannot be parsed")
             }
         }
@@ -11624,6 +11794,7 @@ where
     async fn execute_checkpoint_plan(
         &mut self,
         requested_diff_ids: Option<Vec<String>>,
+        conversation_id: Option<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         if self.active_branch_id == GLOBAL_BRANCH_ID {
             return Err(LixError::new(
@@ -11818,6 +11989,7 @@ where
                 head_commit_id,
                 interval_has_commits,
                 gc_state,
+                conversation_id.clone(),
             )?,
             (Some(selected), Some(unselected)) if unselected.is_empty() => self
                 .stage_checkpoint_commit(
@@ -11828,6 +12000,7 @@ where
                     gc_state,
                     selected,
                     hot_working_diff_certified,
+                    conversation_id.clone(),
                 )?,
             (Some(selected), Some(unselected)) => {
                 let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
@@ -11841,6 +12014,7 @@ where
                     .set_first_commit_parent(branch_id.clone(), checkpoint_commit_id)?;
                 self.staged_writes
                     .add_checkpoint_publication(CheckpointPublication {
+                        conversation_id,
                         recovery_ref: CheckpointRecoveryRef {
                             branch_id: branch_id.clone(),
                             recovered_head_commit_id: head_commit_id,
@@ -11865,7 +12039,7 @@ where
         &mut self,
         diff_ids: Vec<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        self.execute_checkpoint_plan(Some(diff_ids)).await
+        self.execute_checkpoint_plan(Some(diff_ids), None).await
     }
 
     async fn checkpoint_dependency_snapshots(
@@ -13122,6 +13296,7 @@ fn push_checkpoint_selected_change(
         row.deleted,
         created_at,
         row.updated_at,
+        &row.author_id,
     );
     source_membership_exact
 }
@@ -14497,6 +14672,7 @@ where
             rows.snapshot_arena,
             rows.snapshot_offsets,
             None,
+            &self.active_account_id,
             self.functions.call_timestamp(),
         )?;
         match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
@@ -17612,6 +17788,7 @@ mod tests {
             false,
             LixTimestamp::from_unix_millis_utc_lossy(0),
             LixTimestamp::from_unix_millis_utc_lossy(0),
+            crate::ANONYMOUS_ACCOUNT_ID,
         );
         selected_changes.add_selected_change_batch(batch.finish());
         let prepared_writes = PreparedWriteSet {
@@ -17889,6 +18066,7 @@ mod tests {
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: Some(ChangeId::default()),
             commit_id: None,
@@ -20210,6 +20388,7 @@ fallback={large_fallback} decoded={large_decoded}"
             deleted: false,
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("divergent-schema-registration"),
             commit_id: CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID),
         };
@@ -20699,6 +20878,7 @@ fallback={large_fallback} decoded={large_decoded}"
                     deleted: false,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     change_id: ChangeId::for_test_label(&format!(
                         "schema-fixture-{}",
                         key.schema_key

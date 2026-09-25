@@ -73,6 +73,7 @@ impl PreparedBranchHeads {
                     source_branch_id,
                     head_commit_id,
                     ref_change_id,
+                    author_id: crate::branch::BranchHeadControl::author_id_bytes(row.author_id)?,
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                 },

@@ -156,22 +156,11 @@ Pending commits and their base/validation/recovery dependencies are not evictabl
 
 Use Rust `lix.sync_health()` or JavaScript `await lix.syncHealth()` to inspect partial-replica background progress independently of local read availability. The snapshot reports `inactive`, `running`, `stalled`, `failed`, or `stopped`, the latest observed and locally applied cursors, and phase-specific failures. A successful local read does not clear a failed sync phase. Each phase clears its own failure only after it succeeds. `running` is not a promise of instant server freshness; new remote writes may not have been observed yet. Health is process-local and shared by handles of the same engine; a newly opened worker starts a new health lifecycle. Other modes report `inactive`. JavaScript sessions must still be open when reading health.
 
-## 6. Permit server SQL fallback under a precise rule
+## 6. Route reads that require authoritative scope
 
-Yes, a cold `COUNT(*)` or complex join can execute remotely without downloading all its base rows. Store its answer separately as a versioned result entry. That entry does not establish native row coverage or make arbitrary subsequent mutations local.
+A partial replica first evaluates a read locally, hydrating supported native dependencies. If planning reports `LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED`, a cancellable single read or read-only batch executes in full on the authority. This applies to joins, CTEs, and aggregates as well as single-table inventory reads. The server session uses the replica's selected branch and authenticated account. A local-only branch cannot be served by this route.
 
-| Situation | Behavior |
-|---|---|
-| Aggregate inputs already covered | Execute locally |
-| Cold read, no pending local writes, authority can evaluate the same logical baseline/context | Remote fallback allowed |
-| Relevant pending local writes | Hydrate required inputs and execute locally |
-| Pending writes whose irrelevance has not been proved | Treat them as relevant; do not guess |
-| Explicit local transaction | No transparent remote fallback |
-| Offline cold aggregate | Typed unavailable error unless a correct retained result/aggregate state exists |
-
-Start conservatively by disabling fallback whenever the replica has pending writes. Later, planner-certified disjointness can relax this. The server must support evaluating the replica’s pinned baseline for automatic fallback; a normal latest-server SQL request is not equivalent. Immutable versioned SQL still needs compatible catalog and session context.
-
-Example: after an offline local insertion, server `COUNT(*)` excludes the insertion. Flushing that insertion first adds a round trip and changes foreground behavior. A general remote evaluator accepting the exact local overlay is possible, but is a separate feature and unnecessary for the initial plan.
+Authority results carry `LIX_AUTHORITY_SQL`. They reflect the authority's current branch state and exclude unpublished local edits; they do not establish local row coverage or populate a reusable result cache. Callers that require pending local edits or an exact local transaction snapshot must use a locally complete query. Explicit local transactions and coherent read batches do not route remotely. Offline reads whose local scope remains incomplete fail with a typed error.
 
 Cached scalar results remain local only while valid. Do not globally invalidate all native scopes because an aggregate becomes stale. Incremental local maintenance can be added for specifically supported aggregate forms; arbitrary joins/aggregates require more than adjusting the count by the number of local writes.
 

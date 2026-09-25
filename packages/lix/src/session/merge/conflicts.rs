@@ -68,6 +68,7 @@ mod tests {
             updated_at: LixTimestamp::expect_parse("updated", "2026-01-01T00:00:00Z"),
             change_id: ChangeId::for_test_label(label),
             commit_id: CommitId::for_test_label(label),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 

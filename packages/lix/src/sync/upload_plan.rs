@@ -321,6 +321,9 @@ mod tests {
     fn branch(head: CommitId, checkpoint: CommitId) -> SyncRefUpdate {
         SyncRefUpdate {
             branch_id: "main".to_owned(),
+            author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+            ref_change_id: Some(crate::changelog::ChangeId::for_test_label(&format!("{head}-ref")).to_string()),
+            expected_ref_change_id: None,
             expected_head_commit_id: None,
             expected_checkpoint_commit_id: None,
             head_commit_id: Some(head.to_string()),

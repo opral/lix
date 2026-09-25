@@ -211,7 +211,7 @@ mod tests {
                 .unwrap();
             ids.push(CommitId::parse_lix(&head, "proof source chain").unwrap());
         }
-        let checkpoint = lix.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let checkpoint = lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         let checkpoint = CommitId::parse_lix(&checkpoint, "complete checkpoint").unwrap();
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
@@ -344,7 +344,7 @@ mod tests {
             )
             .await
             .unwrap();
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') UNION ALL SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') UNION ALL SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
         }
         for pass in 0..2 {
             let read = adapter.begin_read(Default::default()).await.unwrap();

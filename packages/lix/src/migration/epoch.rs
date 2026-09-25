@@ -55,13 +55,14 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         79 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79),
         80 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80),
         81 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81),
+        82 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, crate::init::CURRENT_FORMAT_VERSION]
+    [79, 80, 81, 82, crate::init::CURRENT_FORMAT_VERSION]
         .into_iter()
         .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
@@ -1200,6 +1201,7 @@ where
                     &target,
                     from_format,
                     options,
+                    false,
                 ))
                 .await?;
             }
@@ -1417,6 +1419,7 @@ where
                     &target,
                     from_format,
                     options,
+                    false,
                 ))
                 .await?;
             }
@@ -1464,6 +1467,7 @@ async fn verify_migration_candidate<S>(
     target: &StorageAdapter<S>,
     from_format: u32,
     options: super::MigrationOptions,
+    partial: bool,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1472,7 +1476,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1517,7 +1521,7 @@ where
                 )?;
             }
             drop(read);
-            if from_format < crate::init::CURRENT_FORMAT_VERSION {
+            if from_format <= 81 {
                 let plan = plan.get_or_insert_with(|| {
                     super::publish::PublicationPlan::bounded(
                         options.max_changes,
@@ -1525,6 +1529,15 @@ where
                     )
                 });
                 Box::pin(super::hot_indexes::append_plan(source, options, plan)).await?;
+            }
+            if from_format <= 82 && !partial {
+                let plan = plan.get_or_insert_with(|| {
+                    super::publish::PublicationPlan::bounded(
+                        options.max_changes,
+                        options.max_preflight_bytes,
+                    )
+                });
+                Box::pin(super::author_storage::append_plan(source, plan)).await?;
             }
             let expected = super::public_api::content_digest_with_adapter(source, plan).await?;
             let actual = super::public_api::content_digest_with_adapter(target, None).await?;
@@ -1605,8 +1618,11 @@ where
     if from_format <= 80 {
         super::runtime_epoch::migrate(target, true).await?;
     }
-    if from_format < crate::init::CURRENT_FORMAT_VERSION {
+    if from_format <= 81 {
         super::hot_indexes::migrate(target, options, true).await?;
+    }
+    if from_format <= 82 {
+        super::author_storage::migrate(target, options, true).await?;
     }
     crate::sync::upgrade_owned_partial_receipt(target).await?;
     let state = crate::handle::retry_expired_read(|| async {
@@ -1626,6 +1642,7 @@ where
         target,
         from_format,
         options,
+        true,
     ))
     .await?;
     Ok(true)
@@ -4264,6 +4281,8 @@ where
                 (80, false) => crate::init::REPOSITORY_PROTOCOL_V80,
                 (81, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81,
                 (81, false) => crate::init::REPOSITORY_PROTOCOL_V81,
+                (82, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
+                (82, false) => crate::init::REPOSITORY_PROTOCOL_V82,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

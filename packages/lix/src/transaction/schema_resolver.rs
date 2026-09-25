@@ -364,6 +364,7 @@ mod tests {
             deleted: false,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
             updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.000Z"),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             global: false,
             change_id: None,
             commit_id: None,

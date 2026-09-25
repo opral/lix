@@ -146,6 +146,7 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    pub(crate) author_id: String,
 }
 
 /// One contiguous identity column shared by a tracked-state diff batch.
@@ -1333,6 +1334,7 @@ impl TrackedStateDiffRow {
             updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
+            author_id: value.author_id,
         }
     }
 
@@ -1352,6 +1354,7 @@ impl TrackedStateDiffRow {
         TrackedStateIndexValue {
             change_id: self.change_id,
             commit_id: self.commit_id,
+            author_id: self.author_id.clone(),
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -1445,6 +1448,7 @@ mod tests {
             updated_at: ts("2024-01-01T00:00:00.000Z"),
             change_id,
             commit_id: CommitId::for_test_label("payload-commit"),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         };
         let entry = TrackedStateDiffEntry {
             identity,
@@ -1517,6 +1521,7 @@ mod tests {
         let value = |change_id: ChangeId, deleted: bool| TrackedStateIndexValue {
             change_id,
             commit_id,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             deleted,
             created_at,
             updated_at,
@@ -1584,6 +1589,7 @@ mod tests {
             Some(TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("live-before"),
                 commit_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: false,
                 created_at,
                 updated_at,
@@ -1591,6 +1597,7 @@ mod tests {
             Some(TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("delete-after"),
                 commit_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 deleted: true,
                 created_at,
                 updated_at,
@@ -1635,6 +1642,7 @@ mod tests {
                 Some(TrackedStateIndexValue {
                     change_id,
                     commit_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     deleted: false,
                     created_at,
                     updated_at,
@@ -1745,6 +1753,7 @@ mod tests {
                 Some(TrackedStateIndexValue {
                     change_id: ChangeId::for_test_label(&format!("change-{index:05}")),
                     commit_id: CommitId::for_test_label("shared-tree-commit"),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -1821,6 +1830,7 @@ mod tests {
                 Some(TrackedStateIndexValue {
                     change_id,
                     commit_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -3878,6 +3888,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(&change_id.replace("change", "commit")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 }

@@ -1048,6 +1048,7 @@ impl DiffRoute {
                             | "lixcol_created_at"
                             | "lixcol_updated_at"
                             | "lixcol_change_id"
+                            | "lixcol_author_id"
                             | "lixcol_commit_id"
                             | "lixcol_global"
                             | "lixcol_untracked"
@@ -1124,6 +1125,7 @@ struct DiffSide {
     created_at: String,
     updated_at: String,
     change_id: String,
+    author_id: String,
     commit_id: String,
     metadata: Option<JsonValue>,
     snapshot: Option<Arc<WasmTypedRow>>,
@@ -1466,6 +1468,7 @@ fn diff_row(
         updated_at: row.updated_at(),
         change_id: row.change_id(),
         commit_id: row.commit_id(),
+        author_id: row.author_id().to_owned(),
     }
 }
 
@@ -1546,6 +1549,7 @@ fn diff_side(
         created_at: row.created_at.to_string(),
         updated_at: row.updated_at.to_string(),
         change_id: row.change_id.to_string(),
+        author_id: row.author_id.clone(),
         commit_id: row.commit_id.to_string(),
         metadata,
         snapshot,
@@ -1802,6 +1806,7 @@ where
                     | "lixcol_created_at"
                     | "lixcol_updated_at"
                     | "lixcol_change_id"
+                    | "lixcol_author_id"
                     | "lixcol_commit_id"
                     | "lixcol_global"
                     | "lixcol_untracked"
@@ -2072,6 +2077,7 @@ fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<
         created_at: row.created_at().to_string(),
         updated_at: row.updated_at().to_string(),
         change_id: row.change_id().to_string(),
+        author_id: row.author_id().to_string(),
         commit_id: row.commit_id().to_string(),
         metadata,
         snapshot: row.decoded_snapshot().cloned(),
@@ -2341,6 +2347,7 @@ fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema
         "lixcol_created_at" => Some(lix_schema::Value::Text(side.created_at.clone())),
         "lixcol_updated_at" => Some(lix_schema::Value::Text(side.updated_at.clone())),
         "lixcol_change_id" => Some(lix_schema::Value::Text(side.change_id.clone())),
+        "lixcol_author_id" => Some(lix_schema::Value::Text(side.author_id.clone())),
         "lixcol_commit_id" => Some(lix_schema::Value::Text(side.commit_id.clone())),
         "lixcol_global" => Some(lix_schema::Value::Boolean(side.global)),
         "lixcol_untracked" => Some(lix_schema::Value::Boolean(false)),
@@ -2582,7 +2589,7 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -2805,7 +2812,7 @@ mod tests {
             .unwrap();
         let directory_id = nested.rows()[0].get::<String>("id").unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("baseline checkpoint");
         let baseline = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
@@ -2836,7 +2843,7 @@ mod tests {
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
         }
         let target = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("seal ancestor move");
         let target = target.rows()[0].get::<String>("commit_id").unwrap();
@@ -2918,7 +2925,7 @@ mod tests {
             .unwrap();
         }
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -2940,7 +2947,7 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -3009,7 +3016,7 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -3022,7 +3029,7 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
