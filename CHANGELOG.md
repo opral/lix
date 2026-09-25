@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.1 - 2026-09-25
+
+### Minor
+
+- Repositories using storage format v82 upgrade to v83 on open. The upgrade preserves existing branch controls, HOT rows, and tracked-state history while enabling persisted row author IDs for new writes. Rows written before author IDs were stored report the anonymous account where the author cannot be recovered.
+- Checkpoints can carry a title and Zettel comment for historical context through `lix_create_checkpoint(title, comment)`.
+
+  Both arguments accept `NULL`. When either is present, `lix_log().conversation_id` identifies the checkpoint's conversation so applications can join to its title and comments. The previous zero- and one-argument checkpoint calls are removed.
+
+### Patch
+
+- Partial replicas execute read-only SQL on the selected authority branch when the local planner cannot prove a complete result. Joins and read-only batches now use the same route as standalone history reads. Authority results report that unpublished local edits are excluded.
+
 ## 0.18.0 - 2026-09-25
 
 ### Minor
