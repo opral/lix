@@ -158,7 +158,7 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                  SELECT row_ref FROM {WORKING_SOURCE} \
                  ORDER BY key LIMIT {checkpoint_selected}))"
             ),
@@ -238,7 +238,7 @@ async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
 fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usize) -> String {
     match command {
         "lix_create_checkpoint" => format!(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
              SELECT row_ref FROM {source} \
              WHERE true {extra_predicate} \
              ORDER BY key LIMIT {selected}))"

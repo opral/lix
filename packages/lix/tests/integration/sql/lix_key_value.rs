@@ -51,13 +51,13 @@ simulation_test!(
         let phases = [
         ("SELECT 1".to_owned(), 4),
         ("UPDATE lix_key_value SET value = 'updated' WHERE key = 'packed-key-0010'".to_owned(), 4),
-        ("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_key_value', NULL, 'packed-key-0010')])".to_owned(), 4),
+        ("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[lix_row_ref('lix_key_value', NULL, 'packed-key-0010')])".to_owned(), 4),
         ("DELETE FROM lix_key_value WHERE key = 'packed-key-0200'".to_owned(), 3),
-        ("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)".to_owned(), 3),
+        ("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)".to_owned(), 3),
         (format!("INSERT INTO lix_key_value (key, value) VALUES {second_values}"), 3),
         ("DELETE FROM lix_key_value".to_owned(), 0),
         ("INSERT INTO lix_key_value (key, value) VALUES ('packed-key-0010', 'recreated')".to_owned(), 1),
-        ("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)".to_owned(), 1),
+        ("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)".to_owned(), 1),
     ];
         for (phase, (statement, expected_count)) in phases.into_iter().enumerate() {
             session

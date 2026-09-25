@@ -18,7 +18,7 @@ async fn descriptor_only_file_diff_and_history_hydrate_selected_bytes() {
         .await
         .unwrap();
     let before = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]

@@ -31,8 +31,11 @@ async fn main() -> Result<(), LixError> {
         &[Value::Text(files[0].into()), Value::Text(files[1].into())],
     )
     .await?;
-    db.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
-        .await?;
+    db.execute(
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        &[],
+    )
+    .await?;
     for file in files {
         for start in (0..count).step_by(1000) {
             let rows = (start..(start + 1000).min(count))

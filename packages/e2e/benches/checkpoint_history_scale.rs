@@ -381,7 +381,7 @@ where
             .await
             .expect("seed checkpoint-query file history");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("create checkpoint-query fixture checkpoint");
     }

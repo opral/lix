@@ -1045,14 +1045,14 @@ simulation_test!(
         // scoped checkpoint without the other.
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_conversation', NULL, $1)])",
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[lix_row_ref('lix_conversation', NULL, $1)])",
                 &[Value::Text(TARGET_CONVERSATION.into())],
             )
             .await
             .expect("a detached conversation checkpoints without its deleted target");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('conversation_custom_target', NULL, 'custom-1')])",
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[lix_row_ref('conversation_custom_target', NULL, 'custom-1')])",
                 &[],
             )
             .await
@@ -1468,7 +1468,7 @@ async fn conversation_resolved(session: &SimSession, id: &str) -> Value {
 
 async fn checkpoint(session: &SimSession) -> String {
     match &session
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]

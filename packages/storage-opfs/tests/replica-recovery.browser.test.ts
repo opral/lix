@@ -38,7 +38,7 @@ test("OPFS retained work exports and restores through the real WASM worker", asy
 		await first.execute(
 			"INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('private', 'device only', true)",
 		);
-		await first.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)");
+		await first.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)");
 		await first.execute(
 			"UPDATE lix_key_value SET value = 'pending device note' WHERE key = 'draft'",
 		);

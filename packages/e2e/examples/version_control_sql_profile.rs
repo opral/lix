@@ -53,7 +53,7 @@ where
         while retained < size {
             lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value", &[Value::Text(retained.to_string())]).await?;
             lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/profile-history.txt', $2) ON CONFLICT (id) DO UPDATE SET content = excluded.content", &[Value::Text(PROFILE_FILE_ID.into()), Value::Blob(retained.to_string().into_bytes().into())]).await?;
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
                 .await?;
             retained += 1;
         }
@@ -105,7 +105,7 @@ where
             lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value", &[Value::Text(format!("working-{index}")), Value::Text(size.to_string())]).await?;
         }
         let started = Instant::now();
-        lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await?;
         println!(
             "{}",

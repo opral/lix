@@ -64,7 +64,7 @@ async fn rs_sdk_sql_checkpoint_returns_the_new_active_head() {
     let before = active_head_commit_id(&lix).await;
 
     let checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]

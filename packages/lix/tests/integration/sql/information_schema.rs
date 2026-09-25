@@ -636,7 +636,10 @@ simulation_test!(
                             .to_string(),
                     ),
                 ],
-                vec![Value::Text("lix_log".to_string()), Value::Null],
+                vec![
+                    Value::Text("lix_log".to_string()),
+                    Value::Text("First-parent commit log. Checkpoint rows expose a nullable conversation_id; join lix_conversation for the title and lix_comment for Zettel comments.".to_string()),
+                ],
             ],
         );
 

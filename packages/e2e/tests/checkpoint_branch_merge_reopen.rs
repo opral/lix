@@ -83,7 +83,7 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         .expect("insert shared rows");
         fork_commit_id = active_commit_id(&main).await;
         checkpoint_commit_id = main
-            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("checkpoint target branch")
             .rows()[0]

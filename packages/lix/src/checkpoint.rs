@@ -271,7 +271,7 @@ mod metadata_tests {
         lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('selected', 'one'), ('remaining', 'two')", &[])
             .await.expect("write two rows");
         let selected = lix.execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'selected'))", &[])
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'selected'))", &[])
             .await.expect("partial checkpoint").rows()[0].get::<String>("commit_id").unwrap();
         let head = lix
             .execute("SELECT lix_active_branch_commit_id() AS id", &[])

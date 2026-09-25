@@ -164,7 +164,7 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .await
         .unwrap();
     let before_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -178,7 +178,7 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .await
         .unwrap();
     let target_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -366,7 +366,7 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
     .unwrap();
 
     let baseline = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -380,7 +380,7 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
         .await
         .unwrap();
     let target = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -498,7 +498,7 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
     .unwrap();
 
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap();
     authority
@@ -509,7 +509,7 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
         .await
         .unwrap();
     let target = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -2088,7 +2088,7 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     .await
     .unwrap();
     let checkpoint = execute_hydrating(&session, &storage, &state, &authority,
-        "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_key_value', NULL, 'receipt-pending')])",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[lix_row_ref('lix_key_value', NULL, 'receipt-pending')])",
         &[], &mut fetches,
     ).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();

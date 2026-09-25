@@ -418,7 +418,7 @@ async fn setup<StorageImpl>(
     let seed_elapsed = seed_start.elapsed();
     let initial_checkpoint_start = Instant::now();
     let initial_checkpoint = session
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("create tracked-working-diff initial checkpoint")
         .rows()[0]
@@ -597,7 +597,7 @@ where
     assert!(before > 0, "fixture has no populated working diffs");
     let start = Instant::now();
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("checkpoint populated working-diff fixture");
     let elapsed = start.elapsed();
@@ -642,7 +642,7 @@ async fn measure_merge_preview<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("checkpoint merge-preview base");
     target
@@ -740,7 +740,7 @@ async fn measure_merge_commit<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("checkpoint merge-commit base");
 

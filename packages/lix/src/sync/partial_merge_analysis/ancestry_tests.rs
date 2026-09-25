@@ -271,9 +271,9 @@ async fn checkpoint_incorporation_requires_complete_state_not_selected_sources()
             .get::<String>("id")
             .unwrap();
         let checkpoint_sql = if full {
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         } else {
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='selected'))"
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='selected'))"
         };
         let checkpoint = lix.execute(checkpoint_sql, &[]).await.unwrap().rows()[0]
             .get::<String>("commit_id")

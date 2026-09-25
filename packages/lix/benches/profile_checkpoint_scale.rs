@@ -841,7 +841,7 @@ where
     ALLOCATION_CALLS.with(|calls| calls.set(0));
     ALLOCATED_BYTES.with(|bytes| bytes.set(0));
     let checkpoint =
-        IntoFuture::into_future(lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[]));
+        IntoFuture::into_future(lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]));
     let (result, storage) = measure_checkpoint_foreground(checkpoint).await;
     result.expect("create benchmark checkpoint");
     let accounting = ForegroundAccounting {

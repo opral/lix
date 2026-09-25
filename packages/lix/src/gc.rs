@@ -1552,6 +1552,15 @@ where
                 commit_id,
             )
             .await?;
+            if crate::checkpoint_conversation::load_checkpoint_conversation(&store, commit_id)
+                .await?
+                .is_some()
+            {
+                crate::checkpoint_conversation::stage_delete_checkpoint_conversation(
+                    &mut candidate_writes,
+                    commit_id,
+                );
+            }
             crate::sync::stage_delete_materialized_sync_state_alias(
                 &mut candidate_writes,
                 commit_id,
@@ -2227,7 +2236,12 @@ where
 
     crate::changelog::stage_delete_commits(writes, sweep_commits.iter().copied());
     for commit_id in &sweep_commits {
-        crate::checkpoint_conversation::stage_delete_checkpoint_conversation(writes, *commit_id);
+        if crate::checkpoint_conversation::load_checkpoint_conversation(store, *commit_id)
+            .await?
+            .is_some()
+        {
+            crate::checkpoint_conversation::stage_delete_checkpoint_conversation(writes, *commit_id);
+        }
     }
     crate::tracked_state::stage_sweep_unreachable_content_nodes(
         store,

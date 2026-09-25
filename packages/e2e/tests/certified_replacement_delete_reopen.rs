@@ -113,7 +113,7 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
                 .rows_affected(),
             ROW_COUNT as u64
         );
-        lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("checkpoint deleted replacement collection");
         assert_collection_empty(&lix).await;

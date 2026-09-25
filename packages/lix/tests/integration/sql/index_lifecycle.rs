@@ -32,7 +32,7 @@ async fn packed_indexes_survive_checkpoint_fork_and_snapshot_reopen() {
     .await
     .unwrap();
     assert_index_matches_scan(&db, "insert", "v", 1).await;
-    db.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+    db.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .unwrap();
     assert_index_matches_scan(&db, "checkpoint", "v", 1).await;

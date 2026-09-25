@@ -178,7 +178,7 @@ test("checkpoint SQL returns the new active head through browser WASM", async ()
 		).rows[0]?.commit_id;
 
 		const checkpoint = await lix.execute(
-			"SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
+			"SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
 		);
 		const checkpointId = checkpoint.rows[0]?.commit_id;
 
@@ -208,7 +208,7 @@ test("checkpoint GC starts without requiring a browser Tokio runtime", async () 
 				["checkpoint-gc-browser-test", sequence],
 			);
 			const checkpoint = await lix.execute(
-				"SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
+				"SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
 			);
 			expect(checkpoint.rows[0]?.commit_id).toEqual(expect.any(String));
 		}

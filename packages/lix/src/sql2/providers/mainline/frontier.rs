@@ -154,7 +154,7 @@ mod tests {
                 .await
                 .unwrap();
             let result = lix
-                .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
                 .await
                 .unwrap();
             commits.push(

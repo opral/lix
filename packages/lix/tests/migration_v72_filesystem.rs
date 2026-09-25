@@ -134,7 +134,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     let new_file_id = new_file.rows()[0].get::<String>("id").expect("file id");
     let partial = lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(
              SELECT row_ref
              FROM lix_diff('lix_file')
              WHERE id = $1))",

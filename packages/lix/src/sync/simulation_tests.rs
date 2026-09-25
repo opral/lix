@@ -921,7 +921,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
     let checkpoint = replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(selected_row_ref)],
         )
         .await
@@ -1023,7 +1023,7 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
 				 SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'working-00'))",
             )
             .await,
@@ -1110,7 +1110,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
     let checkpoint = replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(selected_row_ref)],
         )
         .await
@@ -1252,7 +1252,7 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_file",
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                  SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE id = $1))",
             )
             .await,
@@ -1372,7 +1372,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                  SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected-recreate'))",
             )
             .await,
@@ -1558,7 +1558,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
-                    "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                    "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                      SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE id = $1))",
                 )
                 .await,
@@ -1656,7 +1656,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(first_selected_row_ref)],
         )
         .await
@@ -1732,7 +1732,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(selected_row_ref)],
         )
         .await
@@ -1837,7 +1837,7 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                  SELECT row_ref FROM __LIX_RELATION_DIFF__ \
                  WHERE coalesce(key, '') = 'selected'))",
             )
@@ -1911,7 +1911,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(selected_row_ref)],
         )
         .await
@@ -2004,7 +2004,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
     replica
         .lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[$1])",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
             &[Value::RowRef(selected_row_ref)],
         )
         .await

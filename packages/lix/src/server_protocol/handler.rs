@@ -12651,7 +12651,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)"
+                "sql": "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"
             })),
         )
         .await;
@@ -12700,7 +12700,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
+                "sql": "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY( \
                         SELECT row_ref \
                         FROM lix_diff('lix_key_value') \
                         WHERE key = 'selected'))"
@@ -14915,7 +14915,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)"
+                "sql": "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"
             })),
         )
         .await;

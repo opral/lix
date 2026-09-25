@@ -11363,7 +11363,7 @@ mod tests {
         for value in ["intermediate", "second"] {
             write_key_value(&replica, "pending", value).await;
             replica.execute(
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
                 &[],
             ).await.expect("scoped checkpoint");
         }

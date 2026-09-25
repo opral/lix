@@ -2,20 +2,25 @@ use super::*;
 
 #[tokio::test]
 async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens() {
-    checkpoint_after_edits(false, false).await;
+    checkpoint_after_edits(false, false, false).await;
 }
 
 #[tokio::test]
 async fn checkpoint_after_acknowledged_edits_uploads() {
-    checkpoint_after_edits(true, false).await;
+    checkpoint_after_edits(true, false, false).await;
 }
 
 #[tokio::test]
 async fn checkpoint_after_pending_ordinary_upload_recovers_offline_send() {
-    checkpoint_after_edits(true, true).await;
+    checkpoint_after_edits(true, true, false).await;
 }
 
-async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool) {
+#[tokio::test]
+async fn described_checkpoint_conversation_survives_partial_upload() {
+    checkpoint_after_edits(true, false, true).await;
+}
+
+async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool, described: bool) {
     for selected in [false, true] {
         let width = 16usize;
         let authority = open_lix().await.unwrap();
@@ -111,10 +116,11 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool)
                 assert!(uploaded.unwrap());
             }
         }
-        let checkpoint = if selected {
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'partial-demand-000000'))"
-        } else {
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)"
+        let checkpoint = match (selected, described) {
+            (true, true) => "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'partial-demand-000000'))",
+            (false, true) => "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
+            (true, false) => "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'partial-demand-000000'))",
+            (false, false) => "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
         };
         execute_hydrating(
             &session,
@@ -148,9 +154,7 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool)
             if selected { 15 } else { 0 }
         );
         let branch_id = &state.descriptor().selected_branch.branch_id;
-        if acknowledge_edits {
-            // The checkpoint's conversation is a GLOBAL write. The partial
-            // runtime uploads GLOBAL before the selected branch as well.
+        if described {
             assert!(
                 crate::sync::partial_upload_cycle::upload_partial_once(
                     &storage,
@@ -164,10 +168,7 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool)
                         let state = &state;
                         async move {
                             authority
-                                .push_sync_repository_for_account(
-                                    &request,
-                                    state.active_account_id(),
-                                )
+                                .push_sync_repository_for_account(&request, state.active_account_id())
                                 .await
                         }
                     },
@@ -284,22 +285,21 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool)
             prepared.upload.target.checkpoint,
             "authority must publish the locally authored checkpoint identity"
         );
-        let description = authority
-            .execute(
-                "SELECT c.title, m.body
-                 FROM lix_log() AS l
-                 JOIN lix_conversation AS c ON c.id = l.conversation_id
-                 JOIN lix_comment AS m ON m.conversation_id = c.id
-                 WHERE l.commit_id = $1",
-                &[Value::Text(prepared.upload.target.checkpoint.clone())],
-            )
-            .await
-            .expect("checkpoint description must sync to authority");
-        assert_eq!(description.len(), 1);
-        assert_eq!(
-            description.rows()[0].get::<String>("title").unwrap(),
-            "Checkpoint"
-        );
+        if described {
+            let description = authority
+                .execute(
+                    "SELECT c.title, m.body
+                     FROM lix_log() AS l
+                     JOIN lix_conversation AS c ON c.id = l.conversation_id
+                     JOIN lix_comment AS m ON m.conversation_id = c.id
+                     WHERE l.commit_id = $1",
+                    &[Value::Text(prepared.upload.target.checkpoint.clone())],
+                )
+                .await
+                .expect("checkpoint description must sync to authority");
+            assert_eq!(description.len(), 1);
+            assert_eq!(description.rows()[0].get::<String>("title").unwrap(), "Checkpoint");
+        }
         let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();
         let guards = crate::sync::partial_push_state::stage_acknowledge_partial_upload(

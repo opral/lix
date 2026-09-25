@@ -80,7 +80,7 @@ async fn retained_file_case(checkpoint: bool) {
     if checkpoint {
         execute_hydrating(
             &session, &storage, &state, &authority,
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/retained.txt'))", &[], &mut Fetches::default(),
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/retained.txt'))", &[], &mut Fetches::default(),
         ).await.unwrap();
         execute_hydrating(
             &session,

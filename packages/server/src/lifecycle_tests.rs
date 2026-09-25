@@ -137,7 +137,10 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
         .unwrap();
     source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('untracked-app-state','keep-me',true)", &[]).await.unwrap();
     source
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap();
     let mut snapshot = Vec::new();
@@ -246,7 +249,10 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         .await
         .unwrap();
     source
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap();
     let original_history = source

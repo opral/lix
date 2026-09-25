@@ -438,7 +438,7 @@ async fn probe_partial_checkpoint(
     }
     let started = std::time::Instant::now();
     let checkpoint = selected
-        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await;
     let checkpoint = match checkpoint {
         Ok(result) => {

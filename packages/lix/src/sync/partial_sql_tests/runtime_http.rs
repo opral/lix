@@ -242,7 +242,7 @@ async fn lost_wave_with_pending_edit(
         if scenario == PendingScenario::Checkpoints && index == offline_commits / 2 {
             execute_hydrating(
                 &session, &storage, &old, &authority,
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
                 &[], &mut fetches,
             ).await.unwrap();
         }
@@ -253,7 +253,7 @@ async fn lost_wave_with_pending_edit(
     ) {
         execute_hydrating(
             &session, &storage, &old, &authority,
-            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
             &[], &mut fetches,
         ).await.unwrap();
         let read = storage.begin_read(Default::default()).await.unwrap();
@@ -344,7 +344,7 @@ async fn lost_wave_with_pending_edit(
             )
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         Some(
             authority
                 .partial_replica_descriptor(None)
@@ -664,9 +664,9 @@ async fn file_checkpoint_upload_case(
         }
         if !ordinary_only {
             let checkpoint_sql = if cold_blob.is_some() {
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))"
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))"
             } else {
-                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/checkpoint.bin'))"
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/checkpoint.bin'))"
             };
             execute_hydrating(
                 &session,

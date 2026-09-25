@@ -47,18 +47,24 @@ where
     )
     .await
     .expect("seed rows commit");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
-        .await
-        .expect("seed checkpoint commits");
+    lix.execute(
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        &[],
+    )
+    .await
+    .expect("seed checkpoint commits");
     lix.execute(
         "UPDATE lix_key_value SET value = 'a1' WHERE key = $1",
         &[Value::Text(A_KEY.to_string())],
     )
     .await
     .expect("A commits");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
-        .await
-        .expect("A checkpoint commits");
+    lix.execute(
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        &[],
+    )
+    .await
+    .expect("A checkpoint commits");
     lix.execute(
         "UPDATE lix_key_value SET value = 'b1' WHERE key = $1",
         &[Value::Text(B_KEY.to_string())],
