@@ -217,7 +217,9 @@ where
             &adapter, options, &mut plan,
         ))
         .await?;
-        Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        if before.role != RepositoryRole::PartialReplica {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         (
             "v79-canonical-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
@@ -265,7 +267,9 @@ where
             ))
             .await?;
         }
-        Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        if before.role != RepositoryRole::PartialReplica {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         (
             if before.format == Some(82) {
                 "v83-author-storage-plan-v1"
