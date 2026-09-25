@@ -7552,11 +7552,14 @@ mod tests {
         assert_eq!(filter.row_pks, vec![crate::row_pk::RowPk::single("target")]);
         assert_eq!(
             filter.branch_ids,
-            vec!["01920000-0000-7000-8000-0000000000b1"]
+            vec![
+                "01920000-0000-7000-8000-0000000000b1",
+                crate::GLOBAL_BRANCH_ID,
+            ]
         );
         assert_eq!(filter.file_ids, vec![NullableKeyFilter::Null]);
         // V12 has one canonical identity across retention. The probe remains
-        // narrowed by schema, PK, branch, and file ID, but must inspect both
+        // narrowed by schema, PK, active/global branches, and file ID, but must inspect both
         // tracked and untracked rows so an upsert preserves existing retention.
         assert_eq!(filter.untracked, None);
         assert!(!filter.include_tombstones);

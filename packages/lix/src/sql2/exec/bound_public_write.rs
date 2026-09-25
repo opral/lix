@@ -2670,7 +2670,20 @@ async fn row_upsert(
 
     let mut insert_rows =
         row_insert_batch(ctx, plan, spec, params, active_branch_commit_id).await?;
-    let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows).await?;
+    let visible_branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
+    let candidates =
+        scan_row_conflict_candidates_in_visible_scopes(ctx, spec, &insert_rows, &visible_branch_ids)
+            .await?;
+    let candidate_scopes = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.row_pk().clone(),
+                candidate.file_id().map(SharedStr::from),
+                candidate.global(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
     let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
     let mut new_identities = std::collections::BTreeSet::new();
 
@@ -2693,6 +2706,21 @@ async fn row_upsert(
             ));
         }
         let matching_candidate = find_conflict_candidate(insert_row, &inserted_row_pk, &candidates);
+        if matching_candidate.is_none() && candidate_scopes.contains(&(
+            inserted_row_pk.clone(),
+            insert_row.file_id.cloned(),
+            !insert_row.global,
+        )) {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "INSERT ON CONFLICT on '{}' cannot write a {} row over an existing {} row",
+                    spec.schema_key,
+                    if insert_row.global { "global" } else { "local" },
+                    if insert_row.global { "local" } else { "global" },
+                ),
+            ));
+        }
         match (matching_candidate, &conflict.action) {
             // DO NOTHING on a conflicting row: leave the existing row untouched.
             (Some(_), BoundConflictAction::DoNothing) => {}
@@ -4126,6 +4154,29 @@ async fn scan_row_conflict_candidates(
     spec: &SchemaSurfaceSpec,
     insert_rows: &RawWriteBatch,
 ) -> Result<MaterializedHotStateBatch, LixError> {
+    scan_row_conflict_candidates_in_branches(ctx, spec, insert_rows, &[]).await
+}
+
+async fn scan_row_conflict_candidates_in_visible_scopes(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &SchemaSurfaceSpec,
+    insert_rows: &RawWriteBatch,
+    visible_branch_ids: &[String],
+) -> Result<MaterializedHotStateBatch, LixError> {
+    let mut extra_branch_ids = visible_branch_ids.to_vec();
+    extra_branch_ids.push(crate::GLOBAL_BRANCH_ID.to_string());
+    scan_row_conflict_candidates_in_branches(ctx, spec, insert_rows, &extra_branch_ids).await
+}
+
+async fn scan_row_conflict_candidates_in_branches(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &SchemaSurfaceSpec,
+    insert_rows: &RawWriteBatch,
+    extra_branch_ids: &[String],
+) -> Result<MaterializedHotStateBatch, LixError> {
+    if insert_rows.is_empty() {
+        return Ok(MaterializedHotStateBatch::default());
+    }
     #[cfg(feature = "storage-benches")]
     let _phase =
         crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_WRITE_READ);
@@ -4137,6 +4188,7 @@ async fn scan_row_conflict_candidates(
         row_pks.insert(insert_row_pk(row, spec)?);
         file_ids.insert(row.file_id.cloned());
     }
+    branch_ids.extend(extra_branch_ids.iter().cloned().map(Into::into));
     let file_ids = file_ids
         .into_iter()
         .map(|file_id| {

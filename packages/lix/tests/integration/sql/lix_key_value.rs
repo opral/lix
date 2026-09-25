@@ -374,7 +374,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_key_value_on_conflict_active_insert_does_not_mutate_global_projection,
+    lix_key_value_on_conflict_rejects_cross_scope_and_updates_same_scope,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -401,7 +401,7 @@ simulation_test!(
             .await
             .expect("global insert should succeed");
 
-        session
+        let error = session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
                  VALUES ('kv-upsert-global-shadow', 'active') \
@@ -409,7 +409,83 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("active upsert should insert an active override");
+            .expect_err("local upsert must reject a global key collision");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-upsert-global-shadow', 'ignored') \
+                 ON CONFLICT(key) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("DO NOTHING must not conceal a cross-scope collision");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('kv-upsert-global-shadow', 'updated-global', true) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("explicit global upsert should update the global row");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-upsert-global-shadow', 'active')",
+                &[],
+            )
+            .await
+            .expect("plain INSERT may create a local shadow");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-upsert-global-shadow', 'updated-active') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("same-scope upsert should update the local shadow");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('kv-upsert-global-shadow', 'updated-global-again', true) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("same-scope upsert should update the global row");
+
+        global_session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('kv-upsert-global-shadow', 'updated-global-final', true) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("global session can target the global row directly");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('kv-upsert-local', 'old')",
+                &[],
+            )
+            .await
+            .expect("local seed should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('kv-upsert-local', 'new') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("same-scope upsert should update the local row");
 
         let active = session
             .execute(
@@ -418,7 +494,16 @@ simulation_test!(
             )
             .await
             .expect("active select should succeed");
-        assert_single_text(active, "\"active\"");
+        assert_single_text(active, "\"updated-active\"");
+
+        let local = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'kv-upsert-local'",
+                &[],
+            )
+            .await
+            .expect("local select should succeed");
+        assert_single_text(local, "\"new\"");
 
         let global = global_session
             .execute(
@@ -427,6 +512,60 @@ simulation_test!(
             )
             .await
             .expect("global select should succeed");
+        assert_single_text(global, "\"updated-global-final\"");
+    }
+);
+
+simulation_test!(
+    lix_key_value_on_conflict_updates_mixed_scopes_in_one_statement,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let global_session = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('mixed-scope-key', 'old-global', true)",
+                &[],
+            )
+            .await
+            .expect("global seed should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('mixed-scope-key', 'old-local')",
+                &[],
+            )
+            .await
+            .expect("local shadow should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) VALUES \
+                 ('mixed-scope-key', 'local', false), \
+                 ('mixed-scope-key', 'global', true) \
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                &[],
+            )
+            .await
+            .expect("each upsert should update its matching scope");
+        let local = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'mixed-scope-key'",
+                &[],
+            )
+            .await
+            .expect("local row should remain visible");
+        assert_single_text(local, "\"local\"");
+        let global = global_session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'mixed-scope-key'",
+                &[],
+            )
+            .await
+            .expect("global row should remain visible");
         assert_single_text(global, "\"global\"");
     }
 );

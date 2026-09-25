@@ -35,7 +35,7 @@ simulation_test!(
             .execute("DELETE FROM lix_key_value WHERE key = 'deleted'", &[])
             .await
             .unwrap();
-        draft.execute("INSERT INTO lix_key_value (key, value) VALUES ('g-shadow', 'local'), ('g-tombstone', 'local') ON CONFLICT(key) DO UPDATE SET value = excluded.value", &[]).await.unwrap();
+        draft.execute("INSERT INTO lix_key_value (key, value) VALUES ('g-shadow', 'local'), ('g-tombstone', 'local')", &[]).await.unwrap();
         draft
             .execute("DELETE FROM lix_key_value WHERE key = 'g-tombstone'", &[])
             .await
@@ -174,7 +174,7 @@ simulation_test!(
         assert_eq!(draft.execute("SELECT schema_key FROM lix_registered_schema WHERE schema_key IN ('shared_catalog', 'overridden_catalog')", &[]).await.unwrap().len(), 2);
         for key in ["overridden_catalog"] {
             draft.execute(
-                "INSERT INTO lix_registered_schema (value) VALUES ($1) ON CONFLICT(schema_key) DO UPDATE SET value = excluded.value",
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
                 &[schema(key, true)],
             ).await.unwrap();
         }

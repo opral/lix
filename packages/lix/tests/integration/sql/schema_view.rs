@@ -4,6 +4,75 @@ use lix::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    registered_schema_upsert_rejects_cross_scope_collision,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global_session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .unwrap(),
+            &engine,
+        );
+        let schema = "{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"upsert_scope_note\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"body\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}";
+        global_session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1::jsonb, true)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("schema registration should succeed");
+        global_session
+            .execute(
+                "INSERT INTO upsert_scope_note (id, body, lixcol_global) VALUES ('one', 'global', true)",
+                &[],
+            )
+            .await
+            .expect("global row should insert");
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1::jsonb)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("branch schema registration should succeed");
+
+        for action in [
+            "DO UPDATE SET body = excluded.body",
+            "DO NOTHING",
+        ] {
+            let error = session
+                .execute(
+                    &format!(
+                        "INSERT INTO upsert_scope_note (id, body) VALUES ('one', 'local') \
+                         ON CONFLICT (id) {action}"
+                    ),
+                    &[],
+                )
+                .await
+                .expect_err("cross-scope upsert should fail");
+            assert_eq!(error.code, lix::LixError::CODE_CONSTRAINT_VIOLATION);
+        }
+        session
+            .execute(
+                "INSERT INTO upsert_scope_note (id, body, lixcol_global) VALUES ('one', 'updated', true) \
+                 ON CONFLICT (id) DO UPDATE SET body = excluded.body",
+                &[],
+            )
+            .await
+            .expect("same-scope global upsert should succeed");
+        assert_rows_eq(
+            global_session
+                .execute("SELECT body FROM upsert_scope_note WHERE id = 'one'", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Text("updated".to_string())]],
+        );
+    }
+);
+
+simulation_test!(
     row_filter_pushdown_plan_smoke_for_payload_equality,
     |sim| async move {
         let engine = sim.boot_engine().await;

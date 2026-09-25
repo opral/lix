@@ -221,12 +221,11 @@ simulation_test!(
             .expect("checkpoint should pin the working-diff cursor");
         session
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('shadowed', 'local-shadow') \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "INSERT INTO lix_key_value (key, value) VALUES ('shadowed', 'local-shadow')",
                 &[],
             )
             .await
-            .expect("active upsert should shadow the inherited global row");
+            .expect("plain insert should shadow the inherited global row");
 
         assert_eq!(
             select_rows(&session,

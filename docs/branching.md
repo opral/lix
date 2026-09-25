@@ -96,6 +96,20 @@ await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 
 A new repository opens on a branch named `main`. Lix also creates a hidden branch named `global` that holds repository-wide rows such as branch descriptors. You cannot delete `global`, and you cannot delete the active branch.
 
+For every SQL table, `INSERT ... ON CONFLICT` targets the scope of the inserted
+row. Omitting `lixcol_global` targets the active branch; setting it to `true`
+targets the global branch. If a matching row exists in the inserted scope,
+the upsert follows its `DO UPDATE` or `DO NOTHING` action. Otherwise, a row
+with the same identity in the other visible scope causes a constraint error,
+even with `DO NOTHING`. A plain `INSERT` can still create a local row that
+shadows a global row. For example, to upsert a shared setting:
+
+```sql
+INSERT INTO lix_key_value (key, value, lixcol_global)
+VALUES ('sync_enabled', 'true', true)
+ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+```
+
 `hidden` only marks a branch for UIs. It does not change what SQL queries can see.
 
 ## Branch metadata
