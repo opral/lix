@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Version control system for files and tables";
+    const title = "Lix | Version control for company files and tables";
     const description =
-      "Embed version control for files of any format and SQL tables you define in Lix. Branch, merge, and roll back both; plugins add structured file diffs.";
+      "Give agents a branch for company work. Version files of any format and Lix-managed SQL tables in one repository; inspect, merge, or roll back changes.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

@@ -264,6 +264,9 @@ function OneRepositoryDiagram() {
               </span>
             </div>
           ))}
+          <div className="mt-1 rounded-md bg-[#DDF4F8] px-2 py-2 text-center font-mono text-[10px] font-semibold text-cyan-deep">
+            AGENT BRANCH → INSPECT → MERGE
+          </div>
         </div>
       </div>
     </div>
@@ -305,15 +308,15 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         <section className="flex flex-wrap items-center justify-between gap-12 pt-16">
           <div className="min-w-[300px] max-w-[620px] flex-1">
             <p className="mb-4 font-mono text-xs uppercase tracking-[0.08em] text-ink-faint">
-              Open source · MIT
+              Version control for files + SQL tables · Open source
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Version control system for files and tables
+              Give agents a branch for company work
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Embed Lix to version files of any format and SQL tables you define
-              in Lix. Branch, merge, and roll back both. Plugins add structured
-              file diffs.
+              Files of any format and SQL tables you create in Lix share one
+              version history. People and agents can inspect changes, then merge
+              or roll them back.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
@@ -362,6 +365,17 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               </p>
             </div>
           ))}
+        </section>
+
+        <section className="mt-16 rounded-xl border border-line bg-white px-6 py-7 sm:px-9">
+          <h2 className="text-[20px] font-semibold tracking-[-0.02em]">
+            Toward a repository for company work
+          </h2>
+          <p className="mt-2 max-w-[850px] text-base leading-[1.6] text-ink-secondary">
+            Lix provides branches and history for files and tables today.
+            CI/CD-style checks and automations for company work are the next
+            layer to build on that history.
+          </p>
         </section>
 
         {/* Stats */}

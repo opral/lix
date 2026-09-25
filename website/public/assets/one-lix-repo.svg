@@ -29,5 +29,5 @@
   <g transform="translate(243 246)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">app.js</text></g>
   <g transform="translate(448 246)"><use href="#card"/><use href="#file-icon" x="12" y="10"/><text x="43" y="25" font-size="12" fill="#15171B">pricing.xlsx</text></g>
   <rect x="38" y="300" width="604" height="22" rx="4" fill="#DDF4F8"/>
-  <text x="340" y="315" text-anchor="middle" font-size="10.5" font-weight="700" fill="#087B91">ONE HISTORY · BRANCH · DIFF · MERGE · ROLL BACK</text>
+  <text x="340" y="315" text-anchor="middle" font-size="10.5" font-weight="700" fill="#087B91">AGENT BRANCH · INSPECT CHANGES · MERGE OR ROLL BACK</text>
 </svg>

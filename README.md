@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Version control system for files and tables</h3>
+<h3 align="center">Version control for company files and tables</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a version control system for files and tables. Put documents, large media, CAD files, and application tables in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in your app or connect to a server:
+Give agents a branch for company work. Files of any format and SQL tables you create in Lix share one version history. People and agents can make isolated changes, inspect what changed, and merge or roll them back. Embed Lix in a product or connect to a server:
 
 <img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
 
@@ -21,6 +21,12 @@ Lix is a version control system for files and tables. Put documents, large media
 - 🗄️ **Designed as a database.** Files, tables, and history share one ACID OLTP database. Query millions of rows with SQL.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
+
+## Why a repository for company work?
+
+Software teams use branches, change proposals, and CI checks to control changes to code. Company work also lives in files and tables: documents, media, automations, customer records, and more. Lix brings version control to both kinds of data in one repository. The goal is to run company operations from that repository, so people and agents can try changes before they become the current state.
+
+Early [inlang](https://inlang.com/blog/inlang-v2-release) used Git for translation files to gain pull requests and CI. As structured messages and variants grew, treating Git as the application database led to workarounds; inlang moved to SQLite and Lix. That lesson motivates Lix's shared history for files and tables. CI/CD-style checks and automations for company work are the next layer to build on it; Lix does not include a general CI/CD runner today.
 
 ## Why not Git?
 
@@ -78,6 +84,10 @@ Lix is in alpha.
 
 ## Prime use cases
 
+### Let agents propose changes to company work
+
+An agent can work on a branch of a repository that holds files and Lix-managed SQL tables. A person can inspect the changed files and rows, then merge the branch or discard it. Lix provides the history and merge operations; your product supplies the review interface. [LixRay](https://lixray.com) is a hosted company repository built on Lix.
+
 ### Co-locate code, documents, and app state
 
 Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. Lix can put those files and app tables in one repository with one history.
@@ -127,7 +137,7 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 // Your UI shows the diff. The customer clicks accept or undo.
 ```
 
-### Apps with version control
+### Build versioned workflows into products
 
 Your app reads and writes SQL rows and normal files. Lix records every change with its author, so history, blame, branching, and rollback are queries instead of features you build.
 

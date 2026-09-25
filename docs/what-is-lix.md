@@ -1,12 +1,14 @@
 ---
-description: Lix is an embedded version control system for files of any format and SQL tables in one repository.
+description: Lix brings version control to company files and SQL tables in one repository, so people and agents can branch and inspect work beyond code.
 ---
 
 # What is Lix?
 
-Lix is a version control system for files and tables. It stores any file format, including large media, CAD, Word, and PowerPoint, alongside SQL tables for CRM records, logs, and other application data. Files, tables, and history share one repository. Lix runs inside your app or connects to a server.
+Lix is a version control system for files and tables. It stores any file format, including large media, CAD, Word, and PowerPoint, alongside SQL tables for CRM records, logs, and other application data. Files, tables, and history share one repository. Lix can run inside a product or connect to a server.
 
-Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge. Every tracked write becomes a commit automatically. You never run a commit command.
+The goal is to run company operations from a repository. People and agents can make changes on a branch, inspect the history, then merge or roll back. Applications can build change proposals and review interfaces on these primitives. CI/CD-style checks and automation for company work are a future layer; Lix does not ship a general CI/CD runner today.
+
+Agents and tools read and write normal files. Products query and update SQL rows. Both work on the same repository. Every tracked write becomes a commit automatically. You never run a commit command.
 
 Lix versions tables that your app defines and writes through Lix. It does not automatically version tables in an external database. For supported file formats, plugins track changes inside files as rows. Other files still have whole-file history. See [How Lix compares to Git](./comparison-to-git.md).
 
@@ -15,6 +17,10 @@ Lix versions tables that your app defines and writes through Lix. It does not au
 <img src="../website/public/assets/filesystem-database-version-control.svg" alt="Files of any format, SQL tables, version control, and embedding in one library" width="880" />
 
 ## Use cases
+
+### Let agents propose changes
+
+Give an agent a branch of the files and Lix-managed SQL tables it needs for a task. Your product can show the changed files and rows before merging the branch. This applies to data stored in Lix; external databases and SaaS tools are not versioned automatically. [LixRay](https://lixray.com) is a hosted company repository built on Lix.
 
 ### Co-locate code, documents, and app state
 
