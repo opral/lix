@@ -184,9 +184,10 @@ pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
     replica_repository_identity,
 };
+#[cfg(feature = "server-protocol")]
+pub(crate) use read_fulfillment::MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES;
 pub(crate) use read_fulfillment::{
     ReadFulfillmentRequest, ReadFulfillmentResponse,
-    MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES,
     annotate_capture as annotate_read_fulfillment_capture,
     discover as discover_read_fulfillment,
 };
