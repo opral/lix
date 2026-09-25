@@ -32,6 +32,31 @@ lix.execute(
 .await?;
 ```
 
+## Upsert a path in the intended scope
+
+`INSERT ... ON CONFLICT (path)` or `ON CONFLICT (id)` does not change a file or
+directory in another scope. An insert without `lixcol_global` targets the
+current branch. If its conflict target belongs to a visible global file or
+directory, Lix returns a constraint error, including for `DO NOTHING`. Specify
+`lixcol_global = true` when the write should affect the shared global row:
+
+```sql
+INSERT INTO lix_file (path, content, lixcol_global)
+VALUES ('/media/intro.wav', $1, true)
+ON CONFLICT (path) DO UPDATE SET content = excluded.content
+RETURNING path, lixcol_global;
+```
+
+The same rule applies to `lix_directory`. A path conflict within the selected
+scope continues to follow its `DO UPDATE` or `DO NOTHING` action. An ordinary
+`UPDATE` or `DELETE` instead targets the row visible in the current branch and
+preserves that row's scope.
+
+If a local row shadows a global row with the same ID, the branch session cannot
+target the hidden global row through `ON CONFLICT (id)`, even with
+`lixcol_global = true`; it returns a cross-scope constraint error. Open a
+global-scoped session to upsert that global row.
+
 ## How large files are stored
 
 Lix stores file bytes in a content-addressed store. Lix splits large files into chunks. It stores equal chunks once, even when they appear in several files or branches.

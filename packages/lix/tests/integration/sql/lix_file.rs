@@ -3630,7 +3630,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_on_conflict_path_updates_visible_global_file,
+    lix_file_insert_on_conflict_path_rejects_cross_scope_file,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -3650,7 +3650,19 @@ simulation_test!(
             .await
             .expect("global seed insert should succeed");
 
-        let result = session
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('66696c65-2d67-8c6f-8261-6c2d70617400', '/docs/global.md', CAST('wrong' AS BYTEA)) \
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content",
+                &[],
+            )
+            .await
+            .expect_err("local ID upsert must not update a global file");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing global file"));
+
+        let error = session
             .execute(
                 "INSERT INTO lix_file (path, content) \
                  VALUES ('/docs/global.md', CAST('new' AS BYTEA)) \
@@ -3658,8 +3670,39 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("path upsert should update visible global file");
-        assert_eq!(result.rows_affected(), 1);
+            .expect_err("local path upsert must not update a global file");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("local path"));
+        assert!(error.message.contains("existing global file"));
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/docs/global.md', CAST('ignored' AS BYTEA)) \
+                 ON CONFLICT (path) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("DO NOTHING must not conceal a cross-scope path collision");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_file (path, content, lixcol_global) \
+                 VALUES ('/docs/global.md', CAST('new' AS BYTEA), true) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content \
+                 RETURNING path, lixcol_global",
+                &[],
+            )
+            .await
+            .expect("explicit global path upsert should update global file");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("/docs/global.md".to_string()),
+                Value::Boolean(true),
+            ]],
+        );
 
         let global_session = sim.wrap_session(
             engine
@@ -3682,6 +3725,158 @@ simulation_test!(
                 Value::Text("66696c65-2d67-8c6f-8261-6c2d70617400".to_string()),
                 Value::Blob(b"new".to_vec().into()),
                 Value::Boolean(true),
+            ]],
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ('66696c65-2d6c-8c6f-8261-6c2d70617400', '/docs/global.md', CAST('local-old' AS BYTEA))",
+                &[],
+            )
+            .await
+            .expect("a local file may shadow a global file at the same path");
+        let local = session
+            .execute(
+                "INSERT INTO lix_file (path, content) \
+                 VALUES ('/docs/global.md', CAST('local-new' AS BYTEA)) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content \
+                 RETURNING id, content, lixcol_global",
+                &[],
+            )
+            .await
+            .expect("upsert should choose the local path candidate");
+        assert_rows_eq(
+            local,
+            vec![vec![
+                Value::Text("66696c65-2d6c-8c6f-8261-6c2d70617400".to_string()),
+                Value::Blob(b"local-new".to_vec().into()),
+                Value::Boolean(false),
+            ]],
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content, lixcol_global) \
+                 VALUES ('/docs/global.md', CAST('global-again' AS BYTEA), true) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[],
+            )
+            .await
+            .expect("global upsert should choose the global candidate under a local shadow");
+        let global = global_session
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/docs/global.md'",
+                &[],
+            )
+            .await
+            .expect("global file should remain independently writable");
+        assert_rows_eq(global, vec![vec![Value::Blob(b"global-again".to_vec().into())]]);
+
+        let mixed = session
+            .execute(
+                "INSERT INTO lix_file (path, content, lixcol_global) VALUES \
+                 ('/docs/global.md', CAST('local-batch' AS BYTEA), false), \
+                 ('/docs/global.md', CAST('global-batch' AS BYTEA), true) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content \
+                 RETURNING id, content, lixcol_global",
+                &[],
+            )
+            .await
+            .expect("same path in different scopes should update two distinct rows");
+        assert_rows_eq(
+            mixed,
+            vec![
+                vec![
+                    Value::Text("66696c65-2d6c-8c6f-8261-6c2d70617400".to_string()),
+                    Value::Blob(b"local-batch".to_vec().into()),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("66696c65-2d67-8c6f-8261-6c2d70617400".to_string()),
+                    Value::Blob(b"global-batch".to_vec().into()),
+                    Value::Boolean(true),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_on_conflict_id_requires_global_session_under_local_shadow,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("main session should open"),
+            &engine,
+        );
+        let id = "66696c65-2d73-8c6f-8261-6c2d69640000";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_global) \
+                 VALUES ($1, '/global-id.md', CAST('global-old' AS BYTEA), true)",
+                &[Value::Text(id.to_string())],
+            )
+            .await
+            .expect("global file should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
+                 VALUES ($1, '/local-id.md', CAST('local' AS BYTEA))",
+                &[Value::Text(id.to_string())],
+            )
+            .await
+            .expect("local file should shadow the global ID");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_global) \
+                 VALUES ($1, '/global-id.md', CAST('global-new' AS BYTEA), true) \
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content \
+                 RETURNING content, lixcol_global",
+                &[Value::Text(id.to_string())],
+            )
+            .await
+            .expect_err("a branch session must not bypass its local ID shadow");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing local file"));
+
+        let global_session = sim.wrap_session(
+            engine
+                .open_session_at("ffffffff-ffff-7fff-bfff-ffffffffffff")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let result = global_session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_global) \
+                 VALUES ($1, '/global-id.md', CAST('global-new' AS BYTEA), true) \
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content \
+                 RETURNING content, lixcol_global",
+                &[Value::Text(id.to_string())],
+            )
+            .await
+            .expect("global session should update and return the global row");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Blob(b"global-new".to_vec().into()),
+                Value::Boolean(true),
+            ]],
+        );
+        let local = session
+            .execute(
+                "SELECT content, lixcol_global FROM lix_file WHERE id = $1",
+                &[Value::Text(id.to_string())],
+            )
+            .await
+            .expect("local shadow should still be visible");
+        assert_rows_eq(
+            local,
+            vec![vec![
+                Value::Blob(b"local".to_vec().into()),
+                Value::Boolean(false),
             ]],
         );
     }

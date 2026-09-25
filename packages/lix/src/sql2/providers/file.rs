@@ -2149,6 +2149,30 @@ impl UpsertSupport for LixFileSpec {
             .await
     }
 
+    fn select_conflict_candidate(
+        &self,
+        existing: &RecordBatch,
+        existing_rows: &[usize],
+        proposed: &RecordBatch,
+        proposed_row: usize,
+        _target: &UpsertConflictTarget,
+    ) -> Result<usize> {
+        let proposed_global =
+            optional_bool_value(proposed, proposed_row, "lixcol_global")?.unwrap_or(false);
+        let proposed_untracked =
+            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
+        for &row in existing_rows {
+            if optional_bool_value(existing, row, "lixcol_global")?.unwrap_or(false)
+                == proposed_global
+                && optional_bool_value(existing, row, "lixcol_untracked")?.unwrap_or(false)
+                    == proposed_untracked
+            {
+                return Ok(row);
+            }
+        }
+        Ok(existing_rows[0])
+    }
+
     fn validate_duplicate_proposed(
         &self,
         proposed: &RecordBatch,
@@ -2174,6 +2198,25 @@ impl UpsertSupport for LixFileSpec {
         proposed_row: usize,
         target: &UpsertConflictTarget,
     ) -> Result<()> {
+        let existing_global =
+            optional_bool_value(existing, existing_row, "lixcol_global")?.unwrap_or(false);
+        let proposed_global =
+            optional_bool_value(proposed, proposed_row, "lixcol_global")?.unwrap_or(false);
+        if existing_global != proposed_global {
+            let (column, value) = match target.kind() {
+                UpsertConflictKind::Id => ("id", required_string_value(proposed, proposed_row, "id")?),
+                UpsertConflictKind::Path =>
+                    ("path", required_string_value(proposed, proposed_row, "path")?),
+            };
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "INSERT ON CONFLICT ({column}) on lix_file cannot write {} {column} {value:?} over existing {} file",
+                    global_lane_name(proposed_global),
+                    global_lane_name(existing_global)
+                ),
+            )));
+        }
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
@@ -2346,6 +2389,10 @@ fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> 
 
 fn lane_name(untracked: bool) -> &'static str {
     if untracked { "untracked" } else { "tracked" }
+}
+
+fn global_lane_name(global: bool) -> &'static str {
+    if global { "global" } else { "local" }
 }
 
 struct LixFileInsertSink {
@@ -2956,6 +3003,9 @@ async fn execute_fast_lix_file_id_path_writes_inner(
 
     let active_branch_id = ctx.active_branch_id().to_string();
     let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
+    if conflict.targets_id() && parsed_writes.iter().any(|write| write.id.is_none()) {
+        return Ok(None);
+    }
 
     // Boxed: this function keeps the whole-branch fallback below live in the
     // same state machine, so inlining the indexed route's futures here makes
@@ -3048,15 +3098,29 @@ async fn stage_scanning_file_path_writes(
     for write in parsed_writes {
         let content = write.data.clone();
         if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
+            if conflict.targets_id() && write.id.as_deref() != Some(existing.id.as_str()) {
+                // The fallback index looked up a path, but this statement's
+                // conflict target is ID. Let the general provider insert or
+                // reject the proposed ID against its actual storage scope.
+                return Ok(None);
+            }
             let base_blob_hash = existing
                 .blob_hash
                 .as_deref()
                 .and_then(|hash| BlobId::from_hex(hash).ok());
             if conflict != FastLixFilePathWriteConflict::None {
-                validate_fast_lix_file_path_conflict_pair(
-                    existing.scope.untracked,
-                    &write.parsed.path,
-                )?;
+                if conflict.targets_id() {
+                    validate_fast_lix_file_id_conflict_pair(
+                        existing.scope.global,
+                        write.id.as_deref().expect("ID conflict requires an ID"),
+                    )?;
+                } else {
+                    validate_fast_lix_file_path_conflict_pair(
+                        existing.scope.global,
+                        existing.scope.untracked,
+                        &write.parsed.path,
+                    )?;
+                }
             }
             match conflict {
                 FastLixFilePathWriteConflict::None => {
@@ -3333,13 +3397,19 @@ async fn stage_indexed_file_path_writes(
         TransactionWriteMode::Replace
     };
     for (write, entry) in writes.iter().zip(&indexed.existing) {
-        if !conflict.targets_id()
-            && let Some(entry) = entry
-        {
-            validate_fast_lix_file_path_conflict_pair(
-                entry.key.is_untracked(),
-                &write.parsed.path,
-            )?;
+        if let Some(entry) = entry {
+            if conflict.targets_id() {
+                validate_fast_lix_file_id_conflict_pair(
+                    entry.key.global(),
+                    write.id.as_deref().expect("ID conflict requires an ID"),
+                )?;
+            } else {
+                validate_fast_lix_file_path_conflict_pair(
+                    entry.key.global(),
+                    entry.key.is_untracked(),
+                    &write.parsed.path,
+                )?;
+            }
         }
     }
     let existing = if conflict.updates_existing() {
@@ -3750,9 +3820,18 @@ fn attach_fast_file_write_metadata(
 }
 
 fn validate_fast_lix_file_path_conflict_pair(
+    existing_global: bool,
     existing_untracked: bool,
     path: &str,
 ) -> Result<(), LixError> {
+    if existing_global {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "INSERT ON CONFLICT (path) on lix_file cannot write local path {path:?} over existing global file"
+            ),
+        ));
+    }
     let proposed_untracked = false;
     if existing_untracked == proposed_untracked {
         return Ok(());
@@ -3763,6 +3842,18 @@ fn validate_fast_lix_file_path_conflict_pair(
             "INSERT ON CONFLICT (path) on lix_file cannot write {} path {path:?} over existing {} file",
             lane_name(proposed_untracked),
             lane_name(existing_untracked)
+        ),
+    ))
+}
+
+fn validate_fast_lix_file_id_conflict_pair(existing_global: bool, id: &str) -> Result<(), LixError> {
+    if !existing_global {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "INSERT ON CONFLICT (id) on lix_file cannot write local id {id:?} over existing global file"
         ),
     ))
 }
@@ -12705,7 +12796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_path_upsert_does_not_cross_blob_ref_scope_lanes() {
+    async fn fast_file_path_upsert_rejects_cross_scope_before_staging_blob_refs() {
         let local_descriptor = live_file_row(
             "01920000-0000-7000-8000-000000000442",
             "01920000-0000-7000-8000-0000000000b1",
@@ -12743,7 +12834,7 @@ mod tests {
             ..CapturingWriteContext::default()
         };
 
-        let outcome = super::execute_fast_lix_file_path_writes(
+        let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![
                 (
@@ -12763,26 +12854,14 @@ mod tests {
             None,
         )
         .await
-        .expect("scope-isolated path upsert should stage");
+        .expect_err("local path upsert must not update a global file");
 
-        assert!(outcome.is_some());
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing global file"));
         assert_eq!(write_context.path_index_count, 1);
-        assert_eq!(
-            write_context.exact_load_requests.len(),
-            1,
-            "blob-less scoped descriptors need only the blob-reference probe"
-        );
-        assert_eq!(write_context.exact_load_requests[0].rows.len(), 2);
+        assert!(write_context.exact_load_requests.is_empty());
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileContent {
-            rows, file_content, ..
-        } = &write_context.writes[0]
-        else {
-            panic!("scope-isolated path upsert should stage file data");
-        };
-        assert_eq!(file_content.len(), 2);
-        assert!(file_content.iter().all(|write| !write.had_blob_ref));
-        assert!(rows.iter().all(|row| row.snapshot.is_some()));
+        assert!(write_context.writes.is_empty());
     }
 
     #[tokio::test]

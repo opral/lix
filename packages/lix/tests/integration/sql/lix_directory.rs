@@ -1455,7 +1455,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_insert_on_conflict_path_updates_visible_global_directory,
+    lix_directory_insert_on_conflict_path_rejects_cross_scope_directory,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1475,7 +1475,19 @@ simulation_test!(
             .await
             .expect("global seed directory insert should succeed");
 
-        let result = session
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_metadata) \
+                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', CAST('{\"version\":0}' AS JSONB)) \
+                 ON CONFLICT (id) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
+                &[],
+            )
+            .await
+            .expect_err("local ID upsert must not update a global directory");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("existing global directory"));
+
+        let error = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
                  VALUES ('/global-dir', CAST('{\"version\":2}' AS JSONB)) \
@@ -1483,8 +1495,38 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("path upsert should update visible global directory");
-        assert_eq!(result.rows_affected(), 1);
+            .expect_err("local path upsert must not update a global directory");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("local path"));
+        assert!(error.message.contains("existing global directory"));
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (path) VALUES ('/global-dir') \
+                 ON CONFLICT (path) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("DO NOTHING must not conceal a cross-scope path collision");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+
+        let result = session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata, lixcol_global) \
+                 VALUES ('/global-dir', CAST('{\"version\":2}' AS JSONB), true) \
+                 ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata \
+                 RETURNING path, lixcol_global",
+                &[],
+            )
+            .await
+            .expect("explicit global path upsert should update global directory");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("/global-dir".to_string()),
+                Value::Boolean(true),
+            ]],
+        );
 
         let global_session = sim.wrap_session(
             engine
@@ -1507,6 +1549,33 @@ simulation_test!(
                 Value::Text("6469722d-676c-8f62-816c-2d7061746800".to_string()),
                 Value::Jsonb(json!({"version": 2}).into()),
                 Value::Boolean(true),
+            ]],
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_metadata) \
+                 VALUES ('6469722d-6c6f-8f62-816c-2d7061746800', '/global-dir', CAST('{\"version\":3}' AS JSONB))",
+                &[],
+            )
+            .await
+            .expect("a local directory may shadow a global directory at the same path");
+        let local = session
+            .execute(
+                "INSERT INTO lix_directory (path, lixcol_metadata) \
+                 VALUES ('/global-dir', CAST('{\"version\":4}' AS JSONB)) \
+                 ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata \
+                 RETURNING id, lixcol_metadata, lixcol_global",
+                &[],
+            )
+            .await
+            .expect("upsert should choose the local directory candidate");
+        assert_rows_eq(
+            local,
+            vec![vec![
+                Value::Text("6469722d-6c6f-8f62-816c-2d7061746800".to_string()),
+                Value::Jsonb(json!({"version": 4}).into()),
+                Value::Boolean(false),
             ]],
         );
     }

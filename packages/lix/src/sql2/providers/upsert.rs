@@ -262,6 +262,20 @@ pub(super) trait UpsertSupport: Send + Sync {
             .await
     }
 
+    /// Choose the existing row to resolve a conflict when the same visible
+    /// path has entries in more than one storage scope. Filesystem providers
+    /// prefer the proposed row's scope before validating the selected pair.
+    fn select_conflict_candidate(
+        &self,
+        _existing: &RecordBatch,
+        existing_rows: &[usize],
+        _proposed: &RecordBatch,
+        _proposed_row: usize,
+        _target: &UpsertConflictTarget,
+    ) -> Result<usize> {
+        Ok(existing_rows[0])
+    }
+
     /// Validate a matched existing/proposed pair before applying the conflict
     /// action. Most tables need no extra check; filesystem path targets use it
     /// to reject tracked/untracked namespace collisions.
@@ -331,15 +345,17 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
         let mut unmatched_proposed = Vec::new();
         for row in 0..batch.num_rows() {
             let key = identity_key(batch, row, conflict_columns)?;
+            let seen_key = proposed_conflict_key(batch, row, target, key.clone())?;
             let existing_rows = existing_by_identity.get(&key);
             // Validate every proposed row, including repeated DO NOTHING rows:
             // a later proposal can violate the provider's tracked/untracked lane.
-            if let Some(existing_rows) = existing_rows {
-                for &existing_row in existing_rows {
-                    spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
-                }
+            let selected_existing = existing_rows
+                .map(|rows| spec.select_conflict_candidate(&existing, rows, batch, row, target))
+                .transpose()?;
+            if let Some(existing_row) = selected_existing {
+                spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
             }
-            if !seen.insert(key.clone()) {
+            if !seen.insert(seen_key) {
                 spec.validate_duplicate_proposed(batch, row, target, existing_rows.is_some())?;
                 if matches!(action, UpsertAction::DoNothing) {
                     continue;
@@ -348,8 +364,7 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
                     "ON CONFLICT DO UPDATE cannot affect the same row twice".into(),
                 ));
             }
-            if let Some(existing_rows) = existing_rows {
-                let existing_row = existing_rows[0];
+            if let Some(existing_row) = selected_existing {
                 matched_proposed.push(row as u64);
                 matched_existing.push(existing_row as u64);
             } else {
@@ -423,15 +438,17 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
         let mut existing_for_proposed = vec![None; batch.num_rows()];
         for row in 0..batch.num_rows() {
             let key = identity_key(batch, row, conflict_columns)?;
+            let seen_key = proposed_conflict_key(batch, row, target, key.clone())?;
             let existing_rows = existing_by_identity.get(&key);
             // Validate every proposed row, including repeated DO NOTHING rows:
             // a later proposal can violate the provider's tracked/untracked lane.
-            if let Some(existing_rows) = existing_rows {
-                for &existing_row in existing_rows {
-                    spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
-                }
+            let selected_existing = existing_rows
+                .map(|rows| spec.select_conflict_candidate(&existing, rows, batch, row, target))
+                .transpose()?;
+            if let Some(existing_row) = selected_existing {
+                spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
             }
-            if !seen.insert(key.clone()) {
+            if !seen.insert(seen_key) {
                 spec.validate_duplicate_proposed(batch, row, target, existing_rows.is_some())?;
                 if matches!(action, UpsertAction::DoNothing) {
                     continue;
@@ -440,8 +457,7 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
                     "ON CONFLICT DO UPDATE cannot affect the same row twice".into(),
                 ));
             }
-            if let Some(existing_rows) = existing_rows {
-                let existing_row = existing_rows[0];
+            if let Some(existing_row) = selected_existing {
                 existing_for_proposed[row] = Some(existing_row);
                 matched_proposed.push(row as u64);
                 matched_existing.push(existing_row as u64);
@@ -660,6 +676,29 @@ fn identity_key(
             ScalarValue::try_from_array(batch.column(index).as_ref(), row)
         })
         .collect()
+}
+
+/// Path identities can exist once per global/local scope. Two proposals for
+/// the same path in different scopes therefore target different rows.
+fn proposed_conflict_key(
+    batch: &RecordBatch,
+    row: usize,
+    target: &UpsertConflictTarget,
+    mut key: Vec<ScalarValue>,
+) -> Result<Vec<ScalarValue>> {
+    if target.kind() == UpsertConflictKind::Path {
+        let column = batch.column(batch.schema().index_of("lixcol_global")?);
+        let global = match ScalarValue::try_from_array(column.as_ref(), row)? {
+            ScalarValue::Boolean(value) => value.unwrap_or(false),
+            value => {
+                return Err(DataFusionError::Execution(format!(
+                    "lixcol_global must be BOOLEAN for path conflict, got {value:?}"
+                )));
+            }
+        };
+        key.push(ScalarValue::Boolean(Some(global)));
+    }
+    Ok(key)
 }
 
 /// Select `indices` rows from `batch` into a new batch.

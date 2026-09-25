@@ -1117,6 +1117,30 @@ impl UpsertSupport for LixDirectorySpec {
         lix_directory_record_batch(&self.schema, &rows).map_err(lix_error_to_datafusion_error)
     }
 
+    fn select_conflict_candidate(
+        &self,
+        existing: &RecordBatch,
+        existing_rows: &[usize],
+        proposed: &RecordBatch,
+        proposed_row: usize,
+        _target: &UpsertConflictTarget,
+    ) -> Result<usize> {
+        let proposed_global =
+            optional_bool_value(proposed, proposed_row, "lixcol_global")?.unwrap_or(false);
+        let proposed_untracked =
+            optional_bool_value(proposed, proposed_row, "lixcol_untracked")?.unwrap_or(false);
+        for &row in existing_rows {
+            if optional_bool_value(existing, row, "lixcol_global")?.unwrap_or(false)
+                == proposed_global
+                && optional_bool_value(existing, row, "lixcol_untracked")?.unwrap_or(false)
+                    == proposed_untracked
+            {
+                return Ok(row);
+            }
+        }
+        Ok(existing_rows[0])
+    }
+
     fn validate_duplicate_proposed(
         &self,
         proposed: &RecordBatch,
@@ -1142,6 +1166,25 @@ impl UpsertSupport for LixDirectorySpec {
         proposed_row: usize,
         target: &UpsertConflictTarget,
     ) -> Result<()> {
+        let existing_global =
+            optional_bool_value(existing, existing_row, "lixcol_global")?.unwrap_or(false);
+        let proposed_global =
+            optional_bool_value(proposed, proposed_row, "lixcol_global")?.unwrap_or(false);
+        if existing_global != proposed_global {
+            let (column, value) = match target.kind() {
+                UpsertConflictKind::Id => ("id", required_string_value(proposed, proposed_row, "id")?),
+                UpsertConflictKind::Path =>
+                    ("path", required_string_value(proposed, proposed_row, "path")?),
+            };
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "INSERT ON CONFLICT ({column}) on lix_directory cannot write {} {column} {value:?} over existing {} directory",
+                    global_lane_name(proposed_global),
+                    global_lane_name(existing_global)
+                ),
+            )));
+        }
         if target.kind() != UpsertConflictKind::Path {
             return Ok(());
         }
@@ -1234,6 +1277,10 @@ fn validate_required_paths(batch: &RecordBatch, table_name: &str) -> Result<()> 
 
 fn lane_name(untracked: bool) -> &'static str {
     if untracked { "untracked" } else { "tracked" }
+}
+
+fn global_lane_name(global: bool) -> &'static str {
+    if global { "global" } else { "local" }
 }
 
 fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
