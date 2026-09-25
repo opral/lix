@@ -165,14 +165,20 @@ const TableIcon = () => (
 );
 
 /**
- * Rows shown in the hero diagram: one repository holding source code next to
- * documents, spreadsheets, media, and application tables. Familiar icons only.
+ * Tables lead the diagram because versioning SQL rows alongside files is the
+ * key difference from a file-only repository.
  */
+const repositoryTables: RepositoryFile[] = [
+  { name: "customers", size: "3,180 rows", table: true },
+  { name: "orders", size: "12,400 rows", table: true },
+  { name: "event_log", size: "84,200 rows", table: true },
+];
+
 const repositoryFiles: RepositoryFile[] = [
   {
-    name: "app.js",
-    size: "12 KB",
-    icon: { src: "/assets/icons/javascript.svg", alt: "JavaScript" },
+    name: "model.step",
+    size: "240 MB",
+    badge: { text: "3D", bg: "#E5E7EB", fg: "#374151" },
   },
   {
     name: "contract.docx",
@@ -180,26 +186,19 @@ const repositoryFiles: RepositoryFile[] = [
     icon: { src: "/assets/icons/word.svg", alt: "Word" },
   },
   {
-    name: "pricing.xlsx",
-    size: "1.2 MB",
-    icon: { src: "/assets/icons/excel.svg", alt: "Excel" },
+    name: "deck.pptx",
+    size: "12 MB",
+    badge: { text: "P", bg: "#C5401E", fg: "#FFFFFF" },
   },
   {
-    name: "train.py",
-    size: "8 KB",
-    icon: { src: "/assets/icons/python.svg", alt: "Python" },
+    name: "launch.mp4",
+    size: "4.8 GB",
+    badge: { text: "▶", bg: "#1F2937", fg: "#FFFFFF" },
   },
-  {
-    name: "hero.psd",
-    size: "412 MB",
-    badge: { text: "Ps", bg: "#001E36", fg: "#31A8FF" },
-  },
-  { name: "orders", size: "12,400 rows", table: true },
-  { name: "customers", size: "3,180 rows", table: true },
 ];
 
 /**
- * Hero diagram: one Lix repository holding every file format side by side.
+ * Hero diagram: one Lix repository with SQL tables above files.
  *
  * @example
  * <OneRepositoryDiagram />
@@ -210,12 +209,32 @@ function OneRepositoryDiagram() {
       <div
         className="relative rounded-xl border-[1.5px] border-cyan-bright bg-[rgba(7,182,213,0.05)] px-3.5 pb-3.5 pt-[26px]"
         role="img"
-        aria-label="One Lix repository holding source code, documents, spreadsheets, images, and the application's own database tables."
+        aria-label="One Lix repository holding versioned SQL tables above CAD, Word, PowerPoint, and video files."
       >
         <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-paper px-2.5 font-mono text-[11.5px] font-bold tracking-[0.09em] text-cyan-deep">
           ONE REPOSITORY
         </span>
         <div className="flex flex-col gap-[7px]">
+          <span className="font-mono text-[10px] font-bold uppercase tracking-[0.09em] text-ink-muted">
+            SQL tables
+          </span>
+          {repositoryTables.map((file) => (
+            <div
+              key={file.name}
+              className="flex min-w-0 items-center gap-2.5 rounded-md border border-line bg-white px-3 py-[9px]"
+            >
+              <TableIcon />
+              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
+                {file.name}
+              </span>
+              <span className="shrink-0 font-mono text-[11px] text-ink-faint">
+                {file.size}
+              </span>
+            </div>
+          ))}
+          <span className="mt-1 font-mono text-[10px] font-bold uppercase tracking-[0.09em] text-ink-muted">
+            Any file format
+          </span>
           {repositoryFiles.map((file) => (
             <div
               key={file.name}
@@ -253,19 +272,19 @@ function OneRepositoryDiagram() {
 
 const pillars = [
   {
-    title: "Any format",
+    title: "Any file",
     description:
-      "Store text, binaries, and large files. Plugins provide structured diffs for supported formats, including Markdown and CSV.",
+      "Store code, Word, PowerPoint, CAD, and large media files. Plugins provide structured diffs for supported formats; other files have whole-file history.",
   },
   {
-    title: "Embeddable",
+    title: "SQL tables",
     description:
-      "Runs in-process inside your product. Storage is pluggable: memory, filesystem, browser OPFS, or S3.",
+      "Define tables in Lix for CRM records, logs, and application data. Query rows and history with SQL.",
   },
   {
-    title: "Designed as a database",
+    title: "Built to embed",
     description:
-      "Files, app tables, and history are rows in one ACID database. Query all of it with SQL.",
+      "Run Lix in-process inside your product. Branch, diff, merge, and roll back files and tables through one API.",
   },
 ];
 
@@ -289,11 +308,12 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Version control system for files and application data
+              Version control system for files and tables
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Store files and SQL tables in one repository. Branch, diff,
-              merge, and roll back changes to both.
+              Embed Lix to version files of any format and SQL tables you define
+              in Lix. Branch, merge, and roll back both. Plugins add structured
+              file diffs.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">

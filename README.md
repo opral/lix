@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Version control system for files and application data</h3>
+<h3 align="center">Version control system for files and tables</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,28 +11,29 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a version control system for files and application data. Store files of any format alongside SQL tables in one repository. Branch, diff, merge, and roll back changes to both. Lix runs inside your app or connects to a server:
+Lix is a version control system for files and tables. Put documents, large media, CAD files, and application tables in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in your app or connect to a server:
 
-<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
 
-- 📄 **Any format.** Store text, binaries, and large files. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV.
+- 📄 **Any file.** Store text, binaries, and large files, including Word, PowerPoint, CAD, and video. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV. Other formats have whole-file history.
+- 🗃️ **SQL tables.** Version rows for CRM records, logs, and other application data alongside files.
 - 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
-- 🗄️ **Designed as a database.** File content, app tables, and history are rows in one ACID OLTP database. Query millions of rows with SQL.
+- 🗄️ **Designed as a database.** Files, tables, and history share one ACID OLTP database. Query millions of rows with SQL.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
 
 ## Why not Git?
 
-Git versions files well, but application data usually lives in a separate database. Committing a SQLite database to Git versions its bytes, not its rows: changes are hard to review or merge, and each database revision adds to the repository. Lix stores queryable tables alongside files and versions changes to both.
+Git versions files well, but the tables behind an app usually live in a separate database. Committing a SQLite database to Git versions its bytes, not its rows: changes are hard to review or merge, and each database revision adds to the repository. Lix versions queryable SQL rows alongside files.
 
-|                   | Git                  | Lix                             |
-| ----------------- | -------------------- | ------------------------------- |
-| Process model     | Separate CLI process | Library in your process         |
-| Storage           | Local disk           | Memory · filesystem · OPFS · S3 |
-| Application data  | Separate database    | SQL rows, ACID, with the files  |
-| Recording changes | Manual commits       | Tracked writes commit automatically |
-| Formats           | Text lines           | Structured diffs with plugins for supported formats |
-| Collaboration     | Push and pull        | Real time                       |
+|                    | Git                   | Lix                                     |
+| ------------------ | --------------------- | --------------------------------------- |
+| Process model      | CLI-first             | Library in your process                 |
+| Storage            | Local disk            | Memory · filesystem · OPFS · S3         |
+| Application tables | Separate database     | Versioned SQL rows with the files       |
+| Recording changes  | Manual commits        | Tracked writes commit automatically     |
+| Formats            | Any bytes; text diffs | Any bytes; structured diffs via plugins |
+| Collaboration      | Push and pull         | Real time                               |
 
 ## Getting started
 
@@ -79,9 +80,9 @@ Lix is in alpha.
 
 ### Co-locate code, documents, and app state
 
-Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. No system versions all of them together. Lix stores them in one repository with one history.
+Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. Lix can put those files and app tables in one repository with one history.
 
-<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository with versioned SQL tables above files of many formats" width="760" />
 
 ```ts
 // A script, a 4.8 GB video, and an app table in one transaction.
@@ -105,7 +106,7 @@ await lix.executeBatch([
 
 ### Give each customer a repository
 
-Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive has no version control. Your customers do not have GitHub repos. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, and media.
+Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive's file history does not cover your app's SQL tables. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, media, and app tables.
 
 <img src="./website/public/assets/customer-repositories.svg" alt="Your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files" width="760" />
 
@@ -148,9 +149,13 @@ const changes = await lix.execute(`
 
 ## How Lix works
 
-### Files × database
+Lix puts four capabilities in one library:
 
-Plugins map files to SQL rows. A paragraph, cell, or property becomes a row Lix can version.
+<img src="./website/public/assets/filesystem-database-version-control.svg" alt="Files of any format, SQL tables, version control, and embedding in one library" width="880" />
+
+### Files and tables
+
+Plugins can map parts of files to SQL rows. A paragraph, cell, or property becomes a row Lix can version. Your own tables can hold application data in the same repository.
 
 With `FilesystemStorage`, the file stays available on disk. Its rows are queryable with SQL. Lix tracks changes to both.
 
