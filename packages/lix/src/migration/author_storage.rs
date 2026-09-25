@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(report.before.format, Some(82));
         assert_eq!(report.after.format, Some(83));
         let lix = crate::open_lix().with_storage(storage.clone()).await.unwrap();
-        let rows = lix.execute("SELECT id FROM lix_branch_ref", &[]).await.unwrap();
+        let rows = lix.execute("SELECT id FROM lix_branch", &[]).await.unwrap();
         assert!(!rows.is_empty());
         lix.close().await.unwrap();
         let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
