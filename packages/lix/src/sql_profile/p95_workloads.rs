@@ -12,7 +12,9 @@ fn sample(p: SqlReadProfile) -> serde_json::Value {
     let (builds, descriptor_rows) = crate::filesystem::full_rebuild_stats();
     let (hits, misses) = crate::filesystem::path_index_cache_stats();
     let (nodes, diffs) = crate::sql2::take_mainline_work();
-    serde_json::json!({"total_ms":millis(p.total),"logical_ms":millis(p.logical_planning),"physical_ms":millis(p.physical_planning),"execution_ms":millis(p.arrow_execution),"materialization_ms":millis(p.public_result_materialization),"other_ms":millis(p.unattributed_overhead()),"scan_ms":millis(p.scan_elapsed),"scan_rows":p.scan_rows,"scan_batches":p.scan_batches,"scan_arrow_bytes":p.scan_arrow_bytes,"provider_rows_examined":p.provider_rows_examined,"path_index_builds":builds,"path_index_descriptor_rows":descriptor_rows,"path_index_cache_hits":hits,"path_index_cache_misses":misses,"mainline_nodes":nodes,"mainline_diffs":diffs})
+    let (retirement_batches, retirement_keys) = crate::sql2::take_checkpoint_retirement_work();
+    let (metadata_batches, metadata_rows) = crate::sql2::take_mainline_metadata_work();
+    serde_json::json!({"total_ms":millis(p.total),"logical_ms":millis(p.logical_planning),"physical_ms":millis(p.physical_planning),"execution_ms":millis(p.arrow_execution),"materialization_ms":millis(p.public_result_materialization),"other_ms":millis(p.unattributed_overhead()),"scan_ms":millis(p.scan_elapsed),"scan_rows":p.scan_rows,"scan_batches":p.scan_batches,"scan_arrow_bytes":p.scan_arrow_bytes,"provider_rows_examined":p.provider_rows_examined,"path_index_builds":builds,"path_index_descriptor_rows":descriptor_rows,"path_index_cache_hits":hits,"path_index_cache_misses":misses,"mainline_nodes":nodes,"mainline_diffs":diffs,"retirement_batches":retirement_batches,"retirement_keys":retirement_keys,"metadata_batches":metadata_batches,"metadata_rows":metadata_rows})
 }
 async fn full_profile(
     session: &crate::session::SessionContext<Memory>,
@@ -22,6 +24,8 @@ async fn full_profile(
 ) -> (crate::ExecuteResult, SqlReadProfile) {
     crate::filesystem::reset_full_rebuild_stats();
     let _ = crate::sql2::take_mainline_work();
+    let _ = crate::sql2::take_checkpoint_retirement_work();
+    let _ = crate::sql2::take_mainline_metadata_work();
     let started = std::time::Instant::now();
     let (result, mut profile) = if observe {
         session

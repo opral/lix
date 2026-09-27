@@ -21,3 +21,18 @@ The changing-ID regression remains an actionable QA finding. Shared descriptor d
 Validation: 4,615 all-simulation tests passed (79 skipped), including fresh-engine work bounds at 8/400 files, qualified/aliased source IDs, path-as-ID alias misdirection, staged/global/untracked/tombstone parity and late-content plugin acknowledgement. Ten doctests passed. All seven families also pass explicit observation-SQL mode (six observed families, account ordinary execute) and 128-dirty-file density experiments. Observation-SQL timing excludes the observer invalidation wait, lifecycle and delivered-view acknowledgement.
 
 Independent GPT-6 Luna xhigh reviewers `implement_history` and `audit_cardinality` approved correctness and the cold-tail benefit with the changing-ID tradeoff retained. Reviewer `audit_points` approved the consumed-result observation profiler and its measurement scope.
+
+## Bounded checkpoint-status and columnar log windows
+
+Log scans now collect at most 64 ordered first-parent nodes, resolve their retirement states in one batch at the pinned anchor, and emit a stable columnar batch. History diffs keep one-node windows and the original frontier. A generic physical-fetch callback preserves ordinary ordered-page laziness; repeated optimizer rebinding preserves the original planned cap and its physical cache key. This changes shared scan execution, with no query fingerprint recognizer or maintained count shortcut.
+
+Compared with the preceding point-scope commit, 20 independent trials per arm, 100 warm executions/trial, 128 files/checkpoints, using observation SQL for six production-observed families and execute for account:
+
+| Checkpoint summary | Baseline ms | Batched ms | Change |
+| --- | ---: | ---: | ---: |
+| Median trial warm p95 | 7.488 | 1.863 | -75.1% |
+| Fresh-session p95 | 8.715 | 2.491 | -71.4% |
+
+Warm trial p95 ranges are 7.326–8.193 versus 1.844–1.907 ms. Scan batches fall 128 → 3 and Arrow bytes 45,056 → 5,780; graph nodes remain 131 and retirement keys remain 128, resolved in three batches. All complete-result oracles pass. Other warm medians change by at most about 1%, with overlapping ranges; file-row candidate trial p95 range includes one 0.869 ms outlier versus baseline maximum 0.725 ms, with medians 0.714 versus 0.710 ms. Changing-ID point-read regression from the prior optimization remains open.
+
+Validation: 4,618 all-simulation tests passed (79 skipped), and ten doctests passed. Coverage includes 64-row window boundaries, pinned undo/redo and fork status, plain zero-column count, full-count page consumption, page work independent of older history, LIMIT 0, successive fetch widening/narrowing/removal and effective cache keys. Independent GPT-6 Luna xhigh code and data review challenges preserved in the companion audit ledger. Failed intermediate page-work experiments are retained there and excluded from comparative results. These canonical Memory SQL measurements do not predict deployed production p95 or network/observer delivery time.
