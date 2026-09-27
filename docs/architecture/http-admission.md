@@ -8,7 +8,7 @@ Finite remote SQL protocol responses have a 16 MiB response budget; observations
 
 ## Metadata operation
 
-`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 21`, returns authenticated metadata:
+`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 22`, returns authenticated metadata:
 
 ```
 { repositoryId, principalId, protocolEpoch: 21, storageEpoch: 82 }

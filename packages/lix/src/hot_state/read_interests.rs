@@ -8,6 +8,7 @@ use super::{
     HotStateExactBatchRequest, HotStateProjection, HotStateReadDomain, HotStateScanRequest,
 };
 use crate::LixError;
+use crate::filesystem::FilesystemPathIndexScope;
 use crate::row_pk::RowPk;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -110,8 +111,7 @@ pub(crate) enum LogicalReadInterest {
         schema_key: String,
     },
     FilesystemPaths {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_ids: Option<Vec<String>>,
+        scope: FilesystemPathIndexScope,
         branch_ids: Vec<String>,
         include_blob_refs: bool,
         cache_small_blob_data: bool,
@@ -694,6 +694,8 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "fixture exercises path cache hit"
         );
+        let directory_paths = paths.clone().with_directories_only();
+        reader.path_index(&directory_paths).await.unwrap();
         reader
             .prepare_packed_identity_membership(&branch, "lix_key_value")
             .await
@@ -711,8 +713,26 @@ mod tests {
         let snapshot = registry.snapshot().unwrap();
         assert!(snapshot.interests.iter().any(|recipe| recipe.as_ref()
             == &LogicalReadInterest::scan(&request, HotStateReadDomain::Tracked)));
-        assert_eq!(snapshot.interests.iter().filter(|recipe| matches!(recipe.as_ref(),
-            LogicalReadInterest::FilesystemPaths { branch_ids, .. } if branch_ids == &vec![branch.clone()])).count(), 1);
+        assert_eq!(
+            snapshot
+                .interests
+                .iter()
+                .filter(|recipe| matches!(
+                    recipe.as_ref(),
+                    LogicalReadInterest::FilesystemPaths { branch_ids, .. }
+                        if branch_ids == &vec![branch.clone()]
+                ))
+                .count(),
+            2
+        );
+        assert!(snapshot.interests.iter().any(|recipe| matches!(
+            recipe.as_ref(),
+            LogicalReadInterest::FilesystemPaths {
+                scope: FilesystemPathIndexScope::DirectoriesOnly,
+                branch_ids,
+                ..
+            } if branch_ids == &vec![branch.clone()]
+        )));
         assert!(
             snapshot
                 .interests
@@ -734,13 +754,26 @@ mod tests {
     }
 
     #[test]
-    fn scoped_filesystem_recipe_preserves_legacy_decode_and_selected_refresh_scope() {
-        let legacy = serde_json::json!({"kind":"filesystem_paths", "branch_ids":["branch"], "include_blob_refs":false, "cache_small_blob_data":false});
-        let decoded: LogicalReadInterest = serde_json::from_value(legacy.clone()).unwrap();
-        assert!(matches!(&decoded, LogicalReadInterest::FilesystemPaths { file_ids: None, .. }));
-        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
-        let selected = LogicalReadInterest::FilesystemPaths { branch_ids:vec!["branch".to_owned()], file_ids:Some(vec!["file".to_owned()]), include_blob_refs:true, cache_small_blob_data:false };
-        assert_eq!(serde_json::from_slice::<LogicalReadInterest>(&serde_json::to_vec(&selected).unwrap()).unwrap(), selected);
+    fn scoped_filesystem_recipes_preserve_scope_through_serialization() {
+        for scope in [
+            FilesystemPathIndexScope::All,
+            FilesystemPathIndexScope::FileIds(vec!["file".to_owned()]),
+            FilesystemPathIndexScope::DirectoriesOnly,
+        ] {
+            let recipe = LogicalReadInterest::FilesystemPaths {
+                scope,
+                branch_ids: vec!["branch".to_owned()],
+                include_blob_refs: false,
+                cache_small_blob_data: false,
+            };
+            assert_eq!(
+                serde_json::from_slice::<LogicalReadInterest>(
+                    &serde_json::to_vec(&recipe).unwrap()
+                )
+                .unwrap(),
+                recipe
+            );
+        }
     }
 
     #[tokio::test]

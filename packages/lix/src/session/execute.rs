@@ -1575,7 +1575,7 @@ where
                             register_seeded_file_interest(
                                 capture,
                                 &active_branch_id,
-                                None,
+                                crate::filesystem::FilesystemPathIndexScope::All,
                                 crate::hot_state::FilePathInterest::Comparison {
                                     operation:
                                         crate::hot_state::FilePathInterestComparison::Equal,
@@ -4135,19 +4135,29 @@ pub(crate) fn seed_foreground_filesystem_interest(
     let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
         return Ok(());
     };
-    let (file_ids, path_predicate, content) = match route {
-        ExactFilesystemRead::RootFileListing
-        | ExactFilesystemRead::RootDirectoryListing => {
-            (None, crate::hot_state::FilePathInterest::All, false)
-        }
+    let (scope, path_predicate, content) = match route {
+        ExactFilesystemRead::RootFileListing => (
+            crate::filesystem::FilesystemPathIndexScope::All,
+            crate::hot_state::FilePathInterest::All,
+            false,
+        ),
+        ExactFilesystemRead::RootDirectoryListing => (
+            crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+            crate::hot_state::FilePathInterest::All,
+            false,
+        ),
         ExactFilesystemRead::Point(selector, column) => {
             let content = column == ExactLixFileReadColumn::Content;
             match selector {
                 ExactLixFileReadSelector::Id(id) => {
-                    (Some(vec![id]), crate::hot_state::FilePathInterest::All, content)
+                    (
+                        crate::filesystem::FilesystemPathIndexScope::FileIds(vec![id]),
+                        crate::hot_state::FilePathInterest::All,
+                        content,
+                    )
                 }
                 ExactLixFileReadSelector::Path(path) => (
-                    None,
+                    crate::filesystem::FilesystemPathIndexScope::All,
                     crate::hot_state::FilePathInterest::Comparison {
                         operation: crate::hot_state::FilePathInterestComparison::Equal,
                         value: path,
@@ -4157,14 +4167,14 @@ pub(crate) fn seed_foreground_filesystem_interest(
             }
         }
         ExactFilesystemRead::PathContentBatch(paths) => (
-            None,
+            crate::filesystem::FilesystemPathIndexScope::All,
             crate::hot_state::FilePathInterest::In {
                 values: paths.into_iter().collect(),
             },
             true,
         ),
         ExactFilesystemRead::IdManifestBatch(ids) => (
-            Some(ids.into_iter().collect()),
+            crate::filesystem::FilesystemPathIndexScope::FileIds(ids.into_iter().collect()),
             crate::hot_state::FilePathInterest::All,
             true,
         ),
@@ -4172,7 +4182,7 @@ pub(crate) fn seed_foreground_filesystem_interest(
     register_seeded_file_interest(
         capture,
         active_branch_id,
-        file_ids,
+        scope,
         path_predicate,
         content,
         None,
@@ -4182,15 +4192,27 @@ pub(crate) fn seed_foreground_filesystem_interest(
 fn register_seeded_file_interest(
     capture: &crate::hot_state::ReadInterestRegistry,
     active_branch_id: &str,
-    file_ids: Option<Vec<String>>,
+    scope: crate::filesystem::FilesystemPathIndexScope,
     path_predicate: crate::hot_state::FilePathInterest,
     content: bool,
     byte_range: Option<(u64, u64)>,
 ) -> Result<(), LixError> {
+    let scope = crate::filesystem::FilesystemPathIndexRequest::new(vec![
+        active_branch_id.to_owned(),
+    ])
+    .with_scope(scope)
+    .scope;
+    let file_ids = match &scope {
+        crate::filesystem::FilesystemPathIndexScope::FileIds(file_ids) => Some(file_ids.clone()),
+        crate::filesystem::FilesystemPathIndexScope::All
+        | crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly => None,
+    };
+    let include_blob_refs =
+        content && !matches!(&scope, crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly);
     capture.register(crate::hot_state::LogicalReadInterest::FilesystemPaths {
-        file_ids: file_ids.clone(),
+        scope,
         branch_ids: vec![active_branch_id.to_owned()],
-        include_blob_refs: content,
+        include_blob_refs,
         cache_small_blob_data: false,
     })?;
     if content {

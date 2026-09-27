@@ -109,7 +109,7 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
         &FilePathPredicate::All,
     )?;
     let index = filesystem_path_index
-        .path_index(&FilesystemPathIndexRequest::new(branch_ids))
+        .path_index(&FilesystemPathIndexRequest::new(branch_ids).with_directories_only())
         .await?;
     let matches = indexed_directory_root_matches(index);
     super::file::retain_selected_entries(hot_state.as_ref(), matches.entries(), false)?;
@@ -227,9 +227,10 @@ impl LixDirectorySpec {
         }
         let index = self
             .filesystem_path_index
-            .path_index(&FilesystemPathIndexRequest::new(
-                request.filter.branch_ids.clone(),
-            ))
+            .path_index(
+                &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                    .with_directories_only(),
+            )
             .await
             .map_err(lix_error_to_datafusion_error)?;
         let selected = indexed_path_matches(
@@ -497,18 +498,20 @@ impl TableSpec for LixDirectorySpec {
             if root_parent_filter {
                 let index = self
                     .filesystem_path_index
-                    .path_index(&FilesystemPathIndexRequest::new(
-                        request.filter.branch_ids.clone(),
-                    ))
+                    .path_index(
+                        &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                            .with_directories_only(),
+                    )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 indexed_matches = Some(indexed_directory_root_matches(index));
             } else if let FileIdConstraint::Ids(parent_ids) = &target_parent_ids {
                 let index = self
                     .filesystem_path_index
-                    .path_index(&FilesystemPathIndexRequest::new(
-                        request.filter.branch_ids.clone(),
-                    ))
+                    .path_index(
+                        &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                            .with_directories_only(),
+                    )
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 indexed_matches = Some(indexed_directory_parent_matches(index, parent_ids));
@@ -518,9 +521,10 @@ impl TableSpec for LixDirectorySpec {
         {
             let index = self
                 .filesystem_path_index
-                .path_index(&FilesystemPathIndexRequest::new(
-                    request.filter.branch_ids.clone(),
-                ))
+                .path_index(
+                    &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                        .with_directories_only(),
+                )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             indexed_matches = Some(indexed_path_matches(

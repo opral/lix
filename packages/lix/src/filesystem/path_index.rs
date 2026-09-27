@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::LixError;
 use crate::binary_cas::BlobId;
@@ -710,23 +710,28 @@ impl FilesystemPathIndex {
     ) -> Result<Self, LixError> {
         let mut next = self.clone();
         next.generation = generation.map(<[u8]>::to_vec);
-        for row in rows.iter().filter(|row| {
-            matches!(
+        for row in rows.iter().filter(|row| match &request.scope {
+            FilesystemPathIndexScope::DirectoriesOnly => {
+                row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            }
+            FilesystemPathIndexScope::All | FilesystemPathIndexScope::FileIds(_) => matches!(
                 row.schema_key.as_str(),
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            )
+            ),
         }) {
             for_each_committed_row_projection(request, row, |projected| {
                 next.apply_committed_row(projected)
             })?;
         }
-        for row in rows
-            .iter()
-            .filter(|row| row.schema_key == BLOB_REF_SCHEMA_KEY)
-        {
-            for_each_committed_row_projection(request, row, |projected| {
-                next.apply_committed_blob_ref_row(projected)
-            })?;
+        if !matches!(&request.scope, FilesystemPathIndexScope::DirectoriesOnly) {
+            for row in rows
+                .iter()
+                .filter(|row| row.schema_key == BLOB_REF_SCHEMA_KEY)
+            {
+                for_each_committed_row_projection(request, row, |projected| {
+                    next.apply_committed_blob_ref_row(projected)
+                })?;
+            }
         }
         Ok(next)
     }
@@ -1155,10 +1160,21 @@ fn estimated_entry_index_bytes(entry: &FilesystemPathEntry) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemPathIndexRequest {
-    pub(crate) file_ids: Option<Vec<String>>,
+    pub(crate) scope: FilesystemPathIndexScope,
     pub(crate) branch_ids: Vec<String>,
     pub(crate) include_blob_refs: bool,
     pub(crate) cache_small_blob_data: bool,
+}
+
+/// Select the live filesystem rows needed by one path-index consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FilesystemPathIndexScope {
+    #[default]
+    All,
+    FileIds(Vec<String>),
+    /// Includes all directory descriptors for a branch, never files or blobs.
+    DirectoriesOnly,
 }
 
 impl FilesystemPathIndexRequest {
@@ -1166,7 +1182,7 @@ impl FilesystemPathIndexRequest {
         branch_ids.sort();
         branch_ids.dedup();
         Self {
-            file_ids: None,
+            scope: FilesystemPathIndexScope::All,
             branch_ids,
             include_blob_refs: false,
             cache_small_blob_data: false,
@@ -1175,40 +1191,79 @@ impl FilesystemPathIndexRequest {
 
     /// Restrict a file view without changing ordinary full-index consumers.
     pub(crate) fn with_file_ids(mut self, file_ids: Option<Vec<String>>) -> Self {
-        self.file_ids = file_ids.map(|mut ids| {
+        self.scope = file_ids.map_or(FilesystemPathIndexScope::All, |mut ids| {
             ids.sort();
             ids.dedup();
-            ids
+            FilesystemPathIndexScope::FileIds(ids)
         });
         self
     }
 
+    /// Build a branch-scoped index from directory descriptors only.
+    pub(crate) fn with_directories_only(mut self) -> Self {
+        self.scope = FilesystemPathIndexScope::DirectoriesOnly;
+        self.include_blob_refs = false;
+        self.cache_small_blob_data = false;
+        self
+    }
+
+    pub(crate) fn with_scope(mut self, scope: FilesystemPathIndexScope) -> Self {
+        self.scope = match scope {
+            FilesystemPathIndexScope::All => FilesystemPathIndexScope::All,
+            FilesystemPathIndexScope::DirectoriesOnly => {
+                self.include_blob_refs = false;
+                self.cache_small_blob_data = false;
+                FilesystemPathIndexScope::DirectoriesOnly
+            }
+            FilesystemPathIndexScope::FileIds(mut ids) => {
+                ids.sort();
+                ids.dedup();
+                FilesystemPathIndexScope::FileIds(ids)
+            }
+        };
+        self
+    }
+
+    pub(crate) fn file_ids(&self) -> Option<&[String]> {
+        match &self.scope {
+            FilesystemPathIndexScope::FileIds(file_ids) => Some(file_ids),
+            FilesystemPathIndexScope::All | FilesystemPathIndexScope::DirectoriesOnly => None,
+        }
+    }
+
     pub(crate) fn with_blob_refs(mut self, enabled: bool) -> Self {
-        self.include_blob_refs = enabled;
+        if !matches!(&self.scope, FilesystemPathIndexScope::DirectoriesOnly) {
+            self.include_blob_refs = enabled;
+        }
         self
     }
 
     pub(crate) fn with_cached_blob_data(mut self, enabled: bool) -> Self {
-        self.include_blob_refs |= enabled;
-        self.cache_small_blob_data = enabled;
+        if !matches!(&self.scope, FilesystemPathIndexScope::DirectoriesOnly) {
+            self.include_blob_refs |= enabled;
+            self.cache_small_blob_data = enabled;
+        }
         self
     }
 
     pub(crate) fn hot_state_request(&self) -> HotStateScanRequest {
+        let schema_keys = if matches!(&self.scope, FilesystemPathIndexScope::DirectoriesOnly) {
+            vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()]
+        } else if self.include_blob_refs {
+            vec![
+                BLOB_REF_SCHEMA_KEY.to_string(),
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            ]
+        } else {
+            vec![
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            ]
+        };
         HotStateScanRequest {
             filter: HotStateFilter {
-                schema_keys: if self.include_blob_refs {
-                    vec![
-                        BLOB_REF_SCHEMA_KEY.to_string(),
-                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    ]
-                } else {
-                    vec![
-                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    ]
-                },
+                schema_keys,
                 branch_ids: self.branch_ids.clone(),
                 ..HotStateFilter::default()
             },
@@ -1270,8 +1325,14 @@ pub(crate) async fn read_path_index_rows(
     hot_state: &dyn HotStateReader,
     request: &FilesystemPathIndexRequest,
 ) -> Result<MaterializedHotStateBatch, LixError> {
-    let Some(file_ids) = &request.file_ids else {
-        return hot_state.scan_batch(&request.hot_state_request()).await;
+    let file_ids = match &request.scope {
+        FilesystemPathIndexScope::All => {
+            return hot_state.scan_batch(&request.hot_state_request()).await;
+        }
+        FilesystemPathIndexScope::DirectoriesOnly => {
+            return hot_state.scan_batch(&request.hot_state_request()).await;
+        }
+        FilesystemPathIndexScope::FileIds(file_ids) => file_ids,
     };
     if file_ids.is_empty() {
         return Ok(MaterializedHotStateBatch::default());
@@ -1352,7 +1413,7 @@ fn directory_parent_row_pk(
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheKey {
-    file_ids: Option<Vec<String>>,
+    scope: FilesystemPathIndexScope,
     branch_ids: Vec<String>,
     revision: Option<Vec<u8>>,
     include_blob_refs: bool,
@@ -1361,8 +1422,13 @@ struct CacheKey {
 
 impl CacheKey {
     fn estimated_heap_bytes(&self) -> usize {
-        self.file_ids.as_ref().map_or(0, |ids| ids.capacity() * size_of::<String>() + ids.iter().map(String::capacity).sum::<usize>())
-            + self.branch_ids.capacity() * size_of::<String>()
+        (match &self.scope {
+            FilesystemPathIndexScope::FileIds(ids) => {
+                ids.capacity() * size_of::<String>()
+                    + ids.iter().map(String::capacity).sum::<usize>()
+            }
+            FilesystemPathIndexScope::All | FilesystemPathIndexScope::DirectoriesOnly => 0,
+        }) + self.branch_ids.capacity() * size_of::<String>()
             + self.branch_ids.iter().map(String::capacity).sum::<usize>()
             + self.revision.as_ref().map_or(0, Vec::capacity)
     }
@@ -1399,7 +1465,7 @@ impl FilesystemPathIndexCache {
         revision: Option<&[u8]>,
     ) -> Option<Arc<FilesystemPathIndex>> {
         let key = CacheKey {
-            file_ids: request.file_ids.clone(),
+            scope: request.scope.clone(),
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
@@ -1429,7 +1495,7 @@ impl FilesystemPathIndexCache {
         index: Arc<FilesystemPathIndex>,
     ) -> Arc<FilesystemPathIndex> {
         let key = CacheKey {
-            file_ids: request.file_ids.clone(),
+            scope: request.scope.clone(),
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
@@ -1448,7 +1514,7 @@ impl FilesystemPathIndexCache {
             Arc::new((*index).clone().with_generation(revision))
         };
         entries.retain(|candidate| {
-            candidate.key.file_ids != key.file_ids
+            candidate.key.scope != key.scope
                 || candidate.key.branch_ids != key.branch_ids
                 || candidate.key.include_blob_refs != key.include_blob_refs
                 || candidate.key.cache_small_blob_data != key.cache_small_blob_data
@@ -1500,10 +1566,13 @@ impl FilesystemPathIndexCache {
             // A multi-branch effective view needs cross-branch precedence
             // reconciliation. Filesystem queries normally use one branch, so
             // keep this uncommon case on the correctness fallback as well.
-            if candidate.key.file_ids.is_some() || candidate.key.branch_ids.len() != 1 {
+            if matches!(&candidate.key.scope, FilesystemPathIndexScope::FileIds(_))
+                || candidate.key.branch_ids.len() != 1
+            {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
+                .with_scope(candidate.key.scope.clone())
                 .with_blob_refs(candidate.key.include_blob_refs)
                 .with_cached_blob_data(candidate.key.cache_small_blob_data);
             if let Ok(index) = candidate
@@ -1516,7 +1585,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, index) in advanced {
             let key = CacheKey {
-            file_ids: request.file_ids.clone(),
+                scope: request.scope,
                 branch_ids: request.branch_ids,
                 revision: next_revision.map(<[u8]>::to_vec),
                 include_blob_refs: request.include_blob_refs,
@@ -1562,10 +1631,14 @@ impl FilesystemPathIndexCache {
             let Some(next_revision) = next_revision_for(previous_revision) else {
                 return true;
             };
-            if invalidates_delta || candidate.key.file_ids.is_some() || candidate.key.branch_ids.len() != 1 {
+            if invalidates_delta
+                || matches!(&candidate.key.scope, FilesystemPathIndexScope::FileIds(_))
+                || candidate.key.branch_ids.len() != 1
+            {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
+                .with_scope(candidate.key.scope.clone())
                 .with_blob_refs(candidate.key.include_blob_refs)
                 .with_cached_blob_data(candidate.key.cache_small_blob_data);
             if let Ok(index) =
@@ -1579,7 +1652,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, revision, index) in advanced {
             let key = CacheKey {
-            file_ids: request.file_ids.clone(),
+                scope: request.scope,
                 branch_ids: request.branch_ids,
                 revision: Some(revision),
                 include_blob_refs: request.include_blob_refs,
@@ -1769,11 +1842,31 @@ mod tests {
         // Measure actual rows consumed by the shared builder. This guards the
         // storage-work property, not merely that the request carries an ID.
         reset_full_rebuild_stats();
-        reader
+        let full_index = reader
             .path_index(&FilesystemPathIndexRequest::new(vec![branch.clone()]))
             .await
             .unwrap();
         let (_, full_domain_rows) = full_rebuild_stats();
+        let expected_directory_count = full_index.kind_count(FilesystemPathKind::Directory);
+        reset_full_rebuild_stats();
+        let directory_request =
+            FilesystemPathIndexRequest::new(vec![branch.clone()]).with_directories_only();
+        let directory_index = reader.path_index(&directory_request).await.unwrap();
+        let (_, directory_rows) = full_rebuild_stats();
+        assert_eq!(
+            directory_rows, expected_directory_count,
+            "directory-only scan should read directory descriptors only"
+        );
+        assert_eq!(directory_index.kind_count(FilesystemPathKind::Directory), expected_directory_count);
+        assert_eq!(directory_index.kind_count(FilesystemPathKind::File), 0);
+        for path in ["/top", "/top/nested", "/elsewhere"] {
+            assert!(!directory_index.exact_entries(path).is_empty(), "directory missing: {path}");
+        }
+        assert!(
+            directory_rows * 50 < full_domain_rows,
+            "directory listing work should be independent of unrelated files"
+        );
+
         reset_full_rebuild_stats();
         let index = reader.path_index(&request).await.unwrap();
         let (_, scoped_rows) = full_rebuild_stats();
@@ -1792,15 +1885,107 @@ mod tests {
     fn scoped_path_index_cache_separates_selection_and_evicts_on_revision_change() {
         let cache = FilesystemPathIndexCache::default();
         let full = FilesystemPathIndexRequest::new(vec!["branch".to_owned()]);
+        let directories = full
+            .clone()
+            .with_directories_only()
+            .with_cached_blob_data(true);
+        assert!(!directories.include_blob_refs);
+        assert!(!directories.cache_small_blob_data);
+        assert_eq!(
+            directories.hot_state_request().filter.schema_keys,
+            vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned()]
+        );
         let a = full.clone().with_file_ids(Some(vec!["a".to_owned()]));
         let b = full.clone().with_file_ids(Some(vec!["b".to_owned()]));
         let index = cache.insert(&a, Some(&[1]), Arc::new(FilesystemPathIndex::default()));
-        assert!(cache.get(&full, Some(&[1])).is_none());
+        let directory_index = cache.insert(
+            &directories,
+            Some(&[1]),
+            Arc::new(FilesystemPathIndex::default()),
+        );
+        let full_index = cache.insert(
+            &full,
+            Some(&[1]),
+            Arc::new(FilesystemPathIndex::default()),
+        );
         assert!(cache.get(&b, Some(&[1])).is_none());
         assert!(Arc::ptr_eq(&index, &cache.get(&a, Some(&[1])).unwrap()));
+        assert!(Arc::ptr_eq(
+            &directory_index,
+            &cache.get(&directories, Some(&[1])).unwrap()
+        ));
+        assert!(Arc::ptr_eq(&full_index, &cache.get(&full, Some(&[1])).unwrap()));
         cache.advance_committed(Some(&[1]), Some(&[2]), &[]);
         assert!(cache.get(&a, Some(&[1])).is_none());
         assert!(cache.get(&a, Some(&[2])).is_none());
+        assert!(cache.get(&directories, Some(&[1])).is_none());
+        assert!(cache.get(&full, Some(&[1])).is_none());
+        assert!(cache.get(&directories, Some(&[2])).is_some());
+        assert!(cache.get(&full, Some(&[2])).is_some());
+    }
+
+    #[test]
+    fn deserialized_file_scopes_are_canonicalized_before_use() {
+        let scope: FilesystemPathIndexScope =
+            serde_json::from_str(r#"{"file_ids":["b","a","b"]}"#).unwrap();
+        let request = FilesystemPathIndexRequest::new(vec!["branch".to_owned()]).with_scope(scope);
+        assert_eq!(
+            request.file_ids().unwrap(),
+            ["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn directory_only_cache_advances_directories_and_ignores_file_and_blob_deltas() {
+        let request =
+            FilesystemPathIndexRequest::new(vec!["branch-a".to_owned()]).with_directories_only();
+        let prior_rows = vec![
+            directory_row("docs", None, "docs", "branch-a", false),
+            directory_row("nested", Some("docs"), "nested", "branch-a", false),
+        ];
+        let prior = path_index_from_rows(prior_rows.clone()).unwrap();
+        let prior = Arc::new(prior);
+
+        let deltas = vec![
+            file_row("new-file", Some("docs"), "new.md", "branch-a", false),
+            blob_row("new-file", "new-blob-hash", "branch-a"),
+            directory_row("docs", None, "archive", "branch-a", false),
+        ];
+
+        let committed_cache = FilesystemPathIndexCache::default();
+        committed_cache.insert(&request, Some(&[1]), Arc::clone(&prior));
+        committed_cache.advance_committed(Some(&[1]), Some(&[2]), &deltas);
+        assert_directory_only_cached_update(&committed_cache, &request, Some(&[2]), "/archive");
+        assert!(committed_cache.get(&request, Some(&[1])).is_none());
+        assert_eq!(
+            prior.exact_entries("/docs").len(),
+            1,
+            "prior snapshot remains immutable"
+        );
+        assert!(prior.exact_entries("/archive").is_empty());
+
+        let transaction_cache = FilesystemPathIndexCache::default();
+        transaction_cache.insert(&request, Some(&[1]), prior);
+        transaction_cache
+            .advance_revisions(&deltas, |revision| (revision == [1]).then_some(vec![3]));
+        assert_directory_only_cached_update(&transaction_cache, &request, Some(&[3]), "/archive");
+        assert!(transaction_cache.get(&request, Some(&[1])).is_none());
+    }
+
+    fn assert_directory_only_cached_update(
+        cache: &FilesystemPathIndexCache,
+        request: &FilesystemPathIndexRequest,
+        revision: Option<&[u8]>,
+        renamed_path: &str,
+    ) {
+        let index = cache
+            .get(request, revision)
+            .expect("directory index should advance");
+        assert_eq!(index.kind_count(FilesystemPathKind::Directory), 2);
+        assert_eq!(index.kind_count(FilesystemPathKind::File), 0);
+        assert_eq!(index.exact_entries(renamed_path).len(), 1);
+        assert_eq!(index.exact_entries("/archive/nested").len(), 1);
+        assert!(index.exact_entries("/archive/new.md").is_empty());
     }
 
     #[test]

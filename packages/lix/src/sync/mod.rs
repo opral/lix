@@ -211,7 +211,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v19 attaches bounded authenticated native dependencies to exact metadata.
 // v20 adds operation-level read fulfillment for bounded typed dependency discovery.
 // v21 requires v2 native baseline leases, which v20 clients cannot renew.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 21;
+// v22 adds explicit filesystem path-index scopes to read-fulfillment recipes.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 22;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

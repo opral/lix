@@ -2241,7 +2241,7 @@ where
         }
         if let Some(registry) = &self.read_interest_registry {
             registry.register(super::LogicalReadInterest::FilesystemPaths {
-                file_ids: request.file_ids.clone(),
+                scope: request.scope.clone(),
                 branch_ids: request.branch_ids.clone(),
                 include_blob_refs: request.include_blob_refs,
                 cache_small_blob_data: request.cache_small_blob_data,

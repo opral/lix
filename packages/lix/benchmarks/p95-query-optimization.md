@@ -36,3 +36,20 @@ Compared with the preceding point-scope commit, 20 independent trials per arm, 1
 Warm trial p95 ranges are 7.326–8.193 versus 1.844–1.907 ms. Scan batches fall 128 → 3 and Arrow bytes 45,056 → 5,780; graph nodes remain 131 and retirement keys remain 128, resolved in three batches. All complete-result oracles pass. Other warm medians change by at most about 1%, with overlapping ranges; file-row candidate trial p95 range includes one 0.869 ms outlier versus baseline maximum 0.725 ms, with medians 0.714 versus 0.710 ms. Changing-ID point-read regression from the prior optimization remains open.
 
 Validation: 4,618 all-simulation tests passed (79 skipped), and ten doctests passed. Coverage includes 64-row window boundaries, pinned undo/redo and fork status, plain zero-column count, full-count page consumption, page work independent of older history, LIMIT 0, successive fetch widening/narrowing/removal and effective cache keys. Independent GPT-6 Luna xhigh code and data review challenges preserved in the companion audit ledger. Failed intermediate page-work experiments are retained there and excluded from comparative results. These canonical Memory SQL measurements do not predict deployed production p95 or network/observer delivery time.
+
+## Directory-only filesystem indexes
+
+Directory listing now requests a directory-only index through a shared scope enum. The scope controls schema demand, cache identity and advancement, transaction overlays, and durable partial-replica read interests. Writes still resolve the complete filesystem namespace. This is a shared index/read-demand change rather than a query-fingerprint shortcut.
+
+Compared with the preceding checkpoint-window engine, each fixture has 20 counterbalanced trials per arm and 100 warm samples per query/trial, with matching protocol-enabled build features and complete result equality:
+
+| Directory first-session p95 | Baseline ms | Scoped ms | Engine descriptor rows |
+| --- | ---: | ---: | --- |
+| 128 files, 19 directories | 3.403 | 1.766 | 148 → 19; -48.1% latency |
+| 400 files, 53 directories | 7.048 | 2.266 | 454 → 53; -67.9% latency |
+
+Cold ranges do not overlap: 2.875–3.657 versus 1.472–1.796 ms, and 6.451–7.096 versus 2.100–2.347 ms. Warm median trial p95 is approximately unchanged (0.390 → 0.387 ms at 128 files; 0.559 → 0.548 ms at 400), with overlapping ranges. Other query-family warm medians change by at most 0.8%. These are engine row counts, not physical storage I/O or byte reductions. The larger fixture also has more output directories; it does not establish constant cost as directory count grows. The changing-ID point-read tradeoff remains open.
+
+Validation: 4,878 tests passed with all simulations, storage benchmarks, server protocol and protocol client enabled (91 skipped), and ten doctests passed. Tests check selected-directory output and actual work with 400 unrelated files, cache scope isolation and committed/staged advancement, partial directory demand, and rejection of old interest journals. Initial fixture/bootstrap, OpenAPI and journal write-admission failures were corrected and retained in the companion audit records. Independent GPT-6 Luna xhigh reviewers approved the scope and data.
+
+The serialized interest shape changes intentionally: sync protocol 22 and partial-interest journal version 3 are required. Client and server must use matching sync versions; existing version-2 journals are rejected rather than silently interpreted or erased. No migration or deployment is included in this draft.

@@ -2360,16 +2360,44 @@ async fn scoped_file_index_publication_prepares_renamed_ancestors_and_new_matche
         .interests
         .iter()
         .filter_map(|interest| match interest.as_ref() {
-            crate::hot_state::LogicalReadInterest::FilesystemPaths { file_ids, .. } => {
-                Some(file_ids)
-            }
+            crate::hot_state::LogicalReadInterest::FilesystemPaths { scope, .. } => Some(scope),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert!(!recipes.is_empty());
     assert!(
-        recipes.iter().all(|scope| scope.as_ref() == Some(&ids)),
+        recipes.iter().all(|scope| {
+            *scope == &crate::filesystem::FilesystemPathIndexScope::FileIds(ids.clone())
+        }),
         "selected and negative IDs must survive the retained recipe without widening"
+    );
+    let directory_listing = execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT id,path FROM lix_directory WHERE parent_id IS NULL ORDER BY path",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!directory_listing.rows().is_empty());
+    let interests = engine
+        .sync_mode()
+        .read_interests()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(
+        interests.interests.iter().any(|interest| matches!(
+            interest.as_ref(),
+            crate::hot_state::LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+                ..
+            }
+        )),
+        "partial-replica directory listing should retain a directory-only path-index interest"
     );
     authority
         .execute(

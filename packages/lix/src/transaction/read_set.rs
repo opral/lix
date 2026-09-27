@@ -93,11 +93,7 @@ impl SqlReadSet {
     }
 
     pub(crate) fn record_path_index(&self, request: &FilesystemPathIndexRequest) {
-        if request
-            .file_ids
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        {
+        if request.file_ids().is_some_and(<[String]>::is_empty) {
             return;
         }
         self.record(SqlReadFootprint::PathIndex(request.clone()));

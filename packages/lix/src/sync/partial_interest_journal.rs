@@ -1,6 +1,8 @@
 //! Epoch-bound durable native read recipes. Not a coverage certificate.
 //! The inventory is restored off the repository opening path. Warm unchanged
 //! operations do no journal I/O; newly successful operations flush first.
+//! Version 3 requires explicit filesystem path-index scopes; version 2
+//! recipes are rejected instead of being widened during restoration.
 use super::partial_state::{
     PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
     partial_replica_state_key,
@@ -69,7 +71,7 @@ fn encode(
 ) -> Result<Bytes, LixError> {
     let recipes = canonical_recipes(recipes)?;
     let bytes = serde_json::to_vec(&Journal {
-        version: 2,
+        version: 3,
         epoch_id: state.epoch_id().into(),
         recipes,
     })
@@ -128,7 +130,7 @@ async fn load(
     }
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|_| invalid("interest journal is malformed"))?;
-    if journal.version != 2 || journal.epoch_id != expected.epoch_id() {
+    if journal.version != 3 || journal.epoch_id != expected.epoch_id() {
         return Err(invalid("interest journal version or epoch mismatch"));
     }
     let recipes = canonical_recipes(journal.recipes)?;
@@ -496,6 +498,49 @@ mod tests {
             .unwrap();
         (storage, state)
     }
+
+    #[tokio::test]
+    async fn version_two_filesystem_interest_journals_are_rejected() {
+        let (storage, state) = fixture().await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let (_, _, epoch_guard) = load(&read, &state).await.unwrap();
+        drop(read);
+        let legacy = serde_json::json!({
+            "version": 2,
+            "epochId": state.epoch_id(),
+            "recipes": [{
+                "kind": "filesystem_paths",
+                "file_ids": ["selected-file"],
+                "branch_ids": [state.descriptor().selected_branch.branch_id],
+                "include_blob_refs": false,
+                "cache_small_blob_data": false
+            }]
+        });
+        let mut writes = storage.new_write_set();
+        writes.put(
+            PARTIAL_READ_INTEREST_SPACE,
+            key(&state).unwrap(),
+            crate::storage_adapter::StorageValue {
+                bytes: Bytes::from(serde_json::to_vec(&legacy).unwrap()),
+            },
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions: vec![epoch_guard],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let error = load(&read, &state).await.unwrap_err();
+        assert_eq!(error.code, "LIX_PARTIAL_INTEREST_JOURNAL_INVALID");
+    }
+
     #[tokio::test]
     async fn durable_negative_interests_restore_and_warm_flush_writes_nothing() {
         let (storage, state) = fixture().await;
