@@ -1,9 +1,9 @@
 //! Benchmark-only SQL phase and scan diagnostics.
 
 #[cfg(test)]
-mod point_join_scan_scaling;
-#[cfg(test)]
 mod p95_workloads;
+#[cfg(test)]
+mod point_join_scan_scaling;
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -67,6 +67,60 @@ pub(crate) struct SqlReadProfile {
     /// Checksum of consumed scalar values. This is a benchmark-only
     /// correctness witness, not a public result API.
     pub(crate) result_checksum: u64,
+    /// Elapsed admission/read intervals recorded by storage-benches builds.
+    /// They include CPU and waits, and can overlap SQL phases and each other.
+    #[cfg(feature = "storage-benches")]
+    pub(crate) session_transaction_admission_wait: Duration,
+    #[cfg(feature = "storage-benches")]
+    pub(crate) partial_publication_gate_wait: Duration,
+    #[cfg(feature = "storage-benches")]
+    pub(crate) storage_backend_begin_read: Duration,
+    #[cfg(feature = "storage-benches")]
+    pub(crate) storage_epoch_validation: Duration,
+    #[cfg(feature = "storage-benches")]
+    pub(crate) expired_read_retry_delay: Duration,
+    #[cfg(feature = "storage-benches")]
+    pub(crate) partial_interest_journal_flush: Duration,
+    /// Unique immutable change payloads retained by diff results in this read.
+    #[cfg(test)]
+    pub(crate) diff_payload_rows_retained: u64,
+    /// Unique effective-side payloads captured into SQL diff result batches.
+    #[cfg(test)]
+    pub(crate) effective_payload_rows_captured: u64,
+    /// Typed snapshots serialized to derived JSON `snapshot_content` during this read.
+    #[cfg(test)]
+    pub(crate) derived_snapshot_content_rows: u64,
+}
+
+#[cfg(feature = "storage-benches")]
+#[derive(Clone, Copy)]
+pub(crate) enum WaitOrReadPhase {
+    SessionTransactionAdmission,
+    PartialPublicationGate,
+    StorageBackendBeginRead,
+    StorageEpochValidation,
+    ExpiredReadRetryDelay,
+    PartialInterestJournalFlush,
+}
+
+#[cfg(feature = "storage-benches")]
+pub(crate) fn record_wait_or_read_phase(phase: WaitOrReadPhase, elapsed: Duration) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        let target = match phase {
+            WaitOrReadPhase::SessionTransactionAdmission => {
+                &mut profile.session_transaction_admission_wait
+            }
+            WaitOrReadPhase::PartialPublicationGate => &mut profile.partial_publication_gate_wait,
+            WaitOrReadPhase::StorageBackendBeginRead => &mut profile.storage_backend_begin_read,
+            WaitOrReadPhase::StorageEpochValidation => &mut profile.storage_epoch_validation,
+            WaitOrReadPhase::ExpiredReadRetryDelay => &mut profile.expired_read_retry_delay,
+            WaitOrReadPhase::PartialInterestJournalFlush => {
+                &mut profile.partial_interest_journal_flush
+            }
+        };
+        *target += elapsed;
+    });
 }
 
 impl SqlReadProfile {
@@ -126,6 +180,36 @@ pub(crate) fn record_provider_rows_examined(rows: usize) {
     let _ = ACTIVE_PROFILE.try_with(|profile| {
         let mut profile = profile.borrow_mut();
         profile.provider_rows_examined = profile.provider_rows_examined.saturating_add(rows as u64);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_diff_payload_rows_retained(rows: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.diff_payload_rows_retained = profile
+            .diff_payload_rows_retained
+            .saturating_add(rows as u64);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_effective_payload_rows_captured(rows: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.effective_payload_rows_captured = profile
+            .effective_payload_rows_captured
+            .saturating_add(rows as u64);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_derived_snapshot_content_rows(rows: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.derived_snapshot_content_rows = profile
+            .derived_snapshot_content_rows
+            .saturating_add(rows as u64);
     });
 }
 

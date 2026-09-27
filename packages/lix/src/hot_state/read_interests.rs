@@ -350,9 +350,24 @@ impl ReadInterestRegistry {
         Ok(())
     }
     pub(crate) async fn begin_operation(self: &Arc<Self>) -> ReadInterestOperation {
+        #[cfg(feature = "storage-benches")]
+        let gate = {
+            let profile_wait_started =
+                crate::sql_profile::is_active().then(std::time::Instant::now);
+            let gate = Arc::clone(&self.gate).read_owned().await;
+            if let Some(started) = profile_wait_started {
+                crate::sql_profile::record_wait_or_read_phase(
+                    crate::sql_profile::WaitOrReadPhase::PartialPublicationGate,
+                    started.elapsed(),
+                );
+            }
+            gate
+        };
+        #[cfg(not(feature = "storage-benches"))]
+        let gate = Arc::clone(&self.gate).read_owned().await;
         ReadInterestOperation {
             registry: Arc::clone(self),
-            _guard: Arc::clone(&self.gate).read_owned().await,
+            _guard: gate,
         }
     }
     pub(crate) fn snapshot(&self) -> Result<ReadInterestSnapshot, LixError> {

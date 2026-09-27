@@ -788,7 +788,9 @@ where
                     // Independent storage filters can overfetch a Cartesian
                     // superset. Preserve correlation before limits or output.
                     if let Some(refs) = &route.row_refs {
-                        rows.retain(|row| refs.contains(&(row.file_id.clone(), row.row_pk.clone())));
+                        rows.retain(|row| {
+                            refs.contains(&(row.file_id.clone(), row.row_pk.clone()))
+                        });
                     }
                     if !metadata_filters.is_empty() {
                         let metadata = diff_record_batch(
@@ -1305,6 +1307,8 @@ async fn effective_diff<S: StorageAdapterRead>(
             after: after.map(|row| diff_row(identity, row)),
         });
     }
+    #[cfg(test)]
+    crate::sql_profile::record_effective_payload_rows_captured(payloads.len());
     let payloads = TrackedStatePayloadBatch::from_payloads(
         payloads
             .into_iter()
@@ -3183,17 +3187,11 @@ mod tests {
     #[test]
     fn relation_diff_rejects_wrongly_typed_filesystem_row_refs() {
         for relation_name in ["lix_file", "lix_directory"] {
-            let relation = DiffRelation::from_catalog(
-                PublicCatalog::fixed_system(),
-                relation_name,
-            )
-            .expect("filesystem relation is registered");
-            let malformed = crate::row_ref::encode(
-                relation_name,
-                None,
-                &RowPk::single("not-a-uuid"),
-            )
-            .expect("codec accepts catalog-independent canonical payloads");
+            let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), relation_name)
+                .expect("filesystem relation is registered");
+            let malformed =
+                crate::row_ref::encode(relation_name, None, &RowPk::single("not-a-uuid"))
+                    .expect("codec accepts catalog-independent canonical payloads");
             let route = DiffRoute::from_filters(
                 &[col("row_ref").eq(lit(malformed.as_str()))],
                 &relation,

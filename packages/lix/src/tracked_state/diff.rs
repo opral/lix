@@ -460,6 +460,8 @@ where
 
     let entries = classify_tree_diff_batch(tree_diff, &payloads)?;
 
+    #[cfg(test)]
+    crate::sql_profile::record_diff_payload_rows_retained(payloads.len());
     let diff = TrackedStateDiff::from_entries_with_payloads(entries, payloads);
     Ok(diff)
 }

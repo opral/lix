@@ -14,7 +14,18 @@ fn sample(p: SqlReadProfile) -> serde_json::Value {
     let (nodes, diffs) = crate::sql2::take_mainline_work();
     let (retirement_batches, retirement_keys) = crate::sql2::take_checkpoint_retirement_work();
     let (metadata_batches, metadata_rows) = crate::sql2::take_mainline_metadata_work();
-    serde_json::json!({"total_ms":millis(p.total),"logical_ms":millis(p.logical_planning),"physical_ms":millis(p.physical_planning),"execution_ms":millis(p.arrow_execution),"materialization_ms":millis(p.public_result_materialization),"other_ms":millis(p.unattributed_overhead()),"scan_ms":millis(p.scan_elapsed),"scan_rows":p.scan_rows,"scan_batches":p.scan_batches,"scan_arrow_bytes":p.scan_arrow_bytes,"provider_rows_examined":p.provider_rows_examined,"path_index_builds":builds,"path_index_descriptor_rows":descriptor_rows,"path_index_cache_hits":hits,"path_index_cache_misses":misses,"mainline_nodes":nodes,"mainline_diffs":diffs,"retirement_batches":retirement_batches,"retirement_keys":retirement_keys,"metadata_batches":metadata_batches,"metadata_rows":metadata_rows})
+    #[cfg(feature = "storage-benches")]
+    let wait_phases = serde_json::json!({
+        "session_transaction_admission_ms": millis(p.session_transaction_admission_wait),
+        "partial_publication_gate_ms": millis(p.partial_publication_gate_wait),
+        "storage_backend_begin_read_ms": millis(p.storage_backend_begin_read),
+        "storage_epoch_validation_ms": millis(p.storage_epoch_validation),
+        "expired_read_retry_delay_ms": millis(p.expired_read_retry_delay),
+        "partial_interest_journal_flush_ms": millis(p.partial_interest_journal_flush),
+    });
+    #[cfg(not(feature = "storage-benches"))]
+    let wait_phases = serde_json::Value::Null;
+    serde_json::json!({"total_ms":millis(p.total),"logical_ms":millis(p.logical_planning),"physical_ms":millis(p.physical_planning),"execution_ms":millis(p.arrow_execution),"materialization_ms":millis(p.public_result_materialization),"other_ms":millis(p.unattributed_overhead()),"scan_ms":millis(p.scan_elapsed),"scan_rows":p.scan_rows,"scan_batches":p.scan_batches,"scan_arrow_bytes":p.scan_arrow_bytes,"provider_rows_examined":p.provider_rows_examined,"diff_payload_rows_retained":p.diff_payload_rows_retained,"effective_payload_rows_captured":p.effective_payload_rows_captured,"derived_snapshot_content_rows":p.derived_snapshot_content_rows,"path_index_builds":builds,"path_index_descriptor_rows":descriptor_rows,"path_index_cache_hits":hits,"path_index_cache_misses":misses,"mainline_nodes":nodes,"mainline_diffs":diffs,"retirement_batches":retirement_batches,"retirement_keys":retirement_keys,"metadata_batches":metadata_batches,"metadata_rows":metadata_rows,"wait_phases":wait_phases})
 }
 async fn full_profile(
     session: &crate::session::SessionContext<Memory>,
@@ -55,6 +66,7 @@ async fn seven_p95_workloads() {
     let history = setting("LIX_P95_HISTORY", 128);
     let repeats = setting("LIX_P95_REPEATS", 100);
     let dirty_files = setting("LIX_P95_DIRTY_FILES", 1);
+    let root_current_base = setting("LIX_P95_ROOT_CURRENT_BASE", 0) != 0;
     let mode = std::env::var("LIX_P95_EXECUTION").unwrap_or_else(|_| "execute".into());
     assert!(matches!(mode.as_str(), "execute" | "production_kinds"));
     assert!(dirty_files >= 1 && dirty_files <= rows);
@@ -81,6 +93,48 @@ async fn seven_p95_workloads() {
             .await
             .unwrap();
     }
+    let root_current_base_branch = if root_current_base {
+        let branch = seed
+            .create_branch(crate::session::CreateBranchOptions {
+                id: None,
+                name: "p95-root-backed-current-base".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let read = seed_engine
+            .storage()
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.id)
+            .await
+            .unwrap()
+            .expect("normal branch publication writes its branch control");
+        let current_base = crate::hot_state::TrackedHeadContext::new()
+            .reader(&read)
+            .root_current_base_commit(&branch.id, control.tracked_generation)
+            .await
+            .unwrap();
+        assert!(
+            current_base.is_some(),
+            "fixture flag requires the normal current-base root publication path"
+        );
+        Some(branch.id)
+    } else {
+        None
+    };
+    let seed = if let Some(branch_id) = &root_current_base_branch {
+        seed.close().await.unwrap();
+        seed_engine
+            .open_session_at(branch_id.clone())
+            .await
+            .unwrap()
+    } else {
+        seed
+    };
     let target = Value::Text("01940000-0000-7000-8000-000000000000".into());
     for i in 0..dirty_files {
         seed.execute(
@@ -92,6 +146,28 @@ async fn seven_p95_workloads() {
         )
         .await
         .unwrap();
+    }
+    if let Some(branch_id) = &root_current_base_branch {
+        let read = seed_engine
+            .storage()
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .unwrap()
+            .expect("published branch still has a control after fixture mutations");
+        let current_base = crate::hot_state::TrackedHeadContext::new()
+            .reader(&read)
+            .root_current_base_commit(branch_id, control.tracked_generation)
+            .await
+            .unwrap();
+        assert!(
+            current_base.is_some(),
+            "fixture must retain root current-base coverage after mutations"
+        );
     }
     let account = seed
         .execute("SELECT id FROM lix_account LIMIT 1", &[])
@@ -147,13 +223,85 @@ async fn seven_p95_workloads() {
         expected[1].rows()[0].get::<i64>("file_count").unwrap(),
         dirty_files as i64
     );
+    if root_current_base {
+        let full_dirty_diff = seed
+            .execute(
+                "SELECT id, diff_type, from_content, to_content \
+                 FROM lix_diff('lix_file') ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("root-backed dirty diff should return its full payload rows");
+        assert_eq!(
+            full_dirty_diff.rows().len(),
+            dirty_files,
+            "known dirty writes should produce one complete working-diff row each",
+        );
+        for index in 0..dirty_files {
+            let row = &full_dirty_diff.rows()[index];
+            assert_eq!(
+                row.get::<String>("id").unwrap(),
+                format!("01940000-0000-7000-8000-{index:012x}"),
+                "root-backed diff should retain each expected dirty file identity",
+            );
+            assert_eq!(row.get::<String>("diff_type").unwrap(), "modified");
+            assert_eq!(
+                row.get::<Vec<u8>>("from_content").unwrap(),
+                vec![b'x'; 4096],
+                "full payload should preserve the pre-write content",
+            );
+            assert_eq!(
+                row.get::<Vec<u8>>("to_content").unwrap(),
+                vec![b'y'; 4096],
+                "full payload should preserve the post-write content",
+            );
+        }
+        let dirty_diff_count = seed
+            .execute(
+                "SELECT count(*) AS file_count FROM lix_diff('lix_file')",
+                &[],
+            )
+            .await
+            .expect("root-backed dirty diff count should execute");
+        assert_eq!(
+            dirty_diff_count.rows()[0].get::<i64>("file_count").unwrap(),
+            full_dirty_diff.rows().len() as i64,
+            "identity-only count must match the independent full-payload row oracle",
+        );
+    }
+    if let Some(branch_id) = &root_current_base_branch {
+        let read = seed_engine
+            .storage()
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .unwrap()
+            .expect("published branch still has a control after fixture reads");
+        let current_base = crate::hot_state::TrackedHeadContext::new()
+            .reader(&read)
+            .root_current_base_commit(branch_id, control.tracked_generation)
+            .await
+            .unwrap();
+        assert!(
+            current_base.is_some(),
+            "fixture must retain root current-base coverage immediately before sampling"
+        );
+    }
     seed.close().await.unwrap();
     drop(seed);
     drop(seed_engine);
     for ((name, sql, params), oracle) in queries.into_iter().zip(expected) {
         let observe = mode == "production_kinds" && name != "account_id";
         let engine = Engine::new(storage.clone()).await.unwrap();
-        let session = engine.open_session().await.unwrap();
+        let session = if let Some(branch_id) = &root_current_base_branch {
+            engine.open_session_at(branch_id.clone()).await.unwrap()
+        } else {
+            engine.open_session().await.unwrap()
+        };
         let (result, profile) = full_profile(&session, sql, &params, observe).await;
         assert_eq!(result, oracle, "cold result: {name}");
         let cold = sample(profile);
@@ -169,7 +317,7 @@ async fn seven_p95_workloads() {
         }
         println!(
             "P95_WORKLOAD={}",
-            serde_json::json!({"query":name,"execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
+            serde_json::json!({"query":name,"execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
         );
         if name == "file_content_id" {
             let mut changing_ids = Vec::new();
@@ -187,7 +335,7 @@ async fn seven_p95_workloads() {
             }
             println!(
                 "P95_WORKLOAD={}",
-                serde_json::json!({"query":name,"variant":"changing_ids","execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
+                serde_json::json!({"query":name,"variant":"changing_ids","execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
             );
         }
         session.close().await.unwrap();

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -12,11 +12,11 @@ use crate::sql_telemetry::{
     SqlStatementTelemetry, finish_operation, finish_single_statement_batch, start_batch,
 };
 use crate::sql2;
+use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::{
     ExactFilesystemRead, ExactLixFileReadColumn, ExactLixFileReadSelector,
     exact_filesystem_read_interest_route, exact_filesystem_read_route,
 };
-use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::{is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -1555,119 +1555,121 @@ where
 
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let (content, file_view_mutations, captured_interests) =
-            execute_coherent_session_read::<StorageImpl, _, _, _>(
-                &self.storage,
-                true,
-                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
-                    let paths = paths.clone();
-                    let requested_range = requested_range.clone();
-                    async move {
-                        let active_branch_id =
-                            self.active_branch_id_from_reader(&read_store).await?;
-                        let capture = self.hot_state.capture_foreground_read_interests();
+        let (content, file_view_mutations, captured_interests) = execute_coherent_session_read::<
+            StorageImpl,
+            _,
+            _,
+            _,
+        >(
+            &self.storage,
+            true,
+            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                let paths = paths.clone();
+                let requested_range = requested_range.clone();
+                async move {
+                    let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                    let capture = self.hot_state.capture_foreground_read_interests();
+                    if let Some((_, capture)) = &capture {
+                        let path = paths
+                            .iter()
+                            .next()
+                            .expect("structured file read always has one path")
+                            .clone();
+                        register_seeded_file_interest(
+                            capture,
+                            &active_branch_id,
+                            crate::filesystem::FilesystemPathIndexScope::All,
+                            crate::hot_state::FilePathInterest::Comparison {
+                                operation: crate::hot_state::FilePathInterestComparison::Equal,
+                                value: path,
+                            },
+                            true,
+                            requested_range
+                                .as_ref()
+                                .map(|range| (range.start, range.end)),
+                        )?;
+                    }
+                    let read_hot = capture.as_ref().map_or_else(
+                        || Arc::clone(&self.hot_state),
+                        |(hot, _)| Arc::new(hot.clone()),
+                    );
+                    let plugin_cache_snapshot = read_store.snapshot_cache_key();
+                    let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
+                        Arc::new(read_hot.reader(read_store.clone()));
+                    let filesystem_path_index: Arc<
+                        dyn crate::filesystem::FilesystemPathIndexReader,
+                    > = Arc::new(read_hot.reader(read_store.clone()));
+                    let branch_ref: Arc<dyn BranchRefReader> =
+                        Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                    let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                        Arc::new(self.binary_cas.reader(read_store.clone()));
+                    // A raw file download delivers the same bytes as a direct
+                    // `lix_file.content` read, so it must acknowledge rendered
+                    // plugin state for subsequent collaborative writes.
+                    let file_view_collector = self.file_views.fork_for_read();
+                    let result = async {
+                        let result = sql2::execute_exact_lix_file_batch_read(
+                            &active_branch_id,
+                            hot_state,
+                            filesystem_path_index,
+                            branch_ref,
+                            blob_reader,
+                            self.plugin_host.clone(),
+                            Some(file_view_collector.clone()),
+                            plugin_cache_snapshot,
+                            None,
+                            &paths,
+                            requested_range.clone(),
+                        )
+                        .await?;
+                        let content =
+                            native_file_read_from_exact_result(result, &paths, requested_range)?;
                         if let Some((_, capture)) = &capture {
-                            let path = paths
-                                .iter()
-                                .next()
-                                .expect("structured file read always has one path")
-                                .clone();
-                            register_seeded_file_interest(
-                                capture,
-                                &active_branch_id,
-                                crate::filesystem::FilesystemPathIndexScope::All,
-                                crate::hot_state::FilePathInterest::Comparison {
-                                    operation:
-                                        crate::hot_state::FilePathInterestComparison::Equal,
-                                    value: path,
-                                },
-                                true,
-                                requested_range
-                                    .as_ref()
-                                    .map(|range| (range.start, range.end)),
-                            )?;
-                        }
-                        let read_hot = capture.as_ref().map_or_else(
-                            || Arc::clone(&self.hot_state),
-                            |(hot, _)| Arc::new(hot.clone()),
-                        );
-                        let plugin_cache_snapshot = read_store.snapshot_cache_key();
-                        let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-                            Arc::new(read_hot.reader(read_store.clone()));
-                        let filesystem_path_index: Arc<
-                            dyn crate::filesystem::FilesystemPathIndexReader,
-                        > = Arc::new(read_hot.reader(read_store.clone()));
-                        let branch_ref: Arc<dyn BranchRefReader> =
-                            Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                        let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                            Arc::new(self.binary_cas.reader(read_store.clone()));
-                        // A raw file download delivers the same bytes as a direct
-                        // `lix_file.content` read, so it must acknowledge rendered
-                        // plugin state for subsequent collaborative writes.
-                        let file_view_collector = self.file_views.fork_for_read();
-                        let result = async {
-                            let result = sql2::execute_exact_lix_file_batch_read(
-                                &active_branch_id,
-                                hot_state,
-                                filesystem_path_index,
-                                branch_ref,
-                                blob_reader,
-                                self.plugin_host.clone(),
-                                Some(file_view_collector.clone()),
-                                plugin_cache_snapshot,
-                                None,
-                                &paths,
-                                requested_range.clone(),
-                            )
-                            .await?;
-                            let content =
-                                native_file_read_from_exact_result(result, &paths, requested_range)?;
-                            if let Some((_, capture)) = &capture {
-                                let reader = self.hot_state.reader(read_store.clone());
-                                let executable_rows = reader
-                                    .prepare_captured_read_interests(
-                                        &capture.snapshot()?,
-                                        self.active_account_id(),
-                                    )
-                                    .await?;
-                                self.catalog_context
-                                    .prepare_returned_row_catalogs(
-                                        &reader,
-                                        &executable_rows,
-                                        crate::catalog::load_catalog_revision(&read_store)
-                                            .await?
-                                            .as_ref(),
-                                    )
-                                    .await?;
-                                crate::plugin::runtime::prepare_returned_row_executables(
-                                    &reader,
-                                    &self.binary_cas.reader(read_store),
-                                    &executable_rows,
+                            let reader = self.hot_state.reader(read_store.clone());
+                            let executable_rows = reader
+                                .prepare_captured_read_interests(
+                                    &capture.snapshot()?,
+                                    self.active_account_id(),
                                 )
                                 .await?;
-                            }
-                            Ok::<_, LixError>((
-                                content,
-                                file_view_collector.plugin_file_mutations(),
-                                capture
-                                    .as_ref()
-                                    .map(|(_, capture)| Arc::clone(capture))
-                                    .into_iter()
-                                    .collect::<Vec<_>>(),
-                            ))
-                        }
-                        .await
-                        .map_err(|error| {
-                            crate::sync::annotate_read_fulfillment_capture(
-                                error,
-                                capture.as_ref().map(|(_, capture)| capture.as_ref()),
+                            self.catalog_context
+                                .prepare_returned_row_catalogs(
+                                    &reader,
+                                    &executable_rows,
+                                    crate::catalog::load_catalog_revision(&read_store)
+                                        .await?
+                                        .as_ref(),
+                                )
+                                .await?;
+                            crate::plugin::runtime::prepare_returned_row_executables(
+                                &reader,
+                                &self.binary_cas.reader(read_store),
+                                &executable_rows,
                             )
-                        })?;
-                        Ok(result)
+                            .await?;
+                        }
+                        Ok::<_, LixError>((
+                            content,
+                            file_view_collector.plugin_file_mutations(),
+                            capture
+                                .as_ref()
+                                .map(|(_, capture)| Arc::clone(capture))
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                        ))
                     }
-                },
-            )
-            .await?;
+                    .await
+                    .map_err(|error| {
+                        crate::sync::annotate_read_fulfillment_capture(
+                            error,
+                            capture.as_ref().map(|(_, capture)| capture.as_ref()),
+                        )
+                    })?;
+                    Ok(result)
+                }
+            },
+        )
+        .await?;
         if let Some(content) = &content {
             crate::common::ReadResultBudget::default().charge(content.content().len(), 1)?;
         }
@@ -1713,7 +1715,13 @@ where
             .parse_statement(sql)
             .ok()
             .and_then(|statement| sql2::checkpoint_function_plan(&statement).ok().flatten())
-            .is_some_and(|plan| !matches!(plan, sql2::CheckpointFunctionPlan::Recovery { .. } | sql2::CheckpointFunctionPlan::UndoRedo { .. }));
+            .is_some_and(|plan| {
+                !matches!(
+                    plan,
+                    sql2::CheckpointFunctionPlan::Recovery { .. }
+                        | sql2::CheckpointFunctionPlan::UndoRedo { .. }
+                )
+            });
         let result = if checkpoint_statement {
             // The checkpoint-only wrapper must begin while the SQL span is
             // current so transaction/storage spans become its children. Box
@@ -2493,12 +2501,8 @@ where
 
         match classify_execute_batch(statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
-                self.execute_read_only_batch(
-                    statements,
-                    parsed,
-                    outer_query_span_covers_operation,
-                )
-                .await
+                self.execute_read_only_batch(statements, parsed, outer_query_span_covers_operation)
+                    .await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
                 let contains_write = parsed.contains_write()?;
@@ -2868,9 +2872,7 @@ where
                             let acknowledge_statement =
                                 is_acknowledgeable_file_content_read(&parsed, params)
                                     || late_materialized_lix_file_content_read(&parsed, params)
-                                        .is_some_and(|plan| {
-                                            plan.projection.acknowledges_content()
-                                        });
+                                        .is_some_and(|plan| plan.projection.acknowledges_content());
                             // A mixed batch may return file bytes alongside metadata or
                             // aggregates. Only the exact byte-returning statement may
                             // update the session's private plugin observation.
@@ -3196,40 +3198,47 @@ where
             |(hot, _)| Arc::new(hot.clone()),
         );
         let result = async {
-        let result = Box::pin(self.execute_read_statement_with_scoped_hot(
-            read_store.clone(),
-            read_hot,
-            sql,
-            statement,
-            params,
-            acknowledge_file_views,
-            read_plan,
-            has_durable_runtime_function,
-        ))
-        .await?;
-        if let Some((_, capture)) = &capture {
-            let reader = self.hot_state.reader(read_store.clone());
-            let executable_rows = reader
-                .prepare_captured_read_interests(&capture.snapshot()?, self.active_account_id())
-                .await?;
-            self.catalog_context
-                .prepare_returned_row_catalogs(
+            let result = Box::pin(self.execute_read_statement_with_scoped_hot(
+                read_store.clone(),
+                read_hot,
+                sql,
+                statement,
+                params,
+                acknowledge_file_views,
+                read_plan,
+                has_durable_runtime_function,
+            ))
+            .await?;
+            if let Some((_, capture)) = &capture {
+                let reader = self.hot_state.reader(read_store.clone());
+                let executable_rows = reader
+                    .prepare_captured_read_interests(&capture.snapshot()?, self.active_account_id())
+                    .await?;
+                self.catalog_context
+                    .prepare_returned_row_catalogs(
+                        &reader,
+                        &executable_rows,
+                        crate::catalog::load_catalog_revision(&read_store)
+                            .await?
+                            .as_ref(),
+                    )
+                    .await?;
+                crate::plugin::runtime::prepare_returned_row_executables(
                     &reader,
+                    &self.binary_cas.reader(read_store),
                     &executable_rows,
-                    crate::catalog::load_catalog_revision(&read_store)
-                        .await?
-                        .as_ref(),
                 )
                 .await?;
-            crate::plugin::runtime::prepare_returned_row_executables(
-                &reader,
-                &self.binary_cas.reader(read_store),
-                &executable_rows,
-            )
-            .await?;
+            }
+            Ok::<_, LixError>(result)
         }
-        Ok::<_, LixError>(result)
-        }.await.map_err(|error| crate::sync::annotate_read_fulfillment_capture(error, capture.as_ref().map(|(_, capture)| capture.as_ref())))?;
+        .await
+        .map_err(|error| {
+            crate::sync::annotate_read_fulfillment_capture(
+                error,
+                capture.as_ref().map(|(_, capture)| capture.as_ref()),
+            )
+        })?;
         validate_session_read_result(&result.0.query)?;
         Ok((
             result.0,
@@ -4149,13 +4158,11 @@ pub(crate) fn seed_foreground_filesystem_interest(
         ExactFilesystemRead::Point(selector, column) => {
             let content = column == ExactLixFileReadColumn::Content;
             match selector {
-                ExactLixFileReadSelector::Id(id) => {
-                    (
-                        crate::filesystem::FilesystemPathIndexScope::FileIds(vec![id]),
-                        crate::hot_state::FilePathInterest::All,
-                        content,
-                    )
-                }
+                ExactLixFileReadSelector::Id(id) => (
+                    crate::filesystem::FilesystemPathIndexScope::FileIds(vec![id]),
+                    crate::hot_state::FilePathInterest::All,
+                    content,
+                ),
                 ExactLixFileReadSelector::Path(path) => (
                     crate::filesystem::FilesystemPathIndexScope::All,
                     crate::hot_state::FilePathInterest::Comparison {
@@ -4197,18 +4204,20 @@ fn register_seeded_file_interest(
     content: bool,
     byte_range: Option<(u64, u64)>,
 ) -> Result<(), LixError> {
-    let scope = crate::filesystem::FilesystemPathIndexRequest::new(vec![
-        active_branch_id.to_owned(),
-    ])
-    .with_scope(scope)
-    .scope;
+    let scope =
+        crate::filesystem::FilesystemPathIndexRequest::new(vec![active_branch_id.to_owned()])
+            .with_scope(scope)
+            .scope;
     let file_ids = match &scope {
         crate::filesystem::FilesystemPathIndexScope::FileIds(file_ids) => Some(file_ids.clone()),
         crate::filesystem::FilesystemPathIndexScope::All
         | crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly => None,
     };
-    let include_blob_refs =
-        content && !matches!(&scope, crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly);
+    let include_blob_refs = content
+        && !matches!(
+            &scope,
+            crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly
+        );
     capture.register(crate::hot_state::LogicalReadInterest::FilesystemPaths {
         scope,
         branch_ids: vec![active_branch_id.to_owned()],
@@ -4291,9 +4300,19 @@ where
                         }
                         return Err(error);
                     };
+                    #[cfg(feature = "storage-benches")]
+                    let retry_wait_started =
+                        crate::sql_profile::is_active().then(std::time::Instant::now);
                     tokio::task::yield_now().await;
                     if !delay.is_zero() {
                         crate::sync::sleep(delay).await;
+                    }
+                    #[cfg(feature = "storage-benches")]
+                    if let Some(started) = retry_wait_started {
+                        crate::sql_profile::record_wait_or_read_phase(
+                            crate::sql_profile::WaitOrReadPhase::ExpiredReadRetryDelay,
+                            started.elapsed(),
+                        );
                     }
                 }
             }
@@ -4910,17 +4929,26 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if let sql2::SqlLogicalPlan::Checkpoint(checkpoint) = plan {
-        let recovery = matches!(checkpoint, sql2::CheckpointFunctionPlan::Recovery { .. } | sql2::CheckpointFunctionPlan::UndoRedo { .. });
+        let recovery = matches!(
+            checkpoint,
+            sql2::CheckpointFunctionPlan::Recovery { .. }
+                | sql2::CheckpointFunctionPlan::UndoRedo { .. }
+        );
         let outcome = transaction
             .execute_checkpoint_function(checkpoint, params.to_vec())
             .await?;
         if recovery {
-            return Ok(sql2::SqlWriteResult::returning(outcome.rows_affected, SqlQueryResult {
-                columns: vec!["commit_id".to_string()],
-                column_types: vec![ResultColumnType::Text],
-                rows: vec![vec![outcome.commit_id.map(Value::Text).unwrap_or(Value::Null)]],
-                notices: Vec::new(),
-            }));
+            return Ok(sql2::SqlWriteResult::returning(
+                outcome.rows_affected,
+                SqlQueryResult {
+                    columns: vec!["commit_id".to_string()],
+                    column_types: vec![ResultColumnType::Text],
+                    rows: vec![vec![
+                        outcome.commit_id.map(Value::Text).unwrap_or(Value::Null),
+                    ]],
+                    notices: Vec::new(),
+                },
+            ));
         }
         return sql2::SqlWriteResult::checkpoint_function(outcome);
     }
@@ -5331,7 +5359,9 @@ mod tests {
         };
         assert_eq!(
             late_lix_file_ids(&valid, Some(0)),
-            Some(BTreeSet::from(["01940000-0000-7000-8000-000000000001".into()]))
+            Some(BTreeSet::from([
+                "01940000-0000-7000-8000-000000000001".into()
+            ]))
         );
 
         let malformed = SqlQueryResult {
@@ -6460,9 +6490,7 @@ mod tests {
                 )]
             ),
             Some(ExactFilesystemRead::Point(
-                ExactLixFileReadSelector::Id(
-                    "01920000-0000-7000-8000-0000000000a2".to_string()
-                ),
+                ExactLixFileReadSelector::Id("01920000-0000-7000-8000-0000000000a2".to_string()),
                 ExactLixFileReadColumn::Content,
             ))
         );
@@ -6479,9 +6507,7 @@ mod tests {
         assert_eq!(
             exact_filesystem_read_interest_route(&literal_data_by_id, &[]),
             Some(ExactFilesystemRead::Point(
-                ExactLixFileReadSelector::Id(
-                    "01920000-0000-7000-8000-0000000000a2".to_string()
-                ),
+                ExactLixFileReadSelector::Id("01920000-0000-7000-8000-0000000000a2".to_string()),
                 ExactLixFileReadColumn::Content,
             ))
         );
@@ -11509,8 +11535,7 @@ mod tests {
                 && matches!(&attribute.value, TelemetryValue::String(value) if value == "UPDATE parameter_batch_telemetry_probe SET value = $1 WHERE id = $2")
         }));
         assert!(batch_span.start.attributes.iter().any(|attribute| {
-            attribute.key == "db.operation.batch.size"
-                && attribute.value == TelemetryValue::I64(2)
+            attribute.key == "db.operation.batch.size" && attribute.value == TelemetryValue::I64(2)
         }));
     }
 
@@ -11780,8 +11805,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sizes.columns(), &["path", "size_bytes"]);
-        assert_eq!(sizes.rows()[0].values(), &[Value::Text("/empty.bin".into()), Value::Integer(0)]);
-        assert_eq!(sizes.rows()[1].values(), &[Value::Text("/large.bin".into()), Value::Integer(5)]);
+        assert_eq!(
+            sizes.rows()[0].values(),
+            &[Value::Text("/empty.bin".into()), Value::Integer(0)]
+        );
+        assert_eq!(
+            sizes.rows()[1].values(),
+            &[Value::Text("/large.bin".into()), Value::Integer(5)]
+        );
 
         let unaliased_size = session
             .execute(
@@ -11791,10 +11822,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unaliased_size.columns(), &["OCTET_LENGTH(content)"]);
-        assert_eq!(
-            unaliased_size.rows()[0].values(),
-            &[Value::Integer(5)]
-        );
+        assert_eq!(unaliased_size.rows()[0].values(), &[Value::Integer(5)]);
 
         let unaliased_slice = session
             .execute(
@@ -11804,7 +11832,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(unaliased_slice.columns(), &["SUBSTRING(content FROM 2 FOR 3)"]);
+        assert_eq!(
+            unaliased_slice.columns(),
+            &["SUBSTRING(content FROM 2 FOR 3)"]
+        );
         assert_eq!(
             unaliased_slice.rows()[0].values(),
             &[Value::Blob(b"bcd".to_vec().into())]
@@ -11876,7 +11907,9 @@ mod tests {
     async fn sql_file_substring_reads_a_bounded_range_across_cas_chunks() {
         let session = open_session().await;
         let size = crate::binary_cas::CHUNK_ANCHOR_BYTES + 4096;
-        let content = (0..size).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let content = (0..size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
@@ -13962,11 +13995,15 @@ where
 /// Keep lifetime erasure scoped to native dependency discovery; no read escapes.
 pub(crate) async fn discover_read_fulfillment<StorageImpl: Storage + 'static>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
-    repository: &str, account: &str, lease_id: &str,
+    repository: &str,
+    account: &str,
+    lease_id: &str,
     request: &crate::sync::ReadFulfillmentRequest,
     hot: crate::hot_state::HotStateContext,
-) -> Result<crate::sync::ReadFulfillmentResponse,LixError> {
-    with_static_session_sql_read::<StorageImpl,_,_,_>(read,|read| async move {
-        crate::sync::discover_read_fulfillment(read,repository,account,lease_id,request,hot).await
-    }).await
+) -> Result<crate::sync::ReadFulfillmentResponse, LixError> {
+    with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
+        crate::sync::discover_read_fulfillment(read, repository, account, lease_id, request, hot)
+            .await
+    })
+    .await
 }

@@ -54,6 +54,10 @@ fn test_telemetry_sink() -> Arc<dyn lix_sdk::telemetry::TelemetrySink> {
     Arc::new(lix_sdk::telemetry::CallbackTelemetrySink::new(|_| {}))
 }
 
+#[cfg(test)]
+#[path = "store/loopback_p95_benchmark.rs"]
+mod loopback_p95_benchmark;
+
 // The Lix SlateDB adapter fetches object-store cache parts in 2 MiB chunks.
 // A 15 second request timeout still permits a part to arrive at roughly 140
 // KiB/s, while a single stalled request can no longer occupy a lix runtime
