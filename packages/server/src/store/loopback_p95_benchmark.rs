@@ -204,7 +204,10 @@ fn assert_semantic_witness(query_name: &str, response: &JsonValue) {
                 else {
                     panic!("checkpoint created_at should be UTF-8 text");
                 };
-                assert!(timestamp.contains('T'), "checkpoint timestamp should use ISO format");
+                assert!(
+                    timestamp.contains('T'),
+                    "checkpoint timestamp should use ISO format"
+                );
                 timestamps.push(timestamp);
             }
             assert!(
