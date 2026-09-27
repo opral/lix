@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 mod point_join_scan_scaling;
+#[cfg(test)]
+mod p95_workloads;
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -300,6 +302,10 @@ mod tests {
         assert!(profile.scan_batches > 0);
         assert!(profile.scan_arrow_bytes > 0);
         assert!(profile.scan_elapsed > Duration::ZERO);
+        assert!(
+            profile.public_result_materialization > Duration::ZERO,
+            "lazy row conversion must run inside the active profile scope"
+        );
         let disjoint_phase_sum = profile.logical_planning
             + profile.physical_planning
             + profile.arrow_execution

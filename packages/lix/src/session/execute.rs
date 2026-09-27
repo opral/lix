@@ -1171,7 +1171,7 @@ where
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
 
-    /// Executes one statement and reports neutral columnar phase timings.
+    /// Executes and consumes one statement, reporting public-query phase timings.
     ///
     /// This diagnostic API is available only to storage benchmarks. It uses
     /// the normal public execution path and does not alter query semantics.
@@ -1181,7 +1181,15 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
-        let (result, mut profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        // Result rows are lazy; consume them while the phase scope is active,
+        // so the benchmark includes public row conversion rather than charging
+        // it to untimed oracle validation after returning from this method.
+        let (result, mut profile) = crate::sql_profile::scope(async {
+            let result = self.execute(sql, params).await?;
+            let _ = result.rows();
+            Ok(result)
+        })
+        .await;
         if let Ok(result) = &result {
             if result.profile_provider_rows_examined != 0 {
                 profile.scan_rows = profile.scan_rows.saturating_add(result.len() as u64);
