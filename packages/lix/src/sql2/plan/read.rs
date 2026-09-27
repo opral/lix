@@ -693,6 +693,7 @@ pub(crate) async fn execute_native_read<C: crate::sql2::SqlExecutionContext>(
                     ctx.plugin_host(),
                     ctx.session_file_views(),
                     None,
+                    None,
                     paths,
                     None,
                 )

@@ -181,6 +181,9 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
 pub(crate) struct LateMaterializedLixFileContentRead {
     pub(crate) statement: Box<DataFusionStatement>,
     pub(crate) data_column_index: usize,
+    /// Index of a projected file ID, derived from its source expression.
+    /// Output aliases never determine the selector identity.
+    pub(crate) file_id_column_index: Option<usize>,
     pub(crate) projection: LateLixFileProjection,
 }
 
@@ -230,6 +233,7 @@ pub(crate) fn late_materialized_lix_file_content_read(
     let mut data_column_index = None;
     let mut data_output_name = None;
     let mut data_projection = None;
+    let mut file_id_column_index = None;
     let mut replacement = None;
     let mut removed_parameters = Vec::new();
     for (index, item) in select.projection.iter().enumerate() {
@@ -245,10 +249,19 @@ pub(crate) fn late_materialized_lix_file_content_read(
             data_projection = Some(projection);
             replacement = Some((path_expression, output_name));
             removed_parameters.extend(projection_parameters);
-        } else if direct_projection_identifier(expression).is_none()
-            || expression_mentions_column(expression, "content")
-        {
-            return None;
+        } else {
+            if direct_projection_identifier(expression).is_none()
+                || expression_mentions_column(expression, "content")
+            {
+                return None;
+            }
+            // Derive identity from the projection source, including qualified
+            // or aliased ID columns. `path AS id` must never become a selector.
+            if direct_projection_identifier(expression)
+                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("id"))
+            {
+                file_id_column_index = Some(index);
+            }
         }
     }
     let data_column_index = data_column_index?;
@@ -305,6 +318,7 @@ pub(crate) fn late_materialized_lix_file_content_read(
     Some(LateMaterializedLixFileContentRead {
         statement: Box::new(statement),
         data_column_index,
+        file_id_column_index,
         projection: data_projection,
     })
 }
@@ -1055,6 +1069,43 @@ mod tests {
         assert!(plan.native.is_none());
         assert!(plan.late_content.is_some());
         assert!(plan.acknowledge_file_views);
+    }
+
+    #[test]
+    fn late_content_scope_tracks_source_identity_instead_of_output_aliases() {
+        let direct = sql2::parse_statement(
+            "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+        )
+        .unwrap();
+        let direct_plan = late_materialized_lix_file_content_read(
+            &direct,
+            &[Value::Text("01940000-0000-7000-8000-000000000001".into())],
+        )
+        .expect("ordinary ID/path/content projection should late-materialize");
+        assert_eq!(direct_plan.file_id_column_index, Some(0));
+        assert_eq!(direct_plan.data_column_index, 2);
+
+        let aliased = sql2::parse_statement(
+            "SELECT id AS id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+        )
+        .unwrap();
+        let aliased_plan = late_materialized_lix_file_content_read(
+            &aliased,
+            &[Value::Text("01940000-0000-7000-8000-000000000001".into())],
+        )
+        .expect("aliased ID projection should preserve identity");
+        assert_eq!(aliased_plan.file_id_column_index, Some(0));
+
+        let computed_alias = sql2::parse_statement(
+            "SELECT path AS id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+        )
+        .unwrap();
+        let computed_plan = late_materialized_lix_file_content_read(
+            &computed_alias,
+            &[Value::Text("01940000-0000-7000-8000-000000000001".into())],
+        )
+        .expect("ID-named path alias should retain the ordinary fallback");
+        assert_eq!(computed_plan.file_id_column_index, None);
     }
 
     #[test]

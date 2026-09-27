@@ -13414,8 +13414,11 @@ where
         {
             return Ok(index);
         }
-        let rows =
-            overlay_scan_batch(&self.base, &self.staged, &request.hot_state_request()).await?;
+        // Use the generic scoped row builder over this reader so file-ID
+        // selection and directory ancestry both see the staged transaction
+        // overlay. Building from `hot_state_request()` directly drops the
+        // request's file_ids and widens point reads back to the entire branch.
+        let rows = crate::filesystem::read_path_index_rows(self, request).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);

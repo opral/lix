@@ -623,6 +623,35 @@ impl LixFileSpec {
     }
 }
 
+/// Restrict a hydration index to canonical IDs when every candidate is valid.
+/// Invalid values disable this optional optimization and keep path lookup intact.
+fn canonical_file_ids_for_path_index(
+    file_ids: Option<&BTreeSet<String>>,
+) -> Option<Vec<String>> {
+    let file_ids = file_ids?;
+    file_ids
+        .iter()
+        .all(|file_id| file_id_row_pk(file_id).is_ok())
+        .then(|| file_ids.iter().cloned().collect())
+}
+
+fn exact_lix_file_path_index_request(
+    branch_ids: Vec<String>,
+    selector: &ExactLixFileReadSelector,
+    column: ExactLixFileReadColumn,
+) -> FilesystemPathIndexRequest {
+    let file_ids = match selector {
+        ExactLixFileReadSelector::Id(file_id) if file_id_row_pk(file_id).is_ok() => {
+            Some(vec![file_id.clone()])
+        }
+        ExactLixFileReadSelector::Id(_) | ExactLixFileReadSelector::Path(_) => None,
+    };
+    FilesystemPathIndexRequest::new(branch_ids)
+        .with_file_ids(file_ids)
+        .with_blob_refs(true)
+        .with_cached_blob_data(column == ExactLixFileReadColumn::Content)
+}
+
 /// Executes the narrow active-branch point-read shape without constructing a
 /// DataFusion catalog and plan. Row selection, branch visibility, blob
 /// loading and plugin rendering stay on the regular `lix_file` provider
@@ -702,11 +731,11 @@ pub(crate) async fn execute_exact_lix_file_read(
         )?;
     }
     let index = filesystem_path_index
-        .path_index(
-            &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_blob_refs(true)
-                .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
-        )
+        .path_index(&exact_lix_file_path_index_request(
+            request.filter.branch_ids.clone(),
+            selector,
+            column,
+        ))
         .await?;
     let matches = match selector {
         ExactLixFileReadSelector::Id(file_id) => indexed_file_id_matches(
@@ -850,6 +879,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
     plugin_cache_snapshot: Option<u128>,
+    file_ids: Option<&BTreeSet<String>>,
     paths: &BTreeSet<String>,
     data_range: Option<Range<u64>>,
 ) -> Result<SqlQueryResult, LixError> {
@@ -876,7 +906,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     interest::retain_content(
         hot_state.as_ref(),
         &request,
-        &FileIdConstraint::All,
+        &file_ids.map_or(FileIdConstraint::All, |ids| FileIdConstraint::Ids(ids.clone())),
         &FileIdConstraint::All,
         false,
         &FilePathPredicate::In(paths.clone()),
@@ -886,6 +916,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_file_ids(canonical_file_ids_for_path_index(file_ids))
                 .with_blob_refs(true)
                 .with_cached_blob_data(data_range.is_none()),
         )
@@ -963,6 +994,7 @@ pub(crate) async fn execute_exact_lix_file_size_batch_read(
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     plugin_cache_snapshot: Option<u128>,
+    file_ids: Option<&BTreeSet<String>>,
     paths: &BTreeSet<String>,
 ) -> Result<SqlQueryResult, LixError> {
     let mut request = lix_file_scan_request(Some(active_branch_id), None, None);
@@ -976,6 +1008,7 @@ pub(crate) async fn execute_exact_lix_file_size_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_file_ids(canonical_file_ids_for_path_index(file_ids))
                 .with_blob_refs(true),
         )
         .await?;
@@ -7830,6 +7863,7 @@ mod tests {
             blob_reads.clone(),
             PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
             None,
+            None,
             &paths,
         )
         .await
@@ -7881,6 +7915,7 @@ mod tests {
             Arc::new(TestBranchRefReader),
             blob_reader.clone(),
             PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            None,
             None,
             None,
             &paths,

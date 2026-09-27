@@ -79,12 +79,62 @@ simulation_test!(
             )
             .await
             .expect("branch and global point-read fixtures should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES \
+                 ('756e7472-6163-6b65-8000-000000000001', '/untracked-point.bin', CAST('u' AS BYTEA), true)",
+                &[],
+            )
+            .await
+            .expect("untracked point-read fixture should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content, lixcol_global) VALUES \
+                 ('746f6d62-7374-6f6e-8000-000000000001', '/global-tombstone.bin', CAST('g' AS BYTEA), true)",
+                &[],
+            )
+            .await
+            .expect("global tombstone fixture should insert");
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE id = $1",
+                &[Value::Text(
+                    "746f6d62-7374-6f6e-8000-000000000001".to_owned(),
+                )],
+            )
+            .await
+            .expect("branch-local tombstone should hide the global fixture");
 
         for (fast_sql, generic_sql, parameter) in [
             (
                 "SELECT content FROM lix_file WHERE id = $1",
                 "SELECT content FROM lix_file WHERE id = $1 AND true",
                 "73686172-6564-8d70-8f69-6e742d666900",
+            ),
+            (
+                "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT id, path, content FROM lix_file WHERE id = $1 AND true LIMIT 1",
+                "73686172-6564-8d70-8f69-6e742d666900",
+            ),
+            (
+                "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT id, path, content FROM lix_file WHERE id = $1 AND true LIMIT 1",
+                "6d697373-696e-872d-806f-696e742d6600",
+            ),
+            (
+                "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT id, path, content FROM lix_file WHERE id = $1 AND true LIMIT 1",
+                "756e7472-6163-6b65-8000-000000000001",
+            ),
+            (
+                "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT id, path, content FROM lix_file WHERE id = $1 AND true LIMIT 1",
+                "746f6d62-7374-6f6e-8000-000000000001",
+            ),
+            (
+                "SELECT id, path, content FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT id, path, content FROM lix_file WHERE id = $1 AND true LIMIT 1",
+                "not-a-canonical-id",
             ),
             (
                 "SELECT content FROM lix_file WHERE path = $1",
@@ -100,6 +150,21 @@ simulation_test!(
                 "SELECT content FROM lix_file WHERE id = $1",
                 "SELECT content FROM lix_file WHERE id = $1 AND true",
                 "6d697373-696e-872d-806f-696e742d6600",
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                "756e7472-6163-6b65-8000-000000000001",
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                "746f6d62-7374-6f6e-8000-000000000001",
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                "not-a-canonical-id",
             ),
         ] {
             let params = [Value::Text(parameter.to_string())];
@@ -475,4 +540,67 @@ fn direct_child_name(parent: &str, child: &str) -> Option<String> {
         return None;
     }
     Some(remainder.to_string())
+}
+
+/// A file point read must consume its answer plus ancestry, independently of
+/// unrelated repository size. Fresh engines prevent a warmed full index from
+/// making an unscoped implementation appear to have zero read work.
+#[tokio::test(flavor = "current_thread")]
+async fn file_id_reads_bound_index_work_across_repository_sizes() {
+    for files in [8, 400] {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone()).await.unwrap();
+        let seed_engine = Engine::new(storage.clone()).await.unwrap();
+        let seed = seed_engine.open_session().await.unwrap();
+        let values = (0..files).map(|i| format!("('01940000-0000-7000-8000-{i:012x}', '/nested/file-{i}.bin', CAST('x' AS BYTEA))")).collect::<Vec<_>>().join(",");
+        seed.execute(
+            &format!("INSERT INTO lix_file(id,path,content) VALUES {values}"),
+            &[],
+        )
+        .await
+        .unwrap();
+        seed.close().await.unwrap();
+        drop(seed);
+        drop(seed_engine);
+        for sql in [
+            "SELECT content FROM lix_file WHERE id=$1",
+            "SELECT id,path,content FROM lix_file WHERE id=$1 LIMIT 1",
+            "SELECT f.id AS file_key,f.path,f.content FROM lix_file AS f WHERE f.id=$1 LIMIT 1",
+            "SELECT path AS id,id AS file_key,content FROM lix_file WHERE id=$1 LIMIT 1",
+            "SELECT id,path FROM lix_file WHERE id IN ($1)",
+        ] {
+            let engine = Engine::new(storage.clone()).await.unwrap();
+            let session = engine.open_session().await.unwrap();
+            crate::filesystem::reset_full_rebuild_stats();
+            let result = session
+                .execute(
+                    sql,
+                    &[Value::Text("01940000-0000-7000-8000-000000000000".into())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 1, "{files} files: {sql}");
+            if sql.contains("content") {
+                assert_eq!(
+                    result.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                    b"x".to_vec()
+                );
+            } else {
+                assert_eq!(
+                    result.rows()[0].get::<String>("path").unwrap(),
+                    "/nested/file-0.bin"
+                );
+            }
+            let (builds, rows) = crate::filesystem::full_rebuild_stats();
+            assert!(
+                builds > 0,
+                "fresh point read must exercise the index builder: {sql}"
+            );
+            assert!(
+                rows <= 8,
+                "{files} files: answer + ancestry should bound work, examined {rows}: {sql}"
+            );
+            session.close().await.unwrap();
+        }
+    }
 }

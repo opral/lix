@@ -1744,6 +1744,17 @@ mod tests {
         for path in ["/top/nested/a.bin", "/top/other.bin", "/elsewhere/x.bin", "/root.bin"] {
             lix.upsert_file_content(path, b"content".to_vec()).await.unwrap();
         }
+        let values = (0..400)
+            .map(|index| format!("('/unrelated-{index:03}.bin', CAST('x' AS BYTEA))"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lix.execute(
+            &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
+            &[],
+        )
+        .await
+        .expect("unrelated descriptors should insert in one batch");
+
         let id = lix.execute("SELECT id FROM lix_file WHERE path='/top/nested/a.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
         let root_id = lix.execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
         let branch = lix.partial_replica_descriptor(None).await.unwrap().selected_branch.branch_id;
@@ -1751,10 +1762,24 @@ mod tests {
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let reader = hot.reader(&read);
-        let request = FilesystemPathIndexRequest::new(vec![branch]).with_file_ids(Some(vec![id]));
+        let request = FilesystemPathIndexRequest::new(vec![branch.clone()]).with_file_ids(Some(vec![id]));
         let rows = read_path_index_rows(&reader, &request).await.unwrap();
         assert_eq!(rows.len(), 3, "one file and its two ancestors, no siblings or blobs");
+
+        // Measure actual rows consumed by the shared builder. This guards the
+        // storage-work property, not merely that the request carries an ID.
+        reset_full_rebuild_stats();
+        reader
+            .path_index(&FilesystemPathIndexRequest::new(vec![branch.clone()]))
+            .await
+            .unwrap();
+        let (_, full_domain_rows) = full_rebuild_stats();
+        reset_full_rebuild_stats();
         let index = reader.path_index(&request).await.unwrap();
+        let (_, scoped_rows) = full_rebuild_stats();
+        assert!(full_domain_rows >= 400, "full index should consume all unrelated descriptors: {full_domain_rows}");
+        assert_eq!(scoped_rows, 3, "scoped index should consume only the target and its ancestors");
+        assert!(scoped_rows * 100 < full_domain_rows, "point-read index work should be bounded independently of unrelated files");
         assert_eq!(index.entries().iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["/top", "/top/nested", "/top/nested/a.bin"]);
         assert!(Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()), "scoped reads reuse the revision cache");
         let root = request.clone().with_file_ids(Some(vec![root_id]));

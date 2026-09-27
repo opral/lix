@@ -18,11 +18,19 @@ async fn full_profile(
     session: &crate::session::SessionContext<Memory>,
     sql: &str,
     params: &[Value],
+    observe: bool,
 ) -> (crate::ExecuteResult, SqlReadProfile) {
     crate::filesystem::reset_full_rebuild_stats();
     let _ = crate::sql2::take_mainline_work();
     let started = std::time::Instant::now();
-    let (result, mut profile) = session.execute_profiled(sql, params).await.unwrap();
+    let (result, mut profile) = if observe {
+        session
+            .execute_for_observe_profiled(sql, params)
+            .await
+            .unwrap()
+    } else {
+        session.execute_profiled(sql, params).await.unwrap()
+    };
     // execute_profiled consumes lazy public rows within its phase scope.
     // Oracle validation remains outside the timed operation.
     profile.total = started.elapsed();
@@ -42,6 +50,10 @@ async fn seven_p95_workloads() {
     let rows = setting("LIX_P95_ROWS", 128);
     let history = setting("LIX_P95_HISTORY", 128);
     let repeats = setting("LIX_P95_REPEATS", 100);
+    let dirty_files = setting("LIX_P95_DIRTY_FILES", 1);
+    let mode = std::env::var("LIX_P95_EXECUTION").unwrap_or_else(|_| "execute".into());
+    assert!(matches!(mode.as_str(), "execute" | "production_kinds"));
+    assert!(dirty_files >= 1 && dirty_files <= rows);
     assert!(rows >= 8 && history >= 1 && repeats >= 20);
     let storage = Memory::default();
     Engine::initialize(storage.clone()).await.unwrap();
@@ -66,12 +78,17 @@ async fn seven_p95_workloads() {
             .unwrap();
     }
     let target = Value::Text("01940000-0000-7000-8000-000000000000".into());
-    seed.execute(
-        "UPDATE lix_file SET content=$2 WHERE id=$1",
-        &[target.clone(), Value::Blob(vec![b'y'; 4096].into())],
-    )
-    .await
-    .unwrap();
+    for i in 0..dirty_files {
+        seed.execute(
+            "UPDATE lix_file SET content=$2 WHERE id=$1",
+            &[
+                Value::Text(format!("01940000-0000-7000-8000-{i:012x}")),
+                Value::Blob(vec![b'y'; 4096].into()),
+            ],
+        )
+        .await
+        .unwrap();
+    }
     let account = seed
         .execute("SELECT id FROM lix_account LIMIT 1", &[])
         .await
@@ -122,14 +139,18 @@ async fn seven_p95_workloads() {
     for (_, sql, params) in &queries {
         expected.push(seed.execute(sql, params).await.unwrap());
     }
-    assert_eq!(expected[1].rows()[0].get::<i64>("file_count").unwrap(), 1);
+    assert_eq!(
+        expected[1].rows()[0].get::<i64>("file_count").unwrap(),
+        dirty_files as i64
+    );
     seed.close().await.unwrap();
     drop(seed);
     drop(seed_engine);
     for ((name, sql, params), oracle) in queries.into_iter().zip(expected) {
+        let observe = mode == "production_kinds" && name != "account_id";
         let engine = Engine::new(storage.clone()).await.unwrap();
         let session = engine.open_session().await.unwrap();
-        let (result, profile) = full_profile(&session, sql, &params).await;
+        let (result, profile) = full_profile(&session, sql, &params, observe).await;
         assert_eq!(result, oracle, "cold result: {name}");
         let cold = sample(profile);
         // Two untimed warmups establish caches consistently for every query.
@@ -138,13 +159,13 @@ async fn seven_p95_workloads() {
         }
         let mut warm = Vec::new();
         for _ in 0..repeats {
-            let (result, profile) = full_profile(&session, sql, &params).await;
+            let (result, profile) = full_profile(&session, sql, &params, observe).await;
             assert_eq!(result, oracle, "warm result: {name}");
             warm.push(sample(profile));
         }
         println!(
             "P95_WORKLOAD={}",
-            serde_json::json!({"query":name,"backend":"canonical_memory","files":rows,"checkpoints":history,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
+            serde_json::json!({"query":name,"execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
         );
         if name == "file_content_id" {
             let mut changing_ids = Vec::new();
@@ -153,16 +174,16 @@ async fn seven_p95_workloads() {
                 let params = [Value::Text(format!(
                     "01940000-0000-7000-8000-{selected:012x}"
                 ))];
-                let (result, profile) = full_profile(&session, sql, &params).await;
+                let (result, profile) = full_profile(&session, sql, &params, observe).await;
                 assert_eq!(
                     result.rows()[0].get::<Vec<u8>>("content").unwrap(),
-                    vec![if selected == 0 { b'y' } else { b'x' }; 4096]
+                    vec![if selected < dirty_files { b'y' } else { b'x' }; 4096]
                 );
                 changing_ids.push(sample(profile));
             }
             println!(
                 "P95_WORKLOAD={}",
-                serde_json::json!({"query":name,"variant":"changing_ids","backend":"canonical_memory","files":rows,"checkpoints":history,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
+                serde_json::json!({"query":name,"variant":"changing_ids","execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
             );
         }
         session.close().await.unwrap();

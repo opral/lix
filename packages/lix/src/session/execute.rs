@@ -1181,11 +1181,36 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
+        self.execute_profiled_inner(sql, params, false).await
+    }
+
+    /// Profile the SQL evaluation used by observations. The observer lifecycle,
+    /// invalidation wait and acknowledgement of delivered views are separate.
+    #[cfg(feature = "storage-benches")]
+    pub(crate) async fn execute_for_observe_profiled(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
+        self.execute_profiled_inner(sql, params, true).await
+    }
+
+    #[cfg(feature = "storage-benches")]
+    async fn execute_profiled_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        observe: bool,
+    ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
         // Result rows are lazy; consume them while the phase scope is active,
         // so the benchmark includes public row conversion rather than charging
         // it to untimed oracle validation after returning from this method.
         let (result, mut profile) = crate::sql_profile::scope(async {
-            let result = self.execute(sql, params).await?;
+            let result = if observe {
+                Box::pin(self.execute_for_observe(sql, params)).await?
+            } else {
+                self.execute(sql, params).await?
+            };
             let _ = result.rows();
             Ok(result)
         })
@@ -1590,6 +1615,7 @@ where
                                 self.plugin_host.clone(),
                                 Some(file_view_collector.clone()),
                                 plugin_cache_snapshot,
+                                None,
                                 &paths,
                                 requested_range.clone(),
                             )
@@ -3299,7 +3325,11 @@ where
                 let rewritten_sql = statement.to_string();
                 (
                     statement,
-                    Some((plan.data_column_index, plan.projection)),
+                    Some((
+                        plan.data_column_index,
+                        plan.file_id_column_index,
+                        plan.projection,
+                    )),
                     Some(rewritten_sql),
                 )
             }
@@ -3330,7 +3360,7 @@ where
         .await?;
         drop(read_session);
         drop(ctx);
-        if let Some((data_column_index, projection)) = late_file_projection {
+        if let Some((data_column_index, file_id_column_index, projection)) = late_file_projection {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(read_hot.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
@@ -3350,6 +3380,7 @@ where
                         file_view_collector.clone(),
                         &mut materialized,
                         data_column_index,
+                        file_id_column_index,
                     )
                     .await?;
                 }
@@ -3363,6 +3394,7 @@ where
                         self.plugin_host.clone(),
                         &mut materialized,
                         data_column_index,
+                        file_id_column_index,
                     )
                     .await?;
                 }
@@ -3377,6 +3409,7 @@ where
                         file_view_collector.clone(),
                         &mut materialized,
                         data_column_index,
+                        file_id_column_index,
                         start,
                         length,
                     )
@@ -3614,7 +3647,9 @@ async fn hydrate_lix_file_content_result(
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,
+    file_id_column_index: Option<usize>,
 ) -> Result<(), LixError> {
+    let file_ids = late_lix_file_ids(query, file_id_column_index);
     let Some(column_type) = query.column_types.get_mut(data_column_index) else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3646,6 +3681,7 @@ async fn hydrate_lix_file_content_result(
         plugin_host,
         session_file_views,
         None,
+        file_ids.as_ref(),
         &paths,
         None,
     )
@@ -3694,7 +3730,9 @@ async fn hydrate_lix_file_size_result(
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     query: &mut SqlQueryResult,
     data_column_index: usize,
+    file_id_column_index: Option<usize>,
 ) -> Result<(), LixError> {
+    let file_ids = late_lix_file_ids(query, file_id_column_index);
     let Some(column_type) = query.column_types.get_mut(data_column_index) else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3714,6 +3752,7 @@ async fn hydrate_lix_file_size_result(
         blob_reader,
         plugin_host,
         None,
+        file_ids.as_ref(),
         &paths,
     )
     .await?;
@@ -3760,6 +3799,7 @@ async fn hydrate_lix_file_substring_result(
     session_file_views: Option<sql2::SessionFileViews>,
     query: &mut SqlQueryResult,
     data_column_index: usize,
+    file_id_column_index: Option<usize>,
     start: i64,
     length: u64,
 ) -> Result<(), LixError> {
@@ -3770,6 +3810,7 @@ async fn hydrate_lix_file_substring_result(
         ));
     };
     *column_type = ResultColumnType::Blob;
+    let file_ids = late_lix_file_ids(query, file_id_column_index);
     let paths = late_lix_file_placeholder_paths(query, data_column_index)?;
     if paths.is_empty() {
         return Ok(());
@@ -3782,6 +3823,7 @@ async fn hydrate_lix_file_substring_result(
         Arc::clone(&blob_reader),
         plugin_host.clone(),
         None,
+        file_ids.as_ref(),
         &paths,
     )
     .await?;
@@ -3832,6 +3874,7 @@ async fn hydrate_lix_file_substring_result(
             plugin_host.clone(),
             session_file_views.clone(),
             None,
+            file_ids.as_ref(),
             &selected_paths,
             Some(range_start..range_end),
         )
@@ -3869,6 +3912,21 @@ async fn hydrate_lix_file_substring_result(
         })?;
     }
     Ok(())
+}
+
+fn late_lix_file_ids(
+    query: &SqlQueryResult,
+    file_id_column_index: Option<usize>,
+) -> Option<BTreeSet<String>> {
+    let column_index = file_id_column_index?;
+    query
+        .rows
+        .iter()
+        .map(|row| match row.get(column_index) {
+            Some(Value::Text(file_id)) => Some(file_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn late_lix_file_placeholder_paths(
@@ -5238,6 +5296,29 @@ mod tests {
         Memory,
         engine::{Engine, EngineOptions},
     };
+
+    #[test]
+    fn late_lix_file_ids_fail_closed_when_the_projected_value_is_not_text() {
+        let valid = SqlQueryResult {
+            columns: vec!["id".into()],
+            column_types: vec![ResultColumnType::Text],
+            rows: vec![vec![Value::Text(
+                "01940000-0000-7000-8000-000000000001".into(),
+            )]],
+            notices: Vec::new(),
+        };
+        assert_eq!(
+            late_lix_file_ids(&valid, Some(0)),
+            Some(BTreeSet::from(["01940000-0000-7000-8000-000000000001".into()]))
+        );
+
+        let malformed = SqlQueryResult {
+            rows: vec![vec![Value::Null]],
+            ..valid
+        };
+        assert_eq!(late_lix_file_ids(&malformed, Some(0)), None);
+        assert_eq!(late_lix_file_ids(&malformed, None), None);
+    }
 
     #[test]
     fn durable_completion_errors_preserve_the_receipt_and_forbid_retry() {
@@ -11572,11 +11653,16 @@ mod tests {
                 .unfiltered_plugin_file_view(&view_key)
                 .is_none()
         );
-        let sql = "SELECT content FROM lix_file WHERE path IN ($1) LIMIT 1";
+        let sql = "SELECT id, path, content FROM lix_file WHERE path IN ($1) LIMIT 1";
         let params = [Value::Text("/fallback.txt".into())];
         let plan = sql2::plan_read_statement(&sql2::parse_statement(sql).unwrap(), &params);
         assert!(plan.native.is_none());
-        assert!(plan.late_content.is_some());
+        assert_eq!(
+            plan.late_content
+                .as_ref()
+                .and_then(|late| late.file_id_column_index),
+            Some(0)
+        );
         assert!(
             plan.acknowledge_file_views,
             "delivered bytes must authorize the read collector"
@@ -11589,6 +11675,11 @@ mod tests {
         assert_eq!(view.path, "/fallback.txt");
         assert_eq!(view.plugin_key, plugin_key);
         assert_eq!(result.len(), 1);
+        assert_eq!(result.rows()[0].get::<String>("id").unwrap(), file_id);
+        assert_eq!(
+            result.rows()[0].get::<String>("path").unwrap(),
+            "/fallback.txt"
+        );
         assert_eq!(
             result.rows()[0].value("content").unwrap(),
             &Value::Blob(bytes.to_vec().into())
