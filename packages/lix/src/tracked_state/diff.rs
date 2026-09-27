@@ -460,9 +460,16 @@ where
 
     let entries = classify_tree_diff_batch(tree_diff, &payloads)?;
 
-    #[cfg(test)]
-    crate::sql_profile::record_diff_payload_rows_retained(payloads.len());
-    let diff = TrackedStateDiff::from_entries_with_payloads(entries, payloads);
+    let diff = if request.retain_payloads {
+        #[cfg(test)]
+        crate::sql_profile::record_diff_payload_rows_retained(payloads.len());
+        TrackedStateDiff::from_entries_with_payloads(entries, payloads)
+    } else {
+        // Payloads remain available through classification because typed snapshots
+        // and metadata are required to collapse semantic reverts. Identity-only
+        // results have no consumer for them after that point.
+        TrackedStateDiff::from_entries(entries)
+    };
     Ok(diff)
 }
 

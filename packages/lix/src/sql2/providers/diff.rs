@@ -1241,7 +1241,12 @@ async fn effective_diff<S: StorageAdapterRead>(
     }
 
     let keys = candidates.into_iter().collect::<Vec<_>>();
-    let projection = ChangeRecordProjection::full();
+    let projection = ChangeRecordProjection {
+        snapshot_content: false,
+        metadata: true,
+        snapshot: true,
+        raw_snapshot: false,
+    };
     let from_local = tracked
         .load_projected_batch_at_commit(from_commit_id, &keys, &projection)
         .await
@@ -1286,19 +1291,21 @@ async fn effective_diff<S: StorageAdapterRead>(
         if after_global && after.is_some_and(|row| !row.deleted()) {
             to_global_rows.insert(key.clone());
         }
-        for row in [before, after].into_iter().flatten() {
-            payloads.entry(row.change_id()).or_insert_with(|| {
-                let snapshot = row
-                    .decoded_snapshot()
-                    .and_then(|snapshot| snapshot.durable_payload().ok())
-                    .map(|payload| payload.to_vec());
-                let metadata = row.metadata().and_then(|metadata| {
-                    serde_json::from_str(metadata.as_str())
-                        .ok()
-                        .map(lix_schema::Jsonb::from_value)
+        if request.retain_payloads {
+            for row in [before, after].into_iter().flatten() {
+                payloads.entry(row.change_id()).or_insert_with(|| {
+                    let snapshot = row
+                        .decoded_snapshot()
+                        .and_then(|snapshot| snapshot.durable_payload().ok())
+                        .map(|payload| payload.to_vec());
+                    let metadata = row.metadata().and_then(|metadata| {
+                        serde_json::from_str(metadata.as_str())
+                            .ok()
+                            .map(lix_schema::Jsonb::from_value)
+                    });
+                    (snapshot, metadata)
                 });
-                (snapshot, metadata)
-            });
+            }
         }
         entries.push(TrackedStateDiffEntry {
             identity: identity.clone(),
@@ -1307,19 +1314,22 @@ async fn effective_diff<S: StorageAdapterRead>(
             after: after.map(|row| diff_row(identity, row)),
         });
     }
+    // The counter intentionally measures rows actually captured for SQL diff
+    // payload output. Identity-only projections leave the map empty.
     #[cfg(test)]
     crate::sql_profile::record_effective_payload_rows_captured(payloads.len());
-    let payloads = TrackedStatePayloadBatch::from_payloads(
-        payloads
-            .into_iter()
-            .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
-    )
-    .map_err(lix_error_to_datafusion_error)?;
-    Ok((
-        TrackedStateDiff::from_entries_with_payloads(entries, payloads),
-        from_global_rows,
-        to_global_rows,
-    ))
+    let diff = if request.retain_payloads {
+        let payloads = TrackedStatePayloadBatch::from_payloads(
+            payloads
+                .into_iter()
+                .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+        )
+        .map_err(lix_error_to_datafusion_error)?;
+        TrackedStateDiff::from_entries_with_payloads(entries, payloads)
+    } else {
+        TrackedStateDiff::from_entries(entries)
+    };
+    Ok((diff, from_global_rows, to_global_rows))
 }
 
 async fn load_local_replacement_scopes_for_keys<S: StorageAdapterRead>(
@@ -1455,7 +1465,11 @@ fn effective_snapshot_eq(
             (Ok(before), Ok(after)) => before.as_ref() == after.as_ref(),
             _ => false,
         },
-        _ => before.snapshot_content() == after.snapshot_content(),
+        (Some(_), None) | (None, Some(_)) => false,
+        // This demand projection omits derived JSON, so two absent typed
+        // snapshots cannot prove equality. The full-projection fallback is not
+        // appropriate for these hydrated live rows.
+        (None, None) => false,
     }
 }
 
@@ -2819,6 +2833,19 @@ mod tests {
         )
         .await
         .expect("move ancestor");
+        let moved_file_full = lix
+            .execute("SELECT id, diff_type FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("expanded descendant path diff");
+        let moved_file_count = lix
+            .execute("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("expanded descendant path count");
+        assert_eq!(
+            moved_file_count.rows()[0].get::<i64>("n").unwrap(),
+            moved_file_full.rows().len() as i64,
+            "directory movement expands to the same logical descendant file rows",
+        );
         for query in [
             "SELECT count(*) AS n FROM lix_diff('lix_file')".to_owned(),
             format!("SELECT count(*) AS n FROM lix_diff('lix_file') WHERE id = '{file_id}'"),
