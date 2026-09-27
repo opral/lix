@@ -14,12 +14,12 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
-use crate::row_pk::RowPk;
 use crate::hot_state::{
-    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateBatchBuilder,
-    MaterializedHotStateRow,
+    HotStateFilter, HotStateProjection, HotStateReader, HotStateScanRequest,
+    MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateRow,
+    MaterializedHotStateRowRef,
 };
+use crate::row_pk::RowPk;
 use crate::storage_adapter::{
     REVISION_KEY_FILESYSTEM_PATH, REVISION_SPACE, StorageAdapterRead, StorageValue,
     StorageWriteSet, load_revision, revision_key,
@@ -338,43 +338,33 @@ impl FilesystemPathIndex {
             if row.schema_key() != BLOB_REF_SCHEMA_KEY || row.deleted() {
                 continue;
             }
-            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+            let (id, snapshot) = blob_ref_snapshot_from_row(row)?.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_STORAGE_ERROR,
                     "live lix_binary_blob_ref row has no payload",
                 )
             })?;
-            let id = snapshot
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    LixError::unknown("lix_binary_blob_ref snapshot is missing string id")
-                })?;
             let owned = canonical_blob_ref_projection(&row.to_owned(), &snapshot);
-            blob_rows.insert(
-                FilesystemBlobRefKey::from_live_row_ref(row, id.to_string()),
-                owned,
-            );
+            blob_rows.insert(FilesystemBlobRefKey::from_live_row_ref(row, id), owned);
         }
 
         for row in rows.iter() {
             if row.deleted() {
                 continue;
             }
-            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    format!("live filesystem row '{}' has no payload", row.schema_key()),
-                )
-            })?;
             match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: DirectorySnapshot = serde_json::from_value(snapshot)
-                        .map_err(|error| {
-                            LixError::unknown(format!(
-                                "invalid lix_directory_descriptor snapshot JSON: {error}"
-                            ))
-                        })?;
+                    let snapshot = directory_snapshot_from_row(row, |error| {
+                        LixError::unknown(format!(
+                            "invalid lix_directory_descriptor snapshot JSON: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "live filesystem row 'lix_directory_descriptor' has no payload",
+                        )
+                    })?;
                     let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
                     directory_rows.insert(
                         key.clone(),
@@ -392,12 +382,17 @@ impl FilesystemPathIndex {
                     );
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
-                    let snapshot: FileSnapshot =
-                        serde_json::from_value(snapshot).map_err(|error| {
-                            LixError::unknown(format!(
-                                "invalid lix_file_descriptor snapshot JSON: {error}"
-                            ))
-                        })?;
+                    let snapshot = file_snapshot_from_row(row, |error| {
+                        LixError::unknown(format!(
+                            "invalid lix_file_descriptor snapshot JSON: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "live filesystem row 'lix_file_descriptor' has no payload",
+                        )
+                    })?;
                     let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
                         row,
                         snapshot.id.clone(),
@@ -416,7 +411,15 @@ impl FilesystemPathIndex {
                         },
                     ));
                 }
-                _ => {}
+                BLOB_REF_SCHEMA_KEY => {}
+                _ => {
+                    let _ = row.snapshot_json_value()?.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            format!("live filesystem row '{}' has no payload", row.schema_key()),
+                        )
+                    })?;
+                }
             }
         }
 
@@ -1267,6 +1270,7 @@ impl FilesystemPathIndexRequest {
                 branch_ids: self.branch_ids.clone(),
                 ..HotStateFilter::default()
             },
+            projection: filesystem_path_index_projection(),
             ..HotStateScanRequest::default()
         }
     }
@@ -1353,11 +1357,10 @@ pub(crate) async fn read_path_index_rows(
         .iter()
         .filter(|row| !row.deleted() && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
     {
-        let snapshot: FileSnapshot = serde_json::from_value(
-            row.snapshot_json_value()?
-                .ok_or_else(|| LixError::unknown("file descriptor has no payload"))?,
-        )
-        .map_err(|error| LixError::unknown(format!("invalid file descriptor: {error}")))?;
+        let snapshot = file_snapshot_from_row(row, |error| {
+            LixError::unknown(format!("invalid file descriptor: {error}"))
+        })?
+        .ok_or_else(|| LixError::unknown("file descriptor has no payload"))?;
         if let Some(parent) = snapshot.directory_id {
             pending.insert((row.branch_id().to_owned(), parent));
         }
@@ -1376,6 +1379,7 @@ pub(crate) async fn read_path_index_rows(
                 })
             })
             .collect::<Result<Vec<_>, LixError>>()?,
+        projection: filesystem_path_index_projection(),
         ..Default::default()
     };
     let directories = hot_state
@@ -1393,17 +1397,14 @@ pub(crate) async fn read_path_index_rows(
     Ok(builder.finish())
 }
 
-fn directory_parent_row_pk(
-    row: crate::hot_state::MaterializedHotStateRowRef<'_>,
-) -> Result<Option<RowPk>, LixError> {
+fn directory_parent_row_pk(row: MaterializedHotStateRowRef<'_>) -> Result<Option<RowPk>, LixError> {
     if row.deleted() {
         return Ok(None);
     }
-    let snapshot: DirectorySnapshot = serde_json::from_value(
-        row.snapshot_json_value()?
-            .ok_or_else(|| LixError::unknown("directory descriptor has no payload"))?,
-    )
-    .map_err(|error| LixError::unknown(format!("invalid directory descriptor: {error}")))?;
+    let snapshot = directory_snapshot_from_row(row, |error| {
+        LixError::unknown(format!("invalid directory descriptor: {error}"))
+    })?
+    .ok_or_else(|| LixError::unknown("directory descriptor has no payload"))?;
     snapshot
         .parent_id
         .as_deref()
@@ -1452,7 +1453,11 @@ impl FilesystemPathIndexCache {
     /// write checkpoint. Rebuilding from the restored overlay is cheaper and
     /// safer than cloning potentially large path indexes for an error path.
     pub(crate) fn clear(&self) {
-        self.historical.entries.lock().expect("historical path cache poisoned").clear();
+        self.historical
+            .entries
+            .lock()
+            .expect("historical path cache poisoned")
+            .clear();
         self.entries
             .lock()
             .expect("filesystem path cache lock poisoned")
@@ -1718,6 +1723,120 @@ struct FileSnapshot {
     name: String,
 }
 
+// Descriptor readers commonly receive an already schema-validated typed row.
+// Read only the identity/path columns used here instead of allocating a JSON
+// object, stringifying UUIDs, and deserializing it back into these small structs.
+// Rows without a decoded native view retain the existing JSON path and errors.
+fn typed_string_field(row: MaterializedHotStateRowRef<'_>, name: &str) -> Option<String> {
+    match row.decoded_snapshot()?.row.get(name)? {
+        lix_schema::Value::Text(value) => Some(value.clone()),
+        lix_schema::Value::Uuid(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn typed_nullable_string_field(
+    row: MaterializedHotStateRowRef<'_>,
+    name: &str,
+) -> Option<Option<String>> {
+    match row.decoded_snapshot()?.row.get(name)? {
+        lix_schema::Value::Null => Some(None),
+        lix_schema::Value::Text(value) => Some(Some(value.clone())),
+        lix_schema::Value::Uuid(value) => Some(Some(value.to_string())),
+        _ => None,
+    }
+}
+
+fn file_snapshot_from_row(
+    row: MaterializedHotStateRowRef<'_>,
+    invalid_json: impl FnOnce(serde_json::Error) -> LixError,
+) -> Result<Option<FileSnapshot>, LixError> {
+    if row.decoded_snapshot().is_some() {
+        if let (Some(id), Some(directory_id), Some(name)) = (
+            typed_string_field(row, "id"),
+            typed_nullable_string_field(row, "directory_id"),
+            typed_string_field(row, "name"),
+        ) {
+            return Ok(Some(FileSnapshot {
+                id,
+                directory_id,
+                name,
+            }));
+        }
+    }
+    let Some(snapshot) = row.snapshot_json_value()? else {
+        return Ok(None);
+    };
+    serde_json::from_value(snapshot)
+        .map(Some)
+        .map_err(invalid_json)
+}
+
+fn directory_snapshot_from_row(
+    row: MaterializedHotStateRowRef<'_>,
+    invalid_json: impl FnOnce(serde_json::Error) -> LixError,
+) -> Result<Option<DirectorySnapshot>, LixError> {
+    if row.decoded_snapshot().is_some() {
+        if let (Some(id), Some(parent_id), Some(name)) = (
+            typed_string_field(row, "id"),
+            typed_nullable_string_field(row, "parent_id"),
+            typed_string_field(row, "name"),
+        ) {
+            return Ok(Some(DirectorySnapshot {
+                id,
+                parent_id,
+                name,
+            }));
+        }
+    }
+    let Some(snapshot) = row.snapshot_json_value()? else {
+        return Ok(None);
+    };
+    serde_json::from_value(snapshot)
+        .map(Some)
+        .map_err(invalid_json)
+}
+
+fn blob_ref_snapshot_from_row(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Option<(String, serde_json::Value)>, LixError> {
+    if let Some(decoded) = row.decoded_snapshot()
+        && let (Some(id), Some(blob_hash), Some(lix_schema::Value::Int8(size_bytes))) = (
+            typed_string_field(row, "id"),
+            typed_string_field(row, "blob_hash"),
+            decoded.row.get("size_bytes"),
+        )
+    {
+        let size_bytes = u64::try_from(*size_bytes).map_err(|_| {
+            LixError::unknown(
+                "invalid lix_binary_blob_ref snapshot JSON: size_bytes must be non-negative",
+            )
+        })?;
+        let snapshot = serde_json::json!({
+            "id": id.as_str(),
+            "blob_hash": blob_hash.as_str(),
+            "size_bytes": size_bytes,
+        });
+        return Ok(Some((id, snapshot)));
+    }
+
+    let Some(snapshot) = row.snapshot_json_value()? else {
+        return Ok(None);
+    };
+    let id = snapshot
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| LixError::unknown("lix_binary_blob_ref snapshot is missing string id"))?;
+    Ok(Some((id, snapshot)))
+}
+
+fn filesystem_path_index_projection() -> HotStateProjection {
+    HotStateProjection {
+        columns: vec!["snapshot".to_owned(), "metadata".to_owned()],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BlobRefSnapshot {
     blob_hash: String,
@@ -1778,8 +1897,8 @@ struct FileRecord {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::row_pk::RowPk;
     use crate::hot_state::MaterializedHotStateBatchBuilder;
+    use crate::row_pk::RowPk;
 
     fn path_index_from_rows(
         rows: Vec<MaterializedHotStateRow>,
@@ -1811,11 +1930,209 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct TypedOnlyPathHotStateReader {
+        files: MaterializedHotStateBatch,
+        directories: MaterializedHotStateBatch,
+        scan_projection: Arc<Mutex<Vec<String>>>,
+        exact_projection: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HotStateReader for TypedOnlyPathHotStateReader {
+        async fn scan_batch(
+            &self,
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            *self.scan_projection.lock().unwrap() = request.projection.columns.clone();
+            Ok(self.files.clone())
+        }
+
+        async fn load_exact_batch(
+            &self,
+            request: &crate::hot_state::HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            *self.exact_projection.lock().unwrap() = request.projection.columns.clone();
+            let mut builder = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
+            let mut slots = Vec::with_capacity(request.rows.len());
+            for requested in &request.rows {
+                let row = self.directories.iter().find(|row| {
+                    row.branch_id() == requested.branch_id
+                        && row.schema_key() == requested.schema_key
+                        && row.row_pk() == &requested.row_pk
+                });
+                slots.push(row.map(|row| {
+                    u32::try_from(builder.push_ref(row, None))
+                        .expect("test exact result remains below u32 rows")
+                }));
+            }
+            crate::hot_state::MaterializedHotStateExactBatch::new(builder.finish(), slots)
+        }
+    }
+
+    fn typed_only_descriptors(rows: Vec<MaterializedHotStateRow>) -> MaterializedHotStateBatch {
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+        for mut row in rows {
+            let snapshot: serde_json::Value = serde_json::from_str(
+                row.snapshot_content
+                    .as_ref()
+                    .expect("fixture descriptor has JSON")
+                    .as_str(),
+            )
+            .expect("fixture descriptor JSON should parse");
+            row.row_pk = RowPk::uuid_from_canonical(
+                snapshot
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("fixture descriptor has an ID"),
+            )
+            .expect("fixture descriptor ID should be a canonical UUID");
+            let typed = crate::row_payload::TypedRow::from_builtin_json(
+                &row.schema_key,
+                &row.row_pk,
+                &snapshot,
+            )
+            .expect("builtin descriptor should decode to UUID/null/text fields");
+            row.snapshot_content = None;
+            let ordinal = builder.len();
+            builder.push_owned(row);
+            builder.set_decoded_snapshot(ordinal, Some(Arc::new(typed)));
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn typed_blob_ref_rejects_negative_size_bytes() {
+        const ID: &str = "01920000-0000-7000-8000-0000000000f1";
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        let mut row = blob_row(
+            ID,
+            "84d89877f0d4041efb6bf91a16f0248f392e02bba5e1794fd6e8f8e3f8c7f1a9",
+            BRANCH,
+        );
+        row.row_pk = RowPk::uuid_from_canonical(ID).unwrap();
+        let typed = crate::row_payload::TypedRow::from_test_json_unchecked(
+            &row.row_pk,
+            &serde_json::json!({
+                "id": ID,
+                "blob_hash": "84d89877f0d4041efb6bf91a16f0248f392e02bba5e1794fd6e8f8e3f8c7f1a9",
+                "size_bytes": -1,
+            }),
+        )
+        .unwrap();
+        row.snapshot_content = None;
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
+        let ordinal = builder.len();
+        builder.push_owned(row);
+        builder.set_decoded_snapshot(ordinal, Some(Arc::new(typed)));
+
+        let error = FilesystemPathIndex::from_live_batch(&builder.finish()).unwrap_err();
+        assert_eq!(
+            error.message,
+            "invalid lix_binary_blob_ref snapshot JSON: size_bytes must be non-negative"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_path_index_reads_typed_only_file_and_ancestor_payloads() {
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        let reader = TypedOnlyPathHotStateReader {
+            files: typed_only_descriptors(vec![
+                file_row(
+                    "01920000-0000-7000-8000-0000000000f1",
+                    Some("01920000-0000-7000-8000-0000000000d2"),
+                    "a.md",
+                    BRANCH,
+                    false,
+                ),
+                blob_row(
+                    "01920000-0000-7000-8000-0000000000f1",
+                    "84d89877f0d4041efb6bf91a16f0248f392e02bba5e1794fd6e8f8e3f8c7f1a9",
+                    BRANCH,
+                ),
+            ]),
+            directories: typed_only_descriptors(vec![
+                directory_row(
+                    "01920000-0000-7000-8000-0000000000d2",
+                    Some("01920000-0000-7000-8000-0000000000d1"),
+                    "nested",
+                    BRANCH,
+                    false,
+                ),
+                directory_row(
+                    "01920000-0000-7000-8000-0000000000d1",
+                    None,
+                    "docs",
+                    BRANCH,
+                    false,
+                ),
+            ]),
+            scan_projection: Arc::new(Mutex::new(Vec::new())),
+            exact_projection: Arc::new(Mutex::new(Vec::new())),
+        };
+        let request = FilesystemPathIndexRequest::new(vec![BRANCH.to_owned()])
+            .with_file_ids(Some(vec![
+                "01920000-0000-7000-8000-0000000000f1".to_owned(),
+            ]))
+            .with_blob_refs(true);
+        crate::row_payload::reset_typed_row_json_conversions_for_test();
+        let index = build_path_index(&reader, &request)
+            .await
+            .expect("scoped typed-only path rows should retain decoded payloads");
+        assert_eq!(
+            crate::row_payload::typed_row_json_conversions_for_test(),
+            0,
+            "typed file, parent, and blob reads should not render whole snapshot JSON"
+        );
+        let expected_projection = vec!["snapshot".to_owned(), "metadata".to_owned()];
+        assert_eq!(*reader.scan_projection.lock().unwrap(), expected_projection);
+        assert_eq!(
+            *reader.exact_projection.lock().unwrap(),
+            expected_projection
+        );
+        assert_eq!(
+            index
+                .entries()
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs", "/docs/nested", "/docs/nested/a.md"]
+        );
+        let file = index
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path == "/docs/nested/a.md")
+            .expect("file path should be indexed");
+        let blob = file
+            .blob_ref_live_row()
+            .expect("typed blob ref should remain available to existing consumers");
+        let blob_snapshot: serde_json::Value = serde_json::from_str(
+            blob.snapshot_content
+                .as_ref()
+                .expect("blob ref keeps its canonical DTO snapshot")
+                .as_str(),
+        )
+        .expect("canonical blob ref snapshot should parse");
+        assert_eq!(blob_snapshot["id"], "01920000-0000-7000-8000-0000000000f1");
+        assert_eq!(
+            blob_snapshot["blob_hash"],
+            "84d89877f0d4041efb6bf91a16f0248f392e02bba5e1794fd6e8f8e3f8c7f1a9"
+        );
+        assert_eq!(blob_snapshot["size_bytes"], 7);
+    }
+
     #[tokio::test]
     async fn scoped_path_index_reads_only_selected_files_and_ancestor_closure() {
         let lix = crate::open_lix().await.unwrap();
-        for path in ["/top/nested/a.bin", "/top/other.bin", "/elsewhere/x.bin", "/root.bin"] {
-            lix.upsert_file_content(path, b"content".to_vec()).await.unwrap();
+        for path in [
+            "/top/nested/a.bin",
+            "/top/other.bin",
+            "/elsewhere/x.bin",
+            "/root.bin",
+        ] {
+            lix.upsert_file_content(path, b"content".to_vec())
+                .await
+                .unwrap();
         }
         let values = (0..400)
             .map(|index| format!("('/unrelated-{index:03}.bin', CAST('x' AS BYTEA))"))
@@ -1828,16 +2145,56 @@ mod tests {
         .await
         .expect("unrelated descriptors should insert in one batch");
 
-        let id = lix.execute("SELECT id FROM lix_file WHERE path='/top/nested/a.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
-        let root_id = lix.execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
-        let branch = lix.partial_replica_descriptor(None).await.unwrap().selected_branch.branch_id;
-        let hot = crate::hot_state::HotStateContext::new(crate::tracked_state::TrackedStateContext::new(), crate::commit_graph::CommitGraphContext::new());
+        let id = lix
+            .execute(
+                "SELECT id FROM lix_file WHERE path='/top/nested/a.bin'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let root_id = lix
+            .execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let branch = lix
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap()
+            .selected_branch
+            .branch_id;
+        let hot = crate::hot_state::HotStateContext::new(
+            crate::tracked_state::TrackedStateContext::new(),
+            crate::commit_graph::CommitGraphContext::new(),
+        );
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let reader = hot.reader(&read);
-        let request = FilesystemPathIndexRequest::new(vec![branch.clone()]).with_file_ids(Some(vec![id]));
+        let request =
+            FilesystemPathIndexRequest::new(vec![branch.clone()]).with_file_ids(Some(vec![id]));
+        crate::row_payload::reset_typed_row_json_conversions_for_test();
         let rows = read_path_index_rows(&reader, &request).await.unwrap();
-        assert_eq!(rows.len(), 3, "one file and its two ancestors, no siblings or blobs");
+        assert_eq!(
+            rows.len(),
+            3,
+            "one file and its two ancestors, no siblings or blobs"
+        );
+        assert!(
+            rows.iter().all(|row| {
+                row.snapshot_content().is_none() && row.decoded_snapshot().is_some()
+            }),
+            "path-index requests should retain typed rows without rendering snapshot JSON"
+        );
+        assert_eq!(
+            crate::row_payload::typed_row_json_conversions_for_test(),
+            0,
+            "typed path-index reads should not materialize snapshot JSON"
+        );
 
         // Measure actual rows consumed by the shared builder. This guards the
         // storage-work property, not merely that the request carries an ID.
@@ -1857,10 +2214,16 @@ mod tests {
             directory_rows, expected_directory_count,
             "directory-only scan should read directory descriptors only"
         );
-        assert_eq!(directory_index.kind_count(FilesystemPathKind::Directory), expected_directory_count);
+        assert_eq!(
+            directory_index.kind_count(FilesystemPathKind::Directory),
+            expected_directory_count
+        );
         assert_eq!(directory_index.kind_count(FilesystemPathKind::File), 0);
         for path in ["/top", "/top/nested", "/elsewhere"] {
-            assert!(!directory_index.exact_entries(path).is_empty(), "directory missing: {path}");
+            assert!(
+                !directory_index.exact_entries(path).is_empty(),
+                "directory missing: {path}"
+            );
         }
         assert!(
             directory_rows * 50 < full_domain_rows,
@@ -1870,15 +2233,148 @@ mod tests {
         reset_full_rebuild_stats();
         let index = reader.path_index(&request).await.unwrap();
         let (_, scoped_rows) = full_rebuild_stats();
-        assert!(full_domain_rows >= 400, "full index should consume all unrelated descriptors: {full_domain_rows}");
-        assert_eq!(scoped_rows, 3, "scoped index should consume only the target and its ancestors");
-        assert!(scoped_rows * 100 < full_domain_rows, "point-read index work should be bounded independently of unrelated files");
-        assert_eq!(index.entries().iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["/top", "/top/nested", "/top/nested/a.bin"]);
-        assert!(Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()), "scoped reads reuse the revision cache");
+        assert!(
+            full_domain_rows >= 400,
+            "full index should consume all unrelated descriptors: {full_domain_rows}"
+        );
+        assert_eq!(
+            scoped_rows, 3,
+            "scoped index should consume only the target and its ancestors"
+        );
+        assert!(
+            scoped_rows * 100 < full_domain_rows,
+            "point-read index work should be bounded independently of unrelated files"
+        );
+        assert_eq!(
+            index
+                .entries()
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/top", "/top/nested", "/top/nested/a.bin"]
+        );
+        assert!(
+            Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()),
+            "scoped reads reuse the revision cache"
+        );
         let root = request.clone().with_file_ids(Some(vec![root_id]));
         assert_eq!(read_path_index_rows(&reader, &root).await.unwrap().len(), 1);
-        let missing = request.with_file_ids(Some(vec!["00000000-0000-0000-0000-000000000000".to_owned()]));
-        assert!(read_path_index_rows(&reader, &missing).await.unwrap().is_empty());
+        let missing = request.with_file_ids(Some(vec![
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+        ]));
+        assert!(
+            read_path_index_rows(&reader, &missing)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decoded_uuid_descriptors_match_json_fallback_for_paths_and_null_parents() {
+        const BRANCH: &str = "01920000-0000-7000-8000-0000000000a1";
+        let mut rows = vec![
+            directory_row(
+                "01920000-0000-7000-8000-0000000000d1",
+                None,
+                "docs",
+                BRANCH,
+                false,
+            ),
+            directory_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                Some("01920000-0000-7000-8000-0000000000d1"),
+                "nested",
+                BRANCH,
+                false,
+            ),
+            file_row(
+                "01920000-0000-7000-8000-0000000000f1",
+                Some("01920000-0000-7000-8000-0000000000d2"),
+                "a.md",
+                BRANCH,
+                false,
+            ),
+            file_row(
+                "01920000-0000-7000-8000-0000000000f2",
+                None,
+                "root.md",
+                BRANCH,
+                false,
+            ),
+        ];
+        for row in &mut rows {
+            let snapshot: serde_json::Value = serde_json::from_str(
+                row.snapshot_content
+                    .as_ref()
+                    .expect("fixture descriptor has JSON")
+                    .as_str(),
+            )
+            .expect("fixture descriptor JSON should parse");
+            row.row_pk = RowPk::uuid_from_canonical(
+                snapshot
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("fixture descriptor has an ID"),
+            )
+            .expect("fixture descriptor ID should be a canonical UUID");
+        }
+
+        let mut json_builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+        for row in rows.iter().cloned() {
+            json_builder.push_owned(row);
+        }
+        let json_batch = json_builder.finish();
+
+        let mut typed_builder = MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+        for mut row in rows {
+            let snapshot: serde_json::Value = serde_json::from_str(
+                row.snapshot_content
+                    .as_ref()
+                    .expect("fixture descriptor has JSON")
+                    .as_str(),
+            )
+            .expect("fixture descriptor JSON should parse");
+            let typed = crate::row_payload::TypedRow::from_builtin_json(
+                &row.schema_key,
+                &row.row_pk,
+                &snapshot,
+            )
+            .expect("builtin descriptor should decode to UUID/null/text fields");
+            row.snapshot_content = None;
+            let ordinal = typed_builder.len();
+            typed_builder.push_owned(row);
+            typed_builder.set_decoded_snapshot(ordinal, Some(Arc::new(typed)));
+        }
+        let typed_batch = typed_builder.finish();
+
+        let json_index = FilesystemPathIndex::from_live_batch(&json_batch)
+            .expect("JSON fallback path index should build");
+        let typed_index = FilesystemPathIndex::from_live_batch(&typed_batch)
+            .expect("typed path index should build");
+        let witness = |index: &FilesystemPathIndex| {
+            index
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.path.clone(),
+                        entry.kind,
+                        entry.id().to_owned(),
+                        entry.parent_id.clone(),
+                        entry.name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(witness(&typed_index), witness(&json_index));
+        assert_eq!(
+            witness(&typed_index)
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs", "/docs/nested", "/docs/nested/a.md", "/root.md"]
+        );
     }
 
     #[test]
@@ -1903,18 +2399,17 @@ mod tests {
             Some(&[1]),
             Arc::new(FilesystemPathIndex::default()),
         );
-        let full_index = cache.insert(
-            &full,
-            Some(&[1]),
-            Arc::new(FilesystemPathIndex::default()),
-        );
+        let full_index = cache.insert(&full, Some(&[1]), Arc::new(FilesystemPathIndex::default()));
         assert!(cache.get(&b, Some(&[1])).is_none());
         assert!(Arc::ptr_eq(&index, &cache.get(&a, Some(&[1])).unwrap()));
         assert!(Arc::ptr_eq(
             &directory_index,
             &cache.get(&directories, Some(&[1])).unwrap()
         ));
-        assert!(Arc::ptr_eq(&full_index, &cache.get(&full, Some(&[1])).unwrap()));
+        assert!(Arc::ptr_eq(
+            &full_index,
+            &cache.get(&full, Some(&[1])).unwrap()
+        ));
         cache.advance_committed(Some(&[1]), Some(&[2]), &[]);
         assert!(cache.get(&a, Some(&[1])).is_none());
         assert!(cache.get(&a, Some(&[2])).is_none());

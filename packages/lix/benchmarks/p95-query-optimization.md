@@ -53,3 +53,18 @@ Cold ranges do not overlap: 2.875–3.657 versus 1.472–1.796 ms, and 6.451–7
 Validation: 4,878 tests passed with all simulations, storage benchmarks, server protocol and protocol client enabled (91 skipped), and ten doctests passed. Tests check selected-directory output and actual work with 400 unrelated files, cache scope isolation and committed/staged advancement, partial directory demand, and rejection of old interest journals. Initial fixture/bootstrap, OpenAPI and journal write-admission failures were corrected and retained in the companion audit records. Independent GPT-6 Luna xhigh reviewers approved the scope and data.
 
 The serialized interest shape changes intentionally: sync protocol 22 and partial-interest journal version 3 are required. Client and server must use matching sync versions; existing version-2 journals are rejected rather than silently interpreted or erased. No migration or deployment is included in this draft.
+
+## Typed filesystem descriptor demand
+
+Filesystem index scans and ancestor reads now request typed snapshots and metadata without derived full-row JSON. File, directory and blob fields use schema-validated typed values; the existing JSON fallback remains. Blob consumers still receive their canonical DTO. A focused real-engine test proves zero whole-row JSON renders on the typed path; this is not a measured baseline conversion count.
+
+Two independent comparisons against the directory-scope commit use the same features, production execution kinds, 20 ABBA trials per arm and 100 warm samples per query/trial. All eight complete-result oracles pass.
+
+| Cold directory build | Baseline median ms | Typed median ms | Physical-planning median ms |
+| --- | ---: | ---: | --- |
+| 128 files, 19 descriptors | 1.523 | 1.465 | 0.755 → 0.700 |
+| 400 files, 53 descriptors | 2.191 | 2.024 | 1.219 → 1.066 |
+
+At 400 files, every ABBA block improves cold directory mean time (4.2–16.2%); median first-execution time falls 7.6%. The observed first-execution p95 is 2.569 → 2.137 ms, but trial ranges overlap (2.083–2.612 versus 1.958–2.375), so this is evidence for reduced cold build cost, not a proven general tail reduction. The physical-phase difference scales at approximately 2.9 microseconds per descriptor across the two fixtures; that is an inferred consistency check. At 128 files the p95 is essentially unchanged (1.681 → 1.669 ms). Warm directory and other same-ID query timings remain approximately flat. Changing-ID content improves only about 2%, with overlapping ranges; the original scoped-cache tradeoff remains open.
+
+Validation: 4,881 tests passed (91 skipped), plus ten doctests. Typed-only scan/parent projection, UUID/null fields, canonical blob parity and invalid blob size are covered. Two fixture compilation failures and one existing cross-fixture collection-delete byte-bound failure are retained. The unchanged full suite rerun and six isolated repetitions of that test passed; its assertion was not weakened. Independent GPT-6 Luna xhigh reviewers approved source and the narrow cold-build evidence. These are canonical Memory results, with no deployed production prediction.
