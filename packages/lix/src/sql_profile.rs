@@ -94,6 +94,10 @@ pub(crate) struct SqlReadProfile {
     /// of reloading both endpoint payloads.
     #[cfg(test)]
     pub(crate) file_local_diff_rows_reused: u64,
+    /// Live/live tree rows whose authenticated delta values arrived with the
+    /// comparison payload read, avoiding a separate exact delta-index lookup.
+    #[cfg(test)]
+    pub(crate) diff_payload_joined_delta_validation_rows: u64,
 }
 
 #[cfg(feature = "storage-benches")]
@@ -223,6 +227,16 @@ pub(crate) fn record_file_local_diff_rows_reused(rows: usize) {
         let mut profile = profile.borrow_mut();
         profile.file_local_diff_rows_reused = profile
             .file_local_diff_rows_reused
+            .saturating_add(rows as u64);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_diff_payload_joined_delta_validation_rows(rows: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.diff_payload_joined_delta_validation_rows = profile
+            .diff_payload_joined_delta_validation_rows
             .saturating_add(rows as u64);
     });
 }

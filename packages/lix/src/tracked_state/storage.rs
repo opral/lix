@@ -9845,11 +9845,11 @@ async fn load_columnar_owned_entries(
 /// [`load_commit_delta_values`]: callers already know the owning commit from
 /// the endpoint index value, so no global changelog or delta-space scan is
 /// necessary.
-pub(crate) async fn load_commit_delta_change_records(
+pub(crate) async fn load_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKey],
-) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     #[cfg(feature = "storage-benches")]
     for key in keys {
         crate::storage_bench::record_commit_delta_request_key_clone(
@@ -9861,7 +9861,19 @@ pub(crate) async fn load_commit_delta_change_records(
         .cloned()
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
-    load_commit_delta_change_records_for_owners(store, &requests).await
+    load_owned_commit_delta_entries(store, &requests).await
+}
+
+pub(crate) async fn load_commit_delta_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+    Ok(load_commit_delta_entries(store, commit_id, keys)
+        .await?
+        .into_iter()
+        .map(|entry| entry.map(|entry| entry.change_record))
+        .collect())
 }
 
 /// Loads exact change records from their already-known physical owners in one

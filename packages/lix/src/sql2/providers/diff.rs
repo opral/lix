@@ -2683,6 +2683,10 @@ mod tests {
             profile.file_local_diff_rows_reused > 0,
             "the count path should reuse at least the live/live local winner"
         );
+        assert!(
+            profile.diff_payload_joined_delta_validation_rows >= 2,
+            "the live/live before and after rows should be validated by the same payload fetch"
+        );
         session.close().await.expect("close branch session");
     }
 

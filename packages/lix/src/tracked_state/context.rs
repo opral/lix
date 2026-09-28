@@ -1537,7 +1537,7 @@ where
         // exact collection-generation marker) proves deletion even after GC
         // releases the original mutation body. Requiring that old body here
         // would make a payload projection stricter than the same identity diff.
-        self.validate_tree_diff_batch_against_delta_index(batch)
+        self.validate_tree_diff_batch_against_delta_index(batch, None)
             .await?;
         let rows = batch
             .side_rows()
@@ -1635,11 +1635,83 @@ where
         &mut self,
         batch: &TrackedStateTreeDiffBatch,
     ) -> Result<TrackedStatePayloadBatch, LixError> {
-        self.validate_tree_diff_batch_against_delta_index(batch)
+        let comparison_rows = batch.comparison_rows();
+        let mut keys = Vec::with_capacity(comparison_rows.len());
+        for row in comparison_rows.iter().copied() {
+            keys.push(TrackedStateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                row_pk: row.row_pk().clone(),
+            });
+        }
+        let requests = comparison_rows
+            .iter()
+            .zip(&keys)
+            .map(|(row, key)| (row.commit_id(), key.clone()))
+            .collect::<Vec<_>>();
+        let loaded = storage::load_owned_commit_delta_entries(&self.store, &requests).await?;
+        if loaded.len() != comparison_rows.len() {
+            return Err(LixError::internal_invariant(
+                "tracked-state comparison payload load returned the wrong row count",
+                serde_json::json!({
+                    "requested": comparison_rows.len(),
+                    "returned": loaded.len(),
+                }),
+            ));
+        }
+
+        let mut validated_payload_keys = HashSet::with_capacity(comparison_rows.len());
+        let mut changes = HashMap::<ChangeId, ChangeRecord>::new();
+        let mut fallback_rows = Vec::new();
+        for ((row, key), entry) in comparison_rows
+            .iter()
+            .copied()
+            .zip(keys.iter())
+            .zip(loaded)
+        {
+            let Some(entry) = entry else {
+                // Sparse complete-state boundaries may route the immutable
+                // payload through a selected changelog source even when their
+                // authored delta is intentionally absent. Preserve that exact
+                // fallback, then let the ordinary validator decide whether
+                // the missing delta is permitted for this commit.
+                fallback_rows.push(row);
+                continue;
+            };
+            validate_live_tree_diff_row_against_delta(row, &entry.value)?;
+            validated_payload_keys.insert((row.commit_id(), key.clone()));
+            insert_tree_diff_change_record(&mut changes, entry.change_record, row.change_id())?;
+        }
+        #[cfg(test)]
+        crate::sql_profile::record_diff_payload_joined_delta_validation_rows(
+            validated_payload_keys.len(),
+        );
+
+        // The loaded payload entry already carried its authenticated packed
+        // delta value, so do not fetch that same value a second time. All
+        // other rows (tombstones, additions/removals, same-change rows, and
+        // sparse rows without a local delta entry) keep the standard checks.
+        self.validate_tree_diff_batch_against_delta_index(batch, Some(&validated_payload_keys))
             .await?;
-        let changes = self
-            .load_routed_tree_diff_changes(&batch.comparison_rows())
-            .await?;
+
+        if !fallback_rows.is_empty() {
+            let fallback_changes = self.load_routed_tree_diff_changes(&fallback_rows).await?;
+            for (change_id, change) in fallback_changes {
+                if let Some(existing) = changes.insert(change_id, change.clone())
+                    && existing != change
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state diff change '{change_id}' resolves to conflicting packed payloads"
+                        ),
+                    ));
+                }
+            }
+        }
+        for row in comparison_rows {
+            validate_tree_diff_row_against_changelog(row, &changes)?;
+        }
         TrackedStatePayloadBatch::from_payloads(
             changes
                 .into_iter()
@@ -1682,8 +1754,23 @@ where
     async fn validate_tree_diff_batch_against_delta_index(
         &self,
         batch: &TrackedStateTreeDiffBatch,
+        already_validated: Option<&HashSet<(CommitId, TrackedStateKey)>>,
     ) -> Result<(), LixError> {
-        let rows = batch.side_rows().collect::<Vec<_>>();
+        let rows = batch
+            .side_rows()
+            .filter(|row| {
+                !already_validated.is_some_and(|validated| {
+                    validated.contains(&(
+                        row.commit_id(),
+                        TrackedStateKey {
+                            schema_key: row.schema_key().to_owned(),
+                            file_id: row.file_id().map(str::to_owned),
+                            row_pk: row.row_pk().clone(),
+                        },
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
         let mut by_commit = BTreeMap::<CommitId, Vec<TrackedStateTreeDiffRowRef<'_>>>::new();
         for row in rows {
             by_commit.entry(row.commit_id()).or_default().push(row);
@@ -2523,7 +2610,7 @@ where
                 );
             }
         }
-        self.validate_tree_diff_batch_against_delta_index(&tombstones.finish()?)
+        self.validate_tree_diff_batch_against_delta_index(&tombstones.finish()?, None)
             .await?;
         let rows = rows
             .into_iter()
@@ -5618,6 +5705,72 @@ fn validate_diff_row_against_changelog(
             "tracked-state diff row for change '{}' updated_at does not match changelog change timestamp",
             row.change_id
         )));
+    }
+    Ok(())
+}
+
+fn validate_live_tree_diff_row_against_delta(
+    row: TrackedStateTreeDiffRowRef<'_>,
+    value: &TrackedStateIndexValue,
+) -> Result<(), LixError> {
+    if row.change_id() == value.change_id
+        && row.commit_id() == value.commit_id
+        && row.deleted() == value.deleted
+        && row.updated_at() == value.updated_at()
+    {
+        return Ok(());
+    }
+    Err(LixError::internal_invariant(
+        format!(
+            "tracked-state diff row '{}' does not match commit '{}' delta index",
+            row.change_id(),
+            row.commit_id()
+        ),
+        serde_json::json!({
+            "change_id": row.change_id().to_string(),
+            "commit_id": row.commit_id().to_string(),
+            "row_ref": crate::row_ref::schema_identity_detail(
+                row.schema_key(),
+                row.file_id(),
+                row.row_pk(),
+            ),
+            "file_id": row.file_id(),
+            "row_deleted": row.deleted(),
+            "row_updated_at": row.updated_at().to_string(),
+            "delta_value": {
+                "change_id": value.change_id.to_string(),
+                "commit_id": value.commit_id.to_string(),
+                "deleted": value.deleted,
+                "updated_at": value.updated_at().to_string(),
+            },
+        }),
+    ))
+}
+
+fn insert_tree_diff_change_record(
+    changes: &mut HashMap<ChangeId, ChangeRecord>,
+    change: ChangeRecord,
+    expected_change_id: ChangeId,
+) -> Result<(), LixError> {
+    if change.change_id != expected_change_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked-state diff row '{}' resolves to payload '{}'",
+                expected_change_id, change.change_id
+            ),
+        ));
+    }
+    let change_id = change.change_id;
+    if let Some(existing) = changes.insert(change_id, change.clone())
+        && existing != change
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked-state diff change '{change_id}' resolves to conflicting packed payloads"
+            ),
+        ));
     }
     Ok(())
 }

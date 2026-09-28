@@ -2003,8 +2003,86 @@ mod tests {
         .await;
 
         let diff = diff(&storage, &tracked_state).await;
-
         assert!(diff.entries.is_empty());
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("identity-only read should open");
+        let diff = tracked_state
+            .reader(read)
+            .diff_commits(
+                "left",
+                "right",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("identity-only semantic revert should load");
+        assert!(
+            diff.entries.is_empty(),
+            "the joined payload read must retain exact before/after snapshot and metadata equality"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_only_diff_rejects_packed_delta_tree_value_mismatch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source",
+            None,
+            &[row("row-a", None, "source-change")],
+        )
+        .await
+        .expect("source root should write");
+        write_root_committed_for_test(&storage, &tracked_state, "right-corrupt", None, &[])
+            .await
+            .expect("corrupt endpoint manifest should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let source_diff = tracked_state
+            .reader(read)
+            .diff_commits("right-corrupt", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("source row should load");
+        let source_row = source_diff.entries[0]
+            .after
+            .as_ref()
+            .expect("source row should be live");
+        let (key, mut value) = source_row.clone().into_index_entry();
+        value.change_id = ChangeId::for_test_label("forged-tree-change");
+        stage_corrupt_commit_root(&storage, "right-corrupt", vec![(key, value)], Vec::new())
+            .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("identity-only read should open");
+        let error = tracked_state
+            .reader(read)
+            .diff_commits(
+                "source",
+                "right-corrupt",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect_err("tree value must agree with its authenticated packed delta row");
+        assert!(
+            error.message.contains("does not match commit")
+                && error.message.contains("delta index"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
