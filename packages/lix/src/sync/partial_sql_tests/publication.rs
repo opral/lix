@@ -320,6 +320,85 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
             *state
         );
     }
+    // Simulate a repository created before serving witnesses existed. The
+    // one-time migration must certify the resident undo root without replacing
+    // its unpublished head or row values.
+    {
+        use crate::storage::{Storage as _, StorageWrite as _};
+        let mut raw = storage.storage().begin_write(Default::default()).await.unwrap();
+        let mut keys = Vec::new();
+        for branch in [&state.descriptor().selected_branch, &state.descriptor().global_branch] {
+            let key = StorageKey(bytes::Bytes::copy_from_slice(
+                uuid::Uuid::parse_str(&branch.branch_id).unwrap().as_bytes(),
+            ));
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        raw.delete_many(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, &keys)
+            .await
+            .unwrap();
+        raw.commit().await.unwrap();
+    }
+    let (migrated, migrated_session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .expect("legacy local undo must migrate without losing pending work");
+    assert!(
+        value(migrated_session.execute(
+            "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
+            &[],
+        ).await.unwrap()).contains("pending")
+    );
+    drop(migrated);
+    assert!(matches!(
+        storage
+            .clear_space(crate::changelog::COMMIT_SPACE, Default::default())
+            .await,
+        Err(crate::storage_adapter::StorageError::Corruption(_))
+    ));
+    let unadmitted = StorageAdapter::new(storage.storage().clone());
+    assert!(matches!(
+        unadmitted
+            .clear_space(crate::changelog::COMMIT_SPACE, Default::default())
+            .await,
+        Err(crate::storage_adapter::StorageError::PreconditionFailed(_))
+    ));
+    let mut range = storage.new_write_set();
+    range
+        .delete_range_exclusive(
+            crate::changelog::COMMIT_SPACE,
+            crate::storage_adapter::StorageKeyRange {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+            },
+        )
+        .unwrap();
+    let error: LixError = storage
+        .commit_write_set(range, Default::default())
+        .await
+        .expect_err("partial commit history range deletion must be rejected")
+        .into();
+    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let local_roots = crate::sync::partial_serving::retained_local_roots(&read)
+        .await
+        .unwrap();
+    drop(read);
+    assert!(!local_roots.is_empty());
+    for root in local_roots {
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            crate::tracked_state::commit_state_authority_key(root),
+        );
+        let error: LixError = storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .expect_err("active native root authority must be retained")
+            .into();
+        assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+    }
     // A valid local interval is not permission to accept missing or foreign
     // roots. Keep rejecting malformed markers without replacing local data.
     let read = storage.begin_read(Default::default()).await.unwrap();
@@ -341,17 +420,15 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
             crate::hot_state::hot_generation_scope_prefix(branch_id, control.tracked_generation),
             marker,
         );
-        storage
+        let error = storage
             .commit_write_set(writes, Default::default())
             .await
-            .unwrap();
-        let error = match Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
-            .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("invalid local root was admitted"),
-        };
+            .expect_err("invalid serving coordinates must not commit");
+        let error: LixError = error.into();
         assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .expect("rejected write preserves the admitted replica");
     }
     assert!(
         value(
@@ -2213,29 +2290,30 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
             bytes: serde_json::to_vec(&old_push).unwrap().into(),
         },
     );
-    storage
-        .commit_partial_replica_write_set(
-            crate::sync::partial_replica_write_capability(),
-            writes,
-            StorageWriteOptions {
-                await_durable: true,
-                preconditions: vec![
-                    crate::storage_adapter::StoragePrecondition::KeyValueEquals {
-                        space: crate::sync::partial_push_state::PARTIAL_BRANCH_PUSH_SPACE,
-                        key: push_key,
-                        expected: before_push.clone(),
-                    },
-                    crate::storage_adapter::StoragePrecondition::KeyValueEquals {
-                        space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
-                        key: crate::sync::partial_replica_state_key(),
-                        expected: receipt,
-                    },
-                ],
-                ..Default::default()
-            },
-        )
+    // Recreate the legacy metadata on the same physical epoch for the
+    // detached upgrade test; the live partial writer must reject this format.
+    use crate::storage::StorageWrite as _;
+    let mut raw = storage
+        .begin_migration_write(StorageWriteOptions {
+            await_durable: true,
+            preconditions: vec![
+                crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                    space: crate::sync::partial_push_state::PARTIAL_BRANCH_PUSH_SPACE,
+                    key: push_key,
+                    expected: before_push.clone(),
+                },
+                crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                    space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                    key: crate::sync::partial_replica_state_key(),
+                    expected: receipt,
+                },
+            ],
+            ..Default::default()
+        })
         .await
         .unwrap();
+    writes.lower_into(&mut raw).await.unwrap();
+    raw.commit().await.unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     assert!(
         crate::sync::load_partial_replica_state(&read)

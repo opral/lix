@@ -1621,7 +1621,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if owner_root == current_root {
                 continue;
             }
-            if sealed_owner_allows_importer(owner_root, &relative_path) {
+            if sealed_owner_allows_importer(owner_root, &imported_path, &relative_path) {
                 continue;
             }
 
@@ -1663,9 +1663,28 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
     ["api"].into_iter().collect()
 }
 
-fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
+fn sealed_owner_allows_importer(
+    owner_root: &str,
+    imported_path: &[String],
+    importer_file: &str,
+) -> bool {
     (matches!(owner_root, "api") && importer_file == "lib.rs")
         || importer_file == "storage_bench.rs"
+        // The serving witness is sync-owned, while these integration points
+        // must register, validate, retain, or garbage-collect it. Keep this
+        // exception scoped to that leaf module rather than opening all of
+        // `sync` to its consumers.
+        || (owner_root == "sync"
+            && imported_path.get(1).is_some_and(|module| module == "partial_serving")
+            && matches!(
+                importer_file,
+                "engine.rs"
+                    | "storage_adapter/context.rs"
+                    | "storage_spaces.rs"
+                    | "registered_spaces.rs"
+                    | "gc.rs"
+                    | "migration/epoch.rs"
+            ))
 }
 
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {

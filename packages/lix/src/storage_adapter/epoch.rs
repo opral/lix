@@ -114,6 +114,10 @@ impl EpochRouting {
         self.bank
     }
 
+    pub(super) fn is_migration_writer(&self) -> bool {
+        self.force_durable && self.expected_pointer.is_some() && !self.read_only
+    }
+
     pub(super) fn map_space(&self, space: StorageSpace) -> StorageSpace {
         if self.bank == EpochBank::Legacy || space.id == REPOSITORY_EPOCH_SPACE.id {
             return space;

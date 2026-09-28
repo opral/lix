@@ -1298,6 +1298,7 @@ where
     .await?;
     chronology_roots.extend(uploads.roots);
     chronology_roots.extend(native_global_retention::load_global_migration_roots(store).await?);
+    chronology_roots.extend(crate::sync::partial_serving::retained_local_roots(store).await?);
     chronology_roots.extend(
         load_recovery_refs(store)
             .await?
@@ -2427,6 +2428,8 @@ fn retirement_is_proven(
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::StorageWrite;
+
     #[tokio::test]
     async fn authority_gc_refuses_partial_inventory_before_staging_any_mutation() {
         let authority = crate::open_lix().await.unwrap();
@@ -2446,10 +2449,12 @@ mod tests {
                 bytes: serde_json::to_vec(&state).unwrap().into(),
             },
         );
-        adapter
-            .commit_write_set(seed, StorageWriteOptions::default())
+        let mut raw = adapter
+            .begin_migration_write(StorageWriteOptions::default())
             .await
             .unwrap();
+        seed.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
         let read = SharedStorageAdapterRead::new(
             adapter
                 .begin_read(StorageReadOptions::default())

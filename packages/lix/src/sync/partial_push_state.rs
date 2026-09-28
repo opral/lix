@@ -502,6 +502,30 @@ mod tests {
         Ok(())
     }
 
+    /// Push-state tests use a complete native repository and do not open it as
+    /// a partial engine. Seed the bookkeeping-only receipt below the adapter's
+    /// partial-serving guard so the fixture does not claim partial ownership.
+    async fn seed_bookkeeping_fixture<S>(
+        adapter: &StorageAdapter<S>,
+        writes: StorageWriteSet,
+        preconditions: Vec<StoragePrecondition>,
+    ) where
+        S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+    {
+        use crate::storage::StorageWrite as _;
+
+        let mut raw = adapter
+            .begin_migration_write(StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        writes.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
+    }
+
     #[tokio::test]
     async fn exact_own_ack_preserves_newer_local_control_and_rejects_stale_ack() {
         let lix = open_lix().await.unwrap();
@@ -554,7 +578,7 @@ mod tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap(),
         );
-        commit(&adapter, writes, guards).await.unwrap();
+        seed_bookkeeping_fixture(&adapter, writes, guards).await;
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let initial = load_partial_push_state(&read, &state, &branch_id)
             .await

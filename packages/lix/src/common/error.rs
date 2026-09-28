@@ -540,6 +540,7 @@ impl From<crate::storage_adapter::StorageError> for LixError {
 impl From<crate::storage_adapter::StorageWriteSetError> for LixError {
     fn from(error: crate::storage_adapter::StorageWriteSetError) -> Self {
         match error {
+            crate::storage_adapter::StorageWriteSetError::Admission(error) => error,
             crate::storage_adapter::StorageWriteSetError::Storage(error) => error.into(),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }

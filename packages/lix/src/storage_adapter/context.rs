@@ -224,6 +224,24 @@ where
         ))
     }
 
+    /// Publish a prevalidated detached-candidate migration through the epoch
+    /// claim while keeping raw storage writes inside the adapter layer.
+    pub(crate) async fn commit_migration_write_set(
+        &self,
+        writes: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, StorageWriteSetError> {
+        let mut write = self
+            .begin_migration_write(opts)
+            .await
+            .map_err(StorageWriteSetError::Storage)?;
+        if let Err(error) = writes.lower_into(&mut write).await {
+            let _ = write.rollback().await;
+            return Err(error);
+        }
+        write.commit().await.map_err(StorageWriteSetError::Storage)
+    }
+
     pub async fn begin_read_transaction(
         &self,
     ) -> Result<Box<StorageAdapterReadTransaction<StorageImpl::Read<'_>>>, crate::LixError> {
@@ -308,7 +326,7 @@ where
 
     async fn prepare_write_set_with_replica_capability(
         &self,
-        write_set: StorageWriteSet,
+        mut write_set: StorageWriteSet,
         mut opts: WriteOptions,
         admission: ReplicaWriteAdmission,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
@@ -332,11 +350,45 @@ where
         let may_write_partial = admission == ReplicaWriteAdmission::PartialInstaller
             || (admission == ReplicaWriteAdmission::Ordinary
                 && writer_mode == ReplicaWriterMode::Partial as u8);
+        if may_write_partial
+            && write_set.has_range_delete_outside(crate::session::UPLOAD_MANIFEST_LEAF_SPACE)
+        {
+            return Err(StorageWriteSetError::Admission(crate::LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial replica range deletion requires a domain publication owner",
+            )));
+        }
         if !may_write_partial {
+            if write_set.has_mutations_in_space(crate::sync::PARTIAL_REPLICA_STATE_SPACE)
+                && !write_set.partial_bootstrap_authorized()
+            {
+                return Err(StorageWriteSetError::Admission(crate::LixError::new(
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                    "partial receipt publication requires the sync owner's write capability",
+                )));
+            }
             opts.preconditions.push(Precondition::KeyAbsent {
                 space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
                 key: crate::sync::partial_replica_state_key(),
             });
+        }
+        if (may_write_partial
+            || write_set.has_mutations_in_space(crate::sync::PARTIAL_REPLICA_STATE_SPACE))
+            && crate::sync::partial_serving::has_coordinate_mutations(&write_set)
+        {
+            let read = self
+                .begin_read(ReadOptions::default())
+                .await
+                .map_err(StorageWriteSetError::Storage)?;
+            let (prepared, guards) = crate::sync::partial_serving::prepare_write(
+                &read,
+                write_set,
+                false,
+            )
+            .await
+            .map_err(StorageWriteSetError::Admission)?;
+            write_set = prepared;
+            opts.preconditions.extend(guards);
         }
         if self.authority_writer.load(Ordering::Acquire) {
             opts.preconditions.push(Precondition::KeyValueEquals {
@@ -466,6 +518,27 @@ where
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
         let mut opts = opts;
+        if !self.routing.is_migration_writer() {
+            if self.replica_writer.load(Ordering::Acquire)
+                == ReplicaWriterMode::Partial as u8
+            {
+                return Err(StorageError::Corruption(
+                    "partial replica range deletion requires a checked atomic write set".into(),
+                ));
+            }
+            opts.preconditions.push(Precondition::KeyAbsent {
+                space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                key: crate::sync::partial_replica_state_key(),
+            });
+            if self.replica_writer.load(Ordering::Acquire)
+                != ReplicaWriterMode::Full as u8
+            {
+                opts.preconditions.push(Precondition::KeyAbsent {
+                    space: crate::sync::SYNC_REPLICA_STATE_SPACE,
+                    key: crate::sync::replica_state_key(),
+                });
+            }
+        }
         opts.await_durable |= self.durability == crate::Durability::Durable;
         let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
@@ -670,7 +743,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::storage::{
-        GetOptions, Key, Memory, ProjectedValue, ReadOptions, SpaceId, StoredValue, WriteOptions,
+        GetOptions, Key, Memory, ProjectedValue, ReadOptions, SpaceId, StorageWrite, StoredValue,
+        WriteOptions,
     };
     use crate::storage_adapter::{PointReadPlan, StorageAdapter, StorageSpace};
 
@@ -721,10 +795,12 @@ mod tests {
                         }
                         // Receipt contents are deliberately opaque here: the
                         // storage fence tests ownership presence, not codecs.
-                        storage
-                            .commit_write_set(seed, WriteOptions::default())
+                        let mut raw = storage
+                            .begin_migration_write(WriteOptions::default())
                             .await
                             .unwrap();
+                        seed.lower_into(&mut raw).await.unwrap();
+                        raw.commit().await.unwrap();
                         // Exercise the private role matrix without exposing a
                         // test-only constructor for the sync capability.
                         storage

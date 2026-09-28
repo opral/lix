@@ -208,6 +208,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::partial_bootstrap::stage_partial_bootstrap;
     use super::super::partial_state::stage_partial_replica_state;
     use super::*;
     use crate::{Memory, open_lix};
@@ -222,13 +223,16 @@ mod tests {
         )
         .unwrap();
         let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();
-        let condition = stage_partial_replica_state(&mut writes, &state, None).unwrap();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
         storage
             .commit_write_set(
                 writes,
                 StorageWriteOptions {
-                    preconditions: vec![condition],
+                    preconditions,
                     ..Default::default()
                 },
             )

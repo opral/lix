@@ -1,5 +1,6 @@
 use super::super::partial_state::stage_partial_replica_state;
 use super::*;
+use crate::storage::StorageWrite;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader, BlobManifestRequired};
 use crate::{Memory, open_lix};
 
@@ -15,16 +16,15 @@ async fn fixture() -> (StorageAdapter<Memory>, PartialReplicaState) {
     let storage = StorageAdapter::new(Memory::new());
     let mut writes = storage.new_write_set();
     let condition = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-    storage
-        .commit_write_set(
-            writes,
-            StorageWriteOptions {
-                preconditions: vec![condition],
-                ..Default::default()
-            },
-        )
+    let mut raw = storage
+        .begin_migration_write(StorageWriteOptions {
+            preconditions: vec![condition],
+            ..Default::default()
+        })
         .await
         .unwrap();
+    writes.lower_into(&mut raw).await.unwrap();
+    raw.commit().await.unwrap();
     (storage, state)
 }
 
@@ -148,17 +148,15 @@ async fn bad_hash_and_old_epoch_never_publish_blob_bytes() {
     .unwrap();
     let mut writes = storage.new_write_set();
     let condition = stage_partial_replica_state(&mut writes, &replacement, Some(raw)).unwrap();
-    storage
-        .commit_partial_replica_write_set(
-            super::super::partial_replica_write_capability(),
-            writes,
-            StorageWriteOptions {
-                preconditions: vec![condition],
-                ..Default::default()
-            },
-        )
+    let mut raw = storage
+        .begin_migration_write(StorageWriteOptions {
+            preconditions: vec![condition],
+            ..Default::default()
+        })
         .await
         .unwrap();
+    writes.lower_into(&mut raw).await.unwrap();
+    raw.commit().await.unwrap();
     assert_eq!(
         install_chunk(&storage, &state, ChunkHash::from_content(bytes), bytes)
             .await

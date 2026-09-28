@@ -483,8 +483,19 @@ async fn stage_exact_metadata(
 mod tests {
     use super::super::partial_state::stage_partial_replica_state;
     use super::*;
+    use crate::storage::StorageWrite;
     use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
     use crate::{Memory, open_lix};
+
+    async fn commit_raw_fixture(
+        storage: &StorageAdapter<Memory>,
+        writes: StorageWriteSet,
+        options: StorageWriteOptions,
+    ) {
+        let mut raw = storage.begin_migration_write(options).await.unwrap();
+        writes.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
+    }
 
     #[tokio::test]
     async fn direct_change_locator_is_resolved_without_a_physical_locator_row() {
@@ -560,16 +571,15 @@ mod tests {
         let adapter = StorageAdapter::new(Memory::new());
         let mut writes = adapter.new_write_set();
         let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![guard],
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        commit_raw_fixture(
+            &adapter,
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![guard],
+                ..Default::default()
+            },
+        )
+        .await;
         adapter.admit_partial_replica_writer(super::super::partial_replica_write_capability());
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let mut writes = adapter.new_write_set();
@@ -653,16 +663,15 @@ mod tests {
         let adapter = StorageAdapter::new(Memory::new());
         let mut writes = adapter.new_write_set();
         let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![guard],
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        commit_raw_fixture(
+            &adapter,
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![guard],
+                ..Default::default()
+            },
+        )
+        .await;
         // Test-only admission of the fixture's replica write lane. Production
         // admission remains the dedicated opener's responsibility.
         adapter.admit_partial_replica_writer(super::super::partial_replica_write_capability());
@@ -744,16 +753,15 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
         let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![guard],
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        commit_raw_fixture(
+            &storage,
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![guard],
+                ..Default::default()
+            },
+        )
+        .await;
         let address = &request.objects[0];
         let read = storage.begin_read(Default::default()).await.unwrap();
         assert!(

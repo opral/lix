@@ -1824,16 +1824,15 @@ mod tests {
         let admission =
             crate::sync::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap();
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![admission],
-                    ..Default::default()
-                },
-            )
+        let mut raw = storage
+            .begin_migration_write(StorageWriteOptions {
+                preconditions: vec![admission],
+                ..Default::default()
+            })
             .await
             .unwrap();
+        writes.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
         storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
         let bytes = b"chunk and manifest arrive together".to_vec();

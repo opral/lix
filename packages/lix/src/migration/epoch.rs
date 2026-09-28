@@ -1460,6 +1460,130 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
+/// Project the candidate's partial-serving records from source-owned
+/// coordinates. The record is derived metadata, so its exact bytes must be
+/// included in the preservation digest rather than omitted from comparison.
+async fn append_partial_serving_preservation<S>(
+    source_read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    target: &StorageAdapter<S>,
+    plan: &mut super::publish::PublicationPlan,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let Some((state, _, _)) = crate::sync::prepare_owned_partial_metadata_upgrade(source_read).await?
+    else {
+        return Err(epoch_error("partial migration lost its admission"));
+    };
+    let target_read = target.begin_read(ReadOptions::default()).await?;
+    let mut entries = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    for branch in [
+        &state.descriptor().selected_branch,
+        &state.descriptor().global_branch,
+    ] {
+        if !visited.insert(branch.branch_id.as_str()) {
+            continue;
+        }
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(source_read)
+            .load(&branch.branch_id)
+            .await?
+            .ok_or_else(|| epoch_error("partial migration source branch control is absent"))?;
+        let marker_key = Key(Bytes::from(crate::hot_state::hot_generation_scope_prefix(
+            &branch.branch_id,
+            control.tracked_generation,
+        )));
+        let marker = crate::storage_adapter::PointReadPlan::new(
+            crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+            std::slice::from_ref(&marker_key),
+        )
+        .materialize(source_read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+        let Some(ProjectedValue::FullValue(marker)) = marker else {
+            return Err(epoch_error("partial migration source root marker is absent"));
+        };
+        let root = uuid::Uuid::from_slice(&marker)
+            .map(crate::changelog::CommitId::from)
+            .map_err(|_| epoch_error("partial migration source root marker is malformed"))?;
+        let base = crate::changelog::CommitId::parse_lix(
+            &branch.head.commit_id,
+            "partial admitted base",
+        )?;
+        let admitted = root == base
+            && control.tracked_generation == state.serving_generation(&branch.branch_id)?;
+        let local_root_owned = if admitted {
+            false
+        } else {
+            crate::sync::partial_serving::local_root_is_owned(
+                source_read,
+                control.head_commit_id,
+                root,
+                base,
+            )
+            .await?
+        };
+        if !admitted && !local_root_owned {
+            return Err(epoch_error(
+                "partial migration source root is outside its admitted local interval",
+            ));
+        }
+        let expected = serde_json::json!({
+            "version": 1,
+            "epochId": state.epoch_id(),
+            "branchId": branch.branch_id,
+            "admittedBase": base.to_string(),
+            "head": control.head_commit_id.to_string(),
+            "generation": control.tracked_generation.to_string(),
+            "root": root.to_string(),
+            "localRootOwned": local_root_owned,
+        });
+
+        // An existing source witness must already describe these exact
+        // coordinates; migration may add a missing witness but never repair a
+        // conflicting one silently.
+        if let Some((_, source_bytes)) = crate::sync::partial_serving::load(
+            source_read,
+            &branch.branch_id,
+        )
+        .await?
+        {
+            let source_value: serde_json::Value = serde_json::from_slice(&source_bytes)
+                .map_err(|_| epoch_error("partial migration source witness is malformed"))?;
+            if source_value != expected {
+                return Err(epoch_error(
+                    "partial migration source witness disagrees with its coordinates",
+                ));
+            }
+        }
+        let Some((_, target_bytes)) = crate::sync::partial_serving::load(
+            &target_read,
+            &branch.branch_id,
+        )
+        .await?
+        else {
+            return Err(epoch_error("partial migration candidate witness is absent"));
+        };
+        let target_value: serde_json::Value = serde_json::from_slice(&target_bytes)
+            .map_err(|_| epoch_error("partial migration candidate witness is malformed"))?;
+        if target_value != expected {
+            return Err(epoch_error(
+                "partial migration candidate witness disagrees with source-derived coordinates",
+            ));
+        }
+        let branch_key = crate::storage_codec::id_string::uuid_bytes_from_canonical(
+            &branch.branch_id,
+        )
+        .ok_or_else(|| epoch_error("partial migration branch ID is malformed"))?;
+        entries.push((branch_key.to_vec(), target_bytes.to_vec()));
+    }
+    plan.put_mutable(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, entries)?;
+    Ok(())
+}
+
 /// Preservation checks run while the source is still the active rollback
 /// destination. Any failure rolls back the epoch claim before opening returns.
 async fn verify_migration_candidate<S>(
@@ -1519,6 +1643,19 @@ where
                         crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
                     )],
                 )?;
+            }
+            if partial {
+                append_partial_serving_preservation(
+                    &read,
+                    target,
+                    plan.get_or_insert_with(|| {
+                        super::publish::PublicationPlan::bounded(
+                            options.max_changes,
+                            options.max_preflight_bytes,
+                        )
+                    }),
+                )
+                .await?;
             }
             drop(read);
             if from_format <= 81 {
@@ -1670,15 +1807,12 @@ where
     {
         return Ok(());
     }
-    let legacy = StorageAdapter::new(storage.clone());
     for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
         .iter()
         .copied()
     {
-        legacy
-            .clear_space(
-                space,
-                WriteOptions {
+        let mut write = storage
+            .begin_write(WriteOptions {
                     await_durable: true,
                     preconditions: vec![Precondition::KeyValueEquals {
                         space: REPOSITORY_EPOCH_SPACE,
@@ -1686,10 +1820,20 @@ where
                         expected: active_pointer.clone(),
                     }],
                     ..WriteOptions::default()
+                })
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
                 },
             )
             .await
             .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
     }
     let mut write = storage
         .begin_write(WriteOptions {
