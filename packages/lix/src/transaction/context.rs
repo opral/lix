@@ -13388,6 +13388,16 @@ impl<R> FilesystemPathIndexReader for TransactionReadHotStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + Send + 'static,
 {
+    fn prefer_direct_exact_content(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_content(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_content(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_content(branch_ids, file_id);
+    }
+
     fn historical_cache(&self) -> Option<Arc<crate::filesystem::HistoricalPathIndexCache>> {
         Some(self.filesystem_path_index_cache.historical.clone())
     }

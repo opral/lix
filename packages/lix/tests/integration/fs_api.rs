@@ -542,9 +542,10 @@ fn direct_child_name(parent: &str, child: &str) -> Option<String> {
     Some(remainder.to_string())
 }
 
-/// A file point read must consume its answer plus ancestry, independently of
-/// unrelated repository size. Fresh engines prevent a warmed full index from
-/// making an unscoped implementation appear to have zero read work.
+/// Indexed file point reads must bound index work independently of repository
+/// size; direct content reads skip index-map construction. Fresh engines
+/// prevent a warmed full index from masking unscoped indexed work. Direct
+/// read scope is covered by the partial read-capture request-shape test.
 #[tokio::test(flavor = "current_thread")]
 async fn file_id_reads_bound_index_work_across_repository_sizes() {
     for files in [8, 400] {
@@ -592,10 +593,17 @@ async fn file_id_reads_bound_index_work_across_repository_sizes() {
                 );
             }
             let (builds, rows) = crate::filesystem::full_rebuild_stats();
-            assert!(
-                builds > 0,
-                "fresh point read must exercise the index builder: {sql}"
-            );
+            if sql == "SELECT content FROM lix_file WHERE id=$1" {
+                assert_eq!(
+                    builds, 0,
+                    "the direct content projection should skip index maps: {sql}"
+                );
+            } else {
+                assert!(
+                    builds > 0,
+                    "fresh indexed point read must exercise the index builder: {sql}"
+                );
+            }
             assert!(
                 rows <= 8,
                 "{files} files: answer + ancestry should bound work, examined {rows}: {sql}"

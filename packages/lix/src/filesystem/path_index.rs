@@ -330,6 +330,19 @@ impl Default for FilesystemPathIndex {
 
 impl FilesystemPathIndex {
     pub(crate) fn from_live_batch(rows: &MaterializedHotStateBatch) -> Result<Self, LixError> {
+        let (entries, file_count) = Self::entries_from_live_batch(rows)?;
+        Ok(Self::from_validated_entries(entries, file_count))
+    }
+
+    /// Run the exact path/ancestry validation used by the index builder
+    /// without constructing its five lookup maps for an identity-only read.
+    pub(crate) fn validate_live_batch(rows: &MaterializedHotStateBatch) -> Result<(), LixError> {
+        Self::entries_from_live_batch(rows).map(|_| ())
+    }
+
+    fn entries_from_live_batch(
+        rows: &MaterializedHotStateBatch,
+    ) -> Result<(Vec<FilesystemPathEntry>, usize), LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectoryRecord>::new();
         let mut file_rows = Vec::<(FilesystemDescriptorKey, FileRecord)>::new();
         let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, MaterializedHotStateRow>::new();
@@ -513,6 +526,10 @@ impl FilesystemPathIndex {
             });
         }
 
+        Ok((entries, file_count))
+    }
+
+    fn from_validated_entries(entries: Vec<FilesystemPathEntry>, file_count: usize) -> Self {
         let entries = entries.into_iter().map(Arc::new).collect::<Vec<_>>();
         let mut entries_by_path = entries
             .iter()
@@ -552,7 +569,7 @@ impl FilesystemPathIndex {
         children_by_parent.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let directory_count = entries.len().saturating_sub(file_count);
         let estimated_heap_bytes = estimated_index_heap_bytes(&entries);
-        Ok(Self {
+        Self {
             entries_by_path: PersistentMap::from_sorted(entries_by_path),
             entries_by_identity: PersistentMap::from_sorted(entries_by_identity),
             files_by_id: PersistentMap::from_sorted(files_by_id),
@@ -562,7 +579,7 @@ impl FilesystemPathIndex {
             directory_count,
             estimated_heap_bytes,
             generation: None,
-        })
+        }
     }
 
     pub(crate) fn exact_entries(&self, path: &str) -> Vec<Arc<FilesystemPathEntry>> {
@@ -1282,6 +1299,14 @@ pub(crate) trait FilesystemPathIndexReader: Send + Sync {
         None
     }
 
+    /// A performance hint only: either answer still resolves through the
+    /// authoritative live rows for the requested file identity.
+    fn prefer_direct_exact_content(&self, _branch_ids: &[String], _file_id: &str) -> bool {
+        false
+    }
+
+    fn record_direct_exact_content(&self, _branch_ids: &[String], _file_id: &str) {}
+
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,
@@ -1445,14 +1470,76 @@ struct CachedIndex {
 #[derive(Debug, Default)]
 pub(crate) struct FilesystemPathIndexCache {
     entries: Mutex<Vec<CachedIndex>>,
+    exact_content_reuse: Mutex<VecDeque<((Vec<String>, String), u8)>>,
     pub(crate) historical: Arc<HistoricalPathIndexCache>,
 }
 
 impl FilesystemPathIndexCache {
+    /// Admit one-off IDs to the direct row route. Repeated IDs benefit from
+    /// the path index's small-blob cache after two successful direct reads.
+    /// Bounded LRU state cannot affect results; eviction merely gives an ID
+    /// another direct try.
+    pub(crate) fn prefer_direct_exact_content(
+        &self,
+        branch_ids: &[String],
+        file_id: &str,
+    ) -> bool {
+        let branch_ids = FilesystemPathIndexRequest::new(branch_ids.to_vec()).branch_ids;
+        // The pathful request uses an exact one-ID scope. Only an index with
+        // that same scope can be reused by its revision-checked cache lookup.
+        let cached_route = self
+            .entries
+            .lock()
+            .expect("filesystem path cache lock poisoned")
+            .iter()
+            .filter(|entry| {
+                entry.key.branch_ids == branch_ids
+                    && entry.key.include_blob_refs
+                    && entry.key.cache_small_blob_data
+                    && matches!(&entry.key.scope, FilesystemPathIndexScope::FileIds(ids)
+                        if ids.len() == 1 && ids[0] == file_id)
+            })
+            .any(|_| true);
+        if cached_route {
+            return false;
+        }
+        let hints = self
+            .exact_content_reuse
+            .lock()
+            .expect("exact content reuse hints poisoned");
+        hints
+            .iter()
+            .find(|(candidate, _)| candidate.0 == branch_ids && candidate.1 == file_id)
+            .is_none_or(|(_, count)| *count < 2)
+    }
+
+    pub(crate) fn record_direct_exact_content(&self, branch_ids: &[String], file_id: &str) {
+        const MAX_HINTS: usize = 256;
+        let branch_ids = FilesystemPathIndexRequest::new(branch_ids.to_vec()).branch_ids;
+        let mut hints = self
+            .exact_content_reuse
+            .lock()
+            .expect("exact content reuse hints poisoned");
+        let key = (branch_ids, file_id.to_owned());
+        let count = hints
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+            .and_then(|position| hints.remove(position))
+            .map_or(0, |(_, count)| count);
+        hints.push_back((key, count.saturating_add(1)));
+        if hints.len() > MAX_HINTS {
+            hints.pop_front();
+        }
+    }
+
     /// Evicts transaction-local cached views after restoring an earlier staged
     /// write checkpoint. Rebuilding from the restored overlay is cheaper and
     /// safer than cloning potentially large path indexes for an error path.
     pub(crate) fn clear(&self) {
+        self.exact_content_reuse
+            .lock()
+            .expect("exact content reuse hints poisoned")
+            .clear();
         self.historical
             .entries
             .lock()
@@ -1899,6 +1986,59 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::hot_state::MaterializedHotStateBatchBuilder;
     use crate::row_pk::RowPk;
+
+    #[test]
+    fn exact_content_direct_route_promotes_reused_ids_and_respects_existing_cache() {
+        let cache = FilesystemPathIndexCache::default();
+        let branch = vec!["branch".to_owned()];
+        let id = "01920000-0000-7000-8000-0000000000f1";
+        assert!(cache.prefer_direct_exact_content(&branch, id));
+        cache.record_direct_exact_content(&branch, id);
+        assert!(cache.prefer_direct_exact_content(&branch, id));
+        cache.record_direct_exact_content(&branch, id);
+        assert!(!cache.prefer_direct_exact_content(&branch, id));
+        assert!(cache.prefer_direct_exact_content(&branch, "other"));
+
+        let request = FilesystemPathIndexRequest::new(branch.clone())
+            .with_file_ids(Some(vec!["other".to_owned()]))
+            .with_cached_blob_data(true);
+        let empty = Arc::new(path_index_from_rows(vec![]).unwrap());
+        cache.insert(&request, None, empty);
+        assert!(!cache.prefer_direct_exact_content(&branch, "other"));
+        cache.clear();
+        assert!(cache.prefer_direct_exact_content(&branch, id));
+
+        let request = FilesystemPathIndexRequest::new(branch.clone())
+            .with_file_ids(Some(vec![id.to_owned()]))
+            .with_cached_blob_data(true);
+        let rows = vec![
+            file_row(id, None, "note.txt", &branch[0], false),
+            blob_row(id, &BlobId::from_content(b"bytes").to_hex(), &branch[0]),
+        ];
+        let mut index = path_index_from_rows(rows).unwrap();
+        let broad = FilesystemPathIndexRequest::new(branch.clone()).with_cached_blob_data(true);
+        cache.insert(&broad, None, Arc::new(index.clone()));
+        assert!(cache.prefer_direct_exact_content(&branch, id));
+        let multi = FilesystemPathIndexRequest::new(branch.clone())
+            .with_file_ids(Some(vec![id.to_owned(), "other".to_owned()]))
+            .with_cached_blob_data(true);
+        cache.insert(&multi, None, Arc::new(index.clone()));
+        assert!(cache.prefer_direct_exact_content(&branch, id));
+        cache.insert(&request, None, Arc::new(index.clone()));
+        assert!(!cache.prefer_direct_exact_content(&branch, id));
+        let mut cached = (*index.exact_file_id_entries(id)[0]).clone();
+        cached.cached_blob_data = Some(vec![1u8].into());
+        index.insert_entry(Arc::new(cached));
+        cache.insert(&request, Some(&[1]), Arc::new(index));
+        assert!(!cache.prefer_direct_exact_content(&branch, id));
+        cache.clear();
+        let blobless = path_index_from_rows(vec![file_row(
+            id, None, "note.txt", &branch[0], false,
+        )])
+        .unwrap();
+        cache.insert(&request, None, Arc::new(blobless));
+        assert!(!cache.prefer_direct_exact_content(&branch, id));
+    }
 
     fn path_index_from_rows(
         rows: Vec<MaterializedHotStateRow>,

@@ -583,7 +583,7 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
     );
 }
 
-async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
+pub(super) async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
     engine: &Engine<S>,
     old: &PartialReplicaState,
     next: Arc<PartialReplicaState>,

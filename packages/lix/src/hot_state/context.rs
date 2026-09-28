@@ -2226,6 +2226,16 @@ impl<S> FilesystemPathIndexReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead + Send + Sync,
 {
+    fn prefer_direct_exact_content(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_content(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_content(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_content(branch_ids, file_id);
+    }
+
     fn historical_cache(
         &self,
     ) -> Option<std::sync::Arc<crate::filesystem::HistoricalPathIndexCache>> {

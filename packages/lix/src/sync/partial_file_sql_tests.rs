@@ -99,6 +99,109 @@ fn content(result: ExecuteResult) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
+    use std::sync::Arc;
+
+    let id = "01920000-0000-7000-8000-0000000000f1";
+    let bytes = b"pathless candidate bytes".to_vec();
+    let authority = open_lix().await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_file (id,path,content) VALUES ($1,$2,$3)",
+            &[
+                Value::Text(id.to_owned()),
+                Value::Text("/before.bin".to_owned()),
+                Value::Blob(bytes.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let (authority, engine, session, old) = publication::fixture_from_authority(authority, None).await;
+    let storage = engine.storage();
+    let sql = "SELECT content FROM lix_file WHERE id = $1";
+    let params = [Value::Text(id.to_owned())];
+    assert_eq!(
+        content(
+            execute_file_hydrating(
+                &session,
+                &storage,
+                &old,
+                &authority,
+                sql,
+                &params,
+                &mut FileFetches::default(),
+            )
+            .await
+            .unwrap()
+        ),
+        bytes
+    );
+    let interests = engine
+        .sync_mode()
+        .read_interests()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(interests.interests.iter().any(|interest| matches!(
+        interest.as_ref(),
+        crate::hot_state::LogicalReadInterest::FileContent {
+            file_ids: Some(file_ids), indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::All, ..
+        } if file_ids == &[id.to_owned()]
+    )));
+    assert!(interests.interests.iter().any(|interest| matches!(
+        interest.as_ref(),
+        crate::hot_state::LogicalReadInterest::Scan { request, .. }
+            if request.filter.schema_keys == vec![
+                "lix_binary_blob_ref".to_owned(),
+                "lix_file_descriptor".to_owned(),
+            ] && request.filter.file_ids == vec![crate::NullableKeyFilter::Value(id.to_owned())]
+    )), "direct exact-ID route must capture its narrowed live-row demand");
+
+    authority
+        .execute(
+            "UPDATE lix_file SET path = '/after.bin' WHERE id = $1",
+            &params,
+        )
+        .await
+        .unwrap();
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = publication::prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    crate::sync::partial_publication::publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    execute_file_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        sql,
+        &params,
+        &mut FileFetches::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(content(session.execute(sql, &params).await.unwrap()), bytes);
+    assert_eq!(
+        session.execute("SELECT path FROM lix_file WHERE id = $1", &params)
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("path")
+            .unwrap(),
+        "/after.bin"
+    );
+}
+
+#[tokio::test]
 #[ignore = "manual descriptor-only file SQL partial replica gate"]
 async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
     for width in [16usize, 1600] {

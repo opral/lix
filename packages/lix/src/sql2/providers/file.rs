@@ -45,8 +45,8 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
-    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
-    FilesystemPathSelection,
+    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    FilesystemPathKind, FilesystemPathSelection, read_path_index_rows,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::MaterializedHotStateRow;
@@ -652,6 +652,146 @@ fn exact_lix_file_path_index_request(
         .with_cached_blob_data(column == ExactLixFileReadColumn::Content)
 }
 
+/// Resolve a single ordinary blob-backed content projection from the file's
+/// identity rows. The caller retains the pathful route for ambiguous lanes,
+/// plugin rendering, and session file-view acknowledgments.
+async fn try_exact_file_content_with_bounded_path_validation(
+    hot_state: &Arc<dyn HotStateReader>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_host: &PluginRuntimeHost,
+    request: &HotStateScanRequest,
+    schema: &SchemaRef,
+    file_id: &str,
+    acknowledge_file_views: bool,
+) -> Result<Option<SqlQueryResult>, LixError> {
+    if file_id_row_pk(file_id).is_err() {
+        return Ok(None);
+    }
+    let rows = read_path_index_rows(
+        hot_state.as_ref(),
+        &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+            .with_file_ids(Some(vec![file_id.to_owned()]))
+            .with_blob_refs(true),
+    )
+    .await?;
+    // Path is not projected, but malformed ancestry must have the same error
+    // on the first direct read and after the adaptive index cache is warm.
+    crate::filesystem::FilesystemPathIndex::validate_live_batch(&rows)?;
+    let mut owners = HotStateBatchOwners::default();
+    let batch = owners.push(rows);
+    let mut descriptor = None;
+    let mut blob = None;
+    for index in 0..owners.batch(batch).len() {
+        let handle = hot_state_row_handle(batch, index);
+        let row = owners.row(handle);
+        if row.deleted() {
+            return Ok(None);
+        }
+        match row.schema_key() {
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let Some(snapshot) = file_descriptor_snapshot_from_live_row(row)? else {
+                    return Ok(None);
+                };
+                if snapshot.id != file_id || descriptor.is_some() {
+                    return Ok(None);
+                }
+                descriptor = Some(FileDescriptorRecord {
+                    key: FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                        row,
+                        snapshot.id.clone(),
+                    ),
+                    id: snapshot.id,
+                    directory_id: snapshot.directory_id,
+                    name: snapshot.name,
+                    live: handle,
+                });
+            }
+            BLOB_REF_SCHEMA_KEY => {
+                if blob.is_some() {
+                    return Ok(None);
+                }
+                blob = blob_ref_record_from_live_row(row, handle)?;
+            }
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {}
+            _ => return Ok(None),
+        }
+    }
+    let Some(descriptor) = descriptor else {
+        return exact_content_query_result(schema, None).map(Some);
+    };
+    let Some((blob_key, blob)) = blob else {
+        return Ok(None);
+    };
+    if descriptor.blob_ref_key(&owners) != blob_key {
+        return Ok(None);
+    }
+    if acknowledge_file_views && plugin_descriptor_key_can_have_durable_owner(&descriptor.key) {
+        if !load_plugin_render_branches(Arc::clone(hot_state), request, plugin_host, None)
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        // An uninstalled plugin can leave a durable owner behind. The
+        // pathful renderer reports that state as unavailable, so it must
+        // handle any owner even when the current registry is empty.
+        let owners = hot_state
+            .load_exact_batch(&HotStateExactBatchRequest {
+                rows: vec![HotStateExactRowRequest {
+                    schema_key: "lix_key_value".to_owned(),
+                    branch_id: descriptor.key.branch_id().to_owned(),
+                    row_pk: RowPk::single(PLUGIN_OWNER_KEY),
+                    file_id: Some(file_id.to_owned()),
+                }],
+                projection: plugin_control_hot_state_projection(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?;
+        if owners.row(0).is_some_and(|owner| {
+            owner.schema_key() == "lix_key_value"
+                && owner.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && owner.branch_id() == descriptor.key.branch_id()
+                && owner.file_id() == Some(file_id)
+                && !owner.global()
+                && !owner.untracked()
+        }) {
+            return Ok(None);
+        }
+    }
+    let hash = BlobId::from_hex(&blob.blob_hash)?;
+    blob_reader.require_referenced_manifests(&[hash]).await?;
+    let mut data = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
+    if data.len() != 1 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("blob reader returned {} values for 1 requested hashes", data.len()),
+        ));
+    }
+    let data = data.pop().flatten().unwrap_or_default();
+    exact_content_query_result(schema, Some(data.as_slice())).map(Some)
+}
+
+fn exact_content_query_result(
+    schema: &SchemaRef,
+    data: Option<&[u8]>,
+) -> Result<SqlQueryResult, LixError> {
+    let values = data.map_or_else(Vec::new, |bytes| vec![Some(bytes)]);
+    let batch = RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![Arc::new(LargeBinaryArray::from(values))],
+    )
+    .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
+    crate::sql2::exec::datafusion::query_result_from_batches(
+        &schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        &[batch],
+    )
+}
+
 /// Executes the narrow active-branch point-read shape without constructing a
 /// DataFusion catalog and plan. Row selection, branch visibility, blob
 /// loading and plugin rendering stay on the regular `lix_file` provider
@@ -729,6 +869,25 @@ pub(crate) async fn execute_exact_lix_file_read(
             false,
             &path,
         )?;
+    }
+    if column == ExactLixFileReadColumn::Content
+        && let ExactLixFileReadSelector::Id(file_id) = selector
+        && filesystem_path_index
+            .prefer_direct_exact_content(&request.filter.branch_ids, file_id)
+        && let Some(result) = try_exact_file_content_with_bounded_path_validation(
+            &hot_state,
+            &blob_reader,
+            &plugin_host,
+            &request,
+            &schema,
+            file_id,
+            session_file_views.is_some(),
+        )
+        .await?
+    {
+        filesystem_path_index
+            .record_direct_exact_content(&request.filter.branch_ids, file_id);
+        return Ok(result);
     }
     let index = filesystem_path_index
         .path_index(&exact_lix_file_path_index_request(
@@ -9145,6 +9304,33 @@ mod tests {
         rows: Vec<MaterializedHotStateRow>,
     }
 
+    struct ExactContentHotStateReader {
+        rows: Vec<MaterializedHotStateRow>,
+    }
+
+    #[async_trait]
+    impl HotStateReader for ExactContentHotStateReader {
+        async fn scan_batch(
+            &self,
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            typed_fixture_batch(self.rows.iter().filter(|row| {
+                request.filter.schema_keys.contains(&row.schema_key)
+                    && request.filter.branch_ids.iter().any(|branch| branch == row.branch_id.as_ref())
+                    && request.filter.file_ids.iter().any(|filter| matches!(filter,
+                        NullableKeyFilter::Value(id) if row.file_id.as_deref() == Some(id.as_str())
+                    ))
+            }).cloned())
+        }
+
+        async fn load_exact_batch(
+            &self,
+            request: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            typed_fixture_exact_batch(&self.rows, request)
+        }
+    }
+
     struct RejectingHotStateReader {
         scan_count: Arc<AtomicUsize>,
     }
@@ -10496,6 +10682,98 @@ mod tests {
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
+    }
+
+    #[tokio::test]
+    async fn direct_content_only_skips_plugin_resolution_when_owner_is_absent() {
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let id = "01920000-0000-7000-8000-000000000472";
+        let bytes = b"ordinary file bytes".to_vec();
+        let hash = BlobId::from_content(&bytes);
+        let rows = vec![
+            live_file_row(
+                id,
+                branch,
+                &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#),
+            ),
+            live_blob_ref_row(id, branch, id, &hash.to_hex(), bytes.len()),
+        ];
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                branch_ids: vec![branch.to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let schema = Arc::new(Schema::new(vec![
+            super::lix_file_schema()
+                .field_with_name("content")
+                .unwrap()
+                .clone(),
+        ]));
+        let blob_reader = Arc::new(StaticBlobReader::from_blobs([bytes])) as Arc<dyn BlobDataReader>;
+        let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
+        let ordinary = Arc::new(ExactContentHotStateReader { rows: rows.clone() })
+            as Arc<dyn HotStateReader>;
+        let direct = super::try_exact_file_content_with_bounded_path_validation(
+            &ordinary, &blob_reader, &host, &request, &schema, id, true,
+        ).await.unwrap().expect("ordinary content takes direct route");
+        assert_eq!(direct.rows, vec![vec![Value::Blob(b"ordinary file bytes".to_vec().into())]]);
+
+        let mut owned_rows = rows;
+        owned_rows.push(live_plugin_owner_row(
+            branch,
+            id,
+            "uninstalled_plugin",
+            vec!["plugin_note".to_owned()],
+        ));
+        let stale_owner = Arc::new(ExactContentHotStateReader { rows: owned_rows })
+            as Arc<dyn HotStateReader>;
+        assert!(super::try_exact_file_content_with_bounded_path_validation(
+            &stale_owner, &blob_reader, &host, &request, &schema, id, true,
+        ).await.unwrap().is_none(), "stale owner must reach pathful unavailable error");
+        let raw = super::try_exact_file_content_with_bounded_path_validation(
+            &stale_owner, &blob_reader, &host, &request, &schema, id, false,
+        ).await.unwrap().expect("without a view collector the blob-backed route returns raw content");
+        assert_eq!(raw.rows, direct.rows);
+
+        let missing = Arc::new(ExactContentHotStateReader { rows: Vec::new() })
+            as Arc<dyn HotStateReader>;
+        let empty = super::try_exact_file_content_with_bounded_path_validation(
+            &missing, &blob_reader, &host, &request, &schema, id, true,
+        ).await.unwrap().expect("an authoritative exact-ID miss has no fallback work");
+        assert!(empty.rows.is_empty());
+
+        let other_branch = "01920000-0000-7000-8000-0000000000b2";
+        let ambiguous = Arc::new(ExactContentHotStateReader {
+            rows: vec![
+                live_file_row(id, branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
+                live_file_row(id, other_branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_blob_ref_row(id, other_branch, id, &hash.to_hex(), 19),
+            ],
+        }) as Arc<dyn HotStateReader>;
+        let mut both_branches = request.clone();
+        both_branches.filter.branch_ids.push(other_branch.to_owned());
+        assert!(super::try_exact_file_content_with_bounded_path_validation(
+            &ambiguous, &blob_reader, &host, &both_branches, &schema, id, true,
+        ).await.unwrap().is_none(), "ambiguous file lanes retain indexed winner selection");
+
+        let missing_directory = "01920000-0000-7000-8000-000000000999";
+        let broken = Arc::new(ExactContentHotStateReader {
+            rows: vec![
+                live_file_row(
+                    id,
+                    branch,
+                    &format!(r#"{{"id":"{id}","directory_id":"{missing_directory}","name":"note.txt"}}"#),
+                ),
+                live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
+            ],
+        }) as Arc<dyn HotStateReader>;
+        let error = super::try_exact_file_content_with_bounded_path_validation(
+            &broken, &blob_reader, &host, &request, &schema, id, true,
+        ).await.unwrap_err();
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
