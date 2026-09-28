@@ -90,6 +90,10 @@ pub(crate) struct SqlReadProfile {
     /// Typed snapshots serialized to derived JSON `snapshot_content` during this read.
     #[cfg(test)]
     pub(crate) derived_snapshot_content_rows: u64,
+    /// Root-backed file-diff candidates carried from the local tree instead
+    /// of reloading both endpoint payloads.
+    #[cfg(test)]
+    pub(crate) file_local_diff_rows_reused: u64,
 }
 
 #[cfg(feature = "storage-benches")]
@@ -209,6 +213,16 @@ pub(crate) fn record_derived_snapshot_content_rows(rows: usize) {
         let mut profile = profile.borrow_mut();
         profile.derived_snapshot_content_rows = profile
             .derived_snapshot_content_rows
+            .saturating_add(rows as u64);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_file_local_diff_rows_reused(rows: usize) {
+    let _ = ACTIVE_PROFILE.try_with(|profile| {
+        let mut profile = profile.borrow_mut();
+        profile.file_local_diff_rows_reused = profile
+            .file_local_diff_rows_reused
             .saturating_add(rows as u64);
     });
 }
