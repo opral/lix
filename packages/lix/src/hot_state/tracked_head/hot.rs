@@ -14582,11 +14582,13 @@ mod tests {
             deleted: false,
             created_at: timestamp(),
             updated_at: timestamp(),
+            semantic_fingerprint: None,
         };
         let local_delta = crate::tracked_state::TrackedStateDeltaRef {
             file_id: Some(FILE_A),
             change_id: ChangeId::for_test_label("packed-alias-scope-local-row"),
             commit_id: owner,
+            semantic_fingerprint: None,
             ..source_delta
         };
         let packed_delta = |delta, snapshot| crate::tracked_state::TrackedStateCommitDeltaRef {

@@ -3808,6 +3808,7 @@ mod tests {
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
+                semantic_fingerprint: None,
             },
             metadata: None,
             snapshot: vec![1],
@@ -3874,6 +3875,7 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    semantic_fingerprint: None,
                 }],
             )
             .await
@@ -6386,6 +6388,7 @@ mod tests {
                     deleted: change.snapshot.is_none(),
                     created_at: change.created_at,
                     updated_at: change.created_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: change.metadata.as_ref(),
                 snapshot: change.snapshot.as_deref(),

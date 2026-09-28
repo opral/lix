@@ -31,6 +31,7 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
 }
 
 pub(crate) async fn rebuild_commit_root_at<S>(
@@ -472,6 +473,7 @@ where
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
+            semantic_fingerprint: value.semantic_fingerprint,
         })
         .collect();
 
@@ -515,6 +517,7 @@ where
             deleted: delta.deleted,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
+            semantic_fingerprint: delta.semantic_fingerprint,
         })
         .collect::<Vec<_>>();
     let commit_id = plan.commit_id.to_string();
@@ -623,6 +626,11 @@ where
                 deleted: replacement.is_some() || self.source.deleted,
                 created_at: self.created_at,
                 updated_at: replacement.map_or(self.source.updated_at, |value| value.updated_at),
+                semantic_fingerprint: if replacement.is_some() || self.source.deleted {
+                    None
+                } else {
+                    self.source.semantic_fingerprint
+                },
             }
         }
     }
@@ -747,6 +755,7 @@ mod tests {
             deleted,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(created_millis),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(updated_millis),
+            semantic_fingerprint: None,
         }
     }
 
@@ -889,6 +898,7 @@ mod tests {
                         deleted: child_delta.deleted,
                         created_at: child_delta.created_at,
                         updated_at: child_delta.updated_at,
+                        semantic_fingerprint: child_delta.semantic_fingerprint,
                     }],
                 )
                 .await

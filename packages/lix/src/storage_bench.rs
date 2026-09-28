@@ -2036,6 +2036,7 @@ where
                     deleted: false,
                     created_at,
                     updated_at: created_at,
+                    semantic_fingerprint: None,
                 },
                 snapshot: Some(snapshot.as_ref()),
                 metadata: None,

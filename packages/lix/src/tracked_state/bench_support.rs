@@ -180,6 +180,7 @@ where
                 deleted: false,
                 created_at,
                 updated_at,
+                semantic_fingerprint: None,
             },
             snapshot: Some(b"typed-bench-row"),
             metadata: None,
@@ -235,6 +236,7 @@ where
                 deleted: false,
                 created_at,
                 updated_at,
+                semantic_fingerprint: None,
             },
             snapshot: Some(b"typed-bench-row"),
             metadata: None,
@@ -313,6 +315,7 @@ where
                 deleted: false,
                 created_at,
                 updated_at,
+                semantic_fingerprint: None,
             },
             snapshot: Some(b"typed-bench-row"),
             metadata: None,
@@ -1123,6 +1126,7 @@ impl PackedHistoryDelta {
                 deleted: self.deleted,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
+                semantic_fingerprint: None,
             },
             snapshot: self.snapshot.as_deref(),
             metadata: None,
@@ -1583,6 +1587,7 @@ impl OwnedDelta {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            semantic_fingerprint: None,
         }
     }
 }

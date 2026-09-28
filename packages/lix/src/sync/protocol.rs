@@ -173,6 +173,10 @@ pub struct SyncSnapshotRow {
     pub snapshot: Option<serde_json::Value>,
     pub snapshot_payload: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// Self-verifying canonical typed-row and metadata digest exported with a
+    /// live snapshot. The tracked-state root stores identity only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_fingerprint: Option<String>,
     pub change_id: String,
     pub commit_id: String,
     pub created_at: String,

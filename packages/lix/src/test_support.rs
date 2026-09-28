@@ -259,6 +259,54 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
     rows: &[MaterializedTrackedStateRow],
     certified_replacement_markers: &BTreeSet<TrackedStateKey>,
 ) -> Result<(), crate::LixError> {
+    stage_tracked_root_from_materialized_inner(
+        read,
+        writes,
+        tracked_state,
+        commit_id,
+        parent_commit_id,
+        rows,
+        certified_replacement_markers,
+        false,
+    )
+    .await
+}
+
+/// Stages a production-shaped authored root and commit-delta pair carrying
+/// publication-verified semantic fingerprints. Kept separate from the
+/// default fixtures so legacy and incomplete-proof paths remain directly
+/// testable.
+pub(crate) async fn stage_tracked_root_from_materialized_with_semantic_fingerprints(
+    read: &mut (impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    tracked_state: &TrackedStateContext,
+    commit_id: &str,
+    parent_commit_id: Option<&str>,
+    rows: &[MaterializedTrackedStateRow],
+) -> Result<(), crate::LixError> {
+    stage_tracked_root_from_materialized_inner(
+        read,
+        writes,
+        tracked_state,
+        commit_id,
+        parent_commit_id,
+        rows,
+        &BTreeSet::new(),
+        true,
+    )
+    .await
+}
+
+async fn stage_tracked_root_from_materialized_inner(
+    read: &mut (impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    tracked_state: &TrackedStateContext,
+    commit_id: &str,
+    parent_commit_id: Option<&str>,
+    rows: &[MaterializedTrackedStateRow],
+    certified_replacement_markers: &BTreeSet<TrackedStateKey>,
+    fingerprint_authored_payloads: bool,
+) -> Result<(), crate::LixError> {
     let commit_id = test_commit_id(commit_id);
     let commit_id_text = commit_id.to_string();
     let parent_commit_id_text = parent_commit_id.map(|parent| test_commit_id(parent).to_string());
@@ -276,10 +324,20 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
     let root_deltas = staged
         .change_commit_ids
         .iter()
-        .map(|(row_index, _)| {
+        .map(|(row_index, _)| -> Result<_, crate::LixError> {
             let change = &changes[*row_index];
             let row = &rows[*row_index];
-            TrackedStateDeltaRef {
+            let semantic_fingerprint = if fingerprint_authored_payloads {
+                crate::tracked_state::tracked_payload_semantic_fingerprint(
+                    &change.schema_key,
+                    &change.row_pk,
+                    change.snapshot.as_deref(),
+                    change.metadata.as_ref(),
+                )?
+            } else {
+                None
+            };
+            Ok(TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
                 row_pk: &change.row_pk,
@@ -294,9 +352,10 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
                     "updated_at",
                     &row.updated_at,
                 ),
-            }
+                semantic_fingerprint,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     // Production stages the packed replay index for every tracked commit,
     // including commits that also receive a durable root. Keep rooted test
     // fixtures faithful to that invariant so deleting a root exercises the
@@ -390,6 +449,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                     "updated_at",
                     &row.updated_at,
                 ),
+                semantic_fingerprint: None,
             }
         })
         .collect::<Vec<_>>();
@@ -467,6 +527,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                     "updated_at",
                     &row.updated_at,
                 ),
+                semantic_fingerprint: None,
             }
         })
         .collect::<Vec<_>>();
@@ -661,6 +722,7 @@ async fn stage_test_identity_catalog(
                 deleted: false,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
+                semantic_fingerprint: None,
             },
         );
     }

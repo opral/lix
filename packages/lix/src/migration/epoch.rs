@@ -56,13 +56,14 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         80 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80),
         81 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81),
         82 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82),
+        83 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, 82, crate::init::CURRENT_FORMAT_VERSION]
+    [79, 80, 81, 82, 83, crate::init::CURRENT_FORMAT_VERSION]
         .into_iter()
         .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
@@ -1468,7 +1469,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | 82 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | 83 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1522,7 +1523,7 @@ where
                 });
                 Box::pin(super::hot_indexes::append_plan(source, options, plan)).await?;
             }
-            if from_format < crate::init::CURRENT_FORMAT_VERSION {
+            if from_format <= 82 {
                 let plan = plan.get_or_insert_with(|| {
                     super::publish::PublicationPlan::bounded(
                         options.max_changes,
@@ -1753,8 +1754,11 @@ where
     if from_format <= 81 {
         super::hot_indexes::migrate(target, options, true).await?;
     }
-    if from_format < crate::init::CURRENT_FORMAT_VERSION {
+    if from_format <= 82 {
         super::first_parent_checkpoints::migrate(target, options, true).await?;
+    }
+    if from_format <= 83 {
+        super::semantic_fingerprint_format::migrate(target, true).await?;
     }
     crate::sync::upgrade_owned_partial_receipt(target).await?;
     let state = crate::handle::retry_expired_read(|| async {
@@ -4414,6 +4418,8 @@ where
                 (81, false) => crate::init::REPOSITORY_PROTOCOL_V81,
                 (82, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
                 (82, false) => crate::init::REPOSITORY_PROTOCOL_V82,
+                (83, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
+                (83, false) => crate::init::REPOSITORY_PROTOCOL_V83,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

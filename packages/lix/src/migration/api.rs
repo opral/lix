@@ -92,7 +92,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -216,10 +216,15 @@ where
     if from_version <= 81 {
         migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
     }
-    migration_step(|| {
-        super::first_parent_checkpoints::migrate(&adapter, options, false)
-    })
-    .await?;
+    if from_version <= 82 {
+        migration_step(|| {
+            super::first_parent_checkpoints::migrate(&adapter, options, false)
+        })
+        .await?;
+    }
+    if from_version <= 83 {
+        migration_step(|| super::semantic_fingerprint_format::migrate(&adapter, false)).await?;
+    }
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
     }
@@ -693,7 +698,8 @@ where
                 .map_err(|error| migration_error(format!("repair created_at: {error}")))?,
             updated_at: crate::common::LixTimestamp::parse(&row.updated_at)
                 .map_err(|error| migration_error(format!("repair updated_at: {error}")))?,
-        })
+                semantic_fingerprint: None,
+            })
     }
 
     fn push_missing_directories(

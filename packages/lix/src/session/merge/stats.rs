@@ -196,6 +196,7 @@ mod tests {
                         updated_at: timestamp,
                         change_id,
                         commit_id,
+                        semantic_fingerprint: None,
                     };
                     TrackedStateDiffEntry {
                         identity: identity.clone(),

@@ -2304,6 +2304,7 @@ fn cascade_parent_entry(
         deleted: true,
         created_at: parent_value.created_at(),
         updated_at: cascade.updated_at,
+        semantic_fingerprint: None,
     })
     .into();
     Ok((entry, true))
@@ -2466,6 +2467,7 @@ impl<'a> OrderedTreeAssembler<'a> {
                 deleted: mutation.delta.deleted,
                 created_at,
                 updated_at: mutation.delta.updated_at,
+                semantic_fingerprint: None,
             },
         );
         let value_end = self.current_leaf.value_arena.len();
@@ -3247,6 +3249,7 @@ pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
+                semantic_fingerprint: None,
             })),
         }]
     };
@@ -6281,6 +6284,7 @@ mod tests {
                 "updated_at",
                 "2026-01-01T00:00:00Z",
             ),
+            semantic_fingerprint: None,
         }
     }
 }

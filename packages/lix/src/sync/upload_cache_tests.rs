@@ -455,6 +455,7 @@ async fn checkpoint_source_certificate_rejects_modified_lifetime_and_rootless_va
                 deleted: row.deleted(),
                 created_at: row.updated_at(),
                 updated_at: row.updated_at(),
+                semantic_fingerprint: None,
             }),
         )
         .await

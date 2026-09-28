@@ -1606,6 +1606,12 @@ fn tracked_delta_from_state_row(
         deleted: row.snapshot.is_none(),
         created_at,
         updated_at: row.updated_at,
+        semantic_fingerprint: crate::tracked_state::tracked_payload_semantic_fingerprint(
+            row.schema_key,
+            row.row_pk,
+            row.snapshot,
+            row.metadata,
+        )?,
     })
 }
 
@@ -1635,6 +1641,7 @@ fn tracked_delta_from_selected_change_ref(
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
+        semantic_fingerprint: None,
     })
 }
 
@@ -1665,6 +1672,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             deleted: change_ref.deleted,
             created_at: change_ref.created_at,
             updated_at: change_ref.updated_at,
+            semantic_fingerprint: None,
         },
         metadata: record.and_then(|record| record.metadata.as_ref()),
         snapshot: record.and_then(|record| record.snapshot.as_deref()),
@@ -2346,6 +2354,7 @@ fn materialize_staged_sync_commits(
                 snapshot_json: snapshot_json.as_deref(),
                 decoded_snapshot: decoded_snapshot.as_deref(),
                 metadata_json: metadata_json.as_deref(),
+                semantic_fingerprint: delta.semantic_fingerprint,
                 row_created_at: delta.created_at,
                 row_updated_at: delta.updated_at,
                 change_account_id: active_account_id,
@@ -2403,6 +2412,12 @@ fn materialize_staged_sync_commits(
                     snapshot_json: Some(snapshot_json.as_str()),
                     decoded_snapshot: Some(&decoded_snapshot),
                     metadata_json: None,
+                    semantic_fingerprint: crate::tracked_state::tracked_payload_semantic_fingerprint(
+                        journal.schema_key(),
+                        &row_pk,
+                        Some(row.snapshot()),
+                        None,
+                    )?,
                     row_created_at: lifecycle_created_at,
                     row_updated_at: journal.timestamp(),
                     change_account_id: active_account_id,
@@ -2426,6 +2441,7 @@ fn materialize_staged_sync_commits(
                 snapshot_json: payload.and_then(|payload| payload.snapshot_content.as_deref()),
                 decoded_snapshot: payload.and_then(|payload| payload.decoded_snapshot.as_deref()),
                 metadata_json: payload.and_then(|payload| payload.metadata.as_deref()),
+                semantic_fingerprint: None,
                 row_created_at: change_ref.created_at,
                 row_updated_at: change_ref.updated_at,
                 change_account_id: record.map_or(active_account_id, |record| &record.account_id),
@@ -6965,6 +6981,7 @@ where
                         deleted: false,
                         created_at: LixTimestamp::expect_parse("created_at", &row.created_at),
                         updated_at: LixTimestamp::expect_parse("updated_at", &row.updated_at),
+                        semantic_fingerprint: None,
                     }),
                     base_id,
                 )

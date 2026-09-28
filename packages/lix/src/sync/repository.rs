@@ -1847,6 +1847,7 @@ struct ParsedMember {
     metadata_json: Option<String>,
     snapshot: Option<Vec<u8>>,
     metadata: Option<lix_schema::Jsonb>,
+    semantic_fingerprint: Option<[u8; 32]>,
     row_created_at: LixTimestamp,
     row_updated_at: LixTimestamp,
     change_created_at: LixTimestamp,
@@ -1870,6 +1871,7 @@ struct ParsedSnapshotRow {
     metadata_json: Option<String>,
     snapshot: Vec<u8>,
     metadata: Option<lix_schema::Jsonb>,
+    semantic_fingerprint: Option<[u8; 32]>,
 }
 
 impl ParsedSnapshotRow {
@@ -1898,6 +1900,7 @@ impl ParsedSnapshotRow {
             deleted: false,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            semantic_fingerprint: self.semantic_fingerprint,
         }
     }
 }
@@ -2015,6 +2018,7 @@ impl ParsedMember {
             deleted: self.deleted,
             created_at: self.row_created_at,
             updated_at: self.row_updated_at,
+            semantic_fingerprint: self.semantic_fingerprint,
         }
     }
 
@@ -2029,6 +2033,7 @@ impl ParsedMember {
                 deleted: self.deleted,
                 created_at: self.row_created_at,
                 updated_at: self.row_updated_at,
+                semantic_fingerprint: self.semantic_fingerprint,
             },
             snapshot: self.snapshot.as_deref(),
             metadata: self.metadata.as_ref(),
@@ -2056,19 +2061,23 @@ impl ParsedMember {
     }
 }
 
-fn selected_payload_matches_authored(selected: &ParsedMember, authored: &ParsedMember) -> bool {
-    authored.authored
+fn selected_payload_matches_authored(
+    selected: &ParsedMember,
+    authored: &ParsedMember,
+) -> Result<bool, LixError> {
+    let same_payload = sync_change_records_equal(&selected.change_record(), &authored.change_record())?;
+    Ok(authored.authored
         && selected.change_id == authored.change_id
         && selected.schema_key == authored.schema_key
         && selected.file_id == authored.file_id
         && selected.row_pk == authored.row_pk
         && selected.deleted == authored.deleted
         && selected.snapshot_json == authored.snapshot_json
-        && selected.snapshot == authored.snapshot
+        && same_payload
         && selected.metadata_json == authored.metadata_json
         && selected.change_account_id == authored.change_account_id
         && selected.change_created_at == authored.change_created_at
-        && selected.origin_key == authored.origin_key
+        && selected.origin_key == authored.origin_key)
 }
 
 struct ParsedCommit {
@@ -2898,6 +2907,12 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
             format!("sync member rowPk is invalid: {error}"),
         )
     })?;
+    let semantic_fingerprint = member
+        .semantic_fingerprint
+        .as_deref()
+        .map(parse_sync_state_root_id)
+        .transpose()?
+        .map(|fingerprint| *fingerprint.as_bytes());
     let snapshot = member
         .snapshot
         .as_ref()
@@ -2907,10 +2922,27 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
                 &row_pk,
                 value,
                 member.snapshot_payload.as_deref(),
+                semantic_fingerprint.is_some(),
             )
         })
         .transpose()?;
     let metadata = member.metadata.clone().map(lix_schema::Jsonb::from_value);
+    if let Some(expected) = semantic_fingerprint {
+        if !member.authored
+            || member.deleted
+            || crate::tracked_state::tracked_payload_semantic_fingerprint(
+                &member.schema_key,
+                &row_pk,
+                snapshot.as_deref(),
+                metadata.as_ref(),
+            )? != Some(expected)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync member semantic fingerprint does not match its authored typed payload",
+            ));
+        }
+    }
     Ok(ParsedMember {
         change_id: ChangeId::parse_lix(&member.change_id, "sync member change id")?,
         authored: member.authored,
@@ -2922,6 +2954,7 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
         metadata,
         snapshot_json,
         metadata_json,
+        semantic_fingerprint,
         row_created_at: parse_sync_timestamp("sync member rowCreatedAt", &member.row_created_at)?,
         row_updated_at: parse_sync_timestamp("sync member rowUpdatedAt", &member.row_updated_at)?,
         change_created_at: parse_sync_timestamp(
@@ -3149,39 +3182,59 @@ fn encode_sync_snapshot_row(
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     change: ChangeRecord,
 ) -> Result<SyncSnapshotRow, LixError> {
+    let decoded_snapshot = row
+        .decoded_snapshot()
+        .ok_or_else(|| LixError::unknown("live sync row lacks a materialized typed snapshot"))?;
+    let materialized_bytes = decoded_snapshot.durable_payload().map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("encode sync snapshot durable payload: {error:?}"),
+        )
+    })?;
+    let metadata = row
+        .metadata()
+        .map(|value| serde_json::from_str::<serde_json::Value>(value.as_str()))
+        .transpose()
+        .map_err(|error| LixError::unknown(format!("decode sync snapshot metadata: {error}")))?;
+    let typed_metadata = metadata.clone().map(lix_schema::Jsonb::from_value);
+    let snapshot = row
+        .snapshot_content()
+        .map(|value| serde_json::from_str::<serde_json::Value>(value.as_str()))
+        .transpose()
+        .map_err(|error| LixError::unknown(format!("decode sync snapshot row: {error}")))?;
+    let snapshot_bytes = materialized_bytes.as_ref();
+    let semantic_fingerprint = crate::tracked_state::tracked_payload_semantic_fingerprint(
+        row.schema_key(),
+        row.row_pk(),
+        Some(snapshot_bytes),
+        typed_metadata.as_ref(),
+    )?
+    .expect("live snapshot has durable payload");
+    if row
+        .semantic_fingerprint()
+        .is_some_and(|stored| stored != semantic_fingerprint)
+    {
+        return Err(LixError::internal_invariant(
+            "sync snapshot row fingerprint disagrees with its durable payload",
+            serde_json::json!({"change_id": row.change_id().to_string()}),
+        ));
+    }
+    let snapshot_payload = super::commit::encode_sync_row_payload_bytes(snapshot_bytes);
     Ok(SyncSnapshotRow {
         branch_id: branch_id.to_owned(),
-        // The by-ID record supplies provenance, not the row payload:
-        // eager plugin rows may share a source change ID while having
-        // distinct identities and typed snapshots.
-        snapshot_payload: Some(super::commit::encode_sync_row_payload(
-            row.decoded_snapshot().ok_or_else(|| {
-                LixError::unknown("live sync row lacks a materialized typed snapshot")
-            })?,
-        )?),
+        // The by-ID record supplies provenance. The materialized row is the
+        // snapshot authority even when plugin rows share a source change ID.
+        snapshot_payload: Some(snapshot_payload),
         schema_key: row.schema_key().to_owned(),
         file_id: row.file_id().map(str::to_owned),
         row_pk: row.row_pk().as_typed_json_array_value()?,
-        snapshot: row
-            .snapshot_content()
-            .map(|value| serde_json::from_str(value.as_str()))
-            .transpose()
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("decode sync snapshot row: {error}"),
-                )
-            })?,
-        metadata: row
-            .metadata()
-            .map(|value| serde_json::from_str(value.as_str()))
-            .transpose()
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("decode sync snapshot metadata: {error}"),
-                )
-            })?,
+        snapshot,
+        metadata,
+        semantic_fingerprint: Some(
+            blake3::Hash::from_bytes(semantic_fingerprint)
+                .to_hex()
+                .to_string(),
+        ),
         change_id: row.change_id().to_string(),
         commit_id: row.commit_id().to_string(),
         created_at: row.created_at().to_string(),
@@ -3221,12 +3274,33 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         .snapshot
         .as_ref()
         .expect("live sync snapshot was checked above");
+    let semantic_fingerprint = row
+        .semantic_fingerprint
+        .as_deref()
+        .map(parse_sync_state_root_id)
+        .transpose()?
+        .map(|fingerprint| *fingerprint.as_bytes());
     let typed_snapshot = super::commit::decode_sync_row_payload(
         &row.schema_key,
         &row_pk,
         snapshot_value,
         row.snapshot_payload.as_deref(),
+        semantic_fingerprint.is_some(),
     )?;
+    let typed_metadata = row.metadata.clone().map(lix_schema::Jsonb::from_value);
+    if let Some(expected) = semantic_fingerprint
+        && crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &row.schema_key,
+            &row_pk,
+            Some(&typed_snapshot),
+            typed_metadata.as_ref(),
+        )? != Some(expected)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync snapshot semantic fingerprint does not match its typed payload",
+        ));
+    }
     Ok(ParsedSnapshotRow {
         branch_id: row.branch_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -3244,8 +3318,9 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         origin_key: row.origin_key.clone(),
         snapshot_json: snapshot.clone(),
         metadata_json: metadata.clone(),
+        semantic_fingerprint,
         snapshot: typed_snapshot,
-        metadata: row.metadata.clone().map(lix_schema::Jsonb::from_value),
+        metadata: typed_metadata,
     })
 }
 
@@ -5750,11 +5825,10 @@ where
         let mut changes = BTreeMap::<ChangeId, ChangeRecord>::new();
         for row in &parsed_rows {
             let change = row.change_record();
-            if changes
-                .insert(change.change_id, change.clone())
-                .is_some_and(|existing| existing != change)
-            {
-                return Err(immutable_object_mismatch("change", change.change_id));
+            if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                if !sync_change_records_equal(&existing, &change)? {
+                    return Err(immutable_object_mismatch("change", change.change_id));
+                }
             }
         }
         for branch in branches {
@@ -5769,14 +5843,13 @@ where
                 &record.account_id,
                 record.created_at,
             )?;
-            if changes
-                .insert(change.change_id, change.clone())
-                .is_some_and(|existing| existing != change)
-            {
-                return Err(immutable_object_mismatch(
-                    "branch ref change",
-                    change.change_id,
-                ));
+            if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                if !sync_change_records_equal(&existing, &change)? {
+                    return Err(immutable_object_mismatch(
+                        "branch ref change",
+                        change.change_id,
+                    ));
+                }
             }
         }
         let mut head_mutations = BTreeMap::new();
@@ -5796,11 +5869,10 @@ where
                 stage_imported_commit_body(&mut writes, commit, &mut authored_locators)?;
             for member in &commit.members {
                 let change = member.change_record();
-                if changes
-                    .insert(change.change_id, change.clone())
-                    .is_some_and(|existing| existing != change)
-                {
-                    return Err(immutable_object_mismatch("change", change.change_id));
+                if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                    if !sync_change_records_equal(&existing, &change)? {
+                        return Err(immutable_object_mismatch("change", change.change_id));
+                    }
                 }
             }
             head_mutations.insert(commit.commit_id, mutations);
@@ -7109,6 +7181,7 @@ where
                 deleted: row.deleted(),
                 created_at: row.created_at(),
                 updated_at: row.updated_at(),
+                semantic_fingerprint: None,
             });
             tracked_writer
                 .stage_commit_root(&parent.to_string(), None, deltas)
@@ -7349,7 +7422,7 @@ where
                         continue;
                     }
                     if let Some(authored) = authored_by_change.get(&member.change_id) {
-                        if !selected_payload_matches_authored(member, authored) {
+                        if !selected_payload_matches_authored(member, authored)? {
                             return Err(LixError::new(
                                 LixError::CODE_INVALID_PARAM,
                                 format!(
@@ -7417,7 +7490,7 @@ where
         for row in boundary_rows.values().flatten() {
             let change = row.change_record();
             match load_existing_sync_change(&read, change.change_id).await? {
-                Some(existing) if existing != change => {
+                Some(existing) if !sync_change_records_equal(&existing, &change)? => {
                     return Err(immutable_object_mismatch("change", change.change_id));
                 }
                 Some(_) => {}
@@ -7425,10 +7498,10 @@ where
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(change);
                     }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() == &change => {}
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err(immutable_object_mismatch("change", change.change_id));
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        if !sync_change_records_equal(entry.get(), &change)? {
+                            return Err(immutable_object_mismatch("change", change.change_id));
+                        }
                     }
                 },
             }
@@ -7467,7 +7540,9 @@ where
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
-                    Some(existing) if !sync_change_records_equal(&existing, &change)? => {
+                    Some(existing)
+                        if !sync_change_records_equal(&existing, &change)? =>
+                    {
                         return Err(immutable_object_mismatch("change", change.change_id));
                     }
                     Some(_) => {}
@@ -7475,10 +7550,13 @@ where
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(change);
                         }
-                        std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get() == &change => {}
-                        std::collections::btree_map::Entry::Occupied(_) => {
-                            return Err(immutable_object_mismatch("change", change.change_id));
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if !sync_change_records_equal(entry.get(), &change)? {
+                                return Err(immutable_object_mismatch("change", change.change_id));
+                            }
+                            if member.authored {
+                                entry.insert(change);
+                            }
                         }
                     },
                 }
@@ -8408,6 +8486,7 @@ where
             deleted: false,
             created_at: row.created_at(),
             updated_at: row.updated_at(),
+            semantic_fingerprint: None,
         });
         let mut transient_writes = self.storage_adapter().new_write_set();
         let tracked_context = TrackedStateContext::new();
@@ -11053,6 +11132,13 @@ mod tests {
             // The source record has another schema/PK and payload entirely;
             // only its account, timestamp, and origin apply to the derived row.
             let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, row, source.clone()).unwrap();
+            assert!(wire.semantic_fingerprint.is_some(), "live snapshots carry a canonical typed proof even when the root stores identity only");
+            assert_eq!(
+                wire.snapshot_payload.as_deref(),
+                Some(super::super::commit::encode_sync_row_payload_preserving_storage(
+                    row.decoded_snapshot().expect("materialized typed row")
+                ).unwrap().as_str()),
+            );
             let parsed = parse_snapshot_row(&wire).unwrap();
             assert_eq!(parsed.row_pk, *row.row_pk());
             assert_eq!(
@@ -11067,6 +11153,298 @@ mod tests {
         assert_ne!(
             payloads[0], payloads[1],
             "shared source IDs must not collapse identity-specific payloads"
+        );
+    }
+
+    #[test]
+    fn snapshot_encoding_distinguishes_sql_null_from_json_null() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("built-in schema");
+        let row_pk = RowPk::single("null-row");
+        let sql_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("null-row".to_owned())),
+                ("value", lix_schema::Value::Null),
+            ]),
+        )
+        .unwrap();
+        let json_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("null-row".to_owned())),
+                (
+                    "value",
+                    lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(
+                        serde_json::Value::Null,
+                    )),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_ne!(sql_null, json_null);
+        assert_eq!(sql_null.to_json_value().unwrap(), json_null.to_json_value().unwrap());
+        let source_bytes = sql_null.durable_payload().unwrap();
+        let json_null_bytes = json_null.durable_payload().unwrap();
+        assert_ne!(
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                "lix_key_value", &row_pk, Some(&source_bytes), None,
+            ).unwrap(),
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                "lix_key_value", &row_pk, Some(&json_null_bytes), None,
+            ).unwrap(),
+            "typed proof must distinguish SQL NULL from JSON null",
+        );
+        let source = ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label("sql-null-source"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: row_pk.clone(),
+            file_id: None,
+            snapshot: Some(source_bytes.to_vec()),
+            metadata: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            origin_key: None,
+        };
+        let commit_id = CommitId::for_test_label("json-null-materialized");
+        let json = json_null.to_json_shared().unwrap();
+        let expected = super::super::commit::encode_sync_row_payload_preserving_storage(&json_null)
+            .unwrap();
+        let materialized = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
+            MaterializedTrackedStateRow {
+                row_pk,
+                schema_key: "lix_key_value".into(),
+                file_id: None,
+                snapshot_content: Some(json),
+                decoded_snapshot: Some(Arc::new(json_null)),
+                metadata: None,
+                deleted: false,
+                created_at: source.created_at.to_string(),
+                updated_at: source.created_at.to_string(),
+                change_id: source.change_id,
+                commit_id,
+            },
+        ])
+        .unwrap();
+        let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, materialized.iter().next().unwrap(), source).unwrap();
+        assert_eq!(wire.snapshot_payload.as_deref(), Some(expected.as_str()));
+        assert_ne!(wire.snapshot_payload.unwrap(), super::super::commit::encode_sync_row_payload_bytes(source_bytes.as_ref()));
+    }
+
+    #[test]
+    fn proof_bearing_hydration_accepts_equivalent_typed_payload_encodings() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("built-in schema");
+        let row_pk = RowPk::single("deferred-row");
+        let typed = crate::row_payload::TypedRow::from_normalized_json(
+            plan,
+            &row_pk,
+            &serde_json::json!({"key": "deferred-row", "value": {"same": true}}),
+        )
+        .expect("typed row");
+        let compact = typed.durable_payload().expect("compact durable bytes");
+        let native = crate::plugin::wire::typed::encode_native_row_payload(
+            &typed.schema_fingerprint,
+            &typed.row_pk,
+            &typed.row,
+        )
+        .expect("native wire bytes");
+        assert_ne!(compact.as_ref(), native.as_slice());
+        let authored = ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label("deferred-proof-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk,
+            file_id: None,
+            snapshot: Some(compact.to_vec()),
+            metadata: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            origin_key: None,
+        };
+        let deferred = ChangeRecord {
+            snapshot: Some(native),
+            ..authored.clone()
+        };
+        let proof = crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &authored.schema_key,
+            &authored.row_pk,
+            Some(compact.as_ref()),
+            None,
+        )
+        .expect("proof")
+        .expect("live row proof");
+        assert!(sync_change_records_equal(&deferred, &authored).unwrap());
+        assert_eq!(
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                &deferred.schema_key,
+                &deferred.row_pk,
+                deferred.snapshot.as_deref(),
+                None,
+            )
+            .unwrap(),
+            Some(proof)
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_wire_roundtrips_and_rejects_mismatched_payloads() {
+        fn assert_wire_proofs(
+            schema_key: &str,
+            row_pk: &RowPk,
+            value: serde_json::Value,
+            typed: &crate::row_payload::TypedRow,
+            label: &str,
+        ) {
+            let stored_payload = typed.durable_payload().expect("stored row payload");
+            let fingerprint = crate::tracked_state::tracked_payload_semantic_fingerprint(
+                schema_key,
+                row_pk,
+                Some(stored_payload.as_ref()),
+                None,
+            )
+            .expect("compute payload proof")
+            .expect("live payload has a proof");
+            let fingerprint = blake3::Hash::from_bytes(fingerprint).to_hex().to_string();
+            let snapshot_payload =
+                super::super::commit::encode_sync_row_payload_preserving_storage(typed)
+                    .expect("encode stored row payload");
+            let change_id =
+                ChangeId::for_test_label(&format!("fingerprinted-{label}-change")).to_string();
+            let commit_id =
+                CommitId::for_test_label(&format!("fingerprinted-{label}-commit")).to_string();
+
+            let snapshot = SyncSnapshotRow {
+                branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                row_pk: row_pk
+                    .as_typed_json_array_value()
+                    .expect("typed row identity"),
+                snapshot: Some(value.clone()),
+                snapshot_payload: Some(snapshot_payload.clone()),
+                metadata: None,
+                semantic_fingerprint: Some(fingerprint.clone()),
+                change_id: change_id.clone(),
+                commit_id,
+                created_at: "2026-05-12T00:00:00Z".to_owned(),
+                updated_at: "2026-05-12T00:00:00Z".to_owned(),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                origin_key: None,
+            };
+            let snapshot_wire = serde_json::to_value(&snapshot).expect("serialize snapshot row");
+            assert_eq!(snapshot_wire["semanticFingerprint"], fingerprint);
+            let snapshot: SyncSnapshotRow =
+                serde_json::from_value(snapshot_wire).expect("deserialize snapshot row");
+            assert_eq!(
+                snapshot.semantic_fingerprint.as_deref(),
+                Some(fingerprint.as_str())
+            );
+            parse_snapshot_row(&snapshot).expect("matching snapshot proof validates");
+            let mut mismatched_snapshot = snapshot.clone();
+            mismatched_snapshot.semantic_fingerprint =
+                Some(blake3::hash(b"different payload").to_hex().to_string());
+            assert!(
+                parse_snapshot_row(&mismatched_snapshot)
+                    .err()
+                    .expect("mismatched snapshot proof must fail")
+                    .message
+                    .contains("semantic fingerprint")
+            );
+
+            let member = SyncCommitMember {
+                change_id,
+                authored: true,
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                row_pk: row_pk
+                    .as_typed_json_array_value()
+                    .expect("typed row identity"),
+                deleted: false,
+                snapshot: Some(value),
+                snapshot_payload: Some(snapshot_payload),
+                metadata: None,
+                semantic_fingerprint: Some(fingerprint.clone()),
+                row_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                row_updated_at: "2026-05-12T00:00:00Z".to_owned(),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                origin_key: None,
+            };
+            let member_wire = serde_json::to_value(&member).expect("serialize commit member");
+            assert_eq!(member_wire["semanticFingerprint"], fingerprint);
+            let member: SyncCommitMember =
+                serde_json::from_value(member_wire).expect("deserialize commit member");
+            assert_eq!(
+                member.semantic_fingerprint.as_deref(),
+                Some(fingerprint.as_str())
+            );
+            parse_sync_member(&member).expect("matching member proof validates");
+            let mut mismatched_member = member;
+            mismatched_member.semantic_fingerprint =
+                Some(blake3::hash(b"different payload").to_hex().to_string());
+            assert!(
+                parse_sync_member(&mismatched_member)
+                    .err()
+                    .expect("mismatched member proof must fail")
+                    .message
+                    .contains("semantic fingerprint")
+            );
+        }
+
+        let custom_schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "custom_fingerprinted_row",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "count", "type": "int8", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        });
+        let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[custom_schema])
+            .expect("custom schema catalog");
+        let (_, plan) = catalog
+            .plan_for_key("custom_fingerprinted_row")
+            .expect("custom row plan");
+        let custom_pk = RowPk::single("custom-fingerprinted-row");
+        let custom_value = serde_json::json!({"id": "custom-fingerprinted-row", "count": 7});
+        let custom_typed =
+            crate::row_payload::TypedRow::from_normalized_json(plan, &custom_pk, &custom_value)
+                .expect("custom typed row");
+        assert_wire_proofs(
+            "custom_fingerprinted_row",
+            &custom_pk,
+            custom_value,
+            &custom_typed,
+            "custom",
+        );
+
+        let builtin_pk = RowPk::single("fingerprinted-builtin");
+        let builtin_value = serde_json::json!({
+            "key": "fingerprinted-builtin",
+            "value": {"payload": "x".repeat(8 * 1024)}
+        });
+        let builtin_typed = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_key_value",
+            &builtin_pk,
+            &builtin_value,
+        )
+        .expect("builtin typed row");
+        assert_eq!(
+            builtin_typed.durable_payload().unwrap().first().copied(),
+            Some(crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION),
+            "fixture should exercise a compressed built-in payload"
+        );
+        assert_wire_proofs(
+            "lix_key_value",
+            &builtin_pk,
+            builtin_value,
+            &builtin_typed,
+            "builtin",
         );
     }
 
@@ -12720,6 +13098,7 @@ mod tests {
                 snapshot: row.snapshot.clone(),
                 snapshot_payload: row.snapshot_payload.clone(),
                 metadata: row.metadata.clone(),
+                semantic_fingerprint: None,
                 row_created_at: row.created_at.clone(),
                 row_updated_at: row.updated_at.clone(),
                 change_account_id: row.change_account_id.clone(),
@@ -13513,6 +13892,9 @@ mod tests {
         .unwrap();
         member.snapshot_payload =
             Some(super::super::commit::encode_sync_row_payload(&row).unwrap());
+        // This collision probe deliberately tests immutable-content checks;
+        // retain the legacy proofless body after changing its payload.
+        member.semantic_fingerprint = None;
         let error = target
             .push_sync_repository(&conflicting)
             .await

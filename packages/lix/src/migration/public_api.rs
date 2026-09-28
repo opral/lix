@@ -254,7 +254,7 @@ where
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82)) {
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83)) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let mut plan = super::publish::PublicationPlan::bounded(
             options.max_changes,
@@ -270,10 +270,12 @@ where
             .await?;
         }
         let read = super::MigrationPlanningRead::new(&adapter).await?;
-        super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+        if before.format.is_some_and(|format| format <= 82) {
+            super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+        }
         read.finish()?;
         (
-            "v83-checkpoint-summary-plan-v1",
+            "v84-fingerprint-marker-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -684,8 +686,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v79_to_v83_migration_preserves_admission_and_resident_records_offline() {
-        for format in [79, 80, 81, 82] {
+    async fn partial_v79_to_v84_migration_preserves_admission_and_resident_records_offline() {
+        for format in [79, 80, 81, 82, 83] {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
                 format!("https://example.test/lix/{}", authority.lix_id()),
@@ -714,7 +716,7 @@ mod tests {
             if format <= 81 {
                 // A sparse cache cannot certify whole-collection completeness.
                 // The v79-v81 upgrade retires old index records without
-                // requesting hydration; v82 and v83 preserve it.
+                // requesting hydration; v82, v83, and v84 preserve it.
                 writes.put(
                     crate::hot_state::INDEX_SPACE,
                     b"old-untrusted-index".as_slice(),

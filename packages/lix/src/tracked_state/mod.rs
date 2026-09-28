@@ -175,6 +175,7 @@ pub(crate) use types::{
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateIndexValueRef,
     TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
     TrackedStateSingleStringReplacementRef, row_pk_satisfies_bounds,
+    tracked_payload_semantic_fingerprint,
 };
 #[cfg(test)]
 pub(crate) use types::{CurrentStatePartDescriptor, ReplacementPartSource};

@@ -196,12 +196,12 @@ where
     let (source_marker, target_marker) = if partial {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
         )
     } else {
         (
             crate::init::REPOSITORY_PROTOCOL_V82,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::init::REPOSITORY_PROTOCOL_V83,
         )
     };
     if marker.as_ref() == target_marker {
@@ -410,9 +410,9 @@ mod tests {
             .await
             .expect("v7 records should migrate atomically");
         let expected_marker = if partial {
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83
         } else {
-            crate::init::REPOSITORY_PROTOCOL_VALUE
+            crate::init::REPOSITORY_PROTOCOL_V83
         };
         let marker = crate::migration::api::load_repository_protocol_marker(&adapter)
             .await

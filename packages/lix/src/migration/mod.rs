@@ -31,10 +31,11 @@ pub(crate) use incorporation::{
 mod selected_locators;
 #[cfg(test)]
 pub(crate) use epoch::stage_legacy_partial_epoch_for_test;
+mod hot_indexes;
 mod publish;
 mod registry;
 mod runtime_epoch;
-mod hot_indexes;
+mod semantic_fingerprint_format;
 
 pub use api::MigrationOptions;
 pub(crate) use api::migrate_lix_with_adapter;

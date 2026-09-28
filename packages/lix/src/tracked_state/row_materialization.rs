@@ -30,6 +30,7 @@ struct MaterializedTrackedStateDescriptor {
     updated_at: LixTimestamp,
     change_id: ChangeId,
     commit_id: CommitId,
+    semantic_fingerprint: Option<[u8; 32]>,
 }
 
 /// Typed owner for historical tracked-state materialization.
@@ -98,6 +99,7 @@ impl MaterializedTrackedStateBatch {
                     deleted: row.deleted,
                     created_at,
                     updated_at,
+                    semantic_fingerprint: None,
                 },
                 row.snapshot_content,
                 row.metadata,
@@ -203,6 +205,10 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
 
     pub(crate) fn commit_id(self) -> CommitId {
         self.descriptor().commit_id
+    }
+
+    pub(crate) fn semantic_fingerprint(self) -> Option<[u8; 32]> {
+        self.descriptor().semantic_fingerprint
     }
 
     /// Converts into the legacy DTO only at a terminal compatibility boundary.
@@ -354,6 +360,7 @@ impl MaterializedTrackedStateBatchBuilder {
             updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
+            semantic_fingerprint: value.semantic_fingerprint,
         });
     }
 
@@ -378,6 +385,7 @@ impl MaterializedTrackedStateBatchBuilder {
             updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
+            semantic_fingerprint: value.semantic_fingerprint,
         });
     }
 
@@ -788,6 +796,7 @@ mod tests {
                     deleted: false,
                     created_at: updated_at,
                     updated_at,
+                    semantic_fingerprint: None,
                 },
             )],
             &ChangeRecordProjection::full(),
@@ -936,6 +945,7 @@ mod tests {
             deleted: false,
             created_at: timestamp,
             updated_at: timestamp,
+            semantic_fingerprint: None,
         }
     }
 

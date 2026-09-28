@@ -1649,7 +1649,12 @@ where
             .zip(&keys)
             .map(|(row, key)| (row.commit_id(), key.clone()))
             .collect::<Vec<_>>();
-        let loaded = storage::load_owned_commit_delta_entries(&self.store, &requests).await?;
+        let loaded = storage::load_owned_commit_delta_entries_with_point_cache(
+            &self.store,
+            &requests,
+            &self.commit_delta_point_cache,
+        )
+        .await?;
         if loaded.len() != comparison_rows.len() {
             return Err(LixError::internal_invariant(
                 "tracked-state comparison payload load returned the wrong row count",
@@ -1717,6 +1722,70 @@ where
                 .into_iter()
                 .map(|(change_id, change)| (change_id, change.snapshot, change.metadata)),
         )
+    }
+
+    /// Validates a projectionless semantic comparison from authenticated
+    /// commit-delta fingerprints. Any legacy, selected-source, sparse, or
+    /// missing delta proof returns `None` so the caller loads exact payloads.
+    /// The retained root carries identity only; a present but disagreeing
+    /// root/delta proof from an older layout is corruption and fails closed.
+    pub(crate) async fn try_validate_tree_diff_comparison_fingerprints(
+        &mut self,
+        batch: &TrackedStateTreeDiffBatch,
+    ) -> Result<Option<HashMap<ChangeId, [u8; 32]>>, LixError> {
+        let comparison_rows = batch.comparison_rows();
+        let mut requests = Vec::with_capacity(comparison_rows.len());
+        let mut keys = Vec::with_capacity(comparison_rows.len());
+        for row in comparison_rows.iter().copied() {
+            let key = TrackedStateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                row_pk: row.row_pk().clone(),
+            };
+            requests.push((row.commit_id(), key.clone()));
+            keys.push(key);
+        }
+        let loaded = storage::load_authenticated_commit_delta_index_values(
+            &self.store,
+            &requests,
+            &self.commit_delta_point_cache,
+        )
+        .await?;
+        if loaded.len() != comparison_rows.len() {
+            return Err(LixError::internal_invariant(
+                "tracked-state fingerprint validation returned the wrong row count",
+                serde_json::json!({
+                    "requested": comparison_rows.len(),
+                    "returned": loaded.len(),
+                }),
+            ));
+        }
+        if loaded.iter().any(Option::is_none)
+            || loaded
+                .iter()
+                .flatten()
+                .any(|value| value.semantic_fingerprint.is_none())
+        {
+            return Ok(None);
+        }
+        let mut validated_payload_keys = HashSet::with_capacity(comparison_rows.len());
+        let mut fingerprints = HashMap::with_capacity(comparison_rows.len());
+        for ((row, key), value) in comparison_rows
+            .iter()
+            .copied()
+            .zip(keys.iter())
+            .zip(loaded.iter().flatten())
+        {
+            validate_live_tree_diff_row_against_delta(row, value)?;
+            validated_payload_keys.insert((row.commit_id(), key.clone()));
+            fingerprints.insert(
+                row.change_id(),
+                value.semantic_fingerprint.expect("all loaded proofs were checked"),
+            );
+        }
+        self.validate_tree_diff_batch_against_delta_index(batch, Some(&validated_payload_keys))
+            .await?;
+        Ok(Some(fingerprints))
     }
 
     async fn load_commit_delta_values_for_encoded_queries(
@@ -4627,6 +4696,7 @@ where
                     deleted: true,
                     created_at: value.created_at(),
                     updated_at: cascade.updated_at,
+                    semantic_fingerprint: None,
                 }),
             );
         }
@@ -5064,6 +5134,7 @@ where
                             deleted: true,
                             created_at: value.created_at(),
                             updated_at: marker.updated_at,
+                            semantic_fingerprint: None,
                         }),
                     );
                 }
@@ -5192,6 +5263,10 @@ where
 
                 created_at,
                 updated_at: delta.updated_at,
+                // The authenticated commit-delta leaf owns the proof. Retained
+                // tree roots keep identity only and remain stable across wire
+                // projections of the same live state.
+                semantic_fingerprint: None,
             };
             mutation_batch.push(key, value);
         }
@@ -5472,6 +5547,7 @@ where
                 deleted: delta.deleted,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
+                semantic_fingerprint: None,
             },
         ) {
             return Err(LixError::new(
@@ -5629,6 +5705,7 @@ fn cascade_tombstone(
         deleted: true,
         created_at: inherited.created_at,
         updated_at: cascade.updated_at,
+        semantic_fingerprint: None,
     }
 }
 
@@ -5706,6 +5783,26 @@ fn validate_diff_row_against_changelog(
             row.change_id
         )));
     }
+    if let Some(expected) = row.semantic_fingerprint {
+        let actual = crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &change.schema_key,
+            &change.row_pk,
+            change.snapshot.as_deref(),
+            change.metadata.as_ref(),
+        )?;
+        if actual != Some(expected) {
+            return Err(LixError::internal_invariant(
+                format!(
+                    "tracked-state diff row '{}' semantic fingerprint does not match its payload",
+                    row.change_id
+                ),
+                serde_json::json!({
+                    "change_id": row.change_id.to_string(),
+                    "commit_id": row.commit_id.to_string(),
+                }),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -5717,6 +5814,14 @@ fn validate_live_tree_diff_row_against_delta(
         && row.commit_id() == value.commit_id
         && row.deleted() == value.deleted
         && row.updated_at() == value.updated_at()
+        && match (row.value().semantic_fingerprint, value.semantic_fingerprint) {
+            // A fingerprint is an optional acceleration proof. If either
+            // durable side predates it or uses a representation that cannot
+            // carry it, the caller must retain the exact payload-validation
+            // path; only two present but disagreeing values are corruption.
+            (Some(root), Some(delta)) => root == delta,
+            _ => true,
+        }
     {
         return Ok(());
     }
@@ -6570,6 +6675,7 @@ mod tests {
             deleted: delta.deleted,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
+            semantic_fingerprint: delta.semantic_fingerprint,
         };
         let mut overlay = FirstParentDiffOverlay::with_capacities(ROW_COUNT, 1);
         for ordinal in 0..ROW_COUNT {
@@ -6649,6 +6755,7 @@ mod tests {
             deleted: false,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
+            semantic_fingerprint: delta.semantic_fingerprint,
         };
         let mut overlay =
             RootlessReplayOverlay::with_capacities(ROW_COUNT, keys.encoded_bytes_len());
@@ -6788,6 +6895,7 @@ mod tests {
             deleted: true,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
+            semantic_fingerprint: delta.semantic_fingerprint,
         };
         let mut overlay = RootlessReplayOverlay::with_capacities(FILE_COUNT, 0);
         let mut cascades = RootlessCascadeIndex::with_capacity(FILE_COUNT);
@@ -11153,6 +11261,7 @@ mod tests {
                         "updated_at",
                         &row.updated_at,
                     ),
+                    semantic_fingerprint: None,
                 };
                 TrackedStateMutation::put_encoded(
                     encode_key(&key),
@@ -11354,6 +11463,7 @@ mod tests {
             deleted: row.snapshot_content.is_none(),
             created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
+            semantic_fingerprint: None,
         }
     }
 

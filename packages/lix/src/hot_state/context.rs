@@ -4368,6 +4368,7 @@ mod tests {
                     deleted: change.snapshot.is_none(),
                     created_at: *created_at,
                     updated_at: *updated_at,
+                    semantic_fingerprint: None,
                 })
                 .collect::<Vec<_>>();
             let commit_deltas = rows

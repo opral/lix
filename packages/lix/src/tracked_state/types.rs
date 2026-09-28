@@ -51,6 +51,10 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
+    /// Authenticated canonical `(snapshot, metadata)` identity for locally
+    /// authored live rows. `None` deliberately keeps legacy and selected
+    /// references on the exact payload-validation path.
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
 }
 
 /// Physical location of a row snapshot in an immutable columnar base.
@@ -122,6 +126,10 @@ pub(crate) struct TrackedStateIndexValue {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
+    /// Hash of the canonical live payload, when it was sealed by an authored
+    /// root/delta publication. Tombstones, selected references, and older
+    /// formats use `None` and require payload loading for semantic equality.
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
 }
 
 impl TrackedStateIndexValue {
@@ -146,6 +154,67 @@ pub(crate) struct TrackedStateIndexValueRef {
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
+}
+
+/// Computes a stable semantic identity for one live tracked-state payload.
+/// Durable payload envelopes can encode the same typed row in different ways
+/// (including compact built-in and native plugin encodings). Decode before
+/// hashing a single canonical typed representation so sync hydration and
+/// current-state serving layouts agree. Typed encoding distinguishes SQL NULL
+/// from JSON null; metadata uses canonical JSONB binary encoding.
+pub(crate) fn tracked_payload_semantic_fingerprint(
+    schema_key: &str,
+    row_pk: &RowPk,
+    snapshot: Option<&[u8]>,
+    metadata: Option<&lix_schema::Jsonb>,
+) -> Result<Option<[u8; 32]>, crate::LixError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let typed = WasmTypedRow::decode_durable_payload(
+        Arc::<[u8]>::from(snapshot),
+        schema_key,
+        row_pk,
+    )?;
+    let canonical_snapshot = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+        &typed.schema_fingerprint,
+        &typed.row_pk,
+        &typed.row,
+    )
+    .map_err(|error| {
+        crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            format!("tracked-state typed payload failed canonical encoding: {error:?}"),
+        )
+    })?;
+    let metadata = metadata
+        .map(lix_schema::Jsonb::binary)
+        .transpose()
+        .map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("tracked-state metadata failed canonical encoding: {error}"),
+            )
+        })?;
+    let mut hasher =
+        blake3::Hasher::new_derive_key("lix.tracked-state.payload-semantic-fingerprint.v2");
+    hasher.update(&[1]);
+    hasher.update(&(schema_key.len() as u64).to_be_bytes());
+    hasher.update(schema_key.as_bytes());
+    hasher.update(&(canonical_snapshot.len() as u64).to_be_bytes());
+    hasher.update(&canonical_snapshot);
+    match metadata.as_ref() {
+        Some(bytes) => {
+            hasher.update(&[1]);
+            hasher.update(&(bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+    Ok(Some(*hasher.finalize().as_bytes()))
 }
 
 /// Durable tracked-state root metadata for one commit.
@@ -781,4 +850,79 @@ pub(crate) struct TrackedStateTreeDiffEntry {
     pub(crate) key: TrackedStateKey,
     pub(crate) before: Option<TrackedStateIndexValue>,
     pub(crate) after: Option<TrackedStateIndexValue>,
+}
+
+#[cfg(test)]
+mod semantic_fingerprint_tests {
+    use super::tracked_payload_semantic_fingerprint;
+    use crate::row_pk::RowPk;
+    use lix_schema::Jsonb;
+    use std::sync::Arc;
+
+    #[test]
+    fn fingerprint_is_canonical_and_covers_snapshot_and_metadata() {
+        let row_pk = RowPk::single("fingerprint-row");
+        let first_snapshot = crate::row_payload::TypedRow::from_test_json_unchecked(
+            &row_pk,
+            &serde_json::json!({"body":"first"}),
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap();
+        let second_snapshot = crate::row_payload::TypedRow::from_test_json_unchecked(
+            &row_pk,
+            &serde_json::json!({"body":"second"}),
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap();
+        let first_metadata = Jsonb::from_value(serde_json::json!({"b": 2, "a": 1}));
+        let canonical_binary = first_metadata
+            .binary()
+            .expect("JSONB should encode canonically")
+            .into_owned();
+        let second_metadata = Jsonb::from_binary(Arc::<[u8]>::from(canonical_binary))
+            .expect("canonical JSONB should decode");
+
+        let first = tracked_payload_semantic_fingerprint(
+            "fingerprint_test", &row_pk, Some(&first_snapshot),
+            Some(&first_metadata),
+        )
+        .expect("fingerprint should compute");
+        assert_eq!(
+            first,
+            tracked_payload_semantic_fingerprint(
+                "fingerprint_test", &row_pk, Some(&first_snapshot),
+                Some(&second_metadata),
+            )
+            .expect("equivalent JSONB should fingerprint")
+        );
+        assert_ne!(
+            first,
+            tracked_payload_semantic_fingerprint(
+                "fingerprint_test", &row_pk, Some(&second_snapshot),
+                Some(&first_metadata)
+            )
+            .expect("changed snapshot should fingerprint")
+        );
+        assert_ne!(
+            first,
+            tracked_payload_semantic_fingerprint("fingerprint_test", &row_pk, Some(&first_snapshot), None)
+                .expect("missing metadata should fingerprint")
+        );
+        assert_ne!(
+            tracked_payload_semantic_fingerprint("fingerprint_test", &row_pk, Some(&first_snapshot), None)
+                .expect("SQL NULL metadata should fingerprint"),
+            tracked_payload_semantic_fingerprint(
+                "fingerprint_test", &row_pk, Some(&first_snapshot),
+                Some(&Jsonb::from_value(serde_json::Value::Null)),
+            )
+            .expect("JSON null metadata should fingerprint")
+        );
+        assert_eq!(
+            tracked_payload_semantic_fingerprint("fingerprint_test", &row_pk, None, Some(&first_metadata))
+                .expect("tombstone fingerprint should be absent"),
+            None
+        );
+    }
 }

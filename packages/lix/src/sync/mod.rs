@@ -213,8 +213,9 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v20 adds operation-level read fulfillment for bounded typed dependency discovery.
 // v21 requires v2 native baseline leases, which v20 clients cannot renew.
 // v22 adds explicit filesystem path-index scopes to read-fulfillment recipes.
-// v23 adds validated first-parent checkpoint summaries to commit headers.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 23;
+// v24 carries authenticated semantic fingerprints in commit and snapshot rows;
+// older peers cannot reconstruct the resulting tracked-state root IDs.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 24;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

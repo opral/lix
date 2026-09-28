@@ -116,9 +116,13 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// v81 separates explicit migration from current-format opening and fences old runtimes.
 /// v82 rebuilds declared-column indexes with exact reverse memberships and composite keys.
 /// v83 stores a validated nearest-checkpoint summary on each commit record.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 83;
+/// v84 adds authenticated semantic fingerprints to tracked-state values. The
+/// fingerprint is optional on old roots and deltas, but readers that predate
+/// this format cannot decode the new packed value tail.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 84;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v83";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v84";
+pub(crate) const REPOSITORY_PROTOCOL_V83: &[u8] = b"tracked-default-branch.v83";
 pub(crate) const REPOSITORY_PROTOCOL_V82: &[u8] = b"tracked-default-branch.v82";
 pub(crate) const REPOSITORY_PROTOCOL_V81: &[u8] = b"tracked-default-branch.v81";
 pub(crate) const REPOSITORY_PROTOCOL_V80: &[u8] = b"tracked-default-branch.v80";
@@ -126,6 +130,8 @@ pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v84-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V83: &[u8] =
     b"tracked-default-branch.v83-partial-replica.v1";
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V82: &[u8] =
     b"tracked-default-branch.v82-partial-replica.v1";
@@ -671,6 +677,7 @@ where
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
+                semantic_fingerprint: None,
             })
             .collect::<Vec<_>>();
         let commit_deltas = authored_changes
@@ -765,6 +772,7 @@ where
                 deleted: false,
                 created_at: change.created_at,
                 updated_at: change.created_at,
+                semantic_fingerprint: None,
             })
             .collect::<Vec<_>>();
         let main_commit_deltas = main_changes
@@ -1648,11 +1656,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v83"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 83 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v84"),
-            RepositoryProtocolStatus::TooNew { found_version: 84 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v85"),
+            RepositoryProtocolStatus::TooNew { found_version: 85 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),
