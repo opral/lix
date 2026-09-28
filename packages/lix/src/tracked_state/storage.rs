@@ -12976,9 +12976,11 @@ async fn hydrate_selected_loaded_entries(
         let entry = entries[index]
             .as_mut()
             .expect("selected entry came from the output batch");
-        if entry.change_record.schema_key != change_record.schema_key
+        if entry.change_record.change_id != change_record.change_id
+            || entry.change_record.schema_key != change_record.schema_key
             || entry.change_record.file_id != change_record.file_id
             || entry.change_record.row_pk != change_record.row_pk
+            || entry.change_record.created_at != change_record.created_at
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -12988,9 +12990,19 @@ async fn hydrate_selected_loaded_entries(
                 ),
             ));
         }
-        entry.change_record.snapshot = change_record.snapshot;
-        entry.change_record.metadata = change_record.metadata;
-        entry.change_record.origin_key = change_record.origin_key;
+        if change_record.snapshot.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state selected change '{}' has no canonical live payload",
+                    entry.change_record.change_id
+                ),
+            ));
+        }
+        // A selected delta belongs to the original change, not to the commit
+        // that selected it. The local entry's account comes from that commit's
+        // manifest, so retaining it would misattribute the hydrated payload.
+        entry.change_record = change_record;
         entry.selected_ref = false;
     }
     Ok(())
@@ -18703,6 +18715,20 @@ mod tests {
         commit_id: CommitId,
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
+        stage_fixture_manifest_with_author(
+            writes,
+            commit_id,
+            mutations,
+            crate::ANONYMOUS_ACCOUNT_ID,
+        )
+    }
+
+    fn stage_fixture_manifest_with_author(
+        writes: &mut StorageWriteSet,
+        commit_id: CommitId,
+        mutations: &CommitStateMutationInventory,
+        account_id: &str,
+    ) -> Result<(), LixError> {
         let record = CommitRecord {
             is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
@@ -18713,7 +18739,7 @@ mod tests {
             parent_commit_ids: Vec::new(),
             first_parent_jump_commit_id: commit_id,
             first_parent_jump_span: 0,
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            account_id: account_id.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
         };
         writes.put(
@@ -18721,10 +18747,9 @@ mod tests {
             key(commit_id.as_uuid().as_bytes().to_vec()),
             value(crate::changelog::encode_commit_record(&record)?),
         );
-        stage_commit_state_manifest(
-            writes,
-            &fixture_commit_state_manifest(commit_id, mutations.clone()),
-        )
+        let mut manifest = fixture_commit_state_manifest(commit_id, mutations.clone());
+        manifest.change_account_id = account_id.to_string();
+        stage_commit_state_manifest(writes, &manifest)
     }
 
     fn stage_commit_deltas(
@@ -19808,6 +19833,70 @@ mod tests {
             wrong_lifetime.is_err(),
             "an owner hint must not bypass lifetime validation"
         );
+    }
+
+    #[tokio::test]
+    async fn selected_commit_payload_retains_original_change_author() {
+        let storage = StorageAdapter::new(Memory::new());
+        let authored = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let selected = CommitId::for_test_label("selected-author-checkpoint");
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        let mut writes = storage.new_write_set();
+
+        let mut authored_deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
+        authored_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true])
+            .unwrap();
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            authored,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .unwrap();
+        let change_id = staged.assigned_change_ids[0];
+
+        let mut selected_fixture = fixture.clone();
+        selected_fixture.change_id = change_id;
+        let selected_fixtures = [selected_fixture];
+        let mut selected_deltas = commit_delta_refs(selected, &selected_fixtures);
+        selected_deltas[0].authored = false;
+        selected_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        selected_deltas[0].snapshot = None;
+        stage_addressable_commit_deltas(&mut writes, &selected_deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let selected_records = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(selected, fixture.key())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_records[0].as_ref().unwrap().account_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+        let records = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: selected,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(records[0].account_id, crate::SYSTEM_ACCOUNT_ID);
     }
 
     #[tokio::test]
