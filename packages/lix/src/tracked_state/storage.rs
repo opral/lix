@@ -12132,7 +12132,9 @@ async fn hydrate_selected_members(
     let canonical = load_change_records_by_ids(store, &change_ids).await?;
     for ((index, _), change_record) in selected.into_iter().zip(canonical) {
         let member = &mut members[index];
-        if change_record.schema_key != member.key.schema_key
+        if member.value.change_id != change_record.change_id
+            || member.value.updated_at != change_record.created_at
+            || change_record.schema_key != member.key.schema_key
             || change_record.file_id != member.key.file_id
             || change_record.row_pk != member.key.row_pk
         {
@@ -12144,11 +12146,53 @@ async fn hydrate_selected_members(
                 ),
             ));
         }
-        member.change.snapshot = change_record.snapshot;
-        member.change.metadata = change_record.metadata;
-        member.change.origin_key = change_record.origin_key;
+        member.change = canonical_selected_live_change(
+            &member.change,
+            &member.value.author_id,
+            change_record,
+        )?;
     }
     Ok(())
+}
+
+fn canonical_selected_live_change(
+    selected: &crate::changelog::ChangeRecord,
+    selected_author_id: &str,
+    canonical: crate::changelog::ChangeRecord,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    if selected.change_id != canonical.change_id
+        || selected.schema_key != canonical.schema_key
+        || selected.file_id != canonical.file_id
+        || selected.row_pk != canonical.row_pk
+        || selected.created_at != canonical.created_at
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state selected change '{}' references canonical authority for a different identity",
+                selected.change_id
+            ),
+        ));
+    }
+    if canonical.snapshot.is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state selected change '{}' has no canonical live payload",
+                selected.change_id
+            ),
+        ));
+    }
+    if selected_author_id != canonical.account_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state selected change '{}' author disagrees with canonical authority",
+                selected.change_id
+            ),
+        ));
+    }
+    Ok(canonical)
 }
 
 pub(crate) async fn scan_commit_delta_members(
@@ -12976,33 +13020,14 @@ async fn hydrate_selected_loaded_entries(
         let entry = entries[index]
             .as_mut()
             .expect("selected entry came from the output batch");
-        if entry.change_record.change_id != change_record.change_id
-            || entry.change_record.schema_key != change_record.schema_key
-            || entry.change_record.file_id != change_record.file_id
-            || entry.change_record.row_pk != change_record.row_pk
-            || entry.change_record.created_at != change_record.created_at
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state selected change '{}' references canonical authority for a different identity",
-                    entry.change_record.change_id
-                ),
-            ));
-        }
-        if change_record.snapshot.is_none() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state selected change '{}' has no canonical live payload",
-                    entry.change_record.change_id
-                ),
-            ));
-        }
         // A selected delta belongs to the original change, not to the commit
         // that selected it. The local entry's account comes from that commit's
         // manifest, so retaining it would misattribute the hydrated payload.
-        entry.change_record = change_record;
+        entry.change_record = canonical_selected_live_change(
+            &entry.change_record,
+            &entry.value.author_id,
+            change_record,
+        )?;
         entry.selected_ref = false;
     }
     Ok(())
@@ -19897,6 +19922,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(records[0].account_id, crate::SYSTEM_ACCOUNT_ID);
+
+        let selected_members = load_commit_delta_members_with_payloads(&read, selected)
+            .await
+            .unwrap();
+        assert_eq!(selected_members[0].change, records[0]);
+        let inventory = scan_commit_delta_inventory(&read).await.unwrap();
+        assert_eq!(inventory.commits[&selected].members[0].change, records[0]);
+        let scanned = scan_change_records_from_commit_deltas(&read).await.unwrap();
+        assert_eq!(scanned, records);
+
+        let mismatched = CommitId::for_test_label("selected-wrong-author");
+        let mut mismatched_deltas = commit_delta_refs(mismatched, &selected_fixtures);
+        mismatched_deltas[0].authored = false;
+        mismatched_deltas[0].snapshot = None;
+        let mut writes = storage.new_write_set();
+        stage_addressable_commit_deltas(&mut writes, &mismatched_deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(load_commit_delta_members_with_payloads(&read, mismatched)
+            .await
+            .is_err());
+        assert!(super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(mismatched, fixture.key())]
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
