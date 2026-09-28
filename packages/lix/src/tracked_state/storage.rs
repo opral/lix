@@ -8378,7 +8378,14 @@ pub(crate) fn load_change_records_by_ids<'a>(
     store: &'a (impl StorageAdapterRead + ?Sized),
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
-    Box::pin(load_change_records_by_ids_inner(store, change_ids))
+    Box::pin(load_change_records_by_ids_inner(store, change_ids, false))
+}
+
+fn load_selected_change_records_by_ids<'a>(
+    store: &'a (impl StorageAdapterRead + ?Sized),
+    change_ids: &'a [crate::changelog::ChangeId],
+) -> SelectedChangeRecordsFuture<'a> {
+    Box::pin(load_change_records_by_ids_inner(store, change_ids, true))
 }
 
 /// Only selected, unresolved explicit addresses are eligible for hydration.
@@ -8407,6 +8414,7 @@ fn require_selected_change_locators(
 async fn load_change_records_by_ids_inner(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
+    prefer_physical: bool,
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
@@ -8418,10 +8426,15 @@ async fn load_change_records_by_ids_inner(
         .reader(store)
         .load_changes(ChangeLoadRequest { change_ids })
         .await?;
-    let mut output = stored
+    let mut standalone = stored
         .into_iter()
         .map(|(_, record)| record)
         .collect::<Vec<_>>();
+    let mut output = if prefer_physical {
+        vec![None; change_ids.len()]
+    } else {
+        std::mem::take(&mut standalone)
+    };
     let mut authority_cache = BTreeMap::<CommitId, DirectChangeAuthority>::new();
     let mut direct_by_commit = BTreeMap::<
         CommitId,
@@ -8511,10 +8524,54 @@ async fn load_change_records_by_ids_inner(
                 Ok((*change_id, locator))
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let locators = require_selected_change_locators(&selected)?;
-        let records = Box::pin(load_explicit_change_records_at_locators(store, &locators)).await?;
-        for ((output_index, _), record) in explicit.into_iter().zip(records) {
-            output[output_index] = Some(record);
+        let mut located_indices = Vec::new();
+        let mut located = Vec::new();
+        let mut unresolved = Vec::new();
+        for ((output_index, change_id), (_, locator)) in explicit.into_iter().zip(selected) {
+            if let Some(locator) = locator {
+                located_indices.push(output_index);
+                located.push(locator);
+            } else if prefer_physical && standalone[output_index].is_some() {
+                output[output_index] = standalone[output_index].take();
+            } else {
+                unresolved.push((change_id, None));
+            }
+        }
+        require_selected_change_locators(&unresolved)?;
+        match Box::pin(load_explicit_change_records_at_locators(store, &located)).await {
+            Ok(records) => {
+                for (output_index, record) in located_indices.into_iter().zip(records) {
+                    output[output_index] = Some(record);
+                }
+            }
+            // Old partial checkpoints may leave an explicit locator pointing
+            // at a selected row. Isolate that rare batch failure so a valid
+            // standalone payload can supply just the stale aliases.
+            Err(error) if prefer_physical && error.code == STALE_SELECTED_CHANGE_LOCATOR => {
+                for (output_index, locator) in located_indices.into_iter().zip(located) {
+                    match Box::pin(load_explicit_change_records_at_locators(store, &[locator]))
+                        .await
+                    {
+                        Ok(mut records) => output[output_index] = records.pop(),
+                        Err(error)
+                            if error.code == STALE_SELECTED_CHANGE_LOCATOR
+                                && direct_change_locator(change_ids[output_index]).is_some()
+                                && standalone[output_index].is_some() =>
+                        {
+                            output[output_index] = standalone[output_index].take();
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if prefer_physical {
+        for (record, fallback) in output.iter_mut().zip(standalone) {
+            if record.is_none() {
+                *record = fallback;
+            }
         }
     }
     output
@@ -12147,7 +12204,7 @@ async fn hydrate_selected_members(
         .iter()
         .map(|(_, change_id)| *change_id)
         .collect::<Vec<_>>();
-    let canonical = load_change_records_by_ids(store, &change_ids).await?;
+    let canonical = load_selected_change_records_by_ids(store, &change_ids).await?;
     for ((index, _), change_record) in selected.into_iter().zip(canonical) {
         let member = &mut members[index];
         if member.value.change_id != change_record.change_id
@@ -13033,7 +13090,7 @@ async fn hydrate_selected_loaded_entries(
         .iter()
         .map(|(_, change_id)| *change_id)
         .collect::<Vec<_>>();
-    let canonical = load_change_records_by_ids(store, &change_ids).await?;
+    let canonical = load_selected_change_records_by_ids(store, &change_ids).await?;
     for ((index, _), change_record) in selected.into_iter().zip(canonical) {
         let entry = entries[index]
             .as_mut()
@@ -19985,6 +20042,171 @@ mod tests {
         .await
         .expect("the matching direct owner settles authority before the endpoint");
         assert_eq!(resolved, records);
+    }
+
+    #[tokio::test]
+    async fn selected_payload_prefers_physical_owner_over_stale_standalone() {
+        let storage = StorageAdapter::new(Memory::new());
+        let authored = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1235_0000_0000,
+        ));
+        let selected = CommitId::for_test_label("selected-stale-standalone");
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        let mut writes = storage.new_write_set();
+        let authored_deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true])
+            .unwrap();
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            authored,
+            staged.mutation_inventory(),
+            crate::ANONYMOUS_ACCOUNT_ID,
+        )
+        .unwrap();
+        let change_id = staged.assigned_change_ids[0];
+        let mut selected_fixture = fixture.clone();
+        selected_fixture.change_id = change_id;
+        let selected_fixtures = [selected_fixture];
+        let mut selected_deltas = commit_delta_refs(selected, &selected_fixtures);
+        selected_deltas[0].authored = false;
+        selected_deltas[0].snapshot = None;
+        stage_addressable_commit_deltas(&mut writes, &selected_deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(authored, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.snapshot = Some(b"stale-standalone".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            super::load_change_records_by_ids(&read, &[change_id])
+                .await
+                .unwrap(),
+            vec![stale]
+        );
+        let members = load_commit_delta_members_with_payloads(&read, selected)
+            .await
+            .unwrap();
+        assert_eq!(members[0].change, canonical);
+        let point = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(selected, fixture.key())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(point[0], Some(canonical));
+    }
+
+    #[tokio::test]
+    async fn selected_payload_uses_standalone_when_old_locator_targets_selected_row() {
+        let storage = StorageAdapter::new(Memory::new());
+        let absent_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1236_0000_0000,
+        ));
+        let selected = CommitId::for_test_label("selected-stale-locator");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        fixture.change_id = super::addressable_change_id(absent_owner, 0, 0).unwrap();
+        let fixtures = [fixture.clone()];
+        let mut deltas = commit_delta_refs(selected, &fixtures);
+        deltas[0].authored = false;
+        deltas[0].snapshot = None;
+        let mut writes = storage.new_write_set();
+        stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+        stage_change_locators(
+            &mut writes,
+            &[super::CommitDeltaChangeLocator {
+                change_id: fixture.change_id,
+                commit_id: selected,
+                segment_index: 0,
+                ordinal: 0,
+            }],
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let canonical = crate::changelog::ChangeRecord {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            format_version: 2,
+            change_id: fixture.change_id,
+            schema_key: fixture.schema_key.clone(),
+            row_pk: fixture.row_pk.clone(),
+            file_id: fixture.file_id.clone(),
+            metadata: None,
+            snapshot: Some(b"typed-live-fixture".to_vec()),
+            created_at: fixture.updated_at,
+            origin_key: None,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![canonical.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let members = load_commit_delta_members_with_payloads(&read, selected)
+            .await
+            .unwrap();
+        assert_eq!(members[0].change, canonical);
+        let point = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(selected, fixture.key())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(point[0], Some(canonical));
     }
 
     #[tokio::test]
