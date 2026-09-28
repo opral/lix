@@ -8378,14 +8378,42 @@ pub(crate) fn load_change_records_by_ids<'a>(
     store: &'a (impl StorageAdapterRead + ?Sized),
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
-    Box::pin(load_change_records_by_ids_inner(store, change_ids, false))
+    Box::pin(async move {
+        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, false, false, None).await?)
+    })
 }
 
 fn load_selected_change_records_by_ids<'a>(
     store: &'a (impl StorageAdapterRead + ?Sized),
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
-    Box::pin(load_change_records_by_ids_inner(store, change_ids, true))
+    Box::pin(async move {
+        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, true, false, None).await?)
+    })
+}
+
+fn load_selected_change_records_by_ids_optional<'a>(
+    store: &'a (impl StorageAdapterRead + ?Sized),
+    change_ids: &'a [crate::changelog::ChangeId],
+    standalone: Vec<Option<crate::changelog::ChangeRecord>>,
+) -> futures_util::future::BoxFuture<
+    'a,
+    Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError>,
+> {
+    Box::pin(load_change_records_by_ids_inner(store, change_ids, true, true, Some(standalone)))
+}
+
+fn require_all_selected_changes(
+    records: Vec<Option<crate::changelog::ChangeRecord>>,
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    records
+        .into_iter()
+        .map(|record| {
+            record.ok_or_else(|| {
+                replacement_payload_error("selected change resolution lost a requested row")
+            })
+        })
+        .collect()
 }
 
 /// Only selected, unresolved explicit addresses are eligible for hydration.
@@ -8415,21 +8443,26 @@ async fn load_change_records_by_ids_inner(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
     prefer_physical: bool,
-) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    allow_missing: bool,
+    preloaded_standalone: Option<Vec<Option<crate::changelog::ChangeRecord>>>,
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
     }
     // Self-contained sync checkpoints may carry selected payloads while the
     // authored commit body remains lazy. Prefer their canonical standalone
     // ChangeRecords before attempting commit-delta routing.
-    let stored = ChangelogContext::new()
-        .reader(store)
-        .load_changes(ChangeLoadRequest { change_ids })
-        .await?;
-    let mut standalone = stored
-        .into_iter()
-        .map(|(_, record)| record)
-        .collect::<Vec<_>>();
+    let mut standalone = if let Some(stored) = preloaded_standalone {
+        stored
+    } else {
+        ChangelogContext::new()
+            .reader(store)
+            .load_changes(ChangeLoadRequest { change_ids })
+            .await?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>()
+    };
     let mut output = if prefer_physical {
         vec![None; change_ids.len()]
     } else {
@@ -8537,7 +8570,9 @@ async fn load_change_records_by_ids_inner(
                 unresolved.push((change_id, None));
             }
         }
-        require_selected_change_locators(&unresolved)?;
+        if !allow_missing {
+            require_selected_change_locators(&unresolved)?;
+        }
         match Box::pin(load_explicit_change_records_at_locators(store, &located)).await {
             Ok(records) => {
                 for (output_index, record) in located_indices.into_iter().zip(records) {
@@ -8555,8 +8590,7 @@ async fn load_change_records_by_ids_inner(
                         Ok(mut records) => output[output_index] = records.pop(),
                         Err(error)
                             if error.code == STALE_SELECTED_CHANGE_LOCATOR
-                                && direct_change_locator(change_ids[output_index]).is_some()
-                                && standalone[output_index].is_some() =>
+                                && (standalone[output_index].is_some() || allow_missing) =>
                         {
                             output[output_index] = standalone[output_index].take();
                         }
@@ -8574,14 +8608,7 @@ async fn load_change_records_by_ids_inner(
             }
         }
     }
-    output
-        .into_iter()
-        .map(|record| {
-            record.ok_or_else(|| {
-                replacement_payload_error("selected change resolution lost a requested row")
-            })
-        })
-        .collect()
+    Ok(output)
 }
 
 async fn load_explicit_change_records_at_locators(
@@ -9976,6 +10003,95 @@ pub(crate) struct AuthoritativeLiveChangeRequest {
     pub(crate) source_commit_id: CommitId,
     pub(crate) key: TrackedStateKey,
     pub(crate) updated_at: crate::common::LixTimestamp,
+}
+
+/// Commit selection must use the immutable authored payload when it is local.
+/// A standalone changelog row may be a stale projection of that payload; it
+/// remains a fallback for self-contained sparse checkpoints.
+pub(crate) async fn load_authoritative_selected_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[AuthoritativeLiveChangeRequest],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let change_ids = requests
+        .iter()
+        .map(|request| request.change_id)
+        .collect::<Vec<_>>();
+    let standalone = ChangelogContext::new()
+        .reader(store)
+        .load_changes(ChangeLoadRequest {
+            change_ids: &change_ids,
+        })
+        .await?
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
+    let deferred_sources = requests
+        .iter()
+        .zip(&standalone)
+        .filter_map(|(request, record)| {
+            record
+                .as_ref()
+                .filter(|record| authoritative_live_change_matches(request, record))
+                .map(|_| request.source_commit_id)
+        })
+        .collect::<Vec<_>>();
+    let deferred = deferred_commit_history_ids(store, &deferred_sources)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut records = vec![None; requests.len()];
+    let mut candidate_indices = Vec::new();
+    let mut candidate_ids = Vec::new();
+    let mut candidate_standalone = Vec::new();
+    for (index, (request, record)) in requests.iter().zip(standalone).enumerate() {
+        if deferred.contains(&request.source_commit_id)
+            && record
+                .as_ref()
+                .is_some_and(|record| authoritative_live_change_matches(request, record))
+        {
+            records[index] = record;
+        } else {
+            candidate_indices.push(index);
+            candidate_ids.push(request.change_id);
+            candidate_standalone.push(record);
+        }
+    }
+    let candidates = load_selected_change_records_by_ids_optional(
+        store,
+        &candidate_ids,
+        candidate_standalone,
+    )
+    .await?;
+    let mut unresolved_indices = Vec::new();
+    let mut unresolved_requests = Vec::new();
+    for (index, candidate) in candidate_indices.into_iter().zip(candidates) {
+        let request = &requests[index];
+        if candidate
+            .as_ref()
+            .is_some_and(|record| authoritative_live_change_matches(request, record))
+        {
+            records[index] = candidate;
+        } else {
+            unresolved_indices.push(index);
+            unresolved_requests.push(AuthoritativeLiveChangeRequest {
+                change_id: request.change_id,
+                source_commit_id: request.source_commit_id,
+                key: request.key.clone(),
+                updated_at: request.updated_at,
+            });
+        }
+    }
+    let fallback = load_authoritative_live_change_records(store, &unresolved_requests).await?;
+    for (index, record) in unresolved_indices.into_iter().zip(fallback) {
+        records[index] = Some(record);
+    }
+    Ok(records
+        .into_iter()
+        .map(|record| record.expect("all unresolved selected changes were loaded"))
+        .collect())
 }
 
 /// Resolves live payloads from local changelog authority first, then checks
@@ -20089,6 +20205,7 @@ mod tests {
         .remove(0)
         .unwrap();
         let mut stale = canonical.clone();
+        stale.account_id = crate::SYSTEM_ACCOUNT_ID.to_string();
         stale.snapshot = Some(b"stale-standalone".to_vec());
         let mut writes = storage.new_write_set();
         let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
@@ -20127,18 +20244,35 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(point[0], Some(canonical));
+        assert_eq!(point[0], Some(canonical.clone()));
+        let selected_source = super::load_authoritative_selected_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: selected,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected_source, vec![canonical]);
     }
 
     #[tokio::test]
     async fn selected_payload_uses_standalone_when_old_locator_targets_selected_row() {
+        for address_shaped in [true, false] {
         let storage = StorageAdapter::new(Memory::new());
         let absent_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0192_0000_0000_7000_8000_1236_0000_0000,
         ));
         let selected = CommitId::for_test_label("selected-stale-locator");
         let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
-        fixture.change_id = super::addressable_change_id(absent_owner, 0, 0).unwrap();
+        fixture.change_id = if address_shaped {
+            super::addressable_change_id(absent_owner, 0, 0).unwrap()
+        } else {
+            ChangeId::for_test_label("legacy-selected-stale-locator")
+        };
         let fixtures = [fixture.clone()];
         let mut deltas = commit_delta_refs(selected, &fixtures);
         deltas[0].authored = false;
@@ -20206,7 +20340,20 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(point[0], Some(canonical));
+            assert_eq!(point[0], Some(canonical.clone()));
+        let selected_source = super::load_authoritative_selected_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: fixture.change_id,
+                source_commit_id: selected,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected_source, vec![canonical]);
+        }
     }
 
     #[tokio::test]

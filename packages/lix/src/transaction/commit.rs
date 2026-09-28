@@ -36,7 +36,7 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    encode_key_ref, load_authoritative_live_change_records, load_commit_delta_replay_metadata,
+    encode_key_ref, load_authoritative_selected_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1858,7 +1858,7 @@ async fn load_selected_change_records(
             updated_at: change_ref.updated_at,
         })
         .collect::<Vec<_>>();
-    let loaded = load_authoritative_live_change_records(read, &requests).await?;
+    let loaded = load_authoritative_selected_change_records(read, &requests).await?;
 
     let mut records = HashMap::new();
     for (change_ref, record) in change_refs.into_iter().zip(loaded) {
