@@ -380,6 +380,7 @@ mod tests {
             StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
             crate::changelog::encode_commit_record(&CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -424,6 +425,7 @@ mod tests {
             let parent_commit_id = commit_id(parent);
             let record = CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -792,6 +794,7 @@ mod tests {
         let right = commit_id("commit-cycle-right");
         let record = |commit_id, parents| CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -970,6 +973,7 @@ mod tests {
         let mut writes = storage.new_write_set();
         let record = CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -1532,6 +1536,7 @@ mod tests {
             };
             let record = CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,

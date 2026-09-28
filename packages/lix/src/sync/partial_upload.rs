@@ -587,6 +587,7 @@ mod paging_and_resume_tests {
                 created_at: crate::common::LixTimestamp::parse("2026-08-11T00:00:00Z").unwrap(),
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
             });
         }
         let mut writes = storage.new_write_set();

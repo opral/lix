@@ -9,7 +9,7 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
@@ -267,6 +267,32 @@ fn position_upper_bound(filters: &[Expr], column: &str) -> Option<i64> {
         .min()
 }
 
+/// Only a conjunction containing an exact `is_checkpoint = TRUE` predicate
+/// licenses the checkpoint summary route. ORs and equivalent-looking casts
+/// remain on the complete first-parent scan.
+fn requires_checkpoint_rows(filters: &[Expr]) -> bool {
+    conjuncts(filters).iter().any(|filter| {
+        if matches!(filter, Expr::Column(column) if column.name == "is_checkpoint") {
+            return true;
+        }
+        let Expr::BinaryExpr(binary) = filter else {
+            return false;
+        };
+        if binary.op != Operator::Eq {
+            return false;
+        }
+        matches!(
+            (binary.left.as_ref(), binary.right.as_ref()),
+            (Expr::Column(column), Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+                if column.name == "is_checkpoint"
+        ) || matches!(
+            (binary.right.as_ref(), binary.left.as_ref()),
+            (Expr::Column(column), Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+                if column.name == "is_checkpoint"
+        )
+    })
+}
+
 fn matches_metadata(batch: &RecordBatch, filters: &[Arc<dyn PhysicalExpr>]) -> Result<bool> {
     for expr in filters {
         let value = expr.evaluate(batch)?.into_array(batch.num_rows())?;
@@ -405,6 +431,8 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
         let (metadata_filters, row_filters): (Vec<_>, Vec<_>) = conjuncts(filters)
             .into_iter()
             .partition(|f| metadata_only(f, &meta_schema));
+        let checkpoint_summary_route = self.relation.is_none()
+            && requires_checkpoint_rows(&metadata_filters);
         let max_position = position_upper_bound(
             &metadata_filters,
             if self.relation.is_some() {
@@ -510,12 +538,14 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     let blob_reader = Arc::clone(&blob_reader);
                     let stream_schema = schema.clone();
                     let include_state_headers = relation.is_some();
-                    let stream = async_stream::try_stream! {
-                        let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
-                        let mut graph = CommitGraphContext::new().reader(store.clone());
-                        let mut next = Some(anchor);
-                        let mut position = 0i64;
-                        let mut emitted = 0usize;
+            let stream = async_stream::try_stream! {
+                let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
+                let mut graph = CommitGraphContext::new().reader(store.clone());
+                let mut next = Some(anchor);
+                let mut position = 0i64;
+                let mut checkpoint_cursor = checkpoint_summary_route;
+                let mut first_cursor_node = true;
+                let mut emitted = 0usize;
                         let mut completed_history_checkpoints = 0usize;
                         loop {
                             // Collect a bounded, ordered graph window before resolving the
@@ -524,6 +554,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             // Ordered pages stop promptly, and each history diff keeps
                             // its original checkpoint and selected-ID frontier.
                             let mut window = Vec::with_capacity(window_size);
+                            let mut traversed_node = false;
                             while window.len() < window_size {
                                 if max_position.is_some_and(|ceiling| position > ceiling) { break; }
                                 if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
@@ -531,17 +562,70 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                 record_work(false);
                                 let node = graph.load_node(&id).await.map_err(lix_error_to_datafusion_error)?
                                     .ok_or_else(|| lix_error_to_datafusion_error(crate::commit_graph::missing_commit_graph_error(&id)))?;
-                                next = node.parent_commit_ids.first().copied();
+                                traversed_node = true;
                                 let current_position = position;
-                                position += 1;
                                 let selected = remaining_ids
                                     .as_mut()
                                     .map_or(true, |ids| ids.remove(&id.to_string()));
                                 let parent = node.parent_commit_ids.first().copied();
-                                window.push((node, current_position, selected, parent));
+                                if checkpoint_cursor {
+                                    let is_anchor = first_cursor_node;
+                                    first_cursor_node = false;
+                                    let summary = node.first_parent_checkpoint_summary;
+                                    match summary {
+                                        Some(summary) => {
+                                            if let Some(previous_checkpoint_id) = summary.previous_checkpoint_id {
+                                                if summary.first_parent_distance == 0 {
+                                                    Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                                        format!("commit '{}' has a zero-distance checkpoint summary", node.commit_id),
+                                                    )))?;
+                                                }
+                                                let distance = i64::try_from(summary.first_parent_distance)
+                                                    .map_err(|_| lix_error_to_datafusion_error(crate::LixError::unknown("first-parent checkpoint position exceeds i64")))?;
+                                                position = current_position.checked_add(distance)
+                                                    .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("first-parent checkpoint position exceeds i64")))?;
+                                                next = Some(previous_checkpoint_id);
+                                            } else {
+                                                if summary.first_parent_distance != 0 {
+                                                    Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                                        format!("commit '{}' has a checkpoint-free summary with nonzero distance", node.commit_id),
+                                                    )))?;
+                                                }
+                                                next = None;
+                                            }
+                                        }
+                                        None => {
+                                            checkpoint_cursor = false;
+                                            next = parent;
+                                            position = current_position.checked_add(1)
+                                                .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("mainline position exceeds i64")))?;
+                                        }
+                                    }
+                                    if node.is_checkpoint && selected {
+                                        window.push((node, current_position, selected, parent));
+                                    } else if !is_anchor && !node.is_checkpoint {
+                                        Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                            format!("checkpoint summary target '{}' is not a checkpoint", node.commit_id),
+                                        )))?;
+                                    }
+                                } else {
+                                    next = parent;
+                                    position = current_position.checked_add(1)
+                                        .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("mainline position exceeds i64")))?;
+                                    window.push((node, current_position, selected, parent));
+                                }
                                 if remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
                             }
-                            if window.is_empty() { break; }
+                            if window.is_empty() {
+                                if checkpoint_cursor
+                                    && traversed_node
+                                    && next.is_some()
+                                    && !remaining_ids.as_ref().is_some_and(BTreeSet::is_empty)
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
 
                             let mut checkpoint_active = window.iter()
                                 .map(|(node, _, _, _)| node.is_checkpoint)

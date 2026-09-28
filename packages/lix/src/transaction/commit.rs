@@ -1031,6 +1031,7 @@ async fn stage_changelog_commits(
         .await?;
     let mut generations = BTreeMap::new();
     let mut first_parent_jumps = BTreeMap::new();
+    let mut first_parent_checkpoint_summaries = BTreeMap::new();
     let mut topology_records = BTreeMap::new();
     let mut touched_scope_digests = BTreeMap::<CommitId, CommitTouchedScopeDigest>::new();
     let mut rootless_depths = BTreeMap::new();
@@ -1303,7 +1304,22 @@ async fn stage_changelog_commits(
                 None => CommitTouchedScopeDigest::exact(std::iter::empty()),
             }
         };
+        // The checkpoint cursor belongs to the causal first-parent lane. In
+        // particular, a merge must not inherit a checkpoint from its secondary
+        // parent, even when that parent has the greater graph generation.
+        let first_parent_record = commit
+            .parent_commit_ids
+            .first()
+            .and_then(|parent| topology_records.get(parent))
+            .cloned();
+        let first_parent_checkpoint_summary =
+            crate::changelog::derive_first_parent_checkpoint_summary(
+                &commit.parent_commit_ids,
+                first_parent_record.as_ref(),
+            )?;
         touched_scope_digests.insert(commit_id, touched_scope_digest.clone());
+        first_parent_checkpoint_summaries
+            .insert(commit_id, first_parent_checkpoint_summary);
         topology_records.insert(
             commit_id,
             CommitRecord {
@@ -1318,6 +1334,7 @@ async fn stage_changelog_commits(
                 account_id: active_account_id.to_string(),
                 created_at: commit.created_at,
                 touched_scope_digest,
+                first_parent_checkpoint_summary,
             },
         );
         for child in children.get(&commit_id).into_iter().flatten() {
@@ -1377,6 +1394,8 @@ async fn stage_changelog_commits(
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
             touched_scope_digest: touched_scope_digests[&commit_row.commit_id].clone(),
+            first_parent_checkpoint_summary: first_parent_checkpoint_summaries
+                [&commit_row.commit_id],
         };
         commits.push(record.clone());
         let change_count = state_row_indices.len()
@@ -11735,6 +11754,7 @@ mod tests {
                         let commit_id = commit_id(&format!("missing-fallback-owner-{index}"));
                         CommitRecord {
                             is_checkpoint: false,
+                            first_parent_checkpoint_summary: None,
                             format_version: COMMIT_RECORD_FORMAT_VERSION,
                             base_commit_id: None,
                             commit_id,

@@ -876,6 +876,7 @@ async fn stage_test_changelog_commit(
         .unwrap_or_else(test_timestamp);
     let record = CommitRecord {
         is_checkpoint: false,
+        first_parent_checkpoint_summary: None,
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
         format_version: 4,
         base_commit_id: None,

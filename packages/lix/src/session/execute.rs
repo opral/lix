@@ -6232,6 +6232,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_log_summary_matches_scan_and_ignores_secondary_checkpoints() {
+        let session = open_session().await;
+        for index in 0..4 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, 'main-before')",
+                    &[Value::Text(format!("checkpoint-main-before-{index}"))],
+                )
+                .await
+                .expect("mainline commit should publish");
+        }
+        let first = session
+            .create_checkpoint()
+            .await
+            .expect("first checkpoint should publish");
+        let main_branch_id = session
+            .execute("SELECT lix_active_branch_id() AS branch_id", &[])
+            .await
+            .expect("active branch should resolve")
+            .rows()[0]
+            .get::<String>("branch_id")
+            .expect("branch ID should be text");
+        let side = session
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "checkpoint-summary-side".to_owned(),
+                from_commit_id: Some(first.commit_id.clone()),
+            })
+            .await
+            .expect("side branch should fork from the first checkpoint");
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: side.id.clone(),
+            })
+            .await
+            .expect("side branch should become active");
+        for index in 0..8 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, 'side')",
+                    &[Value::Text(format!("checkpoint-side-{index}"))],
+                )
+                .await
+                .expect("side history commit should publish");
+        }
+        let secondary_checkpoint = session
+            .create_checkpoint()
+            .await
+            .expect("secondary checkpoint should publish");
+        session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: main_branch_id,
+            })
+            .await
+            .expect("main branch should become active");
+        for index in 0..6 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, 'main-after')",
+                    &[Value::Text(format!("checkpoint-main-after-{index}"))],
+                )
+                .await
+                .expect("mainline commit should publish");
+        }
+        let second = session
+            .create_checkpoint()
+            .await
+            .expect("second mainline checkpoint should publish");
+        for index in 0..3 {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, 'main-tail')",
+                    &[Value::Text(format!("checkpoint-main-tail-{index}"))],
+                )
+                .await
+                .expect("mainline tail commit should publish");
+        }
+        let merge = session
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: side.id,
+            })
+            .await
+            .expect("the unrelated branch checkpoint should merge");
+        assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
+
+        let fast_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                        FROM lix_log() WHERE is_checkpoint ORDER BY position ASC";
+        crate::sql2::take_mainline_work();
+        let fast = session
+            .execute(fast_sql, &[])
+            .await
+            .expect("summary-backed checkpoint log should read");
+        let (fast_graph_reads, _) = crate::sql2::take_mainline_work();
+        let scan_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                        FROM lix_log() WHERE is_checkpoint OR commit_id = '' ORDER BY position ASC";
+        crate::sql2::take_mainline_work();
+        let scan = session
+            .execute(scan_sql, &[])
+            .await
+            .expect("ordinary checkpoint scan should read");
+        let (scan_graph_reads, _) = crate::sql2::take_mainline_work();
+        assert_eq!(
+            fast.rows(),
+            scan.rows(),
+            "metadata and positions must match the scan oracle"
+        );
+        let ids = fast
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("commit_id").expect("commit id is text"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [second.commit_id.clone(), first.commit_id.clone()]);
+        assert!(
+            !ids.contains(&secondary_checkpoint.commit_id),
+            "a secondary-parent checkpoint must not enter first-parent log results"
+        );
+        assert!(fast_graph_reads < scan_graph_reads);
+
+        session
+            .execute(
+                "SELECT commit_id FROM lix_undo($1)",
+                &[Value::Text(second.commit_id.clone())],
+            )
+            .await
+            .expect("mainline checkpoint should be retireable");
+        crate::sql2::take_mainline_work();
+        let after_retirement = session
+            .execute(fast_sql, &[])
+            .await
+            .expect("summary route should preserve anchor-pinned retirement state");
+        crate::sql2::take_mainline_work();
+        let scan_after_retirement = session
+            .execute(scan_sql, &[])
+            .await
+            .expect("scan route should read retired checkpoint state");
+        assert_eq!(after_retirement.rows(), scan_after_retirement.rows());
+        assert_eq!(
+            after_retirement.rows().len(),
+            1,
+            "retiring the newest checkpoint should leave the older first-parent checkpoint active"
+        );
+        assert_eq!(
+            after_retirement.rows()[0]
+                .get::<String>("commit_id")
+                .expect("commit id is text"),
+            first.commit_id
+        );
+    }
+
+    #[tokio::test]
     async fn exact_registered_schema_point_preserves_typed_public_projection() {
         let session = open_session().await;
         let schema = serde_json::json!({

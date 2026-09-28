@@ -64,6 +64,14 @@ fn setting(name: &str, fallback: usize) -> usize {
 async fn seven_p95_workloads() {
     let rows = setting("LIX_P95_ROWS", 128);
     let history = setting("LIX_P95_HISTORY", 128);
+    // Add ordinary restore commits after the final checkpoint, in its open
+    // first-parent interval. Alternating between the last two distinct
+    // checkpoints makes each restore a real non-checkpoint commit while
+    // keeping the mainline checkpoint count fixed.
+    let history_gap_commits = setting("LIX_P95_HISTORY_GAP_COMMITS", 0);
+    // Checkpoints on this sibling branch enter the repository-wide inventory
+    // but must not enter the active branch's first-parent log.
+    let off_mainline_checkpoints = setting("LIX_P95_OFF_MAINLINE_CHECKPOINTS", 0);
     let repeats = setting("LIX_P95_REPEATS", 100);
     let dirty_files = setting("LIX_P95_DIRTY_FILES", 1);
     let root_current_base = setting("LIX_P95_ROOT_CURRENT_BASE", 0) != 0;
@@ -71,6 +79,7 @@ async fn seven_p95_workloads() {
     assert!(matches!(mode.as_str(), "execute" | "production_kinds"));
     assert!(dirty_files >= 1 && dirty_files <= rows);
     assert!(rows >= 8 && history >= 1 && repeats >= 20);
+    assert!(history_gap_commits == 0 || history >= 2);
     let storage = Memory::default();
     Engine::initialize(storage.clone()).await.unwrap();
     let seed_engine = Engine::new(storage.clone()).await.unwrap();
@@ -87,11 +96,98 @@ async fn seven_p95_workloads() {
         .await
         .unwrap();
     }
+    let mut checkpoint_ids = Vec::with_capacity(history);
     for i in 0..history {
         seed.execute("INSERT INTO lix_key_value (key,value) VALUES ('p95-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value", &[Value::Text(i.to_string())]).await.unwrap();
-        seed.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        let checkpoint = seed
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
             .unwrap();
+        checkpoint_ids.push(
+            checkpoint.rows()[0]
+                .get::<String>("commit_id")
+                .expect("checkpoint fixture returns its commit ID"),
+        );
+    }
+    if history_gap_commits > 0 {
+        let ordinary_count_before = seed
+            .execute(
+                "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = false",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+        let previous_checkpoint = &checkpoint_ids[history - 2];
+        let latest_checkpoint = &checkpoint_ids[history - 1];
+        for i in 0..history_gap_commits {
+            let target = if i % 2 == 0 {
+                previous_checkpoint
+            } else {
+                latest_checkpoint
+            };
+            seed.execute(
+                "SELECT commit_id FROM lix_restore($1)",
+                &[Value::Text((*target).clone())],
+            )
+            .await
+            .unwrap();
+        }
+        let ordinary_count_after = seed
+            .execute(
+                "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = false",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+        assert_eq!(
+            ordinary_count_after - ordinary_count_before,
+            i64::try_from(history_gap_commits).unwrap(),
+            "each alternating restore must add one visible non-checkpoint mainline node",
+        );
+    }
+    if off_mainline_checkpoints > 0 {
+        let branch = seed
+            .create_branch(crate::session::CreateBranchOptions {
+                id: None,
+                name: "p95-off-mainline-history".into(),
+                from_commit_id: Some(checkpoint_ids[history - 1].clone()),
+            })
+            .await
+            .unwrap();
+        let side = seed_engine.open_session_at(branch.id).await.unwrap();
+        for i in 0..off_mainline_checkpoints {
+            side.execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('p95-off-mainline-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value",
+                &[Value::Text(i.to_string())],
+            )
+            .await
+            .unwrap();
+            side.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+                .await
+                .unwrap();
+        }
+        let side_checkpoint_count = side
+            .execute(
+                "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = true",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+        assert_eq!(
+            side_checkpoint_count,
+            i64::try_from(history + off_mainline_checkpoints).unwrap(),
+            "side-branch fixture must publish all requested off-mainline checkpoints",
+        );
+        side.close().await.unwrap();
     }
     let root_current_base_branch = if root_current_base {
         let branch = seed
@@ -219,6 +315,26 @@ async fn seven_p95_workloads() {
     for (_, sql, params) in &queries {
         expected.push(seed.execute(sql, params).await.unwrap());
     }
+    let mainline_checkpoint_count = seed
+        .execute(
+            "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = true",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("n")
+        .unwrap();
+    assert_eq!(
+        mainline_checkpoint_count,
+        i64::try_from(history).unwrap(),
+        "side-branch checkpoints and open-interval restores must not change mainline checkpoint count",
+    );
+    assert_eq!(
+        expected[0].rows()[0].get::<i64>("total_count").unwrap(),
+        i64::try_from(history).unwrap(),
+        "the full window count must report all active-mainline checkpoints",
+    );
     assert_eq!(
         expected[1].rows()[0].get::<i64>("file_count").unwrap(),
         dirty_files as i64
@@ -317,7 +433,7 @@ async fn seven_p95_workloads() {
         }
         println!(
             "P95_WORKLOAD={}",
-            serde_json::json!({"query":name,"execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
+            serde_json::json!({"query":name,"execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"history_gap_noncheckpoint_commits":history_gap_commits,"off_mainline_checkpoints":off_mainline_checkpoints,"dirty_files":dirty_files,"repeats":repeats,"rows":oracle.len(),"cold":cold,"warm":warm,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed","cold_scope":"fresh_engine_session_first_execution_same_memory_storage"})
         );
         if name == "file_content_id" {
             let mut changing_ids = Vec::new();
@@ -335,7 +451,7 @@ async fn seven_p95_workloads() {
             }
             println!(
                 "P95_WORKLOAD={}",
-                serde_json::json!({"query":name,"variant":"changing_ids","execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"dirty_files":dirty_files,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
+                serde_json::json!({"query":name,"variant":"changing_ids","execution_kind":if observe {"observe_sql"} else {"execute"},"backend":"canonical_memory","serving_layout":if root_current_base {"root_current_base"} else {"canonical_memory_default"},"files":rows,"checkpoints":history,"history_gap_noncheckpoint_commits":history_gap_commits,"off_mainline_checkpoints":off_mainline_checkpoints,"dirty_files":dirty_files,"repeats":repeats,"warm":changing_ids,"verified":true,"timing_scope":"execute_through_lazy_public_rows_consumed"})
             );
         }
         session.close().await.unwrap();

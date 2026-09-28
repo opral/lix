@@ -92,7 +92,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -213,7 +213,13 @@ where
     if from_version <= 80 {
         migration_step(|| super::runtime_epoch::migrate(&adapter, false)).await?;
     }
-    migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
+    if from_version <= 81 {
+        migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
+    }
+    migration_step(|| {
+        super::first_parent_checkpoints::migrate(&adapter, options, false)
+    })
+    .await?;
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
     }
@@ -1271,6 +1277,7 @@ where
         };
         let upgraded = crate::changelog::CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: record.commit_id,
             generation: record.generation,

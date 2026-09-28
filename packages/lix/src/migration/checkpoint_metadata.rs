@@ -22,6 +22,43 @@ use crate::{LixError, storage_codec};
 use super::api::MigrationOptions;
 use super::publish::{PublicationPlan, publish};
 
+/// Exact packed v7 record layout. The current v8 reader must not attempt to
+/// infer old arity from trailing defaults.
+#[derive(Debug, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(super) struct CommitRecordV7 {
+    pub(super) format_version: u32,
+    pub(super) commit_id: CommitId,
+    pub(super) generation: u64,
+    pub(super) parent_commit_ids: Vec<CommitId>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(super) base_commit_id: Option<CommitId>,
+    pub(super) first_parent_jump_commit_id: CommitId,
+    pub(super) first_parent_jump_span: u64,
+    pub(super) account_id: String,
+    pub(super) created_at: crate::common::LixTimestamp,
+    pub(super) touched_scope_digest: crate::changelog::CommitTouchedScopeDigest,
+    pub(super) is_checkpoint: bool,
+}
+
+pub(super) fn decode_v7(bytes: &[u8]) -> Option<CommitRecord> {
+    let record = storage_codec::decode::<CommitRecordV7>("legacy v7 commit record", bytes).ok()?;
+    (record.format_version == 7).then(|| CommitRecord {
+        format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+        commit_id: record.commit_id,
+        generation: record.generation,
+        parent_commit_ids: record.parent_commit_ids,
+        base_commit_id: record.base_commit_id,
+        first_parent_jump_commit_id: record.first_parent_jump_commit_id,
+        first_parent_jump_span: record.first_parent_jump_span,
+        account_id: record.account_id,
+        created_at: record.created_at,
+        touched_scope_digest: record.touched_scope_digest,
+        is_checkpoint: record.is_checkpoint,
+        first_parent_checkpoint_summary: None,
+    })
+}
+
 /// Exact v6 packed arity. Never add defaults to the canonical v7 decoder:
 /// legacy data is accepted only by the fenced migration path.
 #[derive(Debug, musli::Encode, musli::Decode)]
@@ -54,6 +91,7 @@ pub(super) fn decode_v6(bytes: &[u8]) -> Option<CommitRecord> {
         created_at: record.created_at,
         touched_scope_digest: record.touched_scope_digest,
         is_checkpoint: false,
+        first_parent_checkpoint_summary: None,
     })
 }
 
@@ -100,9 +138,10 @@ async fn records<S: crate::storage_adapter::StorageAdapterRead>(
             let record = storage_codec::decode::<CommitRecord>("commit record", &value)
                 .ok()
                 .filter(|r| r.format_version == crate::changelog::COMMIT_RECORD_FORMAT_VERSION)
+                .or_else(|| decode_v7(&value))
                 .or_else(|| decode_v6(&value))
                 .ok_or_else(|| {
-                    failure("checkpoint migration encountered an invalid v6/v7 commit record")
+                    failure("checkpoint migration encountered an invalid v6/v7/v8 commit record")
                 })?;
             let id = record.commit_id;
             if entry.key.0.as_ref() != crate::changelog::commit_key(id).as_slice() {

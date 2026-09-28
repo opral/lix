@@ -8282,6 +8282,7 @@ mod tests {
                 )),
                 crate::changelog::encode_commit_record(&CommitRecord {
                     is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     base_commit_id: None,

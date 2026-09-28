@@ -154,7 +154,7 @@ async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_la
         )
         .await
         .unwrap();
-    let baseline_retirement_work = crate::sql2::take_checkpoint_retirement_work();
+    crate::sql2::take_checkpoint_retirement_work();
     let baseline_nodes = baseline_nodes.rows()[0].get::<i64>("nodes").unwrap() as usize;
     let baseline_checkpoints = baseline_checkpoints.rows()[0]
         .get::<i64>("checkpoints")
@@ -168,7 +168,6 @@ async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_la
     crate::sql2::take_mainline_metadata_work();
     let expected_nodes = baseline_nodes + checkpoint_ids.len();
     let expected_checkpoints = baseline_checkpoints + checkpoint_ids.len();
-    let expected_retirement_keys = baseline_retirement_work.1 + checkpoint_ids.len();
     let counted = lix
         .execute(
             "SELECT commit_id, position, count(*) OVER() AS total_count \
@@ -193,11 +192,13 @@ async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_la
     let expected_windows = expected_nodes.div_ceil(64);
     assert_eq!(
         retirement_work,
-        (expected_windows, expected_retirement_keys)
+        (expected_windows, checkpoint_ids.len()),
+        "the page reads only the checkpoint keys created after counters were reset"
     );
     assert_eq!(
         crate::sql2::take_mainline_metadata_work(),
-        (expected_windows, expected_nodes)
+        (expected_windows, checkpoint_ids.len()),
+        "summary traversal skips the two bootstrap nodes while the logical count includes them"
     );
 
     crate::sql2::take_checkpoint_retirement_work();
@@ -239,11 +240,12 @@ async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_la
     );
     assert_eq!(
         crate::sql2::take_checkpoint_retirement_work(),
-        (expected_windows, expected_retirement_keys)
+        (expected_windows, checkpoint_ids.len())
     );
     assert_eq!(
         crate::sql2::take_mainline_metadata_work(),
-        (expected_windows, expected_nodes)
+        (expected_windows, checkpoint_ids.len()),
+        "summary traversal skips the two bootstrap nodes while the logical count includes them"
     );
 
     crate::sql2::take_checkpoint_retirement_work();

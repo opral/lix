@@ -3913,6 +3913,7 @@ mod tests {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let record = crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -4157,6 +4158,7 @@ mod tests {
                 .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -4335,6 +4337,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,

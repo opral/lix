@@ -21,7 +21,7 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
-    for index in 0..4 {
+    for index in 0..2 {
         authority
             .execute(
                 "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
@@ -30,9 +30,21 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
             .await
             .unwrap();
     }
+    authority.create_checkpoint().await.unwrap();
+    for index in 2..4 {
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
+                &[Value::Text(format!("history-{index}"))],
+            )
+            .await
+            .unwrap();
+    }
+    authority.create_checkpoint().await.unwrap();
     let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
-    let sql = "SELECT commit_id, parent_commit_id, created_at FROM lix_log() WHERE is_checkpoint = true ORDER BY position ASC";
+    let sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position FROM lix_log() WHERE is_checkpoint = true ORDER BY position ASC";
     let expected = authority.execute(sql, &[]).await.unwrap();
+    assert_eq!(expected.rows().len(), 2, "fixture has sparse checkpoint history");
     let mut fetches = Fetches::default();
     let actual = execute_hydrating(
         &session,

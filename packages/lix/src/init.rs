@@ -115,15 +115,19 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// v80 records complete checkpoint incorporation independently of commit membership.
 /// v81 separates explicit migration from current-format opening and fences old runtimes.
 /// v82 rebuilds declared-column indexes with exact reverse memberships and composite keys.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 82;
+/// v83 stores a validated nearest-checkpoint summary on each commit record.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 83;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v82";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v83";
+pub(crate) const REPOSITORY_PROTOCOL_V82: &[u8] = b"tracked-default-branch.v82";
 pub(crate) const REPOSITORY_PROTOCOL_V81: &[u8] = b"tracked-default-branch.v81";
 pub(crate) const REPOSITORY_PROTOCOL_V80: &[u8] = b"tracked-default-branch.v80";
 pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v83-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V82: &[u8] =
     b"tracked-default-branch.v82-partial-replica.v1";
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V81: &[u8] =
     b"tracked-default-branch.v81-partial-replica.v1";
@@ -1024,6 +1028,10 @@ async fn stage_init_changelog_commit(
 ) -> Result<(), LixError> {
     let global_commit = CommitRecord {
         is_checkpoint: false,
+        first_parent_checkpoint_summary: Some(crate::changelog::FirstParentCheckpointSummary {
+            previous_checkpoint_id: None,
+            first_parent_distance: 0,
+        }),
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(touched_scopes),
         format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
         commit_id: plan.global_commit.id,
@@ -1037,6 +1045,10 @@ async fn stage_init_changelog_commit(
     };
     let main_commit = CommitRecord {
         is_checkpoint: false,
+        first_parent_checkpoint_summary: Some(crate::changelog::FirstParentCheckpointSummary {
+            previous_checkpoint_id: None,
+            first_parent_distance: 0,
+        }),
         touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::exact(
             main_touched_scopes,
         ),
@@ -1212,7 +1224,10 @@ mod tests {
     fn plan_init_seed_returns_tracked_repository_bootstrap_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), registered_seed_schema_definitions().len() + 6);
+        assert_eq!(
+            plan.changes.len(),
+            registered_seed_schema_definitions().len() + 6
+        );
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
@@ -1246,7 +1261,10 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), registered_seed_schema_definitions().len() + 6);
+        assert_eq!(
+            change_ids.len(),
+            registered_seed_schema_definitions().len() + 6
+        );
         let first_seed_change_id = test_uuid(5);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.global_commit.change_id.to_string()));
@@ -1376,7 +1394,10 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), registered_seed_schema_definitions().len() + 6);
+        assert_eq!(
+            change_refs.len(),
+            registered_seed_schema_definitions().len() + 6
+        );
         assert!(
             !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
@@ -1623,11 +1644,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v82"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 82 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v83"),
-            RepositoryProtocolStatus::TooNew { found_version: 83 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v84"),
+            RepositoryProtocolStatus::TooNew { found_version: 84 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

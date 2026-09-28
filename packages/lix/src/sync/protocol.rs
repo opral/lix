@@ -143,6 +143,20 @@ pub struct SyncCommitHeader {
     pub first_parent_jump_commit_id: Option<String>,
     /// Number of first-parent edges covered by the jump target.
     pub first_parent_jump_span: Option<u64>,
+    /// Optional nearest-checkpoint proof for the strict first-parent lane.
+    /// `None` means the transmitting replica has incomplete/unproven ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_parent_checkpoint_summary: Option<SyncFirstParentCheckpointSummary>,
+}
+
+/// Wire form of the first-parent checkpoint cursor. A present value with no
+/// target and distance zero proves there is no earlier checkpoint; absence is
+/// reserved for incomplete ancestry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFirstParentCheckpointSummary {
+    pub previous_checkpoint_id: Option<String>,
+    pub first_parent_distance: u64,
 }
 
 /// Current row state transferred during bootstrap.

@@ -19,6 +19,7 @@ pub(crate) use authority_baseline_fence::upgrade_candidate_if_authority;
 pub(crate) use bounded_read::BoundedRead as MigrationBoundedRead;
 mod checkpoint_metadata;
 mod deterministic_witness;
+mod first_parent_checkpoints;
 mod epoch;
 mod incorporation;
 mod omitted_owners;
