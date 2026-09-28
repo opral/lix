@@ -4203,6 +4203,16 @@ fn register_seeded_file_interest(
         include_blob_refs,
         cache_small_blob_data: false,
     })?;
+    if !content && file_ids.is_some() {
+        capture.register(crate::hot_state::LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![active_branch_id.to_owned()],
+            file_ids: file_ids.clone(),
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: path_predicate.clone(),
+        })?;
+    }
     if content {
         capture.register(crate::hot_state::LogicalReadInterest::FileContent {
             request: crate::hot_state::HotStateScanRequest {

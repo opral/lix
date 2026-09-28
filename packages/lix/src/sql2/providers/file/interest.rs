@@ -103,9 +103,11 @@ pub(crate) async fn prepare_native_file_metadata_interest(
     {
         return Ok(());
     }
-    let index = paths
-        .path_index(&FilesystemPathIndexRequest::new(branch_ids.to_vec()))
-        .await?;
+    let mut request = FilesystemPathIndexRequest::new(branch_ids.to_vec());
+    if !directory {
+        request = request.with_file_ids(file_ids.map(<[String]>::to_vec));
+    }
+    let index = paths.path_index(&request).await?;
     let ids = file_ids.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
     let dirs = directory_ids.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
     let path = native_path(path);
