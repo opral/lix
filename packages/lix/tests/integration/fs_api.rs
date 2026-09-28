@@ -543,7 +543,7 @@ fn direct_child_name(parent: &str, child: &str) -> Option<String> {
 }
 
 /// Indexed file point reads must bound index work independently of repository
-/// size; direct content reads skip index-map construction. Fresh engines
+/// size; direct exact-ID projections skip index-map construction. Fresh engines
 /// prevent a warmed full index from masking unscoped indexed work. Direct
 /// read scope is covered by the partial read-capture request-shape test.
 #[tokio::test(flavor = "current_thread")]
@@ -593,10 +593,12 @@ async fn file_id_reads_bound_index_work_across_repository_sizes() {
                 );
             }
             let (builds, rows) = crate::filesystem::full_rebuild_stats();
-            if sql == "SELECT content FROM lix_file WHERE id=$1" {
+            if sql == "SELECT content FROM lix_file WHERE id=$1"
+                || sql == "SELECT id,path FROM lix_file WHERE id IN ($1)"
+            {
                 assert_eq!(
                     builds, 0,
-                    "the direct content projection should skip index maps: {sql}"
+                    "the direct exact-ID projection should skip index maps: {sql}"
                 );
             } else {
                 assert!(
