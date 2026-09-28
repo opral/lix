@@ -335,6 +335,34 @@ where
     Ok(rewritten)
 }
 
+/// Normalize released v78-v83 commit records before migration steps that read
+/// historical roots through the current changelog reader. The copy-and-activate
+/// migration keeps this marker-preserving rewrite hidden until validation.
+pub(super) async fn normalize_v7_records<S>(
+    adapter: &StorageAdapter<S>,
+    options: MigrationOptions,
+    marker: &'static [u8],
+) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = super::MigrationPlanningRead::new(adapter).await?;
+    let revision = crate::storage_adapter::load_repository_mutation_revision(&read).await?;
+    let records = records(&read, options).await?;
+    let count = records.len() as u64;
+    let replacements = records
+        .into_values()
+        .map(|(key, record)| {
+            storage_codec::encode("commit record", &record).map(|value| (key, value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut plan = PublicationPlan::bounded(options.max_changes, options.max_preflight_bytes);
+    plan.put_mutable(crate::changelog::COMMIT_SPACE, replacements)?;
+    read.finish()?;
+    publish(adapter, revision, marker, marker, plan).await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -192,6 +192,24 @@ where
     } else {
         0
     };
+    // Released v78-v83 repositories can still carry v7 packed commit records.
+    // Normalize them inside the hidden candidate before row-PK and hot-index
+    // repair read historical roots through the current changelog decoder.
+    let legacy_commit_records_rewritten = match from_version {
+        78 => Some(crate::init::REPOSITORY_PROTOCOL_V78),
+        79 => Some(crate::init::REPOSITORY_PROTOCOL_V79),
+        80 => Some(crate::init::REPOSITORY_PROTOCOL_V80),
+        81 => Some(crate::init::REPOSITORY_PROTOCOL_V81),
+        82 => Some(crate::init::REPOSITORY_PROTOCOL_V82),
+        83 => Some(crate::init::REPOSITORY_PROTOCOL_V83),
+        _ => None,
+    };
+    let legacy_commit_records_rewritten = if let Some(marker) = legacy_commit_records_rewritten {
+        migration_step(|| super::checkpoint_metadata::normalize_v7_records(&adapter, options, marker))
+            .await?
+    } else {
+        0
+    };
     if from_version <= 78 {
         migration_step(|| backfill_missing_row_pk_indexes(
             &adapter,
@@ -234,7 +252,9 @@ where
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
-        changes_rewritten: commit_records_rewritten + checkpoint_records_rewritten,
+        changes_rewritten: commit_records_rewritten
+            + checkpoint_records_rewritten
+            + legacy_commit_records_rewritten,
         commit_members_rewritten,
     })
 }
