@@ -9921,9 +9921,9 @@ pub(crate) struct AuthoritativeLiveChangeRequest {
     pub(crate) updated_at: crate::common::LixTimestamp,
 }
 
-/// Resolves live payloads from local changelog authority first, then co-loads
-/// only the exact physical owners that were absent or did not match. Encoded
-/// change owners and endpoint owners are candidates, never trusted payloads:
+/// Resolves live payloads from local changelog authority first, then checks
+/// exact physical owners in authority order. Encoded change owners and endpoint
+/// owners are candidates, never trusted payloads:
 /// every result must match the requested identity and lifetime.
 ///
 /// Both paths apply the same identity and lifetime validation. Callers decide
@@ -9969,9 +9969,9 @@ pub(crate) async fn load_authoritative_live_change_records(
             fallback_indices.push(index);
         }
     }
-    let mut owner_requests = Vec::new();
-    let mut owner_outputs = Vec::new();
-    for index in fallback_indices {
+    let mut direct_requests = Vec::new();
+    let mut direct_outputs = Vec::new();
+    for &index in &fallback_indices {
         let request = &requests[index];
         if let Some(locator) = direct_change_locator(request.change_id)
             && locator.commit_id != request.source_commit_id
@@ -9979,14 +9979,32 @@ pub(crate) async fn load_authoritative_live_change_records(
             // A checkpoint can rebase logical provenance without rewriting
             // the change ID. Resolve its authored owner directly, not by
             // replaying the endpoint's ancestry.
-            owner_requests.push((locator.commit_id, request.key.clone()));
-            owner_outputs.push(index);
+            direct_requests.push((locator.commit_id, request.key.clone()));
+            direct_outputs.push(index);
         }
-        owner_requests.push((request.source_commit_id, request.key.clone()));
-        owner_outputs.push(index);
     }
-    let fallback = load_commit_delta_change_records_for_owners(store, &owner_requests).await?;
-    for (index, record) in owner_outputs.into_iter().zip(fallback) {
+    let direct = load_commit_delta_change_records_for_owners(store, &direct_requests).await?;
+    for (index, record) in direct_outputs.into_iter().zip(direct) {
+        if record
+            .as_ref()
+            .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
+        {
+            records[index] = record;
+        }
+    }
+    // A matching direct owner is the change's physical authority. A logical
+    // checkpoint endpoint is only a fallback and can contain a selected copy
+    // with stale or conflicting provenance; it must not overwrite that owner.
+    let endpoint_outputs = fallback_indices
+        .into_iter()
+        .filter(|&index| records[index].is_none())
+        .collect::<Vec<_>>();
+    let endpoint_requests = endpoint_outputs
+        .iter()
+        .map(|&index| (requests[index].source_commit_id, requests[index].key.clone()))
+        .collect::<Vec<_>>();
+    let endpoint = load_commit_delta_change_records_for_owners(store, &endpoint_requests).await?;
+    for (index, record) in endpoint_outputs.into_iter().zip(endpoint) {
         if record
             .as_ref()
             .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
@@ -19955,6 +19973,18 @@ mod tests {
         )
         .await
         .is_err());
+        let resolved = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: mismatched,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("the matching direct owner settles authority before the endpoint");
+        assert_eq!(resolved, records);
     }
 
     #[tokio::test]
@@ -20014,6 +20044,41 @@ mod tests {
                 Some(b"typed-live-fixture".as_slice())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn live_payload_uses_endpoint_after_direct_owner_misses() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hinted_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_4322_0000_0000,
+        ));
+        let endpoint = CommitId::for_test_label("live-payload-endpoint-after-direct-miss");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        fixture.change_id = super::addressable_change_id(hinted_owner, 0, 0).unwrap();
+        let mut writes = storage.new_write_set();
+        let deltas = commit_delta_refs(endpoint, std::slice::from_ref(&fixture));
+        stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let loaded = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: fixture.change_id,
+                source_commit_id: endpoint,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("endpoint authority survives a syntactic direct-owner miss");
+        assert_eq!(loaded[0].change_id, fixture.change_id);
+        assert_eq!(loaded[0].account_id, crate::ANONYMOUS_ACCOUNT_ID);
     }
 
     #[tokio::test]
