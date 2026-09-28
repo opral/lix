@@ -1533,6 +1533,13 @@ impl<'a> RowLiveRowRef<'a> {
         }
     }
 
+    fn author_id(self) -> &'a str {
+        match self {
+            Self::Owned(row) => &row.author_id,
+            Self::Batch(row) => row.author_id(),
+        }
+    }
+
     fn commit_id(self) -> Option<CommitId> {
         match self {
             Self::Owned(row) => row.commit_id,
@@ -3721,7 +3728,7 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id"
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_author_id"
             | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
@@ -5823,6 +5830,13 @@ enum RowEvalRowRef<'a> {
 }
 
 impl<'a> RowEvalRowRef<'a> {
+    fn author_id(self, active_account_id: &str) -> String {
+        match self {
+            Self::Live(row) => row.author_id().to_string(),
+            Self::Staged(_) => active_account_id.to_string(),
+        }
+    }
+
     fn file_id(self) -> Option<&'a str> {
         match self {
             Self::Live(row) => row.file_id(),
@@ -6121,12 +6135,12 @@ fn eval_expr_value(
                     returning_new_absent: false,
                     visible_columns: context.visible_columns,
                 };
-                column_eval_value(&old, &column.name)
+                column_eval_value(&old, &column.name, ctx.active_account_id())
             }
             Some(crate::sql2::bind::expr::ReturningImage::New) if context.returning_new_absent => {
                 Ok(RowEvalValue::SqlNull)
             }
-            _ => column_eval_value(context, &column.name),
+            _ => column_eval_value(context, &column.name, ctx.active_account_id()),
         },
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
         BoundExpr::Cast { expr, data_type } => {
@@ -6473,7 +6487,7 @@ fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
         BoundExpr::Column(column)
             if matches!(
                 column.name.as_str(),
-                "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_commit_id"
+                "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_author_id" | "lixcol_commit_id"
             ) =>
         {
             true
@@ -7007,6 +7021,7 @@ fn json_text_value(value: &JsonValue) -> Result<String, LixError> {
 fn column_eval_value(
     context: &RowEvalContext<'_>,
     column_name: &str,
+    active_account_id: &str,
 ) -> Result<RowEvalValue, LixError> {
     match context.image {
         RowImageRef::Json(snapshot) => {
@@ -7051,6 +7066,7 @@ fn column_eval_value(
             .change_id()
             .map(|value| RowEvalValue::SqlText(value.to_string()))
             .unwrap_or(RowEvalValue::SqlNull)),
+        "lixcol_author_id" => Ok(RowEvalValue::SqlText(row.author_id(active_account_id))),
         "lixcol_created_at" => Ok(row
             .created_at()
             .map(RowEvalValue::SqlText)

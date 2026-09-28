@@ -269,6 +269,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
+        if let Some(conversation_id) = &publication.conversation_id {
+            crate::checkpoint_conversation::stage_checkpoint_conversation(
+                &mut writes,
+                publication.recovery_ref.checkpoint_commit_id,
+                conversation_id,
+            )?;
+        }
     }
     let ordered_replacements = prepared_writes
         .commit_change_refs_by_branch
@@ -319,6 +326,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .map(|(branch, _)| branch.clone())
         .collect::<BTreeSet<_>>();
     let mut state_rows = prepared_writes.state_rows;
+    // Prepared batches can accumulate synthesized rows before user rows. A
+    // batch-wide author must therefore be stamped after all appends, at the
+    // commit boundary. Selected historical changes retain their own author
+    // through their change references below.
+    state_rows.set_author_id(active_account_id.to_owned());
     if let Some(file_id) = certified_fresh_plugin_file_id.as_deref() {
         state_rows.certify_fresh_file_direct_addresses(file_id)?;
     }
@@ -401,6 +413,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         prepared_writes.extra_commit_parents_by_branch,
         prepared_writes.intermediate_commits,
         commit_parent_heads,
+        active_account_id,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -788,6 +801,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &staged_delta_index,
             &checkpoint_state_sources,
             &checkpoint_incorporation_sources,
+            &prepared_writes.checkpoint_publications.iter().filter_map(|publication| {
+                publication.conversation_id.as_ref().map(|id| (publication.recovery_ref.checkpoint_commit_id, id.clone()))
+            }).collect(),
             &staged_snapshot_roots,
             &commit_rows
                 .iter()
@@ -1603,6 +1619,7 @@ fn tracked_delta_from_state_row(
         row_pk: row.row_pk,
         change_id,
         commit_id,
+        author_id: row.author_id,
         deleted: row.snapshot.is_none(),
         created_at,
         updated_at: row.updated_at,
@@ -1638,6 +1655,7 @@ fn tracked_delta_from_selected_change_ref(
         row_pk: change_ref.row_pk(),
         change_id: change_ref.change_id,
         commit_id,
+        author_id: change_ref.author_id,
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
@@ -1656,6 +1674,12 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             "selected commit delta payload has the wrong change id",
         ));
     }
+    if record.is_some_and(|record| record.account_id != change_ref.author_id) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected commit delta author disagrees with its retained source record",
+        ));
+    }
     if record.is_none() && !change_ref.deleted {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1669,6 +1693,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             row_pk: change_ref.row_pk(),
             change_id: change_ref.change_id,
             commit_id,
+            author_id: change_ref.author_id,
             deleted: change_ref.deleted,
             created_at: change_ref.created_at,
             updated_at: change_ref.updated_at,
@@ -1797,6 +1822,7 @@ fn current_state_delta_from_state_row(
         // separately, by the addressable-change filter, not by dropping this.
         change_id: Some(change_id),
         commit_id,
+        author_id: row.author_id,
         untracked: row.untracked,
         deleted: row.snapshot.is_none(),
         created_at: row.created_at,
@@ -1819,6 +1845,7 @@ fn current_state_delta_from_engine_row(
         // prepared-row funnel, so the id has to be carried across explicitly.
         change_id: Some(row.change.change_id),
         commit_id: None,
+        author_id: &row.change.account_id,
         untracked: true,
         deleted: row.change.snapshot.is_none(),
         created_at: row.created_at,
@@ -1980,6 +2007,7 @@ async fn stage_tracked_commit_delta_index(
                             commit_id: root.commit_id,
                             created_at,
                             updated_at: journal.timestamp(),
+                            author_id: journal.author_id(),
                             metadata: None,
                             snapshot: row.snapshot(),
                         })
@@ -1997,6 +2025,7 @@ async fn stage_tracked_commit_delta_index(
                             commit_id: root.commit_id,
                             created_at,
                             updated_at: journal.timestamp(),
+                            author_id: journal.author_id(),
                             metadata: None,
                             snapshot: row.snapshot(),
                         })
@@ -2311,6 +2340,7 @@ fn materialize_staged_sync_commits(
     staged_delta_index: &StagedCommitDeltaIndex,
     checkpoint_state_sources: &BTreeMap<CommitId, CommitId>,
     checkpoint_incorporation_sources: &BTreeMap<CommitId, CommitId>,
+    checkpoint_conversations: &BTreeMap<CommitId, String>,
     staged_snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
     global_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
@@ -2444,7 +2474,7 @@ fn materialize_staged_sync_commits(
                 semantic_fingerprint: None,
                 row_created_at: change_ref.created_at,
                 row_updated_at: change_ref.updated_at,
-                change_account_id: record.map_or(active_account_id, |record| &record.account_id),
+                change_account_id: change_ref.author_id,
                 change_created_at: record.map_or(change_ref.updated_at, |record| record.created_at),
                 origin_key: record.and_then(|record| record.origin_key.as_deref()),
             })?);
@@ -2493,6 +2523,7 @@ fn materialize_staged_sync_commits(
             })
             .transpose()?;
         let commit = SyncCommit {
+            checkpoint_conversation_id: checkpoint_conversations.get(commit_id).cloned(),
             complete_incorporation_source_commit_id: checkpoint_incorporation_sources
                 .get(commit_id)
                 .map(ToString::to_string),
@@ -2557,6 +2588,7 @@ fn try_stage_lossless_columnar_mutations(
             || row.created_at != first.created_at
             || row.updated_at != first.updated_at
             || row.origin_key != first.origin_key
+            || row.author_id != first.author_id
             || row.commit_id != Some(commit_id)
             || row.untracked
             || row.global
@@ -2592,6 +2624,7 @@ fn try_stage_lossless_columnar_mutations(
             .as_bytes(),
         manifest_digest: encoded.manifest.content_digest()?,
         schema_key: first.schema_key.to_string(),
+        author_id: first.author_id.to_owned(),
         row_count: u32::try_from(state_row_indices.len()).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -3418,6 +3451,7 @@ fn lifecycle_selected_tracked_row(
         updated_at: change_ref.updated_at.to_string(),
         change_id: change_ref.change_id,
         commit_id,
+        author_id: change_ref.author_id.to_owned(),
     })
 }
 
@@ -4109,6 +4143,7 @@ async fn stage_tracked_head(
                             row_pk: &row.row_pk,
                             change_id: Some(change_ref.change_id),
                             commit_id: Some(root.commit_id),
+                            author_id: change_ref.author_id,
                             untracked: false,
                             deleted: true,
                             created_at: change_ref.created_at,
@@ -4685,6 +4720,7 @@ async fn stage_tracked_head(
                         row_pk: &row.row_pk,
                         change_id: Some(change_ref.change_id),
                         commit_id: Some(root.commit_id),
+                        author_id: change_ref.author_id,
                         untracked: false,
                         deleted: change_ref.deleted,
                         created_at: change_ref.created_at,
@@ -5457,6 +5493,7 @@ fn normal_branch_head_control(
         created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
         updated_at: root.ref_updated_at,
         ref_change_id: root.ref_change_id,
+        author_id: root.author_id,
         schema_presence_bloom: previous.map_or([0; 4], |control| control.schema_presence_bloom),
     })
 }
@@ -5744,6 +5781,7 @@ async fn stage_root_backed_branch_publication(
         created_at: previous_control.map_or(target.created_at, |control| control.created_at),
         updated_at: target.updated_at,
         ref_change_id: target.ref_change_id,
+        author_id: target.author_id,
         // Root reads answer schema presence directly. Keep the bloom
         // conservative until immutable roots carry schema summaries.
         schema_presence_bloom: [u64::MAX; 4],
@@ -6978,6 +7016,7 @@ where
                         row_pk: &row.row_pk,
                         change_id: row.change_id,
                         commit_id: row.commit_id,
+                        author_id: &row.author_id,
                         deleted: false,
                         created_at: LixTimestamp::expect_parse("created_at", &row.created_at),
                         updated_at: LixTimestamp::expect_parse("updated_at", &row.updated_at),
@@ -7255,6 +7294,7 @@ struct PendingTrackedRoot {
     state_parent_commit_id: Option<CommitId>,
     /// Metadata for the public synthesized `lix_branch_ref` row.
     ref_change_id: ChangeId,
+    author_id: [u8; 16],
     ref_updated_at: LixTimestamp,
     publish_head: bool,
 }
@@ -7265,7 +7305,9 @@ async fn finalize_commit_rows(
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     intermediate_commits: Vec<crate::transaction::staging::StagedIntermediateCommit>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
+    active_account_id: &str,
 ) -> Result<FinalizedCommitRows, LixError> {
+    let author_id = BranchHeadControl::author_id_bytes(active_account_id)?;
     let mut commit_rows = Vec::new();
     let mut tracked_roots = Vec::new();
     let staged_global_commit_id = commit_change_refs_by_branch
@@ -7304,6 +7346,7 @@ async fn finalize_commit_rows(
             parent_commit_id: Some(intermediate.parent_commit_id),
             state_parent_commit_id: Some(intermediate.parent_commit_id),
             ref_change_id: branch_ref_change_id,
+            author_id,
             ref_updated_at: created_at,
             publish_head: false,
         });
@@ -7360,6 +7403,7 @@ async fn finalize_commit_rows(
             parent_commit_id,
             state_parent_commit_id: parent_commit_id,
             ref_change_id: branch_ref_change_id,
+            author_id,
             ref_updated_at: timestamp,
             publish_head: true,
         });
@@ -8004,6 +8048,8 @@ mod tests {
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-02T00:00:00Z"),
                     ref_change_id: change_id("restore-concurrent-ref"),
+                    author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                        .expect("system account is a UUID"),
                     schema_presence_bloom: [0; 4],
                 }),
                 raw_token: None,
@@ -8029,6 +8075,8 @@ mod tests {
             source_branch_id: None,
             head_commit_id: Some(recovered_head),
             ref_change_id: change_id("branch-bridge-ref-change"),
+            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                .expect("system account is a UUID"),
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
         };
@@ -8128,6 +8176,7 @@ mod tests {
         let error = stage_checkpoint_working_diff_epochs(
             &mut writes,
             &[crate::gc::CheckpointPublication {
+                conversation_id: None,
                 recovery_ref: crate::gc::CheckpointRecoveryRef {
                     branch_id: "01960000-0000-7000-8000-0000000000b2".to_owned(),
                     recovered_head_commit_id: commit_id("missing-hot-recovered-head"),
@@ -8172,6 +8221,7 @@ mod tests {
                 false,
                 created_at,
                 created_at,
+                crate::ANONYMOUS_ACCOUNT_ID,
             );
         }
         let selected = selected.finish_source_certified();
@@ -8191,6 +8241,7 @@ mod tests {
                 false,
                 created_at,
                 created_at,
+                crate::ANONYMOUS_ACCOUNT_ID,
             );
         }
         let uncertified = uncertified.finish();
@@ -8214,6 +8265,7 @@ mod tests {
                 false,
                 created_at,
                 created_at,
+                crate::ANONYMOUS_ACCOUNT_ID,
             );
         }
         let duplicate_coordinate = duplicate_coordinate.finish_source_certified();
@@ -8242,6 +8294,7 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("semantic-create"),
             commit_id: CommitId::for_test_label("initial"),
         };
@@ -8256,6 +8309,7 @@ mod tests {
             deleted: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             change_id: ChangeId::for_test_label("descriptor-delete"),
             commit_id: CommitId::for_test_label("delete"),
         };
@@ -8414,6 +8468,7 @@ mod tests {
             row_pk: &tracked_pk,
             change_id: Some(change_id("tracked-update")),
             commit_id: Some(commit_id("tracked-update")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
             deleted: false,
             created_at: timestamp,
@@ -8560,6 +8615,8 @@ mod tests {
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: change_id("working-diff-epoch-test-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                .expect("system account is a UUID"),
             schema_presence_bloom: [0; 4],
         }
     }
@@ -11287,6 +11344,7 @@ mod tests {
                 GLOBAL_BRANCH_ID.to_string(),
                 Some(CommitId::for_test_label("initial-commit")),
             )]),
+            crate::SYSTEM_ACCOUNT_ID,
         )
         .await
         .expect("global commit row should finalize");
@@ -11317,6 +11375,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             &BTreeMap::new(),
+            crate::SYSTEM_ACCOUNT_ID,
         )
         .await
         .expect("empty change_refs should be ignored");
@@ -11339,6 +11398,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("previous-commit")),
             )]),
+            crate::SYSTEM_ACCOUNT_ID,
         )
         .await
         .expect("active-branch commit finalization should resolve parent");
@@ -11370,6 +11430,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("target-head")),
             )]),
+            crate::SYSTEM_ACCOUNT_ID,
         )
         .await
         .expect("merge commit finalization should resolve parents");
@@ -11486,6 +11547,8 @@ mod tests {
             parent_commit_id: Some(boundary),
             state_parent_commit_id: Some(boundary),
             ref_change_id: change_id("replacement-ref"),
+            author_id: BranchHeadControl::author_id_bytes(crate::SYSTEM_ACCOUNT_ID)
+                .expect("system account is a UUID"),
             ref_updated_at: ts("2026-01-01T00:00:00Z"),
             publish_head: true,
         };
@@ -11735,6 +11798,7 @@ mod tests {
             false,
             ts("2026-01-01T00:00:00Z"),
             ts("2026-01-01T00:00:00Z"),
+            crate::ANONYMOUS_ACCOUNT_ID,
         );
         batch.finish()
     }

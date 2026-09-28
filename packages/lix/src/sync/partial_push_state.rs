@@ -52,6 +52,28 @@ fn uuid(value: &str) -> Result<[u8; 16], LixError> {
     crate::storage_codec::id_string::uuid_bytes_from_canonical(value)
         .ok_or_else(|| invalid("partial upload ID must be a canonical UUID"))
 }
+
+/// A stable change identity for a ref published by a partial upload. A retry
+/// of the same publication must name the same immutable ref change.
+pub(super) fn deterministic_ref_change_id(
+    branch_id: &str,
+    head_commit_id: &str,
+    checkpoint_commit_id: &str,
+    author_id: &str,
+) -> Result<String, LixError> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"lix.partial-ref-change.v1\0");
+    for value in [branch_id, head_commit_id, checkpoint_commit_id, author_id] {
+        hash.update(&uuid(value)?);
+    }
+    let digest = hash.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes[15] |= 1; // Keep this distinct from synthetic commit-change IDs.
+    Ok(uuid::Uuid::from_bytes(bytes).to_string())
+}
 fn key(branch: &str) -> Result<StorageKey, LixError> {
     Ok(StorageKey(Bytes::copy_from_slice(&uuid(branch)?)))
 }
@@ -881,20 +903,29 @@ pub(super) struct CreatedPartialRef {
     pub(super) checkpoint_commit_id: String,
 }
 impl PreparedPartialUpload {
-    pub(super) fn append_created_ref_updates(&self, request: &mut super::SyncPushRequest) {
-        request
-            .ref_updates
-            .extend(
-                self.created_refs
-                    .iter()
-                    .map(|child| super::protocol::SyncRefUpdate {
-                        branch_id: child.branch_id.clone(),
-                        expected_head_commit_id: None,
-                        expected_checkpoint_commit_id: None,
-                        head_commit_id: Some(child.head_commit_id.clone()),
-                        checkpoint_commit_id: Some(child.checkpoint_commit_id.clone()),
-                    }),
-            );
+    pub(super) fn append_created_ref_updates(
+        &self,
+        request: &mut super::SyncPushRequest,
+        author_id: &str,
+    ) -> Result<(), LixError> {
+        for child in &self.created_refs {
+            request.ref_updates.push(super::protocol::SyncRefUpdate {
+                branch_id: child.branch_id.clone(),
+                author_id: Some(author_id.to_owned()),
+                ref_change_id: Some(deterministic_ref_change_id(
+                    &child.branch_id,
+                    &child.head_commit_id,
+                    &child.checkpoint_commit_id,
+                    author_id,
+                )?),
+                expected_ref_change_id: None,
+                expected_head_commit_id: None,
+                expected_checkpoint_commit_id: None,
+                head_commit_id: Some(child.head_commit_id.clone()),
+                checkpoint_commit_id: Some(child.checkpoint_commit_id.clone()),
+            });
+        }
+        Ok(())
     }
 }
 async fn guard_created_ref_capture(
@@ -1008,7 +1039,8 @@ mod created_ref_codec_tests {
             .prepared
             .as_ref()
             .unwrap()
-            .append_created_ref_updates(&mut request);
+            .append_created_ref_updates(&mut request, crate::ANONYMOUS_ACCOUNT_ID)
+            .unwrap();
         assert_eq!(request.ref_updates.len(), 1);
         assert_eq!(request.ref_updates[0].branch_id, id(7));
         assert!(request.ref_updates[0].expected_head_commit_id.is_none());

@@ -217,6 +217,9 @@ where
             &adapter, options, &mut plan,
         ))
         .await?;
+        if before.role != RepositoryRole::PartialReplica {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
         let read = super::MigrationPlanningRead::new(&adapter).await?;
         super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
         read.finish()?;
@@ -246,6 +249,9 @@ where
             .await?;
         }
         if before.format.is_some_and(|format| format <= 82) {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
+        if before.format.is_some_and(|format| format <= 83) {
             let read = super::MigrationPlanningRead::new(&adapter).await?;
             super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
             read.finish()?;
@@ -254,7 +260,7 @@ where
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82 | 83)) {
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84)) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let mut plan = super::publish::PublicationPlan::bounded(
             options.max_changes,
@@ -269,13 +275,18 @@ where
             ))
             .await?;
         }
-        let read = super::MigrationPlanningRead::new(&adapter).await?;
-        if before.format.is_some_and(|format| format <= 82) {
-            super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+        if before.format.is_some_and(|format| format <= 82)
+            && before.role != RepositoryRole::PartialReplica
+        {
+            Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
         }
-        read.finish()?;
+        if before.format.is_some_and(|format| format <= 83) {
+            let read = super::MigrationPlanningRead::new(&adapter).await?;
+            super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+            read.finish()?;
+        }
         (
-            "v84-fingerprint-marker-plan-v1",
+            "v85-migration-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -451,7 +462,7 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
 
-    async fn expected_v83_digest<S>(storage: &S) -> String
+    async fn expected_v85_digest<S>(storage: &S) -> String
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
@@ -464,6 +475,9 @@ mod tests {
             options.max_preflight_bytes,
         );
         super::super::hot_indexes::append_plan(&adapter, options, &mut plan)
+            .await
+            .unwrap();
+        super::super::author_storage::append_plan(&adapter, &mut plan)
             .await
             .unwrap();
         let read = super::super::MigrationPlanningRead::new(&adapter)
@@ -494,7 +508,7 @@ mod tests {
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
-        let before = expected_v83_digest(&storage).await;
+        let before = expected_v85_digest(&storage).await;
         let inspection = inspect_repository(storage.clone()).await.unwrap();
         assert_eq!(inspection.format, Some(80));
         assert!(!inspection.current);
@@ -563,7 +577,7 @@ mod tests {
         .await
         .unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -591,7 +605,7 @@ mod tests {
         );
         lix.close().await.unwrap();
 
-        let before = expected_v83_digest(&storage).await;
+        let before = expected_v85_digest(&storage).await;
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
@@ -686,8 +700,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v79_to_v84_migration_preserves_admission_and_resident_records_offline() {
-        for format in [79, 80, 81, 82, 83] {
+    async fn partial_v79_to_v85_migration_preserves_admission_and_resident_records_offline() {
+        for format in [79, 80, 81, 82, 83, 84] {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
                 format!("https://example.test/lix/{}", authority.lix_id()),
@@ -716,7 +730,7 @@ mod tests {
             if format <= 81 {
                 // A sparse cache cannot certify whole-collection completeness.
                 // The v79-v81 upgrade retires old index records without
-                // requesting hydration; v82, v83, and v84 preserve it.
+                // requesting hydration; v82 through v85 preserve it.
                 writes.put(
                     crate::hot_state::INDEX_SPACE,
                     b"old-untrusted-index".as_slice(),

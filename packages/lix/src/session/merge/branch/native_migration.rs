@@ -207,6 +207,7 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
                 pick.selected_row.deleted,
                 pick.selected_row.created_at,
                 pick.selected_row.updated_at,
+                &pick.selected_row.author_id,
             );
         }
         for pick in source_equal_picks
@@ -220,6 +221,7 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
                 pick.selected_row.deleted,
                 pick.selected_row.created_at,
                 pick.selected_row.updated_at,
+                &pick.selected_row.author_id,
             );
         }
         transaction.stage_merge_commit(
@@ -478,6 +480,7 @@ mod source_reuse_tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 change_id: crate::changelog::ChangeId::for_test_label("source-reuse-row"),
                 commit_id: crate::changelog::CommitId::for_test_label("source-reuse-commit"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             },
         ])
         .unwrap();

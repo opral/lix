@@ -711,6 +711,7 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             branch_id: "main".into(),
         }
@@ -847,6 +848,7 @@ mod tests {
             global: false,
             change_id: None,
             commit_id: None,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             branch_id: "main".into(),
         };

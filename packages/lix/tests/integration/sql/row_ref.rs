@@ -414,7 +414,7 @@ simulation_test!(
 
         let checkpoint = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[\
                    lix_row_ref('lix_key_value', $1, 'shared-row-ref')])",
                 &[Value::Text(first_file.into())],
             )

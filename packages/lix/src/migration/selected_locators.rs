@@ -163,7 +163,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let checkpoint = session.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let checkpoint = session.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         drop(session);
         drop(engine);
         let read = adapter.begin_read(Default::default()).await.unwrap();

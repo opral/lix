@@ -19,7 +19,7 @@ use std::path::Path;
 // predicate in the server-protocol gate this cannot match on a prefix: it names
 // the space it reconstructs. A stale value here does not fail loudly at the
 // mismatch, it makes the inventory come back empty.
-const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v11";
+const BRANCH_CONTROL_SPACE: &str = "branch.head_control.v12";
 const COMMIT_MANIFEST_SPACE: &str = "tracked_state.commit_state_manifest.v7";
 const TREE_CHUNK_SPACE: &str = "tracked_state.tree_chunk";
 const BINARY_CHUNK_SPACE: &str = "binary_cas.chunk";
@@ -186,7 +186,7 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
     )
     .await
     .expect("insert healthy probe");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("create checkpoint");
     let checkpoint_head = active_head(&lix).await;
@@ -268,7 +268,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("insert tracked-tree fixture row");
     }
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("checkpoint tracked-tree fixture");
     let checkpoint_head = active_head(&lix).await;
@@ -278,7 +278,7 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     )
     .await
     .expect("update tracked-tree fixture row");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("checkpoint updated tracked-tree fixture");
     let updated_head = active_head(&lix).await;

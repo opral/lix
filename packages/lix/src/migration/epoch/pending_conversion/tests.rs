@@ -155,7 +155,7 @@ async fn run_pending_native_conversion_inner(
     drop(read);
     let mut confirmed = serde_json::Map::new();
     for (branch, control) in controls {
-        confirmed.insert(branch,serde_json::json!({"state":"headed","headCommitId":control.head_commit_id.to_string(),"checkpointCommitId":control.working_diff_checkpoint_commit_id.unwrap().to_string()}));
+        confirmed.insert(branch,serde_json::json!({"state":"headed","headCommitId":control.head_commit_id.to_string(),"checkpointCommitId":control.working_diff_checkpoint_commit_id.unwrap().to_string(),"authorId":control.author_id_string(),"refChangeId":control.ref_change_id.to_string()}));
     }
     local
         .execute("UPDATE lix_key_value SET value='L' WHERE key='local'", &[])

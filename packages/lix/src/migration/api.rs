@@ -92,7 +92,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83 | 84),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -217,12 +217,15 @@ where
         migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
     }
     if from_version <= 82 {
+        migration_step(|| super::author_storage::migrate(&adapter, options, false)).await?;
+    }
+    if from_version <= 83 {
         migration_step(|| {
             super::first_parent_checkpoints::migrate(&adapter, options, false)
         })
         .await?;
     }
-    if from_version <= 83 {
+    if from_version <= 84 {
         migration_step(|| super::semantic_fingerprint_format::migrate(&adapter, false)).await?;
     }
     if let Some(witness) = amendment_witness {
@@ -689,10 +692,11 @@ where
 
     fn index_value_ref(
         row: &crate::tracked_state::MaterializedTrackedStateRow,
-    ) -> Result<crate::tracked_state::TrackedStateIndexValueRef, LixError> {
+    ) -> Result<crate::tracked_state::TrackedStateIndexValueRef<'_>, LixError> {
         Ok(crate::tracked_state::TrackedStateIndexValueRef {
             change_id: row.change_id,
             commit_id: row.commit_id,
+            author_id: &row.author_id,
             deleted: false,
             created_at: crate::common::LixTimestamp::parse(&row.created_at)
                 .map_err(|error| migration_error(format!("repair created_at: {error}")))?,
@@ -1908,6 +1912,7 @@ mod tests {
             updated_at: created_at.to_string(),
             change_id: crate::changelog::ChangeId::for_test_label(change_label),
             commit_id,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         }
     }
 

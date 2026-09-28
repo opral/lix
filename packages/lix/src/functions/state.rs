@@ -108,6 +108,7 @@ pub(crate) async fn stage_sequence(
                 // than relying on the prepared-row path to supply one.
                 change_id: Some(change_id),
                 commit_id: None,
+                author_id: crate::SYSTEM_ACCOUNT_ID,
                 untracked: true,
                 deleted: false,
                 created_at: timestamp,
@@ -737,6 +738,7 @@ mod tests {
                     row_pk: &row_pk,
                     change_id: Some(ChangeId::for_test_label("functions-state-sequence")),
                     commit_id: None,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     untracked: true,
                     deleted: false,
                     created_at: test_timestamp(),

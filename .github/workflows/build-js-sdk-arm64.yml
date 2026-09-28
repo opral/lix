@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubicloud-standard-30-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'

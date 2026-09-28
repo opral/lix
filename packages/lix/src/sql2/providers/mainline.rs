@@ -144,6 +144,7 @@ pub(super) fn metadata_schema(history: bool) -> SchemaRef {
             Field::new("commit_id", DataType::Utf8, false),
             Field::new("created_at", DataType::Utf8, false),
             Field::new("is_checkpoint", DataType::Boolean, false),
+            Field::new("conversation_id", DataType::Utf8, true),
             Field::new("position", DataType::Int64, false),
         ]
     };
@@ -155,6 +156,7 @@ fn metadata_batch(
     history: bool,
     count: usize,
     checkpoint_active: bool,
+    conversation_id: Option<&str>,
 ) -> Result<RecordBatch> {
     let parent = node.parent_commit_ids.first().map(ToString::to_string);
     let mut columns: Vec<ArrayRef> = vec![
@@ -164,34 +166,38 @@ fn metadata_batch(
         Arc::new(Int64Array::from(vec![position; count])),
     ];
     if !history {
-        columns.insert(
-            3,
-            Arc::new(BooleanArray::from(vec![checkpoint_active; count])),
-        );
+        columns.insert(3, Arc::new(BooleanArray::from(vec![checkpoint_active; count])));
+        columns.insert(4, Arc::new(StringArray::from(vec![conversation_id; count])));
     }
     Ok(RecordBatch::try_new(metadata_schema(history), columns)?)
 }
 
-fn log_metadata_window_batch(rows: &[(&CommitGraphNode, i64, bool)]) -> Result<RecordBatch> {
+fn log_metadata_window_batch(
+    rows: &[(&CommitGraphNode, i64, bool, Option<String>)],
+) -> Result<RecordBatch> {
     let parent_ids = rows
         .iter()
-        .map(|(node, _, _)| node.parent_commit_ids.first().map(ToString::to_string))
+        .map(|(node, _, _, _)| node.parent_commit_ids.first().map(ToString::to_string))
         .collect::<Vec<_>>();
     let commit_ids = rows
         .iter()
-        .map(|(node, _, _)| Some(node.commit_id.to_string()))
+        .map(|(node, _, _, _)| Some(node.commit_id.to_string()))
         .collect::<Vec<_>>();
     let created_at = rows
         .iter()
-        .map(|(node, _, _)| Some(node.created_at.to_string()))
+        .map(|(node, _, _, _)| Some(node.created_at.to_string()))
         .collect::<Vec<_>>();
     let checkpoint_active = rows
         .iter()
-        .map(|(_, _, checkpoint_active)| *checkpoint_active)
+        .map(|(_, _, checkpoint_active, _)| *checkpoint_active)
+        .collect::<Vec<_>>();
+    let conversation_ids = rows
+        .iter()
+        .map(|(_, _, _, conversation_id)| conversation_id.as_deref())
         .collect::<Vec<_>>();
     let positions = rows
         .iter()
-        .map(|(_, position, _)| *position)
+        .map(|(_, position, _, _)| *position)
         .collect::<Vec<_>>();
     record_log_metadata_batch(rows.len());
     Ok(RecordBatch::try_new(
@@ -201,6 +207,7 @@ fn log_metadata_window_batch(rows: &[(&CommitGraphNode, i64, bool)]) -> Result<R
             Arc::new(StringArray::from(commit_ids)),
             Arc::new(StringArray::from(created_at)),
             Arc::new(BooleanArray::from(checkpoint_active)),
+            Arc::new(StringArray::from(conversation_ids)),
             Arc::new(Int64Array::from(positions)),
         ],
     )?)
@@ -462,6 +469,9 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                         .iter()
                         .any(|column| column.name == "is_checkpoint")
                 }));
+        let needs_checkpoint_conversation = self.relation.is_none()
+            && (schema.index_of("conversation_id").is_ok()
+                || metadata_filters.iter().any(|filter| filter.column_refs().iter().any(|column| column.name == "conversation_id")));
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
@@ -523,6 +533,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                 let blob_reader = Arc::clone(&source_blob_reader);
                 let max_position = max_position;
                 let needs_checkpoint_active = needs_checkpoint_active;
+                let needs_checkpoint_conversation = needs_checkpoint_conversation;
                 let anchor = anchor;
                 let scan_schema = source_schema.clone();
                 batch_stream_source(scan_schema, 1, move |_, context| {
@@ -634,7 +645,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                 let mut key_indices = Vec::new();
                                 let mut keys = Vec::new();
                                 for (index, (node, _, selected, _)) in window.iter().enumerate() {
-                                    if !selected || !node.is_checkpoint { continue; }
+                                    if !*selected || !node.is_checkpoint { continue; }
                                     let key = crate::tracked_state::TrackedStateKey {
                                         schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
                                         file_id: None,
@@ -660,15 +671,31 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             }
 
                             if relation.is_none() {
-                                let selected_rows = window
-                                    .iter()
-                                    .zip(&checkpoint_active)
-                                    .filter_map(
-                                        |((node, current_position, selected, _), active)| {
-                                            (*selected).then_some((node, *current_position, *active))
-                                        },
-                                    )
-                                    .collect::<Vec<_>>();
+                                let mut selected_rows = Vec::with_capacity(window.len());
+                                for ((node, current_position, selected, _), active) in
+                                    window.iter().zip(&checkpoint_active)
+                                {
+                                    if !*selected {
+                                        continue;
+                                    }
+                                    let conversation_id =
+                                        if needs_checkpoint_conversation && node.is_checkpoint {
+                                            crate::checkpoint_conversation::load_checkpoint_conversation(
+                                                &store,
+                                                node.commit_id,
+                                            )
+                                            .await
+                                            .map_err(lix_error_to_datafusion_error)?
+                                        } else {
+                                            None
+                                        };
+                                    selected_rows.push((
+                                        node,
+                                        *current_position,
+                                        *active,
+                                        conversation_id,
+                                    ));
+                                }
                                 if !selected_rows.is_empty() {
                                     let metadata = log_metadata_window_batch(&selected_rows)?;
                                     let filtered = filter_metadata_batch(metadata, &metadata_filters)?;
@@ -687,7 +714,33 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                 window.into_iter().zip(checkpoint_active)
                             {
                                 if !selected { continue; }
-                                if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1, checkpoint_active)?, &metadata_filters)? { continue; }
+                                let conversation_id =
+                                    if relation.is_none()
+                                        && needs_checkpoint_conversation
+                                        && node.is_checkpoint
+                                    {
+                                        crate::checkpoint_conversation::load_checkpoint_conversation(
+                                            &store,
+                                            node.commit_id,
+                                        )
+                                        .await
+                                        .map_err(lix_error_to_datafusion_error)?
+                                    } else {
+                                        None
+                                    };
+                                if !matches_metadata(
+                                    &metadata_batch(
+                                        &node,
+                                        current_position,
+                                        relation.is_some(),
+                                        1,
+                                        checkpoint_active,
+                                        conversation_id.as_deref(),
+                                    )?,
+                                    &metadata_filters,
+                                )? {
+                                    continue;
+                                }
                                 if let Some(relation) = &relation {
                                     let Some(parent) = parent else { continue; }; // root is a baseline, not a synthetic change
                                     let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
@@ -706,7 +759,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                             Err(lix_error_to_datafusion_error(error))?
                                         }
                                     } {
-                                        let meta = metadata_batch(&node, current_position, true, batch.num_rows(), checkpoint_active)?;
+                                        let meta = metadata_batch(&node, current_position, true, batch.num_rows(), checkpoint_active, None)?;
                                         let columns = schema.fields().iter().map(|field| {
                                             batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
                                                 .ok_or_else(|| DataFusionError::Internal(format!("missing history column {}", field.name())))
@@ -721,7 +774,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                     // needs history, even when the completed diff produced no rows.
                                     completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
                                 } else {
-                                    let batch = metadata_batch(&node, current_position, false, 1, checkpoint_active)?;
+                                    let batch = metadata_batch(&node, current_position, false, 1, checkpoint_active, conversation_id.as_deref())?;
                                     let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;
                                     emitted += 1;
                                     yield batch.project(&indices)?;

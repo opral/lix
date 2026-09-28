@@ -1126,11 +1126,6 @@ where
         execution_disposition(&statement)
     }
 
-    pub(crate) fn is_standalone_global_history_read(&self, sql: &str) -> Result<bool, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        Ok(sql2::is_standalone_global_history_read(&statement))
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     ///
@@ -1181,18 +1176,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
-        self.execute_profiled_inner(sql, params, false).await
-    }
-
-    /// Profile the SQL evaluation used by observations. The observer lifecycle,
-    /// invalidation wait and acknowledgement of delivered views are separate.
-    #[cfg(feature = "storage-benches")]
-    pub(crate) async fn execute_for_observe_profiled(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
-        self.execute_profiled_inner(sql, params, true).await
+        self.execute_profiled_inner(sql, params).await
     }
 
     #[cfg(feature = "storage-benches")]
@@ -1200,17 +1184,12 @@ where
         &self,
         sql: &str,
         params: &[Value],
-        observe: bool,
     ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
         // Result rows are lazy; consume them while the phase scope is active,
         // so the benchmark includes public row conversion rather than charging
         // it to untimed oracle validation after returning from this method.
         let (result, mut profile) = crate::sql_profile::scope(async {
-            let result = if observe {
-                Box::pin(self.execute_for_observe(sql, params)).await?
-            } else {
-                self.execute(sql, params).await?
-            };
+            let result = self.execute(sql, params).await?;
             let _ = result.rows();
             Ok(result)
         })
@@ -6660,6 +6639,55 @@ mod tests {
                 ExactLixFileReadSelector::Id("01920000-0000-7000-8000-0000000000a2".to_string()),
                 ExactLixFileReadColumn::Content,
             ))
+        );
+
+        let prepared_file = sql2::parse_statement(
+            "SELECT id, path, lixcol_change_id, lix_active_branch_commit_id() AS commit_id, \
+             octet_length(content) AS size, content AS content \
+             FROM lix_file AS lix_as_of WHERE id = $1 LIMIT 1",
+        )
+        .unwrap();
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        assert_eq!(
+            exact_filesystem_read_route(&prepared_file, &[Value::Text(file_id.clone())]),
+            None,
+            "multi-column SQL still executes through DataFusion"
+        );
+        assert_eq!(
+            exact_filesystem_read_interest_route(
+                &prepared_file,
+                &[Value::Text(file_id.clone())]
+            ),
+            Some(ExactFilesystemRead::Point(
+                ExactLixFileReadSelector::Id(file_id.clone()),
+                ExactLixFileReadColumn::Content,
+            ))
+        );
+        let all_file_columns =
+            sql2::parse_statement("SELECT * FROM lix_file WHERE id = $1").unwrap();
+        assert_eq!(
+            exact_filesystem_read_interest_route(
+                &all_file_columns,
+                &[Value::Text("01920000-0000-7000-8000-0000000000a2".to_string())]
+            ),
+            Some(ExactFilesystemRead::Point(
+                ExactLixFileReadSelector::Id(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                ),
+                ExactLixFileReadColumn::Content,
+            ))
+        );
+        let broad_predicate = sql2::parse_statement(
+            "SELECT content FROM lix_file WHERE id = $1 OR path = $2",
+        )
+        .unwrap();
+        assert_eq!(
+            exact_filesystem_read_interest_route(
+                &broad_predicate,
+                &[Value::Text(file_id.clone()), Value::Text("/other.md".to_string())]
+            ),
+            None,
+            "only a single exact identity may seed a file closure"
         );
 
         let change_by_path =

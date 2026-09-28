@@ -58,7 +58,7 @@ test("snapshot streams restore a complete Lix deterministically", async () => {
 	await source.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('snapshot-js', 'complete')",
 	);
-	await source.execute("SELECT commit_id FROM lix_create_checkpoint()");
+	await source.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)");
 
 	const bytes = new Uint8Array(
 		await new Response(source.exportSnapshot()).arrayBuffer(),
@@ -923,7 +923,7 @@ test("checkpoint SQL returns the new active head through the local worker", asyn
 	const before = await activeHeadCommitId(lix);
 
 	const checkpoint = await lix.execute(
-		"SELECT commit_id FROM lix_create_checkpoint()",
+		"SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
 	);
 	const checkpointId = checkpoint.rows[0]?.commit_id;
 

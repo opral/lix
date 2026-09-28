@@ -1,4 +1,4 @@
-//! Marker-only v83 -> v84 cut for authenticated tracked-state fingerprints.
+//! Marker-only v84 -> v85 cut for authenticated tracked-state fingerprints.
 //!
 //! Existing roots and commit deltas remain valid without fingerprints and use
 //! the exact payload comparison path. The format gate prevents an older reader
@@ -18,12 +18,12 @@ where
 {
     let (source, target) = if partial {
         (
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
         )
     } else {
         (
-            crate::init::REPOSITORY_PROTOCOL_V83,
+            crate::init::REPOSITORY_PROTOCOL_V84,
             crate::init::REPOSITORY_PROTOCOL_VALUE,
         )
     };

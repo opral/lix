@@ -14,6 +14,11 @@ use crate::LixError;
 /// exactly once by Lix's transaction coordinator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CheckpointFunctionPlan {
+    Create {
+        title_expression: String,
+        comment_expression: String,
+        selection: Box<Self>,
+    },
     Full,
     Empty,
     SelectionQuery(String),
@@ -148,8 +153,16 @@ fn checkpoint_arguments_plan(
     arguments: &[FunctionArg],
 ) -> Result<Option<CheckpointFunctionPlan>, LixError> {
     match arguments {
-        [] => Ok(Some(CheckpointFunctionPlan::Full)),
-        [argument] => Ok(Some(selection_plan(argument)?)),
+        [title, comment] | [title, comment, _] => {
+            let title_expression = endpoint_expression(title)?;
+            let comment_expression = endpoint_expression(comment)?;
+            let selection = arguments.get(2).map(|argument| selection_plan(argument, "lix_create_checkpoint")).transpose()?.unwrap_or(CheckpointFunctionPlan::Full);
+            Ok(Some(CheckpointFunctionPlan::Create {
+                title_expression,
+                comment_expression,
+                selection: Box::new(selection),
+            }))
+        }
         _ => Err(invalid_function_call("lix_create_checkpoint")),
     }
 }
@@ -169,7 +182,7 @@ fn recovery_function_plan(
             .map(|target| format!("SELECT {target} AS commit_id"));
         let selection = arguments
             .get(1)
-            .map(selection_plan)
+            .map(|argument| selection_plan(argument, function_name))
             .transpose()?
             .unwrap_or(CheckpointFunctionPlan::Full);
         return Ok(Some(CheckpointFunctionPlan::UndoRedo {
@@ -205,7 +218,7 @@ fn recovery_function_plan(
     };
     let selection = arguments
         .get(endpoint_count)
-        .map(selection_plan)
+        .map(|argument| selection_plan(argument, function_name))
         .transpose()?
         .unwrap_or(CheckpointFunctionPlan::Full);
     Ok(Some(CheckpointFunctionPlan::Recovery {
@@ -222,7 +235,7 @@ fn endpoint_expression(argument: &FunctionArg) -> Result<String, LixError> {
     Ok(expression.to_string())
 }
 
-fn selection_plan(argument: &FunctionArg) -> Result<CheckpointFunctionPlan, LixError> {
+fn selection_plan(argument: &FunctionArg, function_name: &str) -> Result<CheckpointFunctionPlan, LixError> {
     match argument {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Array(array))) if array.named => {
             if array.elem.is_empty() {
@@ -245,17 +258,23 @@ fn selection_plan(argument: &FunctionArg) -> Result<CheckpointFunctionPlan, LixE
                 && function.within_group.is_empty() =>
         {
             let FunctionArguments::Subquery(selection) = &function.args else {
-                return Err(invalid_function_call("lix recovery function"));
+                return Err(invalid_function_call(function_name));
             };
             Ok(CheckpointFunctionPlan::SelectionQuery(
                 selection.to_string(),
             ))
         }
-        _ => Err(invalid_function_call("lix recovery function")),
+        _ => Err(invalid_function_call(function_name)),
     }
 }
 
 fn invalid_function_call(function_name: &str) -> LixError {
+    if function_name == "lix_create_checkpoint" {
+        return LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_create_checkpoint must be called as SELECT commit_id FROM lix_create_checkpoint(title, comment [, ARRAY row references]); title is TEXT or NULL and comment is Zettel JSONB or NULL",
+        );
+    }
     LixError::new(
         LixError::CODE_UNSUPPORTED_SQL,
         format!(
@@ -275,22 +294,24 @@ mod tests {
     #[test]
     fn recognizes_only_single_invocation_checkpoint_statements() {
         assert_eq!(
-            plan("SELECT commit_id FROM lix_create_checkpoint()").unwrap(),
-            Some(CheckpointFunctionPlan::Full)
+            plan("SELECT commit_id FROM lix_create_checkpoint($1, $2)").unwrap(),
+            Some(CheckpointFunctionPlan::Create { title_expression: "$1".into(), comment_expression: "$2".into(), selection: Box::new(CheckpointFunctionPlan::Full) })
         );
         assert_eq!(
-            plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY[])").unwrap(),
-            Some(CheckpointFunctionPlan::Empty)
+            plan("SELECT commit_id FROM lix_create_checkpoint($1, $2, ARRAY[])").unwrap(),
+            Some(CheckpointFunctionPlan::Create { title_expression: "$1".into(), comment_expression: "$2".into(), selection: Box::new(CheckpointFunctionPlan::Empty) })
         );
         assert!(matches!(
-            plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])")
+            plan("SELECT commit_id FROM lix_create_checkpoint($1, $2, ARRAY[lix_row_ref('lix_file', NULL, $3)])")
                 .unwrap(),
-            Some(CheckpointFunctionPlan::SelectionQuery(_))
+            Some(CheckpointFunctionPlan::Create { selection, .. }) if matches!(*selection, CheckpointFunctionPlan::SelectionQuery(_))
         ));
         assert!(matches!(
-            plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file')))").unwrap(),
-            Some(CheckpointFunctionPlan::SelectionQuery(_))
+            plan("SELECT commit_id FROM lix_create_checkpoint($1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))").unwrap(),
+            Some(CheckpointFunctionPlan::Create { selection, .. }) if matches!(*selection, CheckpointFunctionPlan::SelectionQuery(_))
         ));
+        assert!(plan("SELECT commit_id FROM lix_create_checkpoint()").is_err());
+        assert!(plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY[])").is_err());
         assert!(plan("SELECT * FROM lix_create_checkpoint()").is_err());
         assert!(plan("SELECT commit_id FROM lix_create_checkpoint() WHERE true").is_err());
         assert!(matches!(

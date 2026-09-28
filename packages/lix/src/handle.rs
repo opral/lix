@@ -160,74 +160,118 @@ impl ServerOptions {
 }
 
 #[derive(Default)]
-struct AuthorityHistorySession {
-    state: tokio::sync::Mutex<AuthorityHistorySessionState>,
+struct AuthorityReadSession {
+    state: tokio::sync::Mutex<AuthorityReadSessionState>,
 }
 
-enum AuthorityHistorySessionState {
+enum AuthorityReadSessionState {
     Uninitialized,
     #[cfg(not(target_family = "wasm"))]
     Open(Box<ProtocolClient<crate::sync::AuthorityHttp>>),
     Closed,
 }
 
-impl Default for AuthorityHistorySessionState {
+impl Default for AuthorityReadSessionState {
     fn default() -> Self {
         Self::Uninitialized
     }
 }
 
+async fn open_authority_read_client(
+    server: &ServerOptions,
+    expected_account_id: &str,
+    branch_id: &str,
+) -> Result<ProtocolClient<crate::sync::AuthorityHttp>, LixError> {
+    let http = crate::sync::authority_http(&server.headers)?;
+    let client = open_protocol_client(http, server.url.clone(), Some(branch_id.to_owned())).await?;
+    let authority_account_id = match client.active_account_id().await {
+        Ok(account_id) => account_id,
+        Err(error) => {
+            let _ = client.close().await;
+            return Err(error);
+        }
+    };
+    if authority_account_id != expected_account_id {
+        let _ = client.close().await;
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "authority session authentication changed while opening a read session",
+        ));
+    }
+    Ok(client)
+}
+
 #[cfg(not(target_family = "wasm"))]
-impl AuthorityHistorySession {
+impl AuthorityReadSession {
     async fn execute(
         &self,
         server: &ServerOptions,
         expected_account_id: &str,
+        branch_id: &str,
         sql: &str,
         params: &[Value],
+        options: &ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let mut state = self.state.lock().await;
-        if matches!(*state, AuthorityHistorySessionState::Closed) {
+        if matches!(*state, AuthorityReadSessionState::Closed) {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
-                "cannot execute an authority history query from a closed Lix handle",
+                "cannot execute an authority read from a closed Lix handle",
             ));
         }
-        if matches!(*state, AuthorityHistorySessionState::Uninitialized) {
-            let http = crate::sync::authority_http(&server.headers)?;
-            // These relations are repository-global. A partial replica may have
-            // a local branch that has never been published, and branch selection
-            // does not change the result of either history inventory.
-            let client = open_protocol_client(http, server.url.clone(), None).await?;
-            let authority_account_id = match client.active_account_id().await {
-                Ok(account_id) => account_id,
-                Err(error) => {
-                    let _ = client.close().await;
-                    return Err(error);
-                }
-            };
-            if authority_account_id != expected_account_id {
-                let _ = client.close().await;
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "authority session authentication changed while opening a history session",
-                ));
-            }
-            *state = AuthorityHistorySessionState::Open(Box::new(client));
+        if matches!(*state, AuthorityReadSessionState::Uninitialized) {
+            let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
+            *state = AuthorityReadSessionState::Open(Box::new(client));
         }
-        let AuthorityHistorySessionState::Open(client) = &*state else {
-            unreachable!("closed authority history session was handled above");
+        let AuthorityReadSessionState::Open(client) = &*state else {
+            unreachable!("closed authority read session was handled above");
         };
-        client.execute(sql, params, None).await
+        if client.active_branch_id().await? != branch_id {
+            client.switch_branch(branch_id).await?;
+        }
+        client.execute(sql, params, Some(ProtocolExecuteOptions {
+            origin_key: options.origin_key.clone(),
+            max_auto_commit_retries: options.max_auto_commit_retries,
+            ..Default::default()
+        })).await
+    }
+
+    async fn execute_batch(
+        &self,
+        server: &ServerOptions,
+        expected_account_id: &str,
+        branch_id: &str,
+        statements: &[ExecuteBatchStatement],
+        options: &ExecuteOptions,
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
+        let mut state = self.state.lock().await;
+        if matches!(*state, AuthorityReadSessionState::Closed) {
+            return Err(LixError::new(LixError::CODE_CLOSED, "cannot execute an authority read from a closed Lix handle"));
+        }
+        if matches!(*state, AuthorityReadSessionState::Uninitialized) {
+            let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
+            *state = AuthorityReadSessionState::Open(Box::new(client));
+        }
+        let AuthorityReadSessionState::Open(client) = &*state else {
+            unreachable!("closed authority read session was handled above");
+        };
+        if client.active_branch_id().await? != branch_id {
+            client.switch_branch(branch_id).await?;
+        }
+        client.execute_batch(statements, Some(ProtocolExecuteOptions {
+            origin_key: options.origin_key.clone(),
+            max_auto_commit_retries: options.max_auto_commit_retries,
+            ..Default::default()
+        })).await
     }
 
     async fn close(&self) -> Result<(), LixError> {
         let client = {
             let mut state = self.state.lock().await;
-            match std::mem::replace(&mut *state, AuthorityHistorySessionState::Closed) {
-                AuthorityHistorySessionState::Open(client) => Some(client),
-                AuthorityHistorySessionState::Uninitialized
-                | AuthorityHistorySessionState::Closed => None,
+            match std::mem::replace(&mut *state, AuthorityReadSessionState::Closed) {
+                AuthorityReadSessionState::Open(client) => Some(client),
+                AuthorityReadSessionState::Uninitialized
+                | AuthorityReadSessionState::Closed => None,
             }
         };
         match client {
@@ -238,43 +282,60 @@ impl AuthorityHistorySession {
 }
 
 #[cfg(target_family = "wasm")]
-impl AuthorityHistorySession {
+impl AuthorityReadSession {
     async fn execute(
         &self,
         server: &ServerOptions,
         expected_account_id: &str,
+        branch_id: &str,
         sql: &str,
         params: &[Value],
+        options: &ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let state = self.state.lock().await;
-        if matches!(*state, AuthorityHistorySessionState::Closed) {
+        if matches!(*state, AuthorityReadSessionState::Closed) {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
-                "cannot execute an authority history query from a closed Lix handle",
+                "cannot execute an authority read from a closed Lix handle",
             ));
         }
 
         // ProtocolClient owns browser event callbacks that are intentionally
         // not Send. Keep it scoped to this request so the public Lix handle
         // remains Send across wasm bindings.
-        let http = crate::sync::authority_http(&server.headers)?;
-        let client = open_protocol_client(http, server.url.clone(), None).await?;
-        let authority_account_id = match client.active_account_id().await {
-            Ok(account_id) => account_id,
-            Err(error) => {
-                let _ = client.close().await;
-                return Err(error);
-            }
-        };
-        if authority_account_id != expected_account_id {
-            let _ = client.close().await;
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "authority session authentication changed while opening a history session",
-            ));
-        }
+        let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
 
-        let result = client.execute(sql, params, None).await;
+        let result = client.execute(sql, params, Some(ProtocolExecuteOptions {
+            origin_key: options.origin_key.clone(),
+            max_auto_commit_retries: options.max_auto_commit_retries,
+            ..Default::default()
+        })).await;
+        let close_result = client.close().await;
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    async fn execute_batch(
+        &self,
+        server: &ServerOptions,
+        expected_account_id: &str,
+        branch_id: &str,
+        statements: &[ExecuteBatchStatement],
+        options: &ExecuteOptions,
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
+        let state = self.state.lock().await;
+        if matches!(*state, AuthorityReadSessionState::Closed) {
+            return Err(LixError::new(LixError::CODE_CLOSED, "cannot execute an authority read from a closed Lix handle"));
+        }
+        let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
+        let result = client.execute_batch(statements, Some(ProtocolExecuteOptions {
+            origin_key: options.origin_key.clone(),
+            max_auto_commit_retries: options.max_auto_commit_retries,
+            ..Default::default()
+        })).await;
         let close_result = client.close().await;
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -285,7 +346,7 @@ impl AuthorityHistorySession {
 
     async fn close(&self) -> Result<(), LixError> {
         let mut state = self.state.lock().await;
-        *state = AuthorityHistorySessionState::Closed;
+        *state = AuthorityReadSessionState::Closed;
         Ok(())
     }
 }
@@ -1201,12 +1262,8 @@ where
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.execution_disposition(&self.sql)?;
-                let authority_history_fallback = route == ExecutionDisposition::CancellableRead
+                let authority_fallback = route == ExecutionDisposition::CancellableRead
                     && self.lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
-                    && self
-                        .lix
-                        .session
-                        .is_standalone_global_history_read(&self.sql)?
                     && self.lix.server.is_some();
                 let local = self
                     .lix
@@ -1222,11 +1279,11 @@ where
                     .await;
                 match local {
                     Err(error)
-                        if authority_history_fallback
+                        if authority_fallback
                             && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
                     {
                         self.lix
-                            .execute_authority_history_read(&self.sql, &self.params)
+                            .execute_authority_read(&self.sql, &self.params, &self.options)
                             .await
                     }
                     result => result,
@@ -1295,7 +1352,7 @@ where
                     .lix
                     .session
                     .execute_batch_disposition(&self.statements)?;
-                self.lix
+                let local = self.lix
                     .retry_replica_read(route, || {
                         self.lix.retry_sync_demands(|| {
                             self.lix
@@ -1303,8 +1360,18 @@ where
                                 .execute_batch_with_options(&self.statements, self.options.clone())
                         })
                     })
-                    .await
-                    .map(crate::ExecuteBatchResult::from_results)
+                    .await;
+                match local {
+                    Err(error)
+                        if route == ExecutionDisposition::CancellableRead
+                            && self.lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
+                            && self.lix.server.is_some()
+                            && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
+                    {
+                        self.lix.execute_authority_read_batch(&self.statements, &self.options).await
+                    }
+                    result => result.map(crate::ExecuteBatchResult::from_results),
+                }
             })
         })
     }
@@ -1331,7 +1398,7 @@ where
     sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     server: Option<ServerOptions>,
-    authority_history_session: Arc<AuthorityHistorySession>,
+    authority_read_session: Arc<AuthorityReadSession>,
     open_report: Arc<OpenReport>,
 }
 
@@ -1522,7 +1589,7 @@ where
         sync_lease: None,
         sync_demand_tx: None,
         server: server.clone(),
-        authority_history_session: Arc::new(AuthorityHistorySession::default()),
+        authority_read_session: Arc::new(AuthorityReadSession::default()),
         open_report: Arc::new(open_report),
     };
     lix.bind_session();
@@ -1562,7 +1629,7 @@ where
         sync_lease: None,
         sync_demand_tx: None,
         server: None,
-        authority_history_session: Arc::new(AuthorityHistorySession::default()),
+        authority_read_session: Arc::new(AuthorityReadSession::default()),
         open_report: Arc::new(OpenReport {
             migrations: Vec::new(),
             format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1697,7 +1764,7 @@ where
             sync_lease: None,
             sync_demand_tx: None,
             server: None,
-            authority_history_session: Arc::new(AuthorityHistorySession::default()),
+            authority_read_session: Arc::new(AuthorityReadSession::default()),
             open_report: Arc::new(OpenReport {
                 migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1946,7 +2013,7 @@ where
             sync_lease: None,
             sync_demand_tx: self.sync_demand_tx.clone(),
             server: self.server.clone(),
-            authority_history_session: Arc::new(AuthorityHistorySession::default()),
+            authority_read_session: Arc::new(AuthorityReadSession::default()),
             open_report: Arc::clone(&self.open_report),
         })
     }
@@ -2344,22 +2411,44 @@ where
         self.session.active_account_id()
     }
 
-    async fn execute_authority_history_read(
+    async fn execute_authority_read(
         &self,
         sql: &str,
         params: &[Value],
+        options: &ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let server = self.server.as_ref().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
-                "authoritative history query requires a configured server",
+                "authoritative read requires a configured server",
             )
         })?;
         let expected_account_id = self.active_account_id().to_owned();
-        self.authority_history_session
-            .execute(server, &expected_account_id, sql, params)
+        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+        self.authority_read_session
+            .execute(server, &expected_account_id, &branch_id, sql, params, options)
             .await
             .map(ExecuteResult::with_authority_notice)
+    }
+
+    async fn execute_authority_read_batch(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: &ExecuteOptions,
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
+                "authoritative read requires a configured server",
+            )
+        })?;
+        let expected_account_id = self.active_account_id().to_owned();
+        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+        let mut result = self.authority_read_session
+            .execute_batch(server, &expected_account_id, &branch_id, statements, options)
+            .await?;
+        result.results = result.results.into_iter().map(ExecuteResult::with_authority_notice).collect();
+        Ok(result)
     }
 
     /// Repository identity stored as `lix_key_value.lix_id`.
@@ -2543,7 +2632,7 @@ where
         // Check the independent transactions before mutating any session or
         // remote lifecycle, including their shared publication worker.
         let session_result = self.session.close().await;
-        let authority_result = self.authority_history_session.close().await;
+        let authority_result = self.authority_read_session.close().await;
         let lease_result = match &self.sync_lease {
             Some(lease) => lease.release().await,
             None => Ok(()),
@@ -4357,7 +4446,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             sync_lease: None,
             sync_demand_tx: Some(sender),
             server: None,
-            authority_history_session: Arc::new(AuthorityHistorySession::default()),
+            authority_read_session: Arc::new(AuthorityReadSession::default()),
             open_report: Arc::new(OpenReport {
                 migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,

@@ -48,6 +48,9 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    /// Account that performed this row's latest write, retained independently
+    /// of changelog payload availability.
+    pub(crate) author_id: &'a str,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -99,6 +102,7 @@ pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) row_pk: &'a str,
+    pub(crate) author_id: &'a str,
     pub(crate) commit_id: CommitId,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -123,6 +127,7 @@ pub(crate) struct TrackedStateRootMutationRef<'a> {
 pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    pub(crate) author_id: String,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -148,9 +153,10 @@ impl TrackedStateIndexValue {
 
 /// Zero-copy view of a tracked-state commit-root value.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TrackedStateIndexValueRef {
+pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    pub(crate) author_id: &'a str,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -284,6 +290,7 @@ pub(crate) struct ColumnarMutationPartSet {
     pub(crate) row_group_set_id: [u8; 16],
     pub(crate) manifest_digest: [u8; 32],
     pub(crate) schema_key: String,
+    pub(crate) author_id: String,
     pub(crate) row_count: u32,
     pub(crate) group_row_counts: Vec<u32>,
     #[musli(bytes)]
@@ -408,6 +415,7 @@ pub(crate) struct ColumnarPageSource {
     /// Physical immutable row-group-set id.
     pub(crate) source_id: [u8; 16],
     pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) author_id: String,
     /// Row-group index within the set.
     pub(crate) part_index: u32,
     /// Page index inside `part_index`.
@@ -624,6 +632,7 @@ pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) updated_at: String,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    pub(crate) author_id: String,
 }
 
 /// Identity-centered filter for tracked-state scans.

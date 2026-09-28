@@ -106,6 +106,7 @@ pub(crate) struct FilesystemPathEntry {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
+    author_id: String,
     commit_id: Option<CommitId>,
     blob_ref: Option<MaterializedHotStateRow>,
     cached_blob_data: Option<crate::Blob>,
@@ -151,6 +152,7 @@ impl FilesystemPathEntry {
             ),
             global: self.key.global(),
             change_id: self.change_id,
+            author_id: self.author_id.clone(),
             commit_id: self.commit_id,
             untracked: self.key.is_untracked(),
             branch_id: self.key.branch_id().into(),
@@ -176,7 +178,19 @@ impl FilesystemPathEntry {
     }
 
     pub(crate) fn change_id(&self) -> Option<ChangeId> {
-        self.change_id
+        self.blob_ref
+            .as_ref()
+            .and_then(|blob_ref| blob_ref.change_id)
+            .or(self.change_id)
+    }
+
+    pub(crate) fn author_id(&self) -> &str {
+        self.blob_ref
+            .as_ref()
+            .filter(|blob_ref| blob_ref.change_id.is_some())
+            .map_or(self.author_id.as_str(), |blob_ref| {
+                blob_ref.author_id.as_str()
+            })
     }
 
     pub(crate) fn commit_id(&self) -> Option<CommitId> {
@@ -197,12 +211,14 @@ impl FilesystemPathEntry {
             + self.name.capacity()
             + self.key.estimated_heap_bytes()
             + self.metadata.as_ref().map_or(0, String::capacity)
+            + self.author_id.capacity()
             + self.created_at.capacity()
             + self.updated_at.capacity()
             + self.blob_ref.as_ref().map_or(0, |row| {
                 row.schema_key.capacity()
                     + row.row_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
+                    + row.author_id.capacity()
                     + row
                         .snapshot_content
                         .as_ref()
@@ -410,6 +426,7 @@ impl FilesystemPathIndex {
                             created_at: row.created_at().to_string(),
                             updated_at: row.updated_at().to_string(),
                             change_id: row.change_id(),
+                            author_id: row.author_id().to_owned(),
                             commit_id: row.commit_id(),
                         },
                     );
@@ -440,6 +457,7 @@ impl FilesystemPathIndex {
                             created_at: row.created_at().to_string(),
                             updated_at: row.updated_at().to_string(),
                             change_id: row.change_id(),
+                            author_id: row.author_id().to_owned(),
                             commit_id: row.commit_id(),
                         },
                     ));
@@ -492,6 +510,7 @@ impl FilesystemPathIndex {
                 created_at: record.created_at.clone(),
                 updated_at: record.updated_at.clone(),
                 change_id: record.change_id,
+                author_id: record.author_id.clone(),
                 commit_id: record.commit_id,
                 blob_ref: None,
                 cached_blob_data: None,
@@ -540,6 +559,7 @@ impl FilesystemPathIndex {
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 change_id: record.change_id,
+                author_id: record.author_id,
                 commit_id: record.commit_id,
                 blob_ref,
                 cached_blob_data: None,
@@ -977,6 +997,7 @@ impl FilesystemPathIndex {
             created_at: row.created_at.to_string(),
             updated_at: row.updated_at.to_string(),
             change_id: row.change_id,
+            author_id: row.author_id.clone(),
             commit_id: row.commit_id,
             blob_ref: None,
             cached_blob_data: None,
@@ -1988,6 +2009,7 @@ struct DirectoryRecord {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
+    author_id: String,
     commit_id: Option<CommitId>,
 }
 
@@ -2025,6 +2047,7 @@ struct FileRecord {
     created_at: String,
     updated_at: String,
     change_id: Option<ChangeId>,
+    author_id: String,
     commit_id: Option<CommitId>,
 }
 
@@ -3348,9 +3371,33 @@ mod tests {
             global,
             change_id: Some(ChangeId::for_test_label(id)),
             commit_id: Some(CommitId::for_test_label(id)),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
             untracked: false,
             branch_id: branch_id.into(),
         }
+    }
+
+    #[test]
+    fn file_entry_uses_blob_ref_author_and_change_as_latest_write() {
+        let descriptor_change_id = ChangeId::for_test_label("file-descriptor-change");
+        let content_change_id = ChangeId::for_test_label("file-content-change");
+        let mut descriptor = file_row("file-id", None, "note.md", "branch-id", false);
+        descriptor.change_id = Some(descriptor_change_id);
+        descriptor.author_id = "descriptor-author".to_string();
+        let mut blob_ref = blob_row("file-id", "blob-hash", "branch-id");
+        blob_ref.change_id = Some(content_change_id);
+        blob_ref.author_id = "content-author".to_string();
+
+        let index = path_index_from_rows(vec![descriptor, blob_ref])
+            .expect("file path index should include descriptor and blob ref");
+        let entry = index
+            .exact_entries("/note.md")
+            .into_iter()
+            .next()
+            .expect("file should be indexed by path");
+
+        assert_eq!(entry.change_id(), Some(content_change_id));
+        assert_eq!(entry.author_id(), "content-author");
     }
 }
 

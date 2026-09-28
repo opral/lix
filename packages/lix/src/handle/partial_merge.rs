@@ -845,7 +845,7 @@ mod tests {
             )
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
@@ -857,7 +857,7 @@ mod tests {
             )
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         let later = authority.partial_replica_descriptor(None).await.unwrap();
         let request = publish_wave_with_base_checkpoint(
             &authority,
@@ -933,7 +933,7 @@ mod tests {
             )
             .await
             .unwrap();
-        local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         authority
             .execute(
                 "UPDATE lix_key_value SET value='remote' WHERE key='retained-remote'",
@@ -999,7 +999,7 @@ mod tests {
             .selected_branch
             .head
             .commit_id;
-        local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         authority
             .execute(
                 "UPDATE lix_key_value SET value='remote' WHERE key='checkpoint-remote'",
@@ -1007,7 +1007,7 @@ mod tests {
             )
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         let local_descriptor = local.partial_replica_descriptor(None).await.unwrap();
         let remote = authority.partial_replica_descriptor(None).await.unwrap();
         let forged = invalid_checkpoint.map(|non_checkpoint| {
@@ -1034,7 +1034,7 @@ mod tests {
             )
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         let before = authority.partial_replica_descriptor(None).await.unwrap();
         let outcome = authority
             .merge_partial_replica_for_account(&request, authority.active_account_id())

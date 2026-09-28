@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v11";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v12";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0020),
     BRANCH_HEAD_CONTROL_NAMESPACE,
@@ -27,9 +27,25 @@ pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace = StorageSpace::declare
 );
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
-const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
+const BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC2";
+const LEGACY_BRANCH_HEAD_CONTROL_MAGIC: &[u8; 4] = b"LBC1";
 const BRANCH_HEAD_CONTROL_DIGEST_BYTES: usize = 32;
-const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
+const BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v2";
+const LEGACY_BRANCH_HEAD_CONTROL_DIGEST_CONTEXT: &str = "lix branch-head control v1";
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct LegacyBranchHeadControl {
+    head_commit_id: CommitId,
+    tracked_generation: CommitId,
+    current_state_revision: u64,
+    #[musli(with = storage_codec::option)]
+    working_diff_checkpoint_commit_id: Option<CommitId>,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    ref_change_id: ChangeId,
+    schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
+}
 
 /// The one mutable publication record for a branch.
 ///
@@ -57,6 +73,8 @@ pub(crate) struct BranchHeadControl {
     pub(crate) updated_at: LixTimestamp,
     /// Public `lixcol_change_id` for the last head publication.
     pub(crate) ref_change_id: ChangeId,
+    /// Account that performed the last branch-ref write.
+    pub(crate) author_id: [u8; 16],
     /// Conservative schema-presence summary for this complete hot generation.
     ///
     /// Bits are only added during in-place commits. Lifecycle publications
@@ -84,6 +102,21 @@ pub(crate) struct BranchHeadTrackedReachability {
 }
 
 impl BranchHeadControl {
+    /// Convert a canonical account UUID to the compact authoritative form
+    /// stored in branch control records.
+    pub(crate) fn author_id_bytes(account_id: &str) -> Result<[u8; 16], LixError> {
+        storage_codec::id_string::uuid_bytes_from_canonical(account_id).ok_or_else(|| {
+            LixError::new(
+                "LIX_INVALID_ACCOUNT_ID",
+                "branch-ref author ID must be a canonical UUID",
+            )
+        })
+    }
+
+    pub(crate) fn author_id_string(self) -> String {
+        storage_codec::id_string::uuid_string_from_bytes(self.author_id)
+    }
+
     /// Canonical tracked projection for destructive reachability work.
     ///
     /// `tracked_generation` is the atomic serving selector, not chronology.
@@ -398,6 +431,47 @@ fn encode_control(branch_id: &str, control: &BranchHeadControl) -> Result<Vec<u8
     Ok(encoded)
 }
 
+pub(crate) fn encode_control_for_migration(
+    branch_id: &str,
+    control: &BranchHeadControl,
+) -> Result<(Vec<u8>, Vec<u8>), LixError> {
+    Ok((encode_key(branch_id)?, encode_control(branch_id, control)?))
+}
+
+pub(crate) fn canonicalize_control_for_migration(
+    key: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let key: BranchHeadControlKey = storage_codec::decode("branch-head control key", key)?;
+    let control = decode_control(&key.branch_id, value)?;
+    encode_control(&key.branch_id, &control)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_v82_control_for_test(
+    branch_id: &str,
+    control: &BranchHeadControl,
+) -> Result<(Vec<u8>, Vec<u8>), LixError> {
+    let legacy = LegacyBranchHeadControl {
+        head_commit_id: control.head_commit_id,
+        tracked_generation: control.tracked_generation,
+        current_state_revision: control.current_state_revision,
+        working_diff_checkpoint_commit_id: control.working_diff_checkpoint_commit_id,
+        created_at: control.created_at,
+        updated_at: control.updated_at,
+        ref_change_id: control.ref_change_id,
+        schema_presence_bloom: control.schema_presence_bloom,
+    };
+    let mut bytes = LEGACY_BRANCH_HEAD_CONTROL_MAGIC.to_vec();
+    bytes.extend_from_slice(&storage_codec::encode("v82 control", &legacy)?);
+    bytes.extend_from_slice(&control_digest_with_context(
+        branch_id,
+        &bytes,
+        LEGACY_BRANCH_HEAD_CONTROL_DIGEST_CONTEXT,
+    ));
+    Ok((encode_key(branch_id)?, bytes))
+}
+
 fn decode_control(branch_id: &str, bytes: &[u8]) -> Result<BranchHeadControl, LixError> {
     let payload_end = bytes
         .len()
@@ -405,10 +479,33 @@ fn decode_control(branch_id: &str, bytes: &[u8]) -> Result<BranchHeadControl, Li
         .filter(|payload_end| *payload_end >= BRANCH_HEAD_CONTROL_MAGIC.len())
         .ok_or_else(branch_head_control_corruption)?;
     let (authenticated, stored_digest) = bytes.split_at(payload_end);
-    if !authenticated.starts_with(BRANCH_HEAD_CONTROL_MAGIC)
-        || stored_digest != control_digest(branch_id, authenticated)
+    let legacy = authenticated.starts_with(LEGACY_BRANCH_HEAD_CONTROL_MAGIC);
+    let context = if legacy {
+        LEGACY_BRANCH_HEAD_CONTROL_DIGEST_CONTEXT
+    } else {
+        BRANCH_HEAD_CONTROL_DIGEST_CONTEXT
+    };
+    if !(legacy || authenticated.starts_with(BRANCH_HEAD_CONTROL_MAGIC))
+        || stored_digest != control_digest_with_context(branch_id, authenticated, context)
     {
         return Err(branch_head_control_corruption());
+    }
+    if legacy {
+        let old: LegacyBranchHeadControl = storage_codec::decode(
+            "v82 branch-head control",
+            &authenticated[LEGACY_BRANCH_HEAD_CONTROL_MAGIC.len()..],
+        )?;
+        return Ok(BranchHeadControl {
+            head_commit_id: old.head_commit_id,
+            tracked_generation: old.tracked_generation,
+            current_state_revision: old.current_state_revision,
+            working_diff_checkpoint_commit_id: old.working_diff_checkpoint_commit_id,
+            created_at: old.created_at,
+            updated_at: old.updated_at,
+            ref_change_id: old.ref_change_id,
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)?,
+            schema_presence_bloom: old.schema_presence_bloom,
+        });
     }
     storage_codec::decode(
         "branch-head control",
@@ -476,7 +573,11 @@ fn absent_native_branch_descriptors<'a, S: StorageAdapterRead + ?Sized>(
 }
 
 fn control_digest(branch_id: &str, authenticated: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(BRANCH_HEAD_CONTROL_DIGEST_CONTEXT);
+    control_digest_with_context(branch_id, authenticated, BRANCH_HEAD_CONTROL_DIGEST_CONTEXT)
+}
+
+fn control_digest_with_context(branch_id: &str, authenticated: &[u8], context: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(context);
     hasher.update(&(branch_id.len() as u64).to_be_bytes());
     hasher.update(branch_id.as_bytes());
     hasher.update(authenticated);
@@ -508,6 +609,34 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
+
+    #[test]
+    fn v82_control_decodes_with_anonymous_author_and_authentication() {
+        let branch_id = "00000000-0000-7000-8000-000000000091";
+        let timestamp = LixTimestamp::expect_parse("legacy timestamp", "2026-01-01T00:00:00Z");
+        let legacy = LegacyBranchHeadControl {
+            head_commit_id: CommitId::for_test_label("legacy-head"),
+            tracked_generation: CommitId::for_test_label("legacy-generation"),
+            current_state_revision: 4,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("legacy-ref"),
+            schema_presence_bloom: [0; SCHEMA_PRESENCE_BLOOM_WORDS],
+        };
+        let mut bytes = LEGACY_BRANCH_HEAD_CONTROL_MAGIC.to_vec();
+        bytes.extend_from_slice(&storage_codec::encode("v82 control", &legacy).unwrap());
+        bytes.extend_from_slice(&control_digest_with_context(
+            branch_id,
+            &bytes,
+            LEGACY_BRANCH_HEAD_CONTROL_DIGEST_CONTEXT,
+        ));
+        let decoded = decode_control(branch_id, &bytes).unwrap();
+        assert_eq!(decoded.head_commit_id, legacy.head_commit_id);
+        assert_eq!(decoded.author_id_string(), crate::ANONYMOUS_ACCOUNT_ID);
+        bytes[5] ^= 1;
+        assert!(decode_control(branch_id, &bytes).is_err());
+    }
 
     #[tokio::test]
     async fn native_descriptor_absence_distinguishes_new_branch_from_unseen_existing_control() {
@@ -616,6 +745,8 @@ mod tests {
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("first-ref-change"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
@@ -626,6 +757,8 @@ mod tests {
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
+            author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                .expect("anonymous account ID is canonical"),
         };
         let branch_a = "01920000-0000-7000-8000-0000000000a1".to_string();
         let branch_b = "01920000-0000-7000-8000-0000000000b1".to_string();

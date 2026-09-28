@@ -79,7 +79,7 @@ async fn main() {
         latencies.push(start.elapsed());
         if checkpoint_every > 0 && (index + 1) % checkpoint_every == 0 {
             session
-                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
                 .await
                 .expect("checkpoint should publish");
             checkpoints += 1;

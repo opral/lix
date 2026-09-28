@@ -23,6 +23,9 @@ impl NativeMigrationCleanupRequest {
             inline_blobs: vec![],
             ref_updates: vec![SyncRefUpdate {
                 branch_id: self.migration.source_branch_id.clone(),
+                author_id: None,
+                ref_change_id: None,
+                expected_ref_change_id: None,
                 expected_head_commit_id: Some(
                     self.migration.request.captured_local_head_commit_id.clone(),
                 ),

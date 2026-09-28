@@ -47,6 +47,53 @@ async fn mainline_checkpoint_history_uses_actual_endpoints_and_keeps_empty_log_e
 }
 
 #[tokio::test]
+async fn checkpoint_log_window_preserves_conversation_id() {
+    let lix = crate::open_lix().await.unwrap();
+    let checkpoint = lix
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint('window conversation', NULL)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+
+    // This unbounded checkpoint scan takes the batched summary-window route.
+    let log = lix
+        .execute(
+            "SELECT commit_id, conversation_id FROM lix_log() \
+             WHERE is_checkpoint ORDER BY position",
+            &[],
+        )
+        .await
+        .unwrap();
+    let row = log
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("commit_id").ok().as_deref() == Some(checkpoint.as_str())
+        })
+        .expect("checkpoint should appear in the checkpoint log window");
+    let conversation_id = row
+        .get::<String>("conversation_id")
+        .expect("described checkpoint should keep its conversation ID");
+    let conversation = lix
+        .execute(
+            "SELECT title FROM lix_conversation WHERE id = $1",
+            &[Value::Text(conversation_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        conversation.rows()[0].get::<String>("title").unwrap(),
+        "window conversation"
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn mainline_working_context_and_checkpoint_log() {
     let lix = crate::open_lix().await.unwrap();
     let initial = lix.execute("SELECT commit_id, working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()", &[]).await.unwrap();

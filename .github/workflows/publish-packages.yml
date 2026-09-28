@@ -37,6 +37,9 @@ jobs:
       has_release: ${{ steps.version.outputs.has_release }}
       server_tag: ${{ steps.server.outputs.tag }}
       server_digest: ${{ steps.server.outputs.digest }}
+      server_reuse: ${{ steps.tested-server.outputs.reuse == 'true' && steps.tested-server.outputs.server_artifact == 'true' }}
+      server_source_run: ${{ steps.tested-server.outputs.run_id }}
+      server_source_revision: ${{ steps.tested-server.outputs.revision }}
       browser_run: ${{ steps.browser.outputs.run_id }}
       browser_revision: ${{ steps.browser.outputs.revision }}
 
@@ -140,6 +143,32 @@ jobs:
         id: server
         run: node scripts/ci-server-image.mjs
 
+      - name: Find the server artifact from the identical tested PR tree
+        if: github.event_name == 'push' && steps.server.outputs.digest == ''
+        id: tested-server
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { execFileSync } = await import('node:child_process');
+            const { findReusableRun, readArtifactJson } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-merge-reuse.mjs`);
+            const tree = execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim();
+            let result;
+            try {
+              result = await findReusableRun({
+                github, repository: `${context.repo.owner}/${context.repo.repo}`,
+                sha: context.sha, tree,
+                readEvidence: artifact => readArtifactJson({ github, repo: context.repo, artifact, filename: 'tested-source.json' }),
+              });
+            } catch (error) {
+              core.warning(`Cannot prove tested server image reuse; build fallback remains available: ${error.message}`);
+            }
+            if (result?.serverArtifact) {
+              core.setOutput('reuse', 'true');
+              core.setOutput('run_id', result.runId);
+              core.setOutput('revision', result.revision);
+              core.setOutput('server_artifact', 'true');
+            }
+
       - name: Find tested browser artifacts for the release tree
         if: steps.version.outputs.has_release == 'true'
         id: browser
@@ -158,6 +187,7 @@ jobs:
     needs: release-version
     permissions:
       contents: read
+      actions: read
       packages: write
 
     steps:
@@ -201,9 +231,63 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
 
+      - name: Download the identical-tree tested server image
+        id: reuse-download
+        if: needs.release-version.outputs.server_digest == '' && needs.release-version.outputs.server_reuse == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: lix-server-image-linux-x64-${{ needs.release-version.outputs.server_source_revision }}
+          run-id: ${{ needs.release-version.outputs.server_source_run }}
+          github-token: ${{ github.token }}
+          path: ci-artifact
+
+      - name: Promote tested server layers to the release revision
+        id: reuse-prepare
+        if: needs.release-version.outputs.server_digest == '' && needs.release-version.outputs.server_reuse == 'true' && steps.reuse-download.outcome == 'success'
+        continue-on-error: true
+        env:
+          SOURCE_REVISION: ${{ needs.release-version.outputs.server_source_revision }}
+          SOURCE_RUN: ${{ needs.release-version.outputs.server_source_run }}
+          RELEASE_VERSION: ${{ needs.release-version.outputs.has_release == 'true' && needs.release-version.outputs.version || needs.release-version.outputs.release_sha }}
+        run: node scripts/ci-promote-server-image.mjs
+
+      - name: Select prepared image or source build
+        id: reuse-ready
+        if: needs.release-version.outputs.server_digest == '' && needs.release-version.outputs.server_reuse == 'true'
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.reuse-download.outcome }}
+          PREPARE_OUTCOME: ${{ steps.reuse-prepare.outcome }}
+        run: |
+          if [ "$DOWNLOAD_OUTCOME" = success ] && [ "$PREPARE_OUTCOME" = success ]; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Tested server artifact could not be prepared; building from source.'
+          fi
+
+      - name: Publish the tested server image without recompilation
+        id: reuse-publish
+        if: needs.release-version.outputs.server_digest == '' && steps.reuse-ready.outputs.ready == 'true'
+        env:
+          RELEASE_SHA: ${{ needs.release-version.outputs.release_sha }}
+          IMAGE_TAGS: ${{ steps.image-tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          sha_tag="ghcr.io/opral/lix-server:sha-$RELEASE_SHA"
+          docker tag "lix-server-ci:$RELEASE_SHA" "$sha_tag"
+          docker push "$sha_tag"
+          digest="$(docker buildx imagetools inspect "$sha_tag" --format '{{json .Manifest.Digest}}' | jq -er .)"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          tags=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tags+=(--tag "$tag")
+          done <<< "$IMAGE_TAGS"
+          docker buildx imagetools create --prefer-index=false "${tags[@]}" "ghcr.io/opral/lix-server@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Build and publish immutable server image
         id: publish
-        if: needs.release-version.outputs.server_digest == ''
+        if: needs.release-version.outputs.server_digest == '' && steps.reuse-ready.outputs.ready != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -237,7 +321,7 @@ jobs:
 
       - name: Verify the reference image is publicly pullable
         env:
-          SERVER_DIGEST: ${{ steps.publish.outputs.digest || needs.release-version.outputs.server_digest }}
+          SERVER_DIGEST: ${{ steps.reuse-publish.outputs.digest || steps.publish.outputs.digest || needs.release-version.outputs.server_digest }}
         run: |
           docker logout ghcr.io
           docker manifest inspect \
@@ -253,7 +337,7 @@ jobs:
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
     strategy:

@@ -23,7 +23,7 @@ pub(crate) const PARTIAL_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::decla
     ValueSemantics::Mutable,
 );
 const STATE_KEY: &[u8] = b"current";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 const MAX_STATE_BYTES: usize = 16 * 1024;
 
 pub(crate) fn partial_replica_state_key() -> StorageKey {

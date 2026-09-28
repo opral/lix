@@ -179,17 +179,17 @@ FROM lix_apply(
 );
 
 SELECT commit_id
-FROM lix_create_checkpoint(ARRAY(
+FROM lix_create_checkpoint($1, $2, ARRAY(
   SELECT row_ref
   FROM lix_diff('lix_file')
   WHERE to_path LIKE '/docs/%'
 ));
 
-SELECT commit_id FROM lix_create_checkpoint();
+SELECT commit_id FROM lix_create_checkpoint($1, $2);
 ```
 
 Selecting a file includes the tracked rows composing that file. Partial file checkpoints also include required ancestor directory descriptors. Directory rows and mixed-relation selections use the same dependency planner. A scope that cannot be closed into a valid checkpoint fails before commit.
 
-Each statement is atomic. An empty recovery/apply selection succeeds without creating a content commit and returns one receipt row with `commit_id = NULL`; duplicate selected identities are rejected. A non-empty command returns one new commit ID. Full checkpoints retain their intentional empty milestone behavior. Undo/redo metadata-only transitions are the exception: they intentionally create a non-NULL commit even when no content row changes. The command result is a receipt, so callers should inspect its row rather than infer the commit from selected-row counts. Full checkpoints structurally reuse the branch state without copying application rows.
+For checkpoint calls, `$1` is a nullable title and `$2` is a nullable Zettel JSONB comment. An empty checkpoint selection is rejected. Each statement is atomic. An empty recovery/apply selection succeeds without creating a content commit and returns one receipt row with `commit_id = NULL`; duplicate selected identities are rejected. A non-empty command returns one new commit ID. Full checkpoints retain their intentional empty milestone behavior. Undo/redo metadata-only transitions are the exception: they intentionally create a non-NULL commit even when no content row changes. The command result is a receipt, so callers should inspect its row rather than infer the commit from selected-row counts. Full checkpoints structurally reuse the branch state without copying application rows.
 
-Rows written with `lixcol_untracked` are absent from every diff. Untracked state belongs to the local repository replica and is not transported through commit-based synchronization; use a separate service for state that needs synchronization without version history.
+Rows written with `lixcol_untracked` are absent from every diff. They still have a `lixcol_change_id` for their current-state write, but no commit ID or retained `lix_change` history record. Untracked state belongs to the local repository replica and is not transported through commit-based synchronization; use a separate service for state that needs synchronization without version history.

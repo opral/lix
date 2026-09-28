@@ -62,10 +62,22 @@ pub(super) async fn native_migration_pin_wave(
         reverse.push(commit);
     }
     reverse.reverse();
+    let ref_author = reverse
+        .last()
+        .map(|commit| commit.account_id.clone())
+        .ok_or_else(|| invalid("migration pin has no authored commit"))?;
     let result = SyncPushRequest {
         commits: reverse,
         ref_updates: vec![SyncRefUpdate {
             branch_id: source_branch.into(),
+            ref_change_id: Some(super::partial_push_state::deterministic_ref_change_id(
+                source_branch,
+                &target.to_string(),
+                &request.checkpoint_commit_id,
+                &ref_author,
+            )?),
+            expected_ref_change_id: None,
+            author_id: Some(ref_author),
             expected_head_commit_id: pin_exists.then(|| accepted.into()),
             expected_checkpoint_commit_id: pin_exists.then(|| request.checkpoint_commit_id.clone()),
             head_commit_id: Some(target.to_string()),

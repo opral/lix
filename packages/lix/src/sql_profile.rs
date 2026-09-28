@@ -1,8 +1,6 @@
 //! Benchmark-only SQL phase and scan diagnostics.
 
 #[cfg(test)]
-mod p95_workloads;
-#[cfg(test)]
 mod point_join_scan_scaling;
 
 use std::cell::RefCell;

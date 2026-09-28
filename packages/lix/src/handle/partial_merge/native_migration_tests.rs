@@ -670,6 +670,9 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
                 inline_blobs: vec![],
                 ref_updates: vec![crate::sync::SyncRefUpdate {
                     branch_id: branch.id.clone(),
+                    author_id: Some(source_before.selected_branch.author_id.clone()),
+                    ref_change_id: Some(crate::changelog::ChangeId::for_test_label("partial-migration-target-ref").to_string()),
+                    expected_ref_change_id: Some(source_before.selected_branch.ref_change_id.clone()),
                     expected_head_commit_id: Some(local.clone()),
                     expected_checkpoint_commit_id: Some(
                         source_before.selected_branch.checkpoint.commit_id,

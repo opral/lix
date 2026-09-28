@@ -1,4 +1,4 @@
-//! v82 -> v83: rewrite packed commit records with a strict first-parent
+//! v83 -> v84: rewrite packed commit records with a strict first-parent
 //! nearest-checkpoint summary. Missing ancestry remains unavailable.
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -195,13 +195,13 @@ where
         .ok_or_else(|| failure("checkpoint summary migration has no repository marker"))?;
     let (source_marker, target_marker) = if partial {
         (
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
         )
     } else {
         (
-            crate::init::REPOSITORY_PROTOCOL_V82,
             crate::init::REPOSITORY_PROTOCOL_V83,
+            crate::init::REPOSITORY_PROTOCOL_V84,
         )
     };
     if marker.as_ref() == target_marker {
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v82_full_and_partial_migrations_rewrite_real_v7_commit_records() {
+    async fn v83_full_and_partial_migrations_rewrite_real_v7_commit_records() {
         for partial in [false, true] {
             migrate_v7_checkpoint_fixture(partial).await;
         }
@@ -344,9 +344,9 @@ mod tests {
         values.push((
             crate::init::REPOSITORY_PROTOCOL_KEY.to_vec(),
             if partial {
-                crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82.to_vec()
+                crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83.to_vec()
             } else {
-                crate::init::REPOSITORY_PROTOCOL_V82.to_vec()
+                crate::init::REPOSITORY_PROTOCOL_V83.to_vec()
             },
         ));
         let entries: Vec<PutEntry> = values
@@ -410,9 +410,9 @@ mod tests {
             .await
             .expect("v7 records should migrate atomically");
         let expected_marker = if partial {
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84
         } else {
-            crate::init::REPOSITORY_PROTOCOL_V83
+            crate::init::REPOSITORY_PROTOCOL_V84
         };
         let marker = crate::migration::api::load_repository_protocol_marker(&adapter)
             .await

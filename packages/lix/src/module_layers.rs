@@ -77,7 +77,7 @@ const MODULE_LAYERS: &[&[&str]] = &[
     // invariant: the compiler now rejects a canonical-side read of the cache.
     &["hot_state"],
     // Row-level overlays over the state planes.
-    &["checkpoint"],
+    &["checkpoint", "checkpoint_conversation"],
     // Undo navigation interprets checkpoint boundaries and retirement.
     &["undo_redo"],
     // Public hosted lifecycle composes snapshots and protocol transport.

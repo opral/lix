@@ -2033,6 +2033,7 @@ where
                         "commit-graph-bench-member-{index}"
                     )),
                     commit_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at,
                     updated_at: created_at,

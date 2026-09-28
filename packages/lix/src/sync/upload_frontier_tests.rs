@@ -40,7 +40,7 @@ async fn fully_acknowledged_checkpoint_waves_retire_source_frontiers() {
     for wave in 0..4 {
         write_key_value(&replica, "frontier-checkpoint", &format!("wave-{wave}")).await;
         replica
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
             .await
             .expect("full checkpoint captures working source");
         let mut drained = false;
@@ -126,7 +126,7 @@ async fn checkpoint_body_ack_keeps_source_boundary_for_pending_sibling_branch() 
         .get::<String>("head")
         .expect("head decodes");
     replica
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
         .await
         .expect("full checkpoint");
     replica

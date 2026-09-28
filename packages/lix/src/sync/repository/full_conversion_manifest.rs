@@ -73,6 +73,7 @@ pub(crate) async fn inspect_full_conversion_manifest(
             Some(AuthoritativeBranchCoordinate::Headed {
                 head_commit_id,
                 checkpoint_commit_id,
+                ..
             }) => (
                 Some(ConversionCoordinate {
                     head: head_commit_id.clone(),

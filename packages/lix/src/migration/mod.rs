@@ -13,6 +13,7 @@ pub use public_api::{
 };
 pub use public_api::{RepositoryInspection, RepositoryLayout, RepositoryRole, inspect_repository};
 mod authority_baseline_fence;
+mod author_storage;
 mod bounded_read;
 pub use authority_baseline_fence::upgrade_authority_for_partial_sync;
 pub(crate) use authority_baseline_fence::upgrade_candidate_if_authority;

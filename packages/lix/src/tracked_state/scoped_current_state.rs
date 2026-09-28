@@ -107,6 +107,7 @@ async fn stage_disjoint_columnar_current_state_pages(
                 source: CurrentStatePartSource::ColumnarPage(ColumnarPageSource {
                     source_id: parts.row_group_set_id,
                     owner_commit_id: parts.owner_commit_id,
+                    author_id: parts.author_id.clone(),
                     part_index: u32::try_from(group_index)
                         .map_err(|_| scoped_state_error("columnar group index exceeds u32"))?,
                     source_page_index: u16::try_from(page_index)
@@ -1028,6 +1029,7 @@ mod tests {
                     commit_id,
                     created_at,
                     updated_at: created_at,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     metadata: None,
                     snapshot: b"typed-payload",
                 })
@@ -1105,6 +1107,7 @@ mod tests {
                     commit_id: parent_id,
                     created_at,
                     updated_at,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     metadata: None,
                     snapshot: b"typed-v1",
                 })
@@ -1184,6 +1187,7 @@ mod tests {
                     row_pk: &deleted,
                     change_id: ChangeId::for_test_label("scoped-delete"),
                     commit_id: child_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: true,
                     created_at,
                     updated_at,
@@ -1202,6 +1206,7 @@ mod tests {
                     row_pk: &inserted,
                     change_id: ChangeId::for_test_label("scoped-insert"),
                     commit_id: child_id,
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     deleted: false,
                     created_at,
                     updated_at,
@@ -1341,6 +1346,7 @@ mod tests {
                 row_pk: &row,
                 change_id: ChangeId::for_test_label("certified-new-scope-change"),
                 commit_id: child_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at,
                 updated_at,
@@ -1447,6 +1453,7 @@ mod tests {
                 row_pk: &row,
                 change_id: ChangeId::for_test_label(&format!("multi-scope-{schema_key}")),
                 commit_id: child_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at,
                 updated_at,
@@ -1544,6 +1551,7 @@ mod tests {
                 row_pk: &first_row,
                 change_id: ChangeId::for_test_label("staged-parent-first"),
                 commit_id: first_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at,
                 updated_at,
@@ -1562,6 +1570,7 @@ mod tests {
                 row_pk: &second_row,
                 change_id: ChangeId::for_test_label("staged-parent-second"),
                 commit_id: second_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
                 deleted: false,
                 created_at,
                 updated_at,

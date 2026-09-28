@@ -1,10 +1,10 @@
 ---
-description: Git is a CLI for source code. Lix is a library that versions any file format and stores files and app data in one SQL database.
+description: Git versions files. Lix is an embeddable library that versions files of any format and SQL tables in one repository.
 ---
 
 # How Lix compares to Git
 
-Git versions files, but application data usually lives in a separate database. You can commit a SQLite database file to Git, but Git sees its bytes rather than queryable rows. Database changes are hard to review or merge, and successive versions grow the repository. Lix stores files and application data as SQL tables in one versioned repository. File plugins provide structured diffs for supported formats.
+Git versions files, but an app's tables usually live in a separate database. You can commit a SQLite database file to Git, but Git sees its bytes rather than queryable rows. Database changes are hard to review or merge, and successive versions grow the repository. Lix versions files and SQL tables in one repository. File plugins provide structured diffs for supported formats; other files have whole-file history.
 
 ## When to use which
 

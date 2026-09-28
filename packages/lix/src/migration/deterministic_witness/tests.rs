@@ -132,6 +132,9 @@ async fn v78_backfill_preserves_native_rows_history_and_controls() {
     super::super::hot_indexes::migrate(&adapter, MigrationOptions::default(), false)
         .await
         .unwrap();
+    super::super::author_storage::migrate(&adapter, MigrationOptions::default(), false)
+        .await
+        .unwrap();
     super::super::first_parent_checkpoints::migrate(&adapter, MigrationOptions::default(), false)
         .await
         .unwrap();

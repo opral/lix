@@ -129,6 +129,11 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
         "gc.native_global_migration_retention.v1",
         ValueSemantics::Mutable,
     ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000d),
+        "checkpoint.conversation.v1",
+        ValueSemantics::Mutable,
+    ),
     crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
 ];
 
@@ -228,6 +233,11 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_000c),
         "gc.native_global_migration_retention.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000d),
+        "checkpoint.conversation.v1",
         ValueSemantics::Mutable,
     ),
 ];
@@ -718,6 +728,7 @@ mod tests {
             crate::gc::NATIVE_UPLOAD_ATTEMPT_SPACE,
             crate::gc::NATIVE_GLOBAL_RETENTION_SPACE,
             crate::checkpoint::CHECKPOINT_INVENTORY_SPACE,
+            crate::checkpoint_conversation::CHECKPOINT_CONVERSATION_SPACE,
         ] {
             let row = ALL_STORAGE_SPACES
                 .iter()

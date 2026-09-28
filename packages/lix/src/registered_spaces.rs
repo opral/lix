@@ -121,6 +121,8 @@ pub const NATIVE_UPLOAD_ATTEMPT_SPACE: StorageSpace = crate::gc::NATIVE_UPLOAD_A
 pub const PARTIAL_READ_INTEREST_SPACE: StorageSpace = crate::sync::PARTIAL_READ_INTEREST_SPACE;
 pub const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = crate::gc::CHECKPOINT_RECOVERY_REF_SPACE;
 pub const CHECKPOINT_GC_STATE_SPACE: StorageSpace = crate::gc::CHECKPOINT_GC_STATE_SPACE;
+pub const CHECKPOINT_CONVERSATION_SPACE: StorageSpace =
+    crate::checkpoint_conversation::CHECKPOINT_CONVERSATION_SPACE;
 pub const COMMIT_RETIREMENT_INTENT_SPACE: StorageSpace = crate::gc::COMMIT_RETIREMENT_INTENT_SPACE;
 pub const NATIVE_BASELINE_LEASE_SPACE: StorageSpace = crate::gc::NATIVE_BASELINE_LEASE_SPACE;
 /// Stable, unbanked control row selecting the active physical repository epoch.
@@ -202,6 +204,7 @@ mod tests {
         NATIVE_BASELINE_LEASE_SPACE,
         NATIVE_UPLOAD_ATTEMPT_SPACE,
         NATIVE_GLOBAL_RETENTION_SPACE,
+        CHECKPOINT_CONVERSATION_SPACE,
         REPOSITORY_EPOCH_SPACE,
     ];
 

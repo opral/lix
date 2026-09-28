@@ -1,22 +1,28 @@
 ---
-description: Lix is a version control system for files and application data. It stores files and SQL tables in one repository.
+description: Lix versions files of any format alongside application tables in one repository, with branches and history for both.
 ---
 
 # What is Lix?
 
-Lix is a version control system for files and application data. It stores files of any format alongside application data in SQL tables. Files, tables, and history share one repository. Lix runs inside your app or connects to a server.
+Lix is a version control system for files and tables. It stores any file format, including large media, CAD, Word, and PowerPoint, alongside SQL tables for CRM records, logs, and other application data. Files, tables, and history share one repository. Lix can run inside a product or connect to a server.
 
-Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge. Every tracked write becomes a commit automatically. You never run a commit command.
+Code, documents, and application tables can share one history. A branch can carry related file and row changes for review before they become the current state. This gives teams a foundation for change proposals and, later, automated checks across more than code.
 
-For supported formats, plugins track changes inside files as rows. Other files still have whole-file history. See [How Lix compares to Git](./comparison-to-git.md).
+[Try Lix in the cloud →](https://lixray.com)
 
-<img src="../website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
+Agents and tools read and write normal files. Products query and update SQL rows. Both work on the same repository. Every tracked write becomes a commit automatically. You never run a commit command.
+
+Lix versions tables that your app defines and writes through Lix. It does not automatically version tables in an external database. For supported file formats, plugins track changes inside files as rows. Other files still have whole-file history. See [How Lix compares to Git](./comparison-to-git.md).
+
+<img src="../website/public/assets/one-lix-repo.svg" alt="One Lix repository with files of many formats beside SQL tables and example rows" width="760" />
+
+<img src="../website/public/assets/filesystem-database-version-control.svg" alt="Files of any format, SQL tables, version control, and embedding in one library" width="880" />
 
 ## Use cases
 
 ### Co-locate code, documents, and app state
 
-Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. No system versions all of them together. Lix stores them in one repository with one history.
+Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. Lix can put those files and app tables in one repository with one history.
 
 ```ts
 // A script, a 4.8 GB video, and an app table in one transaction.
@@ -38,7 +44,7 @@ await lix.executeBatch([
 
 ### Give each customer a repository
 
-Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive has no version control. Your customers do not have GitHub repos. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, and media.
+Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive's file history does not cover your app's SQL tables. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, media, and app tables.
 
 <img src="../website/public/assets/customer-repositories.svg" alt="Your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files" width="760" />
 
