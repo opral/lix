@@ -476,7 +476,7 @@ where
     let entries = classify_tree_diff_batch(tree_diff, &payloads, fingerprints.as_ref())?;
 
     let diff = if request.retain_payloads {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "storage-benches"))]
         crate::sql_profile::record_diff_payload_rows_retained(payloads.len());
         TrackedStateDiff::from_entries_with_payloads(entries, payloads)
     } else {

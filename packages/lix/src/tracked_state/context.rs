@@ -1687,7 +1687,7 @@ where
             validated_payload_keys.insert((row.commit_id(), key.clone()));
             insert_tree_diff_change_record(&mut changes, entry.change_record, row.change_id())?;
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "storage-benches"))]
         crate::sql_profile::record_diff_payload_joined_delta_validation_rows(
             validated_payload_keys.len(),
         );

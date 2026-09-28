@@ -256,7 +256,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
         ));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "storage-benches"))]
     if projection.snapshot_content {
         let rows = plans
             .iter()

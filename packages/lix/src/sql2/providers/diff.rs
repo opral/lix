@@ -1247,7 +1247,7 @@ async fn effective_diff<S: StorageAdapterRead>(
             );
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "storage-benches"))]
     crate::sql_profile::record_file_local_diff_rows_reused(direct_local_entries.len());
     let mut candidates = BTreeSet::new();
     extend_diff_keys(&mut candidates, &local_candidates);
@@ -1356,7 +1356,7 @@ async fn effective_diff<S: StorageAdapterRead>(
     }
     // The counter intentionally measures rows actually captured for SQL diff
     // payload output. Identity-only projections leave the map empty.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "storage-benches"))]
     crate::sql_profile::record_effective_payload_rows_captured(payloads.len());
     let diff = if request.retain_payloads {
         let payloads = TrackedStatePayloadBatch::from_payloads(
@@ -2671,15 +2671,22 @@ mod tests {
             "the live/local winner is preserved while the tombstone resolves against the pinned base"
         );
 
+        #[cfg(feature = "storage-benches")]
         let (count, profile) = session
             .execute_profiled("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
             .await
             .expect("profile identity-only mixed diff");
+        #[cfg(not(feature = "storage-benches"))]
+        let count = session
+            .execute("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("count identity-only mixed diff");
         assert_eq!(
             count.rows()[0].get::<i64>("n").unwrap(),
             actual.len() as i64,
             "identity-only count must match the full diff oracle"
         );
+        #[cfg(feature = "storage-benches")]
         assert!(
             profile.file_local_diff_rows_reused > 0,
             "the count path should reuse at least the live/live local winner"
