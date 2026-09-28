@@ -34,6 +34,11 @@ struct Journal {
     epoch_id: String,
     recipes: Vec<LogicalReadInterest>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalVersion {
+    version: u32,
+}
 fn invalid(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_INTEREST_JOURNAL_INVALID", message)
 }
@@ -128,8 +133,27 @@ async fn load(
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err(invalid("interest journal exceeds document bound"));
     }
-    let journal: Journal =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("interest journal is malformed"))?;
+    // Keep current-format loads to one parse. A version-2 filesystem recipe
+    // lacks the required scope, so only failed typed decodes inspect the
+    // envelope to report the deliberate rebootstrap hard cut.
+    let journal: Journal = match serde_json::from_slice(&bytes) {
+        Ok(journal) => journal,
+        Err(_) => {
+            let version: JournalVersion = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("interest journal is malformed"))?;
+            if version.version == 2 {
+                return Err(invalid(
+                    "version 2 partial-interest journals require a fresh partial-replica bootstrap",
+                ));
+            }
+            return Err(invalid("interest journal is malformed"));
+        }
+    };
+    if journal.version == 2 {
+        return Err(invalid(
+            "version 2 partial-interest journals require a fresh partial-replica bootstrap",
+        ));
+    }
     if journal.version != 3 || journal.epoch_id != expected.epoch_id() {
         return Err(invalid("interest journal version or epoch mismatch"));
     }
@@ -143,6 +167,15 @@ async fn load(
             expected: receipt,
         },
     ))
+}
+
+/// Migration must reject an old partial cache before publishing a new epoch;
+/// otherwise its first successful query can fail while flushing interests.
+pub(crate) async fn validate_partial_read_interest_journal(
+    read: &(impl StorageAdapterRead + ?Sized),
+    expected: &PartialReplicaState,
+) -> Result<(), LixError> {
+    load(read, expected).await.map(|_| ())
 }
 /// Candidate preparation must refresh durable interests even if this engine
 /// already flushed its own scopes. Publish with both returned CAS guards.
@@ -539,6 +572,7 @@ mod tests {
         let read = storage.begin_read(Default::default()).await.unwrap();
         let error = load(&read, &state).await.unwrap_err();
         assert_eq!(error.code, "LIX_PARTIAL_INTEREST_JOURNAL_INVALID");
+        assert!(error.to_string().contains("fresh partial-replica bootstrap"));
     }
 
     #[tokio::test]

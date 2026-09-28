@@ -84,6 +84,7 @@ pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
 pub(crate) use partial_interest_journal::{
     PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
+    validate_partial_read_interest_journal,
 };
 mod leased_descriptor;
 mod partial_replica;

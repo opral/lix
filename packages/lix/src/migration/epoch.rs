@@ -1769,6 +1769,11 @@ where
             .0)
     })
     .await?;
+    crate::handle::retry_expired_read(|| async {
+        let read = target.begin_read(ReadOptions::default()).await?;
+        crate::sync::validate_partial_read_interest_journal(&read, &state).await
+    })
+    .await?;
     let (engine, session) =
         Engine::new_partial_replica(target.clone(), EngineOptions::new(), &state).await?;
     drop(session);
