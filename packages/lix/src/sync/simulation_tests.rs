@@ -2223,7 +2223,6 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
         }),
         "bootstrap may derive a direct checkpoint parent from locally present inventory records",
     );
-    drop(changelog);
     drop(read);
     let query = format!(
         "SELECT value FROM lix_as_of('lix_key_value', '{abandoned}') WHERE key = 'inventory'"

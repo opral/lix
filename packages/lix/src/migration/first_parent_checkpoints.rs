@@ -455,7 +455,6 @@ mod tests {
             migrated[&sparse_id].first_parent_checkpoint_summary, None,
             "a missing sparse parent must remain unavailable"
         );
-        drop(changelog);
         drop(read);
     }
 }

@@ -6298,20 +6298,20 @@ mod tests {
 
         let fast_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
                         FROM lix_log() WHERE is_checkpoint ORDER BY position ASC";
-        crate::sql2::take_mainline_work();
+        sql2::take_mainline_work();
         let fast = session
             .execute(fast_sql, &[])
             .await
             .expect("summary-backed checkpoint log should read");
-        let (fast_graph_reads, _) = crate::sql2::take_mainline_work();
+        let (fast_graph_reads, _) = sql2::take_mainline_work();
         let scan_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
                         FROM lix_log() WHERE is_checkpoint OR commit_id = '' ORDER BY position ASC";
-        crate::sql2::take_mainline_work();
+        sql2::take_mainline_work();
         let scan = session
             .execute(scan_sql, &[])
             .await
             .expect("ordinary checkpoint scan should read");
-        let (scan_graph_reads, _) = crate::sql2::take_mainline_work();
+        let (scan_graph_reads, _) = sql2::take_mainline_work();
         assert_eq!(
             fast.rows(),
             scan.rows(),
@@ -6336,12 +6336,12 @@ mod tests {
             )
             .await
             .expect("mainline checkpoint should be retireable");
-        crate::sql2::take_mainline_work();
+        sql2::take_mainline_work();
         let after_retirement = session
             .execute(fast_sql, &[])
             .await
             .expect("summary route should preserve anchor-pinned retirement state");
-        crate::sql2::take_mainline_work();
+        sql2::take_mainline_work();
         let scan_after_retirement = session
             .execute(scan_sql, &[])
             .await

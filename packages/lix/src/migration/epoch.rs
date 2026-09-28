@@ -1537,7 +1537,7 @@ where
                 Box::pin(super::author_storage::append_plan(source, plan)).await?;
             }
             if from_format <= 83 {
-                let read = super::MigrationPlanningRead::new(source).await?;
+                let read = MigrationPlanningRead::new(source).await?;
                 let plan = plan.get_or_insert_with(|| {
                     super::publish::PublicationPlan::bounded(
                         options.max_changes,

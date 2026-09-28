@@ -31,7 +31,7 @@ pub(super) struct CommitRecordV7 {
     pub(super) commit_id: CommitId,
     pub(super) generation: u64,
     pub(super) parent_commit_ids: Vec<CommitId>,
-    #[musli(with = crate::storage_codec::option)]
+    #[musli(with = storage_codec::option)]
     pub(super) base_commit_id: Option<CommitId>,
     pub(super) first_parent_jump_commit_id: CommitId,
     pub(super) first_parent_jump_span: u64,

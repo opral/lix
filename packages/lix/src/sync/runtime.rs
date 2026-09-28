@@ -2075,13 +2075,13 @@ mod tests {
         let unknown = checkpoint_header(None);
         let known = checkpoint_header(Some(summary.clone()));
         assert_eq!(
-            super::reconcile_commit_header_hints(&unknown, &known, "test")
+            reconcile_commit_header_hints(&unknown, &known, "test")
                 .unwrap()
                 .first_parent_checkpoint_summary,
             Some(summary.clone()),
         );
         assert_eq!(
-            super::reconcile_commit_header_hints(&known, &known, "test").unwrap(),
+            reconcile_commit_header_hints(&known, &known, "test").unwrap(),
             known,
         );
 
@@ -2090,14 +2090,14 @@ mod tests {
             first_parent_distance: 0,
         }));
         assert!(
-            super::reconcile_commit_header_hints(&known, &conflicting, "test").is_err(),
+            reconcile_commit_header_hints(&known, &conflicting, "test").is_err(),
             "two present but conflicting summary claims must be rejected",
         );
 
         let mut authored_conflict = known.clone();
         authored_conflict.account_id = "different-account".to_owned();
         assert!(
-            super::reconcile_commit_header_hints(&known, &authored_conflict, "test").is_err(),
+            reconcile_commit_header_hints(&known, &authored_conflict, "test").is_err(),
             "header reconciliation must still reject immutable field mismatches",
         );
     }
