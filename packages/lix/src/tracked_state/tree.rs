@@ -66,6 +66,12 @@ struct FrontierMutation {
     value: Bytes,
 }
 
+#[derive(Debug, Clone)]
+struct DiffLeafEntry {
+    entry: EncodedLeafEntry,
+    author_present: bool,
+}
+
 #[derive(Debug)]
 struct FrontierRewrite {
     summaries: Vec<ChildSummary>,
@@ -291,6 +297,40 @@ impl TrackedStateTree {
             })
             .collect::<Vec<_>>();
         self.get_many_refs(store, root_id, &keys).await
+    }
+
+    /// Returns the physical author-column presence for requested root rows.
+    /// A missing identity yields `None`; a legacy leaf row without an author
+    /// column yields `Some(false)`.
+    pub(crate) async fn get_many_author_presence(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<bool>>, LixError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut key_batch = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+        for key in keys {
+            key_batch.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            });
+        }
+        let encoded_keys = key_batch.finish();
+        let mut encoded_keys = encoded_keys.iter().cloned().enumerate().collect::<Vec<_>>();
+        encoded_keys.sort_by(|left, right| left.1.cmp(&right.1));
+        let mut presence = vec![None; keys.len()];
+        self.get_many_author_presence_node(
+            store,
+            *root_id.as_bytes(),
+            &encoded_keys,
+            &mut presence,
+        )
+        .await?;
+        Ok(presence)
     }
 
     /// Resolves borrowed native identities without first cloning every schema,
@@ -1247,13 +1287,13 @@ impl TrackedStateTree {
                         (DecodedNode::Leaf(left_node), DecodedNode::Leaf(right_node)) => {
                             match left_summary.last_key.cmp(&right_summary.last_key) {
                                 std::cmp::Ordering::Less => {
-                                    left_window.extend(left_node.into_entries());
+                                    left_window.extend(decoded_leaf_entries_owned(&left_node)?);
                                     left.pop_front();
                                     right_loaded = Some(DecodedNode::Leaf(right_node));
                                 }
                                 std::cmp::Ordering::Greater => {
                                     left_loaded = Some(DecodedNode::Leaf(left_node));
-                                    right_window.extend(right_node.into_entries());
+                                    right_window.extend(decoded_leaf_entries_owned(&right_node)?);
                                     right.pop_front();
                                 }
                                 std::cmp::Ordering::Equal => {
@@ -1267,8 +1307,8 @@ impl TrackedStateTree {
                                             out,
                                         )?;
                                     } else {
-                                        left_window.extend(left_node.into_entries());
-                                        right_window.extend(right_node.into_entries());
+                                        left_window.extend(decoded_leaf_entries_owned(&left_node)?);
+                                        right_window.extend(decoded_leaf_entries_owned(&right_node)?);
                                         self.diff_leaf_entries(
                                             &left_window,
                                             &right_window,
@@ -1293,7 +1333,7 @@ impl TrackedStateTree {
                             replace_front_with_children(&mut left, node.into_children())?;
                         }
                         DecodedNode::Leaf(node) => {
-                            left_window.extend(node.into_entries());
+                            left_window.extend(decoded_leaf_entries_owned(&node)?);
                             left.pop_front();
                         }
                     }
@@ -1308,7 +1348,7 @@ impl TrackedStateTree {
                             replace_front_with_children(&mut right, node.into_children())?;
                         }
                         DecodedNode::Leaf(node) => {
-                            right_window.extend(node.into_entries());
+                            right_window.extend(decoded_leaf_entries_owned(&node)?);
                             right.pop_front();
                         }
                     }
@@ -1323,15 +1363,15 @@ impl TrackedStateTree {
 
     fn diff_leaf_entries(
         &self,
-        left: &[EncodedLeafEntry],
-        right: &[EncodedLeafEntry],
+        left: &[DiffLeafEntry],
+        right: &[DiffLeafEntry],
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
         let mut left_index = 0usize;
         let mut right_index = 0usize;
         while left_index < left.len() && right_index < right.len() {
-            match left[left_index].key.cmp(&right[right_index].key) {
+            match left[left_index].entry.key.cmp(&right[right_index].entry.key) {
                 std::cmp::Ordering::Less => {
                     self.push_removed_diff(left[left_index].clone(), request, out)?;
                     left_index += 1;
@@ -1341,7 +1381,7 @@ impl TrackedStateTree {
                     right_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    if left[left_index].value != right[right_index].value {
+                    if left[left_index].entry.value != right[right_index].entry.value {
                         self.push_modified_diff(
                             left[left_index].clone(),
                             right[right_index].clone(),
@@ -1375,7 +1415,7 @@ impl TrackedStateTree {
         while left_index < left.len() && right_index < right.len() {
             let left_entry = decoded_leaf_entry_owned(left, left_index)?;
             let right_entry = decoded_leaf_entry_owned(right, right_index)?;
-            match left_entry.key.cmp(&right_entry.key) {
+            match left_entry.entry.key.cmp(&right_entry.entry.key) {
                 std::cmp::Ordering::Less => {
                     self.push_removed_diff(left_entry, request, out)?;
                     left_index += 1;
@@ -1385,7 +1425,7 @@ impl TrackedStateTree {
                     right_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    if left_entry.value != right_entry.value {
+                    if left_entry.entry.value != right_entry.entry.value {
                         self.push_modified_diff(left_entry, right_entry, request, out)?;
                     }
                     left_index += 1;
@@ -1407,14 +1447,20 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_removed_diff(
         &self,
-        entry: EncodedLeafEntry,
+        entry: DiffLeafEntry,
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        let key = decode_key_shared(entry.key)?;
-        let value = decode_value(&entry.value)?;
+        let key = decode_key_shared(entry.entry.key)?;
+        let value = decode_value(&entry.entry.value)?;
         if request.matches_ref(key.as_ref(), &value) {
-            out.push_shared(key, Some(value), None);
+            out.push_shared_with_author_presence(
+                key,
+                Some(value),
+                entry.author_present,
+                None,
+                true,
+            );
         }
         Ok(())
     }
@@ -1422,14 +1468,20 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_added_diff(
         &self,
-        entry: EncodedLeafEntry,
+        entry: DiffLeafEntry,
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        let key = decode_key_shared(entry.key)?;
-        let value = decode_value(&entry.value)?;
+        let key = decode_key_shared(entry.entry.key)?;
+        let value = decode_value(&entry.entry.value)?;
         if request.matches_ref(key.as_ref(), &value) {
-            out.push_shared(key, None, Some(value));
+            out.push_shared_with_author_presence(
+                key,
+                None,
+                true,
+                Some(value),
+                entry.author_present,
+            );
         }
         Ok(())
     }
@@ -1437,19 +1489,25 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_modified_diff(
         &self,
-        left: EncodedLeafEntry,
-        right: EncodedLeafEntry,
+        left: DiffLeafEntry,
+        right: DiffLeafEntry,
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        debug_assert_eq!(left.key, right.key);
-        let key = decode_key_shared(left.key)?;
-        let left_value = decode_value(&left.value)?;
-        let right_value = decode_value(&right.value)?;
+        debug_assert_eq!(left.entry.key, right.entry.key);
+        let key = decode_key_shared(left.entry.key)?;
+        let left_value = decode_value(&left.entry.value)?;
+        let right_value = decode_value(&right.entry.value)?;
         if request.matches_ref(key.as_ref(), &left_value)
             || request.matches_ref(key.as_ref(), &right_value)
         {
-            out.push_shared(key, Some(left_value), Some(right_value));
+            out.push_shared_with_author_presence(
+                key,
+                Some(left_value),
+                left.author_present,
+                Some(right_value),
+                right.author_present,
+            );
         }
         Ok(())
     }
@@ -1699,6 +1757,12 @@ impl TrackedStateTree {
                         if !encoded_key_in_scan_ranges(&entry.key, ranges) {
                             continue;
                         }
+                        let entry = DiffLeafEntry {
+                            entry,
+                            author_present: leaf
+                                .author_present(index)
+                                .expect("decoded leaf entry has author-presence metadata"),
+                        };
                         if before_side {
                             self.push_removed_diff(entry, request, out)?;
                         } else {
@@ -1874,6 +1938,72 @@ impl TrackedStateTree {
                                     child.child_hash,
                                     &encoded_keys[start..end],
                                     values,
+                                )
+                                .await;
+                            if let Err(error) = result {
+                                if missing.push(error)? {
+                                    break;
+                                }
+                            }
+                        }
+                        start = end;
+                    }
+                    missing.finish()?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_many_author_presence_node<'a, S>(
+        &'a self,
+        store: &'a S,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        encoded_keys: &'a [(usize, Bytes)],
+        presence: &'a mut [Option<bool>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+    {
+        Box::pin(async move {
+            if encoded_keys.is_empty() {
+                return Ok(());
+            }
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
+                    for (original_index, encoded_key) in encoded_keys {
+                        if let Some(entry_index) = binary_search_leaf_key(&leaf, encoded_key)? {
+                            presence[*original_index] = leaf.author_present(entry_index);
+                        }
+                    }
+                }
+                DecodedNodeRef::Internal(internal) => {
+                    let mut missing = MissingTreeFrontier::default();
+                    let mut start = 0usize;
+                    let children = internal.children();
+                    for (child_index, child) in children.iter().enumerate() {
+                        if start >= encoded_keys.len() {
+                            break;
+                        }
+                        let end = if child_index + 1 == children.len() {
+                            encoded_keys.len()
+                        } else {
+                            let mut end = start;
+                            while end < encoded_keys.len()
+                                && encoded_keys[end].1.as_ref() <= child.last_key.as_ref()
+                            {
+                                end += 1;
+                            }
+                            end
+                        };
+                        if start < end {
+                            let result = self
+                                .get_many_author_presence_node(
+                                    store,
+                                    child.child_hash,
+                                    &encoded_keys[start..end],
+                                    presence,
                                 )
                                 .await;
                             if let Err(error) = result {
@@ -2810,13 +2940,31 @@ fn replace_front_with_children(
 fn decoded_leaf_entry_owned(
     leaf: &DecodedLeafNodeRef,
     index: usize,
-) -> Result<EncodedLeafEntry, LixError> {
-    leaf.entry_owned(index).ok_or_else(|| {
+) -> Result<DiffLeafEntry, LixError> {
+    let entry = leaf.entry_owned(index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "tracked-state leaf entry disappeared during diff",
         )
+    })?;
+    let author_present = leaf.author_present(index).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf author metadata disappeared during diff",
+        )
+    })?;
+    Ok(DiffLeafEntry {
+        entry,
+        author_present,
     })
+}
+
+fn decoded_leaf_entries_owned(
+    leaf: &DecodedLeafNodeRef,
+) -> Result<Vec<DiffLeafEntry>, LixError> {
+    (0..leaf.len())
+        .map(|index| decoded_leaf_entry_owned(leaf, index))
+        .collect()
 }
 
 fn decoded_node_row_count(node: &DecodedNode) -> usize {
@@ -6293,5 +6441,43 @@ mod tests {
                 "2026-01-01T00:00:00Z",
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn get_many_author_presence_reports_legacy_leaf_rows() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let present_key = key("legacy", None, "row-a");
+        let absent_key = key("legacy", None, "row-b");
+        let encoded_key = encode_key(&present_key);
+        let mut legacy_leaf = vec![5, 1, 0, 0, 0, encoded_key.len() as u8];
+        legacy_leaf.extend_from_slice(&encoded_key);
+        legacy_leaf.extend_from_slice(ChangeId::for_test_label("legacy-change").as_uuid().as_bytes());
+        legacy_leaf.push(0); // inline commit id
+        legacy_leaf.extend_from_slice(CommitId::for_test_label("legacy-commit").as_uuid().as_bytes());
+        legacy_leaf.push(0); // inline state tail
+        legacy_leaf.push(0); // unchanged zero timestamps, live
+        let root = TrackedStateRootId::new(hash_bytes(&legacy_leaf));
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(root.as_bytes())),
+            crate::storage_adapter::StorageValue {
+                bytes: Bytes::from(legacy_leaf),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+
+        let presence = TrackedStateTree::new()
+            .get_many_author_presence(&read, &root, &[present_key, absent_key])
+            .await
+            .unwrap();
+        assert_eq!(presence, vec![Some(false), None]);
     }
 }

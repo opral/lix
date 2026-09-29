@@ -69,6 +69,7 @@ mod tests {
             change_id: ChangeId::for_test_label(label),
             commit_id: CommitId::for_test_label(label),
             author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            author_present: true,
         }
     }
 

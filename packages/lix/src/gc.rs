@@ -3455,7 +3455,10 @@ mod tests {
             Some(base.commit_id),
             timestamp,
         );
-        let selected_change = packed_change("selected-owner-change", "selected-owner-row", true);
+        let mut owner = owner;
+        owner.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        let mut selected_change = packed_change("selected-owner-change", "selected-owner-row", true);
+        selected_change.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
 
         let mut writes = storage.new_write_set();
         let owner_deltas =
@@ -3474,6 +3477,27 @@ mod tests {
         let checkpoint_stage =
             stage_commit_deltas_for_commit_state(&mut writes, &checkpoint_deltas)
                 .expect("finite selected checkpoint member should stage");
+
+        // The standalone changelog is a rebuildable projection. Keep a stale
+        // projection with matching row identity and lifetime beside the real
+        // authored owner so GC must discover the physical source rather than
+        // treating the projection as proof that no owner exists.
+        let mut stale_projection = selected_change.clone();
+        stale_projection.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale_projection.snapshot = Some(vec![99]);
+        let mut changelog_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale projection read should open");
+        ChangelogContext::new()
+            .writer(&mut changelog_read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale_projection],
+            })
+            .await
+            .expect("stale standalone projection should stage");
+        drop(changelog_read);
 
         let mut owner_manifest =
             test_commit_state_manifest(&owner, owner_stage.mutation_inventory().clone());
@@ -3547,6 +3571,12 @@ mod tests {
                 .is_some(),
             "the finite selected locator keeps its physical owner live"
         );
+        let selected_payload = load_change_record_by_id(&read, selected_locator_change_id)
+            .await
+            .expect("selected payload should resolve after GC")
+            .expect("retained physical owner should provide selected payload");
+        assert_eq!(selected_payload.account_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(selected_payload.snapshot, Some(vec![1]));
         // Co-ownership guard for locator reclamation: the checkpoint also
         // carries this change as a selected member, so a sweep that retired
         // anything must not have taken the row out from under the live owner.
@@ -3819,6 +3849,7 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
             },
+            author_present: true,
             metadata: None,
             snapshot: vec![1],
         };

@@ -35,6 +35,10 @@ const LEGACY_DIGEST_CONTEXT: &str = "lix native current-state data part v3";
 pub(crate) struct CurrentStateDataRow {
     pub(crate) encoded_key: Vec<u8>,
     pub(crate) value: TrackedStateIndexValue,
+    /// Whether the embedded value physically carried its author suffix.
+    /// Legacy v82 parts decode to the anonymous placeholder but retain false
+    /// here so catalog readers can recover the original author.
+    pub(crate) author_present: bool,
     pub(crate) metadata: Option<lix_schema::Jsonb>,
     pub(crate) snapshot: Vec<u8>,
 }
@@ -68,9 +72,8 @@ pub(crate) fn encode_current_state_data_part(
     validate_rows(rows)?;
     let stored = rows
         .iter()
-        .map(|row| StoredCurrentStateDataRow {
-            encoded_key: row.encoded_key.clone(),
-            encoded_value: super::codec::encode_value_ref(
+        .map(|row| {
+            let mut encoded_value = super::codec::encode_value_ref(
                 super::types::TrackedStateIndexValueRef {
                     change_id: row.value.change_id,
                     commit_id: row.value.commit_id,
@@ -79,11 +82,25 @@ pub(crate) fn encode_current_state_data_part(
                     created_at: row.value.created_at,
                     updated_at: row.value.updated_at,
                 },
-            ),
-            metadata: row.metadata.clone(),
-            snapshot: row.snapshot.clone(),
+            );
+            // Rewrites may copy untouched rows from a v82 current-state part.
+            // Preserve their absent-author marker until a reader repairs it
+            // from the row's canonical physical change owner.
+            if !row.author_present {
+                let suffix_len = 2 + row.value.author_id.len();
+                let Some(author_end) = encoded_value.len().checked_sub(suffix_len) else {
+                    return Err(part_error("encoded author suffix is truncated"));
+                };
+                encoded_value.truncate(author_end);
+            }
+            Ok(StoredCurrentStateDataRow {
+                encoded_key: row.encoded_key.clone(),
+                encoded_value,
+                metadata: row.metadata.clone(),
+                snapshot: row.snapshot.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let payload = storage_codec::encode("native current-state data part", &stored)?;
     if payload.len() > CURRENT_STATE_DATA_PART_MAX_DECODED_BYTES {
         return Err(part_error("decoded payload exceeds its bound"));
@@ -192,9 +209,12 @@ pub(crate) fn decode_current_state_data_part(
     let rows = stored
         .into_iter()
         .map(|row| {
+            let (value, author_present) =
+                super::codec::decode_value_with_author_presence(&row.encoded_value)?;
             Ok(CurrentStateDataRow {
                 encoded_key: row.encoded_key,
-                value: decode_value(&row.encoded_value)?,
+                value,
+                author_present,
                 metadata: row.metadata,
                 snapshot: row.snapshot,
             })
@@ -266,6 +286,7 @@ mod tests {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
             },
+            author_present: true,
             metadata: None,
             snapshot: format!("typed-{index}").into_bytes(),
         }
@@ -308,6 +329,7 @@ mod tests {
         let digest = digest_with_context(LEGACY_DIGEST_CONTEXT, &legacy);
         let decoded = decode_current_state_data_part(&digest, &legacy).unwrap();
         assert_eq!(decoded[0].value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+        assert!(!decoded[0].author_present);
     }
 
     #[test]
@@ -338,6 +360,7 @@ mod tests {
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
             },
+            author_present: true,
             metadata: None,
             snapshot: crate::hot_state::encode_snapshot(&typed).expect("typed payload encodes"),
         };

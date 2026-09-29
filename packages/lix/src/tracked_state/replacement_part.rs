@@ -96,6 +96,7 @@ pub(crate) struct DecodedReplacementPart {
     key_ranges: Vec<Range<usize>>,
     metadata: Vec<Option<lix_schema::Jsonb>>,
     authors: Vec<String>,
+    author_present: Vec<bool>,
     snapshots: Vec<Vec<u8>>,
 }
 
@@ -202,6 +203,13 @@ impl DecodedReplacementPart {
 
     pub(crate) fn author_id(&self, ordinal: usize) -> Result<Option<&str>, LixError> {
         Ok(self.authors.get(ordinal).map(String::as_str))
+    }
+
+    /// Whether this physical row encoded its author. Legacy v82 replacement
+    /// parts synthesize the anonymous placeholder, which must be recovered
+    /// from the retained owner before a point read treats it as canonical.
+    pub(crate) fn author_present(&self, ordinal: usize) -> Option<bool> {
+        self.author_present.get(ordinal).copied()
     }
 
     pub(crate) fn snapshot(&self, ordinal: usize) -> Result<Option<&[u8]>, LixError> {
@@ -673,6 +681,7 @@ pub(crate) fn decode_replacement_part(
     let mut key_ranges = Vec::with_capacity(row_count);
     let mut metadata = Vec::with_capacity(row_count);
     let mut authors = Vec::with_capacity(row_count);
+    let mut author_present = Vec::with_capacity(row_count);
     let mut snapshots = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
@@ -700,6 +709,7 @@ pub(crate) fn decode_replacement_part(
         } else {
             decode_author(body, &mut cursor)?
         });
+        author_present.push(!legacy);
         metadata.push(decode_jsonb(body, &mut cursor)?);
         let snapshot = decode_snapshot_slot(body, &mut cursor)?.ok_or_else(|| {
             replacement_part_error("replacement row is missing its typed payload")
@@ -717,6 +727,7 @@ pub(crate) fn decode_replacement_part(
         key_ranges,
         metadata,
         authors,
+        author_present,
         snapshots,
     })
 }
@@ -1121,6 +1132,7 @@ mod tests {
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
             .expect("decode replacement part");
         assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.author_present(0), Some(true));
         assert_eq!(
             decoded.author_id(0).expect("decode author").as_deref(),
             Some("part-author")
@@ -1150,6 +1162,7 @@ mod tests {
         let digest = super::domain_digest(super::LEGACY_REPLACEMENT_PART_DIGEST_CONTEXT, &legacy);
         let decoded = decode_replacement_part(&digest, &legacy).expect("decode v82 part");
         assert_eq!(decoded.author_id(0).unwrap(), Some(crate::ANONYMOUS_ACCOUNT_ID));
+        assert_eq!(decoded.author_present(0), Some(false));
         let raw = super::decode_raw_replacement_part(&digest, bytes::Bytes::from(legacy))
             .expect("decode raw v82 part");
         assert_eq!(raw.author_id(0), Some(crate::ANONYMOUS_ACCOUNT_ID));

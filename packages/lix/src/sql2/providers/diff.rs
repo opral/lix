@@ -1469,6 +1469,7 @@ fn diff_row(
         change_id: row.change_id(),
         commit_id: row.commit_id(),
         author_id: row.author_id().to_owned(),
+        author_present: true,
     }
 }
 

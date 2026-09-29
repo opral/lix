@@ -533,7 +533,9 @@ pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change_record: crate::changelog::ChangeRecord,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
-    selected_ref: bool,
+    author_present: bool,
+    pub(crate) selected_ref: bool,
+    selected_tombstone: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,6 +655,7 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) ordinal: u32,
     pub(crate) authored: bool,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
+    author_present: bool,
     selected_tombstone: bool,
 }
 
@@ -1305,6 +1308,7 @@ async fn load_current_state_values_from_descriptors(
     let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
+    let mut legacy_replacement_author_requests = Vec::new();
     for ((descriptor, source, output_indices), value) in replacement.into_iter().zip(loaded.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("current-state directory references a missing part")
@@ -1335,17 +1339,62 @@ async fn load_current_state_values_from_descriptors(
                 .and_then(|base| base.checked_add(physical_ordinal))
                 .and_then(|address| address.checked_add(1))
                 .ok_or_else(|| replacement_payload_error("replacement address overflows"))?;
+            let change_id = change_id_from_packed_address(owner, packed);
+            let author_id = decoded
+                .author_id(usize::from(found.ordinal))?
+                .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?;
             values[*output_index] = Some(TrackedStateIndexValue {
-                change_id: change_id_from_packed_address(owner, packed),
+                change_id,
                 commit_id: owner,
-                author_id: decoded
-                    .author_id(usize::from(found.ordinal))?
-                    .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?
-                    .to_owned(),
+                author_id: author_id.to_owned(),
                 deleted: false,
                 created_at: source.uniform_created_at,
                 updated_at: source.uniform_updated_at,
             });
+            if !decoded
+                .author_present(usize::from(found.ordinal))
+                .ok_or_else(|| replacement_payload_error("replacement row omitted author presence"))?
+            {
+                legacy_replacement_author_requests.push((
+                    *output_index,
+                    AuthoritativeLiveChangeRequest {
+                        change_id,
+                        source_commit_id: owner,
+                        key: decode_key(&encoded_keys[*output_index])?,
+                        updated_at: source.uniform_updated_at,
+                    },
+                ));
+            }
+        }
+    }
+    if !legacy_replacement_author_requests.is_empty() {
+        let requests = legacy_replacement_author_requests
+            .iter()
+            .map(|(_, request)| AuthoritativeLiveChangeRequest {
+                change_id: request.change_id,
+                source_commit_id: request.source_commit_id,
+                key: request.key.clone(),
+                updated_at: request.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let changes = load_authoritative_live_change_records(store, &requests).await?;
+        for ((output_index, request), change) in
+            legacy_replacement_author_requests.into_iter().zip(changes)
+        {
+            if change.change_id != request.change_id
+                || change.created_at != request.updated_at
+                || change.schema_key != request.key.schema_key
+                || change.file_id != request.key.file_id
+                || change.row_pk != request.key.row_pk
+            {
+                return Err(replacement_payload_error(
+                    "legacy replacement part row disagrees with its physical author authority",
+                ));
+            }
+            values[output_index]
+                .as_mut()
+                .expect("matched legacy replacement row retains its output value")
+                .author_id = change.account_id;
         }
     }
     let native = routed
@@ -1364,6 +1413,7 @@ async fn load_current_state_values_from_descriptors(
     )
     .materialize(store, StorageGetOptions::default())
     .await?;
+    let mut legacy_author_requests = Vec::new();
     for ((_, (descriptor, output_indices)), value) in native.into_iter().zip(loaded.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("current-state directory references a missing native part")
@@ -1383,8 +1433,54 @@ async fn load_current_state_values_from_descriptors(
                     .as_slice()
                     .cmp(encoded_keys[*output_index].as_ref())
             }) {
-                values[*output_index] = Some(rows[index].value.clone());
+                let row = &rows[index];
+                values[*output_index] = Some(row.value.clone());
+                if !row.author_present {
+                    // v82 current-state data parts retain identity and
+                    // lifetime, but omit the author suffix. Keep the repair
+                    // tied to the row's original physical owner; the current
+                    // endpoint may only inherit this catalog entry. Native
+                    // parts are live-only: the decoder rejects tombstones.
+                    let key = decode_key(&row.encoded_key)?;
+                    legacy_author_requests.push((
+                        *output_index,
+                        AuthoritativeLiveChangeRequest {
+                            change_id: row.value.change_id,
+                            source_commit_id: row.value.commit_id,
+                            key,
+                            updated_at: row.value.updated_at,
+                        },
+                    ));
+                }
             }
+        }
+    }
+    if !legacy_author_requests.is_empty() {
+        let requests = legacy_author_requests
+            .iter()
+            .map(|(_, request)| AuthoritativeLiveChangeRequest {
+                change_id: request.change_id,
+                source_commit_id: request.source_commit_id,
+                key: request.key.clone(),
+                updated_at: request.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let changes = load_authoritative_live_change_records(store, &requests).await?;
+        for ((output_index, request), change) in legacy_author_requests.into_iter().zip(changes) {
+            if change.change_id != request.change_id
+                || change.created_at != request.updated_at
+                || change.schema_key != request.key.schema_key
+                || change.file_id != request.key.file_id
+                || change.row_pk != request.key.row_pk
+            {
+                return Err(replacement_payload_error(
+                    "legacy current-state part row disagrees with its physical author authority",
+                ));
+            }
+            values[output_index]
+                .as_mut()
+                .expect("matched native current-state row retains its output value")
+                .author_id = change.account_id;
         }
     }
     let columnar = routed
@@ -3350,6 +3446,7 @@ pub(crate) struct DecodedCommitDeltaBatch {
     file_ids: Vec<SharedStr>,
     rows: Vec<DecodedCommitDeltaRow>,
     values: Vec<TrackedStateIndexValue>,
+    author_present: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -3415,6 +3512,10 @@ impl<'a> DecodedCommitDeltaRowRef<'a> {
 
     pub(crate) fn value(self) -> &'a TrackedStateIndexValue {
         &self.batch.values[self.ordinal]
+    }
+
+    pub(crate) fn author_present(self) -> bool {
+        self.batch.author_present[self.ordinal]
     }
 
     /// Returns a zero-copy view retaining the selected segment arena.
@@ -3502,6 +3603,7 @@ struct DecodedCommitDeltaBatchBuilder {
     file_ids: CommitDeltaStringInterner,
     rows: Vec<DecodedCommitDeltaRow>,
     values: Vec<TrackedStateIndexValue>,
+    author_present: Vec<bool>,
 }
 
 impl DecodedCommitDeltaBatchBuilder {
@@ -3513,6 +3615,7 @@ impl DecodedCommitDeltaBatchBuilder {
             file_ids: CommitDeltaStringInterner::new(row_capacity),
             rows: Vec::with_capacity(row_capacity),
             values: Vec::with_capacity(row_capacity),
+            author_present: Vec::with_capacity(row_capacity),
         }
     }
 
@@ -3539,6 +3642,9 @@ impl DecodedCommitDeltaBatchBuilder {
             {
                 return Ok(());
             }
+            let author_present = leaf
+                .author_present(entry_index)
+                .expect("visited commit-delta row has author-presence metadata");
             let entry_ordinal = u16::try_from(entry_index).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -3558,6 +3664,7 @@ impl DecodedCommitDeltaBatchBuilder {
                 row_pk: key.row_pk,
             });
             self.values.push(value);
+            self.author_present.push(author_present);
             Ok(())
         })?;
         if self.rows.len() != first_row {
@@ -3592,6 +3699,7 @@ impl DecodedCommitDeltaBatchBuilder {
             row_pk,
         });
         self.values.push(value);
+        self.author_present.push(true);
         Ok(())
     }
 
@@ -3624,6 +3732,7 @@ impl DecodedCommitDeltaBatchBuilder {
             row_pk: key.row_pk,
         });
         self.values.push(value);
+        self.author_present.push(true);
         Ok(())
     }
 
@@ -3635,6 +3744,7 @@ impl DecodedCommitDeltaBatchBuilder {
             file_ids: self.file_ids.values,
             rows: self.rows,
             values: self.values,
+            author_present: self.author_present,
         }
     }
 }
@@ -4070,6 +4180,7 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
         let row = (!member.value.deleted).then(|| CurrentStateDataRow {
             encoded_key: encoded_key.clone(),
             value: member.value,
+            author_present: true,
             metadata: member.change.metadata,
             snapshot: member
                 .change
@@ -4544,51 +4655,95 @@ async fn load_scoped_current_state_descriptor_rows(
                     "current-state source slice is out of bounds",
                 ));
             }
-            (start..end)
-                .map(|ordinal| {
-                    let encoded_key = decoded.key(ordinal)?.ok_or_else(|| {
-                        replacement_payload_error("replacement source omitted a key")
+            let mut rows = Vec::with_capacity(end - start);
+            let mut legacy_author_requests = Vec::new();
+            for ordinal in start..end {
+                let encoded_key = decoded.key(ordinal)?.ok_or_else(|| {
+                    replacement_payload_error("replacement source omitted a key")
+                })?;
+                let packed = source
+                    .part_index
+                    .checked_mul(
+                        u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                            .expect("row bound fits u32"),
+                    )
+                    .and_then(|base| {
+                        base.checked_add(u32::try_from(ordinal).expect("ordinal fits u32"))
+                    })
+                    .and_then(|address| address.checked_add(1))
+                    .ok_or_else(|| {
+                        replacement_payload_error("replacement source address overflows")
                     })?;
-                    let packed = source
-                        .part_index
-                        .checked_mul(
-                            u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                                .expect("row bound fits u32"),
-                        )
-                        .and_then(|base| {
-                            base.checked_add(u32::try_from(ordinal).expect("ordinal fits u32"))
-                        })
-                        .and_then(|address| address.checked_add(1))
+                let change_id = change_id_from_packed_address(owner, packed);
+                let author_id = decoded
+                    .author_id(ordinal)?
+                    .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?;
+                let author_present = decoded.author_present(ordinal).ok_or_else(|| {
+                    replacement_payload_error("replacement row omitted author presence")
+                })?;
+                let key = decode_key(encoded_key)?;
+                rows.push(CurrentStateDataRow {
+                    encoded_key: encoded_key.to_vec(),
+                    value: TrackedStateIndexValue {
+                        change_id,
+                        commit_id: owner,
+                        author_id: author_id.to_owned(),
+                        deleted: false,
+                        created_at: source.uniform_created_at,
+                        updated_at: source.uniform_updated_at,
+                    },
+                    author_present,
+                    metadata: decoded.metadata(ordinal)?.cloned(),
+                    snapshot: decoded
+                        .snapshot(ordinal)?
                         .ok_or_else(|| {
-                            replacement_payload_error("replacement source address overflows")
-                        })?;
-                    Ok(CurrentStateDataRow {
-                        encoded_key: encoded_key.to_vec(),
-                        value: TrackedStateIndexValue {
-                            change_id: change_id_from_packed_address(owner, packed),
-                            commit_id: owner,
-                            author_id: decoded
-                                .author_id(ordinal)?
-                                .ok_or_else(|| {
-                                    replacement_payload_error("replacement row omitted author")
-                                })?
-                                .to_owned(),
-                            deleted: false,
-                            created_at: source.uniform_created_at,
+                            replacement_payload_error(
+                                "replacement source omitted typed payload",
+                            )
+                        })?
+                        .to_owned(),
+                });
+                if !author_present {
+                    legacy_author_requests.push((
+                        rows.len() - 1,
+                        AuthoritativeLiveChangeRequest {
+                            change_id,
+                            source_commit_id: owner,
+                            key,
                             updated_at: source.uniform_updated_at,
                         },
-                        metadata: decoded.metadata(ordinal)?.cloned(),
-                        snapshot: decoded
-                            .snapshot(ordinal)?
-                            .ok_or_else(|| {
-                                replacement_payload_error(
-                                    "replacement source omitted typed payload",
-                                )
-                            })?
-                            .to_owned(),
+                    ));
+                }
+            }
+            if !legacy_author_requests.is_empty() {
+                let requests = legacy_author_requests
+                    .iter()
+                    .map(|(_, request)| AuthoritativeLiveChangeRequest {
+                        change_id: request.change_id,
+                        source_commit_id: request.source_commit_id,
+                        key: request.key.clone(),
+                        updated_at: request.updated_at,
                     })
-                })
-                .collect::<Result<Vec<_>, LixError>>()?
+                    .collect::<Vec<_>>();
+                let changes = load_authoritative_live_change_records(store, &requests).await?;
+                for ((row_index, request), change) in
+                    legacy_author_requests.into_iter().zip(changes)
+                {
+                    if change.change_id != request.change_id
+                        || change.created_at != request.updated_at
+                        || change.schema_key != request.key.schema_key
+                        || change.file_id != request.key.file_id
+                        || change.row_pk != request.key.row_pk
+                    {
+                        return Err(replacement_payload_error(
+                            "legacy replacement source row disagrees with its physical author authority",
+                        ));
+                    }
+                    rows[row_index].value.author_id = change.account_id;
+                    rows[row_index].author_present = true;
+                }
+            }
+            rows
         }
         CurrentStatePartSource::NativeDataPart => {
             let physical_key = descriptor.content_digest.to_vec();
@@ -4740,6 +4895,7 @@ async fn load_scoped_current_state_descriptor_rows(
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
                         },
+                        author_present: true,
                         metadata: record.metadata,
                         snapshot: record.snapshot.ok_or_else(|| {
                             replacement_payload_error("current-state source omitted typed payload")
@@ -8384,12 +8540,23 @@ fn hydrate_compact_replacement_direct_run(
 type SelectedChangeRecordsFuture<'a> =
     futures_util::future::BoxFuture<'a, Result<Vec<crate::changelog::ChangeRecord>, LixError>>;
 
+struct ResolvedChangeRecord {
+    record: Option<crate::changelog::ChangeRecord>,
+    physical_owner_commit_id: Option<CommitId>,
+}
+
 pub(crate) fn load_change_records_by_ids<'a>(
     store: &'a (impl StorageAdapterRead + ?Sized),
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
     Box::pin(async move {
-        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, false, false, true).await?)
+        require_all_selected_changes(
+            load_change_records_by_ids_inner(store, change_ids, true, false, true)
+                .await?
+                .into_iter()
+                .map(|resolved| resolved.record)
+                .collect(),
+        )
     })
 }
 
@@ -8398,7 +8565,13 @@ fn load_selected_change_records_by_ids<'a>(
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
     Box::pin(async move {
-        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, true, false, true).await?)
+        require_all_selected_changes(
+            load_change_records_by_ids_inner(store, change_ids, true, false, true)
+                .await?
+                .into_iter()
+                .map(|resolved| resolved.record)
+                .collect(),
+        )
     })
 }
 
@@ -8409,7 +8582,13 @@ fn load_selected_change_records_by_ids_optional<'a>(
     'a,
     Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError>,
 > {
-    Box::pin(load_change_records_by_ids_inner(store, change_ids, true, true, false))
+    Box::pin(async move {
+        Ok(load_change_records_by_ids_inner(store, change_ids, true, true, false)
+            .await?
+            .into_iter()
+            .map(|resolved| resolved.record)
+            .collect())
+    })
 }
 
 fn require_all_selected_changes(
@@ -8454,7 +8633,7 @@ async fn load_change_records_by_ids_inner(
     prefer_physical: bool,
     allow_missing: bool,
     standalone_fallback: bool,
-) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+) -> Result<Vec<ResolvedChangeRecord>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -8477,6 +8656,7 @@ async fn load_change_records_by_ids_inner(
     } else {
         std::mem::take(&mut standalone)
     };
+    let mut physical_owners = vec![None; change_ids.len()];
     let direct_commit_ids = change_ids
         .iter()
         .enumerate()
@@ -8537,7 +8717,10 @@ async fn load_change_records_by_ids_inner(
         .await?;
         for ((output_index, locator), route) in requests.into_iter().zip(routes) {
             match route {
-                DirectChangeRecordRoute::Owned(record) => output[output_index] = Some(record),
+                DirectChangeRecordRoute::Owned(record) => {
+                    output[output_index] = Some(record);
+                    physical_owners[output_index] = Some(locator.commit_id);
+                }
                 DirectChangeRecordRoute::NotOwned(reason) => {
                     let _ = reason;
                     #[cfg(any(test, feature = "storage-benches"))]
@@ -8593,8 +8776,13 @@ async fn load_change_records_by_ids_inner(
         }
         match Box::pin(load_explicit_change_records_at_locators(store, &located)).await {
             Ok(records) => {
-                for (output_index, record) in located_indices.into_iter().zip(records) {
+                for ((output_index, locator), record) in located_indices
+                    .into_iter()
+                    .zip(located)
+                    .zip(records)
+                {
                     output[output_index] = Some(record);
+                    physical_owners[output_index] = Some(locator.commit_id);
                 }
             }
             // Isolate exceptional locator failures. An old selected alias or
@@ -8605,7 +8793,12 @@ async fn load_change_records_by_ids_inner(
                     match Box::pin(load_explicit_change_records_at_locators(store, &[locator]))
                         .await
                     {
-                        Ok(mut records) => output[output_index] = records.pop(),
+                        Ok(mut records) => {
+                            output[output_index] = records.pop();
+                            if output[output_index].is_some() {
+                                physical_owners[output_index] = Some(locator.commit_id);
+                            }
+                        }
                         Err(error)
                             if error.code == STALE_SELECTED_CHANGE_LOCATOR
                                 && ((standalone_fallback && standalone[output_index].is_some())
@@ -8638,7 +8831,14 @@ async fn load_change_records_by_ids_inner(
             }
         }
     }
-    Ok(output)
+    Ok(output
+        .into_iter()
+        .zip(physical_owners)
+        .map(|(record, physical_owner_commit_id)| ResolvedChangeRecord {
+            record,
+            physical_owner_commit_id,
+        })
+        .collect())
 }
 
 async fn load_explicit_change_records_at_locators(
@@ -8982,7 +9182,7 @@ where
             ),
         )
     })?;
-    let value = decode_value(entry.value)?;
+    let mut value = decode_value(entry.value)?;
     if value.change_id != change_id || value.commit_id != locator.commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -9006,6 +9206,16 @@ where
             ));
         }
     };
+    let author_present = leaf
+        .author_present(ordinal)
+        .expect("loaded locator ordinal has an author-presence entry");
+    if !author_present {
+        value.author_id = account_id.to_owned();
+    } else if value.author_id != account_id {
+        return Err(replacement_payload_error(
+            "authored commit-delta author disagrees with physical owner account",
+        ));
+    }
     let updated_at = value.updated_at;
     Ok(LoadedCommitDeltaEntry {
         value,
@@ -9022,7 +9232,9 @@ where
             origin_key,
         },
         base_coordinate,
+        author_present,
         selected_ref: false,
+        selected_tombstone: false,
     })
 }
 
@@ -9423,7 +9635,7 @@ async fn load_expanded_local_commit_delta_values_encoded(
     state: &AuthenticatedReplayCommitStateManifest,
     encoded_keys: &[Bytes],
     point_cache: &CommitDeltaPointReadCache,
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+) -> Result<(Vec<Option<TrackedStateIndexValue>>, Vec<bool>), LixError> {
     if state.mutation_directory_root.as_ref().is_some_and(|root| {
         root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
             || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
@@ -9449,7 +9661,7 @@ async fn load_authenticated_local_commit_delta_values_encoded(
     state: &AuthenticatedReplayCommitStateManifest,
     encoded_keys: &[Bytes],
     point_cache: &CommitDeltaPointReadCache,
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+) -> Result<(Vec<Option<TrackedStateIndexValue>>, Vec<bool>), LixError> {
     if state.mutation_directory_root.as_ref().is_some_and(|root| {
         root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
             || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
@@ -9466,7 +9678,8 @@ async fn load_authenticated_local_commit_delta_values_encoded(
                 load_complete_current_state_values_from_scoped_root(store, root, encoded_keys)
                     .await?
         {
-            return Ok(values);
+            let author_present = values.iter().map(Option::is_some).collect();
+            return Ok((values, author_present));
         }
         let full_state = load_commit_state_manifest(store, state.commit_id)
             .await?
@@ -9503,13 +9716,22 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
     }
     point_cache.remember_authenticated_state(state)?;
     let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
-        return load_authenticated_local_commit_delta_values_encoded(
+        let (mut values, author_present) = load_authenticated_local_commit_delta_values_encoded(
             store,
             state,
             encoded_keys,
             point_cache,
         )
-        .await;
+        .await?;
+        canonicalize_absent_point_authors(
+            store,
+            state.commit_id,
+            encoded_keys,
+            &mut values,
+            &author_present,
+        )
+        .await?;
+        return Ok(values);
     };
     let source = match point_cache.authority(source_commit_id)? {
         Some(source) => source,
@@ -9531,7 +9753,7 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
             "selected-source mutation authority cannot alias another source",
         ));
     }
-    let mut values = load_authenticated_local_commit_delta_values_encoded(
+    let (mut values, mut author_present) = load_authenticated_local_commit_delta_values_encoded(
         store,
         &source,
         encoded_keys,
@@ -9541,26 +9763,82 @@ pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
     for value in values.iter_mut().flatten() {
         value.commit_id = state.commit_id;
     }
-    let local = load_authenticated_local_commit_delta_values_encoded(
+    let (local, local_author_present) = load_authenticated_local_commit_delta_values_encoded(
         store,
         state,
         encoded_keys,
         point_cache,
     )
     .await?;
-    for (value, local) in values.iter_mut().zip(local) {
+    for (((value, author_present), local), local_author_present) in values
+        .iter_mut()
+        .zip(&mut author_present)
+        .zip(local)
+        .zip(local_author_present)
+    {
         if local.is_some() {
             *value = local;
+            *author_present = local_author_present;
         }
     }
+    canonicalize_absent_point_authors(
+        store,
+        state.commit_id,
+        encoded_keys,
+        &mut values,
+        &author_present,
+    )
+    .await?;
     Ok(values)
+}
+
+async fn canonicalize_absent_point_authors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    encoded_keys: &[Bytes],
+    values: &mut [Option<TrackedStateIndexValue>],
+    author_present: &[bool],
+) -> Result<(), LixError> {
+    let candidate_indices = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            value
+                .as_ref()
+                .filter(|_| !author_present[index])
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    if candidate_indices.is_empty() {
+        return Ok(());
+    }
+    let requests = candidate_indices
+        .iter()
+        .map(|&index| Ok((commit_id, decode_key(&encoded_keys[index])?)))
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let loaded = load_owned_commit_delta_entries(store, &requests).await?;
+    for (&index, entry) in candidate_indices.iter().zip(loaded) {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let value = values[index]
+            .as_mut()
+            .expect("candidate point lookup retained its value");
+        if entry.value.change_id != value.change_id || entry.value.updated_at != value.updated_at {
+            return Err(replacement_payload_error(
+                "point replay author authority disagrees with selected delta value",
+            ));
+        }
+        value.author_id = entry.value.author_id;
+    }
+    Ok(())
 }
 
 async fn load_bounded_directory_values_encoded(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     encoded_keys: &[Bytes],
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+) -> Result<(Vec<Option<TrackedStateIndexValue>>, Vec<bool>), LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded point replay omitted its mutation-directory root")
     })?;
@@ -9595,6 +9873,7 @@ async fn load_bounded_directory_values_encoded(
             .materialize(store, StorageGetOptions::default())
             .await?;
     let mut output = vec![None; encoded_keys.len()];
+    let mut author_present = vec![false; encoded_keys.len()];
     for (run, value) in runs.into_iter().zip(loaded.value) {
         let bytes = value
             .and_then(full_value_bytes)
@@ -9629,20 +9908,19 @@ async fn load_bounded_directory_values_encoded(
             content_digest: part.content_digest,
             replacement_part: part.replacement_part,
         };
-        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(&bounds))?;
+        let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
         validate_bounded_direct_row_count(root.layout, direct_row_count, leaf.len())?;
         for output_index in run.selector_span {
-            output[output_index] = find_loaded_commit_delta_entry(
+            let (value, present) = find_commit_delta_value_with_author_presence(
                 &leaf,
-                &payloads,
                 &encoded_keys[output_index],
                 state.commit_id,
-                &state.change_account_id,
-            )?
-            .map(|entry| entry.value);
+            )?;
+            output[output_index] = value;
+            author_present[output_index] = present;
         }
     }
-    Ok(output)
+    Ok((output, author_present))
 }
 
 async fn load_compact_replacement_values_encoded(
@@ -9650,12 +9928,13 @@ async fn load_compact_replacement_values_encoded(
     commit_id: CommitId,
     encoded_keys: &[Bytes],
     state: &CommitStateManifest,
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+) -> Result<(Vec<Option<TrackedStateIndexValue>>, Vec<bool>), LixError> {
     if let Some(root) = state.current_state_scoped_ranges.as_ref()
         && let Some(values) =
             load_complete_current_state_values_from_scoped_root(store, root, encoded_keys).await?
     {
-        return Ok(values);
+        let author_present = values.iter().map(Option::is_some).collect();
+        return Ok((values, author_present));
     }
     let expanded = expanded_commit_delta_manifest_from_commit_state(store, state).await?;
     load_local_commit_delta_values_encoded(store, commit_id, encoded_keys, &expanded).await
@@ -9666,26 +9945,30 @@ async fn load_local_commit_delta_values_encoded(
     commit_id: CommitId,
     encoded_keys: &[Bytes],
     manifest: &CommitDeltaManifest,
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+) -> Result<(Vec<Option<TrackedStateIndexValue>>, Vec<bool>), LixError> {
     if encoded_keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     if let Some(parts) = manifest.columnar_parts.as_ref() {
-        return Box::pin(load_columnar_mutation_values_encoded(
+        let values = Box::pin(load_columnar_mutation_values_encoded(
             store,
             commit_id,
             encoded_keys,
             parts,
         ))
-        .await;
+        .await?;
+        let author_present = values.iter().map(Option::is_some).collect();
+        return Ok((values, author_present));
     }
     let mut values = vec![None; encoded_keys.len()];
+    let mut author_present = vec![false; encoded_keys.len()];
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
         for (output_index, encoded_key) in encoded_keys.iter().enumerate() {
-            values[output_index] = find_commit_delta_value(&leaf, encoded_key, commit_id)?;
+            (values[output_index], author_present[output_index]) =
+                find_commit_delta_value_with_author_presence(&leaf, encoded_key, commit_id)?;
         }
-        return Ok(values);
+        return Ok((values, author_present));
     }
     // Keep one dense lookup column instead of one tree node and one owned
     // vector per touched segment. The key bytes remain in the caller's shared
@@ -9697,7 +9980,7 @@ async fn load_local_commit_delta_values_encoded(
         }
     }
     if lookups.is_empty() {
-        return Ok(values);
+        return Ok((values, author_present));
     }
     lookups.sort_unstable();
     let segment_count = 1 + lookups
@@ -9746,11 +10029,15 @@ async fn load_local_commit_delta_values_encoded(
             commit_id,
         )?;
         for &(_, output_index) in &lookups[start..end] {
-            values[output_index] =
-                find_commit_delta_value(&leaf, &encoded_keys[output_index], commit_id)?;
+            (values[output_index], author_present[output_index]) =
+                find_commit_delta_value_with_author_presence(
+                    &leaf,
+                    &encoded_keys[output_index],
+                    commit_id,
+                )?;
         }
     }
-    Ok(values)
+    Ok((values, author_present))
 }
 
 async fn load_columnar_mutation_values_encoded(
@@ -9974,7 +10261,9 @@ async fn load_columnar_owned_entries(
                     row_index: u32::try_from(row_index_in_group)
                         .expect("columnar mutation row fits u32"),
                 }),
+                author_present: true,
                 selected_ref: false,
+                selected_tombstone: false,
             });
         }
     }
@@ -10717,68 +11006,202 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
                         row_pk: row.row_pk().clone(),
                     },
                     row.value().clone(),
+                    row.author_present(),
                 )
             })
             .collect::<Vec<_>>();
         let owner_requests = rows
             .iter()
-            .map(|(key, value)| (value.commit_id, key.clone()))
+            .map(|(key, value, _)| (value.commit_id, key.clone()))
             .collect::<Vec<_>>();
-        let mut owners = load_owned_commit_delta_entries(store, &owner_requests).await?;
+        let owners = load_owned_commit_delta_entries(store, &owner_requests).await?;
         // File deletion also synthesizes one tombstone per file-scoped row.
-        // Those rows are physically owned by the descriptor deletion rather
-        // than by an exact commit-delta identity, so route missing deleted
-        // members through the same descriptor authority as ordinary history.
-        let fallback_requests = rows
-            .iter()
-            .zip(&owners)
-            .filter_map(|((key, value), owner)| {
-                (owner.is_none() && value.deleted)
-                    .then(|| key.file_id.as_deref())
-                    .flatten()
-                    .map(|file_id| (value.commit_id, cascade_payload_key(file_id)))
-            })
-            .collect::<Vec<_>>();
-        if !fallback_requests.is_empty() {
-            let mut fallbacks = load_owned_commit_delta_entries(store, &fallback_requests)
-                .await?
-                .into_iter();
-            for ((key, value), owner) in rows.iter().zip(&mut owners) {
-                if owner.is_none() && value.deleted && key.file_id.is_some() {
-                    *owner = fallbacks.next().unwrap_or(None);
-                }
+        // They are derived from the descriptor marker and are not logical
+        // checkpoint members. Remove them only after proving that exact
+        // marker owns each missing semantic row; direct selected tombstones
+        // remain addressable members.
+        let derived_file_cascades = complete_state_file_cascade_mask(store, &rows, &owners).await?;
+        let mut retained_rows = Vec::with_capacity(rows.len());
+        let mut retained_owners = Vec::with_capacity(owners.len());
+        for (ordinal, (row, owner)) in rows.into_iter().zip(owners).enumerate() {
+            if !derived_file_cascades[ordinal] {
+                retained_rows.push(row);
+                retained_owners.push(owner);
             }
         }
-        let canonical_fallbacks = if standalone_complete_state {
-            let missing_change_ids = rows
-                .iter()
+        let rows = retained_rows;
+        let owners = retained_owners;
+        let missing_live = if standalone_complete_state {
+            rows.iter()
                 .zip(&owners)
-                .filter_map(|((_, value), owner)| owner.is_none().then_some(value.change_id))
-                .collect::<Vec<_>>();
-            load_change_records_by_ids(store, &missing_change_ids)
-                .await?
-                .into_iter()
-                .map(|change| (change.change_id, change))
-                .collect::<BTreeMap<_, _>>()
+                .enumerate()
+                .filter_map(|(ordinal, ((key, value, _), owner))| {
+                    (owner.is_none() && !value.deleted).then(|| {
+                        (
+                            ordinal,
+                            AuthoritativeLiveChangeRequest {
+                                change_id: value.change_id,
+                                source_commit_id: value.commit_id,
+                                key: key.clone(),
+                                updated_at: value.updated_at,
+                            },
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
         } else {
-            BTreeMap::new()
+            Vec::new()
         };
+        let live_requests = missing_live
+            .iter()
+            .map(|(_, request)| AuthoritativeLiveChangeRequest {
+                change_id: request.change_id,
+                source_commit_id: request.source_commit_id,
+                key: request.key.clone(),
+                updated_at: request.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let live = load_authoritative_live_change_records(store, &live_requests).await?;
+        let missing_deleted = rows
+            .iter()
+            .zip(&owners)
+            .enumerate()
+            .filter_map(|(ordinal, ((_, value, _), owner))| {
+                (value.deleted
+                    && (owner.is_none()
+                        || owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.selected_tombstone)))
+                .then_some((ordinal, value.change_id))
+            })
+            .collect::<Vec<_>>();
+        let missing_deleted_ids = missing_deleted
+            .iter()
+            .map(|(_, change_id)| *change_id)
+            .collect::<Vec<_>>();
+        let deleted = load_change_records_by_ids_inner(
+            store,
+            &missing_deleted_ids,
+            true,
+            true,
+            true,
+        )
+        .await?;
+        let mut canonical_fallbacks = vec![None; rows.len()];
+        let mut canonical_physical_owners = vec![None; rows.len()];
+        for ((ordinal, _request), change) in missing_live.into_iter().zip(live) {
+            canonical_fallbacks[ordinal] = Some(change);
+        }
+        for ((ordinal, _change_id), resolved) in missing_deleted.into_iter().zip(deleted) {
+            let Some(change) = resolved.record else {
+                continue;
+            };
+            let (key, value, author_present) = &rows[ordinal];
+            if !complete_state_tombstone_matches_change(key, value, &change)? {
+                let explicit_selected_owner = owners[ordinal]
+                    .as_ref()
+                    .is_some_and(|owner| {
+                        owner.selected_tombstone
+                            && (owner.author_present || *author_present)
+                            && complete_state_tombstone_matches_owner(key, value, owner)
+                    });
+                if explicit_selected_owner && resolved.physical_owner_commit_id.is_none() {
+                    // A stale standalone projection cannot displace the exact
+                    // selected tombstone identity already present in the
+                    // authenticated checkpoint delta.
+                    continue;
+                }
+                return Err(replacement_payload_error(
+                    "complete-state tombstone canonical authority has a different identity or lifetime",
+                ));
+            }
+            if *author_present && value.author_id != change.account_id {
+                let explicit_selected_owner = owners[ordinal]
+                    .as_ref()
+                    .is_some_and(|owner| {
+                        owner.selected_tombstone
+                            && (owner.author_present || *author_present)
+                            && complete_state_tombstone_matches_owner(key, value, owner)
+                    });
+                if explicit_selected_owner && resolved.physical_owner_commit_id.is_none() {
+                    continue;
+                }
+                return Err(replacement_payload_error(
+                    "complete-state tombstone author disagrees with canonical change account",
+                ));
+            }
+            canonical_fallbacks[ordinal] = Some(change);
+            canonical_physical_owners[ordinal] = resolved.physical_owner_commit_id;
+        }
+        let mut tombstone_authors = vec![None; rows.len()];
+        resolve_complete_state_deleted_authors_with_owners(
+            store,
+            &rows,
+            &owners,
+            &mut tombstone_authors,
+        )
+        .await?;
         return rows
             .into_iter()
             .zip(owners)
             .enumerate()
-            .map(|(ordinal, ((key, mut value), owner))| {
-                let change = match owner {
-                    Some(owner) => {
-                        if owner.value.change_id != value.change_id {
+            .map(|(ordinal, ((key, mut value, author_present), owner))| {
+                let selected_tombstone = owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.selected_tombstone);
+                let mut change = if value.deleted && (selected_tombstone || owner.is_none()) {
+                    if let Some(change) = canonical_fallbacks[ordinal].clone() {
+                        if canonical_physical_owners[ordinal].is_some()
+                            && tombstone_authors[ordinal]
+                                .as_ref()
+                                .is_some_and(|author_id| change.account_id != *author_id)
+                        {
                             return Err(LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
-                                "complete-state checkpoint member disagrees with physical owner",
+                                "complete-state tombstone marker disagrees with canonical physical owner",
+                            ));
+                        }
+                        change
+                    } else if selected_tombstone {
+                        let author_id = tombstone_authors[ordinal].as_ref().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "complete-state checkpoint member '{}' lost canonical tombstone authority",
+                                    value.change_id
+                                ),
+                            )
+                        })?;
+                        let mut identity_only = owner
+                            .as_ref()
+                            .expect("selected tombstone retains its physical identity")
+                            .change_record
+                            .clone();
+                        identity_only.account_id.clone_from(author_id);
+                        identity_only
+                    } else {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "complete-state checkpoint member '{}' lost canonical tombstone authority",
+                                value.change_id
+                            ),
+                        ));
+                    }
+                } else {
+                    match owner {
+                    Some(owner) => {
+                        if owner.value.change_id != value.change_id
+                            || owner.value.updated_at != value.updated_at
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "complete-state checkpoint member disagrees with physical owner identity or lifetime",
                             ));
                         }
                         owner.change_record
                     }
-                    None => canonical_fallbacks.get(&value.change_id).cloned().ok_or_else(|| {
+                    None => canonical_fallbacks[ordinal].clone().ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!(
@@ -10787,15 +11210,42 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
                             ),
                         )
                     })?,
+                    }
                 };
-                if change.schema_key != key.schema_key
+                if change.created_at != value.updated_at
+                    || change.schema_key != key.schema_key
                     || change.file_id != key.file_id
                     || change.row_pk != key.row_pk
                 {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "complete-state checkpoint member disagrees with canonical change identity",
+                        "complete-state checkpoint member disagrees with canonical change identity or lifetime",
                     ));
+                }
+                if value.deleted
+                    && let Some(author_id) = tombstone_authors[ordinal].as_ref()
+                {
+                    if author_present && value.author_id != *author_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "complete-state checkpoint author disagrees with canonical change account",
+                        ));
+                    }
+                    value.author_id.clone_from(author_id);
+                    // A SelectedTombstone has no payload of its own. Its
+                    // checkpoint owner account is not the selected change's
+                    // canonical author.
+                    if value.deleted {
+                        change.account_id.clone_from(author_id);
+                    }
+                } else if author_present && value.author_id != change.account_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "complete-state checkpoint author disagrees with canonical change account",
+                    ));
+                }
+                if !author_present && tombstone_authors[ordinal].is_none() {
+                    value.author_id = change.account_id.clone();
                 }
                 value.commit_id = commit_id;
                 Ok(CommitDeltaMember {
@@ -10812,6 +11262,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
                     })?,
                     authored: false,
                     base_coordinate: None,
+                    author_present: true,
                 })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -10823,7 +11274,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
         }
         return Ok(Some(Vec::new()));
     };
-    let Some((local, local_segment_count)) =
+    let Some((mut local, local_segment_count)) =
         load_authenticated_local_commit_delta_members_for_schemas(
             store,
             &state,
@@ -10837,6 +11288,9 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
         return Ok(None);
     };
     let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
+        if expand_standalone_complete_state {
+            resolve_selected_tombstone_member_authors(store, &mut local).await?;
+        }
         return Ok(Some(local));
     };
     let source = load_point_replay_commit_state(store, source_commit_id)
@@ -10874,7 +11328,11 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
     // hydrating while they still carried the source's `authored` flag skips
     // every live inherited payload.
     hydrate_selected_members(store, &mut members).await?;
-    Ok(Some(merge_selected_source_members(members, local)))
+    let mut members = merge_selected_source_members(members, local);
+    if expand_standalone_complete_state {
+        resolve_selected_tombstone_member_authors(store, &mut members).await?;
+    }
+    Ok(Some(members))
 }
 
 /// Loads one certified exclusive live collection directly from authored typed
@@ -11488,6 +11946,575 @@ fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
     }
 }
 
+fn collection_cascade_payload_key(schema_key: &str, file_id: Option<&str>) -> TrackedStateKey {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+    };
+    TrackedStateKey {
+        schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        file_id: None,
+        row_pk: RowPk::single(collection_scope_key(CollectionScopeRef {
+            schema_key,
+            file_id,
+        })),
+    }
+}
+
+async fn complete_state_file_cascade_mask(
+    store: &(impl StorageAdapterRead + ?Sized),
+    rows: &[(TrackedStateKey, TrackedStateIndexValue, bool)],
+    owners: &[Option<LoadedCommitDeltaEntry>],
+) -> Result<Vec<bool>, LixError> {
+    if rows.len() != owners.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "complete-state file-cascade owner count does not match its rows",
+        ));
+    }
+    let direct_owner_matches = |key: &TrackedStateKey,
+                                value: &TrackedStateIndexValue,
+                                owner: &LoadedCommitDeltaEntry| {
+        owner.value.commit_id == value.commit_id
+            && owner.value.deleted
+            && owner.value.change_id == value.change_id
+            && owner.value.updated_at == value.updated_at
+            && owner.change_record.schema_key == key.schema_key
+            && owner.change_record.file_id == key.file_id
+            && owner.change_record.row_pk == key.row_pk
+    };
+    let mut routes = Vec::new();
+    let mut requests = Vec::new();
+    for (ordinal, ((key, value, _), owner)) in rows.iter().zip(owners).enumerate() {
+        if !value.deleted
+            || key.schema_key == "lix_file_descriptor"
+            || key.file_id.is_none()
+            || owner
+                .as_ref()
+                .is_some_and(|owner| {
+                    direct_owner_matches(key, value, owner) && !owner.selected_tombstone
+                })
+        {
+            continue;
+        }
+        if owner.as_ref().is_some_and(|owner| {
+            !owner.selected_ref && !direct_owner_matches(key, value, owner)
+        }) {
+            // A mismatching direct physical owner is corruption. It must not
+            // be hidden by a same-scope descriptor cascade.
+            continue;
+        }
+        let marker_key = cascade_payload_key(
+            key.file_id
+                .as_deref()
+                .expect("file-scoped candidate retained its file id"),
+        );
+        requests.push((value.commit_id, marker_key.clone()));
+        routes.push((ordinal, key, value, marker_key));
+    }
+
+    let markers = load_owned_commit_delta_entries(store, &requests).await?;
+    let mut mask = vec![false; rows.len()];
+    for ((ordinal, key, value, marker_key), marker) in routes.into_iter().zip(markers) {
+        let Some(marker) = marker else {
+            continue;
+        };
+        if marker.value.change_id != value.change_id {
+            continue;
+        }
+        if marker.value.commit_id != value.commit_id
+            || marker.value.updated_at != value.updated_at
+            || marker.change_record.change_id != value.change_id
+            || marker.change_record.created_at != value.updated_at
+            || marker.change_record.schema_key != marker_key.schema_key
+            || marker.change_record.file_id != marker_key.file_id
+            || marker.change_record.row_pk != marker_key.row_pk
+            || !marker.value.deleted
+            || marker.change_record.snapshot.is_some()
+            || key.file_id != marker_key.file_id
+        {
+            return Err(replacement_payload_error(
+                "complete-state file cascade disagrees with its descriptor marker",
+            ));
+        }
+        let Some((_, _, author_present)) = rows.get(ordinal) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "complete-state file cascade row disappeared during marker validation",
+            ));
+        };
+        if *author_present && value.author_id != marker.change_record.account_id {
+            return Err(replacement_payload_error(
+                "complete-state file cascade author disagrees with its descriptor marker",
+            ));
+        }
+        mask[ordinal] = true;
+    }
+    Ok(mask)
+}
+
+pub(crate) async fn resolve_complete_state_deleted_authors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    rows: &[(TrackedStateKey, TrackedStateIndexValue, bool)],
+    authors: &mut [Option<String>],
+) -> Result<(), LixError> {
+    // Keep owner results aligned with the original row slice. The shared
+    // resolver receives mixed live and deleted rows from complete-state scans.
+    let owner_requests = rows
+        .iter()
+        .map(|(key, value, _)| (value.commit_id, key.clone()))
+        .collect::<Vec<_>>();
+    let owners = load_owned_commit_delta_entries(store, &owner_requests).await?;
+    resolve_complete_state_deleted_authors_with_owners(store, rows, &owners, authors).await
+}
+
+async fn resolve_complete_state_deleted_authors_with_owners(
+    store: &(impl StorageAdapterRead + ?Sized),
+    rows: &[(TrackedStateKey, TrackedStateIndexValue, bool)],
+    owners: &[Option<LoadedCommitDeltaEntry>],
+    authors: &mut [Option<String>],
+) -> Result<(), LixError> {
+    if rows.len() != authors.len() || rows.len() != owners.len() {
+        return Err(replacement_payload_error(
+            "complete-state tombstone authority count does not match its rows",
+        ));
+    }
+    let deleted_rows = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, (key, value, _))| {
+            value.deleted.then_some((ordinal, key, value))
+        })
+        .collect::<Vec<_>>();
+    let mut unresolved = BTreeSet::new();
+    let mut identity_fallbacks = rows
+        .iter()
+        .map(|(_, value, author_present)| (*author_present).then(|| value.author_id.clone()))
+        .collect::<Vec<_>>();
+    for (ordinal, key, value) in &deleted_rows {
+        let owner = owners[*ordinal].clone();
+        if let Some(owner) = owner {
+            let exact_owner = complete_state_tombstone_matches_owner(key, value, &owner);
+            if !exact_owner {
+                // A finite selected reference can resolve to a prior live
+                // value at this semantic key. It is not the owner of the
+                // checkpoint tombstone, so continue to exact cascade-marker
+                // routing. A mismatching local owner remains corruption.
+                if owner.selected_ref {
+                    unresolved.insert(*ordinal);
+                    continue;
+                }
+                return Err(replacement_payload_error(
+                    "complete-state tombstone disagrees with physical owner identity or lifetime",
+                ));
+            }
+            if owner.selected_tombstone {
+                if rows[*ordinal].2 && owner.author_present {
+                    if value.author_id != owner.value.author_id {
+                        return Err(replacement_payload_error(
+                            "complete-state selected tombstone author disagrees with physical owner",
+                        ));
+                    }
+                }
+                // The checkpoint tree's presence bit describes the logical
+                // row being repaired. A newer physical selected-delta suffix
+                // can contain the selecting account, which is not proof of
+                // who authored the retained deletion. Prefer an exact marker
+                // or canonical source record for both absent and explicit
+                // tree authors; preserve an explicit identity only if no such
+                // source was retained.
+                if !rows[*ordinal].2 && owner.author_present {
+                    identity_fallbacks[*ordinal] = Some(owner.value.author_id.clone());
+                }
+                unresolved.insert(*ordinal);
+            } else {
+                if rows[*ordinal].2 && rows[*ordinal].1.author_id != owner.value.author_id {
+                    return Err(replacement_payload_error(
+                        "complete-state tombstone author disagrees with its physical owner",
+                    ));
+                }
+                authors[*ordinal] = Some(owner.value.author_id);
+            }
+        } else {
+            unresolved.insert(*ordinal);
+        }
+    }
+
+    // Cascade tombstones do not have their own physical row. Resolve them
+    // from the exact marker address, with file deletion taking precedence
+    // over collection-generation replacement just as it does in endpoint
+    // diff hydration.
+    let mut cascade_requests = Vec::new();
+    let mut cascade_routes = Vec::new();
+    for &(ordinal, key, value) in &deleted_rows {
+        if !unresolved.contains(&ordinal) {
+            continue;
+        }
+        if key.schema_key != "lix_file_descriptor"
+            && let Some(file_id) = key.file_id.as_deref()
+        {
+            let marker_key = cascade_payload_key(file_id);
+            cascade_requests.push((value.commit_id, marker_key.clone()));
+            cascade_routes.push((ordinal, key, value, marker_key, true));
+        }
+        if key.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+            let marker_key = collection_cascade_payload_key(
+                &key.schema_key,
+                key.file_id.as_deref(),
+            );
+            cascade_requests.push((value.commit_id, marker_key.clone()));
+            cascade_routes.push((ordinal, key, value, marker_key, false));
+        }
+    }
+    let cascade_owners = load_owned_commit_delta_entries(store, &cascade_requests).await?;
+    for ((ordinal, key, value, marker_key, is_file_marker), owner) in
+        cascade_routes.into_iter().zip(cascade_owners)
+    {
+        if !unresolved.contains(&ordinal) {
+            continue;
+        }
+        let Some(owner) = owner else {
+            continue;
+        };
+        // A marker for a different transition in the same scope is not an
+        // authority for this tombstone; leave it unresolved for the next
+        // candidate or canonical fallback.
+        if owner.value.change_id != value.change_id {
+            continue;
+        }
+        if owner.value.commit_id != value.commit_id
+            || owner.value.updated_at != value.updated_at
+            || owner.change_record.change_id != value.change_id
+            || owner.change_record.created_at != value.updated_at
+            || owner.change_record.schema_key != marker_key.schema_key
+            || owner.change_record.file_id != marker_key.file_id
+            || owner.change_record.row_pk != marker_key.row_pk
+        {
+            return Err(replacement_payload_error(
+                "complete-state cascade tombstone disagrees with its physical marker identity or time",
+            ));
+        }
+        if is_file_marker {
+            let file_id = key.file_id.as_deref().ok_or_else(|| {
+                replacement_payload_error("file cascade marker has no semantic file id")
+            })?;
+            if marker_key != cascade_payload_key(file_id)
+                || !owner.value.deleted
+                || owner.change_record.snapshot.is_some()
+            {
+                return Err(replacement_payload_error(
+                    "complete-state file cascade marker is not the matching descriptor tombstone",
+                ));
+            }
+        } else {
+            let (marker_schema, marker_file_id) =
+                crate::collection_generation::collection_scope_from_row_pk(&marker_key.row_pk)?;
+            if marker_key.schema_key
+                != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                || marker_key.file_id.is_some()
+                || marker_schema != key.schema_key
+                || marker_file_id.as_deref() != key.file_id.as_deref()
+                || owner.value.deleted
+                || owner.change_record.snapshot.is_none()
+            {
+                return Err(replacement_payload_error(
+                    "complete-state collection cascade marker is not the matching live generation",
+                ));
+            }
+        }
+        if rows[ordinal].2 && rows[ordinal].1.author_id != owner.value.author_id {
+            return Err(replacement_payload_error(
+                "complete-state cascade tombstone author disagrees with its physical marker",
+            ));
+        }
+        authors[ordinal] = Some(owner.value.author_id);
+        unresolved.remove(&ordinal);
+    }
+
+    // An explicit selected tombstone row is itself sufficient identity when
+    // its exact physical owner has no retained source record. Resolve such
+    // rows through physical authority only: standalone changelog entries are
+    // rebuildable projections and must not displace this identity. Marker
+    // recovery above still has precedence, and retained physical source
+    // records remain canonical when present. Author-less rows stay in the
+    // fallback path below so legacy migration still requires a marker or
+    // canonical author source.
+    let explicit_selected_rows = deleted_rows
+        .iter()
+        .filter_map(|&(ordinal, key, value)| {
+            (unresolved.contains(&ordinal)
+                && rows[ordinal].2
+                && owners[ordinal].as_ref().is_some_and(|owner| {
+                    owner.selected_tombstone
+                        && complete_state_tombstone_matches_owner(key, value, owner)
+                }))
+            .then_some((ordinal, key, value))
+        })
+        .collect::<Vec<_>>();
+    let explicit_selected_ids = explicit_selected_rows
+        .iter()
+        .map(|(_, _, value)| value.change_id)
+        .collect::<Vec<_>>();
+    let explicit_selected_authorities =
+        load_change_records_by_ids_inner(store, &explicit_selected_ids, true, true, false).await?;
+    for ((ordinal, key, value), authority) in explicit_selected_rows
+        .into_iter()
+        .zip(explicit_selected_authorities)
+    {
+        if let Some(change) = authority.record {
+            if !complete_state_tombstone_matches_change(key, value, &change)? {
+                return Err(replacement_payload_error(
+                    "complete-state tombstone physical author authority has a different identity or lifetime",
+                ));
+            }
+            if rows[ordinal].1.author_id != change.account_id {
+                return Err(replacement_payload_error(
+                    "complete-state tombstone author disagrees with canonical physical authority",
+                ));
+            }
+            authors[ordinal] = Some(change.account_id);
+        } else {
+            authors[ordinal] = Some(identity_fallbacks[ordinal].take().ok_or_else(|| {
+                replacement_payload_error(
+                    "explicit selected tombstone lost its identity author fallback",
+                )
+            })?);
+        }
+        unresolved.remove(&ordinal);
+    }
+
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    let unresolved_rows = deleted_rows
+        .iter()
+        .filter(|(ordinal, _, _)| unresolved.contains(ordinal))
+        .collect::<Vec<_>>();
+    let deleted_ids = unresolved_rows
+        .iter()
+        .map(|(_, _, value)| value.change_id)
+        .collect::<Vec<_>>();
+    let deleted_changes = load_change_records_by_ids_inner(store, &deleted_ids, true, true, true)
+        .await?;
+    for ((ordinal, key, value), resolved) in unresolved_rows.into_iter().zip(deleted_changes) {
+        let Some(change) = resolved.record else {
+            if let Some(author_id) = identity_fallbacks[*ordinal].take() {
+                authors[*ordinal] = Some(author_id);
+                continue;
+            }
+            return Err(replacement_payload_error(&format!(
+                "selected tombstone '{}' has no canonical author authority",
+                value.change_id
+            )));
+        };
+        if !complete_state_tombstone_matches_change(key, value, &change)? {
+            return Err(replacement_payload_error(
+                "complete-state tombstone author authority has a different identity or lifetime",
+            ));
+        }
+        if rows[*ordinal].2 && rows[*ordinal].1.author_id != change.account_id {
+            return Err(replacement_payload_error(
+                "complete-state tombstone author disagrees with canonical change authority",
+            ));
+        }
+        authors[*ordinal] = Some(change.account_id);
+    }
+    Ok(())
+}
+
+fn complete_state_tombstone_matches_owner(
+    key: &TrackedStateKey,
+    value: &TrackedStateIndexValue,
+    owner: &LoadedCommitDeltaEntry,
+) -> bool {
+    owner.value.commit_id == value.commit_id
+        && owner.value.deleted
+        && owner.value.change_id == value.change_id
+        && owner.value.updated_at == value.updated_at
+        && owner.change_record.schema_key == key.schema_key
+        && owner.change_record.file_id == key.file_id
+        && owner.change_record.row_pk == key.row_pk
+}
+
+fn complete_state_tombstone_matches_change(
+    key: &TrackedStateKey,
+    value: &TrackedStateIndexValue,
+    change: &crate::changelog::ChangeRecord,
+) -> Result<bool, LixError> {
+    if change.change_id != value.change_id || change.created_at != value.updated_at {
+        return Ok(false);
+    }
+    if change.schema_key == key.schema_key
+        && change.file_id == key.file_id
+        && change.row_pk == key.row_pk
+    {
+        return Ok(change.snapshot.is_none());
+    }
+    if change.schema_key == "lix_file_descriptor"
+        && change.snapshot.is_none()
+        && let Some(file_id) = key.file_id.as_deref()
+    {
+        return Ok(change
+            .row_pk
+            .as_single_string_owned()
+            .map_err(|error| {
+                replacement_payload_error(&format!(
+                    "complete-state file cascade has an invalid descriptor identity: {error}"
+                ))
+            })?
+            == file_id);
+    }
+    if change.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        && change.snapshot.is_some()
+    {
+        let (schema_key, file_id) =
+            crate::collection_generation::collection_scope_from_row_pk(&change.row_pk)?;
+        return Ok(schema_key == key.schema_key && file_id.as_deref() == key.file_id.as_deref());
+    }
+    Ok(false)
+}
+
+/// Resolves source authority for both author-less and explicit selected
+/// tombstones. A retained source record is authoritative even when the
+/// selected row carries a v83 author suffix; without a retained source, that
+/// explicit author is the tombstone's identity and remains usable.
+async fn resolve_selected_tombstone_authorities_with_authors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    rows: &[(TrackedStateKey, TrackedStateIndexValue, bool)],
+) -> Result<Vec<Option<ResolvedChangeRecord>>, LixError> {
+    let identity_rows = rows
+        .iter()
+        .map(|(key, value, author_present)| {
+            (key.clone(), value.clone(), *author_present)
+        })
+        .collect::<Vec<_>>();
+    let resolved = load_selected_tombstone_source_authorities(store, &identity_rows).await?;
+    for ((key, value, author_present), authority) in rows.iter().zip(&resolved) {
+        match authority.record.as_ref() {
+            Some(record) => {
+                if *author_present && value.author_id != record.account_id {
+                    return Err(replacement_payload_error(
+                        "selected tombstone author disagrees with canonical author authority",
+                    ));
+                }
+            }
+            None if !*author_present => {
+                return Err(replacement_payload_error(&format!(
+                    "selected tombstone '{}' has no canonical author authority",
+                    value.change_id
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(resolved
+        .into_iter()
+        .map(|authority| {
+            if authority.record.is_some() {
+                Some(authority)
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// Loads retained canonical sources for selected tombstones without assuming
+/// that every tombstone has such a source. GC uses this to retain any physical
+/// source that exists, while preserving v83 identity-only tombstones whose
+/// source payload was intentionally omitted.
+async fn load_selected_tombstone_source_authorities(
+    store: &(impl StorageAdapterRead + ?Sized),
+    rows: &[(TrackedStateKey, TrackedStateIndexValue, bool)],
+) -> Result<Vec<ResolvedChangeRecord>, LixError> {
+    let change_ids = rows
+        .iter()
+        .map(|(_, value, _)| value.change_id)
+        .collect::<Vec<_>>();
+    let mut resolved =
+        load_change_records_by_ids_inner(store, &change_ids, true, true, true).await?;
+    if rows.len() != resolved.len() {
+        return Err(replacement_payload_error(
+            "selected tombstone authority count does not match its rows",
+        ));
+    }
+    for ((key, value, author_present), authority) in rows.iter().zip(&mut resolved) {
+        let Some(record) = authority.record.as_ref() else {
+            continue;
+        };
+        let identity_matches = complete_state_tombstone_matches_change(key, value, record)?;
+        let author_disagrees = *author_present && value.author_id != record.account_id;
+        if *author_present
+            && authority.physical_owner_commit_id.is_none()
+            && (!identity_matches || author_disagrees)
+        {
+            // A standalone row with a colliding ChangeId is only a
+            // rebuildable projection. An explicit selected author is
+            // sufficient identity when no physical owner was retained;
+            // absent authors still require a matching canonical source.
+            authority.record = None;
+            continue;
+        }
+        if !identity_matches {
+            return Err(replacement_payload_error(&format!(
+                "selected tombstone '{}' author authority has a different identity or lifetime",
+                value.change_id
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+async fn resolve_selected_tombstone_member_authors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    members: &mut [CommitDeltaMember],
+) -> Result<(), LixError> {
+    let selected = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.selected_tombstone)
+        .map(|(index, member)| {
+            (
+                index,
+                TrackedStateKey {
+                    schema_key: member.key.schema_key.clone(),
+                    file_id: member.key.file_id.clone(),
+                    row_pk: member.key.row_pk.clone(),
+                },
+                member.value.clone(),
+                member.author_present,
+            )
+        })
+        .collect::<Vec<_>>();
+    let rows = selected
+        .iter()
+        .map(|(_, key, value, author_present)| {
+            (key.clone(), value.clone(), *author_present)
+        })
+        .collect::<Vec<_>>();
+    let authorities = resolve_selected_tombstone_authorities_with_authors(store, &rows).await?;
+    for ((index, _, _, author_present), authority) in selected.into_iter().zip(authorities) {
+        if let Some(authority) = authority {
+            let author_id = authority
+                .record
+                .expect("resolved selected tombstone authority has a record")
+                .account_id;
+            members[index].value.author_id = author_id.clone();
+            members[index].change.account_id = author_id;
+        } else {
+            debug_assert!(author_present);
+            // With an explicit v83 suffix and no retained source record, the
+            // selected tombstone still carries its author identity. The
+            // synthesized history ChangeRecord must reflect that identity
+            // rather than the checkpoint manifest's account.
+            members[index]
+                .change
+                .account_id
+                .clone_from(&members[index].value.author_id);
+        }
+    }
+    Ok(())
+}
+
 async fn complete_state_fence_delta_batch(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
@@ -11498,16 +12525,77 @@ async fn complete_state_fence_delta_batch(
     else {
         return Ok(None);
     };
-    let mut output = DecodedCommitDeltaBatchBuilder::with_capacity(diff.len(), 0);
-    for row in diff.checkpoint_delta_rows() {
-        let mut value = row.value().clone();
+    let rows = diff
+        .checkpoint_delta_rows()
+        .map(|row| {
+            (
+                TrackedStateKey {
+                    schema_key: row.schema_key().to_owned(),
+                    file_id: row.file_id().map(str::to_owned),
+                    row_pk: row.row_pk().clone(),
+                },
+                row.value().clone(),
+                row.author_present(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut authors = vec![None; rows.len()];
+    let live_rows = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, (key, value, author_present))| {
+            (!author_present && !value.deleted).then(|| {
+                (
+                    ordinal,
+                    AuthoritativeLiveChangeRequest {
+                        change_id: value.change_id,
+                        source_commit_id: value.commit_id,
+                        key: key.clone(),
+                        updated_at: value.updated_at,
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let live_requests = live_rows
+        .iter()
+        .map(|(_, request)| AuthoritativeLiveChangeRequest {
+            change_id: request.change_id,
+            source_commit_id: request.source_commit_id,
+            key: request.key.clone(),
+            updated_at: request.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let live_changes = load_authoritative_live_change_records(store, &live_requests).await?;
+    for ((ordinal, request), change) in live_rows.into_iter().zip(live_changes) {
+        if change.change_id != request.change_id
+            || change.created_at != request.updated_at
+            || change.schema_key != request.key.schema_key
+            || change.file_id != request.key.file_id
+            || change.row_pk != request.key.row_pk
+        {
+            return Err(replacement_payload_error(
+                "complete-state checkpoint row disagrees with canonical change identity",
+            ));
+        }
+        authors[ordinal] = Some(change.account_id);
+    }
+
+    resolve_complete_state_deleted_authors(store, &rows, &mut authors).await?;
+
+    let mut output = DecodedCommitDeltaBatchBuilder::with_capacity(rows.len(), 0);
+    for (ordinal, (key, mut value, author_present)) in rows.into_iter().enumerate() {
+        if !author_present {
+            value.author_id = authors[ordinal].take().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "complete-state checkpoint row has no canonical author authority",
+                )
+            })?;
+        }
         value.commit_id = commit_id;
         output.push_owned_row(
-            TrackedStateKey {
-                schema_key: row.schema_key().to_owned(),
-                file_id: row.file_id().map(str::to_owned),
-                row_pk: row.row_pk().clone(),
-            },
+            key,
             value,
         )?;
     }
@@ -11638,160 +12726,63 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
     };
     let selected = members
         .into_iter()
-        .filter(|member| !member.authored && !member.selected_tombstone)
+        .filter(|member| !member.authored)
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return Ok(BTreeSet::new());
     }
 
-    // Snapshot import can own selected payloads as canonical standalone
-    // ChangeRecords while their authored history remains omitted. Match the
-    // ordinary change reader's precedence; these records have no native owner.
-    let change_ids = selected
+    let selected_live = selected
         .iter()
-        .map(|member| member.value.change_id)
+        .filter(|member| !member.selected_tombstone)
         .collect::<Vec<_>>();
-    let standalone = ChangelogContext::new()
-        .reader(store)
-        .load_changes(ChangeLoadRequest {
-            change_ids: &change_ids,
-        })
-        .await?;
-    let mut unresolved = Vec::new();
-    for (member, (_, record)) in selected.into_iter().zip(standalone) {
-        if let Some(record) = record {
-            validate_selected_owner_record(&member, &record)?;
-        } else {
-            unresolved.push(member);
-        }
-    }
-    let selected = unresolved;
-    if selected.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-
-    // Explicit locators are the canonical route for random change IDs. Probe
-    // them in one batch before trying the packed direct-address convention;
-    // otherwise each random UUID looks like a distinct speculative commit and
-    // turns one finite selection into one manifest probe per row.
-    let locator_keys = selected
+    let selected_tombstones = selected
         .iter()
-        .map(|member| {
-            StorageKey(Bytes::copy_from_slice(
-                member.value.change_id.as_uuid().as_bytes(),
-            ))
-        })
+        .filter(|member| member.selected_tombstone)
         .collect::<Vec<_>>();
-    let locator_values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let explicit_locators = selected
-        .iter()
-        .zip(locator_values.value)
-        .map(|(member, value)| {
-            value
-                .map(|value| {
-                    let bytes = full_value_bytes(value).ok_or_else(|| {
-                        replacement_payload_error("selected locator read omitted payload")
-                    })?;
-                    decode_change_locator(member.value.change_id, &bytes)
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let direct_locators = selected
-        .iter()
-        .map(|member| direct_change_locator(member.value.change_id))
-        .collect::<Vec<_>>();
-
-    // Direct addressing remains canonical when its physical commit really
-    // owns the coordinate. Probe all syntactic candidates in one request so
-    // random explicit IDs cannot reintroduce one backend request per row.
-    let direct_candidate_ids = direct_locators
-        .iter()
-        .flatten()
-        .map(|locator| locator.commit_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let direct_candidate_manifests =
-        load_commit_state_manifests(store, &direct_candidate_ids).await?;
-    let present_direct_candidates = direct_candidate_ids
-        .into_iter()
-        .zip(direct_candidate_manifests)
-        .filter_map(|(commit_id, manifest)| manifest.map(|_| commit_id))
-        .collect::<BTreeSet<_>>();
-
-    let mut direct_by_commit = BTreeMap::<
-        CommitId,
-        (
-            Arc<AuthenticatedReplayCommitStateManifest>,
-            Vec<(usize, CommitDeltaChangeLocator)>,
-        ),
-    >::new();
-    let mut non_owning_direct_candidates = BTreeSet::new();
-    let mut explicit_indices = BTreeSet::new();
-    for (index, locator) in direct_locators.iter().copied().enumerate() {
-        let Some(locator) =
-            locator.filter(|locator| present_direct_candidates.contains(&locator.commit_id))
-        else {
-            explicit_indices.insert(index);
-            continue;
-        };
-        if let Some((_, requests)) = direct_by_commit.get_mut(&locator.commit_id) {
-            requests.push((index, locator));
-            continue;
-        }
-        if non_owning_direct_candidates.contains(&locator.commit_id) {
-            explicit_indices.insert(index);
-            continue;
-        }
-        match load_direct_change_authority(store, locator.commit_id).await? {
-            DirectChangeAuthority::Candidate(authority) => {
-                direct_by_commit
-                    .entry(locator.commit_id)
-                    .or_insert_with(|| (authority, Vec::new()))
-                    .1
-                    .push((index, locator));
-            }
-            DirectChangeAuthority::NotOwned(_) => {
-                non_owning_direct_candidates.insert(locator.commit_id);
-                explicit_indices.insert(index);
-            }
-        }
-    }
-
     let mut owners = BTreeSet::new();
-    for (commit_id, (authority, requests)) in direct_by_commit {
-        let locators = requests
+    if !selected_live.is_empty() {
+        let change_ids = selected_live
             .iter()
-            .map(|(_, locator)| *locator)
+            .map(|member| member.value.change_id)
             .collect::<Vec<_>>();
-        let routes = route_direct_change_records_for_state(store, &authority, &locators).await?;
-        for ((index, _), route) in requests.into_iter().zip(routes) {
-            match route {
-                DirectChangeRecordRoute::Owned(record) => {
-                    validate_selected_owner_record(&selected[index], &record)?;
-                    owners.insert(commit_id);
-                }
-                DirectChangeRecordRoute::NotOwned(_) => {
-                    explicit_indices.insert(index);
-                }
+        // Use the same physical-first direct/explicit resolution as selected
+        // hydration. Standalone changelog rows are a fallback projection and
+        // must not hide an authored owner that GC needs to retain.
+        let resolved =
+            load_change_records_by_ids_inner(store, &change_ids, true, false, true).await?;
+        for (member, resolved) in selected_live.into_iter().zip(resolved) {
+            let record = resolved.record.ok_or_else(|| {
+                replacement_payload_error("selected change resolution lost a requested row")
+            })?;
+            validate_selected_owner_record(member, &record)?;
+            if let Some(owner) = resolved.physical_owner_commit_id {
+                owners.insert(owner);
             }
         }
     }
 
-    let explicit_indices = explicit_indices.into_iter().collect::<Vec<_>>();
-    let requested = explicit_indices
-        .iter()
-        .map(|&index| (selected[index].value.change_id, explicit_locators[index]))
-        .collect::<Vec<_>>();
-    let locators = require_selected_change_locators(&requested)?;
-    let explicit = explicit_indices.into_iter().zip(locators.iter().copied());
-    let records = load_explicit_change_records_at_locators(store, &locators).await?;
-    for ((index, locator), record) in explicit.zip(records) {
-        validate_selected_owner_record(&selected[index], &record)?;
-        owners.insert(locator.commit_id);
+    if !selected_tombstones.is_empty() {
+        let rows = selected_tombstones
+            .iter()
+            .map(|member| {
+                (
+                    TrackedStateKey {
+                        schema_key: member.key.schema_key.clone(),
+                        file_id: member.key.file_id.clone(),
+                        row_pk: member.key.row_pk.clone(),
+                    },
+                    member.value.clone(),
+                    member.author_present,
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolved = load_selected_tombstone_source_authorities(store, &rows).await?;
+        for resolved in resolved {
+            if let Some(owner) = resolved.physical_owner_commit_id {
+                owners.insert(owner);
+            }
+        }
     }
     Ok(owners)
 }
@@ -11800,16 +12791,18 @@ fn validate_selected_owner_record(
     member: &CommitDeltaMember,
     record: &crate::changelog::ChangeRecord,
 ) -> Result<(), LixError> {
-    if record.change_id != member.value.change_id
-        || record.schema_key != member.key.schema_key
-        || record.file_id != member.key.file_id
-        || record.row_pk != member.key.row_pk
-    {
+    if record.created_at != member.value.updated_at {
         return Err(replacement_payload_error(&format!(
-            "selected change '{}' references canonical authority for a different identity",
+            "selected change '{}' references canonical authority for a different lifetime",
             member.value.change_id
         )));
     }
+    canonical_selected_live_change(
+        &member.change,
+        &member.value.author_id,
+        member.author_present,
+        record.clone(),
+    )?;
     Ok(())
 }
 
@@ -12364,6 +13357,7 @@ async fn load_columnar_mutation_members(
                         .expect("columnar mutation group fits u32"),
                     row_index: u32::try_from(row_index).expect("columnar mutation row fits u32"),
                 }),
+                author_present: true,
                 selected_tombstone: false,
             });
         }
@@ -12411,8 +13405,13 @@ async fn hydrate_selected_members(
         member.change = canonical_selected_live_change(
             &member.change,
             &member.value.author_id,
+            member.author_present,
             change_record,
         )?;
+        // Legacy v82 leaves synthesize the anonymous id because their value
+        // has no author field. Once the selected row reaches its physical
+        // owner's canonical change, keep the hydrated value canonical too.
+        member.value.author_id = member.change.account_id.clone();
     }
     Ok(())
 }
@@ -12420,6 +13419,7 @@ async fn hydrate_selected_members(
 fn canonical_selected_live_change(
     selected: &crate::changelog::ChangeRecord,
     selected_author_id: &str,
+    author_present: bool,
     canonical: crate::changelog::ChangeRecord,
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
     if selected.change_id != canonical.change_id
@@ -12445,7 +13445,7 @@ fn canonical_selected_live_change(
             ),
         ));
     }
-    if selected_author_id != canonical.account_id {
+    if author_present && selected_author_id != canonical.account_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -13288,8 +14288,12 @@ async fn hydrate_selected_loaded_entries(
         entry.change_record = canonical_selected_live_change(
             &entry.change_record,
             &entry.value.author_id,
+            entry.author_present,
             change_record,
         )?;
+        // See `hydrate_selected_members`: absent legacy authors are
+        // synthesized on decode and must be replaced by canonical authority.
+        entry.value.author_id = entry.change_record.account_id.clone();
         entry.selected_ref = false;
     }
     Ok(())
@@ -13351,12 +14355,14 @@ pub(crate) async fn scan_commit_delta_values_from_authenticated_states(
     let selected_source_commit_id = state.mutations.selected_source_commit_id();
     match (selected_source_commit_id, source) {
         (None, None) => {
-            return Box::pin(scan_authenticated_local_commit_delta_values(
+            let mut batch = Box::pin(scan_authenticated_local_commit_delta_values(
                 store,
                 state,
                 schema_keys,
             ))
-            .await;
+            .await?;
+            canonicalize_absent_batch_authors(store, &mut batch).await?;
+            return Ok(batch);
         }
         (None, Some(_)) => {
             return Err(replacement_payload_error(
@@ -13382,19 +14388,178 @@ pub(crate) async fn scan_commit_delta_values_from_authenticated_states(
         }
         (Some(_), Some(_)) => {}
     }
-    let source = Box::pin(scan_authenticated_local_commit_delta_values(
+    let mut source = Box::pin(scan_authenticated_local_commit_delta_values(
         store,
         source.expect("validated selected source"),
         schema_keys,
     ))
     .await?;
-    let local = Box::pin(scan_authenticated_local_commit_delta_values(
+    let mut local = Box::pin(scan_authenticated_local_commit_delta_values(
         store,
         state,
         schema_keys,
     ))
     .await?;
-    merge_selected_source_batches(source, local, state.commit_id)
+    canonicalize_absent_batch_authors(store, &mut source).await?;
+    canonicalize_absent_batch_authors(store, &mut local).await?;
+    let batch = merge_selected_source_batches(source, local, state.commit_id)?;
+    Ok(batch)
+}
+
+async fn canonicalize_absent_batch_authors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    batch: &mut DecodedCommitDeltaBatch,
+) -> Result<(), LixError> {
+    let missing_author_rows = batch
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, row)| {
+            if row.author_present() {
+                return None;
+            }
+            let key_ref = row.key_ref();
+            Some((
+                ordinal,
+                row.value().change_id,
+                row.value().updated_at,
+                row.value().commit_id,
+                row.value().deleted,
+                TrackedStateKey {
+                    schema_key: key_ref.schema_key.to_owned(),
+                    file_id: key_ref.file_id.map(str::to_owned),
+                    row_pk: key_ref.row_pk.clone(),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // Resolve every tombstone through its physical row so v83 explicit authors
+    // are checked against a retained canonical deletion record as well as v82
+    // author-less tombstones being repaired. An identity-only v83 tombstone
+    // remains readable when no canonical payload was retained.
+    let tombstones = batch
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, row)| {
+            row.value().deleted.then(|| {
+                let key_ref = row.key_ref();
+                (
+                    ordinal,
+                    row.value().change_id,
+                    row.value().updated_at,
+                    row.value().commit_id,
+                    TrackedStateKey {
+                        schema_key: key_ref.schema_key.to_owned(),
+                        file_id: key_ref.file_id.map(str::to_owned),
+                        row_pk: key_ref.row_pk.clone(),
+                    },
+                    row.author_present(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if !tombstones.is_empty() {
+        let requests = tombstones
+            .iter()
+            .map(|(_, _, _, commit_id, key, _)| (*commit_id, key.clone()))
+            .collect::<Vec<_>>();
+        let owned = load_owned_commit_delta_entries(store, &requests).await?;
+        let mut selected_tombstones = Vec::new();
+        for ((ordinal, change_id, updated_at, _, key, author_present), entry) in
+            tombstones.into_iter().zip(owned)
+        {
+            let entry = entry.ok_or_else(|| {
+                replacement_payload_error(&format!(
+                    "legacy tombstone row '{change_id}' has no physical author authority"
+                ))
+            })?;
+            if entry.value.change_id != change_id
+                || entry.value.updated_at != updated_at
+                || entry.change_record.schema_key != key.schema_key
+                || entry.change_record.file_id != key.file_id
+                || entry.change_record.row_pk != key.row_pk
+            {
+                return Err(replacement_payload_error(
+                    "legacy tombstone row disagrees with physical author authority",
+                ));
+            }
+            if entry.selected_tombstone {
+                selected_tombstones.push((
+                    ordinal,
+                    TrackedStateKey {
+                        schema_key: key.schema_key,
+                        file_id: key.file_id,
+                        row_pk: key.row_pk,
+                    },
+                    entry.value,
+                    author_present,
+                ));
+            } else if !author_present {
+                batch.values[ordinal].author_id = entry.value.author_id;
+                batch.author_present[ordinal] = true;
+            }
+        }
+        if !selected_tombstones.is_empty() {
+            let rows = selected_tombstones
+                .iter()
+                .map(|(_, key, value, author_present)| {
+                    (key.clone(), value.clone(), *author_present)
+                })
+                .collect::<Vec<_>>();
+            let authorities =
+                resolve_selected_tombstone_authorities_with_authors(store, &rows).await?;
+            for ((ordinal, _, _, author_present), authority) in
+                selected_tombstones.into_iter().zip(authorities)
+            {
+                if let Some(authority) = authority {
+                    let author_id = authority
+                        .record
+                        .expect("resolved selected tombstone authority has a record")
+                        .account_id;
+                    batch.values[ordinal].author_id = author_id;
+                    batch.author_present[ordinal] = true;
+                } else {
+                    debug_assert!(author_present);
+                }
+            }
+        }
+    }
+
+    let live_rows = missing_author_rows
+        .into_iter()
+        .filter_map(|(ordinal, change_id, updated_at, commit_id, deleted, key)| {
+            (!deleted).then_some((ordinal, change_id, updated_at, commit_id, key))
+        })
+        .collect::<Vec<_>>();
+    let requests = live_rows
+        .iter()
+        .map(|(_, change_id, updated_at, commit_id, key)| {
+            AuthoritativeLiveChangeRequest {
+                change_id: *change_id,
+                source_commit_id: *commit_id,
+                key: key.clone(),
+                updated_at: *updated_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    let changes = load_authoritative_live_change_records(store, &requests).await?;
+    for ((ordinal, change_id, updated_at, _, key), canonical) in
+        live_rows.into_iter().zip(changes)
+    {
+        if canonical.change_id != change_id
+            || canonical.created_at != updated_at
+            || canonical.schema_key != key.schema_key
+            || canonical.file_id != key.file_id
+            || canonical.row_pk != key.row_pk
+        {
+            return Err(replacement_payload_error(
+                "legacy commit-delta row disagrees with canonical author authority",
+            ));
+        }
+        batch.values[ordinal].author_id = canonical.account_id.clone();
+        batch.author_present[ordinal] = true;
+    }
+    Ok(())
 }
 
 async fn scan_authenticated_local_commit_delta_values(
@@ -13580,7 +14745,11 @@ async fn scan_bounded_commit_delta_values(
         };
         let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
         validate_bounded_direct_row_count(root.layout, direct_row_count, leaf.len())?;
-        batch.push_leaf(leaf, state.commit_id, &requested_schemas)?;
+        batch.push_leaf(
+            leaf,
+            state.commit_id,
+            &requested_schemas,
+        )?;
     }
     Ok(batch.finish())
 }
@@ -13734,18 +14903,51 @@ fn merge_selected_source_batches(
         )
     })?;
     let columnar_key_offset = source.columnar_keys.len();
-    let mut entries = BTreeMap::<Vec<u8>, (DecodedCommitDeltaRow, TrackedStateIndexValue)>::new();
+    let mut entries = BTreeMap::<
+        Vec<u8>,
+        (DecodedCommitDeltaRow, TrackedStateIndexValue, bool),
+    >::new();
     let source_rows = std::mem::take(&mut source.rows);
     let source_values = std::mem::take(&mut source.values);
-    for (row, mut value) in source_rows.into_iter().zip(source_values) {
+    let source_author_present = std::mem::take(&mut source.author_present);
+    for ((row, mut value), author_present) in source_rows
+        .into_iter()
+        .zip(source_values)
+        .zip(source_author_present)
+    {
         let key = decoded_commit_delta_row_key(&source, &row)?.to_vec();
         value.commit_id = commit_id;
-        entries.insert(key, (row, value));
+        entries.insert(key, (row, value, author_present));
     }
     let local_rows = std::mem::take(&mut local.rows);
     let local_values = std::mem::take(&mut local.values);
     for (mut row, value) in local_rows.into_iter().zip(local_values) {
         let key = decoded_commit_delta_row_key(&local, &row)?.to_vec();
+        let author_present = if row.columnar_key.is_some() {
+            true
+        } else {
+            local
+                .arenas
+                .get(row.arena_ordinal as usize)
+                .and_then(|leaf| leaf.author_present(row.entry_ordinal as usize))
+                .ok_or_else(|| {
+                    replacement_payload_error(
+                        "selected-source scan row lost author-presence metadata",
+                    )
+                })?
+        };
+        let mut value = value;
+        if let Some((_, source_value, _)) = entries
+            .get(&key)
+            .filter(|(_, source_value, _)| source_value.change_id == value.change_id)
+        {
+            if author_present && value.author_id != source_value.author_id {
+                return Err(replacement_payload_error(
+                    "selected-source row author disagrees with canonical source author",
+                ));
+            }
+            value.author_id = source_value.author_id.clone();
+        }
         if let Some(range) = row.columnar_key {
             let shifted_offset =
                 range
@@ -13786,7 +14988,7 @@ fn merge_selected_source_batches(
                         )
                     })?;
         }
-        entries.insert(key, (row, value));
+        entries.insert(key, (row, value, author_present));
     }
     let mut columnar_keys = Vec::with_capacity(
         source
@@ -13800,9 +15002,10 @@ fn merge_selected_source_batches(
     source.arenas.append(&mut local.arenas);
     source.schema_keys.append(&mut local.schema_keys);
     source.file_ids.append(&mut local.file_ids);
-    for (_, (row, value)) in entries {
+    for (_, (row, value, author_present)) in entries {
         source.rows.push(row);
         source.values.push(value);
+        source.author_present.push(author_present);
     }
     Ok(source)
 }
@@ -13980,7 +15183,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     }
                     if locator.is_some() {
                         let canonical =
-                            load_change_records_by_ids(store, &[member.change.change_id])
+                            load_selected_change_records_by_ids(store, &[member.change.change_id])
                                 .await?
                                 .pop()
                                 .ok_or_else(|| {
@@ -15246,7 +16449,7 @@ fn collect_strict_commit_delta_members(
                 "tracked_state packed commit_delta leaf has a missing entry",
             )
         })?;
-        let value = decode_value(entry.value)?;
+        let mut value = decode_value(entry.value)?;
         if value.commit_id != expected_commit_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -15275,6 +16478,20 @@ fn collect_strict_commit_delta_members(
                     (None, None, None, base_coordinate, false, true)
                 }
             };
+        let author_present = leaf
+            .author_present(entry_index)
+            .expect("decoded commit-delta row has an author-presence entry");
+        // Selected tombstones are identity-only rows and may deliberately
+        // have no canonical changelog record. In v82 their physical owner's
+        // account is the only retained author authority, just as for an
+        // authored row.
+        if !author_present && (authored || selected_tombstone) {
+            value.author_id = account_id.to_owned();
+        } else if author_present && authored && value.author_id != account_id {
+            return Err(replacement_payload_error(
+                "authored commit-delta author disagrees with physical owner account",
+            ));
+        }
         let change = crate::changelog::ChangeRecord {
             account_id: account_id.to_string(),
             format_version: 2,
@@ -15295,6 +16512,7 @@ fn collect_strict_commit_delta_members(
             ordinal: u32::try_from(entry_index).expect("segment ordinal fits u32"),
             authored,
             base_coordinate,
+            author_present,
             selected_tombstone,
         });
     }
@@ -16524,16 +17742,33 @@ fn decode_replacement_part_as_commit_delta(
                     "tracked_state replacement change address overflows",
                 )
             })?;
-        values.push(encode_value_ref(TrackedStateIndexValueRef {
+        let author_id = decoded
+            .author_id(ordinal)?
+            .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?;
+        let mut value = encode_value_ref(TrackedStateIndexValueRef {
             change_id: change_id_from_packed_address(owner_commit_id, packed),
             commit_id: owner_commit_id,
-            author_id: decoded
-                .author_id(ordinal)?
-                .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?,
+            author_id,
             deleted: false,
             created_at: replacement.uniform_created_at,
             updated_at: replacement.uniform_updated_at,
-        }));
+        });
+        if !decoded
+            .author_present(ordinal)
+            .ok_or_else(|| replacement_payload_error("replacement row omitted author presence"))?
+        {
+            // Keep v82's omitted-author state in the synthetic commit-delta
+            // leaf. The physical commit owner, rather than the decoder's
+            // anonymous placeholder, supplies the canonical author later.
+            let suffix_len = 2 + author_id.len();
+            let Some(author_end) = value.len().checked_sub(suffix_len) else {
+                return Err(replacement_payload_error(
+                    "replacement value author suffix is truncated",
+                ));
+            };
+            value.truncate(author_end);
+        }
+        values.push(value);
         payload_offsets.push(
             u32::try_from(payload_bytes.len())
                 .map_err(|_| replacement_payload_error("payload directory exceeds u32"))?,
@@ -16732,6 +17967,39 @@ fn find_commit_delta_value(
     Ok(Some(value))
 }
 
+fn find_commit_delta_value_with_author_presence(
+    leaf: &DecodedLeafNodeRef,
+    target_key: &[u8],
+    expected_commit_id: CommitId,
+) -> Result<(Option<TrackedStateIndexValue>, bool), LixError> {
+    let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
+        return Ok((None, false));
+    };
+    let entry = leaf.entry(index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state packed commit_delta leaf has a missing entry",
+        )
+    })?;
+    let value = decode_value(entry.value)?;
+    if value.commit_id != expected_commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state packed commit_delta for commit '{expected_commit_id}' contains an entry for commit '{}'",
+                value.commit_id
+            ),
+        ));
+    }
+    let author_present = leaf.author_present(index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state packed commit_delta leaf lost author-presence metadata",
+        )
+    })?;
+    Ok((Some(value), author_present))
+}
+
 fn find_loaded_commit_delta_entry<S>(
     leaf: &DecodedLeafNodeRef,
     payloads: &CommitDeltaPayloadIndex<S>,
@@ -16775,7 +18043,7 @@ where
             "tracked_state packed commit_delta leaf has a missing entry",
         )
     })?;
-    let value = decode_value(entry.value)?;
+    let mut value = decode_value(entry.value)?;
     if value.commit_id != expected_commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -16789,21 +18057,33 @@ where
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
-    let (metadata, snapshot, origin_key, base_coordinate, selected_ref) = match payload {
+    let (metadata, snapshot, origin_key, base_coordinate, selected_ref, selected_tombstone, authored) = match payload {
         CommitDeltaPayload::Authored(payload) => (
             payload.metadata,
             payload.snapshot,
             payload.origin_key,
             payload.base_coordinate,
             false,
+            false,
+            true,
         ),
         CommitDeltaPayload::SelectedRef(base_coordinate) => {
-            (None, None, None, base_coordinate, true)
+            (None, None, None, base_coordinate, true, false, false)
         }
         CommitDeltaPayload::SelectedTombstone(base_coordinate) => {
-            (None, None, None, base_coordinate, false)
+            (None, None, None, base_coordinate, false, true, false)
         }
     };
+    let author_present = leaf
+        .author_present(index)
+        .expect("loaded commit-delta row has an author-presence entry");
+    if !author_present && (authored || selected_tombstone) {
+        value.author_id = account_id.to_owned();
+    } else if author_present && authored && value.author_id != account_id {
+        return Err(replacement_payload_error(
+            "authored commit-delta author disagrees with physical owner account",
+        ));
+    }
     if !selected_ref && value.deleted != snapshot.is_none() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -16832,7 +18112,9 @@ where
         value,
         change_record,
         base_coordinate,
+        author_present,
         selected_ref,
+        selected_tombstone,
     })
 }
 
@@ -18243,7 +19525,7 @@ mod tests {
     use crate::storage_codec;
     use crate::tracked_state::codec::{
         EncodedLeafEntry, PendingChunk, PendingChunkBatch, TrackedStateKeyBatchBuilder,
-        encode_key_ref, encode_value_ref, hash_bytes,
+        decode_value, encode_key_ref, encode_value_ref, hash_bytes,
     };
     use crate::tracked_state::types::CurrentStatePartSource;
     use crate::tracked_state::types::{
@@ -18688,6 +19970,7 @@ mod tests {
                         created_at,
                         updated_at,
                     },
+                    author_present: true,
                     metadata: None,
                     snapshot: native_snapshot_payload(
                         &row_pk,
@@ -18789,6 +20072,7 @@ mod tests {
                     created_at,
                     updated_at,
                 },
+                author_present: true,
                 metadata: None,
                 snapshot: b"typed".to_vec(),
             })
@@ -20016,6 +21300,321 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v82_native_current_state_part_recovers_author_from_physical_owner() {
+        use crate::tracked_state::current_state_data_part::{
+            CURRENT_STATE_DATA_PART_SPACE, CurrentStateDataRow, encode_current_state_data_part,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let fixture = packed_commit_delta_fixtures().remove(1);
+        let mut deltas = commit_delta_refs(owner, std::slice::from_ref(&fixture));
+        deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[true])
+            .expect("physical owner should stage");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            owner,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("physical author authority should stage");
+
+        let key = fixture.key();
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            row_pk: &key.row_pk,
+        });
+        let row = CurrentStateDataRow {
+            encoded_key: encoded_key.clone(),
+            value: TrackedStateIndexValue {
+                change_id: staged.assigned_change_ids[0],
+                commit_id: owner,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                updated_at: fixture.updated_at,
+            },
+            author_present: false,
+            metadata: None,
+            snapshot: b"v82-live-snapshot".to_vec(),
+        };
+        let encoded = encode_current_state_data_part(&[row], &mut None)
+            .expect("legacy-shaped current-state row should encode");
+        assert!(encoded.bytes.starts_with(b"LXCSP04"));
+        let mut legacy_bytes = b"LXCSP03".to_vec();
+        legacy_bytes.extend_from_slice(&encoded.bytes[7..]);
+        let legacy_digest = *blake3::Hasher::new_derive_key("lix native current-state data part v3")
+            .update(&legacy_bytes)
+            .finalize()
+            .as_bytes();
+        writes.put(
+            CURRENT_STATE_DATA_PART_SPACE,
+            super::key(legacy_digest.to_vec()),
+            value(legacy_bytes),
+        );
+
+        let descriptor = CurrentStatePartDescriptor {
+            first_key: encoded_key.clone(),
+            last_key: encoded_key.clone(),
+            content_digest: legacy_digest,
+            source: CurrentStatePartSource::NativeDataPart,
+            source_row_offset: 0,
+            row_count: 1,
+            fragmented: false,
+        };
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy native part and physical owner should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("native part read should open");
+        let values = super::load_current_state_values_from_descriptors(
+            &read,
+            &[Bytes::from(encoded_key)],
+            vec![Some(descriptor)],
+        )
+        .await
+        .expect("catalog route should repair the legacy author from physical authority");
+        assert_eq!(
+            values[0].as_ref().expect("row should load").author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn v82_replacement_part_recovers_author_from_physical_owner() {
+        use crate::tracked_state::replacement_part::{
+            ReplacementPartDirectory, ReplacementPartDirectoryEntry, ReplacementPartRowRef,
+            encode_replacement_part_with_compressor,
+        };
+        use crate::tracked_state::types::{
+            CommitDeltaLifecycleSummary, CommitDeltaReplacementScope, ReplacementPartSource,
+            TrackedStateSingleStringReplacementRef,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0001,
+        ));
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
+        let scope = CommitDeltaReplacementScope {
+            schema_key: "legacy-replacement".to_owned(),
+            file_id: None,
+        };
+        let generation = super::CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            fallback_commit_id: None,
+            lifecycle_summary: CommitDeltaLifecycleSummary {
+                scope,
+                ordered_identity_digest: [73; 32],
+                uniform_created_at: created_at,
+            },
+        };
+        let key = TrackedStateKey {
+            schema_key: "legacy-replacement".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single("legacy-row"),
+        };
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: None,
+            row_pk: &key.row_pk,
+        });
+        let author_id = crate::SYSTEM_ACCOUNT_ID;
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_ordered_addressable_replacement_parts(
+            &mut writes,
+            [Ok(TrackedStateSingleStringReplacementRef {
+                schema_key: &key.schema_key,
+                file_id: None,
+                row_pk: "legacy-row",
+                author_id,
+                commit_id: owner,
+                created_at,
+                updated_at,
+                metadata: None,
+                snapshot: b"typed-v82-replacement",
+            })]
+            .into_iter(),
+            &generation,
+        )
+        .expect("replacement owner should stage");
+
+        // Preserve the v82 physical shape: the old format has no per-row
+        // author bytes, though the authenticated commit owner still does.
+        let mut legacy_part = encode_replacement_part_with_compressor(&[ReplacementPartRowRef {
+            encoded_key: &encoded_key,
+            author_id,
+            metadata: None,
+            snapshot: b"typed-v82-replacement",
+        }], &mut None)
+        .expect("replacement part should encode")
+        .bytes()
+        .to_vec();
+        legacy_part[..8].copy_from_slice(b"LXRPI005");
+        let author_start = 8 + 2 + 2 + 2 + encoded_key.len();
+        let author_end = author_start + 2 + author_id.len();
+        legacy_part.drain(author_start..author_end);
+        let legacy_digest = *blake3::Hasher::new_derive_key(
+            "lix tracked-state replacement identity part v1",
+        )
+        .update(&legacy_part)
+        .finalize()
+        .as_bytes();
+        let directory = ReplacementPartDirectory::try_new(
+            vec![ReplacementPartDirectoryEntry::new(
+                legacy_digest,
+                &encoded_key,
+                &encoded_key,
+                0,
+                1,
+            )],
+            1,
+        )
+        .expect("legacy replacement directory should validate");
+
+        let mut inventory = staged.mutation_inventory().clone();
+        // Compact replacement authority stores part digests separately from
+        // the expanded segment-bounds vector.
+        inventory.parts.clear();
+        inventory.replacement_part_digests[0] = legacy_digest;
+        let replacement_parts = inventory
+            .replacement_parts
+            .as_mut()
+            .expect("replacement part authority should be present");
+        replacement_parts.directory_digest = directory
+            .digest()
+            .expect("legacy replacement directory should digest");
+        let lifecycle = inventory
+            .lifecycle_summary
+            .as_ref()
+            .expect("replacement lifecycle should be present")
+            .clone();
+        let replacement_parts = inventory
+            .replacement_parts
+            .as_ref()
+            .expect("replacement part authority should remain present")
+            .clone();
+        let mut stored_generation = inventory
+            .replacement_generation
+            .clone()
+            .expect("replacement generation should be present");
+        stored_generation.integrity_digest = super::replacement_generation_integrity_digest(
+            &stored_generation,
+            &lifecycle,
+            &replacement_parts,
+        );
+        inventory.replacement_generation = Some(stored_generation);
+
+        let mut physical_key = super::commit_delta_segment_key(owner, 0)
+            .expect("replacement segment key should encode");
+        physical_key.extend_from_slice(&legacy_digest);
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            StorageKey(Bytes::from(physical_key)),
+            value(legacy_part),
+        );
+        stage_fixture_manifest_with_author(&mut writes, owner, &inventory, author_id)
+            .expect("legacy replacement owner authority should stage");
+        let descriptor = CurrentStatePartDescriptor {
+            first_key: encoded_key.to_vec(),
+            last_key: encoded_key.to_vec(),
+            content_digest: legacy_digest,
+            source: CurrentStatePartSource::Replacement(ReplacementPartSource {
+                owner_commit_id: *owner.as_uuid().as_bytes(),
+                part_index: 0,
+                uniform_created_at: created_at,
+                uniform_updated_at: updated_at,
+            }),
+            source_row_offset: 0,
+            row_count: 1,
+            fragmented: false,
+        };
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy replacement part and owner should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy replacement read should open");
+        let values = super::load_current_state_values_from_descriptors(
+            &read,
+            &[Bytes::from(encoded_key)],
+            vec![Some(descriptor.clone())],
+        )
+        .await
+        .expect("catalog route should recover the legacy author from physical authority");
+        assert_eq!(
+            values[0].as_ref().expect("row should load").author_id,
+            author_id
+        );
+
+        let owned = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(owner, key.clone())],
+        )
+        .await
+        .expect("legacy replacement commit-delta owner should resolve");
+        assert_eq!(
+            owned[0]
+                .as_ref()
+                .expect("replacement owner should contain the row")
+                .account_id,
+            author_id,
+            "the synthetic commit-delta leaf must retain v82 author absence so its physical owner supplies the author"
+        );
+
+        // Scoped-range rewrites read the replacement descriptor into native
+        // rows before sparse compaction. Recover the author there as well, so
+        // a native data part cannot turn v82's anonymous placeholder into an
+        // explicit author.
+        let mut rewrite_writes = storage.new_write_set();
+        let rewritten_rows = super::load_scoped_current_state_descriptor_rows(
+            &read,
+            &mut rewrite_writes,
+            &descriptor,
+        )
+        .await
+        .expect("scoped replacement source should recover its legacy author");
+        assert_eq!(rewritten_rows[0].value.author_id, author_id);
+        assert!(rewritten_rows[0].author_present);
+
+        let mut native_descriptors = Vec::new();
+        super::stage_scoped_native_current_state_rows(
+            &mut rewrite_writes,
+            &rewritten_rows,
+            false,
+            &mut native_descriptors,
+        )
+        .expect("recovered replacement row should stage as native current state");
+        let native_bytes = rewrite_writes
+            .staged_value(
+                crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_SPACE,
+                &native_descriptors[0].content_digest,
+            )
+            .expect("migrated native current-state data part should be staged");
+        let migrated_rows = crate::tracked_state::current_state_data_part::decode_current_state_data_part(
+            &native_descriptors[0].content_digest,
+            &native_bytes,
+        )
+        .expect("migrated native current-state part should decode");
+        assert_eq!(migrated_rows[0].value.author_id, author_id);
+        assert!(migrated_rows[0].author_present);
+    }
+
+    #[tokio::test]
     async fn change_locator_loads_inline_and_segmented_records_by_id() {
         for (label, fixtures) in [
             (
@@ -20152,7 +21751,72 @@ mod tests {
         selected_deltas[0].authored = false;
         selected_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
         selected_deltas[0].snapshot = None;
-        stage_addressable_commit_deltas(&mut writes, &selected_deltas, &[false]).unwrap();
+        let selected_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &selected_deltas, &[false])
+                .unwrap();
+        let mut selected_inventory = selected_stage.mutation_inventory().clone();
+        let (_, sidecar) =
+            super::split_commit_delta_segment(&selected_inventory.inline_part).unwrap();
+        let (current_leaf, _) =
+            decode_commit_delta_with_payloads(&selected_inventory.inline_part, None).unwrap();
+        let entry = current_leaf.entry(0).expect("one selected entry");
+        let value = decode_value(entry.value).unwrap();
+        assert_eq!(value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        let author_suffix_len = 2 + value.author_id.len();
+        let legacy_value_end = entry.value.len() - author_suffix_len;
+        assert!(entry.key.len() < 128, "fixture key fits one-byte varint");
+        let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(entry.key.len()).unwrap()];
+        legacy_leaf.extend_from_slice(entry.key);
+        legacy_leaf.extend_from_slice(&entry.value[..16]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[16..32]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[32..legacy_value_end]);
+        let mut legacy_segment = Vec::with_capacity(
+            COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + legacy_leaf.len() + sidecar.len(),
+        );
+        legacy_segment.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+        legacy_segment.extend_from_slice(
+            &u32::try_from(legacy_leaf.len())
+                .expect("one-row legacy leaf fits u32")
+                .to_be_bytes(),
+        );
+        legacy_segment.extend_from_slice(&legacy_leaf);
+        legacy_segment.extend_from_slice(sidecar);
+        selected_inventory.inline_part = legacy_segment;
+        stage_fixture_manifest(&mut writes, selected, &selected_inventory).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(authored, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale.snapshot = Some(b"stale-standalone-v82".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -20162,6 +21826,39 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
+        let scanned_values = scan_commit_delta_values(&read, selected, &[])
+            .await
+            .expect("legacy selected scan should prefer its physical author authority");
+        assert_eq!(scanned_values.len(), 1);
+        assert_eq!(
+            scanned_values.iter().next().unwrap().value().author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+        let (legacy_leaf, legacy_payloads) =
+            decode_commit_delta_with_payloads(&selected_inventory.inline_part, None).unwrap();
+        assert_eq!(legacy_leaf.author_present(0), Some(false));
+        assert_eq!(
+            decode_value(legacy_leaf.entry(0).unwrap().value)
+                .unwrap()
+                .author_id,
+            crate::ANONYMOUS_ACCOUNT_ID
+        );
+        let loaded = super::load_commit_delta_entry_at_index(
+            &legacy_leaf,
+            &legacy_payloads,
+            0,
+            selected,
+            crate::ANONYMOUS_ACCOUNT_ID,
+        )
+        .unwrap();
+        let mut loaded = vec![Some(loaded)];
+        super::hydrate_selected_loaded_entries(&read, &mut loaded)
+            .await
+            .unwrap();
+        let loaded = loaded[0].as_ref().unwrap();
+        assert_eq!(loaded.value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(loaded.change_record.account_id, crate::SYSTEM_ACCOUNT_ID);
+
         let selected_records = super::load_commit_delta_change_records_for_owners(
             &read,
             &[(selected, fixture.key())],
@@ -20189,10 +21886,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected_members[0].change, records[0]);
+        assert_eq!(selected_members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
         let inventory = scan_commit_delta_inventory(&read).await.unwrap();
         assert_eq!(inventory.commits[&selected].members[0].change, records[0]);
+        assert_eq!(
+            inventory.commits[&selected].members[0].value.author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
         let scanned = scan_change_records_from_commit_deltas(&read).await.unwrap();
         assert_eq!(scanned, records);
+        let encoded_key = Bytes::from(encode_key_ref(TrackedStateKeyRef {
+            schema_key: &fixture.schema_key,
+            file_id: fixture.file_id.as_deref(),
+            row_pk: &fixture.row_pk,
+        }));
+        let replayed = load_commit_delta_values_encoded(
+            &read,
+            selected,
+            std::slice::from_ref(&encoded_key),
+        )
+        .await
+        .expect("point replay should restore an author omitted by the v82 selected row");
+        assert_eq!(
+            replayed[0].as_ref().unwrap().author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
 
         let mismatched = CommitId::for_test_label("selected-wrong-author");
         let mut mismatched_deltas = commit_delta_refs(mismatched, &selected_fixtures);
@@ -20303,7 +22021,7 @@ mod tests {
             super::load_change_records_by_ids(&read, &[change_id])
                 .await
                 .unwrap(),
-            vec![stale]
+            vec![canonical.clone()]
         );
         let members = load_commit_delta_members_with_payloads(&read, selected)
             .await
@@ -20448,6 +22166,13 @@ mod tests {
         .await
         .unwrap();
             assert_eq!(point[0], Some(canonical.clone()));
+        assert_eq!(
+            super::load_change_records_by_ids(&read, &[fixture.change_id])
+                .await
+                .unwrap(),
+            vec![canonical.clone()],
+            "a stale selected-row locator must retain the standalone payload fallback"
+        );
         let selected_source = super::load_authoritative_selected_change_records(
             &read,
             &[super::AuthoritativeLiveChangeRequest {
@@ -20618,6 +22343,328 @@ mod tests {
                 .unwrap(),
             vec![canonical],
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_logical_source_does_not_hide_a_distinct_direct_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let authored = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1239_0000_0000,
+        ));
+        let deferred_checkpoint = CommitId::for_test_label("deferred-direct-owner-checkpoint");
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+
+        let mut writes = storage.new_write_set();
+        let mut deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
+        deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[true]).unwrap();
+        let change_id = staged.assigned_change_ids[0];
+        assert!(staged.locators.is_empty(), "direct IDs need no locator");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            authored,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .unwrap();
+        super::stage_commit_history_deferred(&mut writes, deferred_checkpoint);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(authored, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale.snapshot = Some(b"stale-standalone-payload".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let resolved = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: deferred_checkpoint,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("a deferred endpoint must not shadow an available direct owner");
+        assert_eq!(resolved, vec![canonical]);
+    }
+
+    #[tokio::test]
+    async fn deferred_same_source_direct_owner_beats_stale_standalone() {
+        let storage = StorageAdapter::new(Memory::new());
+        let source = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_123b_0000_0000,
+        ));
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        let mut deltas = commit_delta_refs(source, std::slice::from_ref(&fixture));
+        deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[true]).unwrap();
+        let change_id = staged.assigned_change_ids[0];
+        assert!(staged.locators.is_empty(), "direct IDs need no explicit locator");
+        assert_eq!(
+            super::direct_change_locator(change_id)
+                .expect("authored change ID should encode its owner")
+                .commit_id,
+            source,
+        );
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .unwrap();
+        super::stage_commit_history_deferred(&mut writes, source);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(source, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        assert_eq!(canonical.account_id, crate::SYSTEM_ACCOUNT_ID);
+        let mut stale = canonical.clone();
+        stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale.snapshot = Some(b"stale-standalone-payload".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let resolved = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: source,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("a direct owner retained beside a deferred marker must win");
+        assert_eq!(resolved, vec![canonical]);
+    }
+
+    #[tokio::test]
+    async fn deferred_source_locator_coordinate_redirect_beats_standalone() {
+        let storage = StorageAdapter::new(Memory::new());
+        let source = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_123a_0000_0000,
+        ));
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        // The imported wire ID encodes source part 0, ordinal 1, while its
+        // authenticated physical row is packed at source part 0, ordinal 0.
+        // The explicit locator therefore redirects within the same commit.
+        fixture.change_id = super::addressable_change_id(source, 0, 1).unwrap();
+        let mut writes = storage.new_write_set();
+        let deltas = commit_delta_refs(source, std::slice::from_ref(&fixture));
+        let staged = super::stage_imported_addressable_commit_deltas(&mut writes, &deltas, &[true])
+            .unwrap();
+        assert_eq!(staged.locators.len(), 1);
+        let explicit = staged.locators[0];
+        let embedded = super::direct_change_locator(fixture.change_id).unwrap();
+        assert_eq!(explicit.commit_id, source);
+        assert_eq!((explicit.segment_index, explicit.ordinal), (0, 0));
+        assert_eq!((embedded.segment_index, embedded.ordinal), (0, 1));
+        assert_ne!(explicit, embedded);
+        stage_change_locators(&mut writes, &staged.locators);
+        stage_fixture_manifest(&mut writes, source, staged.mutation_inventory()).unwrap();
+        super::stage_commit_history_deferred(&mut writes, source);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(source, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.snapshot = Some(b"stale-standalone-payload".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let resolved = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: fixture.change_id,
+                source_commit_id: source,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("same-commit coordinate redirect must validate physical payload");
+        assert_eq!(resolved, vec![canonical]);
+    }
+
+    #[tokio::test]
+    async fn deferred_non_addressable_same_source_locator_beats_standalone() {
+        let storage = StorageAdapter::new(Memory::new());
+        let source = CommitId::for_test_label("deferred-non-addressable-owner");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        fixture.change_id = ChangeId::for_test_label("deferred-non-addressable-change");
+        let mut deltas = commit_delta_refs(source, std::slice::from_ref(&fixture));
+        deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[false])
+            .expect("non-addressable authored row should stage");
+        assert_eq!(staged.locators.len(), 1);
+        assert_eq!(staged.locators[0].commit_id, source);
+        stage_change_locators(&mut writes, &staged.locators);
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("physical owner should stage");
+        // Deferred metadata can coexist with retained physical owner data.
+        // An explicit non-addressable locator must still select that owner.
+        super::stage_commit_history_deferred(&mut writes, source);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(source, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        assert_eq!(canonical.account_id, crate::SYSTEM_ACCOUNT_ID);
+        let mut stale = canonical.clone();
+        stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale.snapshot = Some(b"stale-standalone-payload".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let resolved = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id: fixture.change_id,
+                source_commit_id: source,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .expect("explicit same-source locator should validate physical payload");
+        assert_eq!(resolved, vec![canonical]);
     }
 
     #[tokio::test]
@@ -21848,6 +23895,7 @@ mod tests {
             0x0192_0000_0000_7000_8000_5679_0000_0000,
         ));
         let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
         let scope = CommitDeltaReplacementScope {
             schema_key: "compact-direct".to_string(),
             file_id: None,
@@ -21872,7 +23920,7 @@ mod tests {
                     author_id: crate::ANONYMOUS_ACCOUNT_ID,
                     commit_id,
                     created_at,
-                    updated_at: created_at,
+                    updated_at,
                     metadata: None,
                     snapshot: b"typed-v1",
                 })
@@ -21909,6 +23957,20 @@ mod tests {
             .expect("compact direct row should exist");
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.row_pk, RowPk::single("compact-001"));
+        assert_eq!(loaded.created_at, updated_at);
+        let batch = load_commit_delta_change_records(
+            &read,
+            commit_id,
+            &[TrackedStateKey {
+                schema_key: "compact-direct".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("compact-001"),
+            }],
+        )
+        .await
+        .expect("compact batch hydration should succeed");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].as_ref(), Some(&loaded));
         assert_eq!(invocation_accounting.selector_all_roots, 0);
         assert!(invocation_accounting.direct_route_calls > 0);
         assert!(invocation_accounting.selector_direct_calls > 0);
@@ -22163,19 +24225,148 @@ mod tests {
     async fn selected_tombstones_may_share_one_source_change_id() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("duplicate-selected-tombstone");
+        let parent_commit = CommitId::for_test_label("duplicate-selected-tombstone-parent");
         let mut fixtures = packed_commit_delta_fixtures()
             .into_iter()
             .take(2)
             .collect::<Vec<_>>();
         fixtures[0].deleted = true;
         fixtures[1].deleted = true;
+        fixtures[1].schema_key = fixtures[0].schema_key.clone();
         fixtures[1].change_id = fixtures[0].change_id;
+
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_rows = fixtures
+            .iter()
+            .enumerate()
+            .map(|(ordinal, fixture)| {
+                crate::tracked_state::types::MaterializedTrackedStateRow {
+                    row_pk: fixture.row_pk.clone(),
+                    schema_key: fixture.schema_key.clone(),
+                    file_id: fixture.file_id.clone(),
+                    snapshot_content: Some(r#"{"value":"before-delete"}"#.into()),
+                    decoded_snapshot: None,
+                    metadata: None,
+                    deleted: false,
+                    created_at: fixture.created_at.to_string(),
+                    updated_at: fixture.created_at.to_string(),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    change_id: ChangeId::for_test_label(&format!(
+                        "duplicate-selected-tombstone-parent-{ordinal}"
+                    )),
+                    commit_id: parent_commit,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut parent_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("parent root read should open");
+        let mut parent_writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut parent_read,
+            &mut parent_writes,
+            &tracked_state,
+            "duplicate-selected-tombstone-parent",
+            None,
+            &parent_rows,
+        )
+        .await
+        .expect("live parent root should stage");
+        drop(parent_read);
+        storage
+            .commit_write_set(parent_writes, StorageWriteOptions::default())
+            .await
+            .expect("live parent root should commit");
+
         let mut deltas = commit_delta_refs(commit_id, &fixtures);
         for delta in &mut deltas {
             delta.authored = false;
+            delta.delta.author_id = crate::SYSTEM_ACCOUNT_ID;
         }
         let mut writes = storage.new_write_set();
-        stage_commit_deltas(&mut writes, &deltas).expect("selected tombstones should stage");
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[false, false])
+            .expect("selected tombstones should stage");
+
+        let leaf = {
+            let mut entries = fixtures
+                .iter()
+                .map(|fixture| EncodedLeafEntry {
+                    key: encode_key_ref(TrackedStateKeyRef {
+                        schema_key: &fixture.schema_key,
+                        file_id: fixture.file_id.as_deref(),
+                        row_pk: &fixture.row_pk,
+                    })
+                    .into(),
+                    value: encode_value_ref(TrackedStateIndexValueRef {
+                        change_id: fixture.change_id,
+                        commit_id,
+                        author_id: crate::SYSTEM_ACCOUNT_ID,
+                        deleted: true,
+                        created_at: fixture.created_at,
+                        updated_at: fixture.updated_at,
+                    })
+                    .into(),
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.key.cmp(&right.key));
+            crate::tracked_state::codec::encode_leaf_node(&entries)
+        };
+        let root_id = TrackedStateRootId::new(hash_bytes(&leaf));
+        writes.put(
+            super::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key(root_id.as_bytes().to_vec()),
+            value(leaf),
+        );
+        let mut manifest = fixture_commit_state_manifest(
+            commit_id,
+            staged.mutation_inventory().clone(),
+        );
+        manifest.change_account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        manifest.replay_debt = CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
+            commit_id,
+            root_id: root_id.clone(),
+            parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
+                commit_id: parent_commit,
+                root_id: root_id.clone(),
+            }],
+            changed_key_count: u64::try_from(fixtures.len()).expect("small test row count"),
+            row_count_estimate: u64::try_from(fixtures.len()).expect("small test row count"),
+            tree_height: 1,
+            complete_state_fence: true,
+        }));
+        let checkpoint_record = CommitRecord {
+            is_checkpoint: true,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 3,
+            base_commit_id: None,
+            commit_id,
+            generation: 1,
+            parent_commit_ids: vec![parent_commit],
+            first_parent_jump_commit_id: parent_commit,
+            first_parent_jump_span: 1,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: fixtures[0].updated_at,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint changelog read should open");
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: vec![checkpoint_record],
+                changes: Vec::new(),
+            },
+        )
+        .await
+        .expect("checkpoint commit should stage through the changelog writer");
+        drop(writer);
+        drop(read);
+        stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("selected tombstone fence authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -22192,15 +24383,1445 @@ mod tests {
                 .len(),
             2
         );
-        assert!(
-            scan_change_records_from_commit_deltas(&read)
-                .await
-                .expect("selected tombstones should not conflict with public authority")
-                .is_empty()
-        );
+        let replayed = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("explicit selected tombstone authors should remain readable");
+        assert_eq!(replayed.len(), 2);
+        assert!(replayed
+            .iter()
+            .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID));
+        assert!(scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("selected tombstones should not conflict with public authority")
+            .iter()
+            .all(|change| change.change_id != fixtures[0].change_id));
         scan_commit_delta_inventory(&read)
             .await
             .expect("selected tombstones should be valid inventory members");
+        drop(read);
+
+        // A complete-state fence can retain exact, explicitly-authored
+        // selected tombstones without a canonical ChangeRecord. Keep the
+        // duplicated ChangeId here: resolving these rows through a map keyed
+        // by ChangeId would collapse two distinct logical members.
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fenced history read should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            commit_id,
+            &[fixtures[0].schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("identity-only selected tombstones should hydrate from the fence");
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.key.row_pk.clone())
+                .collect::<BTreeSet<_>>(),
+            fixtures
+                .iter()
+                .map(|fixture| fixture.row_pk.clone())
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(members.iter().all(|member| {
+            member.value.author_id == crate::SYSTEM_ACCOUNT_ID
+                && member.change.account_id == crate::SYSTEM_ACCOUNT_ID
+                && member.change.snapshot.is_none()
+        }));
+
+        // A rebuildable standalone projection with the same ID but unrelated
+        // identity must not displace either explicit selected tombstone.
+        let stale_projection = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: fixtures[0].change_id,
+            account_id: "stale-projection-account".to_owned(),
+            schema_key: "stale_projection_schema".to_owned(),
+            row_pk: RowPk::single("stale-projection-row"),
+            file_id: None,
+            snapshot: None,
+            metadata: None,
+            created_at: fixtures[0].updated_at,
+            origin_key: None,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale projection read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale_projection],
+            },
+        )
+        .await
+        .expect("stale standalone projection should stage");
+        drop(writer);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("stale standalone projection should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("history read with stale projection should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            commit_id,
+            &[fixtures[0].schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("stale standalone projection must not displace exact selected identity");
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| {
+            member.value.author_id == crate::SYSTEM_ACCOUNT_ID
+                && member.change.account_id == crate::SYSTEM_ACCOUNT_ID
+                && member.change.snapshot.is_none()
+        }));
+        let replay = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("stale standalone projection must not displace point replay identity");
+        assert_eq!(replay.len(), 2);
+        assert!(replay
+            .iter()
+            .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID));
+    }
+
+    #[tokio::test]
+    async fn rootless_v82_selected_tombstone_uses_and_retains_source_authority() {
+        const CHECKPOINT_ACCOUNT: &str = "checkpoint-account";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let source_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_0000_0000_0641,
+        ));
+        let checkpoint_commit = CommitId::for_test_label("rootless-v82-selected-tombstone");
+        let mut fixture = packed_commit_delta_fixtures().remove(1);
+        fixture.schema_key = "test_schema".to_owned();
+        fixture.row_pk = RowPk::single("rootless-v82-selected-row");
+        fixture.deleted = true;
+
+        let mut source_deltas = commit_delta_refs(source_commit, std::slice::from_ref(&fixture));
+        source_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        let mut writes = storage.new_write_set();
+        let source_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &source_deltas, &[true])
+                .expect("authored source tombstone should stage");
+        let change_id = source_stage.assigned_change_ids[0];
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source_commit,
+            source_stage.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("source author should remain in physical authority");
+
+        let selected_delta = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                row_pk: &fixture.row_pk,
+                change_id,
+                commit_id: checkpoint_commit,
+                author_id: CHECKPOINT_ACCOUNT,
+                deleted: true,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            },
+            metadata: None,
+            snapshot: None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: false,
+        };
+        let selected_stage = super::stage_addressable_commit_deltas(
+            &mut writes,
+            &[selected_delta],
+            &[false],
+        )
+        .expect("finite selected tombstone should stage");
+
+        // Convert only the selected checkpoint leaf to the old v82 layout.
+        // The source owner remains current-format and preserves SYSTEM.
+        let mut selected_inventory = selected_stage.mutation_inventory().clone();
+        let (_, sidecar) =
+            super::split_commit_delta_segment(&selected_inventory.inline_part)
+                .expect("selected segment should have a payload sidecar");
+        let (leaf, _) =
+            decode_commit_delta_with_payloads(&selected_inventory.inline_part, None)
+                .expect("selected row should decode before legacy conversion");
+        let entry = leaf.entry(0).expect("one selected row");
+        let value = decode_value(entry.value).expect("selected value should decode");
+        let author_suffix_len = 2 + value.author_id.len();
+        let value_end = entry.value.len() - author_suffix_len;
+        assert!(entry.key.len() < 128, "test key fits one-byte varint");
+        let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(entry.key.len()).unwrap()];
+        legacy_leaf.extend_from_slice(entry.key);
+        legacy_leaf.extend_from_slice(&entry.value[..16]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[16..32]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[32..value_end]);
+        let mut legacy_segment = Vec::with_capacity(
+            COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + legacy_leaf.len() + sidecar.len(),
+        );
+        legacy_segment.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+        legacy_segment.extend_from_slice(
+            &u32::try_from(legacy_leaf.len())
+                .expect("legacy leaf fits u32")
+                .to_be_bytes(),
+        );
+        legacy_segment.extend_from_slice(&legacy_leaf);
+        legacy_segment.extend_from_slice(sidecar);
+        selected_inventory.inline_part = legacy_segment;
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            checkpoint_commit,
+            &selected_inventory,
+            CHECKPOINT_ACCOUNT,
+        )
+        .expect("rootless checkpoint should stage without a complete-state fence");
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected checkpoint and physical source should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless selected read should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_commit,
+            &[fixture.schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("history should resolve the retained v82 tombstone source");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(members[0].change.account_id, crate::SYSTEM_ACCOUNT_ID);
+
+        let replay = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+            .await
+            .expect("point replay should resolve the retained v82 tombstone source");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            replay.iter().next().unwrap().value().author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+
+        assert_eq!(
+            super::load_local_selected_change_owner_commit_ids(&read, checkpoint_commit)
+                .await
+                .expect("GC should discover the author source dependency"),
+            BTreeSet::from([source_commit]),
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_v83_selected_tombstone_rejects_author_disagreeing_with_source() {
+        const CHECKPOINT_ACCOUNT: &str = "checkpoint-account";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let source_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_0000_0000_0642,
+        ));
+        let checkpoint_commit = CommitId::for_test_label("rootless-v83-selected-tombstone");
+        let mut fixture = packed_commit_delta_fixtures().remove(1);
+        fixture.schema_key = "test_schema".to_owned();
+        fixture.row_pk = RowPk::single("rootless-v83-selected-row");
+        fixture.deleted = true;
+
+        let mut source_deltas = commit_delta_refs(source_commit, std::slice::from_ref(&fixture));
+        source_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        let mut writes = storage.new_write_set();
+        let source_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &source_deltas, &[true])
+                .expect("authored source tombstone should stage");
+        let change_id = source_stage.assigned_change_ids[0];
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source_commit,
+            source_stage.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("source author should remain in physical authority");
+
+        let selected_delta = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                row_pk: &fixture.row_pk,
+                change_id,
+                commit_id: checkpoint_commit,
+                author_id: CHECKPOINT_ACCOUNT,
+                deleted: true,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            },
+            metadata: None,
+            snapshot: None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: false,
+        };
+        let selected_stage = super::stage_addressable_commit_deltas(
+            &mut writes,
+            &[selected_delta],
+            &[false],
+        )
+        .expect("explicit-author selected tombstone should stage");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            checkpoint_commit,
+            selected_stage.mutation_inventory(),
+            CHECKPOINT_ACCOUNT,
+        )
+        .expect("rootless checkpoint should stage without a complete-state fence");
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected checkpoint and physical source should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless selected read should open");
+
+        let history_error = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_commit,
+            &[fixture.schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect_err("history must reject an explicit author that conflicts with its source");
+        assert!(history_error.message.contains(
+            "selected tombstone author disagrees with canonical author authority"
+        ));
+
+        let replay_error = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+            .await
+            .expect_err("point replay must validate explicit selected tombstone authors");
+        assert!(replay_error.message.contains(
+            "selected tombstone author disagrees with canonical author authority"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rootless_v83_identity_only_tombstone_ignores_stale_standalone_projections() {
+        const CHECKPOINT_ACCOUNT: &str = "checkpoint-account";
+        const TOMBSTONE_AUTHOR: &str = "identity-only-author";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let checkpoint_commit = CommitId::for_test_label("rootless-v83-identity-only-stale-projection");
+        let mut fixture = packed_commit_delta_fixtures().remove(1);
+        fixture.schema_key = "test_schema".to_owned();
+        fixture.row_pk = RowPk::single("rootless-v83-identity-only-row");
+        fixture.deleted = true;
+        fixture.change_id = ChangeId::for_test_label("rootless-v83-identity-only-change");
+
+        let mut account_only_fixture = fixture.clone();
+        account_only_fixture.row_pk = RowPk::single("rootless-v83-account-only-stale-row");
+        account_only_fixture.change_id =
+            ChangeId::for_test_label("rootless-v83-account-only-stale-change");
+        let fixtures = [fixture, account_only_fixture];
+        let mut selected_deltas = commit_delta_refs(checkpoint_commit, &fixtures);
+        for delta in &mut selected_deltas {
+            delta.authored = false;
+            delta.delta.author_id = TOMBSTONE_AUTHOR;
+        }
+        let mut writes = storage.new_write_set();
+        let selected_stage = super::stage_addressable_commit_deltas(
+            &mut writes,
+            &selected_deltas,
+            &[false, false],
+        )
+        .expect("identity-only selected tombstones should stage");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            checkpoint_commit,
+            selected_stage.mutation_inventory(),
+            CHECKPOINT_ACCOUNT,
+        )
+        .expect("rootless checkpoint should stage without a complete-state fence");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("rootless checkpoint should commit");
+
+        // This same-ID standalone row is stale and has neither the selected
+        // tombstone's identity nor its author. Since it has no physical owner,
+        // it cannot override the explicit v83 identity suffix. The second row
+        // matches identity and lifetime but has a stale account, exercising
+        // the account-only collision as well.
+        let stale_projection = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: fixtures[0].change_id,
+            account_id: "stale-projection-account".to_owned(),
+            schema_key: "stale_projection_schema".to_owned(),
+            row_pk: RowPk::single("stale-projection-row"),
+            file_id: None,
+            snapshot: None,
+            metadata: None,
+            created_at: fixtures[0].updated_at,
+            origin_key: None,
+        };
+        let account_only_stale_projection = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: fixtures[1].change_id,
+            account_id: "stale-projection-account".to_owned(),
+            schema_key: fixtures[1].schema_key.clone(),
+            row_pk: fixtures[1].row_pk.clone(),
+            file_id: fixtures[1].file_id.clone(),
+            snapshot: None,
+            metadata: None,
+            created_at: fixtures[1].updated_at,
+            origin_key: None,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale projection read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale_projection, account_only_stale_projection],
+            },
+        )
+        .await
+        .expect("stale standalone projection should stage");
+        drop(writer);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("stale standalone projection should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless selected read should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_commit,
+            &[fixtures[0].schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("history should preserve explicit identity without canonical source");
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| {
+            member.value.author_id == TOMBSTONE_AUTHOR
+                && member.change.account_id == TOMBSTONE_AUTHOR
+        }));
+
+        let replay = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+            .await
+            .expect("point replay should preserve explicit identity without canonical source");
+        assert_eq!(replay.len(), 2);
+        assert!(replay
+            .iter()
+            .all(|row| row.value().author_id == TOMBSTONE_AUTHOR));
+
+        assert!(super::load_local_selected_change_owner_commit_ids(&read, checkpoint_commit)
+            .await
+            .expect("GC should ignore the stale nonphysical projection")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_state_file_cascade_masks_exact_v82_selected_tombstone_from_marker_author() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-00000000063a";
+        const CHECKPOINT_ACCOUNT: &str = "checkpoint-account";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let source_commit = CommitId::for_test_label("v82-selected-cascade-source");
+        let checkpoint_commit = CommitId::for_test_label("v82-selected-cascade-checkpoint");
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(42);
+        let marker_key = super::cascade_payload_key(FILE_ID);
+        let marker_fixture = CommitDeltaFixture {
+            schema_key: marker_key.schema_key.clone(),
+            file_id: marker_key.file_id.clone(),
+            row_pk: marker_key.row_pk.clone(),
+            change_id: ChangeId::for_test_label("v82-selected-cascade-change"),
+            deleted: true,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut source_deltas =
+            commit_delta_refs(source_commit, std::slice::from_ref(&marker_fixture));
+        source_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+
+        let semantic_key = TrackedStateKey {
+            schema_key: "test_schema".to_owned(),
+            file_id: Some(FILE_ID.to_owned()),
+            row_pk: RowPk::single("v82-selected-cascade-row"),
+        };
+        let selected_delta = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &semantic_key.schema_key,
+                file_id: semantic_key.file_id.as_deref(),
+                row_pk: &semantic_key.row_pk,
+                change_id: marker_fixture.change_id,
+                commit_id: checkpoint_commit,
+                author_id: CHECKPOINT_ACCOUNT,
+                deleted: true,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            metadata: None,
+            snapshot: None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: false,
+        };
+
+        let mut writes = storage.new_write_set();
+        let source_stage = super::stage_commit_deltas_for_commit_state(&mut writes, &source_deltas)
+            .expect("SYSTEM descriptor marker should stage");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source_commit,
+            source_stage.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("SYSTEM source authority should stage");
+
+        let checkpoint_stage = super::stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &[selected_delta],
+            &[false],
+            source_commit,
+        )
+        .expect("selected tombstone should stage");
+        let mut checkpoint_inventory = checkpoint_stage.mutation_inventory().clone();
+        let (_, sidecar) = super::split_commit_delta_segment(&checkpoint_inventory.inline_part)
+            .expect("selected checkpoint segment should split");
+        let (leaf, _) =
+            decode_commit_delta_with_payloads(&checkpoint_inventory.inline_part, None)
+                .expect("selected checkpoint row should decode before legacy conversion");
+        let entry = leaf.entry(0).expect("one selected tombstone row");
+        let value = decode_value(entry.value).expect("selected tombstone value should decode");
+        assert_eq!(value.author_id, CHECKPOINT_ACCOUNT);
+        let author_suffix_len = 2 + value.author_id.len();
+        let legacy_value_end = entry.value.len() - author_suffix_len;
+        assert!(entry.key.len() < 128, "test key fits one-byte varint");
+        let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(entry.key.len()).unwrap()];
+        legacy_leaf.extend_from_slice(entry.key);
+        legacy_leaf.extend_from_slice(&entry.value[..16]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[16..32]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&entry.value[32..legacy_value_end]);
+        let mut legacy_segment = Vec::with_capacity(
+            COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + legacy_leaf.len() + sidecar.len(),
+        );
+        legacy_segment.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+        legacy_segment.extend_from_slice(
+            &u32::try_from(legacy_leaf.len())
+                .expect("legacy selected leaf fits u32")
+                .to_be_bytes(),
+        );
+        legacy_segment.extend_from_slice(&legacy_leaf);
+        legacy_segment.extend_from_slice(sidecar);
+        checkpoint_inventory.inline_part = legacy_segment;
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            checkpoint_commit,
+            &checkpoint_inventory,
+            CHECKPOINT_ACCOUNT,
+        )
+        .expect("checkpoint authority should stage");
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("v82 marker and selected checkpoint should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("v82 cascade read should open");
+        let mut owners = super::load_owned_commit_delta_entries(
+            &read,
+            &[(checkpoint_commit, semantic_key.clone())],
+        )
+        .await
+        .expect("selected tombstone owner should load");
+        let owner = owners
+            .pop()
+            .flatten()
+            .expect("selected tombstone should have an exact physical owner");
+        assert!(owner.selected_tombstone);
+        assert!(!owner.author_present, "fixture should exercise v82 author absence");
+        assert_eq!(owner.value.author_id, CHECKPOINT_ACCOUNT);
+
+        let rows = vec![(semantic_key, owner.value.clone(), owner.author_present)];
+        let masked = super::complete_state_file_cascade_mask(&read, &rows, &[Some(owner)])
+            .await
+            .expect("the matching descriptor marker should prove this derived row");
+        assert_eq!(masked, vec![true]);
+
+        let mut authors = vec![None];
+        super::resolve_complete_state_deleted_authors(&read, &rows, &mut authors)
+            .await
+            .expect("the descriptor marker should restore the v82 source author");
+        assert_eq!(authors, vec![Some(crate::SYSTEM_ACCOUNT_ID.to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn complete_state_legacy_tombstones_restore_authors_from_validated_cascade_markers() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000628";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("complete-state-cascade-markers");
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(42);
+        let file_marker_key = super::cascade_payload_key(FILE_ID);
+        let collection_marker_key = super::collection_cascade_payload_key(
+            "test_schema",
+            Some(FILE_ID),
+        );
+        let fixtures = vec![
+            CommitDeltaFixture {
+                schema_key: file_marker_key.schema_key.clone(),
+                file_id: file_marker_key.file_id.clone(),
+                row_pk: file_marker_key.row_pk.clone(),
+                change_id: ChangeId::for_test_label("complete-state-file-marker"),
+                deleted: true,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            CommitDeltaFixture {
+                schema_key: collection_marker_key.schema_key.clone(),
+                file_id: collection_marker_key.file_id.clone(),
+                row_pk: collection_marker_key.row_pk.clone(),
+                change_id: ChangeId::for_test_label("complete-state-collection-marker"),
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+        ];
+        let mut deltas = commit_delta_refs(commit_id, &fixtures);
+        for delta in &mut deltas {
+            delta.delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        }
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_commit_deltas_for_commit_state(&mut writes, &deltas)
+            .expect("physical cascade markers should stage");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            commit_id,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("SYSTEM marker authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("cascade markers should commit");
+
+        let file_value = TrackedStateIndexValue {
+            change_id: fixtures[0].change_id,
+            commit_id,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            deleted: true,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(7),
+            updated_at: timestamp,
+        };
+        let collection_value = TrackedStateIndexValue {
+            change_id: fixtures[1].change_id,
+            ..file_value.clone()
+        };
+        let rows = vec![
+            (
+                TrackedStateKey {
+                    schema_key: "test_schema".to_owned(),
+                    file_id: Some(FILE_ID.to_owned()),
+                    row_pk: RowPk::single("file-cascaded-row"),
+                },
+                file_value,
+                false,
+            ),
+            (
+                TrackedStateKey {
+                    schema_key: "test_schema".to_owned(),
+                    file_id: Some(FILE_ID.to_owned()),
+                    row_pk: RowPk::single("collection-cascaded-row"),
+                },
+                collection_value,
+                false,
+            ),
+        ];
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("marker authority read should open");
+        let mut authors = vec![None; rows.len()];
+        super::resolve_complete_state_deleted_authors(&read, &rows, &mut authors)
+            .await
+            .expect("legacy cascade rows should resolve through their physical markers");
+        assert_eq!(
+            authors,
+            vec![
+                Some(crate::SYSTEM_ACCOUNT_ID.to_owned()),
+                Some(crate::SYSTEM_ACCOUNT_ID.to_owned()),
+            ]
+        );
+
+        let mut malformed_rows = rows.clone();
+        malformed_rows[1].1.updated_at = LixTimestamp::from_unix_millis_utc_lossy(43);
+        let error = super::resolve_complete_state_deleted_authors(
+            &read,
+            &malformed_rows,
+            &mut vec![None; malformed_rows.len()],
+        )
+        .await
+        .expect_err("a matching marker with a different lifetime must be rejected");
+        assert!(error.message.contains("physical marker identity or time"));
+    }
+
+    #[tokio::test]
+    async fn complete_state_v82_selected_tombstone_uses_retained_source_author() {
+        const CHECKPOINT_ACCOUNT: &str = "checkpoint-account";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let parent_commit = CommitId::for_test_label("v82-direct-selected-parent");
+        let source_commit = CommitId::for_test_label("v82-direct-selected-source");
+        let checkpoint_commit = CommitId::for_test_label("v82-direct-selected-checkpoint");
+        let mut fixture = packed_commit_delta_fixtures().remove(1);
+        fixture.schema_key = "test_schema".to_owned();
+        fixture.row_pk = RowPk::single("v82-direct-selected-row");
+        fixture.change_id = ChangeId::for_test_label("v82-direct-selected-change");
+        fixture.deleted = true;
+        let timestamp = fixture.updated_at;
+        let semantic_key = fixture.key();
+
+        let parent_row = crate::tracked_state::types::MaterializedTrackedStateRow {
+            row_pk: semantic_key.row_pk.clone(),
+            schema_key: semantic_key.schema_key.clone(),
+            file_id: semantic_key.file_id.clone(),
+            snapshot_content: Some(r#"{"value":"before-delete"}"#.into()),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: fixture.created_at.to_string(),
+            updated_at: fixture.created_at.to_string(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label("v82-direct-selected-parent-change"),
+            commit_id: parent_commit,
+        };
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let mut read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut parent_writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut parent_writes,
+            &tracked_state,
+            "v82-direct-selected-parent",
+            None,
+            &[parent_row],
+        )
+        .await
+        .expect("parent live root should stage");
+        drop(read);
+        storage
+            .commit_write_set(parent_writes, StorageWriteOptions::default())
+            .await
+            .expect("parent live root should commit");
+
+        let mut source_deltas = commit_delta_refs(source_commit, std::slice::from_ref(&fixture));
+        source_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+        let mut writes = storage.new_write_set();
+        let source = super::stage_addressable_commit_deltas(&mut writes, &source_deltas, &[true])
+            .expect("authored source tombstone should stage");
+        let source_change_id = source.assigned_change_ids[0];
+        drop(source_deltas);
+        fixture.change_id = source_change_id;
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            source_commit,
+            source.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("source manifest should retain its SYSTEM author");
+
+        let selected = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &semantic_key.schema_key,
+                file_id: semantic_key.file_id.as_deref(),
+                row_pk: &semantic_key.row_pk,
+                change_id: fixture.change_id,
+                commit_id: checkpoint_commit,
+                author_id: CHECKPOINT_ACCOUNT,
+                deleted: true,
+                created_at: fixture.created_at,
+                updated_at: timestamp,
+            },
+            metadata: None,
+            snapshot: None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: false,
+        };
+        let selected_stage = super::stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &[selected],
+            &[false],
+            source_commit,
+        )
+        .expect("checkpoint should retain a selected tombstone");
+
+        // Model a migrated v82 complete-state root whose leaf never encoded
+        // an author. Its local selected delta still carries the checkpoint
+        // account, while the direct source owner carries SYSTEM.
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &semantic_key.schema_key,
+            file_id: semantic_key.file_id.as_deref(),
+            row_pk: &semantic_key.row_pk,
+        });
+        assert!(encoded_key.len() < 128);
+        let encoded_value = encode_value_ref(TrackedStateIndexValueRef {
+            change_id: fixture.change_id,
+            commit_id: checkpoint_commit,
+            author_id: CHECKPOINT_ACCOUNT,
+            deleted: true,
+            created_at: fixture.created_at,
+            updated_at: timestamp,
+        });
+        let author_suffix_len = 2 + CHECKPOINT_ACCOUNT.len();
+        let value_end = encoded_value.len() - author_suffix_len;
+        let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(encoded_key.len()).unwrap()];
+        legacy_leaf.extend_from_slice(&encoded_key);
+        legacy_leaf.extend_from_slice(&encoded_value[..16]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&encoded_value[16..32]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&encoded_value[32..value_end]);
+        let root_id = TrackedStateRootId::new(hash_bytes(&legacy_leaf));
+        writes.put(
+            super::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key(root_id.as_bytes().to_vec()),
+            value(legacy_leaf),
+        );
+        let mut manifest = fixture_commit_state_manifest(
+            checkpoint_commit,
+            selected_stage.mutation_inventory().clone(),
+        );
+        manifest.change_account_id = CHECKPOINT_ACCOUNT.to_owned();
+        manifest.replay_debt = CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
+            commit_id: checkpoint_commit,
+            root_id: root_id.clone(),
+            parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
+                commit_id: source_commit,
+                root_id,
+            }],
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            complete_state_fence: true,
+        }));
+        let checkpoint_record = CommitRecord {
+            is_checkpoint: true,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            format_version: 3,
+            base_commit_id: None,
+            commit_id: checkpoint_commit,
+            generation: 1,
+            parent_commit_ids: vec![parent_commit],
+            first_parent_jump_commit_id: parent_commit,
+            first_parent_jump_span: 1,
+            account_id: CHECKPOINT_ACCOUNT.to_owned(),
+            created_at: timestamp,
+        };
+        let mut read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: vec![checkpoint_record],
+                changes: Vec::new(),
+            },
+        )
+        .await
+        .expect("checkpoint record should stage through the changelog writer");
+        drop(writer);
+        drop(read);
+        stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("v82 selected checkpoint root should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected source and v82 root should publish");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("v82 complete-state root should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_commit,
+            &[semantic_key.schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("complete-state history should resolve selected tombstone authority");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(members[0].change.account_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(
+            super::load_local_selected_change_owner_commit_ids(&read, checkpoint_commit)
+                .await
+                .expect("GC should retain the canonical source for an author-absent root row"),
+            BTreeSet::from([source_commit]),
+        );
+
+        let mut reader = crate::tracked_state::TrackedStateContext::new().reader(&read);
+        let rows = reader
+            .scan_batch_at_commit(
+                &checkpoint_commit.to_string(),
+                &crate::tracked_state::types::TrackedStateScanRequest {
+                    filter: crate::tracked_state::types::TrackedStateFilter {
+                        schema_keys: vec![semantic_key.schema_key],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("v82 point/scan root repair should resolve selected author")
+            .into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author_id, crate::SYSTEM_ACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn complete_state_history_members_omit_derived_file_cascade_tombstones() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000629";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let mut descriptor = crate::tracked_state::types::MaterializedTrackedStateRow {
+            row_pk: RowPk::uuid_from_canonical(FILE_ID).expect("canonical file ID"),
+            schema_key: "lix_file_descriptor".to_owned(),
+            file_id: Some(FILE_ID.to_owned()),
+            snapshot_content: Some(r#"{"value":"file"}"#.into()),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label("cascade-member-base-descriptor"),
+            commit_id: CommitId::for_test_label("cascade-member-base"),
+        };
+        let semantic = crate::tracked_state::types::MaterializedTrackedStateRow {
+            row_pk: RowPk::single("cascade-member-row"),
+            schema_key: "test_schema".to_owned(),
+            file_id: Some(FILE_ID.to_owned()),
+            snapshot_content: Some(r#"{"value":"live"}"#.into()),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label("cascade-member-base-row"),
+            commit_id: CommitId::for_test_label("cascade-member-base"),
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("base read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "cascade-member-base",
+            None,
+            &[descriptor.clone(), semantic.clone()],
+        )
+        .await
+        .expect("base root should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("base root should commit");
+
+        descriptor.snapshot_content = None;
+        descriptor.deleted = true;
+        descriptor.change_id = ChangeId::for_test_label("cascade-member-delete-descriptor");
+        descriptor.commit_id = CommitId::for_test_label("cascade-member-child");
+        descriptor.updated_at = "2026-01-02T00:00:00Z".to_owned();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "cascade-member-child",
+            Some("cascade-member-base"),
+            &[descriptor],
+        )
+        .await
+        .expect("file-deleting child root should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("file-deleting child root should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence manifest read should open");
+        let child_id = CommitId::for_test_label("cascade-member-child");
+        let mut manifest = load_commit_state_manifest(&read, child_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        let root = manifest
+            .snapshot_root
+            .as_mut()
+            .expect("child root should exist");
+        // A fence's physical source has the same tree root. Its logical
+        // parent remains the prior checkpoint, whose tree is diffed below.
+        root.parent_roots[0].root_id = root.root_id.clone();
+        root.complete_state_fence = true;
+        let mut writes = storage.new_write_set();
+        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("complete-state fence should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("complete-state fence should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("history member read should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            child_id,
+            &["lix_file_descriptor".to_owned(), "test_schema".to_owned()],
+            &[],
+        )
+        .await
+        .expect("complete-state history should resolve file cascade membership");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].key.schema_key, "lix_file_descriptor");
+        assert_eq!(members[0].key.file_id.as_deref(), Some(FILE_ID));
+        assert!(members[0].value.deleted);
+    }
+
+    #[tokio::test]
+    async fn complete_state_history_members_reject_physical_owner_lifetime_mismatch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let base = crate::tracked_state::types::MaterializedTrackedStateRow {
+            row_pk: RowPk::single("checkpoint-lifetime-row"),
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"value":"live"}"#.into()),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label("checkpoint-lifetime-base-row"),
+            commit_id: CommitId::for_test_label("checkpoint-lifetime-base"),
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("base read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "checkpoint-lifetime-base",
+            None,
+            &[base.clone()],
+        )
+        .await
+        .expect("base root should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("base root should commit");
+
+        let mut deleted = base.clone();
+        deleted.snapshot_content = None;
+        deleted.deleted = true;
+        deleted.change_id = ChangeId::for_test_label("checkpoint-lifetime-delete");
+        deleted.commit_id = CommitId::for_test_label("checkpoint-lifetime-child");
+        deleted.updated_at = "2026-01-02T00:00:00Z".to_owned();
+        let child_id = deleted.commit_id;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "checkpoint-lifetime-child",
+            Some("checkpoint-lifetime-base"),
+            &[deleted.clone()],
+        )
+        .await
+        .expect("child root should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("child root should commit");
+
+        // Corrupt only the complete-state root's tombstone lifetime. The
+        // authenticated physical delta and canonical ChangeRecord retain the
+        // child's original timestamp, so member hydration must reject this
+        // root instead of accepting it by matching only the change id.
+        let stale_updated_at = LixTimestamp::expect_parse(
+            "updated_at",
+            "2026-01-03T00:00:00Z",
+        );
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &deleted.schema_key,
+            file_id: deleted.file_id.as_deref(),
+            row_pk: &deleted.row_pk,
+        });
+        let mut encoded_value = encode_value_ref(TrackedStateIndexValueRef {
+            change_id: deleted.change_id,
+            commit_id: child_id,
+            author_id: &deleted.author_id,
+            deleted: true,
+            created_at: LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: stale_updated_at,
+        });
+        // Leave the legacy author absent so this fixture reaches the
+        // lifetime check rather than failing an unrelated explicit-author
+        // comparison first.
+        encoded_value.truncate(encoded_value.len() - 2 - deleted.author_id.len());
+        let leaf = crate::tracked_state::codec::encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(encoded_key),
+            value: Bytes::from(encoded_value),
+        }]);
+        let stale_root_id = TrackedStateRootId::new(hash_bytes(&leaf));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence manifest read should open");
+        let mut manifest = load_commit_state_manifest(&read, child_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        let root = manifest
+            .snapshot_root
+            .as_mut()
+            .expect("child root should exist");
+        root.root_id = stale_root_id.clone();
+        root.row_count_estimate = 1;
+        // The fence's physical source has the same tree root, while its
+        // logical parent still supplies the earlier tree for the diff.
+        root.parent_roots[0].root_id = stale_root_id.clone();
+        root.complete_state_fence = true;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key(stale_root_id.as_bytes().to_vec()),
+            value(leaf),
+        );
+        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("stale complete-state root should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("stale complete-state root should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("history member read should open");
+        let error = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            child_id,
+            &["test_schema".to_owned()],
+            &[],
+        )
+        .await
+        .expect_err("checkpoint member timestamp must match its physical owner");
+        assert!(error.message.contains("identity or lifetime"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn standalone_complete_state_legacy_author_uses_physical_change_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let owner_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_0000_0000_063b,
+        ));
+        let checkpoint_commit = CommitId::for_test_label("standalone-v82-author-checkpoint");
+        let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        let mut deltas = commit_delta_refs(owner_commit, std::slice::from_ref(&fixture));
+        deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
+
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[true])
+            .expect("authored SYSTEM row should stage");
+        let change_id = staged.assigned_change_ids[0];
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            owner_commit,
+            staged.mutation_inventory(),
+            crate::SYSTEM_ACCOUNT_ID,
+        )
+        .expect("physical SYSTEM authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("physical owner should commit");
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("physical owner read should open");
+        let mut stale = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(owner_commit, fixture.key())],
+        )
+        .await
+        .expect("physical change should load")
+        .remove(0)
+        .expect("physical change should exist");
+        assert_eq!(stale.account_id, crate::SYSTEM_ACCOUNT_ID);
+        stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        stale.snapshot = Some(b"stale standalone projection".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .expect("stale standalone projection should stage");
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("stale standalone projection should commit");
+
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &fixture.schema_key,
+            file_id: fixture.file_id.as_deref(),
+            row_pk: &fixture.row_pk,
+        });
+        let encoded_value = encode_value_ref(TrackedStateIndexValueRef {
+            change_id,
+            commit_id: checkpoint_commit,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
+            deleted: false,
+            created_at: fixture.created_at,
+            updated_at: fixture.updated_at,
+        });
+        let decoded_value = decode_value(&encoded_value).expect("v83 fixture value should decode");
+        let author_suffix_len = 2 + decoded_value.author_id.len();
+        let legacy_value_end = encoded_value.len() - author_suffix_len;
+        let encoded_value = Bytes::copy_from_slice(&encoded_value[..legacy_value_end]);
+        let leaf = crate::tracked_state::codec::encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(encoded_key),
+            value: encoded_value,
+        }]);
+        let root_id = TrackedStateRootId::new(hash_bytes(&leaf));
+        let mut manifest = fixture_commit_state_manifest(
+            checkpoint_commit,
+            CommitStateMutationInventory::default(),
+        );
+        manifest.replay_debt = CommitStateReplayDebt::default();
+        manifest.snapshot_root = Some(Box::new(
+            crate::tracked_state::types::TrackedStateCommitRoot {
+                commit_id: checkpoint_commit,
+                root_id: root_id.clone(),
+                parent_roots: Vec::new(),
+                changed_key_count: 1,
+                row_count_estimate: 1,
+                tree_height: 1,
+                complete_state_fence: true,
+            },
+        ));
+        let mut writes = storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key(root_id.as_bytes().to_vec()),
+            value(leaf),
+        );
+        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("standalone v82 checkpoint should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("standalone v82 checkpoint should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint history read should open");
+        let members = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_commit,
+            &[fixture.schema_key.clone()],
+            &[],
+        )
+        .await
+        .expect("standalone checkpoint should resolve its v82 author physically");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(members[0].change.account_id, crate::SYSTEM_ACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn standalone_complete_state_members_reject_canonical_lifetime_mismatch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let row = crate::tracked_state::types::MaterializedTrackedStateRow {
+            row_pk: RowPk::single("standalone-lifetime-row"),
+            schema_key: "test_schema".to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"value":"live"}"#.into()),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-02T00:00:00Z".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label("standalone-lifetime-change"),
+            commit_id: CommitId::for_test_label("standalone-lifetime-checkpoint"),
+        };
+        let checkpoint_id = row.commit_id;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "standalone-lifetime-checkpoint",
+            None,
+            &[row.clone()],
+        )
+        .await
+        .expect("standalone checkpoint should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("standalone checkpoint should commit");
+
+        // Make the complete-state tree refer to a missing physical source and
+        // a different lifetime while leaving the standalone canonical change
+        // record intact. This exercises the fallback path where no physical
+        // owner can attest the row.
+        let stale_value = TrackedStateIndexValueRef {
+            change_id: row.change_id,
+            commit_id: CommitId::for_test_label("missing-standalone-lifetime-owner"),
+            author_id: &row.author_id,
+            deleted: false,
+            created_at: LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-01-03T00:00:00Z",
+            ),
+        };
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            row_pk: &row.row_pk,
+        });
+        let encoded_value = encode_value_ref(stale_value);
+        let leaf = crate::tracked_state::codec::encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from(encoded_key),
+            value: Bytes::from(encoded_value),
+        }]);
+        let stale_root_id = TrackedStateRootId::new(hash_bytes(&leaf));
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("checkpoint manifest read should open");
+        let mut manifest = load_commit_state_manifest(&read, checkpoint_id)
+            .await
+            .expect("checkpoint manifest should load")
+            .expect("checkpoint manifest should exist");
+        let root = manifest
+            .snapshot_root
+            .as_mut()
+            .expect("checkpoint root should exist");
+        root.root_id = stale_root_id.clone();
+        root.row_count_estimate = 1;
+        root.complete_state_fence = true;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key(stale_root_id.as_bytes().to_vec()),
+            value(leaf),
+        );
+        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
+            .expect("standalone complete-state root should reseal");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("standalone complete-state root should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("history read should open");
+        let error = super::load_commit_history_members_with_payloads_for_schemas(
+            &read,
+            checkpoint_id,
+            &["test_schema".to_owned()],
+            &[],
+        )
+        .await
+        .expect_err("standalone fallback must check canonical change lifetime");
+        assert!(error.message.contains("no authoritative live payload"), "{error:?}");
     }
 
     #[tokio::test]

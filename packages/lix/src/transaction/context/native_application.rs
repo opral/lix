@@ -1345,6 +1345,7 @@ fn native_file_lifecycle_pick(
             created_at: row.created_at(),
             updated_at: row.updated_at(),
             author_id: row.author_id().to_owned(),
+            author_present: true,
         },
     })
 }
