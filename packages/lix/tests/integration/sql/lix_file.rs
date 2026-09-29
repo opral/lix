@@ -3901,6 +3901,36 @@ simulation_test!(
             .await
             .expect("transaction descriptor anchor should stage");
 
+        // The explicit transaction has a staged descriptor epoch now. Exact
+        // ID reads and generic SQL must both see the same overlay rows.
+        let staged_id = Value::Text("01950000-0000-7000-8000-000000000003".to_owned());
+        let staged_fast = transaction
+            .execute("SELECT content FROM lix_file WHERE id = $1", std::slice::from_ref(&staged_id))
+            .await
+            .expect("exact point read should see a staged descriptor");
+        let staged_generic = transaction
+            .execute(
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                std::slice::from_ref(&staged_id),
+            )
+            .await
+            .expect("generic point read should see a staged descriptor");
+        assert_eq!(staged_fast, staged_generic);
+
+        let local_id = Value::Text("6c616e65-2d66-896c-8500-000000000000".to_owned());
+        let local_fast = transaction
+            .execute("SELECT content FROM lix_file WHERE id = $1", std::slice::from_ref(&local_id))
+            .await
+            .expect("exact point read should select the branch-local row");
+        let local_generic = transaction
+            .execute(
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                std::slice::from_ref(&local_id),
+            )
+            .await
+            .expect("generic point read should select the branch-local row");
+        assert_eq!(local_fast, local_generic);
+
         let local = transaction
             .execute(
                 "SELECT id, path FROM lix_file WHERE id = '6c616e65-2d66-896c-8500-000000000000'",
@@ -3925,6 +3955,20 @@ simulation_test!(
             .await
             .expect("branch-local lane tombstone should stage");
         assert_eq!(deleted.rows_affected(), 1);
+
+        let hidden_fast = transaction
+            .execute("SELECT content FROM lix_file WHERE id = $1", std::slice::from_ref(&local_id))
+            .await
+            .expect("exact point read should honor the staged tombstone");
+        let hidden_generic = transaction
+            .execute(
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
+                std::slice::from_ref(&local_id),
+            )
+            .await
+            .expect("generic point read should honor the staged tombstone");
+        assert_eq!(hidden_fast, hidden_generic);
+        assert_eq!(hidden_fast.len(), 0, "the tombstone must suppress the global row");
 
         let hidden_by_tombstone = transaction
             .execute(

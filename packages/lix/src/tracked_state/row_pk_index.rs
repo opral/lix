@@ -147,6 +147,7 @@ pub(crate) async fn stage_row_pk_index_from_members(
                 deleted: false,
                 created_at: member.value.created_at,
                 updated_at: member.value.updated_at,
+                semantic_fingerprint: None,
             },
         );
     }
@@ -203,6 +204,7 @@ pub(crate) async fn stage_row_pk_index_from_deltas_with_base<'a>(
                 deleted: false,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
+                semantic_fingerprint: None,
             },
         );
     }
@@ -308,6 +310,7 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
                     .map_err(row_pk_index_error)?,
                 updated_at: crate::common::LixTimestamp::parse(&row.updated_at)
                     .map_err(row_pk_index_error)?,
+                semantic_fingerprint: None,
             },
         );
     }
@@ -415,6 +418,7 @@ mod tests {
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
             updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+            semantic_fingerprint: None,
         };
         let mut builder = TrackedStateMutationBatchBuilder::with_row_capacity(1);
         builder.push(

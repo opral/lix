@@ -1350,6 +1350,7 @@ async fn load_current_state_values_from_descriptors(
                 deleted: false,
                 created_at: source.uniform_created_at,
                 updated_at: source.uniform_updated_at,
+                semantic_fingerprint: None,
             });
             if !decoded
                 .author_present(usize::from(found.ordinal))
@@ -1656,6 +1657,7 @@ fn apply_columnar_identity_page(
             deleted: false,
             created_at: source.uniform_created_at,
             updated_at: source.uniform_updated_at,
+            semantic_fingerprint: None,
         });
     }
     Ok(())
@@ -2955,6 +2957,8 @@ struct CommitDeltaPointReadCacheInner {
     authorities: VecDeque<(CommitId, Arc<AuthenticatedReplayCommitStateManifest>)>,
     manifests: VecDeque<(CommitId, Arc<CommitDeltaManifest>)>,
     segments: VecDeque<((CommitId, usize), Arc<DecodedCommitDeltaSegment>)>,
+    encoded_segments: VecDeque<((CommitId, usize), CommitDeltaSegmentBounds, Bytes)>,
+    encoded_segment_resident_bytes: usize,
     recent_segment_misses: VecDeque<(CommitId, usize)>,
     segment_resident_bytes: usize,
 }
@@ -2973,6 +2977,87 @@ impl CommitDeltaPointReadCache {
             segment: None,
             next_entry_index: 0,
         }
+    }
+
+    fn encoded_segment(
+        &self,
+        commit_id: CommitId,
+        segment_index: usize,
+        expected_bounds: &CommitDeltaSegmentBounds,
+    ) -> Result<Option<Bytes>, LixError> {
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        let Some(position) = cache
+            .encoded_segments
+            .iter()
+            .position(|(address, bounds, _)| {
+                *address == (commit_id, segment_index) && bounds == expected_bounds
+            })
+        else {
+            return Ok(None);
+        };
+        let entry = cache
+            .encoded_segments
+            .remove(position)
+            .expect("located encoded transaction commit-delta segment");
+        verify_commit_delta_part_digest(entry.1.content_digest, &entry.2)?;
+        let bytes = entry.2.clone();
+        cache.encoded_segments.push_back(entry);
+        Ok(Some(bytes))
+    }
+
+    fn remember_encoded_segment(
+        &self,
+        commit_id: CommitId,
+        segment_index: usize,
+        bounds: CommitDeltaSegmentBounds,
+        bytes: Bytes,
+    ) -> Result<(), LixError> {
+        verify_commit_delta_part_digest(bounds.content_digest, &bytes)?;
+        if bytes.len() > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES {
+            return Ok(());
+        }
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        if let Some(position) = cache
+            .encoded_segments
+            .iter()
+            .position(|(address, _, _)| *address == (commit_id, segment_index))
+        {
+            let previous = cache
+                .encoded_segments
+                .remove(position)
+                .expect("located encoded transaction commit-delta segment");
+            cache.encoded_segment_resident_bytes = cache
+                .encoded_segment_resident_bytes
+                .saturating_sub(previous.2.len());
+        }
+        cache.encoded_segment_resident_bytes = cache
+            .encoded_segment_resident_bytes
+            .saturating_add(bytes.len());
+        cache
+            .encoded_segments
+            .push_back(((commit_id, segment_index), bounds, bytes));
+        while cache.encoded_segment_resident_bytes > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES
+            || cache.encoded_segments.len() > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_ENTRIES
+        {
+            let evicted = cache
+                .encoded_segments
+                .pop_front()
+                .expect("over-budget encoded commit-delta cache is non-empty");
+            cache.encoded_segment_resident_bytes = cache
+                .encoded_segment_resident_bytes
+                .saturating_sub(evicted.2.len());
+        }
+        Ok(())
     }
 }
 
@@ -4691,6 +4776,7 @@ async fn load_scoped_current_state_descriptor_rows(
                         deleted: false,
                         created_at: source.uniform_created_at,
                         updated_at: source.uniform_updated_at,
+                        semantic_fingerprint: None,
                     },
                     author_present,
                     metadata: decoded.metadata(ordinal)?.cloned(),
@@ -4894,6 +4980,7 @@ async fn load_scoped_current_state_descriptor_rows(
                             deleted: false,
                             created_at: source.uniform_created_at,
                             updated_at: source.uniform_updated_at,
+                            semantic_fingerprint: None,
                         },
                         author_present: true,
                         metadata: record.metadata,
@@ -5224,56 +5311,78 @@ async fn load_point_replay_commit_states(
     if commit_ids.is_empty() {
         return Ok(Vec::new());
     }
-    #[cfg(test)]
-    record_point_replay_authority_batch_for_test(commit_ids.len());
-    #[cfg(feature = "storage-benches")]
-    for _ in commit_ids {
-        crate::storage_bench::record_crud_replay_manifest_load();
+    let mut states = Vec::with_capacity(commit_ids.len());
+    for batch in commit_ids.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
+        #[cfg(test)]
+        record_point_replay_authority_batch_for_test(batch.len());
+        #[cfg(feature = "storage-benches")]
+        for _ in batch {
+            crate::storage_bench::record_crud_replay_manifest_load();
+        }
+        let header_keys = batch
+            .iter()
+            .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
+            .collect::<Vec<_>>();
+        let inventory_keys = batch
+            .iter()
+            .map(|commit_id| StorageKey(Bytes::from(commit_mutation_inventory_key(*commit_id))))
+            .collect::<Vec<_>>();
+        let requests = [
+            StorageGetManyRequest {
+                space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                keys: &header_keys,
+                opts: StorageGetOptions::default(),
+            },
+            StorageGetManyRequest {
+                space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+                keys: &inventory_keys,
+                opts: StorageGetOptions::default(),
+            },
+        ];
+        let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+        let headers = values.by_ref().take(batch.len()).collect::<Vec<_>>();
+        let inventories = values.collect::<Vec<_>>();
+        if headers.len() != batch.len() || inventories.len() != batch.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replay authority batch returned the wrong cardinality",
+            ));
+        }
+        states.extend(
+            batch
+                .iter()
+                .copied()
+                .zip(headers)
+                .zip(inventories)
+                .map(|((commit_id, header), inventory)| {
+                    decode_point_replay_commit_state_values(commit_id, header, inventory)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
     }
-    let header_keys = commit_ids
-        .iter()
-        .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
-        .collect::<Vec<_>>();
-    let inventory_keys = commit_ids
-        .iter()
-        .map(|commit_id| StorageKey(Bytes::from(commit_mutation_inventory_key(*commit_id))))
-        .collect::<Vec<_>>();
-    let requests = [
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-            keys: &header_keys,
-            opts: StorageGetOptions::default(),
-        },
-        StorageGetManyRequest {
-            space: TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
-            keys: &inventory_keys,
-            opts: StorageGetOptions::default(),
-        },
-    ];
-    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
-    let headers = values.by_ref().take(commit_ids.len()).collect::<Vec<_>>();
-    let inventories = values.collect::<Vec<_>>();
-    if headers.len() != commit_ids.len() || inventories.len() != commit_ids.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked_state replay authority batch returned the wrong cardinality",
-        ));
-    }
-    commit_ids
-        .iter()
-        .copied()
-        .zip(headers)
-        .zip(inventories)
-        .map(|((commit_id, header), inventory)| {
-            decode_point_replay_commit_state_values(commit_id, header, inventory)
-        })
-        .collect()
+    Ok(states)
 }
 
 #[cfg(test)]
 std::thread_local! {
     static POINT_REPLAY_AUTHORITY_BATCH_PROBE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POINT_REPLAY_AUTHORITY_BATCH_PROBE: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static COMMIT_DELTA_PAYLOAD_DECODE_PROBE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_commit_delta_payload_decode_probe_for_test() {
+    COMMIT_DELTA_PAYLOAD_DECODE_PROBE.with(|probe| probe.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_commit_delta_payload_decode_probe_for_test() -> usize {
+    COMMIT_DELTA_PAYLOAD_DECODE_PROBE.with(|probe| probe.replace(0))
+}
+
+#[cfg(test)]
+fn record_commit_delta_payload_decode_for_test() {
+    COMMIT_DELTA_PAYLOAD_DECODE_PROBE.with(|probe| probe.set(probe.get() + 1));
 }
 
 #[cfg(test)]
@@ -6928,6 +7037,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
                 deleted: delta.delta.deleted,
                 created_at: delta.delta.created_at,
                 updated_at: delta.delta.updated_at,
+                semantic_fingerprint: delta.delta.semantic_fingerprint,
             },
         );
         payloads.push(CommitDeltaPayloadRef {
@@ -7003,6 +7113,7 @@ fn stage_commit_deltas_inner(
                 deleted: delta.delta.deleted,
                 created_at: delta.delta.created_at,
                 updated_at: delta.delta.updated_at,
+                semantic_fingerprint: delta.delta.semantic_fingerprint,
             },
         );
         payloads.push(CommitDeltaPayloadRef {
@@ -7110,6 +7221,11 @@ fn stage_commit_deltas_inner(
                     deleted: value.deleted,
                     created_at: value.created_at,
                     updated_at: value.updated_at,
+                    // Readdressing a locally authored mutation changes only
+                    // its commit-local ChangeId. Preserve the payload proof
+                    // that was already validated against the authored body;
+                    // selected references reach this branch without one.
+                    semantic_fingerprint: value.semantic_fingerprint,
                 }));
                 candidate_assignments.push((source_indices[source_index], change_id));
             }
@@ -10128,6 +10244,7 @@ async fn load_columnar_mutation_values_encoded(
                 deleted: false,
                 created_at: parts.uniform_created_at,
                 updated_at: parts.uniform_updated_at,
+                semantic_fingerprint: None,
             });
         }
     }
@@ -10245,6 +10362,7 @@ async fn load_columnar_owned_entries(
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
+                    semantic_fingerprint: None,
                 },
                 change_record: decode_columnar_change_record(
                     &manifest,
@@ -10275,11 +10393,11 @@ async fn load_columnar_owned_entries(
 /// [`load_commit_delta_values`]: callers already know the owning commit from
 /// the endpoint index value, so no global changelog or delta-space scan is
 /// necessary.
-pub(crate) async fn load_commit_delta_change_records(
+pub(crate) async fn load_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKey],
-) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     #[cfg(feature = "storage-benches")]
     for key in keys {
         crate::storage_bench::record_commit_delta_request_key_clone(
@@ -10291,7 +10409,19 @@ pub(crate) async fn load_commit_delta_change_records(
         .cloned()
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
-    load_commit_delta_change_records_for_owners(store, &requests).await
+    load_owned_commit_delta_entries(store, &requests).await
+}
+
+pub(crate) async fn load_commit_delta_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
+    Ok(load_commit_delta_entries(store, commit_id, keys)
+        .await?
+        .into_iter()
+        .map(|entry| entry.map(|entry| entry.change_record))
+        .collect())
 }
 
 /// Loads exact change records from their already-known physical owners in one
@@ -12388,7 +12518,7 @@ async fn resolve_selected_tombstone_authorities_with_authors(
         })
         .collect::<Vec<_>>();
     let resolved = load_selected_tombstone_source_authorities(store, &identity_rows).await?;
-    for ((key, value, author_present), authority) in rows.iter().zip(&resolved) {
+    for ((_key, value, author_present), authority) in rows.iter().zip(&resolved) {
         match authority.record.as_ref() {
             Some(record) => {
                 if *author_present && value.author_id != record.account_id {
@@ -13344,6 +13474,7 @@ async fn load_columnar_mutation_members(
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
+                    semantic_fingerprint: None,
                 },
                 change,
                 segment_index: u32::try_from(global_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS)
@@ -13524,21 +13655,44 @@ pub(crate) async fn load_owned_commit_delta_entries(
     requests: &[(CommitId, TrackedStateKey)],
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let point_cache = CommitDeltaPointReadCache::default();
+    load_owned_commit_delta_entries_with_point_cache(store, requests, &point_cache).await
+}
+
+pub(crate) async fn load_owned_commit_delta_entries_with_point_cache(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+    point_cache: &CommitDeltaPointReadCache,
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let owner_commit_ids = requests
         .iter()
         .map(|(commit_id, _)| *commit_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut authorities = owner_commit_ids
+    let mut authorities = BTreeMap::new();
+    let mut owners_to_load = Vec::new();
+    for commit_id in &owner_commit_ids {
+        match point_cache.authority(*commit_id)? {
+            Some(state) => {
+                authorities.insert(*commit_id, Some(state));
+            }
+            None => owners_to_load.push(*commit_id),
+        }
+    }
+    for (commit_id, state) in owners_to_load
         .iter()
         .copied()
-        .zip(load_point_replay_commit_states(store, &owner_commit_ids).await?)
-        .collect::<BTreeMap<_, _>>();
+        .zip(load_point_replay_commit_states(store, &owners_to_load).await?)
+    {
+        if let Some(state) = &state {
+            point_cache.remember_authority(Arc::clone(state))?;
+        }
+        authorities.insert(commit_id, state);
+    }
     let mut output = load_local_owned_commit_delta_entries(
         store,
         requests,
-        Some(&point_cache),
+        Some(point_cache),
         Some(&authorities),
     )
     .await?;
@@ -13566,16 +13720,29 @@ pub(crate) async fn load_owned_commit_delta_entries(
         .into_iter()
         .filter(|commit_id| !authorities.contains_key(commit_id))
         .collect::<Vec<_>>();
-    authorities.extend(
-        source_commit_ids
-            .iter()
-            .copied()
-            .zip(load_point_replay_commit_states(store, &source_commit_ids).await?),
-    );
+    let mut uncached_source_ids = Vec::new();
+    for commit_id in source_commit_ids {
+        match point_cache.authority(commit_id)? {
+            Some(state) => {
+                authorities.insert(commit_id, Some(state));
+            }
+            None => uncached_source_ids.push(commit_id),
+        }
+    }
+    for (commit_id, state) in uncached_source_ids
+        .iter()
+        .copied()
+        .zip(load_point_replay_commit_states(store, &uncached_source_ids).await?)
+    {
+        if let Some(state) = &state {
+            point_cache.remember_authority(Arc::clone(state))?;
+        }
+        authorities.insert(commit_id, state);
+    }
     let selected = load_local_owned_commit_delta_entries(
         store,
         &source_requests,
-        Some(&point_cache),
+        Some(point_cache),
         Some(&authorities),
     )
     .await?;
@@ -13668,6 +13835,265 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
     load_owned_commit_delta_entries(store, &requests).await
 }
 
+/// Loads only authenticated commit-delta leaf values for a point batch. This
+/// is the body-free half of semantic diff validation: callers may trust a
+/// fingerprint only after this authenticated delta value matches the root's
+/// row identity. Payload bytes
+/// remain in the same immutable segment; external segments are hashed against
+/// their authenticated inventory digest before the leaf is decoded.
+pub(crate) async fn load_authenticated_commit_delta_index_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+    point_cache: &CommitDeltaPointReadCache,
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut keys_by_commit = BTreeMap::<CommitId, BTreeSet<TrackedStateKey>>::new();
+    for (commit_id, key) in requests {
+        keys_by_commit
+            .entry(*commit_id)
+            .or_default()
+            .insert(key.clone());
+    }
+    let mut values_by_key =
+        BTreeMap::<(CommitId, TrackedStateKey), Option<TrackedStateIndexValue>>::new();
+    let mut authorities = BTreeMap::new();
+    let mut owners_to_load = Vec::new();
+    for commit_id in keys_by_commit.keys().copied() {
+        match point_cache.authority(commit_id)? {
+            Some(state) => {
+                authorities.insert(commit_id, Some(state));
+            }
+            None => owners_to_load.push(commit_id),
+        }
+    }
+    for (commit_id, state) in owners_to_load
+        .iter()
+        .copied()
+        .zip(load_point_replay_commit_states(store, &owners_to_load).await?)
+    {
+        if let Some(state) = &state {
+            point_cache.remember_authority(Arc::clone(state))?;
+        }
+        authorities.insert(commit_id, state);
+    }
+    for (commit_id, keys) in keys_by_commit {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let state = authorities
+            .remove(&commit_id)
+            .expect("every commit owner has an authenticated authority slot");
+        let Some(state) = state else {
+            for key in keys {
+                values_by_key.insert((commit_id, key), None);
+            }
+            continue;
+        };
+        let key_refs = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            })
+            .collect::<Vec<_>>();
+        let loaded = load_authenticated_commit_delta_index_values_for_state(
+            store,
+            commit_id,
+            &key_refs,
+            &state,
+            point_cache,
+        )
+        .await?;
+        for (key, value) in keys.into_iter().zip(loaded) {
+            values_by_key.insert((commit_id, key), value);
+        }
+    }
+    Ok(requests
+        .iter()
+        .map(|(commit_id, key)| {
+            values_by_key
+                .get(&(*commit_id, key.clone()))
+                .cloned()
+                .flatten()
+        })
+        .collect())
+}
+
+async fn load_authenticated_commit_delta_index_values_for_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    state: &AuthenticatedReplayCommitStateManifest,
+    point_cache: &CommitDeltaPointReadCache,
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if state.mutations.columnar_parts.is_some()
+        || !state.mutations.replacement_part_digests.is_empty()
+    {
+        return Ok((0..keys.len()).map(|_| None).collect());
+    }
+
+    let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+    for &key in keys {
+        encoded_keys.push(key);
+    }
+    let encoded_keys = encoded_keys.finish();
+    let mut output = vec![None; keys.len()];
+
+    if let Some(root) = state.mutation_directory_root.as_ref() {
+        if root.layout != super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+            && root.layout != super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+        {
+            return Ok(output);
+        }
+        let runs = super::mutation_directory::load_mutation_part_read_plan(
+            store,
+            root,
+            super::mutation_directory::MutationDirectoryReadSelection::SortedUniquePoints(
+                &encoded_keys,
+            ),
+        )
+        .await?
+        .into_runs();
+        let mut storage_keys = Vec::with_capacity(runs.len());
+        let mut parts = Vec::with_capacity(runs.len());
+        for run in &runs {
+            let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } =
+                &run.entry
+            else {
+                return Ok(output);
+            };
+            if part.replacement_part.is_some() {
+                return Ok(output);
+            }
+            storage_keys.push(StorageKey(Bytes::from(commit_delta_segment_key_for_part(
+                commit_id,
+                usize::try_from(run.entry_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                part,
+            )?)));
+            parts.push(part.clone());
+        }
+        let loaded = if storage_keys.is_empty() {
+            Vec::new()
+        } else {
+            PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value
+        };
+        for ((run, part), stored) in runs.into_iter().zip(parts).zip(loaded) {
+            let Some(bytes) = stored.and_then(full_value_bytes) else {
+                continue;
+            };
+            verify_commit_delta_part_digest(part.content_digest, &bytes)?;
+            point_cache.remember_encoded_segment(
+                commit_id,
+                usize::try_from(run.entry_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                CommitDeltaSegmentBounds {
+                    first_key: part.first_key.clone(),
+                    last_key: part.last_key.clone(),
+                    content_digest: part.content_digest,
+                    replacement_part: None,
+                },
+                bytes.clone(),
+            )?;
+            let bounds = CommitDeltaSegmentBounds {
+                first_key: part.first_key,
+                last_key: part.last_key,
+                content_digest: part.content_digest,
+                replacement_part: None,
+            };
+            let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
+            visit_commit_delta_leaf(&leaf, commit_id, |_, _, _| Ok(()))?;
+            for output_index in run.selector_span {
+                output[output_index] =
+                    find_commit_delta_value(&leaf, &encoded_keys[output_index], commit_id)?;
+            }
+        }
+        return Ok(output);
+    }
+
+    let manifest = commit_delta_manifest_from_commit_state(state);
+    if let Some(inline) = manifest.inline_segment() {
+        // Inline bytes are part of the mutation inventory whose serialized
+        // digest was checked while loading `state`; they have no separate part
+        // digest to compare.
+        let leaf = decode_commit_delta_leaf(inline, None)?;
+        visit_commit_delta_leaf(&leaf, commit_id, |_, _, _| Ok(()))?;
+        for (output_index, key) in encoded_keys.iter().enumerate() {
+            output[output_index] = find_commit_delta_value(&leaf, key, commit_id)?;
+        }
+        return Ok(output);
+    }
+
+    let mut segment_indices = BTreeMap::<usize, Vec<usize>>::new();
+    for (output_index, key) in encoded_keys.iter().enumerate() {
+        let Some(segment_index) = commit_delta_segment_for_key(&manifest, key) else {
+            continue;
+        };
+        if manifest.segments[segment_index].replacement_part.is_some() {
+            return Ok(output);
+        }
+        segment_indices
+            .entry(segment_index)
+            .or_default()
+            .push(output_index);
+    }
+    let storage_keys = segment_indices
+        .keys()
+        .map(|&segment_index| {
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &manifest.segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let loaded = if storage_keys.is_empty() {
+        Vec::new()
+    } else {
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value
+    };
+    for ((segment_index, output_indices), stored) in segment_indices.into_iter().zip(loaded) {
+        let Some(bytes) = stored.and_then(full_value_bytes) else {
+            continue;
+        };
+        let bounds = &manifest.segments[segment_index];
+        verify_commit_delta_part_digest(bounds.content_digest, &bytes)?;
+        point_cache.remember_encoded_segment(
+            commit_id,
+            segment_index,
+            bounds.clone(),
+            bytes.clone(),
+        )?;
+        let leaf = decode_commit_delta_leaf(&bytes, Some(bounds))?;
+        visit_commit_delta_leaf(&leaf, commit_id, |_, _, _| Ok(()))?;
+        for output_index in output_indices {
+            output[output_index] =
+                find_commit_delta_value(&leaf, &encoded_keys[output_index], commit_id)?;
+        }
+    }
+    Ok(output)
+}
+
+fn verify_commit_delta_part_digest(expected: [u8; 32], bytes: &[u8]) -> Result<(), LixError> {
+    if *blake3::hash(bytes).as_bytes() != expected {
+        return Err(replacement_payload_error(
+            "authenticated commit-delta part content digest mismatch",
+        ));
+    }
+    Ok(())
+}
+
 async fn load_local_owned_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[(CommitId, TrackedStateKey)],
@@ -13756,6 +14182,7 @@ async fn load_inventory_part_entries_one_ordered(
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
     state: &AuthenticatedReplayCommitStateManifest,
+    point_cache: Option<&CommitDeltaPointReadCache>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("ordered mutation inventory omitted its directory root")
@@ -13774,49 +14201,66 @@ async fn load_inventory_part_entries_one_ordered(
     )
     .await?
     .into_runs();
-    let storage_keys = runs
-        .iter()
-        .map(|run| {
-            let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } =
-                &run.entry
-            else {
-                return Err(replacement_payload_error(
-                    "ordered mutation inventory selected a non-bounded part",
-                ));
-            };
-            commit_delta_segment_key_for_part(
+    let mut segment_bytes = vec![None; runs.len()];
+    let mut storage_keys = Vec::new();
+    let mut storage_key_runs = Vec::new();
+    for (run_index, run) in runs.iter().enumerate() {
+        let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } = &run.entry
+        else {
+            return Err(replacement_payload_error(
+                "ordered mutation inventory selected a non-bounded part",
+            ));
+        };
+        let segment_index = usize::try_from(run.entry_index)
+            .map_err(|_| replacement_payload_error("part index exceeds usize"))?;
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: part.first_key.clone(),
+            last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
+            replacement_part: part.replacement_part.clone(),
+        };
+        if let Some(bytes) = point_cache
+            .map(|cache| cache.encoded_segment(commit_id, segment_index, &bounds))
+            .transpose()?
+            .flatten()
+        {
+            segment_bytes[run_index] = Some(bytes);
+        } else {
+            storage_keys.push(StorageKey(Bytes::from(commit_delta_segment_key_for_part(
                 commit_id,
-                usize::try_from(run.entry_index)
-                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                segment_index,
                 part,
-            )
-            .map(|key| StorageKey(Bytes::from(key)))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let loaded =
-        PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
+            )?)));
+            storage_key_runs.push(run_index);
+        }
+    }
+    if !storage_keys.is_empty() {
+        let fetched =
+            PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+        for (run_index, value) in storage_key_runs.into_iter().zip(fetched.value) {
+            segment_bytes[run_index] = value.and_then(full_value_bytes);
+        }
+    }
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
-    for (run, value) in runs.into_iter().zip(loaded.value) {
-        let bytes = value
-            .and_then(full_value_bytes)
-            .ok_or_else(|| match &run.entry {
-                super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
-                    super::NativeObjectRef::CommitDeltaPart {
-                        commit_id: *commit_id.as_uuid().as_bytes(),
-                        part_index: run.entry_index,
-                        expected_digest: part.content_digest,
-                        replacement: part.replacement_part.is_some(),
-                    }
-                    .annotate_missing(replacement_payload_error(
-                        "mutation inventory references a missing immutable part",
-                    ))
+    for (run, bytes) in runs.into_iter().zip(segment_bytes) {
+        let bytes = bytes.ok_or_else(|| match &run.entry {
+            super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
+                super::NativeObjectRef::CommitDeltaPart {
+                    commit_id: *commit_id.as_uuid().as_bytes(),
+                    part_index: run.entry_index,
+                    expected_digest: part.content_digest,
+                    replacement: part.replacement_part.is_some(),
                 }
-                _ => replacement_payload_error(
+                .annotate_missing(replacement_payload_error(
                     "mutation inventory references a missing immutable part",
-                ),
-            })?;
+                ))
+            }
+            _ => {
+                replacement_payload_error("mutation inventory references a missing immutable part")
+            }
+        })?;
         let super::mutation_directory::MutationDirectoryEntry::Bounded {
             part,
             direct_row_count,
@@ -13832,6 +14276,15 @@ async fn load_inventory_part_entries_one_ordered(
             content_digest: part.content_digest,
             replacement_part: part.replacement_part,
         };
+        if let Some(point_cache) = point_cache {
+            point_cache.remember_encoded_segment(
+                commit_id,
+                usize::try_from(run.entry_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                bounds.clone(),
+                bytes.clone(),
+            )?;
+        }
         let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(&bounds))?;
         validate_bounded_direct_row_count(root.layout, direct_row_count, leaf.len())?;
         for output_index in run.selector_span {
@@ -13892,7 +14345,14 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                 || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
         })
     {
-        return load_inventory_part_entries_one_ordered(store, commit_id, keys, &state).await;
+        return load_inventory_part_entries_one_ordered(
+            store,
+            commit_id,
+            keys,
+            &state,
+            point_cache,
+        )
+        .await;
     }
     let manifest = match point_cache
         .map(|cache| cache.manifest(commit_id))
@@ -14064,11 +14524,17 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             match cache.segment(commit_id, segment_index, Some(bounds))? {
                 Some(decoded) => decoded_segments.push(Some(decoded)),
                 None => {
-                    decoded_segments.push(None);
-                    missing_indices.push(segment_index);
-                    missing_keys.push(StorageKey(Bytes::from(
-                        commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?,
-                    )));
+                    if let Some(bytes) = cache.encoded_segment(commit_id, segment_index, bounds)? {
+                        let decoded = decode_owned_commit_delta_segment(&bytes, Some(bounds))?;
+                        cache.remember_segment(commit_id, segment_index, Arc::clone(&decoded))?;
+                        decoded_segments.push(Some(decoded));
+                    } else {
+                        decoded_segments.push(None);
+                        missing_indices.push(segment_index);
+                        missing_keys.push(StorageKey(Bytes::from(
+                            commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?,
+                        )));
+                    }
                 }
             }
         }
@@ -14866,6 +15332,7 @@ async fn scan_columnar_mutation_values(
                     deleted: false,
                     created_at: parts.uniform_created_at,
                     updated_at: parts.uniform_updated_at,
+                    semantic_fingerprint: None,
                 },
             )?;
             global_ordinal += 1;
@@ -17147,10 +17614,36 @@ fn encode_commit_delta_segment_layout(
 ) -> Result<EncodedCommitDeltaSegment, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     for (entry, payload) in entries.iter().zip(payloads) {
+        let value = decode_value(entry.value).map_err(CommitDeltaSegmentEncodeError::Codec)?;
+        if payload.authored
+            && let Some(actual) = value.semantic_fingerprint
+        {
+            let key = decode_key(entry.key).map_err(CommitDeltaSegmentEncodeError::Codec)?;
+            let expected = crate::tracked_state::tracked_payload_semantic_fingerprint(
+                &key.schema_key,
+                &key.row_pk,
+                payload.snapshot,
+                payload.metadata,
+            )
+            .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+            if expected != Some(actual) {
+                return Err(CommitDeltaSegmentEncodeError::Codec(
+                    replacement_payload_error(
+                        "authored semantic fingerprint disagrees with its payload",
+                    ),
+                ));
+            }
+        }
+        if !payload.authored && value.semantic_fingerprint.is_some() {
+            return Err(CommitDeltaSegmentEncodeError::Codec(
+                replacement_payload_error(
+                    "selected commit-delta reference cannot publish a local semantic fingerprint",
+                ),
+            ));
+        }
         if !payload.authored {
             continue;
         }
-        let value = decode_value(entry.value).map_err(CommitDeltaSegmentEncodeError::Codec)?;
         let has_live_payload = payload
             .snapshot
             .is_some_and(|snapshot| !snapshot.is_empty());
@@ -17515,6 +18008,8 @@ fn decode_commit_delta_with_payloads<'a>(
     bytes: &'a [u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
 ) -> Result<(DecodedLeafNodeRef, CommitDeltaPayloadIndexRef<'a>), LixError> {
+    #[cfg(test)]
+    record_commit_delta_payload_decode_for_test();
     if let Some(bounds) = expected_bounds
         && bounds.replacement_part.is_some()
     {
@@ -17745,6 +18240,13 @@ fn decode_replacement_part_as_commit_delta(
         let author_id = decoded
             .author_id(ordinal)?
             .ok_or_else(|| replacement_payload_error("replacement row omitted author"))?;
+        let metadata = decoded.metadata(ordinal)?;
+        let snapshot = decoded.snapshot(ordinal)?.ok_or_else(|| {
+            replacement_payload_error("replacement part omitted its typed payload")
+        })?;
+        // Replacement parts predate canonical typed proofs. Their callers
+        // retain the exact payload and use the established comparison path.
+        let semantic_fingerprint = None;
         let mut value = encode_value_ref(TrackedStateIndexValueRef {
             change_id: change_id_from_packed_address(owner_commit_id, packed),
             commit_id: owner_commit_id,
@@ -17752,6 +18254,7 @@ fn decode_replacement_part_as_commit_delta(
             deleted: false,
             created_at: replacement.uniform_created_at,
             updated_at: replacement.uniform_updated_at,
+            semantic_fingerprint,
         });
         if !decoded
             .author_present(ordinal)
@@ -17773,20 +18276,13 @@ fn decode_replacement_part_as_commit_delta(
             u32::try_from(payload_bytes.len())
                 .map_err(|_| replacement_payload_error("payload directory exceeds u32"))?,
         );
-        let metadata = decoded.metadata(ordinal)?;
-        let snapshot = decoded.snapshot(ordinal)?;
-        if snapshot.is_none() {
-            return Err(replacement_payload_error(
-                "replacement part omitted its typed payload",
-            ));
-        }
         payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
         storage_codec::append(
             "tracked_state replacement authored payload",
             &mut payload_bytes,
             &CommitDeltaAuthoredPayloadRef {
                 metadata,
-                snapshot,
+                snapshot: Some(snapshot),
                 origin_key: None,
                 base_coordinate: None,
             },
@@ -19872,6 +20368,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: None,
                 snapshot: Some(
@@ -19969,6 +20466,7 @@ mod tests {
                         deleted: false,
                         created_at,
                         updated_at,
+                        semantic_fingerprint: None,
                     },
                     author_present: true,
                     metadata: None,
@@ -20071,6 +20569,7 @@ mod tests {
                     deleted: false,
                     created_at,
                     updated_at,
+                    semantic_fingerprint: None,
                 },
                 author_present: true,
                 metadata: None,
@@ -20302,6 +20801,7 @@ mod tests {
     ) -> Result<(), LixError> {
         let record = CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 3,
             base_commit_id: None,
@@ -20417,6 +20917,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -20576,6 +21077,7 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         }]);
@@ -20629,6 +21131,7 @@ mod tests {
                     deleted: false,
                     created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                     updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -20752,6 +21255,7 @@ mod tests {
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                semantic_fingerprint: None,
             })
             .into(),
         }];
@@ -20851,6 +21355,7 @@ mod tests {
                         deleted: false,
                         created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                         updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                        semantic_fingerprint: None,
                     })
                     .into(),
                 },
@@ -21052,6 +21557,7 @@ mod tests {
                 deleted: self.deleted,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
+                semantic_fingerprint: None,
             }
         }
     }
@@ -21286,6 +21792,7 @@ mod tests {
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             },
             metadata,
             snapshot: if fixture.deleted {
@@ -21339,7 +21846,8 @@ mod tests {
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                 updated_at: fixture.updated_at,
-            },
+                            semantic_fingerprint: None,
+},
             author_present: false,
             metadata: None,
             snapshot: b"v82-live-snapshot".to_vec(),
@@ -22975,6 +23483,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn addressable_repacking_preserves_authored_semantic_fingerprint() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_5678_9abd,
+        ));
+        let fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .nth(1)
+            .expect("one fixture row");
+        let snapshot = native_snapshot_payload(
+            &fixture.row_pk,
+            serde_json::json!({"id": "fingerprinted", "value": true}),
+        );
+        let expected = crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &fixture.schema_key,
+            &fixture.row_pk,
+            Some(&snapshot),
+            None,
+        )
+        .expect("canonical payload fingerprint")
+        .expect("live payload has fingerprint");
+        let mut delta = commit_delta_ref(commit_id, &fixture, None, None, None);
+        delta.snapshot = Some(&snapshot);
+        delta.delta.semantic_fingerprint = Some(expected);
+        let mut writes = storage.new_write_set();
+        let staged = stage_addressable_commit_deltas(&mut writes, &[delta], &[true])
+            .expect("addressable authored delta should stage");
+        assert_ne!(staged.assigned_change_ids[0], ChangeId::default());
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("addressable authored delta should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("addressable fingerprint read should open");
+        let values = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("addressable delta values should scan");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values
+                .iter()
+                .next()
+                .expect("one value")
+                .value()
+                .semantic_fingerprint,
+            Some(expected),
+            "reassigning the physical ChangeId must not erase the authored semantic proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_index_probe_reuses_part_bytes_for_payload_fallback() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("fingerprint-fallback-cache");
+        let fixtures = packed_commit_delta_fixtures();
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("segmented authored delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("segmented authored delta should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fingerprint fallback read should open");
+        let segment_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = SegmentCountingRead {
+            inner: read,
+            segment_requests: std::sync::Arc::clone(&segment_requests),
+        };
+        let point_cache = super::CommitDeltaPointReadCache::default();
+        let key = fixtures[1].key();
+        let requests = [(commit_id, key.clone())];
+        let probed =
+            super::load_authenticated_commit_delta_index_values(&read, &requests, &point_cache)
+                .await
+                .expect("authenticated body-free index probe should succeed");
+        assert_eq!(probed.len(), 1);
+        assert!(
+            probed[0]
+                .as_ref()
+                .is_some_and(|value| value.semantic_fingerprint.is_none())
+        );
+        let reads_after_probe = segment_requests.load(Ordering::Relaxed);
+        assert!(
+            reads_after_probe > 0,
+            "the probe must read the selected part"
+        );
+
+        let loaded =
+            super::load_owned_commit_delta_entries_with_point_cache(&read, &requests, &point_cache)
+                .await
+                .expect("incomplete proof must retain its exact payload fallback");
+
+        assert!(
+            loaded[0]
+                .as_ref()
+                .is_some_and(|entry| entry.change_record.snapshot.is_some())
+        );
+        assert_eq!(
+            segment_requests.load(Ordering::Relaxed),
+            reads_after_probe,
+            "the payload fallback should decode the authenticated cached bytes without fetching the part twice"
+        );
+    }
+
+    #[tokio::test]
     async fn imported_direct_ids_survive_schema_bounded_repacking() {
         for selected_source in [
             None,
@@ -23909,10 +24529,20 @@ mod tests {
                 uniform_created_at: created_at,
             },
         };
+        let identities = ["compact-000", "compact-001"];
+        let payloads = identities
+            .iter()
+            .map(|identity| {
+                native_snapshot_payload(
+                    &RowPk::single(*identity),
+                    serde_json::json!({"id": identity, "value": "typed-v1"}),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut writes = storage.new_write_set();
         let staged = super::stage_ordered_addressable_replacement_parts(
             &mut writes,
-            ["compact-000", "compact-001"].into_iter().map(|row_pk| {
+            identities.into_iter().zip(&payloads).map(|(row_pk, payload)| {
                 Ok(TrackedStateSingleStringReplacementRef {
                     schema_key: "compact-direct",
                     file_id: None,
@@ -23922,7 +24552,7 @@ mod tests {
                     created_at,
                     updated_at,
                     metadata: None,
-                    snapshot: b"typed-v1",
+                    snapshot: payload,
                 })
             }),
             &generation,
@@ -23943,6 +24573,13 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("compact replacement read should open");
+        let decoded_values = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("compact replacement index should scan");
+        assert_eq!(decoded_values.len(), 2);
+        assert!(decoded_values
+            .iter()
+            .all(|row| row.value().semantic_fingerprint.is_none()));
         super::super::mutation_directory::reset_mutation_directory_read_accounting();
         let change_id = staged
             .change_id_at(1)
@@ -24305,7 +24942,8 @@ mod tests {
                         deleted: true,
                         created_at: fixture.created_at,
                         updated_at: fixture.updated_at,
-                    })
+                                            semantic_fingerprint: None,
+})
                     .into(),
                 })
                 .collect::<Vec<_>>();
@@ -24348,7 +24986,8 @@ mod tests {
             first_parent_jump_span: 1,
             account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
             created_at: fixtures[0].updated_at,
-        };
+                    first_parent_checkpoint_summary: None,
+};
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -24537,7 +25176,8 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
-            },
+                            semantic_fingerprint: None,
+},
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -24613,7 +25253,7 @@ mod tests {
         assert_eq!(members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
         assert_eq!(members[0].change.account_id, crate::SYSTEM_ACCOUNT_ID);
 
-        let replay = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+        let replay = scan_commit_delta_values(&read, checkpoint_commit, &[])
             .await
             .expect("point replay should resolve the retained v82 tombstone source");
         assert_eq!(replay.len(), 1);
@@ -24670,7 +25310,8 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
-            },
+                            semantic_fingerprint: None,
+},
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -24712,7 +25353,7 @@ mod tests {
             "selected tombstone author disagrees with canonical author authority"
         ));
 
-        let replay_error = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+        let replay_error = scan_commit_delta_values(&read, checkpoint_commit, &[])
             .await
             .expect_err("point replay must validate explicit selected tombstone authors");
         assert!(replay_error.message.contains(
@@ -24831,7 +25472,7 @@ mod tests {
                 && member.change.account_id == TOMBSTONE_AUTHOR
         }));
 
-        let replay = super::scan_commit_delta_values(&read, checkpoint_commit, &[])
+        let replay = scan_commit_delta_values(&read, checkpoint_commit, &[])
             .await
             .expect("point replay should preserve explicit identity without canonical source");
         assert_eq!(replay.len(), 2);
@@ -24884,7 +25525,8 @@ mod tests {
                 deleted: true,
                 created_at: timestamp,
                 updated_at: timestamp,
-            },
+                            semantic_fingerprint: None,
+},
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -24958,7 +25600,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("v82 cascade read should open");
-        let mut owners = super::load_owned_commit_delta_entries(
+        let mut owners = load_owned_commit_delta_entries(
             &read,
             &[(checkpoint_commit, semantic_key.clone())],
         )
@@ -25043,7 +25685,8 @@ mod tests {
             deleted: true,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(7),
             updated_at: timestamp,
-        };
+                    semantic_fingerprint: None,
+};
         let collection_value = TrackedStateIndexValue {
             change_id: fixtures[1].change_id,
             ..file_value.clone()
@@ -25172,7 +25815,8 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: timestamp,
-            },
+                            semantic_fingerprint: None,
+},
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -25203,7 +25847,8 @@ mod tests {
             deleted: true,
             created_at: fixture.created_at,
             updated_at: timestamp,
-        });
+                    semantic_fingerprint: None,
+});
         let author_suffix_len = 2 + CHECKPOINT_ACCOUNT.len();
         let value_end = encoded_value.len() - author_suffix_len;
         let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(encoded_key.len()).unwrap()];
@@ -25249,7 +25894,8 @@ mod tests {
             first_parent_jump_span: 1,
             account_id: CHECKPOINT_ACCOUNT.to_owned(),
             created_at: timestamp,
-        };
+                    first_parent_checkpoint_summary: None,
+};
         let mut read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
         let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
         crate::changelog::ChangelogWriter::stage_append(
@@ -25527,7 +26173,8 @@ mod tests {
                 "2026-01-01T00:00:00Z",
             ),
             updated_at: stale_updated_at,
-        });
+                    semantic_fingerprint: None,
+});
         // Leave the legacy author absent so this fixture reaches the
         // lifetime check rather than failing an unrelated explicit-author
         // comparison first.
@@ -25655,7 +26302,8 @@ mod tests {
             deleted: false,
             created_at: fixture.created_at,
             updated_at: fixture.updated_at,
-        });
+                    semantic_fingerprint: None,
+});
         let decoded_value = decode_value(&encoded_value).expect("v83 fixture value should decode");
         let author_suffix_len = 2 + decoded_value.author_id.len();
         let legacy_value_end = encoded_value.len() - author_suffix_len;
@@ -25671,7 +26319,7 @@ mod tests {
         );
         manifest.replay_debt = CommitStateReplayDebt::default();
         manifest.snapshot_root = Some(Box::new(
-            crate::tracked_state::types::TrackedStateCommitRoot {
+            TrackedStateCommitRoot {
                 commit_id: checkpoint_commit,
                 root_id: root_id.clone(),
                 parent_roots: Vec::new(),
@@ -25768,7 +26416,8 @@ mod tests {
                 "updated_at",
                 "2026-01-03T00:00:00Z",
             ),
-        };
+                    semantic_fingerprint: None,
+};
         let encoded_key = encode_key_ref(TrackedStateKeyRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
@@ -25846,6 +26495,7 @@ mod tests {
                 deleted: orphan_fixture.deleted,
                 created_at: orphan_fixture.created_at,
                 updated_at: orphan_fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         };
@@ -26353,6 +27003,7 @@ mod tests {
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
+                        semantic_fingerprint: None,
                     },
                 )
                 .expect("source columnar row should append");
@@ -26370,6 +27021,7 @@ mod tests {
                         deleted: false,
                         created_at: timestamp,
                         updated_at: timestamp,
+                        semantic_fingerprint: None,
                     },
                 )
                 .expect("local columnar row should append");
@@ -26906,6 +27558,7 @@ mod tests {
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         };
@@ -27014,6 +27667,7 @@ mod tests {
                     deleted: fixture.deleted,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27126,6 +27780,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27224,6 +27879,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27321,6 +27977,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27374,6 +28031,65 @@ mod tests {
     }
 
     #[test]
+    fn authored_commit_delta_publication_rejects_fingerprint_payload_mismatch() {
+        let fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let snapshot = native_snapshot_payload(
+            &fixture.row_pk,
+            serde_json::json!({"value": "fingerprinted"}),
+        );
+        let entry = EncodedLeafEntry {
+            key: encode_key_ref(TrackedStateKeyRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                row_pk: &fixture.row_pk,
+            })
+            .into(),
+            value: encode_value_ref(TrackedStateIndexValueRef {
+                change_id: fixture.change_id,
+                commit_id: CommitId::for_test_label("fingerprint-publication"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID,
+                deleted: false,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+                semantic_fingerprint: Some([0x5a; 32]),
+            })
+            .into(),
+        };
+        let payload = CommitDeltaPayloadRef {
+            metadata: None,
+            snapshot: Some(&snapshot),
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let mut compressor = None;
+        let error =
+            try_encode_commit_delta_segment_with_payloads(&[entry], &[payload], &mut compressor)
+                .expect_err("a caller cannot publish an unverified semantic fingerprint")
+                .into_lix_error();
+        assert!(
+            error.message.contains("semantic fingerprint disagrees with its payload"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn authenticated_commit_delta_part_digest_rejects_tampered_payload_bytes() {
+        let encoded = b"authenticated segment and sidecar bytes";
+        let digest = *blake3::hash(encoded).as_bytes();
+        assert!(super::verify_commit_delta_part_digest(digest, encoded).is_ok());
+
+        let mut tampered = encoded.to_vec();
+        *tampered.last_mut().expect("fixture has bytes") ^= 1;
+        let error = super::verify_commit_delta_part_digest(digest, &tampered)
+            .expect_err("changing any sidecar byte must invalidate the authenticated segment");
+        assert!(error.message.contains("content digest mismatch"));
+    }
+
+    #[test]
     fn authored_typed_fast_layout_rejects_invalid_live_delete_payloads() {
         let fixture = packed_commit_delta_fixtures()
             .into_iter()
@@ -27393,6 +28109,7 @@ mod tests {
                 deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         };
@@ -27463,6 +28180,7 @@ mod tests {
                     deleted: false,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27519,6 +28237,7 @@ mod tests {
                 deleted: fixture.deleted,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         };
@@ -27569,6 +28288,7 @@ mod tests {
                     deleted: fixture.deleted,
                     created_at: fixture.created_at,
                     updated_at: fixture.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             })
@@ -27714,6 +28434,7 @@ mod tests {
                 deleted: false,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
+                semantic_fingerprint: None,
             })
             .into(),
         };
@@ -28258,6 +28979,7 @@ mod tests {
                     deleted: alpha.deleted,
                     created_at: alpha.created_at,
                     updated_at: alpha.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             },
@@ -28275,6 +28997,7 @@ mod tests {
                     deleted: beta.deleted,
                     created_at: beta.created_at,
                     updated_at: beta.updated_at,
+                    semantic_fingerprint: None,
                 })
                 .into(),
             },
@@ -28545,6 +29268,7 @@ mod tests {
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
+                semantic_fingerprint: None,
             })
             .into(),
         };

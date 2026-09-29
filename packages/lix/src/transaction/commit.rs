@@ -1047,6 +1047,7 @@ async fn stage_changelog_commits(
         .await?;
     let mut generations = BTreeMap::new();
     let mut first_parent_jumps = BTreeMap::new();
+    let mut first_parent_checkpoint_summaries = BTreeMap::new();
     let mut topology_records = BTreeMap::new();
     let mut touched_scope_digests = BTreeMap::<CommitId, CommitTouchedScopeDigest>::new();
     let mut rootless_depths = BTreeMap::new();
@@ -1319,7 +1320,22 @@ async fn stage_changelog_commits(
                 None => CommitTouchedScopeDigest::exact(std::iter::empty()),
             }
         };
+        // The checkpoint cursor belongs to the causal first-parent lane. In
+        // particular, a merge must not inherit a checkpoint from its secondary
+        // parent, even when that parent has the greater graph generation.
+        let first_parent_record = commit
+            .parent_commit_ids
+            .first()
+            .and_then(|parent| topology_records.get(parent))
+            .cloned();
+        let first_parent_checkpoint_summary =
+            crate::changelog::derive_first_parent_checkpoint_summary(
+                &commit.parent_commit_ids,
+                first_parent_record.as_ref(),
+            )?;
         touched_scope_digests.insert(commit_id, touched_scope_digest.clone());
+        first_parent_checkpoint_summaries
+            .insert(commit_id, first_parent_checkpoint_summary);
         topology_records.insert(
             commit_id,
             CommitRecord {
@@ -1334,6 +1350,7 @@ async fn stage_changelog_commits(
                 account_id: active_account_id.to_string(),
                 created_at: commit.created_at,
                 touched_scope_digest,
+                first_parent_checkpoint_summary,
             },
         );
         for child in children.get(&commit_id).into_iter().flatten() {
@@ -1393,6 +1410,8 @@ async fn stage_changelog_commits(
             account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
             touched_scope_digest: touched_scope_digests[&commit_row.commit_id].clone(),
+            first_parent_checkpoint_summary: first_parent_checkpoint_summaries
+                [&commit_row.commit_id],
         };
         commits.push(record.clone());
         let change_count = state_row_indices.len()
@@ -1604,6 +1623,12 @@ fn tracked_delta_from_state_row(
         deleted: row.snapshot.is_none(),
         created_at,
         updated_at: row.updated_at,
+        semantic_fingerprint: crate::tracked_state::tracked_payload_semantic_fingerprint(
+            row.schema_key,
+            row.row_pk,
+            row.snapshot,
+            row.metadata,
+        )?,
     })
 }
 
@@ -1634,6 +1659,7 @@ fn tracked_delta_from_selected_change_ref(
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
+        semantic_fingerprint: None,
     })
 }
 
@@ -1671,6 +1697,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             deleted: change_ref.deleted,
             created_at: change_ref.created_at,
             updated_at: change_ref.updated_at,
+            semantic_fingerprint: None,
         },
         metadata: record.and_then(|record| record.metadata.as_ref()),
         snapshot: record.and_then(|record| record.snapshot.as_deref()),
@@ -2357,6 +2384,7 @@ fn materialize_staged_sync_commits(
                 snapshot_json: snapshot_json.as_deref(),
                 decoded_snapshot: decoded_snapshot.as_deref(),
                 metadata_json: metadata_json.as_deref(),
+                semantic_fingerprint: delta.semantic_fingerprint,
                 row_created_at: delta.created_at,
                 row_updated_at: delta.updated_at,
                 change_account_id: active_account_id,
@@ -2414,6 +2442,12 @@ fn materialize_staged_sync_commits(
                     snapshot_json: Some(snapshot_json.as_str()),
                     decoded_snapshot: Some(&decoded_snapshot),
                     metadata_json: None,
+                    semantic_fingerprint: crate::tracked_state::tracked_payload_semantic_fingerprint(
+                        journal.schema_key(),
+                        &row_pk,
+                        Some(row.snapshot()),
+                        None,
+                    )?,
                     row_created_at: lifecycle_created_at,
                     row_updated_at: journal.timestamp(),
                     change_account_id: active_account_id,
@@ -2437,6 +2471,7 @@ fn materialize_staged_sync_commits(
                 snapshot_json: payload.and_then(|payload| payload.snapshot_content.as_deref()),
                 decoded_snapshot: payload.and_then(|payload| payload.decoded_snapshot.as_deref()),
                 metadata_json: payload.and_then(|payload| payload.metadata.as_deref()),
+                semantic_fingerprint: None,
                 row_created_at: change_ref.created_at,
                 row_updated_at: change_ref.updated_at,
                 change_account_id: change_ref.author_id,
@@ -6985,6 +7020,7 @@ where
                         deleted: false,
                         created_at: LixTimestamp::expect_parse("created_at", &row.created_at),
                         updated_at: LixTimestamp::expect_parse("updated_at", &row.updated_at),
+                        semantic_fingerprint: None,
                     }),
                     base_id,
                 )
@@ -11823,6 +11859,7 @@ mod tests {
                     .map(|commit_id| {
                         CommitRecord {
                             is_checkpoint: false,
+                            first_parent_checkpoint_summary: None,
                             format_version: COMMIT_RECORD_FORMAT_VERSION,
                             base_commit_id: None,
                             commit_id,

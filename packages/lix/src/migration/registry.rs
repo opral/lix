@@ -9,6 +9,14 @@ pub(crate) struct Migration {
 }
 
 const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from_version: 84,
+        to_version: 85,
+    },
+    Migration {
+        from_version: 83,
+        to_version: 84,
+    },
     Migration { from_version: 82, to_version: 83 },
     Migration { from_version: 81, to_version: 82 },
     Migration {
@@ -124,9 +132,38 @@ mod tests {
                 to_version: 80,
             })
         );
-        assert_eq!(registered_migrations().len(), 11);
+        assert_eq!(
+            migration_from(82),
+            Some(&Migration {
+                from_version: 82,
+                to_version: 83,
+            })
+        );
+        assert_eq!(
+            migration_from(83),
+            Some(&Migration {
+                from_version: 83,
+                to_version: 84,
+            })
+        );
+        assert_eq!(
+            migration_from(84),
+            Some(&Migration {
+                from_version: 84,
+                to_version: 85,
+            })
+        );
+        assert_eq!(registered_migrations().len(), 13);
         assert!(has_complete_migration_path(
             72,
+            crate::init::CURRENT_FORMAT_VERSION
+        ));
+        assert!(has_complete_migration_path(
+            83,
+            crate::init::CURRENT_FORMAT_VERSION
+        ));
+        assert!(has_complete_migration_path(
+            84,
             crate::init::CURRENT_FORMAT_VERSION
         ));
         assert!(!has_complete_migration_path(

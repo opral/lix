@@ -2241,6 +2241,26 @@ impl<S> FilesystemPathIndexReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead + Send + Sync,
 {
+    fn prefer_direct_exact_content(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_content(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_content(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_content(branch_ids, file_id);
+    }
+
+    fn prefer_direct_exact_path(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_path(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_path(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_path(branch_ids, file_id);
+    }
+
     fn historical_cache(
         &self,
     ) -> Option<std::sync::Arc<crate::filesystem::HistoricalPathIndexCache>> {
@@ -2256,7 +2276,7 @@ where
         }
         if let Some(registry) = &self.read_interest_registry {
             registry.register(super::LogicalReadInterest::FilesystemPaths {
-                file_ids: request.file_ids.clone(),
+                scope: request.scope.clone(),
                 branch_ids: request.branch_ids.clone(),
                 include_blob_refs: request.include_blob_refs,
                 cache_small_blob_data: request.cache_small_blob_data,
@@ -3912,6 +3932,7 @@ mod tests {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let record = crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -4156,6 +4177,7 @@ mod tests {
                 .map_or((commit_id, 0), |parent| (parent, 1));
             append.commits.push(crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -4334,6 +4356,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let record = crate::changelog::CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -4365,6 +4388,7 @@ mod tests {
                     deleted: change.snapshot.is_none(),
                     created_at: *created_at,
                     updated_at: *updated_at,
+                    semantic_fingerprint: None,
                 })
                 .collect::<Vec<_>>();
             let commit_deltas = rows

@@ -476,7 +476,18 @@ where
             self.sync_mode.partial_admission(),
             self.sync_mode.read_interests(),
         ) {
-            crate::sync::flush_partial_read_interests(&self.storage, &state, &registry).await?;
+            #[cfg(feature = "storage-benches")]
+            let profile_started = crate::sql_profile::is_active().then(std::time::Instant::now);
+            let result =
+                crate::sync::flush_partial_read_interests(&self.storage, &state, &registry).await;
+            #[cfg(feature = "storage-benches")]
+            if let Some(started) = profile_started {
+                crate::sql_profile::record_wait_or_read_phase(
+                    crate::sql_profile::WaitOrReadPhase::PartialInterestJournalFlush,
+                    started.elapsed(),
+                );
+            }
+            result?;
         }
         Ok(())
     }
@@ -1453,6 +1464,123 @@ mod tests {
             .expect("second automatic write should resume after the first finishes")
             .expect("second automatic write lease should begin");
         drop(second_write);
+    }
+
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn profiled_account_read_on_second_session_does_not_wait_for_first_session_write() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("two-session control storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("two-session control engine should open");
+        let writer = engine
+            .open_session()
+            .await
+            .expect("first branch-pinned session should open");
+        let reader = engine
+            .open_session()
+            .await
+            .expect("second branch-pinned session should open");
+        assert_eq!(
+            writer.active_branch_id().await.unwrap(),
+            reader.active_branch_id().await.unwrap(),
+            "the control sessions should start on the same branch",
+        );
+
+        let sql = "SELECT name, kind, profile_uri FROM lix_account WHERE id = $1";
+        let account_id = reader
+            .execute("SELECT id FROM lix_account LIMIT 1", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let params = [crate::Value::Text(account_id)];
+        let expected = reader.execute(sql, &params).await.unwrap();
+
+        let held_write = writer
+            .begin_session_write_lease()
+            .await
+            .expect("first session automatic write lease should begin");
+        let mut pending_write = Box::pin(writer.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('two-session-control', 'value')",
+            &[],
+        ));
+        assert!(
+            futures_util::poll!(pending_write.as_mut()).is_pending(),
+            "a write on the first session should remain pending behind its lease",
+        );
+
+        let (actual, profile) = tokio::time::timeout(
+            TEST_WAIT_TIMEOUT,
+            reader.execute_profiled(sql, &params),
+        )
+        .await
+        .expect("second-session account read should finish while first-session write is pending")
+        .expect("second-session account read should succeed");
+        assert_eq!(
+            actual, expected,
+            "the independent read returns the expected account row"
+        );
+        assert_eq!(
+            profile.session_transaction_admission_wait,
+            Duration::ZERO,
+            "the held lease belongs only to the first session",
+        );
+
+        drop(held_write);
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, pending_write)
+            .await
+            .expect("first-session write should resume after its lease is released")
+            .expect("first-session write should succeed after release");
+        reader.close().await.unwrap();
+        writer.close().await.unwrap();
+    }
+
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn profiled_account_read_attributes_same_session_automatic_write_wait() {
+        let session = open_session().await;
+        let account_id = session
+            .execute("SELECT id FROM lix_account LIMIT 1", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let sql = "SELECT name, kind, profile_uri FROM lix_account WHERE id = $1";
+        let params = [crate::Value::Text(account_id)];
+        let expected = session.execute(sql, &params).await.unwrap();
+
+        let automatic_write = session
+            .begin_session_write_lease()
+            .await
+            .expect("automatic write lease should begin");
+        let mut profiled_read = Box::pin(session.execute_profiled(sql, &params));
+        assert!(
+            futures_util::poll!(profiled_read.as_mut()).is_pending(),
+            "account read must block while its session owns an automatic write lease"
+        );
+        const CONTROLLED_WAIT: Duration = Duration::from_millis(100);
+        tokio::time::sleep(CONTROLLED_WAIT).await;
+        drop(automatic_write);
+
+        let (actual, profile) = tokio::time::timeout(TEST_WAIT_TIMEOUT, profiled_read)
+            .await
+            .expect("account read should resume after the write lease is released")
+            .expect("account read should succeed");
+        assert_eq!(
+            actual, expected,
+            "the delayed account read returns the same row"
+        );
+        assert!(
+            profile.session_transaction_admission_wait >= CONTROLLED_WAIT,
+            "the intentional wait should be attributed to same-session admission: {:?}",
+            profile.session_transaction_admission_wait
+        );
     }
 
     #[tokio::test]

@@ -292,10 +292,7 @@ where
             .sum::<usize>()
     );
     migration_profile_record_duration!(_profile, _started, publication_plan_copy);
-    plan.replace_mutable_space(
-        crate::hot_state::INDEX_SPACE,
-        staged,
-    )?;
+    plan.replace_mutable_space(crate::hot_state::INDEX_SPACE, staged)?;
     drop(reader);
     read.finish()?;
     Ok(())
@@ -391,7 +388,7 @@ mod tests {
             .await
             .unwrap();
         assert!(report.semantic_preservation_verified);
-        assert_eq!(report.preservation_basis, "v82-hot-index-plan-v1");
+        assert_eq!(report.preservation_basis, "v85-migration-plan-v1");
         assert_ne!(report.before_content_digest, report.after_content_digest);
         assert_eq!(report.expected_content_digest, report.after_content_digest);
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
@@ -696,10 +693,7 @@ mod tests {
             started.elapsed().as_micros()
         );
 
-        let lix = crate::open_lix()
-            .with_storage(storage)
-            .await
-            .unwrap();
+        let lix = crate::open_lix().with_storage(storage).await.unwrap();
         let result = lix
             .execute("SELECT id FROM migration_profile", &[])
             .await

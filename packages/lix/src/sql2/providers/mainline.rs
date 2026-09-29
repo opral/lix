@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::common::{DFSchema, DataFusionError, Result};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
@@ -28,7 +29,7 @@ mod frontier;
 
 use super::diff::{DiffMode, DiffRelation, DiffSpec};
 use super::spec::{
-    PlannedScan, SpecTableProvider, TableSpec, batch_stream_source, projected_schema,
+    PlannedScan, ScanSource, SpecTableProvider, TableSpec, batch_stream_source, projected_schema,
 };
 
 pub(super) fn register_functions<S>(
@@ -170,6 +171,47 @@ fn metadata_batch(
     }
     Ok(RecordBatch::try_new(metadata_schema(history), columns)?)
 }
+
+fn log_metadata_window_batch(
+    rows: &[(&CommitGraphNode, i64, bool, Option<String>)],
+) -> Result<RecordBatch> {
+    let parent_ids = rows
+        .iter()
+        .map(|(node, _, _, _)| node.parent_commit_ids.first().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let commit_ids = rows
+        .iter()
+        .map(|(node, _, _, _)| Some(node.commit_id.to_string()))
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|(node, _, _, _)| Some(node.created_at.to_string()))
+        .collect::<Vec<_>>();
+    let checkpoint_active = rows
+        .iter()
+        .map(|(_, _, checkpoint_active, _)| *checkpoint_active)
+        .collect::<Vec<_>>();
+    let conversation_ids = rows
+        .iter()
+        .map(|(_, _, _, conversation_id)| conversation_id.as_deref())
+        .collect::<Vec<_>>();
+    let positions = rows
+        .iter()
+        .map(|(_, position, _, _)| *position)
+        .collect::<Vec<_>>();
+    record_log_metadata_batch(rows.len());
+    Ok(RecordBatch::try_new(
+        metadata_schema(false),
+        vec![
+            Arc::new(StringArray::from(parent_ids)),
+            Arc::new(StringArray::from(commit_ids)),
+            Arc::new(StringArray::from(created_at)),
+            Arc::new(BooleanArray::from(checkpoint_active)),
+            Arc::new(StringArray::from(conversation_ids)),
+            Arc::new(Int64Array::from(positions)),
+        ],
+    )?)
+}
 fn conjuncts(filters: &[Expr]) -> Vec<Expr> {
     fn append(e: &Expr, out: &mut Vec<Expr>) {
         if let Expr::BinaryExpr(b) = e {
@@ -232,6 +274,32 @@ fn position_upper_bound(filters: &[Expr], column: &str) -> Option<i64> {
         .min()
 }
 
+/// Only a conjunction containing an exact `is_checkpoint = TRUE` predicate
+/// licenses the checkpoint summary route. ORs and equivalent-looking casts
+/// remain on the complete first-parent scan.
+fn requires_checkpoint_rows(filters: &[Expr]) -> bool {
+    conjuncts(filters).iter().any(|filter| {
+        if matches!(filter, Expr::Column(column) if column.name == "is_checkpoint") {
+            return true;
+        }
+        let Expr::BinaryExpr(binary) = filter else {
+            return false;
+        };
+        if binary.op != Operator::Eq {
+            return false;
+        }
+        matches!(
+            (binary.left.as_ref(), binary.right.as_ref()),
+            (Expr::Column(column), Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+                if column.name == "is_checkpoint"
+        ) || matches!(
+            (binary.right.as_ref(), binary.left.as_ref()),
+            (Expr::Column(column), Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+                if column.name == "is_checkpoint"
+        )
+    })
+}
+
 fn matches_metadata(batch: &RecordBatch, filters: &[Arc<dyn PhysicalExpr>]) -> Result<bool> {
     for expr in filters {
         let value = expr.evaluate(batch)?.into_array(batch.num_rows())?;
@@ -246,13 +314,47 @@ fn matches_metadata(batch: &RecordBatch, filters: &[Arc<dyn PhysicalExpr>]) -> R
     Ok(true)
 }
 
+fn filter_metadata_batch(
+    mut batch: RecordBatch,
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> Result<RecordBatch> {
+    for expr in filters {
+        let value = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let value = value
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| DataFusionError::Internal("metadata filter must be boolean".into()))?;
+        let keep = BooleanArray::from(
+            value
+                .iter()
+                .map(|value| value == Some(true))
+                .collect::<Vec<_>>(),
+        );
+        batch = filter_record_batch(&batch, &keep)?;
+        if batch.num_rows() == 0 {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
 #[cfg(test)]
 thread_local! {
     static MAINLINE_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static CHECKPOINT_RETIREMENT_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static MAINLINE_METADATA_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 #[cfg(test)]
 pub(crate) fn take_mainline_work() -> (usize, usize) {
     MAINLINE_WORK.with(|work| work.replace((0, 0)))
+}
+#[cfg(test)]
+pub(crate) fn take_checkpoint_retirement_work() -> (usize, usize) {
+    CHECKPOINT_RETIREMENT_WORK.with(|work| work.replace((0, 0)))
+}
+#[cfg(test)]
+pub(crate) fn take_mainline_metadata_work() -> (usize, usize) {
+    MAINLINE_METADATA_WORK.with(|work| work.replace((0, 0)))
 }
 #[inline]
 fn record_work(_diff: bool) {
@@ -336,6 +438,8 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
         let (metadata_filters, row_filters): (Vec<_>, Vec<_>) = conjuncts(filters)
             .into_iter()
             .partition(|f| metadata_only(f, &meta_schema));
+        let checkpoint_summary_route = self.relation.is_none()
+            && requires_checkpoint_rows(&metadata_filters);
         let max_position = position_upper_bound(
             &metadata_filters,
             if self.relation.is_some() {
@@ -387,94 +491,319 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             }
             .into(),
         );
-        let source = batch_stream_source(schema.clone(), 1, move |_, context| {
-            let (store, relation, schema, metadata_filters, row_filters, active_branch_id) = (
-                store.clone(),
-                relation.clone(),
-                output_schema.clone(),
-                metadata_filters.clone(),
-                row_filters.clone(),
-                active_branch_id.clone(),
-            );
-            let mut remaining_ids = selected_ids.clone();
-            let blob_reader = Arc::clone(&blob_reader);
-            let stream_schema = schema.clone();
-            let include_state_headers = relation.is_some();
+        let can_rebind_fetch = relation.is_none() && row_filters.is_empty();
+        let build_source: Arc<dyn Fn(Option<usize>) -> ScanSource + Send + Sync> = {
+            let source_schema = schema.clone();
+            let source_store = store.clone();
+            let source_relation = relation.clone();
+            let source_output_schema = output_schema.clone();
+            let source_metadata_filters = metadata_filters.clone();
+            let source_row_filters = row_filters.clone();
+            let source_selected_ids = selected_ids.clone();
+            let source_active_branch_id = active_branch_id.clone();
+            let source_blob_reader = Arc::clone(&blob_reader);
+            let planned_limit = limit;
+            Arc::new(move |fetch| {
+                let limit = match (planned_limit, fetch) {
+                    (Some(planned), Some(fetch)) => Some(planned.min(fetch)),
+                    (Some(planned), None) => Some(planned),
+                    (None, fetch) => fetch,
+                };
+                let window_size = if limit.is_some() || source_relation.is_some() {
+                    1
+                } else {
+                    64
+                };
+                let (
+                    store,
+                    relation,
+                    output_schema,
+                    metadata_filters,
+                    row_filters,
+                    active_branch_id,
+                ) = (
+                    source_store.clone(),
+                    source_relation.clone(),
+                    source_output_schema.clone(),
+                    source_metadata_filters.clone(),
+                    source_row_filters.clone(),
+                    source_active_branch_id.clone(),
+                );
+                let selected_ids = source_selected_ids.clone();
+                let blob_reader = Arc::clone(&source_blob_reader);
+                let max_position = max_position;
+                let needs_checkpoint_active = needs_checkpoint_active;
+                let needs_checkpoint_conversation = needs_checkpoint_conversation;
+                let anchor = anchor;
+                let scan_schema = source_schema.clone();
+                batch_stream_source(scan_schema, 1, move |_, context| {
+                    let (store, relation, schema, metadata_filters, row_filters, active_branch_id) = (
+                        store.clone(),
+                        relation.clone(),
+                        output_schema.clone(),
+                        metadata_filters.clone(),
+                        row_filters.clone(),
+                        active_branch_id.clone(),
+                    );
+                    let mut remaining_ids = selected_ids.clone();
+                    let blob_reader = Arc::clone(&blob_reader);
+                    let stream_schema = schema.clone();
+                    let include_state_headers = relation.is_some();
             let stream = async_stream::try_stream! {
                 let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
                 let mut graph = CommitGraphContext::new().reader(store.clone());
                 let mut next = Some(anchor);
                 let mut position = 0i64;
+                let mut checkpoint_cursor = checkpoint_summary_route;
+                let mut first_cursor_node = true;
                 let mut emitted = 0usize;
-                let mut completed_history_checkpoints = 0usize;
-                while let Some(id) = next {
-                    if max_position.is_some_and(|ceiling| position > ceiling) { break; }
-                    if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
-                    record_work(false);
-                    let node = graph.load_node(&id).await.map_err(lix_error_to_datafusion_error)?
-                        .ok_or_else(|| lix_error_to_datafusion_error(crate::commit_graph::missing_commit_graph_error(&id)))?;
-                    next = node.parent_commit_ids.first().copied();
-                    let current_position = position;
-                    position += 1;
-                    if remaining_ids.as_mut().is_some_and(|ids| !ids.remove(&id.to_string())) { continue; }
-                    let checkpoint_active = node.is_checkpoint && (!needs_checkpoint_active || !checkpoint_retired_at(store.clone(), anchor, id).await.map_err(lix_error_to_datafusion_error)?);
-                    let conversation_id = if node.is_checkpoint && needs_checkpoint_conversation {
-                        crate::checkpoint_conversation::load_checkpoint_conversation(&store, id).await.map_err(lix_error_to_datafusion_error)?
-                    } else { None };
-                    if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1, checkpoint_active, conversation_id.as_deref())?, &metadata_filters)? { continue; }
-                    if let Some(relation) = &relation {
-                        let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
-                        let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
-                        record_work(true);
-                        let diff = DiffSpec { path_cache: Some(path_cache.clone()), blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
-                            to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
-                        let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
-                        let mut batches = plan.source.open(0, context.clone())?;
-                        while let Some(batch) = match batches.try_next().await {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                let error = frontier::discover(
-                                    &diff, parent, &diff_projection, &row_filters,
-                                    completed_history_checkpoints, remaining_ids.as_ref(), datafusion_error_to_lix_error(error),
-                                ).await;
-                                Err(lix_error_to_datafusion_error(error))?
+                        let mut completed_history_checkpoints = 0usize;
+                        loop {
+                            // Collect a bounded, ordered graph window before resolving the
+                            // checkpoint status keys at this query's pinned anchor.
+                            // Pushed limits and history diffs use a single-node window.
+                            // Ordered pages stop promptly, and each history diff keeps
+                            // its original checkpoint and selected-ID frontier.
+                            let mut window = Vec::with_capacity(window_size);
+                            let mut traversed_node = false;
+                            while window.len() < window_size {
+                                if max_position.is_some_and(|ceiling| position > ceiling) { break; }
+                                if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
+                                let Some(id) = next else { break; };
+                                record_work(false);
+                                let node = graph.load_node(&id).await.map_err(lix_error_to_datafusion_error)?
+                                    .ok_or_else(|| lix_error_to_datafusion_error(crate::commit_graph::missing_commit_graph_error(&id)))?;
+                                traversed_node = true;
+                                let current_position = position;
+                                let selected = remaining_ids
+                                    .as_mut()
+                                    .map_or(true, |ids| ids.remove(&id.to_string()));
+                                let parent = node.parent_commit_ids.first().copied();
+                                if checkpoint_cursor {
+                                    let is_anchor = first_cursor_node;
+                                    first_cursor_node = false;
+                                    let summary = node.first_parent_checkpoint_summary;
+                                    match summary {
+                                        Some(summary) => {
+                                            if let Some(previous_checkpoint_id) = summary.previous_checkpoint_id {
+                                                if summary.first_parent_distance == 0 {
+                                                    Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                                        format!("commit '{}' has a zero-distance checkpoint summary", node.commit_id),
+                                                    )))?;
+                                                }
+                                                let distance = i64::try_from(summary.first_parent_distance)
+                                                    .map_err(|_| lix_error_to_datafusion_error(crate::LixError::unknown("first-parent checkpoint position exceeds i64")))?;
+                                                position = current_position.checked_add(distance)
+                                                    .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("first-parent checkpoint position exceeds i64")))?;
+                                                next = Some(previous_checkpoint_id);
+                                            } else {
+                                                if summary.first_parent_distance != 0 {
+                                                    Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                                        format!("commit '{}' has a checkpoint-free summary with nonzero distance", node.commit_id),
+                                                    )))?;
+                                                }
+                                                next = None;
+                                            }
+                                        }
+                                        None => {
+                                            checkpoint_cursor = false;
+                                            next = parent;
+                                            position = current_position.checked_add(1)
+                                                .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("mainline position exceeds i64")))?;
+                                        }
+                                    }
+                                    if node.is_checkpoint && selected {
+                                        window.push((node, current_position, selected, parent));
+                                    } else if !is_anchor && !node.is_checkpoint {
+                                        Err(lix_error_to_datafusion_error(crate::LixError::unknown(
+                                            format!("checkpoint summary target '{}' is not a checkpoint", node.commit_id),
+                                        )))?;
+                                    }
+                                } else {
+                                    next = parent;
+                                    position = current_position.checked_add(1)
+                                        .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::unknown("mainline position exceeds i64")))?;
+                                    window.push((node, current_position, selected, parent));
+                                }
+                                if remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
                             }
-                        } {
-                            let meta = metadata_batch(&node, current_position, true, batch.num_rows(), checkpoint_active, None)?;
-                            let columns = schema.fields().iter().map(|field| {
-                                batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
-                                    .ok_or_else(|| DataFusionError::Internal(format!("missing history column {}", field.name())))
-                            }).collect::<Result<Vec<_>>>()?;
-                            let mut output = RecordBatch::try_new_with_options(schema.clone(), columns, &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?;
-                            if let Some(n) = limit { output = output.slice(0, output.num_rows().min(n - emitted)); }
-                            emitted += output.num_rows();
-                            yield output;
-                            if limit.is_some_and(|n| emitted >= n) { break; }
+                            if window.is_empty() {
+                                if checkpoint_cursor
+                                    && traversed_node
+                                    && next.is_some()
+                                    && !remaining_ids.as_ref().is_some_and(BTreeSet::is_empty)
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+
+                            let mut checkpoint_active = window.iter()
+                                .map(|(node, _, _, _)| node.is_checkpoint)
+                                .collect::<Vec<_>>();
+                            if needs_checkpoint_active {
+                                let mut key_indices = Vec::new();
+                                let mut keys = Vec::new();
+                                for (index, (node, _, selected, _)) in window.iter().enumerate() {
+                                    if !*selected || !node.is_checkpoint { continue; }
+                                    let key = crate::tracked_state::TrackedStateKey {
+                                        schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
+                                        file_id: None,
+                                        row_pk: crate::row_pk::RowPk::uuid_from_canonical(&node.commit_id.to_string())
+                                            .map_err(|error| lix_error_to_datafusion_error(crate::LixError::unknown(error.to_string())))?,
+                                    };
+                                    key_indices.push(index);
+                                    keys.push(key);
+                                }
+                                if !keys.is_empty() {
+                                    record_checkpoint_retirement_work(keys.len());
+                                    let mut tracked_state = crate::tracked_state::TrackedStateContext::new().reader(store.clone());
+                                    let retirement_rows = tracked_state.load_projected_batch_at_commit(
+                                        &anchor.to_string(),
+                                        &keys,
+                                        &crate::changelog::ChangeRecordProjection::from_columns(&["snapshot_content".into()]),
+                                    ).await.map_err(lix_error_to_datafusion_error)?;
+                                    for (slot, index) in key_indices.into_iter().enumerate() {
+                                        checkpoint_active[index] = !checkpoint_retired_from_row(retirement_rows.row(slot))
+                                            .map_err(lix_error_to_datafusion_error)?;
+                                    }
+                                }
+                            }
+
+                            if relation.is_none() {
+                                let mut selected_rows = Vec::with_capacity(window.len());
+                                for ((node, current_position, selected, _), active) in
+                                    window.iter().zip(&checkpoint_active)
+                                {
+                                    if !*selected {
+                                        continue;
+                                    }
+                                    let conversation_id =
+                                        if needs_checkpoint_conversation && node.is_checkpoint {
+                                            crate::checkpoint_conversation::load_checkpoint_conversation(
+                                                &store,
+                                                node.commit_id,
+                                            )
+                                            .await
+                                            .map_err(lix_error_to_datafusion_error)?
+                                        } else {
+                                            None
+                                        };
+                                    selected_rows.push((
+                                        node,
+                                        *current_position,
+                                        *active,
+                                        conversation_id,
+                                    ));
+                                }
+                                if !selected_rows.is_empty() {
+                                    let metadata = log_metadata_window_batch(&selected_rows)?;
+                                    let filtered = filter_metadata_batch(metadata, &metadata_filters)?;
+                                    if filtered.num_rows() > 0 {
+                                        let indices = schema.fields().iter().map(|field| filtered.schema().index_of(field.name())).collect::<std::result::Result<Vec<_>, _>>()?;
+                                        let output = filtered.project(&indices)?;
+                                        emitted += output.num_rows();
+                                        yield output;
+                                        if limit.is_some_and(|n| emitted >= n) { break; }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            for ((node, current_position, selected, parent), checkpoint_active) in
+                                window.into_iter().zip(checkpoint_active)
+                            {
+                                if !selected { continue; }
+                                let conversation_id =
+                                    if relation.is_none()
+                                        && needs_checkpoint_conversation
+                                        && node.is_checkpoint
+                                    {
+                                        crate::checkpoint_conversation::load_checkpoint_conversation(
+                                            &store,
+                                            node.commit_id,
+                                        )
+                                        .await
+                                        .map_err(lix_error_to_datafusion_error)?
+                                    } else {
+                                        None
+                                    };
+                                if !matches_metadata(
+                                    &metadata_batch(
+                                        &node,
+                                        current_position,
+                                        relation.is_some(),
+                                        1,
+                                        checkpoint_active,
+                                        conversation_id.as_deref(),
+                                    )?,
+                                    &metadata_filters,
+                                )? {
+                                    continue;
+                                }
+                                if let Some(relation) = &relation {
+                                    let Some(parent) = parent else { continue; }; // root is a baseline, not a synthetic change
+                                    let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
+                                    record_work(true);
+                                    let diff = DiffSpec { path_cache: Some(path_cache.clone()), blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
+                                        to_commit_id: node.commit_id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
+                                    let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
+                                    let mut batches = plan.source.open(0, context.clone())?;
+                                    while let Some(batch) = match batches.try_next().await {
+                                        Ok(batch) => batch,
+                                        Err(error) => {
+                                            let error = frontier::discover(
+                                                &diff, parent, &diff_projection, &row_filters,
+                                                completed_history_checkpoints, remaining_ids.as_ref(), datafusion_error_to_lix_error(error),
+                                            ).await;
+                                            Err(lix_error_to_datafusion_error(error))?
+                                        }
+                                    } {
+                                        let meta = metadata_batch(&node, current_position, true, batch.num_rows(), checkpoint_active, None)?;
+                                        let columns = schema.fields().iter().map(|field| {
+                                            batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
+                                                .ok_or_else(|| DataFusionError::Internal(format!("missing history column {}", field.name())))
+                                        }).collect::<Result<Vec<_>>>()?;
+                                        let mut output = RecordBatch::try_new_with_options(schema.clone(), columns, &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?;
+                                        if let Some(n) = limit { output = output.slice(0, output.num_rows().min(n - emitted)); }
+                                        emitted += output.num_rows();
+                                        yield output;
+                                        if limit.is_some_and(|n| emitted >= n) { break; }
+                                    }
+                                    // Reaching the next selected checkpoint means the consumer still
+                                    // needs history, even when the completed diff produced no rows.
+                                    completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
+                                } else {
+                                    let batch = metadata_batch(&node, current_position, false, 1, checkpoint_active, conversation_id.as_deref())?;
+                                    let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;
+                                    emitted += 1;
+                                    yield batch.project(&indices)?;
+                                }
+                            }
                         }
-                        // Reaching the next selected checkpoint means the consumer still
-                        // needs history, even when the completed diff produced no rows.
-                        completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
-                    } else {
-                        let batch = metadata_batch(&node, current_position, false, 1, checkpoint_active, conversation_id.as_deref())?;
-                        let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;
-                        emitted += 1;
-                        yield batch.project(&indices)?;
-                    }
-                }
-            };
-            let stream = stream.map_err(move |error| {
-                lix_error_to_datafusion_error(
-                    crate::tracked_state::NativeMetadataRef::annotate_history_demand(
-                        datafusion_error_to_lix_error(error),
-                        include_state_headers,
-                    ),
-                )
-            });
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                stream_schema,
-                stream,
-            )))
-        });
+                    };
+                    let stream = stream.map_err(move |error| {
+                        lix_error_to_datafusion_error(
+                            crate::tracked_state::NativeMetadataRef::annotate_history_demand(
+                                datafusion_error_to_lix_error(error),
+                                include_state_headers,
+                            ),
+                        )
+                    });
+                    Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        stream_schema,
+                        stream,
+                    )))
+                })
+            })
+        };
+        let source = build_source(None);
+        let source = if can_rebind_fetch {
+            let rebind = Arc::clone(&build_source);
+            source.with_fetch_rebind(move |fetch| rebind(fetch))
+        } else {
+            source
+        };
         Ok(PlannedScan {
             schema,
             source,
@@ -504,40 +833,47 @@ pub(crate) fn relation_history_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Project retirement at the query anchor without changing internal commit identity.
-async fn checkpoint_retired_at<S: StorageAdapterRead + Clone + Send + Sync + 'static>(
-    store: S,
-    anchor: CommitId,
-    checkpoint: CommitId,
+fn checkpoint_retired_from_row(
+    row: Option<crate::tracked_state::MaterializedTrackedStateRowRef<'_>>,
 ) -> std::result::Result<bool, crate::LixError> {
-    use crate::tracked_state::{TrackedStateContext, TrackedStateKey};
-    let key = TrackedStateKey {
-        schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
-        file_id: None,
-        row_pk: crate::row_pk::RowPk::uuid_from_canonical(&checkpoint.to_string())
-            .map_err(|error| crate::LixError::unknown(error.to_string()))?,
-    };
-    let rows = TrackedStateContext::new()
-        .reader(store)
-        .load_projected_batch_at_commit(
-            &anchor.to_string(),
-            &[key],
-            &crate::changelog::ChangeRecordProjection::from_columns(&["snapshot_content".into()]),
-        )
-        .await?;
-    let Some(snapshot) = rows
-        .row(0)
+    let Some(snapshot) = row
         .filter(|row| !row.deleted())
         .and_then(|row| row.snapshot_content())
     else {
         return Ok(false);
     };
     #[derive(serde::Deserialize)]
-    struct RetirementSnapshot { state: RetirementState }
+    struct RetirementSnapshot {
+        state: RetirementState,
+    }
     #[derive(serde::Deserialize)]
-    struct RetirementState { retired: bool }
+    struct RetirementState {
+        retired: bool,
+    }
     let value: RetirementSnapshot = serde_json::from_str(snapshot.as_str()).map_err(|error| {
         crate::LixError::unknown(format!("invalid checkpoint retirement state: {error}"))
     })?;
     Ok(value.state.retired)
+}
+
+#[inline]
+fn record_checkpoint_retirement_work(keys: usize) {
+    #[cfg(test)]
+    CHECKPOINT_RETIREMENT_WORK.with(|work| {
+        let (batches, total_keys) = work.get();
+        work.set((batches + 1, total_keys + keys));
+    });
+    #[cfg(not(test))]
+    let _ = keys;
+}
+
+#[inline]
+fn record_log_metadata_batch(rows: usize) {
+    #[cfg(test)]
+    MAINLINE_METADATA_WORK.with(|work| {
+        let (batches, total_rows) = work.get();
+        work.set((batches + 1, total_rows + rows));
+    });
+    #[cfg(not(test))]
+    let _ = rows;
 }

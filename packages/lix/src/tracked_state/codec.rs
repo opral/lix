@@ -1158,6 +1158,7 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
         deleted: value.deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
+        semantic_fingerprint: value.semantic_fingerprint,
     })
 }
 
@@ -1176,6 +1177,7 @@ pub(crate) fn encode_value_ref_into(out: &mut Vec<u8>, value: TrackedStateIndexV
         value.deleted,
         value.created_at.packed(),
         value.updated_at.packed(),
+        value.semantic_fingerprint,
     );
     let author_len = u16::try_from(value.author_id.len())
         .expect("author account id must fit the tracked-state value bound");
@@ -1222,9 +1224,9 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixE
 fn decode_value_view_with_author_presence(
     bytes: &[u8],
 ) -> Result<(TrackedStateIndexValueRef<'_>, bool), LixError> {
-    if !(VALUE_STATE_TAIL_START + 1..=VALUE_MAX_BYTES).contains(&bytes.len()) {
+    if !(VALUE_LEGACY_MIN_BYTES..=VALUE_MAX_BYTES).contains(&bytes.len()) {
         return Err(value_codec_error(format!(
-            "has {} bytes; expected {VALUE_MIN_BYTES}..={VALUE_MAX_BYTES}",
+            "has {} bytes; expected {VALUE_LEGACY_MIN_BYTES}..={VALUE_MAX_BYTES}",
             bytes.len(),
         )));
     }
@@ -1239,7 +1241,7 @@ fn decode_value_view_with_author_presence(
             .expect("fixed commit-id slice"),
     ));
     let mut offset = VALUE_STATE_TAIL_START;
-    let (deleted, created_at_packed, updated_at_packed) =
+    let (deleted, created_at_packed, updated_at_packed, semantic_fingerprint) =
         read_value_tail_fields(bytes, &mut offset, "tracked-state value")?;
     let optional_author = read_optional_value_author(bytes, &mut offset, "tracked-state value")?;
     let author_present = optional_author.is_some();
@@ -1261,6 +1263,7 @@ fn decode_value_view_with_author_presence(
             deleted,
             created_at,
             updated_at,
+            semantic_fingerprint,
         },
         author_present,
     ))
@@ -1275,7 +1278,7 @@ fn read_value_tail_fields(
     bytes: &[u8],
     offset: &mut usize,
     context: &str,
-) -> Result<(bool, u64, u64), LixError> {
+) -> Result<(bool, u64, u64, Option<[u8; 32]>), LixError> {
     let tag = *bytes.get(*offset).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -1284,7 +1287,20 @@ fn read_value_tail_fields(
     })?;
     *offset += 1;
     let deleted = tag & VALUE_TAIL_DELETED != 0;
-    let code = tag & VALUE_TAIL_CODE_MASK;
+    let tag_code = tag & VALUE_TAIL_CODE_MASK;
+    let fingerprinted = tag_code == VALUE_TAIL_FINGERPRINT;
+    let code = if fingerprinted {
+        let code = *bytes.get(*offset).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{context} fingerprinted state tail is truncated"),
+            )
+        })?;
+        *offset += 1;
+        code
+    } else {
+        tag_code
+    };
     let (created_width, updated_width, equal) = match code {
         0..=VALUE_TIMESTAMP_MAX_WIDTH => (usize::from(code), 0, true),
         VALUE_TAIL_DISTINCT_MIN..=VALUE_TAIL_DISTINCT_MAX => {
@@ -1314,10 +1330,34 @@ fn read_value_tail_fields(
             format!("{context} uses the distinct timestamp form for equal values"),
         ));
     }
-    Ok((deleted, created_at, updated_at))
+    let semantic_fingerprint = if fingerprinted {
+        let end = offset.checked_add(32).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{context} fingerprint width overflows usize"),
+            )
+        })?;
+        let encoded = bytes.get(*offset..end).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{context} semantic fingerprint is truncated"),
+            )
+        })?;
+        *offset = end;
+        Some(encoded.try_into().expect("fixed semantic fingerprint"))
+    } else {
+        None
+    };
+    Ok((deleted, created_at, updated_at, semantic_fingerprint))
 }
 
-fn write_value_tail(out: &mut Vec<u8>, deleted: bool, created_at: u64, updated_at: u64) {
+fn write_value_tail(
+    out: &mut Vec<u8>,
+    deleted: bool,
+    created_at: u64,
+    updated_at: u64,
+    semantic_fingerprint: Option<[u8; 32]>,
+) {
     let created_width = minimal_timestamp_width(created_at);
     let updated_width = minimal_timestamp_width(updated_at);
     let created_width_code =
@@ -1331,6 +1371,16 @@ fn write_value_tail(out: &mut Vec<u8>, deleted: bool, created_at: u64, updated_a
             + created_width_code * VALUE_TIMESTAMP_WIDTH_COUNT
             + updated_width_code
     };
+    if let Some(semantic_fingerprint) = semantic_fingerprint {
+        out.push(VALUE_TAIL_FINGERPRINT | (u8::from(deleted) * VALUE_TAIL_DELETED));
+        out.push(code);
+        out.extend_from_slice(&created_at.to_le_bytes()[..created_width]);
+        if created_at != updated_at {
+            out.extend_from_slice(&updated_at.to_le_bytes()[..updated_width]);
+        }
+        out.extend_from_slice(&semantic_fingerprint);
+        return;
+    }
     out.push(code | (u8::from(deleted) * VALUE_TAIL_DELETED));
     out.extend_from_slice(&created_at.to_le_bytes()[..created_width]);
     if created_at != updated_at {
@@ -1402,6 +1452,7 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
         deleted,
         created_at,
         updated_at,
+        semantic_fingerprint,
     } = value;
     TrackedStateIndexValue {
         change_id,
@@ -1410,6 +1461,7 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
         deleted,
         created_at,
         updated_at,
+        semantic_fingerprint,
     }
 }
 
@@ -1431,9 +1483,13 @@ const VALUE_STATE_TAIL_START: usize = 32;
 const VALUE_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 2 + 1;
 const VALUE_LEGACY_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1;
 const AUTHOR_ID_MAX_BYTES: usize = 256;
-const VALUE_MAX_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 8 + 8 + 2 + AUTHOR_ID_MAX_BYTES;
+const VALUE_MAX_BYTES: usize = VALUE_STATE_TAIL_START + 2 + 8 + 8 + 32 + 2 + AUTHOR_ID_MAX_BYTES;
 const VALUE_TAIL_DELETED: u8 = 0x80;
 const VALUE_TAIL_CODE_MASK: u8 = 0x7f;
+// Timestamp encodings occupy tags 0..=89. This extension tag preserves the
+// compact legacy layout for values without a fingerprint and marks the
+// additional 32 bytes for new authenticated semantic identities.
+const VALUE_TAIL_FINGERPRINT: u8 = 90;
 const VALUE_TIMESTAMP_MAX_WIDTH: u8 = 8;
 const VALUE_TIMESTAMP_WIDTH_COUNT: u8 = VALUE_TIMESTAMP_MAX_WIDTH + 1;
 const VALUE_TAIL_DISTINCT_MIN: u8 = VALUE_TIMESTAMP_WIDTH_COUNT;
@@ -1941,8 +1997,9 @@ fn decode_leaf_v5(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef, LixEr
         )?);
     }
     // Reconstructed keys can exceed their front-coded bytes, and dictionary
-    // refs can omit up to 33 bytes from each value. Cap the count contribution
-    // by the body size so corrupt metadata cannot force an unbounded reserve.
+    // refs can omit the full extended tail from each value. Cap the count
+    // contribution by the body size so corrupt metadata cannot force an
+    // unbounded reserve.
     let omitted_value_bytes = entry_count
         .min(body.len())
         .saturating_mul(VALUE_MAX_BYTES - VALUE_CHANGE_ID_END);
@@ -2608,6 +2665,7 @@ mod tests {
             tail & 1 != 0,
             u64::from(tail),
             u64::from(tail.wrapping_add(1)),
+            None,
         );
         append_author(&mut value, format!("account-{commit}").as_bytes());
         value
@@ -2666,7 +2724,7 @@ mod tests {
                 let mut value = Vec::new();
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
-                write_value_tail(&mut value, false, 7, 7);
+                write_value_tail(&mut value, false, 7, 7, None);
                 append_author(&mut value, b"author");
                 (format!("key-{ordinal:04}").into_bytes(), value)
             })
@@ -2692,7 +2750,7 @@ mod tests {
                 let mut value = Vec::new();
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
-                write_value_tail(&mut value, false, 9, 9);
+                write_value_tail(&mut value, false, 9, 9, None);
                 append_author(&mut value, b"author");
                 (format!("key-{ordinal}").into_bytes(), value)
             })
@@ -2719,7 +2777,7 @@ mod tests {
                 let mut value = Vec::new();
                 value.extend_from_slice(&change_id);
                 value.extend_from_slice(&commit_id);
-                write_value_tail(&mut value, false, 9, 9);
+                write_value_tail(&mut value, false, 9, 9, None);
                 append_author(&mut value, b"author");
                 (format!("key-{ordinal}").into_bytes(), value)
             })
@@ -2802,6 +2860,7 @@ mod tests {
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-01T00:00:00Z"),
+            semantic_fingerprint: None,
         });
         assert!((VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&encoded.len()));
         assert_eq!(&encoded[..16], change_id.as_uuid().as_bytes());
@@ -3013,7 +3072,7 @@ mod tests {
         bad_author_ref.extend_from_slice(&[0; 16]);
         bad_author_ref.push(0);
         bad_author_ref.extend_from_slice(&[0; 16]);
-        write_value_tail(&mut bad_author_ref, false, 0, 0);
+        write_value_tail(&mut bad_author_ref, false, 0, 0, None);
         bad_author_ref.push(1);
         assert!(decode_node_ref_for_leaf_tests(&bad_author_ref).is_err());
     }
@@ -3030,7 +3089,7 @@ mod tests {
         leaf.push(0);
         leaf.extend_from_slice(&[0x22; 16]);
         leaf.push(0);
-        write_value_tail(&mut leaf, false, 0, 0);
+        write_value_tail(&mut leaf, false, 0, 0, None);
         let NodeRefForLeafTests::Leaf(decoded) = decode_node_ref_for_leaf_tests(&leaf).unwrap()
         else {
             panic!("expected v82 leaf");
@@ -3051,7 +3110,7 @@ mod tests {
         direct.extend_from_slice(&[0x33; 16]);
         direct.extend_from_slice(&7_u32.to_be_bytes());
         direct.extend_from_slice(&[0, 0, 1, b'k', 0]);
-        write_value_tail(&mut direct, false, 0, 0);
+        write_value_tail(&mut direct, false, 0, 0, None);
         let NodeRefForLeafTests::Leaf(decoded) = decode_node_ref_for_leaf_tests(&direct).unwrap()
         else {
             panic!("expected v82 direct leaf");
@@ -3073,6 +3132,7 @@ mod tests {
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+            semantic_fingerprint: None,
         }
     }
 
@@ -3581,6 +3641,7 @@ mod tests {
             deleted: false,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+            semantic_fingerprint: None,
         };
 
         let encoded = encode_value(&value);
@@ -3596,6 +3657,7 @@ mod tests {
             deleted: true,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+            semantic_fingerprint: None,
         };
 
         let encoded = encode_value(&value);
@@ -3658,8 +3720,33 @@ mod tests {
         set_timestamps(&mut value, "3000-01-01T00:00:00Z", "3000-01-02T00:00:00Z");
         value.author_id = "a".repeat(AUTHOR_ID_MAX_BYTES);
         let far_future = encode_value(&value);
-        assert_eq!(far_future.len(), VALUE_MAX_BYTES);
+        assert_eq!(
+            far_future.len(),
+            VALUE_STATE_TAIL_START + 1 + 8 + 8 + 2 + AUTHOR_ID_MAX_BYTES
+        );
         assert_eq!(decode_value(&far_future).expect("far-future value"), value);
+    }
+
+    #[test]
+    fn value_and_leaf_roundtrip_semantic_fingerprint() {
+        let mut value = test_value("fingerprinted-commit", "fingerprinted-change");
+        value.semantic_fingerprint = Some([0xa5; 32]);
+        let encoded = encode_value(&value);
+        assert_eq!(decode_value(&encoded).expect("fingerprinted value"), value);
+        assert!(
+            decode_value(&encoded[..encoded.len() - 1]).is_err(),
+            "a truncated fingerprint must fail closed"
+        );
+
+        let encoded_leaf = encode_leaf_node(&[EncodedLeafEntry {
+            key: Bytes::from_static(b"fingerprinted-key"),
+            value: Bytes::from(encoded),
+        }]);
+        let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded_leaf).expect("leaf") else {
+            panic!("fingerprinted value leaf should decode as a leaf");
+        };
+        let stored = leaf.entry(0).expect("fingerprinted row");
+        assert_eq!(decode_value(stored.value).expect("stored value"), value);
     }
 
     #[test]
@@ -3675,6 +3762,7 @@ mod tests {
             deleted: compact.deleted,
             created_at: compact.created_at,
             updated_at: compact.updated_at,
+            semantic_fingerprint: None,
         });
         assert_eq!(compact_owned, compact_borrowed);
         assert_eq!(
@@ -3697,6 +3785,7 @@ mod tests {
             deleted: distinct.deleted,
             created_at: distinct.created_at,
             updated_at: distinct.updated_at,
+            semantic_fingerprint: None,
         });
         assert_eq!(distinct_owned, distinct_borrowed);
         assert_eq!(
@@ -3741,6 +3830,7 @@ mod tests {
                 deleted: false,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+                semantic_fingerprint: None,
             },
             TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("change-2"),
@@ -3749,6 +3839,7 @@ mod tests {
                 deleted: true,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+                semantic_fingerprint: None,
             },
             TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("change-3"),
@@ -3757,6 +3848,7 @@ mod tests {
                 deleted: false,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
+                semantic_fingerprint: None,
             },
         ];
 
@@ -3817,6 +3909,7 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    semantic_fingerprint: None,
                 },
             );
         }

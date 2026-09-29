@@ -11,7 +11,6 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 
 use crate::storage_adapter::{StorageSpace, StorageSpaceId, ValueSemantics};
-use crate::tracked_state::codec::decode_value;
 use crate::tracked_state::types::TrackedStateIndexValue;
 use crate::{LixError, storage_codec};
 
@@ -81,6 +80,7 @@ pub(crate) fn encode_current_state_data_part(
                     deleted: row.value.deleted,
                     created_at: row.value.created_at,
                     updated_at: row.value.updated_at,
+                    semantic_fingerprint: None,
                 },
             );
             // Rewrites may copy untouched rows from a v82 current-state part.
@@ -285,6 +285,7 @@ mod tests {
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
+                semantic_fingerprint: None,
             },
             author_present: true,
             metadata: None,
@@ -359,6 +360,7 @@ mod tests {
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
                 updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                semantic_fingerprint: None,
             },
             author_present: true,
             metadata: None,

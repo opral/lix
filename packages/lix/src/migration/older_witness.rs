@@ -362,8 +362,11 @@ struct V5 {
 fn commit(raw: &[u8]) -> Result<(crate::changelog::CommitRecord, bool), LixError> {
     use crate::changelog::CommitRecord;
     if let Ok(record) = crate::storage_codec::decode::<CommitRecord>("witness commit", raw)
-        && record.format_version == 7
+        && record.format_version == crate::changelog::COMMIT_RECORD_FORMAT_VERSION
     {
+        return Ok((record, false));
+    }
+    if let Some(record) = super::checkpoint_metadata::decode_v7(raw) {
         return Ok((record, false));
     }
     if let Some(record) = super::checkpoint_metadata::decode_v6(raw) {
@@ -375,7 +378,7 @@ fn commit(raw: &[u8]) -> Result<(crate::changelog::CommitRecord, bool), LixError
     }
     Ok((
         CommitRecord {
-            format_version: 7,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: old.commit_id,
             generation: old.generation,
             parent_commit_ids: old.parent_commit_ids,
@@ -386,6 +389,7 @@ fn commit(raw: &[u8]) -> Result<(crate::changelog::CommitRecord, bool), LixError
             created_at: old.created_at,
             touched_scope_digest: old.touched_scope_digest,
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
         },
         true,
     ))
@@ -663,6 +667,8 @@ fn descriptors<'a>(
                 "candidate checkpoint inventory differs from source checkpoint identities",
             ));
         }
+        let expected_summaries =
+            derive_source_first_parent_checkpoint_summaries(&commits, &checkpoint_ids)?;
         for (id, (mut expected, _)) in commits.clone() {
             expected.is_checkpoint = checkpoint_ids.contains(&id);
             let key = (
@@ -673,12 +679,23 @@ fn descriptors<'a>(
                 .get(&key)
                 .ok_or_else(|| failure("candidate dropped source commit"))?;
             let (actual, legacy) = commit(raw)?;
+            let expected_summary = expected_summaries
+                .get(&id)
+                .copied()
+                .ok_or_else(|| failure("source summary witness omitted a commit"))?;
+            if actual.first_parent_checkpoint_summary != expected_summary {
+                return Err(failure(format!(
+                    "candidate checkpoint summary differs from the source-derived witness for '{id}'"
+                )));
+            }
+            expected.first_parent_checkpoint_summary = expected_summary;
             if legacy || actual != expected {
                 return Err(failure(format!(
                     "candidate changed source commit descriptor {id}"
                 )));
             }
         }
+        verify_first_parent_checkpoint_summaries(target)?;
         if !logical_amendment
             && target
                 .keys()
@@ -773,6 +790,137 @@ fn descriptors<'a>(
         target_read.finish()?;
         Ok(())
     })
+}
+
+/// Independently validate the format-83 summary field against candidate
+/// first-parent topology. The summary is derived migration metadata, so it is
+/// excluded from source descriptor equality but may not be accepted on trust.
+fn verify_first_parent_checkpoint_summaries(records: &Records) -> Result<(), LixError> {
+    let mut commits = BTreeMap::<crate::changelog::CommitId, crate::changelog::CommitRecord>::new();
+    for ((space, key), raw) in records {
+        if *space != crate::changelog::COMMIT_SPACE.id.0 {
+            continue;
+        }
+        let (record, legacy) = commit(raw)?;
+        if legacy || record.format_version != crate::changelog::COMMIT_RECORD_FORMAT_VERSION {
+            return Err(failure(
+                "candidate commit descriptor did not reach current format",
+            ));
+        }
+        if key.as_ref() != record.commit_id.as_uuid().as_bytes() {
+            return Err(failure("candidate commit key differs from identity"));
+        }
+        if commits.insert(record.commit_id, record).is_some() {
+            return Err(failure("candidate contains duplicate commit identity"));
+        }
+    }
+
+    let mut ordered = commits
+        .values()
+        .map(|record| (record.generation, record.commit_id))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let mut verified =
+        BTreeMap::<crate::changelog::CommitId, crate::changelog::CommitRecord>::new();
+    for (_, commit_id) in ordered {
+        let record = &commits[&commit_id];
+        let parent_id = record.parent_commit_ids.first().copied();
+        let parent_record = parent_id.and_then(|parent_id| commits.get(&parent_id));
+        if let (Some(parent_id), Some(parent_record)) = (parent_id, parent_record)
+            && parent_record.generation >= record.generation
+        {
+            return Err(failure(format!(
+                "candidate first parent '{parent_id}' does not precede '{commit_id}'"
+            )));
+        }
+        let parent = parent_id.and_then(|parent_id| verified.get(&parent_id));
+        let mut expected = crate::changelog::derive_first_parent_checkpoint_summary(
+            &record.parent_commit_ids,
+            parent,
+        )?;
+        if let Some(target_id) = expected.and_then(|summary| summary.previous_checkpoint_id) {
+            match commits.get(&target_id) {
+                Some(target) if !target.is_checkpoint => {
+                    return Err(failure(format!(
+                        "candidate summary target '{target_id}' is not a checkpoint"
+                    )));
+                }
+                None => expected = None,
+                Some(_) => {}
+            }
+        }
+        if record.first_parent_checkpoint_summary != expected {
+            return Err(failure(format!(
+                "candidate first-parent checkpoint summary is not source-derived for '{commit_id}'"
+            )));
+        }
+        verified.insert(commit_id, record.clone());
+    }
+    Ok(())
+}
+
+/// Derive the expected format-83 summaries from source commit descriptors,
+/// before comparing any candidate descriptor. In particular, a source
+/// boundary whose first parent is absent must stay unknown even if the
+/// candidate claims a useful-looking hint.
+fn derive_source_first_parent_checkpoint_summaries(
+    source: &BTreeMap<crate::changelog::CommitId, (crate::changelog::CommitRecord, bool)>,
+    checkpoint_ids: &std::collections::BTreeSet<crate::changelog::CommitId>,
+) -> Result<
+    BTreeMap<crate::changelog::CommitId, Option<crate::changelog::FirstParentCheckpointSummary>>,
+    LixError,
+> {
+    let mut commits = source
+        .iter()
+        .map(|(id, (record, _))| {
+            let mut record = record.clone();
+            record.is_checkpoint = checkpoint_ids.contains(id);
+            (*id, record)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered = commits
+        .values()
+        .map(|record| (record.generation, record.commit_id))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let mut summaries = BTreeMap::new();
+    let mut verified =
+        BTreeMap::<crate::changelog::CommitId, crate::changelog::CommitRecord>::new();
+    for (_, commit_id) in ordered {
+        let record = &commits[&commit_id];
+        let parent_id = record.parent_commit_ids.first().copied();
+        let parent_record = parent_id.and_then(|parent_id| commits.get(&parent_id));
+        if let (Some(parent_id), Some(parent_record)) = (parent_id, parent_record)
+            && parent_record.generation >= record.generation
+        {
+            return Err(failure(format!(
+                "source first parent '{parent_id}' does not precede '{commit_id}'"
+            )));
+        }
+        let parent = parent_id.and_then(|parent_id| verified.get(&parent_id));
+        let mut summary = crate::changelog::derive_first_parent_checkpoint_summary(
+            &record.parent_commit_ids,
+            parent,
+        )?;
+        if let Some(target_id) = summary.and_then(|summary| summary.previous_checkpoint_id) {
+            match commits.get(&target_id) {
+                Some(target) if !target.is_checkpoint => {
+                    return Err(failure(format!(
+                        "source summary target '{target_id}' is not a checkpoint"
+                    )));
+                }
+                None => summary = None,
+                Some(_) => {}
+            }
+        }
+        summaries.insert(commit_id, summary);
+        commits
+            .get_mut(&commit_id)
+            .expect("source record remains present")
+            .first_parent_checkpoint_summary = summary;
+        verified.insert(commit_id, commits[&commit_id].clone());
+    }
+    Ok(summaries)
 }
 
 #[cfg(test)]

@@ -78,6 +78,7 @@ where
                 record.commit_id,
                 CommitGraphNode {
                     is_checkpoint: record.is_checkpoint,
+                    first_parent_checkpoint_summary: record.first_parent_checkpoint_summary,
                     commit_id: record.commit_id,
                     change_id: record.change_id(),
                     account_id: record.account_id,

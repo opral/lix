@@ -256,6 +256,15 @@ pub(crate) fn materialize_known_change_payloads_in_order(
         ));
     }
 
+    #[cfg(all(test, feature = "storage-benches"))]
+    if projection.snapshot_content {
+        let rows = plans
+            .iter()
+            .filter(|(_, _, _, decoded_snapshot)| decoded_snapshot.is_some())
+            .count();
+        crate::sql_profile::record_derived_snapshot_content_rows(rows);
+    }
+
     plans
         .into_iter()
         .map(

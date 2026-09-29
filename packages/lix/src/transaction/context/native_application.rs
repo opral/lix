@@ -1344,6 +1344,7 @@ fn native_file_lifecycle_pick(
             deleted: row.deleted(),
             created_at: row.created_at(),
             updated_at: row.updated_at(),
+            semantic_fingerprint: None,
             author_id: row.author_id().to_owned(),
             author_present: true,
         },

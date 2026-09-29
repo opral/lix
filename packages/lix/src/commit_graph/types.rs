@@ -26,6 +26,8 @@ pub(crate) struct CommitGraphChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphNode {
     pub(crate) is_checkpoint: bool,
+    pub(crate) first_parent_checkpoint_summary:
+        Option<crate::changelog::FirstParentCheckpointSummary>,
     pub(crate) commit_id: CommitId,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,

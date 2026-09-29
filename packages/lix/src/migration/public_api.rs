@@ -220,6 +220,9 @@ where
         if before.role != RepositoryRole::PartialReplica {
             Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
         }
+        let read = super::MigrationPlanningRead::new(&adapter).await?;
+        super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+        read.finish()?;
         (
             "v79-canonical-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
@@ -239,20 +242,25 @@ where
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         // A current-format authority capability upgrade does not rebuild
         // storage indexes; project only mutations the migration will execute.
-        if before.format.is_some_and(|version| version <= 81) {
+        if before.format.is_some_and(|format| format <= 81) {
             Box::pin(super::hot_indexes::append_plan(
                 &adapter, options, &mut plan,
             ))
             .await?;
         }
-        if before.format.is_some_and(|version| version <= 82) {
+        if before.format.is_some_and(|format| format <= 82) {
             Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
+        }
+        if before.format.is_some_and(|format| format <= 83) {
+            let read = super::MigrationPlanningRead::new(&adapter).await?;
+            super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+            read.finish()?;
         }
         (
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82)) {
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84)) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let mut plan = super::publish::PublicationPlan::bounded(
             options.max_changes,
@@ -261,21 +269,24 @@ where
         let read = super::MigrationPlanningRead::new(&adapter).await?;
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         read.finish()?;
-        if before.format != Some(82) {
+        if before.format.is_some_and(|format| format <= 81) {
             Box::pin(super::hot_indexes::append_plan(
                 &adapter, options, &mut plan,
             ))
             .await?;
         }
-        if before.role != RepositoryRole::PartialReplica {
+        if before.format.is_some_and(|format| format <= 82)
+            && before.role != RepositoryRole::PartialReplica
+        {
             Box::pin(super::author_storage::append_plan(&adapter, &mut plan)).await?;
         }
+        if before.format.is_some_and(|format| format <= 83) {
+            let read = super::MigrationPlanningRead::new(&adapter).await?;
+            super::first_parent_checkpoints::append_plan(&read, options, &mut plan).await?;
+            read.finish()?;
+        }
         (
-            if before.format == Some(82) {
-                "v83-author-storage-plan-v1"
-            } else {
-                "v82-hot-index-plan-v1"
-            },
+            "v85-migration-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -348,7 +359,7 @@ where
 
 /// Domain-separated digest of every logical persisted record except the format
 /// marker and mutation revision. Derived index changes are projected through
-/// a source-derived bounded v82 rebuild plan.
+/// source-derived bounded migration plans.
 /// Includes pending operations, blobs, history, and all deduplication receipts.
 pub(super) async fn content_digest<S>(storage: &S) -> Result<String, LixError>
 where
@@ -451,7 +462,7 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
 
-    async fn expected_v82_digest<S>(storage: &S) -> String
+    async fn expected_v85_digest<S>(storage: &S) -> String
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
@@ -466,6 +477,16 @@ mod tests {
         super::super::hot_indexes::append_plan(&adapter, options, &mut plan)
             .await
             .unwrap();
+        super::super::author_storage::append_plan(&adapter, &mut plan)
+            .await
+            .unwrap();
+        let read = super::super::MigrationPlanningRead::new(&adapter)
+            .await
+            .unwrap();
+        super::super::first_parent_checkpoints::append_plan(&read, options, &mut plan)
+            .await
+            .unwrap();
+        read.finish().unwrap();
         content_digest_with_plan(storage, Some(plan)).await.unwrap()
     }
 
@@ -487,7 +508,7 @@ mod tests {
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
-        let before = expected_v82_digest(&storage).await;
+        let before = expected_v85_digest(&storage).await;
         let inspection = inspect_repository(storage.clone()).await.unwrap();
         assert_eq!(inspection.format, Some(80));
         assert!(!inspection.current);
@@ -584,7 +605,7 @@ mod tests {
         );
         lix.close().await.unwrap();
 
-        let before = expected_v82_digest(&storage).await;
+        let before = expected_v85_digest(&storage).await;
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
@@ -679,8 +700,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v79_to_v81_migration_preserves_admission_and_resident_records_offline() {
-        for format in [79, 80, 81] {
+    async fn partial_v79_to_v85_migration_preserves_admission_and_resident_records_offline() {
+        for format in [79, 80, 81, 82, 83, 84] {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
                 format!("https://example.test/lix/{}", authority.lix_id()),
@@ -706,13 +727,16 @@ mod tests {
                 .unwrap()
                 .remove("archivedBranchIds");
             let mut writes = installed.adapter.new_write_set();
-            // A sparse cache cannot certify whole-collection completeness. The
-            // upgrade retires all old index records without requesting hydration.
-            writes.put(
-                crate::hot_state::INDEX_SPACE,
-                b"old-untrusted-index".as_slice(),
-                b"partial-cache".as_slice(),
-            );
+            if format <= 81 {
+                // A sparse cache cannot certify whole-collection completeness.
+                // The v79-v81 upgrade retires old index records without
+                // requesting hydration; v82 through v85 preserve it.
+                writes.put(
+                    crate::hot_state::INDEX_SPACE,
+                    b"old-untrusted-index".as_slice(),
+                    b"partial-cache".as_slice(),
+                );
+            }
             writes.put(
                 crate::sync::PARTIAL_REPLICA_STATE_SPACE,
                 crate::sync::partial_replica_state_key(),
@@ -737,7 +761,9 @@ mod tests {
                     .is_err()
             );
             assert_ne!(content_digest(&storage).await.unwrap(), expected);
-            let report = migrate_repository(storage.clone()).await.unwrap();
+            let report = migrate_repository(storage.clone())
+                .await
+                .unwrap_or_else(|error| panic!("format {format} migration failed: {error:?}"));
             assert!(report.semantic_preservation_verified);
             assert_eq!(report.expected_content_digest, report.after_content_digest);
             assert_eq!(report.after_content_digest, expected);
@@ -754,6 +780,65 @@ mod tests {
                 .unwrap();
             assert_eq!(admitted.state, state);
         }
+    }
+
+    #[tokio::test]
+    async fn partial_v82_journal_v2_requires_rebootstrap_without_publishing_candidate() {
+        let authority = crate::open_lix().await.unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            authority.active_account_id().to_owned(),
+            "00000000-0000-7000-8000-000000000599".into(),
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap();
+        authority.close().await.unwrap();
+        let storage = StorageSession::acquire(crate::sync::durable_memory_for_test(crate::Memory::new()))
+            .await
+            .unwrap();
+        let installed = super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
+            .await
+            .unwrap();
+        let journal_key = crate::storage_codec::id_string::uuid_bytes_from_canonical(
+            state.epoch_id(),
+        )
+        .unwrap();
+        let mut writes = installed.adapter.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            journal_key.as_slice(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "epochId": state.epoch_id(),
+                "recipes": [{
+                    "kind": "filesystem_paths",
+                    "file_ids": ["selected-file"],
+                    "branch_ids": [state.descriptor().selected_branch.branch_id],
+                    "include_blob_refs": false,
+                    "cache_small_blob_data": false
+                }],
+            }))
+            .unwrap(),
+        );
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = installed
+            .adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
+        super::super::epoch::stage_repository_format_for_test(&storage, true, 82)
+            .await
+            .unwrap();
+        let before = content_digest(&storage).await.unwrap();
+        let error = migrate_repository(storage.clone()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("fresh partial-replica bootstrap"),
+            "the hard cut must explain recovery: {error}"
+        );
+        assert_eq!(inspect_repository(storage.clone()).await.unwrap().format, Some(82));
+        assert_eq!(content_digest(&storage).await.unwrap(), before);
     }
 
     #[tokio::test]

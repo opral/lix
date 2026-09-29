@@ -20,7 +20,7 @@ mod file;
 mod mainline;
 pub(crate) use mainline::relation_history_schema;
 #[cfg(test)]
-pub(crate) use mainline::take_mainline_work;
+pub(crate) use mainline::{take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work};
 pub(crate) fn log_schema() -> datafusion::arrow::datatypes::SchemaRef {
     mainline::metadata_schema(false)
 }

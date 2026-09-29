@@ -198,6 +198,7 @@ pub fn append_ordered_commits(
         let commit_id = CommitId::with_change_address_space(ordered_bench_uuid(commit_index, 0));
         append.commits.push(CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
@@ -233,6 +234,7 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
             super::next_first_parent_jump(commit_id, &parent_commit_ids, parent, parent_jump)?;
         append.commits.push(CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id,
@@ -535,6 +537,7 @@ fn direct_append_with_shape(
         }
         append.commits.push(CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             commit_id: typed_commit_id,

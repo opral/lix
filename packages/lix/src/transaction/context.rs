@@ -13563,6 +13563,26 @@ impl<R> FilesystemPathIndexReader for TransactionReadHotStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + Send + 'static,
 {
+    fn prefer_direct_exact_content(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_content(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_content(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_content(branch_ids, file_id);
+    }
+
+    fn prefer_direct_exact_path(&self, branch_ids: &[String], file_id: &str) -> bool {
+        self.filesystem_path_index_cache
+            .prefer_direct_exact_path(branch_ids, file_id)
+    }
+
+    fn record_direct_exact_path(&self, branch_ids: &[String], file_id: &str) {
+        self.filesystem_path_index_cache
+            .record_direct_exact_path(branch_ids, file_id);
+    }
+
     fn historical_cache(&self) -> Option<Arc<crate::filesystem::HistoricalPathIndexCache>> {
         Some(self.filesystem_path_index_cache.historical.clone())
     }
@@ -13589,8 +13609,11 @@ where
         {
             return Ok(index);
         }
-        let rows =
-            overlay_scan_batch(&self.base, &self.staged, &request.hot_state_request()).await?;
+        // Use the generic scoped row builder over this reader so file-ID
+        // selection and directory ancestry both see the staged transaction
+        // overlay. Building from `hot_state_request()` directly drops the
+        // request's file_ids and widens point reads back to the entire branch.
+        let rows = crate::filesystem::read_path_index_rows(self, request).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
