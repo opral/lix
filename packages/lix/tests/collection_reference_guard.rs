@@ -58,13 +58,14 @@ async fn collection_census(
         .get::<i64>("n")?;
     assert_eq!(after, 0);
     println!(
-        "mode={mode} rows={n} affected={} elapsed_ms={:.3} point_keys={} scan_starts={} scan_pages={} scan_rows={} written_bytes={}",
+        "mode={mode} rows={n} affected={} elapsed_ms={:.3} point_keys={} scan_starts={} scan_pages={} scan_rows={} written_records={} written_bytes={}",
         result.rows_affected(),
         elapsed.as_secs_f64() * 1000.,
         reads.point_keys,
         reads.scan_starts,
         reads.scan_pages,
         reads.scan_rows,
+        reads.written_records,
         reads.written_bytes
     );
     db.close().await?;
@@ -76,8 +77,10 @@ async fn empty_reference_declarations_preserve_collection_marker_delete() -> Res
     for n in [100, 2000] {
         let plain = collection_census("plain", n).await?;
         let empty = collection_census("empty_row_ref", n).await?;
+        // A bounded number of checkpoint bookkeeping records may differ between
+        // independently initialized repositories. Per-row tombstones grow with n.
         assert!(
-            empty.written_bytes <= plain.written_bytes + 2048,
+            empty.written_records <= plain.written_records + 4,
             "empty source caused row tombstones: plain={plain:?}, empty={empty:?}"
         );
         assert!(
