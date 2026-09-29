@@ -718,6 +718,74 @@ mod tests {
                 .iter()
                 .all(|guard| matches!(guard, StoragePrecondition::KeyValueEquals { .. }))
         );
+        drop(read);
+        adapter
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                same,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("reinstalling identical native metadata must be idempotent");
+
+        // The append-only fence must still reject a write that carries a
+        // value-equality guard for the old bytes but stages different bytes.
+        let graph = response
+            .objects
+            .iter()
+            .find(|object| matches!(&object.address, NativeMetadataRef::CommitGraphRecord(_)))
+            .unwrap();
+        let mut changed_bytes = graph.bytes.clone();
+        changed_bytes[0] ^= 1;
+        let mut overwrite = adapter.new_write_set();
+        overwrite.put(
+            space(&graph.address),
+            key(&graph.address).unwrap(),
+            StorageValue {
+                bytes: Bytes::from(changed_bytes),
+            },
+        );
+        let overwrite_error = adapter
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                overwrite,
+                StorageWriteOptions {
+                    preconditions: vec![StoragePrecondition::KeyValueEquals {
+                        space: space(&graph.address),
+                        key: key(&graph.address).unwrap(),
+                        expected: Bytes::copy_from_slice(&graph.bytes),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("partial commit graph writes must remain append-only");
+        assert!(matches!(
+            overwrite_error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::PreconditionFailed(ref failures)
+            ) if failures.iter().any(|failure| failure.index == 2)
+        ));
+
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let graph_key = [key(&graph.address).unwrap()];
+        let stored = read
+            .get_many(&[StorageGetManyRequest {
+                space: space(&graph.address),
+                keys: &graph_key,
+                opts: StorageGetOptions::default(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.values,
+            [Some(StorageProjectedValue::FullValue(Bytes::copy_from_slice(
+                &graph.bytes
+            )))]
+        );
         let mut changed = response.clone();
         let graph = changed
             .objects

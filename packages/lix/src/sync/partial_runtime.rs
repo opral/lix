@@ -22,6 +22,11 @@ use super::runtime::{
 };
 use super::{SyncPhase, SyncTransport};
 
+// Metadata installs run synchronously on the serial demand worker. Retry brief
+// local CAS contention, but cap it so a deterministic failed guard cannot
+// retain the worker forever.
+const MAX_METADATA_INSTALL_PRECONDITION_RETRIES: usize = 8;
+
 pub(crate) async fn start_partial_runtime_with_engine<S>(
     storage: StorageAdapter<S>,
     state: Arc<PartialReplicaState>,
@@ -214,6 +219,7 @@ async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
     request: &NativeMetadataRequest,
     response: &super::native_metadata::NativeMetadataResponse,
 ) -> Result<(), LixError> {
+    let mut precondition_retries = 0;
     loop {
         let read = storage.begin_read(Default::default()).await?;
         // Retry local CAS contention only while these authenticated inputs
@@ -248,9 +254,18 @@ async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
         {
             Err(crate::storage_adapter::StorageWriteSetError::Storage(
                 crate::storage_adapter::StorageError::PreconditionFailed(_),
-            )) => {
+            )) if precondition_retries < MAX_METADATA_INSTALL_PRECONDITION_RETRIES => {
+                precondition_retries += 1;
                 sleep(Duration::from_millis(1)).await;
                 continue;
+            }
+            Err(crate::storage_adapter::StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::PreconditionFailed(_),
+            )) => {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "native metadata hydration exceeded its local precondition retry limit",
+                ));
             }
             result => return result.map(|_| ()).map_err(Into::into),
         }
@@ -2083,6 +2098,70 @@ mod tests {
             native_metadata_is_resident(&read, &state, &address)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_metadata_cas_contention_does_not_block_the_demand_queue() {
+        let (storage, state, transport, client, address) = fixture(false).await;
+        let memory = storage.storage().clone();
+        drop(storage);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let storage = StorageAdapter::new(ContendedMetadataStorage {
+            memory,
+            conflicts: Arc::new(AtomicUsize::new(usize::MAX)),
+            writes: writes.clone(),
+        });
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (first_response, first_done) = tokio::sync::oneshot::channel();
+        sender
+            .send(SyncDemand {
+                request: SyncDemandRequest::NativeMetadata(
+                    vec![address],
+                    LixError::unknown("missing metadata"),
+                ),
+                response: first_response,
+            })
+            .await
+            .unwrap();
+        let (second_response, second_done) = tokio::sync::oneshot::channel();
+        sender
+            .send(SyncDemand {
+                request: SyncDemandRequest::History(vec!["unsupported-history-demand".into()]),
+                response: second_response,
+            })
+            .await
+            .unwrap();
+
+        let worker = run_partial_worker(storage, state, transport, shutdown_rx, receiver);
+        let caller = async {
+            let first = tokio::time::timeout(Duration::from_secs(2), first_done)
+                .await
+                .expect("bounded metadata contention must release the demand worker")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(first.code, LixError::CODE_TRANSACTION_CONFLICT);
+
+            let second = tokio::time::timeout(Duration::from_secs(2), second_done)
+                .await
+                .expect("the worker must service the next queued demand")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(second.code, "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED");
+            shutdown.send_replace(SyncShutdown::Stop);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(worker, caller)
+        })
+        .await
+        .expect("the partial worker must stop after both demands settle");
+        result.unwrap();
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            MAX_METADATA_INSTALL_PRECONDITION_RETRIES + 1,
+            "retry budget counts the initial commit attempt plus each retry"
         );
     }
 

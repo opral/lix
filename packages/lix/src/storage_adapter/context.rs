@@ -385,10 +385,12 @@ where
             )));
         }
         if may_write_partial {
-            opts.preconditions.extend(
-                crate::sync::partial_serving::commit_graph_guards(&write_set)
-                    .map_err(StorageWriteSetError::Admission)?,
-            );
+            let graph_guards = crate::sync::partial_serving::commit_graph_guards(
+                &write_set,
+                &opts.preconditions,
+            )
+            .map_err(StorageWriteSetError::Admission)?;
+            opts.preconditions.extend(graph_guards);
         }
         if !may_write_partial {
             if write_set.has_mutations_in_space(crate::sync::PARTIAL_REPLICA_STATE_SPACE)
