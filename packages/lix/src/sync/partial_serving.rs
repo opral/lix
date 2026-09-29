@@ -35,6 +35,7 @@ pub(crate) fn has_coordinate_mutations(writes: &StorageWriteSet) -> bool {
         BRANCH_HEAD_CONTROL_SPACE,
         ROOT_CURRENT_BASE_SPACE,
         PARTIAL_SERVING_SPACE,
+        crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
     ]
     .into_iter()
     .any(|space| writes.has_mutations_in_space(space))
@@ -217,6 +218,7 @@ pub(crate) async fn prepare_write(
         BRANCH_HEAD_CONTROL_SPACE,
         ROOT_CURRENT_BASE_SPACE,
         PARTIAL_SERVING_SPACE,
+        crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
     ]
     .into_iter()
     .any(|space| writes.has_range_delete_in_space(space))
@@ -249,6 +251,27 @@ pub(crate) async fn prepare_write(
         // An existing witness is never silently repaired by a later write.
         // Missing witnesses are the sole legacy migration case.
         assert_admitted(read, previous).await?;
+    }
+    let mut retired_recovery_refs = Vec::new();
+    if writes.has_mutations_in_space(crate::gc::CHECKPOINT_RECOVERY_REF_SPACE) {
+        let allowed = [
+            crate::gc::recovery_ref_key(&state.descriptor().selected_branch.branch_id)?,
+            crate::gc::recovery_ref_key(&state.descriptor().global_branch.branch_id)?,
+        ];
+        for key in writes.declared_keys(crate::gc::CHECKPOINT_RECOVERY_REF_SPACE) {
+            if !allowed.contains(&key) {
+                let branch_id = crate::gc::recovery_ref_branch_id(&key)?;
+                let control_key = crate::branch::branch_head_control_key(&branch_id)?;
+                if !writes.staged_delete(crate::gc::CHECKPOINT_RECOVERY_REF_SPACE, &key)
+                    || !writes.staged_delete(BRANCH_HEAD_CONTROL_SPACE, &control_key)
+                {
+                    return Err(mismatch(
+                        "partial serving can retire an unrelated recovery ref only with its branch control",
+                    ));
+                }
+                retired_recovery_refs.push((branch_id, key));
+            }
+        }
     }
     if writes.has_deletions_in_space(
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
@@ -285,6 +308,35 @@ pub(crate) async fn prepare_write(
             key: super::partial_replica_state_key(),
         });
     }
+    for (branch_id, recovery_key) in retired_recovery_refs {
+        let control = crate::branch::observe_branch_control_coordinate(read, &branch_id).await?;
+        guards.push(crate::branch::branch_head_control_precondition(
+            &branch_id,
+            control.raw_token,
+        )?);
+        let recovery_storage_key = StorageKey(Bytes::from(recovery_key));
+        let prior_recovery = PointReadPlan::new(
+            crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+            std::slice::from_ref(&recovery_storage_key),
+        )
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+        guards.push(match prior_recovery {
+            Some(StorageProjectedValue::FullValue(bytes)) => StoragePrecondition::KeyValueEquals {
+                space: crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+                key: recovery_storage_key,
+                expected: bytes,
+            },
+            None => StoragePrecondition::KeyAbsent {
+                space: crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+                key: recovery_storage_key,
+            },
+            Some(_) => return Err(mismatch("partial serving recovery ref read omitted its value")),
+        });
+    }
     let mut staged = Vec::new();
     let mut visited = std::collections::BTreeSet::new();
     let all_branches = migrate_missing
@@ -296,11 +348,17 @@ pub(crate) async fn prepare_write(
         }
         let branch_key = crate::branch::branch_head_control_key(&branch.branch_id)?;
         let serving_key = key(&branch.branch_id)?;
+        let recovery_key = crate::gc::recovery_ref_key(&branch.branch_id)?;
+        let recovery_changed = writes.contains_put(
+            crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+            &recovery_key,
+        ) || writes.staged_delete(crate::gc::CHECKPOINT_RECOVERY_REF_SPACE, &recovery_key);
         if !all_branches
             && !writes.contains_put(BRANCH_HEAD_CONTROL_SPACE, &branch_key)
             && !writes.staged_delete(BRANCH_HEAD_CONTROL_SPACE, &branch_key)
             && !writes.contains_put(PARTIAL_SERVING_SPACE, &serving_key.0)
             && !writes.staged_delete(PARTIAL_SERVING_SPACE, &serving_key.0)
+            && !recovery_changed
         {
             continue;
         }
@@ -325,6 +383,48 @@ pub(crate) async fn prepare_write(
             && control.tracked_generation == state.serving_generation(&branch.branch_id)?;
         let old = load(read, &branch.branch_id).await?;
         let previous = old.as_ref().map(|(record, _)| record);
+        if recovery_changed {
+            let prior_head = previous
+                .ok_or_else(|| mismatch("partial serving recovery ref has no prior witness"))
+                .and_then(|prior| CommitId::parse_lix(&prior.head, "partial prior serving head"))?;
+            if writes.staged_delete(crate::gc::CHECKPOINT_RECOVERY_REF_SPACE, &recovery_key)
+                || !writes.contains_put(BRANCH_HEAD_CONTROL_SPACE, &branch_key)
+                || prior_head == control.head_commit_id
+                || !checkpoint_extends_prior(
+                    &overlay,
+                    &branch.branch_id,
+                    control.head_commit_id,
+                    prior_head,
+                )
+                .await?
+            {
+                return Err(mismatch(
+                    "partial serving recovery ref requires a certified checkpoint transition",
+                ));
+            }
+            let recovery_storage_key = StorageKey(Bytes::from(recovery_key));
+            let prior_recovery = PointReadPlan::new(
+                crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+                std::slice::from_ref(&recovery_storage_key),
+            )
+            .materialize(read, StorageGetOptions::default())
+            .await?
+            .value
+            .pop()
+            .flatten();
+            guards.push(match prior_recovery {
+                Some(StorageProjectedValue::FullValue(bytes)) => StoragePrecondition::KeyValueEquals {
+                    space: crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+                    key: recovery_storage_key,
+                    expected: bytes,
+                },
+                None => StoragePrecondition::KeyAbsent {
+                    space: crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+                    key: recovery_storage_key,
+                },
+                Some(_) => return Err(mismatch("partial serving recovery ref read omitted its value")),
+            });
+        }
         let stable_local_root = previous.is_some_and(|prior| {
             prior.local_root_owned
                 && prior.epoch_id == state.epoch_id()

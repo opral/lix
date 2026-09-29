@@ -221,6 +221,12 @@ struct CheckpointRecoveryRefKey<'a> {
     branch_id: &'a str,
 }
 
+#[derive(musli::Decode)]
+#[musli(packed)]
+struct OwnedCheckpointRecoveryRefKey {
+    branch_id: String,
+}
+
 #[derive(Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct StoredCheckpointRecoveryRef {
@@ -671,11 +677,23 @@ fn validate_checkpoint_gc_state(state: CheckpointGcState) -> Result<(), LixError
     Ok(())
 }
 
-fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
+pub(crate) fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode(
         "checkpoint recovery ref key",
         &CheckpointRecoveryRefKey { branch_id },
     )
+}
+
+pub(crate) fn recovery_ref_branch_id(key: &[u8]) -> Result<String, LixError> {
+    let decoded: OwnedCheckpointRecoveryRefKey =
+        storage_codec::decode("checkpoint recovery ref key", key)?;
+    if recovery_ref_key(&decoded.branch_id)? != key {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "checkpoint recovery ref key is not canonical",
+        ));
+    }
+    Ok(decoded.branch_id)
 }
 
 fn validate_stored_recovery_ref(

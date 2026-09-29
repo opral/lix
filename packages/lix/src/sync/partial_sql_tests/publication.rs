@@ -422,6 +422,81 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .unwrap()
         .unwrap();
     drop(read);
+    let active_commit_key = crate::changelog::commit_key(control.head_commit_id);
+    let mut delete_commit = storage.new_write_set();
+    delete_commit.delete(crate::changelog::COMMIT_SPACE, active_commit_key.as_slice());
+    let error: LixError = storage
+        .commit_write_set(delete_commit, Default::default())
+        .await
+        .expect_err("the admitted head cannot be point-deleted")
+        .into();
+    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+
+    let mut rewrite_commit = storage.new_write_set();
+    rewrite_commit.put(
+        crate::changelog::COMMIT_SPACE,
+        active_commit_key.as_slice(),
+        b"forged-parent".as_slice(),
+    );
+    storage
+        .commit_write_set(rewrite_commit, Default::default())
+        .await
+        .expect_err("the admitted head cannot be overwritten");
+
+    let mut rewrite_recovery = storage.new_write_set();
+    rewrite_recovery.put(
+        crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+        crate::gc::recovery_ref_key(branch_id).unwrap(),
+        b"forged-recovery".as_slice(),
+    );
+    let error: LixError = storage
+        .commit_write_set(rewrite_recovery, Default::default())
+        .await
+        .expect_err("recovery ref cannot change outside a checkpoint transition")
+        .into();
+    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+    let mut rewrite_other_recovery = storage.new_write_set();
+    rewrite_other_recovery.put(
+        crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
+        crate::gc::recovery_ref_key("00000000-0000-7000-8000-000000009999").unwrap(),
+        b"forged-other-recovery".as_slice(),
+    );
+    let error: LixError = storage
+        .commit_write_set(rewrite_other_recovery, Default::default())
+        .await
+        .expect_err("an unrelated recovery ref cannot bypass the serving gate")
+        .into();
+    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+    // Retiring an inactive branch removes its control and checkpoint recovery
+    // root together. The gate must admit that paired deletion.
+    let retired_branch = "00000000-0000-7000-8000-000000009998";
+    let mut seed = storage.new_write_set();
+    crate::branch::stage_branch_head_control(&mut seed, retired_branch, control).unwrap();
+    crate::gc::stage_recovery_ref_rotation(
+        &mut seed,
+        &crate::gc::CheckpointRecoveryRef {
+            branch_id: retired_branch.into(),
+            recovered_head_commit_id: control.head_commit_id,
+            checkpoint_commit_id: control.head_commit_id,
+            interval_has_commits: false,
+        },
+    )
+    .unwrap();
+    use crate::storage_adapter::StorageWrite as _;
+    let mut migration = storage.begin_migration_write(Default::default()).await.unwrap();
+    seed.lower_into(&mut migration).await.unwrap();
+    migration.commit().await.unwrap();
+    let mut retire = storage.new_write_set();
+    crate::branch::stage_delete_branch_head_control(&mut retire, retired_branch).unwrap();
+    crate::gc::stage_delete_recovery_ref(&mut retire, retired_branch).unwrap();
+    storage
+        .commit_write_set(retire, Default::default())
+        .await
+        .expect("paired inactive branch retirement must remain possible");
+    Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+        .await
+        .expect("rejected source rewrites preserve the admitted replica");
+
     let foreign_root =
         crate::changelog::CommitId::parse(&state.descriptor().global_branch.head.commit_id)
             .unwrap();
