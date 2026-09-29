@@ -237,10 +237,13 @@ mod tests {
             crate::sync::partial_replica_state_key(),
             b"unknown-partial-state".as_slice(),
         );
-        adapter
-            .commit_write_set(writes, Default::default())
-            .await
-            .unwrap();
+        // The fixture intentionally creates contradictory physical metadata.
+        // Ordinary admission must reject such a receipt; the migration writer
+        // seeds the historical layout that the upgrade must inspect.
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = adapter.begin_migration_write(Default::default()).await.unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
         drop(adapter);
         let error = upgrade_authority_for_partial_sync(storage.clone())
             .await
