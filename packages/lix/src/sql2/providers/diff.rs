@@ -1543,6 +1543,7 @@ fn diff_row(
         commit_id: row.commit_id(),
         semantic_fingerprint: None,
         author_id: row.author_id().to_owned(),
+        author_present: true,
     }
 }
 

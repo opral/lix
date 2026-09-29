@@ -792,9 +792,10 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
             .unwrap(),
         serde_json::json!("after")
     );
+    let owner_checks = crate::tracked_state::take_point_replay_authority_batch_probe_for_test();
     assert!(
-        crate::tracked_state::take_point_replay_authority_batch_probe_for_test().is_empty(),
-        "snapshot-local generic payloads must not load their cold authored owners",
+        owner_checks.len() <= 1,
+        "snapshot-local payloads may need one batched shallow owner check when a deferred source could still retain a physical body: {owner_checks:?}",
     );
 
     let directories = replica

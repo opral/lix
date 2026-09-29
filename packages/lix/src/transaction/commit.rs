@@ -36,7 +36,7 @@ use crate::tracked_state::{
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
-    encode_key_ref, load_authoritative_live_change_records, load_commit_delta_replay_metadata,
+    encode_key_ref, load_authoritative_selected_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1885,7 +1885,7 @@ async fn load_selected_change_records(
             updated_at: change_ref.updated_at,
         })
         .collect::<Vec<_>>();
-    let loaded = load_authoritative_live_change_records(read, &requests).await?;
+    let loaded = load_authoritative_selected_change_records(read, &requests).await?;
 
     let mut records = HashMap::new();
     for (change_ref, record) in change_refs.into_iter().zip(loaded) {
@@ -11785,6 +11785,18 @@ mod tests {
         row_pk: &str,
         source_commit_id: &str,
     ) -> StagedCommitChangeBatch {
+        selected_change_batch_for_id(
+            self::change_id(change_id),
+            row_pk,
+            commit_id(source_commit_id),
+        )
+    }
+
+    fn selected_change_batch_for_id(
+        change_id: ChangeId,
+        row_pk: &str,
+        source_commit_id: CommitId,
+    ) -> StagedCommitChangeBatch {
         let identity = crate::tracked_state::TrackedStateDiffIdentity::from_key(TrackedStateKey {
             schema_key: "test_schema".to_string(),
             file_id: None,
@@ -11793,8 +11805,8 @@ mod tests {
         let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
         batch.push(
             identity,
-            commit_id(source_commit_id),
-            self::change_id(change_id),
+            source_commit_id,
+            change_id,
             false,
             ts("2026-01-01T00:00:00Z"),
             ts("2026-01-01T00:00:00Z"),
@@ -11808,10 +11820,21 @@ mod tests {
         const CHANGE_COUNT: usize = 8;
         let storage = StorageAdapter::new(Memory::new());
         let timestamp = ts("2026-01-01T00:00:00Z");
+        let source_commit_ids = (0..CHANGE_COUNT)
+            .map(|index| commit_id(&format!("missing-fallback-owner-{index}")))
+            .collect::<Vec<_>>();
+        let change_ids = source_commit_ids
+            .iter()
+            .map(|commit_id| {
+                let mut bytes = *commit_id.as_uuid().as_bytes();
+                bytes[12..].copy_from_slice(&1_u32.to_be_bytes());
+                ChangeId::new(uuid::Uuid::from_bytes(bytes))
+            })
+            .collect::<Vec<_>>();
         let changes = (0..CHANGE_COUNT)
             .map(|index| ChangeRecord {
                 format_version: 2,
-                change_id: change_id(&format!("fallback-change-{index}")),
+                change_id: change_ids[index],
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                 schema_key: "test_schema".to_owned(),
                 row_pk: RowPk::single(format!("fallback-row-{index}")),
@@ -11830,9 +11853,10 @@ mod tests {
         ChangelogContext::new()
             .writer(&mut &read, &mut writes)
             .stage_certified_sparse_append(crate::changelog::ChangelogAppend {
-                commits: (0..CHANGE_COUNT)
-                    .map(|index| {
-                        let commit_id = commit_id(&format!("missing-fallback-owner-{index}"));
+                commits: source_commit_ids
+                    .iter()
+                    .copied()
+                    .map(|commit_id| {
                         CommitRecord {
                             is_checkpoint: false,
                             first_parent_checkpoint_summary: None,
@@ -11883,10 +11907,10 @@ mod tests {
             created_at: timestamp,
             selected_change_batches: (0..CHANGE_COUNT)
                 .map(|index| {
-                    selected_change_batch_from(
-                        &format!("fallback-change-{index}"),
+                    selected_change_batch_for_id(
+                        change_ids[index],
                         &format!("fallback-row-{index}"),
-                        &format!("missing-fallback-owner-{index}"),
+                        source_commit_ids[index],
                     )
                 })
                 .collect(),
@@ -11902,12 +11926,12 @@ mod tests {
             vec![CHANGE_COUNT],
             "all missing selected payloads must enter one physical changelog point batch",
         );
-        assert!(
-            owner_authority_batches
+        assert_eq!(
+            *owner_authority_batches
                 .lock()
-                .expect("owner authority batch counter lock")
-                .is_empty(),
-            "snapshot-local selected payloads must not probe their cold owner commits",
+                .expect("owner authority batch counter lock"),
+            vec![CHANGE_COUNT],
+            "same-source direct IDs need one batched authority check; missing owners must still use the local standalone batch",
         );
     }
 

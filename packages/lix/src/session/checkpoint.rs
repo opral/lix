@@ -320,6 +320,7 @@ mod tests {
                 commit_id: CommitId::for_test_label("checkpoint-canonicalized-commit"),
                 semantic_fingerprint: None,
                 author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                author_present: true,
             },
             TrackedStateDiffKind::Added,
         );
