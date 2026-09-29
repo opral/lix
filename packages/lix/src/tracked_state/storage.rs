@@ -8366,7 +8366,11 @@ fn hydrate_compact_replacement_direct_run(
                 file_id: key.file_id,
                 metadata,
                 snapshot: snapshot,
-                created_at: lifecycle.uniform_created_at,
+                // The lifecycle summary preserves the row's creation time,
+                // while a changelog record's `created_at` is the authored
+                // mutation time. The compact replacement authority carries
+                // that time separately.
+                created_at: authority.uniform_updated_at,
                 origin_key: None,
             },
         ));
