@@ -7688,7 +7688,13 @@ async fn load_direct_change_authority(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<DirectChangeAuthority, LixError> {
-    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+    classify_direct_change_authority(load_point_replay_commit_state(store, commit_id).await?)
+}
+
+fn classify_direct_change_authority(
+    state: Option<Arc<AuthenticatedReplayCommitStateManifest>>,
+) -> Result<DirectChangeAuthority, LixError> {
+    let Some(state) = state else {
         #[cfg(any(test, feature = "storage-benches"))]
         super::mutation_directory::record_direct_route_missing_commit(1);
         return Ok(DirectChangeAuthority::NotOwned(
@@ -8379,7 +8385,7 @@ pub(crate) fn load_change_records_by_ids<'a>(
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
     Box::pin(async move {
-        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, false, false, None).await?)
+        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, false, false, true).await?)
     })
 }
 
@@ -8388,19 +8394,18 @@ fn load_selected_change_records_by_ids<'a>(
     change_ids: &'a [crate::changelog::ChangeId],
 ) -> SelectedChangeRecordsFuture<'a> {
     Box::pin(async move {
-        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, true, false, None).await?)
+        require_all_selected_changes(load_change_records_by_ids_inner(store, change_ids, true, false, true).await?)
     })
 }
 
 fn load_selected_change_records_by_ids_optional<'a>(
     store: &'a (impl StorageAdapterRead + ?Sized),
     change_ids: &'a [crate::changelog::ChangeId],
-    standalone: Vec<Option<crate::changelog::ChangeRecord>>,
 ) -> futures_util::future::BoxFuture<
     'a,
     Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError>,
 > {
-    Box::pin(load_change_records_by_ids_inner(store, change_ids, true, true, Some(standalone)))
+    Box::pin(load_change_records_by_ids_inner(store, change_ids, true, true, false))
 }
 
 fn require_all_selected_changes(
@@ -8444,7 +8449,7 @@ async fn load_change_records_by_ids_inner(
     change_ids: &[crate::changelog::ChangeId],
     prefer_physical: bool,
     allow_missing: bool,
-    preloaded_standalone: Option<Vec<Option<crate::changelog::ChangeRecord>>>,
+    standalone_fallback: bool,
 ) -> Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
@@ -8452,9 +8457,7 @@ async fn load_change_records_by_ids_inner(
     // Self-contained sync checkpoints may carry selected payloads while the
     // authored commit body remains lazy. Prefer their canonical standalone
     // ChangeRecords before attempting commit-delta routing.
-    let mut standalone = if let Some(stored) = preloaded_standalone {
-        stored
-    } else {
+    let mut standalone = if standalone_fallback {
         ChangelogContext::new()
             .reader(store)
             .load_changes(ChangeLoadRequest { change_ids })
@@ -8462,13 +8465,28 @@ async fn load_change_records_by_ids_inner(
             .into_iter()
             .map(|(_, record)| record)
             .collect::<Vec<_>>()
+    } else {
+        vec![None; change_ids.len()]
     };
     let mut output = if prefer_physical {
         vec![None; change_ids.len()]
     } else {
         std::mem::take(&mut standalone)
     };
-    let mut authority_cache = BTreeMap::<CommitId, DirectChangeAuthority>::new();
+    let direct_commit_ids = change_ids
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| output[*index].is_none())
+        .filter_map(|(_, &change_id)| direct_change_locator(change_id).map(|locator| locator.commit_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let authority_cache = direct_commit_ids
+        .iter()
+        .copied()
+        .zip(load_point_replay_commit_states(store, &direct_commit_ids).await?)
+        .map(|(commit_id, state)| Ok((commit_id, classify_direct_change_authority(state)?)))
+        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
     let mut direct_by_commit = BTreeMap::<
         CommitId,
         (
@@ -8485,14 +8503,10 @@ async fn load_change_records_by_ids_inner(
             explicit.push((output_index, change_id));
             continue;
         };
-        let authority = match authority_cache.get(&locator.commit_id) {
-            Some(authority) => authority.clone(),
-            None => {
-                let authority = load_direct_change_authority(store, locator.commit_id).await?;
-                authority_cache.insert(locator.commit_id, authority.clone());
-                authority
-            }
-        };
+        let authority = authority_cache
+            .get(&locator.commit_id)
+            .expect("direct authority batch includes every candidate")
+            .clone();
         let authority = match authority {
             DirectChangeAuthority::Candidate(authority) => authority,
             DirectChangeAuthority::NotOwned(reason) => {
@@ -8564,7 +8578,7 @@ async fn load_change_records_by_ids_inner(
             if let Some(locator) = locator {
                 located_indices.push(output_index);
                 located.push(locator);
-            } else if prefer_physical && standalone[output_index].is_some() {
+            } else if prefer_physical && standalone_fallback && standalone[output_index].is_some() {
                 output[output_index] = standalone[output_index].take();
             } else {
                 unresolved.push((change_id, None));
@@ -8579,10 +8593,10 @@ async fn load_change_records_by_ids_inner(
                     output[output_index] = Some(record);
                 }
             }
-            // Old partial checkpoints may leave an explicit locator pointing
-            // at a selected row. Isolate that rare batch failure so a valid
-            // standalone payload can supply just the stale aliases.
-            Err(error) if prefer_physical && error.code == STALE_SELECTED_CHANGE_LOCATOR => {
+            // Isolate exceptional locator failures. An old selected alias or
+            // an intentionally deferred owner has no local authored payload;
+            // neither may suppress other valid physical records in the batch.
+            Err(_) if prefer_physical => {
                 for (output_index, locator) in located_indices.into_iter().zip(located) {
                     match Box::pin(load_explicit_change_records_at_locators(store, &[locator]))
                         .await
@@ -8590,7 +8604,19 @@ async fn load_change_records_by_ids_inner(
                         Ok(mut records) => output[output_index] = records.pop(),
                         Err(error)
                             if error.code == STALE_SELECTED_CHANGE_LOCATOR
-                                && (standalone[output_index].is_some() || allow_missing) =>
+                                && ((standalone_fallback && standalone[output_index].is_some())
+                                    || allow_missing) =>
+                        {
+                            output[output_index] = standalone[output_index].take();
+                        }
+                        Err(_)
+                            if (allow_missing || standalone[output_index].is_some())
+                                && load_deferred_commit_history(store, locator.commit_id)
+                                    .await?
+                                    .is_some()
+                                && load_point_replay_commit_state(store, locator.commit_id)
+                                    .await?
+                                    .is_none() =>
                         {
                             output[output_index] = standalone[output_index].take();
                         }
@@ -8601,7 +8627,7 @@ async fn load_change_records_by_ids_inner(
             Err(error) => return Err(error),
         }
     }
-    if prefer_physical {
+    if prefer_physical && standalone_fallback {
         for (record, fallback) in output.iter_mut().zip(standalone) {
             if record.is_none() {
                 *record = fallback;
@@ -10005,6 +10031,46 @@ pub(crate) struct AuthoritativeLiveChangeRequest {
     pub(crate) updated_at: crate::common::LixTimestamp,
 }
 
+async fn deferred_standalone_sources(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[AuthoritativeLiveChangeRequest],
+    standalone: &[Option<crate::changelog::ChangeRecord>],
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let source_ids = requests
+        .iter()
+        .zip(standalone)
+        .filter_map(|(request, record)| {
+            record
+                .as_ref()
+                .filter(|record| authoritative_live_change_matches(request, record))
+                .map(|_| request.source_commit_id)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if source_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let keys = source_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let values = PointReadPlan::new(TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut deferred = BTreeSet::new();
+    for (commit_id, value) in source_ids.into_iter().zip(values.value) {
+        if let Some(value) = value {
+            let bytes = full_value_bytes(value).ok_or_else(|| {
+                replacement_payload_error("deferred-history marker read omitted payload")
+            })?;
+            decode_deferred_commit_history(commit_id, &bytes)?;
+            deferred.insert(commit_id);
+        }
+    }
+    Ok(deferred)
+}
+
 /// Commit selection must use the immutable authored payload when it is local.
 /// A standalone changelog row may be a stale projection of that payload; it
 /// remains a fallback for self-contained sparse checkpoints.
@@ -10012,86 +10078,7 @@ pub(crate) async fn load_authoritative_selected_change_records(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[AuthoritativeLiveChangeRequest],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
-    let change_ids = requests
-        .iter()
-        .map(|request| request.change_id)
-        .collect::<Vec<_>>();
-    let standalone = ChangelogContext::new()
-        .reader(store)
-        .load_changes(ChangeLoadRequest {
-            change_ids: &change_ids,
-        })
-        .await?
-        .into_iter()
-        .map(|(_, record)| record)
-        .collect::<Vec<_>>();
-    let deferred_sources = requests
-        .iter()
-        .zip(&standalone)
-        .filter_map(|(request, record)| {
-            record
-                .as_ref()
-                .filter(|record| authoritative_live_change_matches(request, record))
-                .map(|_| request.source_commit_id)
-        })
-        .collect::<Vec<_>>();
-    let deferred = deferred_commit_history_ids(store, &deferred_sources)
-        .await?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let mut records = vec![None; requests.len()];
-    let mut candidate_indices = Vec::new();
-    let mut candidate_ids = Vec::new();
-    let mut candidate_standalone = Vec::new();
-    for (index, (request, record)) in requests.iter().zip(standalone).enumerate() {
-        if deferred.contains(&request.source_commit_id)
-            && record
-                .as_ref()
-                .is_some_and(|record| authoritative_live_change_matches(request, record))
-        {
-            records[index] = record;
-        } else {
-            candidate_indices.push(index);
-            candidate_ids.push(request.change_id);
-            candidate_standalone.push(record);
-        }
-    }
-    let candidates = load_selected_change_records_by_ids_optional(
-        store,
-        &candidate_ids,
-        candidate_standalone,
-    )
-    .await?;
-    let mut unresolved_indices = Vec::new();
-    let mut unresolved_requests = Vec::new();
-    for (index, candidate) in candidate_indices.into_iter().zip(candidates) {
-        let request = &requests[index];
-        if candidate
-            .as_ref()
-            .is_some_and(|record| authoritative_live_change_matches(request, record))
-        {
-            records[index] = candidate;
-        } else {
-            unresolved_indices.push(index);
-            unresolved_requests.push(AuthoritativeLiveChangeRequest {
-                change_id: request.change_id,
-                source_commit_id: request.source_commit_id,
-                key: request.key.clone(),
-                updated_at: request.updated_at,
-            });
-        }
-    }
-    let fallback = load_authoritative_live_change_records(store, &unresolved_requests).await?;
-    for (index, record) in unresolved_indices.into_iter().zip(fallback) {
-        records[index] = Some(record);
-    }
-    Ok(records
-        .into_iter()
-        .map(|record| record.expect("all unresolved selected changes were loaded"))
-        .collect())
+    load_authoritative_live_change_records(store, requests).await
 }
 
 /// Resolves live payloads from local changelog authority first, then checks
@@ -10139,6 +10126,69 @@ pub(crate) async fn load_authoritative_live_change_records(
         {
             *slot = record;
         } else {
+            fallback_indices.push(index);
+        }
+    }
+    let standalone_fallback = records.clone();
+    let deferred = deferred_standalone_sources(store, requests, &records).await?;
+    let deferred_direct_indices = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            let request = &requests[index];
+            let owner_is_deferred_source = deferred.contains(&request.source_commit_id)
+                && direct_change_locator(request.change_id)
+                    .is_some_and(|locator| locator.commit_id == request.source_commit_id);
+            (record.is_some() && owner_is_deferred_source).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    // A direct-shaped ID can be dispatched through an explicit locator to an
+    // unrelated physical owner. A deferred logical endpoint only exempts its
+    // own omitted body from verification, not that other owner's body.
+    let deferred_keys = deferred_direct_indices
+        .iter()
+        .map(|&index| {
+            StorageKey(Bytes::copy_from_slice(
+                requests[index].change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let deferred_locators = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &deferred_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut skip_physical = vec![false; requests.len()];
+    for (index, value) in deferred_direct_indices
+        .into_iter()
+        .zip(deferred_locators.value)
+    {
+        let owner = value
+            .and_then(full_value_bytes)
+            .map(|bytes| decode_change_locator(requests[index].change_id, &bytes))
+            .transpose()?;
+        skip_physical[index] = owner
+            .as_ref()
+            .is_none_or(|locator| locator.commit_id == requests[index].source_commit_id);
+    }
+    let physical_indices = records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| (record.is_some() && !skip_physical[index]).then_some(index))
+        .collect::<Vec<_>>();
+    let physical_ids = physical_indices
+        .iter()
+        .map(|&index| requests[index].change_id)
+        .collect::<Vec<_>>();
+    let physical = load_selected_change_records_by_ids_optional(store, &physical_ids).await?;
+    let mut physical_conflict = vec![false; requests.len()];
+    for (index, candidate) in physical_indices.into_iter().zip(physical) {
+        if candidate
+            .as_ref()
+            .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
+        {
+            records[index] = candidate;
+        } else if candidate.is_some() || !deferred.contains(&requests[index].source_commit_id) {
+            physical_conflict[index] = candidate.is_some();
+            records[index] = None;
             fallback_indices.push(index);
         }
     }
@@ -10222,6 +10272,11 @@ pub(crate) async fn load_authoritative_live_change_records(
             {
                 records[index] = record;
             }
+        }
+    }
+    for (index, fallback) in standalone_fallback.into_iter().enumerate() {
+        if records[index].is_none() && !physical_conflict[index] {
+            records[index] = fallback;
         }
     }
     requests
@@ -10321,7 +10376,14 @@ async fn load_deferred_commit_history(
     else {
         return Ok(None);
     };
-    let marker = match bytes.as_ref() {
+    Ok(Some(decode_deferred_commit_history(commit_id, &bytes)?))
+}
+
+fn decode_deferred_commit_history(
+    commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<DeferredCommitHistory, LixError> {
+    let marker = match bytes {
         b"deferred" | b"deferred-local" => DeferredCommitHistory::Header {
             global_scope: false,
         },
@@ -10340,7 +10402,7 @@ async fn load_deferred_commit_history(
             ));
         }
     };
-    Ok(Some(marker))
+    Ok(marker)
 }
 
 pub(crate) async fn commit_history_is_omitted(
@@ -20257,6 +20319,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(selected_source, vec![canonical]);
+        let live = super::load_authoritative_live_change_records(
+            &read,
+            &[super::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id: selected,
+                key: fixture.key(),
+                updated_at: fixture.updated_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(live, selected_source);
+
+        let deferred_source = CommitId::for_test_label("stale-standalone-deferred-source");
+        let mut writes = storage.new_write_set();
+        super::stage_commit_history_deferred(&mut writes, deferred_source);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id,
+            source_commit_id: deferred_source,
+            key: fixture.key(),
+            updated_at: fixture.updated_at,
+        };
+        assert_eq!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .unwrap(),
+            selected_source,
+        );
     }
 
     #[tokio::test]
@@ -20281,7 +20379,7 @@ mod tests {
         stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
         stage_change_locators(
             &mut writes,
-            &[super::CommitDeltaChangeLocator {
+            &[CommitDeltaChangeLocator {
                 change_id: fixture.change_id,
                 commit_id: selected,
                 segment_index: 0,
@@ -20448,6 +20546,314 @@ mod tests {
         .expect("endpoint authority survives a syntactic direct-owner miss");
         assert_eq!(loaded[0].change_id, fixture.change_id);
         assert_eq!(loaded[0].account_id, crate::ANONYMOUS_ACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn live_payload_checks_endpoint_before_matching_standalone_without_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let endpoint = CommitId::for_test_label("live-payload-endpoint-without-locator");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        fixture.change_id = ChangeId::for_test_label("live-payload-legacy-without-locator");
+        let mut writes = storage.new_write_set();
+        let deltas = commit_delta_refs(endpoint, std::slice::from_ref(&fixture));
+        stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(endpoint, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.snapshot = Some(b"stale-standalone".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id: fixture.change_id,
+            source_commit_id: endpoint,
+            key: fixture.key(),
+            updated_at: fixture.updated_at,
+        };
+        assert_eq!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .unwrap(),
+            vec![canonical],
+        );
+    }
+
+    #[tokio::test]
+    async fn live_payload_uses_standalone_for_deferred_explicit_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let deferred = CommitId::for_test_label("deferred-explicit-live-owner");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        fixture.change_id = ChangeId::for_test_label("deferred-explicit-live-change");
+        let record = crate::changelog::ChangeRecord {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            format_version: 2,
+            change_id: fixture.change_id,
+            schema_key: fixture.schema_key.clone(),
+            row_pk: fixture.row_pk.clone(),
+            file_id: fixture.file_id.clone(),
+            metadata: None,
+            snapshot: Some(b"typed-live-fixture".to_vec()),
+            created_at: fixture.updated_at,
+            origin_key: None,
+        };
+        let mut writes = storage.new_write_set();
+        super::stage_commit_history_deferred(&mut writes, deferred);
+        stage_change_locators(
+            &mut writes,
+            &[CommitDeltaChangeLocator {
+                change_id: fixture.change_id,
+                commit_id: deferred,
+                segment_index: 0,
+                ordinal: 0,
+            }],
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![record.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id: fixture.change_id,
+            source_commit_id: deferred,
+            key: fixture.key(),
+            updated_at: fixture.updated_at,
+        };
+        assert_eq!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .unwrap(),
+            vec![record],
+        );
+
+        drop(read);
+        let mut writes = storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+            StorageKey(Bytes::from(super::commit_key(deferred))),
+            &b"invalid-marker"[..],
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id: fixture.change_id,
+            source_commit_id: deferred,
+            key: fixture.key(),
+            updated_at: fixture.updated_at,
+        };
+        assert!(super::load_authoritative_live_change_records(&read, &[request])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid deferred-history marker"));
+    }
+
+    #[tokio::test]
+    async fn live_payload_checks_explicit_owner_for_deferred_address_shaped_endpoint() {
+        let storage = StorageAdapter::new(Memory::new());
+        let deferred_endpoint = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1237_0000_0000,
+        ));
+        let authored_owner = CommitId::for_test_label("deferred-address-shaped-explicit-owner");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        // The ID's decoded direct owner is the deferred logical endpoint, but
+        // the explicit locator identifies the authored payload elsewhere.
+        fixture.change_id = super::addressable_change_id(deferred_endpoint, 0, 0).unwrap();
+
+        let mut writes = storage.new_write_set();
+        super::stage_commit_history_deferred(&mut writes, deferred_endpoint);
+        let deltas = commit_delta_refs(authored_owner, std::slice::from_ref(&fixture));
+        let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+        assert_eq!(staged.locators.len(), 1);
+        assert_eq!(staged.locators[0].commit_id, authored_owner);
+        stage_change_locators(&mut writes, &staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let canonical = super::load_commit_delta_change_records_for_owners(
+            &read,
+            &[(authored_owner, fixture.key())],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let mut stale = canonical.clone();
+        stale.snapshot = Some(b"stale-standalone".to_vec());
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![stale],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id: fixture.change_id,
+            source_commit_id: deferred_endpoint,
+            key: fixture.key(),
+            updated_at: fixture.updated_at,
+        };
+        assert_eq!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .unwrap(),
+            vec![canonical],
+        );
+    }
+
+    #[tokio::test]
+    async fn live_payload_rejects_conflicting_explicit_owner_for_deferred_endpoint() {
+        let storage = StorageAdapter::new(Memory::new());
+        let deferred_endpoint = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1238_0000_0000,
+        ));
+        let authored_owner = CommitId::for_test_label("deferred-conflicting-explicit-owner");
+        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+        // The ID's decoded direct owner is the deferred logical endpoint, but
+        // the explicit locator identifies a physical row with another identity.
+        fixture.change_id = super::addressable_change_id(deferred_endpoint, 0, 0).unwrap();
+
+        let mut writes = storage.new_write_set();
+        super::stage_commit_history_deferred(&mut writes, deferred_endpoint);
+        let deltas = commit_delta_refs(authored_owner, std::slice::from_ref(&fixture));
+        let staged = stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+        assert_eq!(staged.locators.len(), 1);
+        assert_eq!(staged.locators[0].commit_id, authored_owner);
+        stage_change_locators(&mut writes, &staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let mut standalone_key = fixture.key();
+        standalone_key.row_pk = RowPk::single("standalone-row".to_owned());
+        let standalone = crate::changelog::ChangeRecord {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            format_version: 2,
+            change_id: fixture.change_id,
+            schema_key: standalone_key.schema_key.clone(),
+            row_pk: standalone_key.row_pk.clone(),
+            file_id: standalone_key.file_id.clone(),
+            metadata: None,
+            snapshot: Some(b"standalone-payload".to_vec()),
+            created_at: fixture.updated_at,
+            origin_key: None,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(
+            &mut writer,
+            crate::changelog::ChangelogAppend {
+                commits: Vec::new(),
+                changes: vec![standalone],
+            },
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = super::AuthoritativeLiveChangeRequest {
+            change_id: fixture.change_id,
+            source_commit_id: deferred_endpoint,
+            key: standalone_key,
+            updated_at: fixture.updated_at,
+        };
+        assert!(super::load_authoritative_live_change_records(&read, &[request])
+            .await
+            .is_err());
     }
 
     #[tokio::test]
