@@ -141,6 +141,7 @@ struct LeafEntrySpan {
     key_end: usize,
     value_start: usize,
     value_end: usize,
+    author_present: bool,
 }
 
 impl DecodedLeafNodeRef {
@@ -181,6 +182,14 @@ impl DecodedLeafNodeRef {
             key: &self.arena[span.key_start..span.key_end],
             value: &self.arena[span.value_start..span.value_end],
         })
+    }
+
+    /// Whether the physical leaf encoding carried an author column for this
+    /// row. Legacy leaves synthesize the anonymous account id while decoding,
+    /// so callers that reconcile row authors with canonical change records
+    /// need to retain this distinction.
+    pub(crate) fn author_present(&self, index: usize) -> Option<bool> {
+        self.entries.get(index).map(|span| span.author_present)
     }
 
     pub(crate) fn entry_owned(&self, index: usize) -> Option<EncodedLeafEntry> {
@@ -1186,6 +1195,17 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixEr
     decode_value_view(bytes).map(tracked_value_from_storage)
 }
 
+/// Decodes one tracked-state value while retaining whether the physical
+/// encoding carried an author. Legacy values synthesize ANONYMOUS, so readers
+/// that reconcile provenance need this bit to distinguish them from an
+/// explicitly anonymous author.
+pub(crate) fn decode_value_with_author_presence(
+    bytes: &[u8],
+) -> Result<(TrackedStateIndexValue, bool), LixError> {
+    let (value, author_present) = decode_value_view_with_author_presence(bytes)?;
+    Ok((tracked_value_from_storage(value), author_present))
+}
+
 pub(crate) fn decode_visible_value(
     bytes: &[u8],
     include_tombstones: bool,
@@ -1198,9 +1218,15 @@ pub(crate) fn decode_visible_value(
 }
 
 fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
-    if !(VALUE_STATE_TAIL_START + 1..=VALUE_MAX_BYTES).contains(&bytes.len()) {
+    decode_value_view_with_author_presence(bytes).map(|(value, _)| value)
+}
+
+fn decode_value_view_with_author_presence(
+    bytes: &[u8],
+) -> Result<(TrackedStateIndexValueRef<'_>, bool), LixError> {
+    if !(VALUE_LEGACY_MIN_BYTES..=VALUE_MAX_BYTES).contains(&bytes.len()) {
         return Err(value_codec_error(format!(
-            "has {} bytes; expected {VALUE_MIN_BYTES}..={VALUE_MAX_BYTES}",
+            "has {} bytes; expected {VALUE_LEGACY_MIN_BYTES}..={VALUE_MAX_BYTES}",
             bytes.len(),
         )));
     }
@@ -1217,48 +1243,30 @@ fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixE
     let mut offset = VALUE_STATE_TAIL_START;
     let (deleted, created_at_packed, updated_at_packed, semantic_fingerprint) =
         read_value_tail_fields(bytes, &mut offset, "tracked-state value")?;
-    let author_id = if offset == bytes.len() {
-        crate::ANONYMOUS_ACCOUNT_ID
-    } else {
-    let author_len_end = offset
-        .checked_add(2)
-        .ok_or_else(|| value_codec_error("author length overflow"))?;
-    let author_len = bytes
-        .get(offset..author_len_end)
-        .ok_or_else(|| value_codec_error("author length is truncated"))?;
-    let author_len = usize::from(u16::from_be_bytes(
-        author_len.try_into().expect("fixed author length"),
-    ));
-    offset = author_len_end;
-    if author_len == 0 || author_len > AUTHOR_ID_MAX_BYTES {
-        return Err(value_codec_error("author account id length is invalid"));
-    }
-    let author_end = offset
-        .checked_add(author_len)
-        .ok_or_else(|| value_codec_error("author account id length overflow"))?;
-    let author_id = std::str::from_utf8(
-        bytes
-            .get(offset..author_end)
-            .ok_or_else(|| value_codec_error("author account id is truncated"))?,
-    )
-    .map_err(|_| value_codec_error("author account id is not UTF-8"))?;
-    offset = author_end;
-    author_id
-    };
+    let optional_author = read_optional_value_author(bytes, &mut offset, "tracked-state value")?;
+    let author_present = optional_author.is_some();
+    let author_id = optional_author
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| value_codec_error("author account id is not UTF-8"))?
+        .unwrap_or(crate::ANONYMOUS_ACCOUNT_ID);
     if offset != bytes.len() {
         return Err(value_codec_error("has trailing bytes"));
     }
     let created_at = decode_value_timestamp(created_at_packed, "created_at")?;
     let updated_at = decode_value_timestamp(updated_at_packed, "updated_at")?;
-    Ok(TrackedStateIndexValueRef {
-        change_id,
-        commit_id,
-        author_id,
-        deleted,
-        created_at,
-        updated_at,
-        semantic_fingerprint,
-    })
+    Ok((
+        TrackedStateIndexValueRef {
+            change_id,
+            commit_id,
+            author_id,
+            deleted,
+            created_at,
+            updated_at,
+            semantic_fingerprint,
+        },
+        author_present,
+    ))
 }
 
 fn decode_value_timestamp(packed: u64, field: &str) -> Result<LixTimestamp, LixError> {
@@ -1472,7 +1480,8 @@ const VALUE_CHANGE_ID_END: usize = 16;
 const VALUE_COMMIT_ID_START: usize = 16;
 const VALUE_COMMIT_ID_END: usize = 32;
 const VALUE_STATE_TAIL_START: usize = 32;
-const VALUE_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1;
+const VALUE_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1 + 2 + 1;
+const VALUE_LEGACY_MIN_BYTES: usize = VALUE_STATE_TAIL_START + 1;
 const AUTHOR_ID_MAX_BYTES: usize = 256;
 const VALUE_MAX_BYTES: usize = VALUE_STATE_TAIL_START + 2 + 8 + 8 + 32 + 2 + AUTHOR_ID_MAX_BYTES;
 const VALUE_TAIL_DELETED: u8 = 0x80;
@@ -1501,7 +1510,8 @@ const VALUE_TAIL_DISTINCT_MAX: u8 =
 ///   16 change-id bytes
 ///   varint commit_ref       0 + 16 literal bytes, or dictionary slot n-1
 ///   varint tail_ref         0 + literal state tail, or dictionary slot n-1
-///   varint author_ref       0 + u16 byte_len + UTF-8 bytes, or dictionary slot n-1
+///   varint author_ref       0 + (u16 byte_len + UTF-8 bytes, empty means legacy-absent),
+///                           or dictionary slot n-1
 /// ```
 ///
 /// Only values repeated within the leaf enter a dictionary, so a dictionary
@@ -1540,11 +1550,11 @@ fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     );
     for entry in entries {
         assert!(
-            (VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&entry.value.len()),
-            "tracked-state leaf values must use the author-bearing value layout"
+            (VALUE_LEGACY_MIN_BYTES..=VALUE_MAX_BYTES).contains(&entry.value.len()),
+            "tracked-state leaf values must use the bounded value layout"
         );
         split_value_tail_author(entry.value, "tracked-state leaf value")
-            .expect("tracked-state leaf value must have a valid state tail and author");
+            .expect("tracked-state leaf value must have a valid state tail and optional author");
     }
     if let Some((commit_id, first_packed)) = direct_leaf_sequence(entries) {
         return encode_direct_leaf_v2(entries, commit_id, first_packed);
@@ -1590,10 +1600,10 @@ fn encode_leaf_node_refs_inner(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
         if tail_ref == 0 {
             out.extend_from_slice(tail);
         }
-        let author_ref = slice_dictionary_ref(&author_dictionary, author);
+        let author_ref = author.map_or(0, |author| slice_dictionary_ref(&author_dictionary, author));
         write_varint(&mut out, author_ref);
         if author_ref == 0 {
-            append_author(&mut out, author);
+            append_optional_author(&mut out, author);
         }
         previous_key = entry.key;
     }
@@ -1667,10 +1677,10 @@ fn encode_direct_leaf_v2(
         if tail_ref == 0 {
             out.extend_from_slice(tail);
         }
-        let author_ref = slice_dictionary_ref(&author_dictionary, author);
+        let author_ref = author.map_or(0, |author| slice_dictionary_ref(&author_dictionary, author));
         write_varint(&mut out, author_ref);
         if author_ref == 0 {
-            append_author(&mut out, author);
+            append_optional_author(&mut out, author);
         }
         previous_key = entry.key;
     }
@@ -1747,6 +1757,9 @@ fn repeated_author_dictionary<'a>(entries: &[EncodedLeafEntryRef<'a>]) -> Vec<&'
     for entry in entries {
         let (_, author) = split_value_tail_author(entry.value, "tracked-state leaf value")
             .expect("leaf value was validated above");
+        let Some(author) = author else {
+            continue;
+        };
         if let Some((_, count)) = counts.iter_mut().find(|(known, _)| *known == author) {
             *count += 1;
         } else {
@@ -1762,11 +1775,11 @@ fn repeated_author_dictionary<'a>(entries: &[EncodedLeafEntryRef<'a>]) -> Vec<&'
 fn split_value_tail_author<'a>(
     value: &'a [u8],
     context: &str,
-) -> Result<(&'a [u8], &'a [u8]), LixError> {
+) -> Result<(&'a [u8], Option<&'a [u8]>), LixError> {
     let mut offset = VALUE_STATE_TAIL_START;
     read_value_tail(value, &mut offset, context)?;
     let tail_end = offset;
-    let author = read_value_author(value, &mut offset, context)?;
+    let author = read_optional_value_author(value, &mut offset, context)?;
     if offset != value.len() {
         return Err(value_codec_error(format!("{context} has trailing bytes")));
     }
@@ -1805,10 +1818,110 @@ fn read_value_author<'a>(
     Ok(author)
 }
 
+fn read_optional_value_author<'a>(
+    value: &'a [u8],
+    offset: &mut usize,
+    context: &str,
+) -> Result<Option<&'a [u8]>, LixError> {
+    if *offset == value.len() {
+        return Ok(None);
+    }
+    let len_end = offset
+        .checked_add(2)
+        .ok_or_else(|| value_codec_error(format!("{context} author length overflow")))?;
+    let len_bytes = value
+        .get(*offset..len_end)
+        .ok_or_else(|| value_codec_error(format!("{context} author length is truncated")))?;
+    let len = usize::from(u16::from_be_bytes(
+        len_bytes.try_into().expect("fixed author length"),
+    ));
+    *offset = len_end;
+    if len == 0 {
+        return Err(value_codec_error(format!(
+            "{context} author length is invalid"
+        )));
+    }
+    if len > AUTHOR_ID_MAX_BYTES {
+        return Err(value_codec_error(format!(
+            "{context} author length is invalid"
+        )));
+    }
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| value_codec_error(format!("{context} author length overflow")))?;
+    let author = value
+        .get(*offset..end)
+        .ok_or_else(|| value_codec_error(format!("{context} author is truncated")))?;
+    std::str::from_utf8(author)
+        .map_err(|_| value_codec_error(format!("{context} author is not UTF-8")))?;
+    *offset = end;
+    Ok(Some(author))
+}
+
+fn read_optional_author<'a>(
+    body: &'a [u8],
+    offset: &mut usize,
+    context: &str,
+) -> Result<Option<&'a [u8]>, LixError> {
+    let len_end = offset.checked_add(2).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author length overflows usize"),
+        )
+    })?;
+    let len_bytes = body.get(*offset..len_end).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author length is truncated"),
+        )
+    })?;
+    let len = usize::from(u16::from_be_bytes(
+        len_bytes.try_into().expect("fixed author length"),
+    ));
+    *offset = len_end;
+    if len == 0 {
+        return Ok(None);
+    }
+    if len > AUTHOR_ID_MAX_BYTES {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author length is invalid"),
+        ));
+    }
+    let end = offset.checked_add(len).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author length overflows usize"),
+        )
+    })?;
+    let author = body.get(*offset..end).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author is truncated"),
+        )
+    })?;
+    std::str::from_utf8(author).map_err(|_| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} author is not UTF-8"),
+        )
+    })?;
+    *offset = end;
+    Ok(Some(author))
+}
+
 fn append_author(out: &mut Vec<u8>, author: &[u8]) {
     let len = u16::try_from(author.len()).expect("validated author length fits u16");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(author);
+}
+
+fn append_optional_author(out: &mut Vec<u8>, author: Option<&[u8]>) {
+    if let Some(author) = author {
+        append_author(out, author);
+    } else {
+        out.extend_from_slice(&0_u16.to_be_bytes());
+    }
 }
 
 fn slice_dictionary_ref(dictionary: &[&[u8]], value: &[u8]) -> u64 {
@@ -1960,14 +2073,14 @@ fn decode_leaf_v5(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef, LixEr
             tail_dictionary[tail_ref - 1]
         };
         let author = if legacy {
-            crate::ANONYMOUS_ACCOUNT_ID.as_bytes()
+            None
         } else {
             let author_ref = usize_from(
                 read_varint(body, &mut offset, "tracked-state leaf node")?,
                 "author dictionary ref",
             )?;
             if author_ref == 0 {
-                read_value_author(body, &mut offset, "tracked-state leaf node")?
+                read_optional_author(body, &mut offset, "tracked-state leaf node")?
             } else {
                 if author_ref > author_dict_len {
                     return Err(LixError::new(
@@ -1975,20 +2088,23 @@ fn decode_leaf_v5(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef, LixEr
                         "tracked-state leaf node author dictionary ref is out of bounds",
                     ));
                 }
-                author_dictionary[author_ref - 1]
+                Some(author_dictionary[author_ref - 1])
             }
         };
         let value_start = arena.len();
         arena.extend_from_slice(change_id);
         arena.extend_from_slice(commit_id);
         arena.extend_from_slice(tail);
-        append_author(&mut arena, author);
+        if let Some(author) = author {
+            append_author(&mut arena, author);
+        }
         let value_end = arena.len();
         entries.push(LeafEntrySpan {
             key_start,
             key_end,
             value_start,
             value_end,
+            author_present: author.is_some(),
         });
         previous_key_start = key_start;
         previous_key_end = key_end;
@@ -2125,14 +2241,14 @@ fn decode_direct_leaf_v2(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef
             tail_dictionary[tail_ref - 1]
         };
         let author = if legacy {
-            crate::ANONYMOUS_ACCOUNT_ID.as_bytes()
+            None
         } else {
             let author_ref = usize_from(
                 read_varint(body, &mut offset, "tracked-state direct leaf node")?,
                 "author dictionary ref",
             )?;
             if author_ref == 0 {
-                read_value_author(body, &mut offset, "tracked-state direct leaf node")?
+                read_optional_author(body, &mut offset, "tracked-state direct leaf node")?
             } else {
                 if author_ref > author_dict_len {
                     return Err(LixError::new(
@@ -2140,7 +2256,7 @@ fn decode_direct_leaf_v2(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef
                         "tracked-state direct leaf node author dictionary ref is out of bounds",
                     ));
                 }
-                author_dictionary[author_ref - 1]
+                Some(author_dictionary[author_ref - 1])
             }
         };
         let packed = first_packed
@@ -2161,13 +2277,16 @@ fn decode_direct_leaf_v2(body: &[u8], legacy: bool) -> Result<DecodedLeafNodeRef
         arena.extend_from_slice(&packed.to_be_bytes());
         arena.extend_from_slice(&commit_id);
         arena.extend_from_slice(tail);
-        append_author(&mut arena, author);
+        if let Some(author) = author {
+            append_author(&mut arena, author);
+        }
         let value_end = arena.len();
         entries.push(LeafEntrySpan {
             key_start,
             key_end,
             value_start,
             value_end,
+            author_present: author.is_some(),
         });
         previous_key_start = key_start;
         previous_key_end = key_end;
@@ -2571,6 +2690,7 @@ mod tests {
             let entry = decoded.entry(index).expect("entry should exist");
             assert_eq!(entry.key, key.as_slice(), "key {index}");
             assert_eq!(entry.value, value.as_slice(), "value {index}");
+            assert_eq!(decoded.author_present(index), Some(true), "author {index}");
         }
     }
 
@@ -2976,6 +3096,15 @@ mod tests {
         };
         let value = decode_value(decoded.entry(0).unwrap().value).unwrap();
         assert_eq!(value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(decoded.author_present(0), Some(false));
+        let legacy_value = decoded.entry(0).unwrap().value;
+        let upgraded = encode_leaf_node_refs(&[decoded.entry(0).unwrap()]);
+        let NodeRefForLeafTests::Leaf(upgraded) = decode_node_ref_for_leaf_tests(&upgraded).unwrap()
+        else {
+            panic!("expected upgraded v83 leaf");
+        };
+        assert_eq!(upgraded.author_present(0), Some(false));
+        assert_eq!(upgraded.entry(0).unwrap().value, legacy_value);
 
         let mut direct = vec![NODE_KIND_DIRECT_LEAF_V1, 1];
         direct.extend_from_slice(&[0x33; 16]);
@@ -2988,6 +3117,7 @@ mod tests {
         };
         let value = decode_value(decoded.entry(0).unwrap().value).unwrap();
         assert_eq!(value.author_id, crate::ANONYMOUS_ACCOUNT_ID);
+        assert_eq!(decoded.author_present(0), Some(false));
     }
 
     fn timestamp(field: &str, value: &str) -> LixTimestamp {

@@ -5,7 +5,9 @@ use crate::LixError;
 #[cfg(test)]
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
-use crate::changelog::CommitId;
+use crate::changelog::{
+    ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitId,
+};
 use crate::commit_graph::CommitGraphContext;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -1540,7 +1542,20 @@ where
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            crate::tracked_state::load_change_records_by_ids(&self.store, &ids).await?;
+            // Read preparation only warms data for a possible later mutation.
+            // Local standalone payloads suffice here; if one is absent, the
+            // physical-first resolver fetches just that missing change.
+            let standalone = ChangelogContext::new()
+                .reader(&self.store)
+                .load_changes(ChangeLoadRequest { change_ids: &ids })
+                .await?;
+            let missing = standalone
+                .into_iter()
+                .filter_map(|(id, record)| record.is_none().then_some(*id))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                crate::tracked_state::load_change_records_by_ids(&self.store, &missing).await?;
+            }
             let mut keys = std::collections::BTreeMap::<
                 String,
                 Vec<crate::tracked_state::TrackedStateKey>,

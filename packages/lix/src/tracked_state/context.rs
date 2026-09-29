@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
-    ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
+    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
+    CommitLoadRequest,
 };
 use crate::common::SharedStr;
 use crate::row_pk::{RowPk, RowPkComponent};
@@ -27,7 +28,8 @@ use crate::tracked_state::codec::{
     decode_key_shared, encode_key, encode_key_ref_into, encode_value_ref,
 };
 use crate::tracked_state::diff::{
-    TrackedStateDiff, TrackedStateDiffIdentity, TrackedStateDiffRequest, TrackedStateDiffRow,
+    TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRequest,
+    TrackedStateDiffRow,
     TrackedStatePayloadBatch, TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder,
     TrackedStateTreeDiffRowRef, diff_commits,
 };
@@ -1265,6 +1267,9 @@ where
             if let Some(limit) = request.limit {
                 entries.truncate(limit);
             }
+            if let Some(root_id) = durable_root.as_ref() {
+                self.restore_legacy_root_authors(root_id, &mut entries).await?;
+            }
             return materialize_batch_from_index_entries(&self.store, entries, &materialization)
                 .await;
         }
@@ -1312,6 +1317,222 @@ where
             .map(|(key, value)| (key.as_ref(), value))
             .collect();
         materialize_batch_from_index_entry_refs(&self.store, entries, &materialization).await
+    }
+
+    /// v82 leaves did not encode an author. The decoder exposes the historical
+    /// anonymous placeholder, but an unchanged leaf can remain reachable after
+    /// the v83 repository migration. Consult the physical leaf's presence bit
+    /// before replacing that placeholder with the change's retained author.
+    async fn restore_legacy_root_authors(
+        &self,
+        root_id: &TrackedStateRootId,
+        entries: &mut [(TrackedStateKey, TrackedStateIndexValue)],
+    ) -> Result<(), LixError> {
+        let candidates = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (key, value))| {
+                (value.author_id == crate::ANONYMOUS_ACCOUNT_ID).then_some((index, key.clone()))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let keys = candidates
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let presence = self
+            .tree
+            .get_many_author_presence(&self.store, root_id, &keys)
+            .await?;
+        let legacy = candidates
+            .into_iter()
+            .zip(presence)
+            .filter_map(|((index, _), present)| match present {
+                Some(false) => Some(Ok(index)),
+                Some(true) => None,
+                None => Some(Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state root lost a row while resolving its legacy author",
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let live = legacy
+            .iter()
+            .filter_map(|&index| {
+                let (key, value) = &entries[index];
+                (!value.deleted).then_some(storage::AuthoritativeLiveChangeRequest {
+                    change_id: value.change_id,
+                    source_commit_id: value.commit_id,
+                    key: key.clone(),
+                    updated_at: value.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut canonical_live = storage::load_authoritative_live_change_records(&self.store, &live)
+            .await?
+            .into_iter();
+        let deleted = legacy
+            .iter()
+            .filter_map(|&index| {
+                let (key, value) = &entries[index];
+                value.deleted.then_some((
+                    index,
+                    value.commit_id,
+                    key.clone(),
+                    value.change_id,
+                    value.updated_at,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let deleted_requests = deleted
+            .iter()
+            .map(|(_, commit_id, key, change_id, updated_at)| {
+                (*commit_id, key.clone(), *change_id, *updated_at)
+            })
+            .collect::<Vec<_>>();
+        let deleted_authors = self
+            .resolve_legacy_tombstone_authors(&deleted_requests)
+            .await?
+            .into_iter();
+        let mut deleted = deleted.into_iter().zip(deleted_authors);
+        for index in legacy {
+            let (key, value) = &mut entries[index];
+            let author_id = if value.deleted {
+                let ((deleted_index, _, _, _, _), author_id) = deleted
+                    .next()
+                    .expect("one resolved author per legacy tombstone");
+                if deleted_index != index {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state legacy tombstone author resolution lost row order",
+                    ));
+                }
+                author_id
+            } else {
+                let canonical = canonical_live.next().expect("one record per legacy live row");
+                if canonical.change_id != value.change_id
+                    || canonical.schema_key != key.schema_key
+                    || canonical.file_id != key.file_id
+                    || canonical.row_pk != key.row_pk
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state legacy row author refers to a different change identity",
+                    ));
+                }
+                canonical.account_id
+            };
+            value.author_id = author_id;
+        }
+        Ok(())
+    }
+
+    /// Resolves tombstone authors from their physical row, exact cascade
+    /// marker, or selected change owner. A selected tombstone's local commit
+    /// account belongs to the checkpoint and is not its canonical author.
+    async fn resolve_legacy_tombstone_authors(
+        &self,
+        requests: &[(
+            CommitId,
+            TrackedStateKey,
+            ChangeId,
+            crate::common::LixTimestamp,
+        )],
+    ) -> Result<Vec<String>, LixError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = requests
+            .iter()
+            .map(|(commit_id, key, change_id, updated_at)| {
+                (
+                    key.clone(),
+                    TrackedStateIndexValue {
+                        change_id: *change_id,
+                        commit_id: *commit_id,
+                        author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                        deleted: true,
+                        created_at: *updated_at,
+                        updated_at: *updated_at,
+                        semantic_fingerprint: None,
+                    },
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut authors = vec![None; rows.len()];
+        storage::resolve_complete_state_deleted_authors(&self.store, &rows, &mut authors).await?;
+        authors
+            .into_iter()
+            .map(|author| {
+                author.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state legacy tombstone author resolution is incomplete",
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn restore_legacy_root_values(
+        &self,
+        root_id: &TrackedStateRootId,
+        keys: &[TrackedStateKey],
+        values: &mut [Option<TrackedStateIndexValue>],
+    ) -> Result<(), LixError> {
+        let mut candidates = keys
+            .iter()
+            .zip(values.iter())
+            .enumerate()
+            .filter_map(|(index, (key, value))| {
+                value.as_ref().and_then(|value| {
+                    (value.author_id == crate::ANONYMOUS_ACCOUNT_ID)
+                        .then(|| (index, key.clone(), value.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut entries = candidates
+            .iter()
+            .map(|(_, key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        self.restore_legacy_root_authors(root_id, &mut entries).await?;
+        for ((index, _, _), (_, resolved)) in candidates.drain(..).zip(entries) {
+            values[index] = Some(resolved);
+        }
+        Ok(())
+    }
+
+    async fn restore_legacy_root_encoded_values(
+        &self,
+        root_id: &TrackedStateRootId,
+        keys: &[Bytes],
+        values: &mut [Option<TrackedStateIndexValue>],
+    ) -> Result<(), LixError> {
+        let mut candidates = Vec::new();
+        for (index, (key, value)) in keys.iter().zip(values.iter()).enumerate() {
+            let Some(value) = value.as_ref().filter(|value| {
+                value.author_id == crate::ANONYMOUS_ACCOUNT_ID
+            }) else {
+                continue;
+            };
+            candidates.push((
+                index,
+                crate::tracked_state::codec::decode_key(key)?,
+                value.clone(),
+            ));
+        }
+        let mut entries = candidates
+            .iter()
+            .map(|(_, key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        self.restore_legacy_root_authors(root_id, &mut entries).await?;
+        for ((index, _, _), (_, resolved)) in candidates.into_iter().zip(entries) {
+            values[index] = Some(resolved);
+        }
+        Ok(())
     }
 
     pub(crate) async fn load_projected_batch_at_commit(
@@ -1443,6 +1664,35 @@ where
                 entries.push((key, value));
             }
         }
+        if entries
+            .iter()
+            .any(|(_, value)| value.author_id == crate::ANONYMOUS_ACCOUNT_ID)
+            && let Some(root_id) = self.tree.load_root(&self.store, commit_id).await?
+        {
+            let mut candidates = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (key, value))| {
+                    (value.author_id == crate::ANONYMOUS_ACCOUNT_ID).then_some((
+                        index,
+                        TrackedStateKey {
+                            schema_key: key.schema_key.to_owned(),
+                            file_id: key.file_id.map(str::to_owned),
+                            row_pk: key.row_pk.clone(),
+                        },
+                        value.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mut owned = candidates
+                .iter()
+                .map(|(_, key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            self.restore_legacy_root_authors(&root_id, &mut owned).await?;
+            for ((index, _, _), (_, value)) in candidates.drain(..).zip(owned) {
+                entries[index].1.author_id = value.author_id;
+            }
+        }
         let slots = unique_ordinal_by_input
             .into_iter()
             .map(|unique_ordinal| present_ordinal_by_unique[unique_ordinal as usize])
@@ -1480,6 +1730,82 @@ where
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
         diff_commits(self, left_commit_id, right_commit_id, request, true).await
+    }
+
+    pub(crate) async fn restore_legacy_diff_authors(
+        &self,
+        entries: &mut [TrackedStateDiffEntry],
+    ) -> Result<(), LixError> {
+        let mut live_slots = Vec::new();
+        let mut live_requests = Vec::new();
+        let mut deleted_slots = Vec::new();
+        let mut deleted_requests = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            for (after, row) in [(false, entry.before.as_ref()), (true, entry.after.as_ref())] {
+                let Some(row) = row.filter(|row| !row.author_present()) else {
+                    continue;
+                };
+                if row.deleted {
+                    deleted_slots.push((index, after));
+                    deleted_requests.push((
+                        row.commit_id,
+                        TrackedStateKey {
+                            schema_key: row.schema_key().to_owned(),
+                            file_id: row.file_id().map(str::to_owned),
+                            row_pk: row.row_pk().clone(),
+                        },
+                        row.change_id,
+                        row.updated_at,
+                    ));
+                } else {
+                    live_slots.push((index, after));
+                    live_requests.push(storage::AuthoritativeLiveChangeRequest {
+                        change_id: row.change_id,
+                        source_commit_id: row.commit_id,
+                        key: TrackedStateKey {
+                            schema_key: row.schema_key().to_owned(),
+                            file_id: row.file_id().map(str::to_owned),
+                            row_pk: row.row_pk().clone(),
+                        },
+                        updated_at: row.updated_at,
+                    });
+                }
+            }
+        }
+        let live = storage::load_authoritative_live_change_records(&self.store, &live_requests)
+            .await?;
+        let deleted_authors = self
+            .resolve_legacy_tombstone_authors(&deleted_requests)
+            .await?;
+        for ((index, after), change) in live_slots.into_iter().zip(live) {
+            let row = if after {
+                entries[index].after.as_mut()
+            } else {
+                entries[index].before.as_mut()
+            }
+            .expect("legacy diff row retains its side");
+            if change.change_id != row.change_id
+                || change.schema_key != row.schema_key()
+                || change.file_id.as_deref() != row.file_id()
+                || change.row_pk != *row.row_pk()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state legacy diff author refers to a different change identity",
+                ));
+            }
+            row.author_id = change.account_id;
+        }
+        for ((index, after), author_id) in deleted_slots.into_iter().zip(deleted_authors) {
+            let row = if after {
+                entries[index].after.as_mut()
+            } else {
+                entries[index].before.as_mut()
+            }
+            .expect("legacy diff row retains its side");
+            row.author_id = author_id;
+        }
+        Ok(())
     }
 
     /// Loads only the requested schema ranges from one commit delta. Semantic
@@ -1575,9 +1901,18 @@ where
 
         let mut scopes = BTreeMap::<
             (CommitId, String, Option<String>),
-            (TrackedStateKey, Vec<(usize, ChangeId)>),
+            (
+                TrackedStateKey,
+                Vec<(
+                    usize,
+                    ChangeId,
+                    crate::common::LixTimestamp,
+                    String,
+                    bool,
+                )>,
+            ),
         >::new();
-        for (ordinal, key, _, after) in batch.rows() {
+        for (ordinal, key, after, author_present) in batch.rows_with_after_author_presence() {
             let Some(after) = after.filter(|after| after.deleted) else {
                 continue;
             };
@@ -1597,14 +1932,32 @@ where
                 .entry((after.commit_id, scope.0, scope.1))
                 .or_insert_with(|| (marker_key, Vec::new()))
                 .1
-                .push((ordinal, after.change_id));
+                .push((
+                    ordinal,
+                    after.change_id,
+                    after.updated_at,
+                    after.author_id.clone(),
+                    author_present,
+                ));
         }
         if scopes.is_empty() {
             return Ok(());
         }
 
         let mut by_commit =
-            BTreeMap::<CommitId, Vec<(TrackedStateKey, Vec<(usize, ChangeId)>)>>::new();
+            BTreeMap::<
+                CommitId,
+                Vec<(
+                    TrackedStateKey,
+                    Vec<(
+                        usize,
+                        ChangeId,
+                        crate::common::LixTimestamp,
+                        String,
+                        bool,
+                    )>,
+                )>,
+            >::new();
         for ((commit_id, _, _), request) in scopes {
             by_commit.entry(commit_id).or_default().push(request);
         }
@@ -1620,8 +1973,23 @@ where
                 let Some(record) = record else {
                     continue;
                 };
-                for (ordinal, change_id) in candidates {
-                    if record.change_id == change_id && record.snapshot.is_some() {
+                for (ordinal, change_id, updated_at, author_id, author_present) in candidates {
+                    if record.change_id != change_id {
+                        continue;
+                    }
+                    if record.created_at != updated_at {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "collection-generation cascade tombstone disagrees with its marker time",
+                        ));
+                    }
+                    if record.snapshot.is_some() {
+                        if author_present && author_id != record.account_id {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "collection-generation cascade tombstone disagrees with its marker author",
+                            ));
+                        }
                         remove[ordinal] = true;
                     }
                 }
@@ -3045,12 +3413,33 @@ where
             .zip(loaded.iter())
             .filter_map(|(change_id, record)| record.is_none().then_some(*change_id))
             .collect::<Vec<_>>();
-        let mut fallback = storage::load_change_records_by_ids(&self.store, &missing)
-            .await?
-            .into_iter();
+        // This endpoint has no local replay authority. Its standalone
+        // snapshot payloads are the local fallback while authored history is
+        // omitted; the general change-ID resolver must probe physical owners.
+        let standalone = ChangelogContext::new()
+            .reader(&self.store)
+            .load_changes(ChangeLoadRequest {
+                change_ids: &missing,
+            })
+            .await?;
+        let physical_missing = standalone
+            .iter()
+            .filter_map(|(id, record)| record.is_none().then_some(*id))
+            .collect::<Vec<_>>();
+        let physical = if physical_missing.is_empty() {
+            Vec::new()
+        } else {
+            storage::load_change_records_by_ids(&self.store, &physical_missing).await?
+        };
+        let mut physical = physical.into_iter();
+        let mut fallback = standalone
+            .into_iter()
+            .map(|(_, record)| record.or_else(|| physical.next()));
         for record in loaded {
             if record.is_none() {
-                *record = fallback.next();
+                *record = fallback
+                    .next()
+                    .expect("one standalone fallback was loaded per missing change");
             }
         }
         Ok(())
@@ -3888,13 +4277,16 @@ where
             limit: None,
             ..request.clone()
         };
-        let baseline = if let Some(root_id) = interval.baseline_root.as_ref() {
+        let mut baseline = if let Some(root_id) = interval.baseline_root.as_ref() {
             self.tree
                 .scan(&self.store, root_id, &baseline_request)
                 .await?
         } else {
             Vec::new()
         };
+        if let Some(root_id) = interval.baseline_root.as_ref() {
+            self.restore_legacy_root_authors(root_id, &mut baseline).await?;
+        }
         let row_capacity = baseline.len().checked_add(delta_rows).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4042,6 +4434,10 @@ where
         } else {
             vec![None; keys.len()]
         };
+        if let Some(root_id) = interval.baseline_root.as_ref() {
+            self.restore_legacy_root_encoded_values(root_id, keys, &mut values)
+                .await?;
+        }
         let mut cascades = vec![None; file_ids.len()];
         for &current_commit_id in interval.commits().iter().rev() {
             let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
@@ -4208,6 +4604,10 @@ where
         } else {
             vec![None; keys.len()]
         };
+        if let Some(root_id) = interval.baseline_root.as_ref() {
+            self.restore_legacy_root_values(root_id, keys, &mut values)
+                .await?;
+        }
         let descriptor_keys = keys
             .iter()
             .map(file_descriptor_key_for_file_scoped_key)
@@ -6072,7 +6472,7 @@ mod tests {
 
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::changelog::CommitRecord;
+    use crate::changelog::{ChangelogWriter, CommitRecord};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -6544,6 +6944,235 @@ mod tests {
             .validate_commit_root_metadata_against_changelog("child", metadata)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn collection_cascade_member_suppression_rejects_marker_time_mismatch() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-00000000062a";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked = TrackedStateContext::new();
+        let marker_key = collection_cascade_payload_key("test_schema", Some(FILE_ID));
+        let mut marker = row("unused", "collection-marker-time", "collection-marker-time");
+        marker.schema_key = marker_key.schema_key;
+        marker.file_id = marker_key.file_id;
+        marker.row_pk = marker_key.row_pk;
+        marker.snapshot_content = Some(r#"{"live_count":0}"#.into());
+        // `write_root_for_test` writes anonymous-account changelog owners;
+        // keep the materialized marker author consistent so the check below
+        // reaches the marker-time validation it is intended to exercise.
+        marker.author_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        marker.created_at = "2026-01-02T00:00:00Z".to_owned();
+        marker.updated_at = marker.created_at.clone();
+        write_root_for_test(
+            &storage,
+            &tracked,
+            "collection-marker-time",
+            None,
+            &[marker.clone()],
+        )
+        .await
+        .expect("collection marker should write");
+
+        let after = TrackedStateIndexValue {
+            change_id: marker.change_id,
+            commit_id: marker.commit_id,
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            deleted: true,
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "cascade created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "cascade updated_at",
+                "2026-01-02T00:00:01Z",
+            ),
+                    semantic_fingerprint: None,
+};
+        let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
+        builder.push_shared(
+            crate::tracked_state::codec::DecodedTrackedStateKeyShared {
+                schema_key: SharedStr::from_static("test_schema"),
+                file_id: Some(SharedStr::from_static(FILE_ID)),
+                row_pk: RowPk::single("cascaded-row"),
+            },
+            None,
+            Some(after),
+        );
+        let mut batch = builder.finish().expect("cascade diff batch should seal");
+        let mut reader = tracked.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("marker read should open"),
+        );
+
+        let error = reader
+            .suppress_collection_generation_cascade_tombstones(&mut batch)
+            .await
+            .expect_err("matching marker with a different timestamp is corrupt");
+        assert!(error.message.contains("marker time"));
+        assert_eq!(batch.len(), 1, "mismatched tombstone must not be suppressed");
+    }
+
+    #[tokio::test]
+    async fn collection_cascade_member_suppression_checks_author_presence() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-00000000062b";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked = TrackedStateContext::new();
+        let marker_key = collection_cascade_payload_key("test_schema", Some(FILE_ID));
+        let mut marker = row("unused", "collection-marker-author", "collection-marker-author");
+        marker.schema_key = marker_key.schema_key.clone();
+        marker.file_id = marker_key.file_id.clone();
+        marker.row_pk = marker_key.row_pk.clone();
+        marker.author_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        marker.created_at = "2026-01-02T00:00:00Z".to_owned();
+        marker.updated_at = marker.created_at.clone();
+
+        // Give the marker a SYSTEM physical owner so the v82 placeholder and
+        // the explicit v83 author below have a different expected value.
+        let commit_id = marker.commit_id;
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "collection marker timestamp",
+            &marker.updated_at,
+        );
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("marker write should open");
+        let mut writes = storage.new_write_set();
+        let mut change = crate::test_support::tracked_change_from_materialized(&marker)
+            .expect("marker payload should encode");
+        change.format_version = 2;
+        change.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        change.created_at = timestamp;
+        let commit = CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            base_commit_id: None,
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: timestamp,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
+};
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(crate::changelog::ChangelogAppend {
+                commits: vec![commit],
+                changes: vec![change.clone()],
+            })
+            .await
+            .expect("SYSTEM marker commit should stage");
+        let commit_delta = crate::tracked_state::types::TrackedStateCommitDeltaRef {
+            delta: delta_from_materialized_row(&marker),
+            metadata: change.metadata.as_ref(),
+            snapshot: change.snapshot.as_deref(),
+            origin_key: change.origin_key.as_deref(),
+            base_coordinate: None,
+            authored: true,
+        };
+        let staged = storage::stage_addressable_commit_deltas(
+            &mut writes,
+            &[commit_delta],
+            &[false],
+        )
+        .expect("SYSTEM marker delta should stage");
+        storage::stage_change_locators(&mut writes, &staged.locators);
+        let mut root_writer = tracked.writer(&read, &mut writes);
+        root_writer
+            .stage_commit_root(
+                &commit_id.to_string(),
+                None,
+                [delta_from_materialized_row(&marker)],
+            )
+            .await
+            .expect("marker root should stage");
+        let snapshot_root = root_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == commit_id)
+            .cloned()
+            .expect("marker root should be available");
+        drop(root_writer);
+        let manifest = crate::tracked_state::types::CommitStateManifest {
+            incorporation: crate::tracked_state::types::CommitStateIncorporation::None,
+            commit_id,
+            change_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            replay_debt: Default::default(),
+            mutations: staged.mutation_inventory().clone(),
+            touched_scope_filter: Default::default(),
+            global_scope: false,
+            current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
+            snapshot_root: Some(Box::new(snapshot_root)),
+        };
+        storage::stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("SYSTEM marker authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("SYSTEM marker authority should commit");
+
+        let make_batch = |author_present| {
+            let after = TrackedStateIndexValue {
+                change_id: marker.change_id,
+                commit_id,
+                // This is the v82 decoder's placeholder. It is intentionally
+                // different from the marker owner; absent bytes are not proof
+                // of a conflicting author.
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                deleted: true,
+                created_at: timestamp,
+                updated_at: timestamp,
+                            semantic_fingerprint: None,
+};
+            let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
+            builder.push_shared_with_author_presence(
+                crate::tracked_state::codec::DecodedTrackedStateKeyShared {
+                    schema_key: SharedStr::from_static("test_schema"),
+                    file_id: Some(SharedStr::from_static(FILE_ID)),
+                    row_pk: RowPk::single("cascaded-row"),
+                },
+                None,
+                false,
+                Some(after),
+                author_present,
+            );
+            builder.finish().expect("cascade diff batch should seal")
+        };
+
+        let mut explicit_v83 = make_batch(true);
+        let mut reader = tracked.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("marker read should open"),
+        );
+        let error = reader
+            .suppress_collection_generation_cascade_tombstones(&mut explicit_v83)
+            .await
+            .expect_err("explicit author mismatch is corrupt");
+        assert!(error.message.contains("marker author"));
+        assert_eq!(explicit_v83.len(), 1, "corrupt tombstone must be retained");
+        drop(reader);
+
+        let mut authorless_v82 = make_batch(false);
+        let mut reader = tracked.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("marker read should reopen"),
+        );
+        reader
+            .suppress_collection_generation_cascade_tombstones(&mut authorless_v82)
+            .await
+            .expect("an omitted v82 author must not conflict with its marker");
+        assert_eq!(authorless_v82.len(), 0, "valid cascade should be suppressed");
     }
 
     #[tokio::test]
@@ -11411,6 +12040,859 @@ mod tests {
             paged.push(key);
         }
         assert_eq!(paged, expected);
+    }
+
+    #[tokio::test]
+    async fn durable_v82_root_scan_restores_the_authored_system_author() {
+        let storage = StorageAdapter::new(Memory::new());
+        let context = TrackedStateContext::new();
+        // Keep the commit label available to the rootless test helper below,
+        // which constructs the child's first-parent ID from this label.
+        let commit_id = CommitId::for_test_label("legacy-v82-author");
+        let change_id = storage::change_id_from_packed_address(commit_id, 1);
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "legacy author test timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut row = row("legacy-v82-author", "unused", "unused");
+        row.commit_id = commit_id;
+        row.change_id = change_id;
+        row.author_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        row.created_at = timestamp.to_string();
+        row.updated_at = timestamp.to_string();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+
+        let mut change = crate::test_support::tracked_change_from_materialized(&row)
+            .expect("canonical change payload should encode");
+        change.format_version = 2;
+        change.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        change.created_at = timestamp;
+        let commit = CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            base_commit_id: None,
+            first_parent_jump_commit_id: commit_id,
+            first_parent_jump_span: 0,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: timestamp,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
+};
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(crate::changelog::ChangelogAppend {
+                commits: vec![commit],
+                changes: vec![change.clone()],
+            })
+            .await
+            .expect("canonical SYSTEM commit and change should stage");
+
+        let delta = delta_from_materialized_row(&row);
+        let commit_delta = crate::tracked_state::types::TrackedStateCommitDeltaRef {
+            delta,
+            metadata: change.metadata.as_ref(),
+            snapshot: change.snapshot.as_deref(),
+            origin_key: change.origin_key.as_deref(),
+            base_coordinate: None,
+            authored: true,
+        };
+        let staged = storage::stage_addressable_commit_deltas(
+            &mut writes,
+            &[commit_delta],
+            &[true],
+        )
+        .expect("authored mutation should stage");
+        assert_eq!(staged.assigned_change_ids.as_slice(), &[change_id]);
+
+        // Build the exact authorless generic-leaf encoding used by v82. The
+        // retained packed owner above remains the canonical SYSTEM authority.
+        let key = encoded_key_from_materialized_row(&row);
+        let value = encode_value_ref(
+            TrackedStateIndexValueRef {
+                change_id,
+                commit_id,
+                author_id: &row.author_id,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                            semantic_fingerprint: None,
+},
+        );
+        let author_suffix_len = 2 + row.author_id.len();
+        let tail_end = value
+            .len()
+            .checked_sub(author_suffix_len)
+            .expect("encoded value should contain its author");
+        assert_eq!(
+            &value[tail_end + 2..],
+            crate::SYSTEM_ACCOUNT_ID.as_bytes()
+        );
+        let mut legacy_leaf = vec![5, 1, 0, 0];
+        {
+            let mut write_varint = |mut value: u64| {
+                while value >= 0x80 {
+                    legacy_leaf.push((value as u8) | 0x80);
+                    value >>= 7;
+                }
+                legacy_leaf.push(value as u8);
+            };
+            write_varint(0); // shared key prefix
+            write_varint(key.len() as u64);
+        }
+        legacy_leaf.extend_from_slice(&key);
+        legacy_leaf.extend_from_slice(&value[..16]);
+        legacy_leaf.push(0); // no commit dictionary entry
+        legacy_leaf.extend_from_slice(&value[16..32]);
+        legacy_leaf.push(0); // no state-tail dictionary entry
+        legacy_leaf.extend_from_slice(&value[32..tail_end]);
+        let root_hash = crate::tracked_state::codec::hash_bytes(&legacy_leaf);
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            root_hash.to_vec(),
+            legacy_leaf,
+        );
+
+        // Rootless test commits require the parent's row-PK identity catalog
+        // as their baseline. This fixture writes the root directly to model
+        // the legacy authorless tree, so stage the matching catalog root too.
+        let mut catalog_primary = TrackedStateMutationBatchBuilder::with_row_capacity(1);
+        catalog_primary.push(
+            TrackedStateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                row_pk: &row.row_pk,
+            },
+            TrackedStateIndexValueRef {
+                change_id,
+                commit_id,
+                author_id: &row.author_id,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                            semantic_fingerprint: None,
+},
+        );
+        let (_, catalog_mutations) = crate::tracked_state::with_row_pk_index_mutations(
+            catalog_primary.finish(),
+        )
+        .expect("legacy root catalog mutation should encode");
+        let mut catalog_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+        let catalog_root = TrackedStateTree::new()
+            .apply_mutations_with_overlay(
+                &read,
+                &mut writes,
+                &mut catalog_overlay,
+                None,
+                catalog_mutations,
+                None,
+            )
+            .await
+            .expect("legacy root identity catalog should stage")
+            .root_id;
+
+        let manifest = crate::tracked_state::types::CommitStateManifest {
+            incorporation: crate::tracked_state::types::CommitStateIncorporation::None,
+            commit_id,
+            change_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            replay_debt: Default::default(),
+            mutations: staged.mutation_inventory().clone(),
+            touched_scope_filter: Default::default(),
+            global_scope: false,
+            current_state_scoped_ranges: None,
+            row_pk_index_root_id: Some(catalog_root),
+            snapshot_root: Some(Box::new(TrackedStateCommitRoot {
+                commit_id,
+                root_id: TrackedStateRootId::new(root_hash),
+                parent_roots: Vec::new(),
+                changed_key_count: 1,
+                row_count_estimate: 1,
+                tree_height: 1,
+                complete_state_fence: false,
+            })),
+        };
+        storage::stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("v82 root authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("v82 root fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("committed root should open");
+        let mut reader = context.reader(read);
+        let rows = reader
+            .scan_batch_at_commit(&commit_id.to_string(), &test_schema_scan_request())
+            .await
+            .expect("durable v82 tree scan should resolve");
+        let rows = rows.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author_id, crate::SYSTEM_ACCOUNT_ID);
+        let exact_key = crate::tracked_state::codec::decode_key(&key)
+            .expect("legacy root key should decode");
+        let exact = reader
+            .load_batch_at_commit(&commit_id.to_string(), &[exact_key.clone()])
+            .await
+            .expect("durable v82 exact read should resolve");
+        assert_eq!(
+            exact.into_rows()[0]
+                .as_ref()
+                .expect("legacy row should exist")
+                .author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+        drop(reader);
+
+        // A rootless child reuses the v82 root as its interval baseline. The
+        // inherited row must keep its retained SYSTEM author through both the
+        // scan overlay and point replay paths.
+        write_rootless_commit_for_test(
+            &storage,
+            "legacy-v82-rootless-child",
+            "legacy-v82-author",
+            &[row_with_value(
+                "legacy-v82-child-row",
+                "legacy-v82-child-change",
+                "legacy-v82-rootless-child",
+                "child",
+            )],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rootless child should open");
+        let mut reader = context.reader(read);
+        let child_rows = reader
+            .scan_batch_at_commit(
+                "legacy-v82-rootless-child",
+                &test_schema_scan_request(),
+            )
+            .await
+            .expect("rootless child scan should restore the legacy baseline author");
+        assert_eq!(child_rows.len(), 2);
+        assert_eq!(
+            child_rows
+                .iter()
+                .find(|row| row.row_pk() == &RowPk::single("legacy-v82-author"))
+                .expect("inherited v82 row should remain visible")
+                .author_id(),
+            crate::SYSTEM_ACCOUNT_ID
+        );
+
+        let inherited = reader
+            .load_batch_at_commit("legacy-v82-rootless-child", &[exact_key])
+            .await
+            .expect("rootless child point read should restore the legacy baseline author");
+        assert_eq!(
+            inherited.into_rows()[0]
+                .as_ref()
+                .expect("inherited row should exist")
+                .author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn v82_cascade_tombstones_restore_authors_from_their_physical_markers() {
+        const FILE_DELETE_ID: &str = "01920000-0000-7000-8000-000000000626";
+        const GENERATION_ID: &str = "01920000-0000-7000-8000-000000000627";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let context = TrackedStateContext::new();
+        let mut file_delete = row("unused", "unused", "initial");
+        file_delete.change_id = ChangeId::for_test_label("v82-base-file-delete-descriptor");
+        file_delete.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_owned();
+        file_delete.row_pk = RowPk::uuid_from_canonical(FILE_DELETE_ID).unwrap();
+        file_delete.file_id = Some(FILE_DELETE_ID.to_owned());
+        let mut generation_file = row("unused", "unused", "initial");
+        generation_file.change_id =
+            ChangeId::for_test_label("v82-base-generation-descriptor");
+        generation_file.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_owned();
+        generation_file.row_pk = RowPk::uuid_from_canonical(GENERATION_ID).unwrap();
+        generation_file.file_id = Some(GENERATION_ID.to_owned());
+        let mut file_row = row("file-delete-row", "file-delete-row-before", "initial");
+        file_row.change_id = ChangeId::for_test_label("v82-base-file-delete-row");
+        file_row.file_id = Some(FILE_DELETE_ID.to_owned());
+        let mut generation_row = row("generation-row", "generation-row-before", "initial");
+        generation_row.change_id = ChangeId::for_test_label("v82-base-generation-row");
+        generation_row.file_id = Some(GENERATION_ID.to_owned());
+        write_root_for_test(
+            &storage,
+            &context,
+            "initial",
+            None,
+            &[
+                file_delete.clone(),
+                generation_file,
+                file_row.clone(),
+                generation_row.clone(),
+            ],
+        )
+        .await
+        .expect("base root should write");
+
+        file_delete.deleted = true;
+        file_delete.snapshot_content = None;
+        file_delete.change_id = ChangeId::for_test_label("v82-file-delete-marker");
+        file_delete.commit_id = CommitId::for_test_label("v82-cascade-child");
+        file_delete.author_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        file_delete.updated_at = "2026-01-02T00:00:00Z".to_owned();
+
+        let marker_key = collection_cascade_payload_key("test_schema", Some(GENERATION_ID));
+        let mut generation_marker = row(
+            "unused",
+            "v82-generation-marker",
+            "v82-cascade-child",
+        );
+        generation_marker.schema_key = marker_key.schema_key.clone();
+        generation_marker.file_id = marker_key.file_id.clone();
+        generation_marker.row_pk = marker_key.row_pk.clone();
+        generation_marker.author_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        generation_marker.snapshot_content = Some(r#"{"live_count":0}"#.into());
+        generation_marker.created_at = "2026-01-02T00:00:00Z".to_owned();
+        generation_marker.updated_at = "2026-01-02T00:00:00Z".to_owned();
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child write should open");
+        let mut writes = storage.new_write_set();
+        // The generic test helper creates anonymous commits. This fixture
+        // needs SYSTEM to be both the commit's physical owner account and
+        // each authored marker's account so v82 author recovery has a
+        // non-placeholder authority to restore.
+        let child_commit_id = file_delete.commit_id;
+        let parent_commit_id = CommitId::for_test_label("initial");
+        let child_commit_id_text = child_commit_id.to_string();
+        let parent_commit_id_text = parent_commit_id.to_string();
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "cascade marker timestamp",
+            &file_delete.updated_at,
+        );
+        let mut changes = [file_delete.clone(), generation_marker.clone()]
+            .iter()
+            .map(crate::test_support::tracked_change_from_materialized)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cascade marker payloads should encode");
+        for change in &mut changes {
+            change.format_version = 2;
+            change.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+            change.created_at = timestamp;
+        }
+        let commit = CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id: child_commit_id,
+            generation: 1,
+            parent_commit_ids: vec![parent_commit_id],
+            base_commit_id: None,
+            first_parent_jump_commit_id: parent_commit_id,
+            first_parent_jump_span: 1,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: timestamp,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
+};
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(crate::changelog::ChangelogAppend {
+                commits: vec![commit],
+                changes: changes.clone(),
+            })
+            .await
+            .expect("SYSTEM cascade commit should stage");
+        let deltas = [
+            delta_from_materialized_row(&file_delete),
+            delta_from_materialized_row(&generation_marker),
+        ];
+        let commit_deltas = changes
+            .iter()
+            .zip(deltas.iter().copied())
+            .map(|(change, delta)| crate::tracked_state::types::TrackedStateCommitDeltaRef {
+                delta,
+                metadata: change.metadata.as_ref(),
+                snapshot: change.snapshot.as_deref(),
+                origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
+                authored: true,
+            })
+            .collect::<Vec<_>>();
+        let staged = storage::stage_addressable_commit_deltas(
+            &mut writes,
+            &commit_deltas,
+            &[false, false],
+        )
+        .expect("SYSTEM cascade deltas should stage");
+        storage::stage_change_locators(&mut writes, &staged.locators);
+        let mut root_writer = context.writer(&read, &mut writes);
+        root_writer
+            .stage_commit_root_with_absence_guards(
+                &child_commit_id_text,
+                Some(&parent_commit_id_text),
+                deltas,
+                &BTreeSet::new(),
+                &BTreeSet::from([marker_key]),
+            )
+            .await
+            .expect("cascade child root should stage");
+        let snapshot_root = root_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == child_commit_id)
+            .cloned()
+            .expect("cascade child root should be available");
+        drop(root_writer);
+        let parent_catalog = storage::load_commit_state_manifest(&read, parent_commit_id)
+            .await
+            .expect("initial commit-state authority should load")
+            .and_then(|manifest| manifest.row_pk_index_root_id)
+            .expect("initial root should publish its identity catalog");
+        let mut catalog_primary =
+            TrackedStateMutationBatchBuilder::with_row_capacity(
+                deltas.len(),
+            );
+        for delta in &deltas {
+            catalog_primary.push(
+                TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    file_id: delta.file_id,
+                    row_pk: delta.row_pk,
+                },
+                TrackedStateIndexValueRef {
+                    change_id: delta.change_id,
+                    commit_id: delta.commit_id,
+                    author_id: delta.author_id,
+                    deleted: false,
+                    created_at: delta.created_at,
+                    updated_at: delta.updated_at,
+                                    semantic_fingerprint: None,
+},
+            );
+        }
+        let (_, catalog_mutations) = crate::tracked_state::with_row_pk_index_mutations(
+            catalog_primary.finish(),
+        )
+        .expect("cascade identity catalog mutations should encode");
+        let mut catalog_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
+        let catalog_root = TrackedStateTree::new()
+            .apply_mutations_with_overlay(
+                &read,
+                &mut writes,
+                &mut catalog_overlay,
+                Some(&parent_catalog),
+                catalog_mutations,
+                None,
+            )
+            .await
+            .expect("cascade identity catalog should stage")
+            .root_id;
+        let manifest = crate::tracked_state::types::CommitStateManifest {
+            incorporation: crate::tracked_state::types::CommitStateIncorporation::None,
+            commit_id: child_commit_id,
+            change_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            replay_debt: Default::default(),
+            mutations: staged.mutation_inventory().clone(),
+            touched_scope_filter: Default::default(),
+            global_scope: false,
+            current_state_scoped_ranges: None,
+            row_pk_index_root_id: Some(catalog_root),
+            snapshot_root: Some(Box::new(snapshot_root)),
+        };
+        storage::stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("SYSTEM cascade commit-state authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("cascade child should commit");
+
+        overwrite_root_leaf_without_authors_for_test(&storage, "v82-cascade-child").await;
+
+        let mut reader = context.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("legacy root should open"),
+        );
+        let scan = reader
+            .scan_batch_at_commit(
+                "v82-cascade-child",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        file_ids: vec![
+                            NullableKeyFilter::Value(FILE_DELETE_ID.to_owned()),
+                            NullableKeyFilter::Value(GENERATION_ID.to_owned()),
+                        ],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("v82 cascade scan should restore both marker authors")
+            .into_rows();
+        assert_eq!(scan.len(), 2);
+        assert!(scan.iter().all(|row| row.deleted));
+        assert!(scan
+            .iter()
+            .all(|row| row.author_id == crate::SYSTEM_ACCOUNT_ID));
+
+        let diff = reader
+            .diff_commits(
+                "initial",
+                "v82-cascade-child",
+                &TrackedStateDiffRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        file_ids: vec![
+                            NullableKeyFilter::Value(FILE_DELETE_ID.to_owned()),
+                            NullableKeyFilter::Value(GENERATION_ID.to_owned()),
+                        ],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("v82 cascade diff should restore both marker authors");
+        assert_eq!(diff.entries.len(), 2);
+        assert!(diff.entries.iter().all(|entry| {
+            entry.kind == crate::tracked_state::TrackedStateDiffKind::Removed
+                && entry.after.as_ref().is_some_and(|row| {
+                    row.author_id == crate::SYSTEM_ACCOUNT_ID
+                })
+        }));
+
+        drop(reader);
+        write_rootless_commit_for_test(
+            &storage,
+            "v82-cascade-rootless-child",
+            "v82-cascade-child",
+            &[row(
+                "rootless-added-row",
+                "rootless-added-change",
+                "v82-cascade-rootless-child",
+            )],
+        )
+        .await;
+        let mut reader = context.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rootless legacy baseline should open"),
+        );
+        let rootless_scan = reader
+            .scan_batch_at_commit(
+                "v82-cascade-rootless-child",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rootless baseline scan should restore cascaded tombstone authors")
+            .into_rows();
+        assert_eq!(rootless_scan.iter().filter(|row| row.deleted).count(), 2);
+        assert!(rootless_scan.iter().filter(|row| row.deleted).all(|row| {
+            row.author_id == crate::SYSTEM_ACCOUNT_ID
+        }));
+        for key in [
+            TrackedStateKey {
+                schema_key: "test_schema".to_owned(),
+                file_id: Some(FILE_DELETE_ID.to_owned()),
+                row_pk: file_row.row_pk,
+            },
+            TrackedStateKey {
+                schema_key: "test_schema".to_owned(),
+                file_id: Some(GENERATION_ID.to_owned()),
+                row_pk: generation_row.row_pk,
+            },
+        ] {
+            let exact = reader
+                .load_batch_at_commit("v82-cascade-rootless-child", &[key])
+                .await
+                .expect("rootless point read should restore cascaded tombstone author");
+            assert_eq!(
+                exact.into_rows()[0]
+                    .as_ref()
+                    .expect("cascade tombstone should remain present")
+                    .author_id,
+                crate::SYSTEM_ACCOUNT_ID
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v82_cascade_tombstone_ignores_mismatching_selected_source_row() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000628";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let context = TrackedStateContext::new();
+        let source_commit = CommitId::for_test_label("selected-cascade-source");
+        let alias_commit = CommitId::for_test_label("selected-cascade-alias");
+        let source_commit_text = source_commit.to_string();
+        let alias_commit_text = alias_commit.to_string();
+        let mut source_row = row("selected-cascade-row", "source-row", "selected-cascade-source");
+        source_row.file_id = Some(FILE_ID.to_owned());
+        write_root_for_test(
+            &storage,
+            &context,
+            "selected-cascade-source",
+            None,
+            &[source_row],
+        )
+        .await
+        .expect("selected source root should write");
+
+        let mut descriptor = row(FILE_ID, "unused", "selected-cascade-alias");
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_owned();
+        descriptor.file_id = Some(FILE_ID.to_owned());
+        descriptor.row_pk = RowPk::uuid_from_canonical(FILE_ID).unwrap();
+        descriptor.snapshot_content = None;
+        descriptor.deleted = true;
+        descriptor.author_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "selected cascade timestamp",
+            "2026-01-02T00:00:00Z",
+        );
+        descriptor.created_at = timestamp.to_string();
+        descriptor.updated_at = timestamp.to_string();
+        let mut change = crate::test_support::tracked_change_from_materialized(&descriptor)
+            .expect("descriptor change should encode");
+        change.format_version = 2;
+        change.account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        change.created_at = timestamp;
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected alias read should open");
+        let mut writes = storage.new_write_set();
+        let commit = CommitRecord {
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+            commit_id: alias_commit,
+            generation: 1,
+            parent_commit_ids: vec![source_commit],
+            base_commit_id: None,
+            first_parent_jump_commit_id: source_commit,
+            first_parent_jump_span: 1,
+            account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            created_at: timestamp,
+            touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+            is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
+};
+
+        let provisional_delta = delta_from_materialized_row(&descriptor);
+        let provisional_commit_delta = crate::tracked_state::types::TrackedStateCommitDeltaRef {
+            delta: provisional_delta,
+            metadata: change.metadata.as_ref(),
+            snapshot: change.snapshot.as_deref(),
+            origin_key: change.origin_key.as_deref(),
+            base_coordinate: None,
+            authored: true,
+        };
+        let staged = storage::stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &[provisional_commit_delta],
+            &[true],
+            source_commit,
+        )
+        .expect("selected-source descriptor delta should stage");
+        descriptor.change_id = staged.assigned_change_ids[0];
+        change.change_id = descriptor.change_id;
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(crate::changelog::ChangelogAppend {
+                commits: vec![commit],
+                changes: vec![change],
+            })
+            .await
+            .expect("selected-source alias changelog should stage");
+
+        let delta = delta_from_materialized_row(&descriptor);
+        let mut root_writer = context.writer(&read, &mut writes);
+        root_writer
+            .stage_commit_root(
+                &alias_commit_text,
+                Some(&source_commit_text),
+                std::iter::once(delta),
+            )
+            .await
+            .expect("selected-source cascade root should stage");
+        let snapshot_root = root_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == alias_commit)
+            .cloned()
+            .expect("selected-source root should be staged");
+        drop(root_writer);
+        let manifest = crate::tracked_state::types::CommitStateManifest {
+            incorporation: crate::tracked_state::types::CommitStateIncorporation::None,
+            commit_id: alias_commit,
+            change_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+            replay_debt: Default::default(),
+            mutations: staged.mutation_inventory().clone(),
+            touched_scope_filter: Default::default(),
+            global_scope: false,
+            current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
+            snapshot_root: Some(Box::new(snapshot_root)),
+        };
+        storage::stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("selected-source commit state should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected-source alias should commit");
+
+        overwrite_root_leaf_without_authors_for_test(&storage, &alias_commit_text).await;
+        let mut reader = context.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("v82 selected-source root should open"),
+        );
+        let rows = reader
+            .scan_batch_at_commit(
+                &alias_commit_text,
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_owned())],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("selected-source live row must defer to the cascade marker")
+            .into_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].deleted);
+        assert_eq!(rows[0].author_id, crate::SYSTEM_ACCOUNT_ID);
+
+        let alias_request = storage::load_owned_commit_delta_entries(
+            &reader.store,
+            &[(alias_commit, TrackedStateKey {
+                schema_key: "test_schema".to_owned(),
+                file_id: Some(FILE_ID.to_owned()),
+                row_pk: RowPk::single("selected-cascade-row"),
+            })],
+        )
+        .await
+        .expect("selected-source row lookup should resolve");
+        assert!(alias_request[0]
+            .as_ref()
+            .is_some_and(|entry| entry.selected_ref && !entry.value.deleted));
+    }
+
+    async fn overwrite_root_leaf_without_authors_for_test(
+        storage: &StorageAdapter,
+        commit_id: &str,
+    ) {
+        fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+            while value >= 0x80 {
+                out.push((value as u8) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy root read should open");
+        let root = storage::load_snapshot_commit_root(&read, commit_id)
+            .await
+            .expect("root metadata should load")
+            .expect("root should exist");
+        let entries = TrackedStateTree::new()
+            .scan(
+                &read,
+                &root.root_id,
+                &TrackedStateTreeScanRequest {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("root entries should scan");
+        let mut legacy_leaf = vec![5];
+        write_varint(&mut legacy_leaf, entries.len() as u64);
+        write_varint(&mut legacy_leaf, 0); // no commit dictionary
+        write_varint(&mut legacy_leaf, 0); // no state-tail dictionary
+        let mut previous_key = Vec::new();
+        for (key, value) in &entries {
+            let encoded_key = encode_key(key);
+            let shared = previous_key
+                .iter()
+                .zip(&encoded_key)
+                .take_while(|(left, right)| left == right)
+                .count();
+            write_varint(&mut legacy_leaf, shared as u64);
+            write_varint(&mut legacy_leaf, (encoded_key.len() - shared) as u64);
+            legacy_leaf.extend_from_slice(&encoded_key[shared..]);
+            let encoded_value = encode_value_ref(TrackedStateIndexValueRef {
+                change_id: value.change_id,
+                commit_id: value.commit_id,
+                author_id: &value.author_id,
+                deleted: value.deleted,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
+                            semantic_fingerprint: None,
+});
+            legacy_leaf.extend_from_slice(&encoded_value[..16]);
+            legacy_leaf.push(0);
+            legacy_leaf.extend_from_slice(&encoded_value[16..32]);
+            legacy_leaf.push(0);
+            let author_suffix_len = 2 + value.author_id.len();
+            let tail_end = encoded_value.len() - author_suffix_len;
+            legacy_leaf.extend_from_slice(&encoded_value[32..tail_end]);
+            previous_key = encoded_key;
+        }
+
+        let root_hash = crate::tracked_state::codec::hash_bytes(&legacy_leaf);
+        let mut writes = storage.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&root_hash)),
+            legacy_leaf,
+        );
+        let published = storage::load_published_commit_state_manifest(
+            &read,
+            CommitId::for_test_label(commit_id),
+        )
+        .await
+        .expect("commit-state authority should load")
+        .expect("root commit should publish state authority");
+        let mut legacy_manifest = (*published).clone();
+        legacy_manifest
+            .snapshot_root
+            .as_mut()
+            .expect("root manifest should retain its snapshot")
+            .root_id = TrackedStateRootId::new(root_hash);
+        storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &legacy_manifest)
+            .expect("legacy root authority should encode");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy root should commit");
     }
 
     fn test_schema_scan_request() -> TrackedStateScanRequest {

@@ -151,6 +151,7 @@ pub(crate) struct TrackedStateDiffRow {
     /// payloads. Query projections do not expose this field.
     pub(crate) semantic_fingerprint: Option<[u8; 32]>,
     pub(crate) author_id: String,
+    pub(crate) author_present: bool,
 }
 
 /// One contiguous identity column shared by a tracked-state diff batch.
@@ -223,6 +224,8 @@ pub(crate) struct TrackedStateTreeDiffBatch {
     identities: Option<Arc<TrackedStateDiffIdentityBatch>>,
     before: Vec<Option<TrackedStateIndexValue>>,
     after: Vec<Option<TrackedStateIndexValue>>,
+    before_author_present: Vec<bool>,
+    after_author_present: Vec<bool>,
 }
 
 pub(crate) struct TrackedStateTreeDiffBatchBuilder {
@@ -231,6 +234,8 @@ pub(crate) struct TrackedStateTreeDiffBatchBuilder {
     rows: Vec<TrackedStateDiffKeyRow>,
     before: Vec<Option<TrackedStateIndexValue>>,
     after: Vec<Option<TrackedStateIndexValue>>,
+    before_author_present: Vec<bool>,
+    after_author_present: Vec<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -238,6 +243,7 @@ pub(crate) struct TrackedStateTreeDiffRowRef<'a> {
     identities: &'a TrackedStateDiffIdentityBatch,
     ordinal: u32,
     value: &'a TrackedStateIndexValue,
+    author_present: bool,
 }
 
 /// Root-local tracked-state identity view.
@@ -474,7 +480,8 @@ where
     // as no-diff). Reuse the records loaded for changed-row validation instead
     // of issuing a second changelog read.
 
-    let entries = classify_tree_diff_batch(tree_diff, &payloads, fingerprints.as_ref())?;
+    let mut entries = classify_tree_diff_batch(tree_diff, &payloads, fingerprints.as_ref())?;
+    reader.restore_legacy_diff_authors(&mut entries).await?;
 
     let diff = if request.retain_payloads {
         #[cfg(all(test, feature = "storage-benches"))]
@@ -498,7 +505,8 @@ fn classify_tree_diff_batch(
     if row_count == 0 {
         return Ok(Vec::new());
     }
-    let (identities, before, after) = tree_diff.into_columns();
+    let (identities, before, after, before_author_present, after_author_present) =
+        tree_diff.into_columns();
     let identities = identities.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -506,7 +514,13 @@ fn classify_tree_diff_batch(
         )
     })?;
     let mut entries = Vec::with_capacity(row_count);
-    for (ordinal, (before, after)) in before.into_iter().zip(after).enumerate() {
+    for (ordinal, (((before, after), before_author_present), after_author_present)) in before
+        .into_iter()
+        .zip(after)
+        .zip(before_author_present)
+        .zip(after_author_present)
+        .enumerate()
+    {
         let ordinal_u32 = u32::try_from(ordinal).expect("diff row count was bounded to u32");
         let Some(kind) = classify_diff_values(
             identities.schema_key(ordinal_u32),
@@ -522,10 +536,12 @@ fn classify_tree_diff_batch(
             Arc::clone(&identities),
             ordinal_u32,
         );
-        let before =
-            before.map(|value| TrackedStateDiffRow::from_index_value(identity.clone(), value));
-        let after =
-            after.map(|value| TrackedStateDiffRow::from_index_value(identity.clone(), value));
+        let before = before.map(|value| {
+            TrackedStateDiffRow::from_index_value(identity.clone(), value, before_author_present)
+        });
+        let after = after.map(|value| {
+            TrackedStateDiffRow::from_index_value(identity.clone(), value, after_author_present)
+        });
         entries.push(TrackedStateDiffEntry {
             identity,
             kind,
@@ -621,6 +637,8 @@ impl TrackedStateTreeDiffBatchBuilder {
             rows: Vec::with_capacity(row_count),
             before: Vec::with_capacity(row_count),
             after: Vec::with_capacity(row_count),
+            before_author_present: Vec::with_capacity(row_count),
+            after_author_present: Vec::with_capacity(row_count),
         }
     }
 
@@ -632,6 +650,8 @@ impl TrackedStateTreeDiffBatchBuilder {
             let _ = self.rows.try_reserve_exact(row_count);
             let _ = self.before.try_reserve_exact(row_count);
             let _ = self.after.try_reserve_exact(row_count);
+            let _ = self.before_author_present.try_reserve_exact(row_count);
+            let _ = self.after_author_present.try_reserve_exact(row_count);
             self.schema_keys.set_expected_cardinality(row_count);
             self.file_ids.set_expected_cardinality(row_count);
         }
@@ -647,6 +667,17 @@ impl TrackedStateTreeDiffBatchBuilder {
         before: Option<TrackedStateIndexValue>,
         after: Option<TrackedStateIndexValue>,
     ) {
+        self.push_shared_with_author_presence(key, before, true, after, true);
+    }
+
+    pub(crate) fn push_shared_with_author_presence(
+        &mut self,
+        key: DecodedTrackedStateKeyShared,
+        before: Option<TrackedStateIndexValue>,
+        before_author_present: bool,
+        after: Option<TrackedStateIndexValue>,
+        after_author_present: bool,
+    ) {
         debug_assert!(before.is_some() || after.is_some());
         let schema_key_ordinal = self.schema_keys.intern_shared(key.schema_key);
         let file_id_ordinal = key
@@ -659,12 +690,16 @@ impl TrackedStateTreeDiffBatchBuilder {
         });
         self.before.push(before);
         self.after.push(after);
+        self.before_author_present.push(before_author_present);
+        self.after_author_present.push(after_author_present);
     }
 
     pub(crate) fn finish(self) -> Result<TrackedStateTreeDiffBatch, LixError> {
         let row_count = self.rows.len();
         debug_assert_eq!(self.before.len(), row_count);
         debug_assert_eq!(self.after.len(), row_count);
+        debug_assert_eq!(self.before_author_present.len(), row_count);
+        debug_assert_eq!(self.after_author_present.len(), row_count);
         if row_count == 0 {
             return Ok(TrackedStateTreeDiffBatch::default());
         }
@@ -685,6 +720,8 @@ impl TrackedStateTreeDiffBatchBuilder {
             identities: Some(identities),
             before: self.before,
             after: self.after,
+            before_author_present: self.before_author_present,
+            after_author_present: self.after_author_present,
         })
     }
 }
@@ -701,24 +738,34 @@ impl TrackedStateTreeDiffBatch {
 
     pub(crate) fn swap_sides(&mut self) {
         std::mem::swap(&mut self.before, &mut self.after);
+        std::mem::swap(
+            &mut self.before_author_present,
+            &mut self.after_author_present,
+        );
     }
 
     pub(crate) fn side_rows(&self) -> impl Iterator<Item = TrackedStateTreeDiffRowRef<'_>> {
         let identities = self.identities.as_deref();
-        self.before.iter().zip(&self.after).enumerate().flat_map(
-            move |(ordinal, (before, after))| {
-                [before.as_ref(), after.as_ref()]
+        self.before
+            .iter()
+            .zip(&self.after)
+            .zip(&self.before_author_present)
+            .zip(&self.after_author_present)
+            .enumerate()
+            .flat_map(move |(ordinal, (((before, after), before_author), after_author))| {
+                [(before.as_ref(), *before_author), (after.as_ref(), *after_author)]
                     .into_iter()
-                    .flatten()
-                    .map(move |value| TrackedStateTreeDiffRowRef {
-                        identities: identities
-                            .expect("non-empty tree diff columns retain identities"),
-                        ordinal: u32::try_from(ordinal)
-                            .expect("tree diff batch row count is bounded to u32"),
-                        value,
+                    .filter_map(move |(value, author_present)| {
+                        value.map(|value| TrackedStateTreeDiffRowRef {
+                            identities: identities
+                                .expect("non-empty tree diff columns retain identities"),
+                            ordinal: u32::try_from(ordinal)
+                                .expect("tree diff batch row count is bounded to u32"),
+                            value,
+                            author_present,
+                        })
                     })
-            },
-        )
+            })
     }
 
     pub(crate) fn rows(
@@ -753,6 +800,25 @@ impl TrackedStateTreeDiffBatch {
             })
     }
 
+    /// Iterates the after side together with the physical author-presence bit.
+    /// The decoded author value alone cannot distinguish an explicit v83
+    /// anonymous author from the anonymous placeholder used by v82 leaves.
+    pub(crate) fn rows_with_after_author_presence(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            TrackedStateKeyRef<'_>,
+            Option<&TrackedStateIndexValue>,
+            bool,
+        ),
+    > {
+        let author_presence = &self.after_author_present;
+        self.rows().map(move |(ordinal, key, _, after)| {
+            (ordinal, key, after, author_presence[ordinal])
+        })
+    }
+
     pub(crate) fn remove_rows(&mut self, remove: &[bool]) {
         debug_assert_eq!(remove.len(), self.len());
         if !remove.iter().any(|remove| *remove) {
@@ -764,8 +830,16 @@ impl TrackedStateTreeDiffBatch {
         let mut keys = Vec::with_capacity(self.len());
         let mut before = Vec::with_capacity(self.len());
         let mut after = Vec::with_capacity(self.len());
-        for (ordinal, ((before_value, after_value), remove)) in
-            self.before.iter().zip(&self.after).zip(remove).enumerate()
+        let mut before_author_present = Vec::with_capacity(self.len());
+        let mut after_author_present = Vec::with_capacity(self.len());
+        for (ordinal, ((((before_value, after_value), before_author), after_author), remove)) in self
+            .before
+            .iter()
+            .zip(&self.after)
+            .zip(&self.before_author_present)
+            .zip(&self.after_author_present)
+            .zip(remove)
+            .enumerate()
         {
             if *remove {
                 continue;
@@ -779,6 +853,8 @@ impl TrackedStateTreeDiffBatch {
             });
             before.push(before_value.clone());
             after.push(after_value.clone());
+            before_author_present.push(*before_author);
+            after_author_present.push(*after_author);
         }
         if keys.is_empty() {
             *self = Self::default();
@@ -786,6 +862,8 @@ impl TrackedStateTreeDiffBatch {
             self.identities = Some(TrackedStateDiffIdentityBatch::from_keys(keys));
             self.before = before;
             self.after = after;
+            self.before_author_present = before_author_present;
+            self.after_author_present = after_author_present;
         }
     }
 
@@ -799,8 +877,12 @@ impl TrackedStateTreeDiffBatch {
         &self,
     ) -> impl Iterator<Item = TrackedStateTreeDiffRowRef<'_>> {
         let identities = self.identities.as_deref();
-        self.before.iter().zip(&self.after).enumerate().filter_map(
-            move |(ordinal, (before, after))| {
+        self.before
+            .iter()
+            .zip(&self.after)
+            .zip(&self.after_author_present)
+            .enumerate()
+            .filter_map(move |(ordinal, ((before, after), after_author_present))| {
                 let after = after.as_ref()?;
                 if after.deleted && before.as_ref().is_none_or(|before| before.deleted) {
                     return None;
@@ -810,9 +892,9 @@ impl TrackedStateTreeDiffBatch {
                     ordinal: u32::try_from(ordinal)
                         .expect("tree diff batch row count is bounded to u32"),
                     value: after,
+                    author_present: *after_author_present,
                 })
-            },
-        )
+            })
     }
 
     pub(crate) fn comparison_rows(&self) -> Vec<TrackedStateTreeDiffRowRef<'_>> {
@@ -820,7 +902,17 @@ impl TrackedStateTreeDiffBatch {
             return Vec::new();
         };
         let mut rows = Vec::new();
-        for (ordinal, (before, after)) in self.before.iter().zip(&self.after).enumerate() {
+        for (ordinal, ((before, after), (before_author_present, after_author_present))) in self
+            .before
+            .iter()
+            .zip(&self.after)
+            .zip(
+                self.before_author_present
+                    .iter()
+                    .zip(&self.after_author_present),
+            )
+            .enumerate()
+        {
             let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) else {
                 continue;
             };
@@ -833,11 +925,13 @@ impl TrackedStateTreeDiffBatch {
                 identities,
                 ordinal,
                 value: before,
+                author_present: *before_author_present,
             });
             rows.push(TrackedStateTreeDiffRowRef {
                 identities,
                 ordinal,
                 value: after,
+                author_present: *after_author_present,
             });
         }
         rows
@@ -849,8 +943,16 @@ impl TrackedStateTreeDiffBatch {
         Option<Arc<TrackedStateDiffIdentityBatch>>,
         Vec<Option<TrackedStateIndexValue>>,
         Vec<Option<TrackedStateIndexValue>>,
+        Vec<bool>,
+        Vec<bool>,
     ) {
-        (self.identities, self.before, self.after)
+        (
+            self.identities,
+            self.before,
+            self.after,
+            self.before_author_present,
+            self.after_author_present,
+        )
     }
 
     #[cfg(test)]
@@ -858,9 +960,10 @@ impl TrackedStateTreeDiffBatch {
         if self.is_empty() {
             0
         } else {
-            // Identity rows plus two aligned side columns. Tiny dictionaries
-            // stay below the large-buffer threshold.
-            3
+            // Identity rows, two aligned value columns, and two aligned
+            // author-presence columns. Tiny dictionaries stay below the
+            // large-buffer threshold.
+            5
         }
     }
 
@@ -876,13 +979,15 @@ impl TrackedStateTreeDiffBatch {
         identity_capacity
             .max(self.before.capacity())
             .max(self.after.capacity())
+            .max(self.before_author_present.capacity())
+            .max(self.after_author_present.capacity())
     }
 
     #[cfg(test)]
     pub(crate) fn into_rows_for_test(
         self,
     ) -> Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry> {
-        let (identities, before, after) = self.into_columns();
+        let (identities, before, after, _, _) = self.into_columns();
         let Some(identities) = identities else {
             return Vec::new();
         };
@@ -910,6 +1015,10 @@ impl TrackedStateTreeDiffBatch {
 impl<'a> TrackedStateTreeDiffRowRef<'a> {
     pub(crate) fn value(self) -> &'a TrackedStateIndexValue {
         self.value
+    }
+
+    pub(crate) fn author_present(self) -> bool {
+        self.author_present
     }
 
     pub(crate) fn schema_key(self) -> &'a str {
@@ -1385,10 +1494,14 @@ impl Hash for TrackedStateDiffIdentity {
 
 impl TrackedStateDiffRow {
     pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
-        Self::from_index_value(TrackedStateDiffIdentity::from_key(key), value)
+        Self::from_index_value(TrackedStateDiffIdentity::from_key(key), value, true)
     }
 
-    fn from_index_value(identity: TrackedStateDiffIdentity, value: TrackedStateIndexValue) -> Self {
+    fn from_index_value(
+        identity: TrackedStateDiffIdentity,
+        value: TrackedStateIndexValue,
+        author_present: bool,
+    ) -> Self {
         Self {
             identity,
             deleted: value.deleted,
@@ -1398,7 +1511,12 @@ impl TrackedStateDiffRow {
             commit_id: value.commit_id,
             semantic_fingerprint: value.semantic_fingerprint,
             author_id: value.author_id,
+            author_present,
         }
+    }
+
+    pub(crate) fn author_present(&self) -> bool {
+        self.author_present
     }
 
     pub(crate) fn schema_key(&self) -> &str {
@@ -1514,6 +1632,7 @@ mod tests {
             commit_id: CommitId::for_test_label("payload-commit"),
             semantic_fingerprint: None,
             author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            author_present: true,
         };
         let entry = TrackedStateDiffEntry {
             identity,
@@ -1636,6 +1755,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_rows_retain_legacy_author_absence() {
+        let timestamp = ts("2024-01-01T00:00:00.000Z");
+        let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
+        builder.push_shared_with_author_presence(
+            DecodedTrackedStateKeyShared {
+                schema_key: SharedStr::from_static("test_schema"),
+                file_id: None,
+                row_pk: RowPk::single("legacy-row"),
+            },
+            None,
+            true,
+            Some(TrackedStateIndexValue {
+                change_id: ChangeId::for_test_label("legacy-selected-change"),
+                commit_id: CommitId::for_test_label("legacy-selected-commit"),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                            semantic_fingerprint: None,
+}),
+            false,
+        );
+        let batch = builder.finish().expect("tree diff should seal");
+        let row = batch
+            .checkpoint_delta_rows()
+            .next()
+            .expect("live checkpoint transition should be retained");
+        assert!(!row.author_present());
+    }
+
     /// The after side must stay raw: a `Removed` entry's after row *is* the
     /// tombstone, and merge relies on it. If normalization ever leaks across to
     /// `after`, every delete would encode as a sideless diff and fail to encode
@@ -1719,7 +1869,7 @@ mod tests {
             );
         }
         let tree_entries = tree_entries.finish().expect("tree batch should seal");
-        assert_eq!(tree_entries.large_buffer_count(), 3);
+        assert_eq!(tree_entries.large_buffer_count(), 5);
         let rows = classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default(), None)
             .expect("tree rows should classify");
         assert_eq!(rows.len(), row_count);
@@ -1833,7 +1983,7 @@ mod tests {
         let batch = builder.finish().expect("shared tree batch should seal");
 
         assert_eq!(batch.len(), row_count);
-        assert_eq!(batch.large_buffer_count(), 3);
+        assert_eq!(batch.large_buffer_count(), 5);
         let identities = batch.identities.as_ref().expect("identity columns");
         let TrackedStateDiffKeyStorage::Batch(keys) = &identities.keys else {
             panic!("tree diff must use batch identity columns");
@@ -1980,6 +2130,7 @@ mod tests {
                 row_pk: RowPk::single("row"),
             }),
             before.clone(),
+            true,
         );
         assert_eq!(row.index_value().semantic_fingerprint, Some(same));
 
