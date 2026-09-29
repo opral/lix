@@ -49,6 +49,7 @@ pub(crate) fn has_coordinate_mutations(writes: &StorageWriteSet) -> bool {
 /// after sealing its retained-root proof.
 pub(crate) fn commit_graph_guards(
     writes: &StorageWriteSet,
+    existing_preconditions: &[StoragePrecondition],
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     let commits = crate::changelog::COMMIT_SPACE;
     if writes.has_deletions_in_space(commits) && !writes.changelog_gc_is_sealed() {
@@ -60,9 +61,35 @@ pub(crate) fn commit_graph_guards(
         .declared_keys(commits)
         .into_iter()
         .filter(|key| writes.contains_put(commits, key))
-        .map(|key| StoragePrecondition::KeyAbsent {
-            space: commits,
-            key: StorageKey(Bytes::from(key)),
+        .filter_map(|key| {
+            let key = StorageKey(Bytes::from(key));
+            let same_value_is_guarded = writes
+                .staged_value(commits, &key.0)
+                .is_some_and(|staged| {
+                    existing_preconditions.iter().any(|precondition| {
+                        matches!(
+                            precondition,
+                            StoragePrecondition::KeyValueEquals {
+                                space,
+                                key: guarded_key,
+                                expected,
+                            } if *space == commits
+                                && guarded_key == &key
+                                && expected == &staged
+                        )
+                    })
+                });
+            if same_value_is_guarded {
+                // Reinstalling an identical immutable commit is idempotent.
+                // The caller's atomic equality guard preserves append-only
+                // semantics without contradicting it with KeyAbsent.
+                None
+            } else {
+                Some(StoragePrecondition::KeyAbsent {
+                    space: commits,
+                    key,
+                })
+            }
         })
         .collect())
 }
