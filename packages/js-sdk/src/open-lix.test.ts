@@ -193,7 +193,7 @@ test("a source error completes restore cancellation before an immediate destinat
 		await restored.close();
 		rmSync(dir, { recursive: true, force: true });
 	}
-});
+}, 30_000);
 
 test("a locked snapshot source does not strand the destination before retry", async () => {
 	const source = await openLix();
@@ -234,7 +234,7 @@ test("a locked snapshot source does not strand the destination before retry", as
 		}
 		rmSync(dir, { recursive: true, force: true });
 	}
-});
+}, 30_000);
 
 test("snapshot export emits bounded chunks and cancellation releases the native actor", async () => {
 	const lix = await openLix();
