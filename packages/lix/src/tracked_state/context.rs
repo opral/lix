@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
-    ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
+    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
+    CommitLoadRequest,
 };
 use crate::common::SharedStr;
 use crate::row_pk::{RowPk, RowPkComponent};
@@ -2889,12 +2890,33 @@ where
             .zip(loaded.iter())
             .filter_map(|(change_id, record)| record.is_none().then_some(*change_id))
             .collect::<Vec<_>>();
-        let mut fallback = storage::load_change_records_by_ids(&self.store, &missing)
-            .await?
-            .into_iter();
+        // This endpoint has no local replay authority. Its standalone
+        // snapshot payloads are the local fallback while authored history is
+        // omitted; the general change-ID resolver must probe physical owners.
+        let standalone = ChangelogContext::new()
+            .reader(&self.store)
+            .load_changes(ChangeLoadRequest {
+                change_ids: &missing,
+            })
+            .await?;
+        let physical_missing = standalone
+            .iter()
+            .filter_map(|(id, record)| record.is_none().then_some(*id))
+            .collect::<Vec<_>>();
+        let physical = if physical_missing.is_empty() {
+            Vec::new()
+        } else {
+            storage::load_change_records_by_ids(&self.store, &physical_missing).await?
+        };
+        let mut physical = physical.into_iter();
+        let mut fallback = standalone
+            .into_iter()
+            .map(|(_, record)| record.or_else(|| physical.next()));
         for record in loaded {
             if record.is_none() {
-                *record = fallback.next();
+                *record = fallback
+                    .next()
+                    .expect("one standalone fallback was loaded per missing change");
             }
         }
         Ok(())
