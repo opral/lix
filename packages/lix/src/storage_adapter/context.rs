@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tracing::Instrument as _;
 
 use crate::storage::{
-    CommitResult, Key, KeyRange, Memory, Precondition, Prefix, PutBatch, PutEntry, ReadOptions, Storage,
+    CommitResult, KeyRange, Memory, Precondition, Prefix, PutBatch, PutEntry, ReadOptions, Storage,
     StorageChangeWatch, StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{

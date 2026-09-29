@@ -451,18 +451,18 @@ pub(crate) async fn prepare_write(
         let stable_local_root = previous.is_some_and(|prior| {
             prior.local_root_owned
                 && prior.epoch_id == state.epoch_id()
-                && prior.admitted_base == base.to_string()
-                && prior.root == root.to_string()
-                && prior.generation == control.tracked_generation.to_string()
+                && prior.admitted_base == base
+                && prior.root == root
+                && prior.generation == control.tracked_generation
         });
         let prior_head_extends = if previous.is_some_and(|prior| {
             prior.epoch_id == state.epoch_id()
-                && prior.admitted_base == base.to_string()
-                && prior.head == control.head_commit_id.to_string()
+                && prior.admitted_base == base
+                && prior.head == control.head_commit_id
         }) {
             true
         } else if let Some(prior) = previous.filter(|prior| {
-            prior.epoch_id == state.epoch_id() && prior.admitted_base == base.to_string()
+            prior.epoch_id == state.epoch_id() && prior.admitted_base == base
         }) {
             let prior_head = CommitId::parse_lix(&prior.head, "partial prior serving head")?;
             let node = CommitGraphContext::new()
@@ -472,7 +472,7 @@ pub(crate) async fn prepare_write(
             node.is_some_and(|node| {
                 node.parent_commit_ids
                     .first()
-                    .is_some_and(|parent| prior.head == parent.to_string())
+                    .is_some_and(|parent| prior.head == *parent)
             })
                 || checkpoint_extends_prior(
                     &overlay,
@@ -540,7 +540,7 @@ pub(crate) async fn prepare_write(
             control.tracked_generation,
         )));
         let old_marker = if writes.contains_put(ROOT_CURRENT_BASE_SPACE, &marker_key.0) {
-            PointReadPlan::new(ROOT_CURRENT_BASE_SPACE, &[marker_key.clone()])
+            PointReadPlan::new(ROOT_CURRENT_BASE_SPACE, std::slice::from_ref(&marker_key))
                 .materialize(read, StorageGetOptions::default())
                 .await?
                 .value
@@ -680,10 +680,10 @@ pub(crate) async fn assert_admitted(
         let (root, _) = root_marker(read, &branch.branch_id, control.tracked_generation).await?;
         let base = CommitId::parse_lix(&branch.head.commit_id, "partial admitted base")?;
         if serving.epoch_id != state.epoch_id()
-            || serving.admitted_base != base.to_string()
-            || serving.head != control.head_commit_id.to_string()
-            || serving.generation != control.tracked_generation.to_string()
-            || serving.root != root.to_string()
+            || serving.admitted_base != base
+            || serving.head != control.head_commit_id
+            || serving.generation != control.tracked_generation
+            || serving.root != root
             || serving.local_root_owned
                 != (root != base || control.tracked_generation != state.serving_generation(&branch.branch_id)?)
         {
