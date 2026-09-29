@@ -212,6 +212,9 @@ where
             )?;
         }
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
+        if before.role == RepositoryRole::PartialReplica {
+            super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
+        }
         read.finish()?;
         Box::pin(super::hot_indexes::append_plan(
             &adapter, options, &mut plan,
@@ -260,7 +263,9 @@ where
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84)) {
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84))
+        || (before.role == RepositoryRole::PartialReplica && before.current)
+    {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let mut plan = super::publish::PublicationPlan::bounded(
             options.max_changes,
@@ -268,6 +273,9 @@ where
         );
         let read = super::MigrationPlanningRead::new(&adapter).await?;
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
+        if before.role == RepositoryRole::PartialReplica {
+            super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
+        }
         read.finish()?;
         if before.format.is_some_and(|format| format <= 81) {
             Box::pin(super::hot_indexes::append_plan(
@@ -292,7 +300,10 @@ where
     } else {
         ("exact-records-v1", before_content_digest.clone())
     };
-    super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
+    let admission = super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
+    if before.role == RepositoryRole::PartialReplica {
+        crate::sync::partial_serving::migrate_missing(&admission.adapter).await?;
+    }
     if before.role == RepositoryRole::Authority {
         super::authority_baseline_fence::upgrade_authority_native_baseline_fence(storage).await?;
     }
@@ -700,8 +711,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v79_to_v85_migration_preserves_admission_and_resident_records_offline() {
-        for format in [79, 80, 81, 82, 83, 84] {
+    async fn partial_legacy_formats_to_v85_preserve_admission_and_resident_records_offline() {
+        for format in [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION] {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
                 format!("https://example.test/lix/{}", authority.lix_id()),
@@ -719,6 +730,40 @@ mod tests {
                 super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
                     .await
                     .unwrap();
+            let local_roots = if matches!(format, 83 | 84) {
+                let (engine, session) = crate::engine::Engine::new_partial_replica(
+                    installed.adapter.clone(),
+                    crate::engine::EngineOptions::new(),
+                    &state,
+                )
+                .await
+                .unwrap();
+                engine.sync_mode().admit_partial_replica(
+                    std::sync::Arc::new(state.clone()),
+                    crate::sync::partial_replica_write_capability(),
+                );
+                installed.adapter.admit_partial_replica_writer(
+                    crate::sync::partial_replica_write_capability(),
+                );
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key,value) VALUES ('local-migration-root','pending')",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                let read = installed.adapter.begin_read(Default::default()).await.unwrap();
+                let roots = crate::sync::partial_serving::retained_local_roots(&read)
+                    .await
+                    .unwrap();
+                assert!(!roots.is_empty(), "format {format} fixture needs a local root");
+                drop(read);
+                drop(session);
+                drop(engine);
+                roots
+            } else {
+                Vec::new()
+            };
             let expected = content_digest(&storage).await.unwrap();
             let mut legacy_receipt = serde_json::to_value(&state).unwrap();
             legacy_receipt["version"] = serde_json::json!(1);
@@ -737,11 +782,29 @@ mod tests {
                     b"partial-cache".as_slice(),
                 );
             }
-            writes.put(
-                crate::sync::PARTIAL_REPLICA_STATE_SPACE,
-                crate::sync::partial_replica_state_key(),
-                serde_json::to_vec(&legacy_receipt).unwrap(),
-            );
+            if format < crate::init::CURRENT_FORMAT_VERSION {
+                writes.put(
+                    crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                    crate::sync::partial_replica_state_key(),
+                    serde_json::to_vec(&legacy_receipt).unwrap(),
+                );
+            }
+            // These formats predate serving witnesses. Keep the expected
+            // digest from the fully admitted repository, then remove both
+            // witnesses so migration must derive their exact bytes.
+            let mut visited = std::collections::BTreeSet::new();
+            for branch in [
+                &state.descriptor().selected_branch,
+                &state.descriptor().global_branch,
+            ] {
+                if visited.insert(&branch.branch_id) {
+                    let key = crate::storage_codec::id_string::uuid_bytes_from_canonical(
+                        &branch.branch_id,
+                    )
+                    .unwrap();
+                    writes.delete(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, key.as_slice());
+                }
+            }
             // Seed historical metadata through the fixture's migration writer;
             // ordinary partial writer capabilities remain sync-private.
             use crate::storage_adapter::StorageWrite as _;
@@ -752,14 +815,16 @@ mod tests {
                 .unwrap();
             writes.lower_into(&mut write).await.unwrap();
             write.commit().await.unwrap();
-            super::super::epoch::stage_repository_format_for_test(&storage, true, format)
-                .await
-                .unwrap();
-            assert!(
-                super::super::epoch::admit_partial_epoch(&storage)
+            if format < crate::init::CURRENT_FORMAT_VERSION {
+                super::super::epoch::stage_repository_format_for_test(&storage, true, format)
                     .await
-                    .is_err()
-            );
+                    .unwrap();
+                assert!(
+                    super::super::epoch::admit_partial_epoch(&storage)
+                        .await
+                        .is_err()
+                );
+            }
             assert_ne!(content_digest(&storage).await.unwrap(), expected);
             let report = migrate_repository(storage.clone())
                 .await
@@ -779,6 +844,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(admitted.state, state);
+            let read = admitted.adapter.begin_read(Default::default()).await.unwrap();
+            assert!(crate::sync::partial_serving::assert_admitted(&read, &state).await.unwrap());
+            assert_eq!(
+                crate::sync::partial_serving::retained_local_roots(&read)
+                    .await
+                    .unwrap(),
+                local_roots,
+            );
         }
     }
 

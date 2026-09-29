@@ -499,6 +499,42 @@ pub(crate) async fn prepare_write(
     Ok((writes, guards))
 }
 
+/// Derive the exact witness bytes a migrated partial repository must retain.
+/// The same postimage validator used by live partial writes supplies missing
+/// witnesses, while existing witnesses must already agree with the source.
+pub(crate) async fn preservation_entries(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, LixError> {
+    let Some((state, upgrade_writes, _)) =
+        super::prepare_owned_partial_metadata_upgrade(read).await?
+    else {
+        return Err(mismatch("partial migration lost its admission"));
+    };
+    let upgraded = CandidateRead {
+        base: read,
+        staged: Arc::new(upgrade_writes),
+    };
+    let (writes, _) = prepare_write(&upgraded, StorageWriteSet::new(), true).await?;
+    let mut entries = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    for branch in [&state.descriptor().selected_branch, &state.descriptor().global_branch] {
+        if !visited.insert(&branch.branch_id) {
+            continue;
+        }
+        let branch_key = key(&branch.branch_id)?;
+        let bytes = if let Some(staged) = writes.staged_value(PARTIAL_SERVING_SPACE, &branch_key.0) {
+            staged
+        } else {
+            load(&upgraded, &branch.branch_id)
+                .await?
+                .ok_or_else(|| mismatch("partial migration source witness is absent"))?
+                .1
+        };
+        entries.push((branch.branch_id.clone(), branch_key.0.to_vec(), bytes.to_vec()));
+    }
+    Ok(entries)
+}
+
 pub(crate) async fn assert_admitted(
     read: &(impl StorageAdapterRead + ?Sized),
     state: &super::PartialReplicaState,

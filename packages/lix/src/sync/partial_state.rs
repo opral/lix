@@ -620,9 +620,9 @@ where
             .commit_migration_write_set(
                 writes,
                 crate::storage_adapter::StorageWriteOptions {
-                await_durable: true,
-                preconditions,
-                ..Default::default()
+                    await_durable: true,
+                    preconditions,
+                    ..Default::default()
                 },
             )
             .await?;
