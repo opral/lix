@@ -10135,21 +10135,19 @@ pub(crate) async fn load_authoritative_live_change_records(
     }
     let standalone_fallback = records.clone();
     let deferred = deferred_standalone_sources(store, requests, &records).await?;
-    let deferred_direct_indices = records
+    let deferred_candidate_indices = records
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
             let request = &requests[index];
-            let owner_is_deferred_source = deferred.contains(&request.source_commit_id)
-                && direct_change_locator(request.change_id)
-                    .is_some_and(|locator| locator.commit_id == request.source_commit_id);
-            (record.is_some() && owner_is_deferred_source).then_some(index)
+            (record.is_some() && deferred.contains(&request.source_commit_id)).then_some(index)
         })
         .collect::<Vec<_>>();
-    // A direct-shaped ID can be dispatched through an explicit locator to an
-    // unrelated physical owner. A deferred logical endpoint only exempts its
-    // own omitted body from verification, not that other owner's body.
-    let deferred_keys = deferred_direct_indices
+    // A matching standalone record can stand in for a deferred source whose
+    // body was intentionally omitted. An explicit locator still redirects the
+    // record to local physical authority, so check all such locators in one
+    // batch before deciding which candidates need physical verification.
+    let deferred_keys = deferred_candidate_indices
         .iter()
         .map(|&index| {
             StorageKey(Bytes::copy_from_slice(
@@ -10161,7 +10159,7 @@ pub(crate) async fn load_authoritative_live_change_records(
         .materialize(store, StorageGetOptions::default())
         .await?;
     let mut skip_physical = vec![false; requests.len()];
-    for (index, value) in deferred_direct_indices
+    for (index, value) in deferred_candidate_indices
         .into_iter()
         .zip(deferred_locators.value)
     {
@@ -10169,9 +10167,16 @@ pub(crate) async fn load_authoritative_live_change_records(
             .and_then(full_value_bytes)
             .map(|bytes| decode_change_locator(requests[index].change_id, &bytes))
             .transpose()?;
-        skip_physical[index] = owner
-            .as_ref()
-            .is_none_or(|locator| locator.commit_id == requests[index].source_commit_id);
+        let direct_owner = direct_change_locator(requests[index].change_id);
+        // A deferred logical endpoint may still have an available authored
+        // owner encoded directly in the change id or named by an explicit
+        // locator. A matching standalone row can bypass physical lookup only
+        // when neither route names a candidate owner. Even when the encoded
+        // owner is the deferred source itself, retained physical data may
+        // coexist with the deferred marker, so the candidate must be checked.
+        // Without an explicit locator, non-addressable IDs have no derivable
+        // coordinate and retain the standalone-only fast path.
+        skip_physical[index] = owner.is_none() && direct_owner.is_none();
     }
     let physical_indices = records
         .iter()
