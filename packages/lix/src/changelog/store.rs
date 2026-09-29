@@ -276,6 +276,10 @@ mod tests {
             ("migration/incorporation/tests.rs .delete(", 1),
             // Test-only corruption fixture must not receive snapshot repair.
             ("sync/snapshot_omission_migration_tests.rs .delete(", 1),
+            // Test-only partial admission fixture probes rejection of graph
+            // deletion and replacement without altering the persisted index.
+            ("sync/partial_sql_tests/publication.rs .delete(", 1),
+            ("sync/partial_sql_tests/publication.rs .put(", 1),
         ]
         .into_iter()
         .map(|(site, count)| (site.to_string(), count))
