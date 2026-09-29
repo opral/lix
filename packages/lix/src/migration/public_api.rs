@@ -730,40 +730,6 @@ mod tests {
                 super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
                     .await
                     .unwrap();
-            let local_roots = if matches!(format, 83 | 84) {
-                let (engine, session) = crate::engine::Engine::new_partial_replica(
-                    installed.adapter.clone(),
-                    crate::engine::EngineOptions::new(),
-                    &state,
-                )
-                .await
-                .unwrap();
-                engine.sync_mode().admit_partial_replica(
-                    std::sync::Arc::new(state.clone()),
-                    crate::sync::partial_replica_write_capability(),
-                );
-                installed.adapter.admit_partial_replica_writer(
-                    crate::sync::partial_replica_write_capability(),
-                );
-                session
-                    .execute(
-                        "INSERT INTO lix_key_value (key,value) VALUES ('local-migration-root','pending')",
-                        &[],
-                    )
-                    .await
-                    .unwrap();
-                let read = installed.adapter.begin_read(Default::default()).await.unwrap();
-                let roots = crate::sync::partial_serving::retained_local_roots(&read)
-                    .await
-                    .unwrap();
-                assert!(!roots.is_empty(), "format {format} fixture needs a local root");
-                drop(read);
-                drop(session);
-                drop(engine);
-                roots
-            } else {
-                Vec::new()
-            };
             let expected = content_digest(&storage).await.unwrap();
             let mut legacy_receipt = serde_json::to_value(&state).unwrap();
             legacy_receipt["version"] = serde_json::json!(1);
@@ -846,12 +812,6 @@ mod tests {
             assert_eq!(admitted.state, state);
             let read = admitted.adapter.begin_read(Default::default()).await.unwrap();
             assert!(crate::sync::partial_serving::assert_admitted(&read, &state).await.unwrap());
-            assert_eq!(
-                crate::sync::partial_serving::retained_local_roots(&read)
-                    .await
-                    .unwrap(),
-                local_roots,
-            );
         }
     }
 

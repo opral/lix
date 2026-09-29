@@ -44,6 +44,29 @@ pub(crate) fn has_coordinate_mutations(writes: &StorageWriteSet) -> bool {
         )
 }
 
+/// Append-only ancestry is required for every admitted partial write, even
+/// when no serving coordinate changes. The collector alone may remove nodes
+/// after sealing its retained-root proof.
+pub(crate) fn commit_graph_guards(
+    writes: &StorageWriteSet,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let commits = crate::changelog::COMMIT_SPACE;
+    if writes.has_deletions_in_space(commits) && !writes.changelog_gc_is_sealed() {
+        return Err(mismatch(
+            "partial serving commit graph deletion requires certified garbage collection",
+        ));
+    }
+    Ok(writes
+        .declared_keys(commits)
+        .into_iter()
+        .filter(|key| writes.contains_put(commits, key))
+        .map(|key| StoragePrecondition::KeyAbsent {
+            space: commits,
+            key: StorageKey(Bytes::from(key)),
+        })
+        .collect())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PartialServing {

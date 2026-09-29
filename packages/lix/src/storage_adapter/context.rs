@@ -385,27 +385,10 @@ where
             )));
         }
         if may_write_partial {
-            // Commit graph rows are the durable ancestry proof behind a
-            // serving witness. New IDs may be appended, but an existing node
-            // cannot be rewritten. Only the reachability-certified collector
-            // may retire graph rows after its root-closure proof is sealed.
-            let commits = crate::changelog::COMMIT_SPACE;
-            if write_set.has_deletions_in_space(commits)
-                && !write_set.changelog_gc_is_sealed()
-            {
-                return Err(StorageWriteSetError::Admission(crate::LixError::new(
-                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                    "partial serving commit graph deletion requires certified garbage collection",
-                )));
-            }
-            for key in write_set.declared_keys(commits) {
-                if write_set.contains_put(commits, &key) {
-                    opts.preconditions.push(Precondition::KeyAbsent {
-                        space: commits,
-                        key: Key(Bytes::from(key)),
-                    });
-                }
-            }
+            opts.preconditions.extend(
+                crate::sync::partial_serving::commit_graph_guards(&write_set)
+                    .map_err(StorageWriteSetError::Admission)?,
+            );
         }
         if !may_write_partial {
             if write_set.has_mutations_in_space(crate::sync::PARTIAL_REPLICA_STATE_SPACE)
