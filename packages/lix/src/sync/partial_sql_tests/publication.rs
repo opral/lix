@@ -21,7 +21,7 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
-    for index in 0..4 {
+    for index in 0..2 {
         authority
             .execute(
                 "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
@@ -30,9 +30,21 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
             .await
             .unwrap();
     }
+    authority.create_checkpoint().await.unwrap();
+    for index in 2..4 {
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
+                &[Value::Text(format!("history-{index}"))],
+            )
+            .await
+            .unwrap();
+    }
+    authority.create_checkpoint().await.unwrap();
     let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
-    let sql = "SELECT commit_id, parent_commit_id, created_at FROM lix_log() WHERE is_checkpoint = true ORDER BY position ASC";
+    let sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position FROM lix_log() WHERE is_checkpoint = true ORDER BY position ASC";
     let expected = authority.execute(sql, &[]).await.unwrap();
+    assert_eq!(expected.rows().len(), 2, "fixture has sparse checkpoint history");
     let mut fetches = Fetches::default();
     let actual = execute_hydrating(
         &session,
@@ -660,7 +672,7 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
     );
 }
 
-async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
+pub(super) async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
     engine: &Engine<S>,
     old: &PartialReplicaState,
     next: Arc<PartialReplicaState>,
@@ -2457,16 +2469,44 @@ async fn scoped_file_index_publication_prepares_renamed_ancestors_and_new_matche
         .interests
         .iter()
         .filter_map(|interest| match interest.as_ref() {
-            crate::hot_state::LogicalReadInterest::FilesystemPaths { file_ids, .. } => {
-                Some(file_ids)
-            }
+            crate::hot_state::LogicalReadInterest::FilesystemPaths { scope, .. } => Some(scope),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert!(!recipes.is_empty());
     assert!(
-        recipes.iter().all(|scope| scope.as_ref() == Some(&ids)),
+        recipes.iter().all(|scope| {
+            *scope == &crate::filesystem::FilesystemPathIndexScope::FileIds(ids.clone())
+        }),
         "selected and negative IDs must survive the retained recipe without widening"
+    );
+    let directory_listing = execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT id,path FROM lix_directory WHERE parent_id IS NULL ORDER BY path",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!directory_listing.rows().is_empty());
+    let interests = engine
+        .sync_mode()
+        .read_interests()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(
+        interests.interests.iter().any(|interest| matches!(
+            interest.as_ref(),
+            crate::hot_state::LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+                ..
+            }
+        )),
+        "partial-replica directory listing should retain a directory-only path-index interest"
     );
     authority
         .execute(

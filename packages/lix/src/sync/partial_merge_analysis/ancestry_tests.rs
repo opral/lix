@@ -61,6 +61,7 @@ fn append(records: &mut BTreeMap<CommitId, CommitRecord>, parents: Vec<CommitId>
             created_at: crate::common::LixTimestamp::parse("2026-09-12T00:00:00Z").unwrap(),
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
         },
     );
     id

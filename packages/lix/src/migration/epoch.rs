@@ -56,13 +56,15 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         80 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80),
         81 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81),
         82 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82),
+        83 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83),
+        84 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, 82, crate::init::CURRENT_FORMAT_VERSION]
+    [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION]
         .into_iter()
         .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
@@ -658,8 +660,7 @@ where
                     // Keep cold migration/bootstrap state off the ordinary
                     // open future's stack, including for filesystem adapters.
                     return Box::pin(migrate_active(
-                        storage, bank, generation, format, bytes, progress, server, options,
-                        intent,
+                        storage, bank, generation, format, bytes, progress, server, options, intent,
                     ))
                     .await;
                 }
@@ -1158,11 +1159,9 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(
-                    &migration_source,
-                    &target,
-                    (79..crate::init::CURRENT_FORMAT_VERSION).contains(&from_format),
-                ).await?;
+                let _ =
+                    copy_repository(&migration_source, &target, (79..82).contains(&from_format))
+                        .await?;
                 write_candidate_page(
                     &target,
                     crate::init::REPOSITORY_PROTOCOL_SPACE,
@@ -1394,11 +1393,9 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(
-                    &migration_source,
-                    &target,
-                    (79..crate::init::CURRENT_FORMAT_VERSION).contains(&from_format),
-                ).await?;
+                let _ =
+                    copy_repository(&migration_source, &target, (79..82).contains(&from_format))
+                        .await?;
                 // Keep the multi-version migration state machine off this
                 // candidate frame. Its inactive repair phases otherwise inflate
                 // the stack while an older migration runs ordinary SQL.
@@ -1600,7 +1597,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | 82 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | 83 | 84 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1676,12 +1673,38 @@ where
                 });
                 Box::pin(super::author_storage::append_plan(source, plan)).await?;
             }
+            if from_format <= 83 {
+                let read = MigrationPlanningRead::new(source).await?;
+                let plan = plan.get_or_insert_with(|| {
+                    super::publish::PublicationPlan::bounded(
+                        options.max_changes,
+                        options.max_preflight_bytes,
+                    )
+                });
+                super::first_parent_checkpoints::append_plan(&read, options, plan).await?;
+                read.finish()?;
+            }
+            #[cfg(test)]
+            let diagnostic_plan = plan.clone();
             let expected = super::public_api::content_digest_with_adapter(source, plan).await?;
             let actual = super::public_api::content_digest_with_adapter(target, None).await?;
             if expected != actual {
+                #[cfg(test)]
+                let detail = first_migration_content_difference(source, target, diagnostic_plan)
+                    .await?
+                    .unwrap_or_else(|| "no individual snapshot-space difference found".to_owned());
+                #[cfg(not(test))]
+                let detail = "";
                 return Err(LixError::new(
                     "LIX_MIGRATION_PRESERVATION_FAILED",
-                    "candidate content differs from the source-derived preservation witness",
+                    format!(
+                        "candidate content differs from the source-derived preservation witness{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        }
+                    ),
                 ));
             }
             Ok(())
@@ -1695,6 +1718,129 @@ where
             "repository format has no candidate preservation contract",
         )),
     }
+}
+
+/// Test-only first-difference witness for migrations whose aggregate logical
+/// content digest disagrees. It reports the exact space/key while leaving the
+/// production preservation contract unchanged.
+#[cfg(test)]
+async fn first_migration_content_difference<S>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    plan: Option<super::publish::PublicationPlan>,
+) -> Result<Option<String>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let (mut overlay, cleared) = plan
+        .map(super::publish::PublicationPlan::into_preservation_overlay)
+        .unwrap_or_default();
+    let source_read = MigrationPlanningRead::new(source).await?;
+    let target_read = MigrationPlanningRead::new(target).await?;
+    for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES {
+        let mut expected = BTreeMap::<Bytes, Bytes>::new();
+        let mut cursor = source_read
+            .begin_scan(
+                *space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        while let Some(entries) = cursor.next_chunk().await? {
+            for entry in entries {
+                let ProjectedValue::FullValue(value) = entry.value else {
+                    return Err(epoch_error(
+                        "source preservation diagnostic omitted a value",
+                    ));
+                };
+                if is_witnessed_content_key(*space, entry.key.0.as_ref()) {
+                    expected.insert(entry.key.0, value);
+                }
+            }
+        }
+        drop(cursor);
+        if cleared.contains(&space.id.0) {
+            expected.clear();
+        }
+        if let Some(replacements) = overlay.remove(&space.id.0) {
+            expected.extend(replacements);
+        }
+
+        let mut actual = BTreeMap::<Bytes, Bytes>::new();
+        let mut cursor = target_read
+            .begin_scan(
+                *space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions {
+                    projection: CoreProjection::FullValue,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        while let Some(entries) = cursor.next_chunk().await? {
+            for entry in entries {
+                let ProjectedValue::FullValue(value) = entry.value else {
+                    return Err(epoch_error(
+                        "candidate preservation diagnostic omitted a value",
+                    ));
+                };
+                if is_witnessed_content_key(*space, entry.key.0.as_ref()) {
+                    actual.insert(entry.key.0, value);
+                }
+            }
+        }
+        drop(cursor);
+
+        let keys = expected
+            .keys()
+            .chain(actual.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in keys {
+            let expected_value = expected.get(&key);
+            let actual_value = actual.get(&key);
+            if expected_value != actual_value {
+                let key_hex = key
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let value_digest = |value: Option<&Bytes>| {
+                    value.map_or_else(
+                        || "<missing>".to_owned(),
+                        |bytes| blake3::hash(bytes).to_hex().to_string(),
+                    )
+                };
+                return Ok(Some(format!(
+                    "space '{}' key {} expected={} actual={}",
+                    space.name,
+                    key_hex,
+                    value_digest(expected_value),
+                    value_digest(actual_value),
+                )));
+            }
+        }
+    }
+    source_read.finish()?;
+    target_read.finish()?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn is_witnessed_content_key(space: StorageSpace, key: &[u8]) -> bool {
+    !(space == crate::init::REPOSITORY_PROTOCOL_SPACE
+        && key == crate::init::REPOSITORY_PROTOCOL_KEY)
+        && !(space == crate::storage_adapter::REVISION_SPACE && key == b"m")
 }
 
 async fn migrate_sparse_candidate<S>(
@@ -1761,6 +1907,12 @@ where
     if from_format <= 82 {
         super::author_storage::migrate(target, options, true).await?;
     }
+    if from_format <= 83 {
+        super::first_parent_checkpoints::migrate(target, options, true).await?;
+    }
+    if from_format <= 84 {
+        super::semantic_fingerprint_format::migrate(target, true).await?;
+    }
     crate::sync::upgrade_owned_partial_receipt(target).await?;
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
@@ -1768,6 +1920,11 @@ where
             .await?
             .ok_or_else(|| epoch_error("partial migration lost its admission"))?
             .0)
+    })
+    .await?;
+    crate::handle::retry_expired_read(|| async {
+        let read = target.begin_read(ReadOptions::default()).await?;
+        crate::sync::validate_partial_read_interest_journal(&read, &state).await
     })
     .await?;
     let (engine, session) =
@@ -2070,9 +2227,9 @@ where
     // state. It is rebuilt from authoritative current rows below, so copying
     // the old index only adds a full scan and a write before publication
     // deletes it.
-    for space in epoch_data_spaces().filter(|space| {
-        !skip_derived_index || *space != crate::hot_state::INDEX_SPACE
-    }) {
+    for space in epoch_data_spaces()
+        .filter(|space| !skip_derived_index || *space != crate::hot_state::INDEX_SPACE)
+    {
         let mut lower = Bound::Unbounded;
         loop {
             // The migration claim makes the source bank immutable. Reopen a
@@ -4427,6 +4584,10 @@ where
                 (81, false) => crate::init::REPOSITORY_PROTOCOL_V81,
                 (82, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
                 (82, false) => crate::init::REPOSITORY_PROTOCOL_V82,
+                (83, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
+                (83, false) => crate::init::REPOSITORY_PROTOCOL_V83,
+                (84, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
+                (84, false) => crate::init::REPOSITORY_PROTOCOL_V84,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

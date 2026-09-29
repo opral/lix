@@ -244,14 +244,15 @@ where
         inventory_headers.keys().cloned().collect::<BTreeSet<_>>();
     for header in std::mem::take(&mut history.commit_headers) {
         sparse_inventory_commit_ids.remove(&header.commit_id);
-        if inventory_headers
-            .insert(header.commit_id.clone(), header.clone())
-            .is_some_and(|existing| existing != header)
-        {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "checkpoint inventory disagrees with history header",
-            ));
+        if let Some(existing) = inventory_headers.get(&header.commit_id) {
+            let merged = reconcile_commit_header_hints(
+                existing,
+                &header,
+                "checkpoint inventory and history",
+            )?;
+            inventory_headers.insert(merged.commit_id.clone(), merged);
+        } else {
+            inventory_headers.insert(header.commit_id.clone(), header);
         }
     }
     history.commit_headers = inventory_headers.into_values().collect();
@@ -429,9 +430,9 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         | SyncDemandRequest::BlobManifest(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
-        SyncDemandRequest::ChunksWithRead(ids, error) => {
-            sync_demand_request_for_error(&error)?.or_else(|| Some(SyncDemandRequest::Chunks(ids))).ok_or(error)
-        }
+        SyncDemandRequest::ChunksWithRead(ids, error) => sync_demand_request_for_error(&error)?
+            .or_else(|| Some(SyncDemandRequest::Chunks(ids)))
+            .ok_or(error),
         request => Ok(request),
     }
 }
@@ -1120,7 +1121,9 @@ fn resolve_sync_demand_results(
                 retry.push(demand);
             }
             result => {
-                let _ = demand.response.send(result.map(|_| HydratedInputs::default()));
+                let _ = demand
+                    .response
+                    .send(result.map(|_| HydratedInputs::default()));
             }
         }
     }
@@ -1305,6 +1308,39 @@ struct FetchedHistory {
     boundaries: Vec<super::SyncHistoryBoundary>,
 }
 
+/// Reconciles the optional first-parent summary when the same immutable header
+/// arrives through paths with different ancestry closure. `None` is unknown,
+/// so it may be enriched by one consistent `Some` claim; all authored fields
+/// and any two present claims must agree exactly.
+fn reconcile_commit_header_hints(
+    existing: &super::SyncCommitHeader,
+    incoming: &super::SyncCommitHeader,
+    context: &str,
+) -> Result<super::SyncCommitHeader, LixError> {
+    let mut existing_authored = existing.clone();
+    let existing_summary = existing_authored.first_parent_checkpoint_summary.take();
+    let mut incoming_authored = incoming.clone();
+    let incoming_summary = incoming_authored.first_parent_checkpoint_summary.take();
+    if existing_authored != incoming_authored {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{context} returned conflicting commit headers"),
+        ));
+    }
+    let summary = match (existing_summary, incoming_summary) {
+        (Some(existing), Some(incoming)) if existing != incoming => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("{context} returned conflicting checkpoint summary claims"),
+            ));
+        }
+        (Some(summary), _) | (_, Some(summary)) => Some(summary),
+        (None, None) => None,
+    };
+    existing_authored.first_parent_checkpoint_summary = summary;
+    Ok(existing_authored)
+}
+
 fn validate_history_page_body_budget(
     response: &super::SyncHistoryResponse,
     head: &str,
@@ -1379,13 +1415,11 @@ fn merge_fetched_history_response(
     boundaries: &mut BTreeMap<String, super::SyncHistoryBoundary>,
 ) -> Result<(), LixError> {
     for header in response.commit_headers {
-        if let Some(existing) = commit_headers.insert(header.commit_id.clone(), header.clone())
-            && existing != header
-        {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "sync history returned conflicting commit headers",
-            ));
+        if let Some(existing) = commit_headers.get(&header.commit_id) {
+            let merged = reconcile_commit_header_hints(existing, &header, "sync history")?;
+            commit_headers.insert(merged.commit_id.clone(), merged);
+        } else {
+            commit_headers.insert(header.commit_id.clone(), header);
         }
     }
     let response_commits = response.commits;
@@ -2011,6 +2045,63 @@ mod tests {
     use crate::storage::Memory;
     use crate::{Value, open_lix};
 
+    fn checkpoint_header(
+        summary: Option<super::super::SyncFirstParentCheckpointSummary>,
+    ) -> super::super::SyncCommitHeader {
+        super::super::SyncCommitHeader {
+            is_checkpoint: true,
+            checkpoint_conversation_id: None,
+            commit_id: "commit".to_owned(),
+            parent_commit_ids: vec!["parent".to_owned()],
+            base_commit_id: None,
+            account_id: "account".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            global_scope: true,
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: false,
+            generation: 2,
+            first_parent_jump_commit_id: None,
+            first_parent_jump_span: None,
+            first_parent_checkpoint_summary: summary,
+        }
+    }
+
+    #[test]
+    fn duplicate_headers_reconcile_only_unknown_or_consistent_summary_hints() {
+        let summary = super::super::SyncFirstParentCheckpointSummary {
+            previous_checkpoint_id: Some("parent".to_owned()),
+            first_parent_distance: 1,
+        };
+        let unknown = checkpoint_header(None);
+        let known = checkpoint_header(Some(summary.clone()));
+        assert_eq!(
+            reconcile_commit_header_hints(&unknown, &known, "test")
+                .unwrap()
+                .first_parent_checkpoint_summary,
+            Some(summary.clone()),
+        );
+        assert_eq!(
+            reconcile_commit_header_hints(&known, &known, "test").unwrap(),
+            known,
+        );
+
+        let conflicting = checkpoint_header(Some(super::super::SyncFirstParentCheckpointSummary {
+            previous_checkpoint_id: None,
+            first_parent_distance: 0,
+        }));
+        assert!(
+            reconcile_commit_header_hints(&known, &conflicting, "test").is_err(),
+            "two present but conflicting summary claims must be rejected",
+        );
+
+        let mut authored_conflict = known.clone();
+        authored_conflict.account_id = "different-account".to_owned();
+        assert!(
+            reconcile_commit_header_hints(&known, &authored_conflict, "test").is_err(),
+            "header reconciliation must still reject immutable field mismatches",
+        );
+    }
+
     #[test]
     fn authority_lix_id_must_match_before_sync_iteration() {
         validate_authority_lix_id("local", "local").expect("same lixId should pass");
@@ -2335,6 +2426,7 @@ mod tests {
                 snapshot: Some(serde_json::json!({ "blob_hash": blob_id })),
                 snapshot_payload: Some(String::new()),
                 metadata: None,
+                semantic_fingerprint: None,
                 row_created_at: "2026-01-01T00:00:00Z".to_owned(),
                 row_updated_at: "2026-01-01T00:00:00Z".to_owned(),
                 change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
@@ -2736,6 +2828,7 @@ mod tests {
             snapshot: Some(serde_json::json!({ "key": row_id, "value": row_id })),
             snapshot_payload: Some(String::new()),
             metadata: None,
+            semantic_fingerprint: None,
             change_id: format!("change-{row_id}"),
             commit_id: "head".to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -4317,8 +4410,11 @@ mod tests {
                 .with_details(serde_json::json!({ "httpStatus": 503 })),
         ));
         assert!(is_retryable_sync_transport_error(
-            &LixError::new(LixError::CODE_STORAGE_IO_UNAVAILABLE, "object store PUT failed")
-                .with_details(serde_json::json!({ "httpStatus": 503 })),
+            &LixError::new(
+                LixError::CODE_STORAGE_IO_UNAVAILABLE,
+                "object store PUT failed"
+            )
+            .with_details(serde_json::json!({ "httpStatus": 503 })),
         ));
         assert!(!is_retryable_sync_transport_error(
             &LixError::new(LixError::CODE_STORAGE_CORRUPTION, "segment hash mismatch")

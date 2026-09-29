@@ -299,7 +299,7 @@ async fn synthetic_markdown_path_versus_id_probe() {
         assert_eq!(
             requests.len(),
             1,
-            "{label} cold read took multiple sync requests"
+            "{label} cold read took multiple sync requests: {requests:?}"
         );
         assert_eq!(requests[0]["operation"], "read-fulfillment");
         assert_eq!(attempts, 2, "{label} cold read required extra SQL retries");

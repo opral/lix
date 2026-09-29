@@ -93,11 +93,7 @@ impl SqlReadSet {
     }
 
     pub(crate) fn record_path_index(&self, request: &FilesystemPathIndexRequest) {
-        if request
-            .file_ids
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        {
+        if request.file_ids().is_some_and(<[String]>::is_empty) {
             return;
         }
         self.record(SqlReadFootprint::PathIndex(request.clone()));
@@ -302,14 +298,15 @@ pub(crate) async fn changed_footprint_rows(
                     );
                     after_rows.insert(identity, after.row(slot).map(fingerprint_row).transpose()?);
                 }
-                (
-                    flatten_optional(before_rows),
-                    flatten_optional(after_rows),
-                )
+                (flatten_optional(before_rows), flatten_optional(after_rows))
             }
             SqlReadFootprint::PathIndex(request) => (
-                fingerprint_batch(&crate::filesystem::read_path_index_rows(opening, request).await?)?,
-                fingerprint_batch(&crate::filesystem::read_path_index_rows(current, request).await?)?,
+                fingerprint_batch(
+                    &crate::filesystem::read_path_index_rows(opening, request).await?,
+                )?,
+                fingerprint_batch(
+                    &crate::filesystem::read_path_index_rows(current, request).await?,
+                )?,
             ),
         };
         diff_fingerprints(&before, &after, &mut overlaps);
@@ -583,7 +580,11 @@ mod tests {
         overlaps.sort();
         assert_eq!(
             overlaps,
-            vec![identity("changed"), identity("deleted"), identity("inserted")]
+            vec![
+                identity("changed"),
+                identity("deleted"),
+                identity("inserted")
+            ]
         );
     }
 }

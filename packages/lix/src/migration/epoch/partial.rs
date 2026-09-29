@@ -349,9 +349,11 @@ mod tests {
                 .begin_read(ReadOptions::default())
                 .await
                 .unwrap();
-            assert!(crate::init::is_partial_repository_protocol(&read)
-                .await
-                .unwrap());
+            assert!(
+                crate::init::is_partial_repository_protocol(&read)
+                    .await
+                    .unwrap()
+            );
         }
     }
 

@@ -436,6 +436,84 @@ where
         self.stage_append_records(append)
     }
 
+    /// Enriches an already stored commit with a first-parent checkpoint
+    /// summary that this replica has derived from locally available ancestry.
+    ///
+    /// This is intentionally a proof-only update: every immutable field must
+    /// remain byte-semantically identical, and the only permitted transition
+    /// is `None` to `Some(summary)`. Sync imports stage these rows in the same
+    /// write set as the headers or bodies whose ancestry proves the summary.
+    pub(crate) async fn stage_certified_checkpoint_summary_enrichment(
+        &mut self,
+        commits: Vec<CommitRecord>,
+    ) -> Result<Vec<(CommitId, Bytes)>, LixError> {
+        self.ensure_changelog_mutation_is_allowed()?;
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        validate_unique(commits.iter().map(|commit| commit.commit_id), "commit_id")?;
+        let keys = commits
+            .iter()
+            .map(|commit| commit_key(commit.commit_id))
+            .collect::<Vec<_>>();
+        let stored = get_many(self.store, COMMIT_SPACE, keys).await?;
+        let mut batch = EncodedChangelogBatch::with_capacity(
+            commits.len(),
+            commits.len() * 16,
+            commits.iter().map(commit_value_capacity).sum(),
+        );
+        let mut precondition_values = Vec::with_capacity(commits.len());
+
+        for (commit, bytes) in commits.into_iter().zip(stored) {
+            let commit_id = commit.commit_id;
+            let Some(bytes) = bytes else {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    format!(
+                        "cannot enrich checkpoint summary for missing commit '{}'",
+                        commit_id
+                    ),
+                ));
+            };
+            let expected_bytes = Bytes::from(bytes);
+            let existing: CommitRecord = storage_codec::decode("commit record", &expected_bytes)?;
+            let Some(summary) = commit.first_parent_checkpoint_summary else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "checkpoint summary enrichment must provide a derived summary",
+                ));
+            };
+            if existing.first_parent_checkpoint_summary.is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    format!(
+                        "checkpoint summary for commit '{}' is already known",
+                        commit_id
+                    ),
+                ));
+            }
+            let mut expected_record = existing;
+            expected_record.first_parent_checkpoint_summary = Some(summary);
+            if expected_record != commit {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    format!(
+                        "checkpoint summary enrichment changed immutable commit '{}' metadata",
+                        commit_id
+                    ),
+                ));
+            }
+            batch.try_put(commit_id.as_uuid().as_bytes(), |bytes| {
+                append_commit_record(bytes, &commit)
+            })?;
+            self.staged_commits.insert(commit_id, commit);
+            precondition_values.push((commit_id, expected_bytes));
+        }
+        batch.stage(self.writes, COMMIT_SPACE);
+        Ok(precondition_values)
+    }
+
     /// Stages a terminal append assembled from already-prepared transaction rows.
     ///
     /// The transaction owns ID generation, parent selection, and change-ref
@@ -1072,6 +1150,7 @@ mod sparse_append_tests {
             crate::common::LixTimestamp::expect_parse("test timestamp", "1970-01-01T00:00:00.000Z");
         let record = CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             format_version: COMMIT_RECORD_FORMAT_VERSION,
             base_commit_id: None,
             commit_id,

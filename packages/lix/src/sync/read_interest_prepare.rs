@@ -5,7 +5,9 @@
 //! caller supplies the already scoped reader and recipe snapshot.
 
 use crate::LixError;
-use crate::filesystem::{FilesystemPathIndexReader, FilesystemPathIndexRequest};
+use crate::filesystem::{
+    FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathIndexScope,
+};
 use crate::hot_state::{
     HotStateContext, HotStateReader, LogicalReadInterest, ReadInterestSnapshot,
 };
@@ -21,6 +23,18 @@ enum NativeReadPreparationPurpose {
     Authority {
         blob_capture: Arc<crate::sync::read_fulfillment::BlobReadCapture>,
     },
+}
+
+fn path_index_request_for_interest(
+    scope: &FilesystemPathIndexScope,
+    branch_ids: &[String],
+    include_blob_refs: bool,
+    cache_small_blob_data: bool,
+) -> FilesystemPathIndexRequest {
+    FilesystemPathIndexRequest::new(branch_ids.to_vec())
+        .with_scope(scope.clone())
+        .with_blob_refs(include_blob_refs || cache_small_blob_data)
+        .with_cached_blob_data(cache_small_blob_data)
 }
 
 /// Prepare all native inputs selected by `interests` against one reader for
@@ -166,7 +180,7 @@ where
                 .await?;
             }
             LogicalReadInterest::FilesystemPaths {
-                file_ids,
+                scope,
                 branch_ids,
                 include_blob_refs,
                 cache_small_blob_data,
@@ -174,9 +188,12 @@ where
                 for branch in branch_ids {
                     super::partial_candidate_prepare::selected_branch(descriptor, branch)?;
                 }
-                let request = FilesystemPathIndexRequest::new(branch_ids.clone())
-                    .with_file_ids(file_ids.clone())
-                    .with_blob_refs(*include_blob_refs || *cache_small_blob_data);
+                let request = path_index_request_for_interest(
+                    scope,
+                    branch_ids,
+                    *include_blob_refs,
+                    *cache_small_blob_data,
+                );
                 match &purpose {
                     NativeReadPreparationPurpose::Candidate { .. } => {
                         hot.reader(read.clone())
@@ -632,4 +649,27 @@ async fn prepare_path_index_small_blob_inputs(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_path_interest_preparation_preserves_directory_scope() {
+        let request = path_index_request_for_interest(
+            &FilesystemPathIndexScope::DirectoriesOnly,
+            &["branch".to_owned()],
+            true,
+            true,
+        );
+
+        assert_eq!(request.scope, FilesystemPathIndexScope::DirectoriesOnly);
+        assert!(!request.include_blob_refs);
+        assert!(!request.cache_small_blob_data);
+        assert_eq!(
+            request.hot_state_request().filter.schema_keys,
+            vec!["lix_directory_descriptor".to_owned()]
+        );
+    }
 }

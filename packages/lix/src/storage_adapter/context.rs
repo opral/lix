@@ -193,7 +193,33 @@ where
     ) -> Result<StorageAdapterReadScope<StorageImpl::Read<'_>>, StorageError> {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_checkpoint_read_view();
+        #[cfg(feature = "storage-benches")]
+        let read = {
+            let backend_started = crate::sql_profile::is_active().then(std::time::Instant::now);
+            let result = self.storage.begin_read(opts).await;
+            if let Some(started) = backend_started {
+                crate::sql_profile::record_wait_or_read_phase(
+                    crate::sql_profile::WaitOrReadPhase::StorageBackendBeginRead,
+                    started.elapsed(),
+                );
+            }
+            result?
+        };
+        #[cfg(not(feature = "storage-benches"))]
         let read = self.storage.begin_read(opts).await?;
+        #[cfg(feature = "storage-benches")]
+        {
+            let epoch_started = crate::sql_profile::is_active().then(std::time::Instant::now);
+            let result = self.routing.validate_read(&read).await;
+            if let Some(started) = epoch_started {
+                crate::sql_profile::record_wait_or_read_phase(
+                    crate::sql_profile::WaitOrReadPhase::StorageEpochValidation,
+                    started.elapsed(),
+                );
+            }
+            result?;
+        }
+        #[cfg(not(feature = "storage-benches"))]
         self.routing.validate_read(&read).await?;
         Ok(StorageAdapterReadScope::with_routing(
             read,

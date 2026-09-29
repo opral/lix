@@ -7,6 +7,21 @@ use crate::{LixError, common::SharedStr, row_pk::RowPk};
 use bytes::Bytes;
 use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+thread_local! {
+    static TYPED_ROW_JSON_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_typed_row_json_conversions_for_test() {
+    TYPED_ROW_JSON_CONVERSIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn typed_row_json_conversions_for_test() -> usize {
+    TYPED_ROW_JSON_CONVERSIONS.with(std::cell::Cell::get)
+}
+
 pub(crate) const COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION: u8 = 4;
 // Zstd's fixed per-frame workspace dominates the small engine rows that make
 // up SQL state. Keep those rows in the compact typed encoding directly; only
@@ -271,6 +286,8 @@ impl TypedRow {
     /// that explicitly project `snapshot_content`. Durable state never calls
     /// this conversion.
     pub(crate) fn to_json_value(&self) -> Result<serde_json::Value, LixError> {
+        #[cfg(test)]
+        TYPED_ROW_JSON_CONVERSIONS.with(|count| count.set(count.get().saturating_add(1)));
         let mut object = serde_json::Map::with_capacity(self.row.len());
         for (name, value) in &self.row {
             let value = match value {

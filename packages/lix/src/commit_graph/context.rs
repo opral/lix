@@ -838,6 +838,7 @@ fn commit_graph_node_from_record(
     };
     let node = CommitGraphNode {
         is_checkpoint: record.is_checkpoint,
+        first_parent_checkpoint_summary: record.first_parent_checkpoint_summary,
         commit_id: record.commit_id,
         change_id: record.change_id(),
         account_id: record.account_id,
@@ -850,6 +851,21 @@ fn commit_graph_node_from_record(
         touched_scope_digest: record.touched_scope_digest,
     };
     node.touched_scope_digest.validate()?;
+    if let Some(summary) = node.first_parent_checkpoint_summary {
+        if summary.previous_checkpoint_id == Some(node.commit_id)
+            || (summary.previous_checkpoint_id.is_some()
+                != (summary.first_parent_distance > 0))
+            || summary.first_parent_distance > node.generation
+            || (node.parent_commit_ids.is_empty()
+                && (summary.previous_checkpoint_id.is_some()
+                    || summary.first_parent_distance != 0))
+        {
+            return Err(LixError::unknown(format!(
+                "commit '{}' has an invalid first-parent checkpoint summary",
+                node.commit_id
+            )));
+        }
+    }
     validate_first_parent_jump_summary(&node)?;
     Ok(Some(node))
 }
@@ -1733,6 +1749,7 @@ mod tests {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
                     is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     base_commit_id: None,
@@ -1759,6 +1776,7 @@ mod tests {
                     deleted: true,
                     created_at,
                     updated_at: created_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: None,
                 snapshot: None,
@@ -1777,6 +1795,7 @@ mod tests {
                     deleted: true,
                     created_at,
                     updated_at: created_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: None,
                 snapshot: None,
@@ -1795,6 +1814,7 @@ mod tests {
                     deleted: true,
                     created_at,
                     updated_at: created_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: None,
                 snapshot: None,
@@ -2286,6 +2306,7 @@ mod tests {
 
             let record = CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 3,
                 base_commit_id: None,
@@ -2324,6 +2345,7 @@ mod tests {
                         deleted: change.snapshot.is_none(),
                         created_at: change.created_at,
                         updated_at: change.created_at,
+                        semantic_fingerprint: None,
                     },
                     metadata: change.metadata.as_ref(),
                     snapshot: change.snapshot.as_deref(),
@@ -2380,6 +2402,7 @@ mod tests {
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         append.commits.push(CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -2425,6 +2448,7 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             commit_id,
             change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),

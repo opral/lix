@@ -93,6 +93,21 @@ fn immutable_object_mismatch(kind: &str, id: impl ToString) -> LixError {
     }))
 }
 
+fn commit_record_precondition(commit_id: CommitId, expected: Option<Bytes>) -> StoragePrecondition {
+    let key = StorageKey(Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()));
+    match expected {
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: COMMIT_SPACE,
+            key,
+            expected,
+        },
+        None => StoragePrecondition::KeyAbsent {
+            space: COMMIT_SPACE,
+            key,
+        },
+    }
+}
+
 pub(super) fn sync_commit_blob_ids(commits: &[SyncCommit]) -> Result<BTreeSet<String>, LixError> {
     let mut ids = BTreeSet::new();
     for member in commits
@@ -488,6 +503,12 @@ fn sync_header_from_record(
             .then(|| record.first_parent_jump_commit_id.to_string()),
         first_parent_jump_span: (record.first_parent_jump_span > 0)
             .then_some(record.first_parent_jump_span),
+        first_parent_checkpoint_summary: record.first_parent_checkpoint_summary.map(|summary| {
+            super::SyncFirstParentCheckpointSummary {
+                previous_checkpoint_id: summary.previous_checkpoint_id.map(|id| id.to_string()),
+                first_parent_distance: summary.first_parent_distance,
+            }
+        }),
     }
 }
 
@@ -571,7 +592,9 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
 // Keeping the marker here avoids expanding the public registered-space list.
 pub(crate) const SYNC_AUTHORITY_STATE_SPACE: StorageSpace = SYNC_REPLICA_STATE_SPACE;
 pub(crate) const SYNC_REPLICA_RETIREMENT_SPACE: StorageSpace = StorageSpace::declare(
-    StorageSpaceId(0x0007_0022), "sync.replica_retirement.v1", ValueSemantics::Mutable,
+    StorageSpaceId(0x0007_0022),
+    "sync.replica_retirement.v1",
+    ValueSemantics::Mutable,
 );
 
 const SEQUENCE_KEY: &[u8] = b"repository";
@@ -1862,6 +1885,7 @@ struct ParsedMember {
     metadata_json: Option<String>,
     snapshot: Option<Vec<u8>>,
     metadata: Option<lix_schema::Jsonb>,
+    semantic_fingerprint: Option<[u8; 32]>,
     row_created_at: LixTimestamp,
     row_updated_at: LixTimestamp,
     change_created_at: LixTimestamp,
@@ -1885,6 +1909,7 @@ struct ParsedSnapshotRow {
     metadata_json: Option<String>,
     snapshot: Vec<u8>,
     metadata: Option<lix_schema::Jsonb>,
+    semantic_fingerprint: Option<[u8; 32]>,
 }
 
 impl ParsedSnapshotRow {
@@ -1914,6 +1939,7 @@ impl ParsedSnapshotRow {
             deleted: false,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            semantic_fingerprint: self.semantic_fingerprint,
         }
     }
 }
@@ -2031,6 +2057,7 @@ impl ParsedMember {
             deleted: self.deleted,
             created_at: self.row_created_at,
             updated_at: self.row_updated_at,
+            semantic_fingerprint: self.semantic_fingerprint,
         }
     }
 
@@ -2046,6 +2073,7 @@ impl ParsedMember {
                 deleted: self.deleted,
                 created_at: self.row_created_at,
                 updated_at: self.row_updated_at,
+                semantic_fingerprint: self.semantic_fingerprint,
             },
             snapshot: self.snapshot.as_deref(),
             metadata: self.metadata.as_ref(),
@@ -2074,19 +2102,23 @@ impl ParsedMember {
     }
 }
 
-fn selected_payload_matches_authored(selected: &ParsedMember, authored: &ParsedMember) -> bool {
-    authored.authored
+fn selected_payload_matches_authored(
+    selected: &ParsedMember,
+    authored: &ParsedMember,
+) -> Result<bool, LixError> {
+    let same_payload = sync_change_records_equal(&selected.change_record(), &authored.change_record())?;
+    Ok(authored.authored
         && selected.change_id == authored.change_id
         && selected.schema_key == authored.schema_key
         && selected.file_id == authored.file_id
         && selected.row_pk == authored.row_pk
         && selected.deleted == authored.deleted
         && selected.snapshot_json == authored.snapshot_json
-        && selected.snapshot == authored.snapshot
+        && same_payload
         && selected.metadata_json == authored.metadata_json
         && selected.change_account_id == authored.change_account_id
         && selected.change_created_at == authored.change_created_at
-        && selected.origin_key == authored.origin_key
+        && selected.origin_key == authored.origin_key)
 }
 
 struct ParsedCommit {
@@ -2122,6 +2154,7 @@ struct ParsedSyncHeader {
     generation: u64,
     first_parent_jump_commit_id: CommitId,
     first_parent_jump_span: u64,
+    first_parent_checkpoint_summary: Option<crate::changelog::FirstParentCheckpointSummary>,
 }
 
 impl ParsedSyncHeader {
@@ -2199,6 +2232,30 @@ impl ParsedSyncHeader {
             .as_deref()
             .map(|base| CommitId::parse_lix(base, "sync base commit header"))
             .transpose()?;
+        let first_parent_checkpoint_summary = header
+            .first_parent_checkpoint_summary
+            .as_ref()
+            .map(|summary| {
+                let previous_checkpoint_id = summary
+                    .previous_checkpoint_id
+                    .as_deref()
+                    .map(|id| CommitId::parse_lix(id, "sync checkpoint summary"))
+                    .transpose()?;
+                if previous_checkpoint_id == Some(commit_id)
+                    || (previous_checkpoint_id.is_some() != (summary.first_parent_distance > 0))
+                    || summary.first_parent_distance > header.generation
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync checkpoint summary has an invalid target/distance",
+                    ));
+                }
+                Ok(crate::changelog::FirstParentCheckpointSummary {
+                    previous_checkpoint_id,
+                    first_parent_distance: summary.first_parent_distance,
+                })
+            })
+            .transpose()?;
         if base_commit_id == Some(commit_id) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -2230,6 +2287,7 @@ impl ParsedSyncHeader {
             generation: header.generation,
             first_parent_jump_commit_id,
             first_parent_jump_span,
+            first_parent_checkpoint_summary,
         })
     }
 
@@ -2239,6 +2297,10 @@ impl ParsedSyncHeader {
         // actually carried by the immutable wire header.
         let mut expected = self.record();
         expected.touched_scope_digest = existing.touched_scope_digest.clone();
+        // A wire summary is only a claim. The locally derived summary remains
+        // authoritative; import verifies claims when ancestry is present and
+        // otherwise preserves the local value without trusting the hint.
+        expected.first_parent_checkpoint_summary = existing.first_parent_checkpoint_summary;
         *existing == expected
     }
 
@@ -2255,6 +2317,7 @@ impl ParsedSyncHeader {
             account_id: self.account_id.clone(),
             created_at: self.created_at,
             touched_scope_digest: CommitTouchedScopeDigest::opaque(),
+            first_parent_checkpoint_summary: self.first_parent_checkpoint_summary,
         }
     }
 }
@@ -2327,6 +2390,71 @@ fn validate_sync_header_set(
             .iter()
             .filter_map(|parent| headers.get(parent).map(|parent| parent.generation))
             .collect::<Vec<_>>();
+        if let Some(summary) = header.first_parent_checkpoint_summary {
+            if let Some(target_id) = summary.previous_checkpoint_id {
+                let Some(target) = headers.get(&target_id) else {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' is missing checkpoint summary dependency '{target_id}'",
+                            header.commit_id
+                        ),
+                    ));
+                };
+                if !target.is_checkpoint || target.generation >= header.generation {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' has an invalid checkpoint summary target",
+                            header.commit_id
+                        ),
+                    ));
+                }
+            } else if !header.parent_commit_ids.is_empty() && summary.first_parent_distance != 0 {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "{context} header '{}' has an invalid checkpoint-free summary",
+                        header.commit_id
+                    ),
+                ));
+            }
+            if let Some(parent_id) = header.parent_commit_ids.first()
+                && let Some(parent) = headers.get(parent_id)
+            {
+                let expected = if parent.is_checkpoint {
+                    Some(crate::changelog::FirstParentCheckpointSummary {
+                        previous_checkpoint_id: Some(parent.commit_id),
+                        first_parent_distance: 1,
+                    })
+                } else {
+                    parent
+                        .first_parent_checkpoint_summary
+                        .and_then(|parent_summary| {
+                            Some(crate::changelog::FirstParentCheckpointSummary {
+                                previous_checkpoint_id: parent_summary.previous_checkpoint_id,
+                                first_parent_distance: if parent_summary
+                                    .previous_checkpoint_id
+                                    .is_some()
+                                {
+                                    parent_summary.first_parent_distance.checked_add(1)?
+                                } else {
+                                    0
+                                },
+                            })
+                        })
+                };
+                if expected.is_some_and(|expected| expected != summary) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!(
+                            "{context} header '{}' has an incorrect first-parent checkpoint summary",
+                            header.commit_id
+                        ),
+                    ));
+                }
+            }
+        }
         if header.parent_commit_ids.is_empty() && header.generation != 0 {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -2621,13 +2749,21 @@ fn parsed_undo_baseline_transition(
     Ok(transition)
 }
 
-fn parse_undo_baseline_marker(snapshot: &str) -> Result<Option<ParsedUndoBaselineTransition>, LixError> {
+fn parse_undo_baseline_marker(
+    snapshot: &str,
+) -> Result<Option<ParsedUndoBaselineTransition>, LixError> {
     use crate::undo_redo::{UndoRedoKind, UndoRedoMarker};
     let marker: UndoRedoMarker = serde_json::from_str(snapshot).map_err(|error| {
-        LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid sync undo marker: {error}"))
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("invalid sync undo marker: {error}"),
+        )
     })?;
     if marker.baseline_before.is_some() != marker.baseline_after.is_some() {
-        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker has an incomplete baseline transition"));
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync undo marker has an incomplete baseline transition",
+        ));
     }
     let (Some(before), Some(after)) = (marker.baseline_before, marker.baseline_after) else {
         return Ok(None);
@@ -2637,7 +2773,10 @@ fn parse_undo_baseline_marker(snapshot: &str) -> Result<Option<ParsedUndoBaselin
         UndoRedoKind::Redo => (after, before),
     };
     if !marker.checkpoint || target != marker.target_commit_id || target == parent {
-        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker baseline transition does not match its checkpoint target and direction"));
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync undo marker baseline transition does not match its checkpoint target and direction",
+        ));
     }
     Ok(Some(ParsedUndoBaselineTransition { before, after }))
 }
@@ -2648,14 +2787,20 @@ fn validate_undo_marker_target(
     parents: &[CommitId],
 ) -> Result<(), LixError> {
     if marker.checkpoint != is_checkpoint || parents.len() != 1 {
-        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker does not match its target role or topology"));
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync undo marker does not match its target role or topology",
+        ));
     }
     let recorded_parent = match marker.kind {
         crate::undo_redo::UndoRedoKind::Undo => marker.baseline_after,
         crate::undo_redo::UndoRedoKind::Redo => marker.baseline_before,
     };
     if recorded_parent.is_some_and(|parent| parents != [parent]) {
-        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo baseline does not match the checkpoint's immutable parent"));
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync undo baseline does not match the checkpoint's immutable parent",
+        ));
     }
     Ok(())
 }
@@ -2811,6 +2956,12 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
             format!("sync member rowPk is invalid: {error}"),
         )
     })?;
+    let semantic_fingerprint = member
+        .semantic_fingerprint
+        .as_deref()
+        .map(parse_sync_state_root_id)
+        .transpose()?
+        .map(|fingerprint| *fingerprint.as_bytes());
     let snapshot = member
         .snapshot
         .as_ref()
@@ -2820,10 +2971,27 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
                 &row_pk,
                 value,
                 member.snapshot_payload.as_deref(),
+                semantic_fingerprint.is_some(),
             )
         })
         .transpose()?;
     let metadata = member.metadata.clone().map(lix_schema::Jsonb::from_value);
+    if let Some(expected) = semantic_fingerprint {
+        if !member.authored
+            || member.deleted
+            || crate::tracked_state::tracked_payload_semantic_fingerprint(
+                &member.schema_key,
+                &row_pk,
+                snapshot.as_deref(),
+                metadata.as_ref(),
+            )? != Some(expected)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync member semantic fingerprint does not match its authored typed payload",
+            ));
+        }
+    }
     Ok(ParsedMember {
         change_id: ChangeId::parse_lix(&member.change_id, "sync member change id")?,
         authored: member.authored,
@@ -2835,6 +3003,7 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
         metadata,
         snapshot_json,
         metadata_json,
+        semantic_fingerprint,
         row_created_at: parse_sync_timestamp("sync member rowCreatedAt", &member.row_created_at)?,
         row_updated_at: parse_sync_timestamp("sync member rowUpdatedAt", &member.row_updated_at)?,
         change_created_at: parse_sync_timestamp(
@@ -3047,39 +3216,59 @@ fn encode_sync_snapshot_row(
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     change: ChangeRecord,
 ) -> Result<SyncSnapshotRow, LixError> {
+    let decoded_snapshot = row
+        .decoded_snapshot()
+        .ok_or_else(|| LixError::unknown("live sync row lacks a materialized typed snapshot"))?;
+    let materialized_bytes = decoded_snapshot.durable_payload().map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("encode sync snapshot durable payload: {error:?}"),
+        )
+    })?;
+    let metadata = row
+        .metadata()
+        .map(|value| serde_json::from_str::<serde_json::Value>(value.as_str()))
+        .transpose()
+        .map_err(|error| LixError::unknown(format!("decode sync snapshot metadata: {error}")))?;
+    let typed_metadata = metadata.clone().map(lix_schema::Jsonb::from_value);
+    let snapshot = row
+        .snapshot_content()
+        .map(|value| serde_json::from_str::<serde_json::Value>(value.as_str()))
+        .transpose()
+        .map_err(|error| LixError::unknown(format!("decode sync snapshot row: {error}")))?;
+    let snapshot_bytes = materialized_bytes.as_ref();
+    let semantic_fingerprint = crate::tracked_state::tracked_payload_semantic_fingerprint(
+        row.schema_key(),
+        row.row_pk(),
+        Some(snapshot_bytes),
+        typed_metadata.as_ref(),
+    )?
+    .expect("live snapshot has durable payload");
+    if row
+        .semantic_fingerprint()
+        .is_some_and(|stored| stored != semantic_fingerprint)
+    {
+        return Err(LixError::internal_invariant(
+            "sync snapshot row fingerprint disagrees with its durable payload",
+            serde_json::json!({"change_id": row.change_id().to_string()}),
+        ));
+    }
+    let snapshot_payload = super::commit::encode_sync_row_payload_bytes(snapshot_bytes);
     Ok(SyncSnapshotRow {
         branch_id: branch_id.to_owned(),
-        // The by-ID record supplies provenance, not the row payload:
-        // eager plugin rows may share a source change ID while having
-        // distinct identities and typed snapshots.
-        snapshot_payload: Some(super::commit::encode_sync_row_payload(
-            row.decoded_snapshot().ok_or_else(|| {
-                LixError::unknown("live sync row lacks a materialized typed snapshot")
-            })?,
-        )?),
+        // The by-ID record supplies provenance. The materialized row is the
+        // snapshot authority even when plugin rows share a source change ID.
+        snapshot_payload: Some(snapshot_payload),
         schema_key: row.schema_key().to_owned(),
         file_id: row.file_id().map(str::to_owned),
         row_pk: row.row_pk().as_typed_json_array_value()?,
-        snapshot: row
-            .snapshot_content()
-            .map(|value| serde_json::from_str(value.as_str()))
-            .transpose()
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("decode sync snapshot row: {error}"),
-                )
-            })?,
-        metadata: row
-            .metadata()
-            .map(|value| serde_json::from_str(value.as_str()))
-            .transpose()
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("decode sync snapshot metadata: {error}"),
-                )
-            })?,
+        snapshot,
+        metadata,
+        semantic_fingerprint: Some(
+            blake3::Hash::from_bytes(semantic_fingerprint)
+                .to_hex()
+                .to_string(),
+        ),
         change_id: row.change_id().to_string(),
         commit_id: row.commit_id().to_string(),
         created_at: row.created_at().to_string(),
@@ -3094,6 +3283,14 @@ fn encode_sync_snapshot_row(
 }
 
 fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixError> {
+    if crate::storage_codec::id_string::uuid_bytes_from_canonical(&row.change_account_id)
+        .is_none()
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync snapshot changeAccountId must be a canonical UUID",
+        ));
+    }
     let snapshot = row
         .snapshot
         .as_ref()
@@ -3122,12 +3319,33 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         .snapshot
         .as_ref()
         .expect("live sync snapshot was checked above");
+    let semantic_fingerprint = row
+        .semantic_fingerprint
+        .as_deref()
+        .map(parse_sync_state_root_id)
+        .transpose()?
+        .map(|fingerprint| *fingerprint.as_bytes());
     let typed_snapshot = super::commit::decode_sync_row_payload(
         &row.schema_key,
         &row_pk,
         snapshot_value,
         row.snapshot_payload.as_deref(),
+        semantic_fingerprint.is_some(),
     )?;
+    let typed_metadata = row.metadata.clone().map(lix_schema::Jsonb::from_value);
+    if let Some(expected) = semantic_fingerprint
+        && crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &row.schema_key,
+            &row_pk,
+            Some(&typed_snapshot),
+            typed_metadata.as_ref(),
+        )? != Some(expected)
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync snapshot semantic fingerprint does not match its typed payload",
+        ));
+    }
     Ok(ParsedSnapshotRow {
         branch_id: row.branch_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -3145,8 +3363,9 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         origin_key: row.origin_key.clone(),
         snapshot_json: snapshot.clone(),
         metadata_json: metadata.clone(),
+        semantic_fingerprint,
         snapshot: typed_snapshot,
-        metadata: row.metadata.clone().map(lix_schema::Jsonb::from_value),
+        metadata: typed_metadata,
     })
 }
 
@@ -5338,21 +5557,85 @@ where
         let mut records = BTreeMap::<CommitId, CommitRecord>::new();
         let mut existing_complete = BTreeSet::new();
         let mut appended_records = Vec::with_capacity(header_by_id.len());
-        for header in header_by_id.values() {
+        let mut summary_enrichments = Vec::new();
+        let mut ordered_headers = header_by_id.values().collect::<Vec<_>>();
+        ordered_headers.sort_by_key(|header| (header.generation, header.commit_id));
+        for header in ordered_headers {
             if deferred_commit_global_scope(&read, header.commit_id)
                 .await?
                 .is_some_and(|scope| scope != header.global_scope)
             {
                 return Err(immutable_object_mismatch("commit", header.commit_id));
             }
-            if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
+            if let Some(mut existing) = load_commit_record(&read, header.commit_id).await? {
                 if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
-                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, header.commit_id).await?
+                let first_parent = if let Some(parent_id) = header.parent_commit_ids.first() {
+                    records
+                        .get(parent_id)
+                        .cloned()
+                        .or(load_commit_record(&read, *parent_id).await?)
+                } else {
+                    None
+                };
+                let mut derived = crate::changelog::derive_first_parent_checkpoint_summary(
+                    &header.parent_commit_ids,
+                    first_parent.as_ref(),
+                )?;
+                if let Some(target_id) = derived.and_then(|summary| summary.previous_checkpoint_id)
+                {
+                    match records
+                        .get(&target_id)
+                        .cloned()
+                        .or(load_commit_record(&read, target_id).await?)
+                    {
+                        Some(target) if !target.is_checkpoint => {
+                            return Err(immutable_object_mismatch(
+                                "checkpoint summary target",
+                                target_id,
+                            ));
+                        }
+                        None => derived = None,
+                        Some(_) => {}
+                    }
+                }
+                if let (Some(claim), Some(derived)) =
+                    (header.first_parent_checkpoint_summary, derived)
+                    && claim != derived
+                {
+                    return Err(immutable_object_mismatch(
+                        "commit checkpoint summary",
+                        header.commit_id,
+                    ));
+                }
+                if let Some(derived) = derived
+                    && existing
+                        .first_parent_checkpoint_summary
+                        .is_some_and(|stored| stored != derived)
+                {
+                    return Err(immutable_object_mismatch(
+                        "commit checkpoint summary",
+                        header.commit_id,
+                    ));
+                }
+                if existing.first_parent_checkpoint_summary.is_none()
+                    && let Some(derived) = derived
+                {
+                    existing.first_parent_checkpoint_summary = Some(derived);
+                    summary_enrichments.push(existing.clone());
+                }
+                if crate::checkpoint_conversation::load_checkpoint_conversation(
+                    &read,
+                    header.commit_id,
+                )
+                .await?
                     != header.checkpoint_conversation_id
                 {
-                    return Err(immutable_object_mismatch("checkpoint conversation", header.commit_id));
+                    return Err(immutable_object_mismatch(
+                        "checkpoint conversation",
+                        header.commit_id,
+                    ));
                 }
                 let existing_scope =
                     match load_published_commit_state_topology(&read, header.commit_id).await? {
@@ -5369,7 +5652,49 @@ where
                 }
                 records.insert(header.commit_id, existing);
             } else {
-                let record = header.record();
+                let mut record = header.record();
+                let first_parent = if let Some(parent_id) = header.parent_commit_ids.first() {
+                    records
+                        .get(parent_id)
+                        .cloned()
+                        .or(load_commit_record(&read, *parent_id).await?)
+                } else {
+                    None
+                };
+                record.first_parent_checkpoint_summary =
+                    crate::changelog::derive_first_parent_checkpoint_summary(
+                        &header.parent_commit_ids,
+                        first_parent.as_ref(),
+                    )?;
+                if let (Some(claim), Some(derived)) = (
+                    header.first_parent_checkpoint_summary,
+                    record.first_parent_checkpoint_summary,
+                ) && claim != derived
+                {
+                    return Err(immutable_object_mismatch(
+                        "commit checkpoint summary",
+                        header.commit_id,
+                    ));
+                }
+                if let Some(target_id) = record
+                    .first_parent_checkpoint_summary
+                    .and_then(|summary| summary.previous_checkpoint_id)
+                {
+                    let target = records
+                        .get(&target_id)
+                        .cloned()
+                        .or(load_commit_record(&read, target_id).await?);
+                    match target {
+                        Some(target) if !target.is_checkpoint => {
+                            return Err(immutable_object_mismatch(
+                                "checkpoint summary target",
+                                target_id,
+                            ));
+                        }
+                        None => record.first_parent_checkpoint_summary = None,
+                        Some(_) => {}
+                    }
+                }
                 records.insert(header.commit_id, record.clone());
                 appended_records.push(record);
             }
@@ -5652,11 +5977,10 @@ where
         let mut changes = BTreeMap::<ChangeId, ChangeRecord>::new();
         for row in &parsed_rows {
             let change = row.change_record();
-            if changes
-                .insert(change.change_id, change.clone())
-                .is_some_and(|existing| existing != change)
-            {
-                return Err(immutable_object_mismatch("change", change.change_id));
+            if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                if !sync_change_records_equal(&existing, &change)? {
+                    return Err(immutable_object_mismatch("change", change.change_id));
+                }
             }
         }
         for branch in branches {
@@ -5675,14 +5999,13 @@ where
                 &branch.author_id,
                 record.created_at,
             )?;
-            if changes
-                .insert(change.change_id, change.clone())
-                .is_some_and(|existing| existing != change)
-            {
-                return Err(immutable_object_mismatch(
-                    "branch ref change",
-                    change.change_id,
-                ));
+            if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                if !sync_change_records_equal(&existing, &change)? {
+                    return Err(immutable_object_mismatch(
+                        "branch ref change",
+                        change.change_id,
+                    ));
+                }
             }
         }
         let mut head_mutations = BTreeMap::new();
@@ -5702,11 +6025,10 @@ where
                 stage_imported_commit_body(&mut writes, commit, &mut authored_locators)?;
             for member in &commit.members {
                 let change = member.change_record();
-                if changes
-                    .insert(change.change_id, change.clone())
-                    .is_some_and(|existing| existing != change)
-                {
-                    return Err(immutable_object_mismatch("change", change.change_id));
+                if let Some(existing) = changes.insert(change.change_id, change.clone()) {
+                    if !sync_change_records_equal(&existing, &change)? {
+                        return Err(immutable_object_mismatch("change", change.change_id));
+                    }
                 }
             }
             head_mutations.insert(commit.commit_id, mutations);
@@ -5729,16 +6051,27 @@ where
                 }
             }
         }
-        changes.retain(|change_id, _| {
-            !existing_change_ids.contains(change_id)
-        });
-        ChangelogContext::new()
-            .writer(&mut &read, &mut writes)
-            .stage_certified_sparse_append(ChangelogAppend {
-                commits: appended_records,
-                changes: changes.into_values().collect(),
-            })
-            .await?;
+        changes.retain(|change_id, _| !existing_change_ids.contains(change_id));
+        {
+            let mut read_ref = &read;
+            let mut changelog_writer = ChangelogContext::new().writer(&mut read_ref, &mut writes);
+            let proof_preconditions = changelog_writer
+                .stage_certified_checkpoint_summary_enrichment(summary_enrichments)
+                .await?;
+            preconditions.extend(
+                proof_preconditions
+                    .into_iter()
+                    .map(|(commit_id, expected)| {
+                        commit_record_precondition(commit_id, Some(expected))
+                    }),
+            );
+            changelog_writer
+                .stage_certified_sparse_append(ChangelogAppend {
+                    commits: appended_records,
+                    changes: changes.into_values().collect(),
+                })
+                .await?;
+        }
 
         let mut row_pk_index_overlay = TrackedStateChunkOverlay::new();
         for head in snapshot_body_ids.iter().copied() {
@@ -6025,77 +6358,247 @@ where
             }
         }
         validate_sync_header_set(&parsed, "sync history", &BTreeSet::new())?;
-        let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut new_records = Vec::new();
-        let mut writes = adapter.new_write_set();
-        let mut resolved_omissions = false;
-        for header in parsed.values() {
-            if deferred_commit_global_scope(&read, header.commit_id)
-                .await?
-                .is_some_and(|scope| scope != header.global_scope)
-            {
-                return Err(immutable_object_mismatch("commit", header.commit_id));
-            }
-            if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
-                if !header.matches_record(&existing) {
+        const MAX_ATTEMPTS: usize = 4;
+        for attempt in 0..MAX_ATTEMPTS {
+            let adapter = self.storage_adapter();
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            let expected_mutation_revision =
+                StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read).await?;
+            let mut new_records = Vec::new();
+            let mut summary_enrichments = Vec::new();
+            let mut writes = adapter.new_write_set();
+            let mut resolved_omissions = false;
+            let mut ordered_headers = parsed.values().collect::<Vec<_>>();
+            ordered_headers.sort_by_key(|header| (header.generation, header.commit_id));
+            let mut trusted_records = BTreeMap::<CommitId, CommitRecord>::new();
+            for header in ordered_headers {
+                if deferred_commit_global_scope(&read, header.commit_id)
+                    .await?
+                    .is_some_and(|scope| scope != header.global_scope)
+                {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
-                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, header.commit_id).await?
-                    != header.checkpoint_conversation_id
-                {
-                    return Err(immutable_object_mismatch("checkpoint conversation", header.commit_id));
-                }
-                let existing_scope =
-                    match load_published_commit_state_topology(&read, header.commit_id).await? {
+                if let Some(mut existing) = load_commit_record(&read, header.commit_id).await? {
+                    if !header.matches_record(&existing) {
+                        return Err(immutable_object_mismatch("commit", header.commit_id));
+                    }
+                    let first_parent = if let Some(parent_id) = header.parent_commit_ids.first() {
+                        trusted_records
+                            .get(parent_id)
+                            .cloned()
+                            .or(load_commit_record(&read, *parent_id).await?)
+                    } else {
+                        None
+                    };
+                    let mut derived = crate::changelog::derive_first_parent_checkpoint_summary(
+                        &header.parent_commit_ids,
+                        first_parent.as_ref(),
+                    )?;
+                    if let Some(target_id) =
+                        derived.and_then(|summary| summary.previous_checkpoint_id)
+                    {
+                        match trusted_records
+                            .get(&target_id)
+                            .cloned()
+                            .or(load_commit_record(&read, target_id).await?)
+                        {
+                            Some(target) if !target.is_checkpoint => {
+                                return Err(immutable_object_mismatch(
+                                    "checkpoint summary target",
+                                    target_id,
+                                ));
+                            }
+                            None => derived = None,
+                            Some(_) => {}
+                        }
+                    }
+                    if let (Some(claim), Some(derived)) =
+                        (header.first_parent_checkpoint_summary, derived)
+                        && claim != derived
+                    {
+                        return Err(immutable_object_mismatch(
+                            "commit checkpoint summary",
+                            header.commit_id,
+                        ));
+                    }
+                    if let Some(derived) = derived
+                        && existing
+                            .first_parent_checkpoint_summary
+                            .is_some_and(|stored| stored != derived)
+                    {
+                        return Err(immutable_object_mismatch(
+                            "commit checkpoint summary",
+                            header.commit_id,
+                        ));
+                    }
+                    if existing.first_parent_checkpoint_summary.is_none()
+                        && let Some(derived) = derived
+                    {
+                        existing.first_parent_checkpoint_summary = Some(derived);
+                        summary_enrichments.push(existing.clone());
+                    }
+                    trusted_records.insert(header.commit_id, existing.clone());
+                    if crate::checkpoint_conversation::load_checkpoint_conversation(
+                        &read,
+                        header.commit_id,
+                    )
+                    .await?
+                        != header.checkpoint_conversation_id
+                    {
+                        return Err(immutable_object_mismatch(
+                            "checkpoint conversation",
+                            header.commit_id,
+                        ));
+                    }
+                    let existing_scope = match load_published_commit_state_topology(
+                        &read,
+                        header.commit_id,
+                    )
+                    .await?
+                    {
                         Some(topology) => Some(topology.global_scope()),
                         None => deferred_commit_global_scope(&read, header.commit_id).await?,
                     };
-                if existing_scope.is_some_and(|scope| scope != header.global_scope) {
-                    return Err(immutable_object_mismatch("commit", header.commit_id));
-                }
-                if crate::tracked_state::commit_history_is_omitted(&read, header.commit_id).await? {
+                    if existing_scope.is_some_and(|scope| scope != header.global_scope) {
+                        return Err(immutable_object_mismatch("commit", header.commit_id));
+                    }
+                    if crate::tracked_state::commit_history_is_omitted(&read, header.commit_id)
+                        .await?
+                    {
+                        stage_commit_history_deferred_with_scope(
+                            &mut writes,
+                            header.commit_id,
+                            header.global_scope,
+                        );
+                        resolved_omissions = true;
+                    }
+                } else {
+                    let first_parent = if let Some(parent_id) = header.parent_commit_ids.first() {
+                        trusted_records
+                            .get(parent_id)
+                            .cloned()
+                            .or(load_commit_record(&read, *parent_id).await?)
+                    } else {
+                        None
+                    };
+                    let mut record = header.record();
+                    record.first_parent_checkpoint_summary =
+                        crate::changelog::derive_first_parent_checkpoint_summary(
+                            &header.parent_commit_ids,
+                            first_parent.as_ref(),
+                        )?;
+                    if let (Some(claim), Some(derived)) = (
+                        header.first_parent_checkpoint_summary,
+                        record.first_parent_checkpoint_summary,
+                    ) && claim != derived
+                    {
+                        return Err(immutable_object_mismatch(
+                            "commit checkpoint summary",
+                            header.commit_id,
+                        ));
+                    }
+                    if let Some(target_id) = record
+                        .first_parent_checkpoint_summary
+                        .and_then(|summary| summary.previous_checkpoint_id)
+                    {
+                        let target = trusted_records
+                            .get(&target_id)
+                            .cloned()
+                            .or(load_commit_record(&read, target_id).await?);
+                        match target {
+                            Some(target) if !target.is_checkpoint => {
+                                return Err(immutable_object_mismatch(
+                                    "checkpoint summary target",
+                                    target_id,
+                                ));
+                            }
+                            None => record.first_parent_checkpoint_summary = None,
+                            Some(_) => {}
+                        }
+                    }
+                    trusted_records.insert(header.commit_id, record.clone());
+                    new_records.push(record);
+                    if let Some(conversation_id) = &header.checkpoint_conversation_id {
+                        crate::checkpoint_conversation::stage_checkpoint_conversation(
+                            &mut writes,
+                            header.commit_id,
+                            conversation_id,
+                        )?;
+                    }
                     stage_commit_history_deferred_with_scope(
                         &mut writes,
                         header.commit_id,
                         header.global_scope,
                     );
-                    resolved_omissions = true;
                 }
-            } else {
-                new_records.push(header.record());
-                if let Some(conversation_id) = &header.checkpoint_conversation_id {
-                    crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, header.commit_id, conversation_id)?;
+            }
+            if new_records.is_empty() && summary_enrichments.is_empty() && !resolved_omissions {
+                return Ok(());
+            }
+            let mut preconditions = new_records
+                .iter()
+                .map(|record| commit_record_precondition(record.commit_id, None))
+                .collect::<Vec<_>>();
+            {
+                let mut read_ref = &read;
+                let mut changelog_writer =
+                    ChangelogContext::new().writer(&mut read_ref, &mut writes);
+                let proof_preconditions = changelog_writer
+                    .stage_certified_checkpoint_summary_enrichment(summary_enrichments)
+                    .await?;
+                preconditions.extend(proof_preconditions.into_iter().map(
+                    |(commit_id, expected)| commit_record_precondition(commit_id, Some(expected)),
+                ));
+                changelog_writer
+                    .stage_certified_sparse_append(ChangelogAppend {
+                        commits: new_records,
+                        changes: Vec::new(),
+                    })
+                    .await?;
+            }
+            preconditions.push(
+                StorageAdapter::<StorageImpl>::mutation_revision_precondition(
+                    expected_mutation_revision,
+                ),
+            );
+            drop(read);
+            match adapter
+                .commit_certified_replica_write_set(
+                    super::certified_replica_write_capability(),
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..StorageWriteOptions::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(crate::storage_adapter::StorageWriteSetError::Storage(
+                    crate::storage_adapter::StorageError::PreconditionFailed(_)
+                    | crate::storage_adapter::StorageError::WriteConflict,
+                )) if attempt + 1 < MAX_ATTEMPTS => {
+                    // Another header import may have installed the same immutable
+                    // record, updated proof input, or enriched summary while this
+                    // read snapshot was open. Re-read and derive the whole batch
+                    // against that winner; identical imports remain idempotent and
+                    // conflicting content still fails validation.
+                    continue;
                 }
-                stage_commit_history_deferred_with_scope(
-                    &mut writes,
-                    header.commit_id,
-                    header.global_scope,
-                );
+                Err(crate::storage_adapter::StorageWriteSetError::Storage(
+                    crate::storage_adapter::StorageError::PreconditionFailed(_)
+                    | crate::storage_adapter::StorageError::WriteConflict,
+                )) => {
+                    return Err(LixError::new(
+                        LixError::CODE_TRANSACTION_CONFLICT,
+                        "sync history headers changed repeatedly while importing",
+                    ));
+                }
+                Err(error) => return Err(error.into()),
             }
         }
-        if new_records.is_empty() && !resolved_omissions {
-            return Ok(());
-        }
-        ChangelogContext::new()
-            .writer(&mut &read, &mut writes)
-            .stage_certified_sparse_append(ChangelogAppend {
-                commits: new_records,
-                changes: Vec::new(),
-            })
-            .await?;
-        drop(read);
-        adapter
-            .commit_certified_replica_write_set(
-                super::certified_replica_write_capability(),
-                writes,
-                StorageWriteOptions {
-                    await_durable: true,
-                    ..StorageWriteOptions::default()
-                },
-            )
-            .await?;
-        Ok(())
+        unreachable!("bounded history-header import loop returns or retries")
     }
 
     /// Authenticated authority admission: historical dependency objects may
@@ -6430,16 +6933,38 @@ where
             if parsed_refs.is_empty() {
                 continue;
             }
-            for member in commit.members.iter().filter(|member| member.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY && !member.deleted) {
-                let marker: crate::undo_redo::UndoRedoMarker = serde_json::from_str(member.snapshot_json.as_deref().ok_or_else(|| LixError::unknown("missing undo marker"))?)
-                    .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid sync undo marker: {error}")))?;
-                let (is_checkpoint, parents) = if let Some(target) = parsed.get(&marker.target_commit_id) {
-                    (target.wire.is_checkpoint, target.parent_commit_ids.clone())
-                } else {
-                    let target = CommitGraphContext::new().reader(&read).load_node(&marker.target_commit_id).await?
-                        .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker target does not exist"))?;
-                    (target.is_checkpoint, target.parent_commit_ids)
-                };
+            for member in commit.members.iter().filter(|member| {
+                member.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                    && !member.deleted
+            }) {
+                let marker: crate::undo_redo::UndoRedoMarker = serde_json::from_str(
+                    member
+                        .snapshot_json
+                        .as_deref()
+                        .ok_or_else(|| LixError::unknown("missing undo marker"))?,
+                )
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("invalid sync undo marker: {error}"),
+                    )
+                })?;
+                let (is_checkpoint, parents) =
+                    if let Some(target) = parsed.get(&marker.target_commit_id) {
+                        (target.wire.is_checkpoint, target.parent_commit_ids.clone())
+                    } else {
+                        let target = CommitGraphContext::new()
+                            .reader(&read)
+                            .load_node(&marker.target_commit_id)
+                            .await?
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INVALID_PARAM,
+                                    "sync undo marker target does not exist",
+                                )
+                            })?;
+                        (target.is_checkpoint, target.parent_commit_ids)
+                    };
                 validate_undo_marker_target(&marker, is_checkpoint, &parents)?;
             }
         }
@@ -6896,6 +7421,7 @@ where
                 deleted: row.deleted(),
                 created_at: row.created_at(),
                 updated_at: row.updated_at(),
+                semantic_fingerprint: None,
             });
             tracked_writer
                 .stage_commit_root(&parent.to_string(), None, deltas)
@@ -7136,7 +7662,7 @@ where
                         continue;
                     }
                     if let Some(authored) = authored_by_change.get(&member.change_id) {
-                        if !selected_payload_matches_authored(member, authored) {
+                        if !selected_payload_matches_authored(member, authored)? {
                             return Err(LixError::new(
                                 LixError::CODE_INVALID_PARAM,
                                 format!(
@@ -7204,7 +7730,7 @@ where
         for row in boundary_rows.values().flatten() {
             let change = row.change_record();
             match load_existing_sync_change(&read, change.change_id).await? {
-                Some(existing) if existing != change => {
+                Some(existing) if !sync_change_records_equal(&existing, &change)? => {
                     return Err(immutable_object_mismatch("change", change.change_id));
                 }
                 Some(_) => {}
@@ -7212,10 +7738,10 @@ where
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(change);
                     }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() == &change => {}
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err(immutable_object_mismatch("change", change.change_id));
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        if !sync_change_records_equal(entry.get(), &change)? {
+                            return Err(immutable_object_mismatch("change", change.change_id));
+                        }
                     }
                 },
             }
@@ -7254,7 +7780,9 @@ where
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
-                    Some(existing) if !sync_change_records_equal(&existing, &change)? => {
+                    Some(existing)
+                        if !sync_change_records_equal(&existing, &change)? =>
+                    {
                         return Err(immutable_object_mismatch("change", change.change_id));
                     }
                     Some(_) => {}
@@ -7262,10 +7790,13 @@ where
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(change);
                         }
-                        std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get() == &change => {}
-                        std::collections::btree_map::Entry::Occupied(_) => {
-                            return Err(immutable_object_mismatch("change", change.change_id));
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if !sync_change_records_equal(entry.get(), &change)? {
+                                return Err(immutable_object_mismatch("change", change.change_id));
+                            }
+                            if member.authored {
+                                entry.insert(change);
+                            }
                         }
                     },
                 }
@@ -7496,8 +8027,18 @@ where
                 parent_record,
                 parent_jump,
             )?;
+            let first_parent_record = commit
+                .parent_commit_ids
+                .first()
+                .and_then(|parent| records.get(parent));
+            let first_parent_checkpoint_summary =
+                crate::changelog::derive_first_parent_checkpoint_summary(
+                    &commit.parent_commit_ids,
+                    first_parent_record,
+                )?;
             let record = CommitRecord {
                 is_checkpoint: commit.wire.is_checkpoint,
+                first_parent_checkpoint_summary,
                 format_version: COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
@@ -7523,6 +8064,11 @@ where
                     || certified.first_parent_jump_span != record.first_parent_jump_span
                     || certified.account_id != record.account_id
                     || certified.created_at != record.created_at
+                    || certified
+                        .first_parent_checkpoint_summary
+                        .is_some_and(|summary| {
+                            Some(summary) != record.first_parent_checkpoint_summary
+                        })
                 {
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PARAM,
@@ -8226,6 +8772,7 @@ where
             deleted: false,
             created_at: row.created_at(),
             updated_at: row.updated_at(),
+            semantic_fingerprint: None,
         });
         let mut transient_writes = self.storage_adapter().new_write_set();
         let tracked_context = TrackedStateContext::new();
@@ -8336,6 +8883,13 @@ where
                 )
             })?);
         }
+        // Summary claims are useful on headers whose complete bodies are in
+        // this response. Their target headers are included below, but those
+        // dependency-only headers need not carry recursive summary claims.
+        // Otherwise a one-commit history page could expand through every
+        // checkpoint ever published.
+        let mut summary_claim_ids = body_ids.clone();
+        summary_claim_ids.extend(external_base_ids.iter().copied());
         // A complete-state alias is O(1) only when the receiver already owns
         // its physical source (the normal ordered-delta case). History demand
         // cannot assume that, and GC may have retired the source's semantic
@@ -8360,6 +8914,16 @@ where
             if record.first_parent_jump_span > 0 {
                 header_ids.insert(record.first_parent_jump_commit_id);
             }
+        }
+        for commit_id in &summary_claim_ids {
+            let record = load_commit_record(&read, *commit_id)
+                .await?
+                .expect("response body commit remains present");
+            header_ids.extend(
+                record
+                    .first_parent_checkpoint_summary
+                    .and_then(|summary| summary.previous_checkpoint_id),
+            );
         }
         let mut pending_header_ids = header_ids.iter().copied().collect::<Vec<_>>();
         while let Some(commit_id) = pending_header_ids.pop() {
@@ -8398,12 +8962,20 @@ where
                         )));
                     }
                 };
-            commit_headers.push(sync_header_from_record(
+            let mut header = sync_header_from_record(
                 &record,
-                crate::checkpoint_conversation::load_checkpoint_conversation(&read, record.commit_id).await?,
+                crate::checkpoint_conversation::load_checkpoint_conversation(
+                    &read,
+                    record.commit_id,
+                )
+                .await?,
                 global_scope,
                 incorporation,
-            ));
+            );
+            if !summary_claim_ids.contains(&commit_id) {
+                header.first_parent_checkpoint_summary = None;
+            }
+            commit_headers.push(header);
         }
         let mut boundaries = Vec::with_capacity(boundary_ids.len());
         for commit_id in boundary_ids {
@@ -8648,12 +9220,21 @@ where
                     ))
                 })?
                 .incorporation();
-            commit_headers.push(sync_header_from_record(
+            let mut header = sync_header_from_record(
                 &record,
-                crate::checkpoint_conversation::load_checkpoint_conversation(&read, record.commit_id).await?,
+                crate::checkpoint_conversation::load_checkpoint_conversation(
+                    &read,
+                    record.commit_id,
+                )
+                .await?,
                 record.base_commit_id.is_none(),
                 incorporation,
-            ));
+            );
+            // Inventory pages are intentionally sparse and independently
+            // paginated. They carry no ancestry closure with which to prove a
+            // nearest-checkpoint hint, so the replica must leave it unknown.
+            header.first_parent_checkpoint_summary = None;
+            commit_headers.push(header);
         }
         Ok(super::SyncCheckpointInventoryPage {
             cursor,
@@ -10865,6 +11446,13 @@ mod tests {
             // The source record has another schema/PK and payload entirely;
             // only its account, timestamp, and origin apply to the derived row.
             let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, row, source.clone()).unwrap();
+            assert!(wire.semantic_fingerprint.is_some(), "live snapshots carry a canonical typed proof even when the root stores identity only");
+            assert_eq!(
+                wire.snapshot_payload.as_deref(),
+                Some(super::super::commit::encode_sync_row_payload_preserving_storage(
+                    row.decoded_snapshot().expect("materialized typed row")
+                ).unwrap().as_str()),
+            );
             let parsed = parse_snapshot_row(&wire).unwrap();
             assert_eq!(parsed.row_pk, *row.row_pk());
             assert_eq!(
@@ -10879,6 +11467,308 @@ mod tests {
         assert_ne!(
             payloads[0], payloads[1],
             "shared source IDs must not collapse identity-specific payloads"
+        );
+    }
+
+    #[test]
+    fn snapshot_encoding_distinguishes_sql_null_from_json_null() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("built-in schema");
+        let row_pk = RowPk::single("null-row");
+        let sql_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("null-row".to_owned())),
+                ("value", lix_schema::Value::Null),
+            ]),
+        )
+        .unwrap();
+        let json_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("null-row".to_owned())),
+                (
+                    "value",
+                    lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(
+                        serde_json::Value::Null,
+                    )),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_ne!(sql_null, json_null);
+        assert_eq!(sql_null.to_json_value().unwrap(), json_null.to_json_value().unwrap());
+        let source_bytes = sql_null.durable_payload().unwrap();
+        let json_null_bytes = json_null.durable_payload().unwrap();
+        assert_ne!(
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                "lix_key_value", &row_pk, Some(&source_bytes), None,
+            ).unwrap(),
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                "lix_key_value", &row_pk, Some(&json_null_bytes), None,
+            ).unwrap(),
+            "typed proof must distinguish SQL NULL from JSON null",
+        );
+        let source = ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label("sql-null-source"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: row_pk.clone(),
+            file_id: None,
+            snapshot: Some(source_bytes.to_vec()),
+            metadata: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            origin_key: None,
+        };
+        let commit_id = CommitId::for_test_label("json-null-materialized");
+        let json = json_null.to_json_shared().unwrap();
+        let expected = super::super::commit::encode_sync_row_payload_preserving_storage(&json_null)
+            .unwrap();
+        let materialized = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
+            MaterializedTrackedStateRow {
+                row_pk,
+                schema_key: "lix_key_value".into(),
+                file_id: None,
+                snapshot_content: Some(json),
+                decoded_snapshot: Some(Arc::new(json_null)),
+                metadata: None,
+                deleted: false,
+                created_at: source.created_at.to_string(),
+                updated_at: source.created_at.to_string(),
+                change_id: source.change_id,
+                commit_id,
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            },
+        ])
+        .unwrap();
+        let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, materialized.iter().next().unwrap(), source).unwrap();
+        assert_eq!(wire.snapshot_payload.as_deref(), Some(expected.as_str()));
+        assert_ne!(wire.snapshot_payload.unwrap(), super::super::commit::encode_sync_row_payload_bytes(source_bytes.as_ref()));
+    }
+
+    #[test]
+    fn proof_bearing_hydration_accepts_equivalent_typed_payload_encodings() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("built-in schema");
+        let row_pk = RowPk::single("deferred-row");
+        let typed = crate::row_payload::TypedRow::from_normalized_json(
+            plan,
+            &row_pk,
+            &serde_json::json!({"key": "deferred-row", "value": {"same": true}}),
+        )
+        .expect("typed row");
+        let compact = typed.durable_payload().expect("compact durable bytes");
+        let native = crate::plugin::wire::typed::encode_native_row_payload(
+            &typed.schema_fingerprint,
+            &typed.row_pk,
+            &typed.row,
+        )
+        .expect("native wire bytes");
+        assert_ne!(compact.as_ref(), native.as_slice());
+        let authored = ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label("deferred-proof-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk,
+            file_id: None,
+            snapshot: Some(compact.to_vec()),
+            metadata: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            origin_key: None,
+        };
+        let deferred = ChangeRecord {
+            snapshot: Some(native),
+            ..authored.clone()
+        };
+        let proof = crate::tracked_state::tracked_payload_semantic_fingerprint(
+            &authored.schema_key,
+            &authored.row_pk,
+            Some(compact.as_ref()),
+            None,
+        )
+        .expect("proof")
+        .expect("live row proof");
+        assert!(sync_change_records_equal(&deferred, &authored).unwrap());
+        assert_eq!(
+            crate::tracked_state::tracked_payload_semantic_fingerprint(
+                &deferred.schema_key,
+                &deferred.row_pk,
+                deferred.snapshot.as_deref(),
+                None,
+            )
+            .unwrap(),
+            Some(proof)
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_wire_roundtrips_and_rejects_mismatched_payloads() {
+        fn assert_wire_proofs(
+            schema_key: &str,
+            row_pk: &RowPk,
+            value: serde_json::Value,
+            typed: &crate::row_payload::TypedRow,
+            label: &str,
+        ) {
+            let stored_payload = typed.durable_payload().expect("stored row payload");
+            let fingerprint = crate::tracked_state::tracked_payload_semantic_fingerprint(
+                schema_key,
+                row_pk,
+                Some(stored_payload.as_ref()),
+                None,
+            )
+            .expect("compute payload proof")
+            .expect("live payload has a proof");
+            let fingerprint = blake3::Hash::from_bytes(fingerprint).to_hex().to_string();
+            let snapshot_payload =
+                super::super::commit::encode_sync_row_payload_preserving_storage(typed)
+                    .expect("encode stored row payload");
+            let change_id =
+                ChangeId::for_test_label(&format!("fingerprinted-{label}-change")).to_string();
+            let commit_id =
+                CommitId::for_test_label(&format!("fingerprinted-{label}-commit")).to_string();
+
+            let snapshot = SyncSnapshotRow {
+                branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                row_pk: row_pk
+                    .as_typed_json_array_value()
+                    .expect("typed row identity"),
+                snapshot: Some(value.clone()),
+                snapshot_payload: Some(snapshot_payload.clone()),
+                metadata: None,
+                semantic_fingerprint: Some(fingerprint.clone()),
+                change_id: change_id.clone(),
+                commit_id,
+                created_at: "2026-05-12T00:00:00Z".to_owned(),
+                updated_at: "2026-05-12T00:00:00Z".to_owned(),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                origin_key: None,
+            };
+            let snapshot_wire = serde_json::to_value(&snapshot).expect("serialize snapshot row");
+            assert_eq!(snapshot_wire["semanticFingerprint"], fingerprint);
+            let snapshot: SyncSnapshotRow =
+                serde_json::from_value(snapshot_wire).expect("deserialize snapshot row");
+            assert_eq!(
+                snapshot.semantic_fingerprint.as_deref(),
+                Some(fingerprint.as_str())
+            );
+            parse_snapshot_row(&snapshot).expect("matching snapshot proof validates");
+            let mut oversized_author = snapshot.clone();
+            oversized_author.change_account_id = "x".repeat(257);
+            assert!(
+                parse_snapshot_row(&oversized_author)
+                    .err()
+                    .expect("oversized snapshot author must fail before leaf encoding")
+                    .message
+                    .contains("canonical UUID")
+            );
+            let mut mismatched_snapshot = snapshot.clone();
+            mismatched_snapshot.semantic_fingerprint =
+                Some(blake3::hash(b"different payload").to_hex().to_string());
+            assert!(
+                parse_snapshot_row(&mismatched_snapshot)
+                    .err()
+                    .expect("mismatched snapshot proof must fail")
+                    .message
+                    .contains("semantic fingerprint")
+            );
+
+            let member = SyncCommitMember {
+                change_id,
+                authored: true,
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                row_pk: row_pk
+                    .as_typed_json_array_value()
+                    .expect("typed row identity"),
+                deleted: false,
+                snapshot: Some(value),
+                snapshot_payload: Some(snapshot_payload),
+                metadata: None,
+                semantic_fingerprint: Some(fingerprint.clone()),
+                row_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                row_updated_at: "2026-05-12T00:00:00Z".to_owned(),
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_created_at: "2026-05-12T00:00:00Z".to_owned(),
+                origin_key: None,
+            };
+            let member_wire = serde_json::to_value(&member).expect("serialize commit member");
+            assert_eq!(member_wire["semanticFingerprint"], fingerprint);
+            let member: SyncCommitMember =
+                serde_json::from_value(member_wire).expect("deserialize commit member");
+            assert_eq!(
+                member.semantic_fingerprint.as_deref(),
+                Some(fingerprint.as_str())
+            );
+            parse_sync_member(&member).expect("matching member proof validates");
+            let mut mismatched_member = member;
+            mismatched_member.semantic_fingerprint =
+                Some(blake3::hash(b"different payload").to_hex().to_string());
+            assert!(
+                parse_sync_member(&mismatched_member)
+                    .err()
+                    .expect("mismatched member proof must fail")
+                    .message
+                    .contains("semantic fingerprint")
+            );
+        }
+
+        let custom_schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "custom_fingerprinted_row",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "count", "type": "int8", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        });
+        let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[custom_schema])
+            .expect("custom schema catalog");
+        let (_, plan) = catalog
+            .plan_for_key("custom_fingerprinted_row")
+            .expect("custom row plan");
+        let custom_pk = RowPk::single("custom-fingerprinted-row");
+        let custom_value = serde_json::json!({"id": "custom-fingerprinted-row", "count": 7});
+        let custom_typed =
+            crate::row_payload::TypedRow::from_normalized_json(plan, &custom_pk, &custom_value)
+                .expect("custom typed row");
+        assert_wire_proofs(
+            "custom_fingerprinted_row",
+            &custom_pk,
+            custom_value,
+            &custom_typed,
+            "custom",
+        );
+
+        let builtin_pk = RowPk::single("fingerprinted-builtin");
+        let builtin_value = serde_json::json!({
+            "key": "fingerprinted-builtin",
+            "value": {"payload": "x".repeat(8 * 1024)}
+        });
+        let builtin_typed = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_key_value",
+            &builtin_pk,
+            &builtin_value,
+        )
+        .expect("builtin typed row");
+        assert_eq!(
+            builtin_typed.durable_payload().unwrap().first().copied(),
+            Some(crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION),
+            "fixture should exercise a compressed built-in payload"
+        );
+        assert_wire_proofs(
+            "lix_key_value",
+            &builtin_pk,
+            builtin_value,
+            &builtin_typed,
+            "builtin",
         );
     }
 
@@ -11052,7 +11942,9 @@ mod tests {
             "baseline_before": target,
             "baseline_after": parent
         });
-        let parsed = parse_undo_baseline_marker(&marker.to_string()).unwrap().unwrap();
+        let parsed = parse_undo_baseline_marker(&marker.to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed.before, target);
         assert_eq!(parsed.after, parent);
         for (field, value) in [
@@ -11064,9 +11956,13 @@ mod tests {
         ] {
             let mut invalid = marker.clone();
             invalid[field] = value;
-            assert!(parse_undo_baseline_marker(&invalid.to_string()).is_err(), "accepted invalid {field}");
+            assert!(
+                parse_undo_baseline_marker(&invalid.to_string()).is_err(),
+                "accepted invalid {field}"
+            );
         }
-        let mut partial: crate::undo_redo::UndoRedoMarker = serde_json::from_value(marker.clone()).unwrap();
+        let mut partial: crate::undo_redo::UndoRedoMarker =
+            serde_json::from_value(marker.clone()).unwrap();
         partial.baseline_before = None;
         partial.baseline_after = None;
         assert!(validate_undo_marker_target(&partial, true, &[parent]).is_ok());
@@ -11080,59 +11976,69 @@ mod tests {
         assert!(parse_undo_baseline_marker(&redo.to_string()).is_err());
         redo["baseline_before"] = serde_json::json!(parent);
         redo["baseline_after"] = serde_json::json!(target);
-        assert_eq!(parse_undo_baseline_marker(&redo.to_string()).unwrap().unwrap().before, parent);
+        assert_eq!(
+            parse_undo_baseline_marker(&redo.to_string())
+                .unwrap()
+                .unwrap()
+                .before,
+            parent
+        );
     }
 
     #[tokio::test]
     async fn offline_checkpoint_then_undo_syncs_across_compacted_parent() {
         for second_checkpoint in [false, true] {
-        let authority = open_lix().await.unwrap();
-        write_key_value(&authority, "offline-checkpoint", "before").await;
-        let mut baseline = authority.create_checkpoint().await.unwrap().commit_id;
-        // The acknowledged ordinary head will be skipped by checkpoint compaction.
-        write_key_value(&authority, "offline-checkpoint", "checkpoint-one").await;
-        let snapshot = authority
-            .pull_sync_repository(None, crate::sync::MAX_SYNC_REQUEST_ITEMS)
-            .await
-            .unwrap();
-        let replica = replica_from_snapshot(&authority, &snapshot).await;
-        let history = authority
-            .execute("SELECT commit_id FROM lix_log()", &[])
-            .await
-            .unwrap();
-        for row in history.rows() {
-            hydrate_history_commit(
-                &authority,
-                &replica,
-                &row.get::<String>("commit_id").unwrap(),
-            )
-            .await;
-        }
-        let mut checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
-        if second_checkpoint {
-            baseline = checkpoint;
-            write_key_value(&replica, "offline-checkpoint", "after").await;
-            checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
-        }
-        let undone = replica
-            .execute(
-                "SELECT commit_id FROM lix_undo($1)",
-                &[Value::Text(checkpoint)],
-            )
-            .await
-            .unwrap();
-        assert!(undone.rows()[0].get::<String>("commit_id").is_ok());
-        let request = replica
-            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
-            .await
-            .unwrap()
-            .unwrap();
-        authority.push_sync_repository(&request).await.unwrap();
-        assert_eq!(
-            read_key_value(&authority, "offline-checkpoint").await,
-            if second_checkpoint { "checkpoint-one" } else { "before" }
-        );
-        assert_eq!(
+            let authority = open_lix().await.unwrap();
+            write_key_value(&authority, "offline-checkpoint", "before").await;
+            let mut baseline = authority.create_checkpoint().await.unwrap().commit_id;
+            // The acknowledged ordinary head will be skipped by checkpoint compaction.
+            write_key_value(&authority, "offline-checkpoint", "checkpoint-one").await;
+            let snapshot = authority
+                .pull_sync_repository(None, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .unwrap();
+            let replica = replica_from_snapshot(&authority, &snapshot).await;
+            let history = authority
+                .execute("SELECT commit_id FROM lix_log()", &[])
+                .await
+                .unwrap();
+            for row in history.rows() {
+                hydrate_history_commit(
+                    &authority,
+                    &replica,
+                    &row.get::<String>("commit_id").unwrap(),
+                )
+                .await;
+            }
+            let mut checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
+            if second_checkpoint {
+                baseline = checkpoint;
+                write_key_value(&replica, "offline-checkpoint", "after").await;
+                checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
+            }
+            let undone = replica
+                .execute(
+                    "SELECT commit_id FROM lix_undo($1)",
+                    &[Value::Text(checkpoint)],
+                )
+                .await
+                .unwrap();
+            assert!(undone.rows()[0].get::<String>("commit_id").is_ok());
+            let request = replica
+                .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .await
+                .unwrap()
+                .unwrap();
+            authority.push_sync_repository(&request).await.unwrap();
+            assert_eq!(
+                read_key_value(&authority, "offline-checkpoint").await,
+                if second_checkpoint {
+                    "checkpoint-one"
+                } else {
+                    "before"
+                }
+            );
+            assert_eq!(
             authority
                 .execute(
                     "SELECT working_base_commit_id FROM lix_branch WHERE id=lix_active_branch_id()",
@@ -12385,7 +13291,20 @@ mod tests {
     #[tokio::test]
     async fn deep_snapshot_imports_a_bounded_sparse_jump_header_closure() {
         let authority = open_lix().await.expect("authority should open");
-        for generation in 0..32 {
+        for generation in 0..16 {
+            write_key_value(
+                &authority,
+                "deep-history",
+                &format!("generation-{generation}"),
+            )
+            .await;
+        }
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish")
+            .commit_id;
+        for generation in 16..32 {
             write_key_value(
                 &authority,
                 "deep-history",
@@ -12408,8 +13327,30 @@ mod tests {
             .map(|header| header.commit_id.as_str())
             .collect::<BTreeSet<_>>();
         assert!(
-            header_ids.len() <= 6,
-            "bootstrap topology must stay bounded independently of history depth",
+            header_ids.len() <= 7,
+            "history bootstrap topology must stay bounded independently of history depth",
+        );
+        let head_header = history
+            .commit_headers
+            .iter()
+            .find(|header| header.commit_id == head)
+            .expect("head summary header should be present");
+        let checkpoint_id = head_header
+            .first_parent_checkpoint_summary
+            .as_ref()
+            .and_then(|summary| summary.previous_checkpoint_id.as_deref())
+            .expect("head should name its nearest first-parent checkpoint");
+        assert_eq!(checkpoint_id, checkpoint.as_str());
+        assert!(header_ids.contains(checkpoint_id));
+        let checkpoint_header = history
+            .commit_headers
+            .iter()
+            .find(|header| header.commit_id == checkpoint_id)
+            .expect("summary dependency header should be included");
+        assert!(checkpoint_header.is_checkpoint);
+        assert!(
+            checkpoint_header.first_parent_checkpoint_summary.is_none(),
+            "dependency-only headers omit recursive summary claims"
         );
         for header in &history.commit_headers {
             if let Some(jump) = header.first_parent_jump_commit_id.as_deref() {
@@ -12481,6 +13422,7 @@ mod tests {
                 snapshot: row.snapshot.clone(),
                 snapshot_payload: row.snapshot_payload.clone(),
                 metadata: row.metadata.clone(),
+                semantic_fingerprint: None,
                 row_created_at: row.created_at.clone(),
                 row_updated_at: row.updated_at.clone(),
                 change_account_id: row.change_account_id.clone(),
@@ -13277,6 +14219,9 @@ mod tests {
         .unwrap();
         member.snapshot_payload =
             Some(super::super::commit::encode_sync_row_payload(&row).unwrap());
+        // This collision probe deliberately tests immutable-content checks;
+        // retain the legacy proofless body after changing its payload.
+        member.semantic_fingerprint = None;
         let error = target
             .push_sync_repository(&conflicting)
             .await
@@ -13852,6 +14797,7 @@ mod tests {
             generation: 4,
             first_parent_jump_commit_id: CommitId::for_test_label("sparse-inventory-jump"),
             first_parent_jump_span: 3,
+            first_parent_checkpoint_summary: None,
         }
     }
 

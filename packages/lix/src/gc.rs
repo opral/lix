@@ -2643,13 +2643,24 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp =
             LixTimestamp::expect_parse("history retention timestamp", "2026-01-01T00:00:00Z");
-        let old_root = replay_commit_record("history-retained-old", 0, None, timestamp);
-        let active = replay_commit_record(
+        let mut old_root = replay_commit_record("history-retained-old", 0, None, timestamp);
+        old_root.is_checkpoint = true;
+        old_root.first_parent_checkpoint_summary =
+            Some(crate::changelog::FirstParentCheckpointSummary {
+                previous_checkpoint_id: None,
+                first_parent_distance: 0,
+            });
+        let mut active = replay_commit_record(
             "history-retained-active",
             1,
             Some(old_root.commit_id),
             timestamp,
         );
+        active.first_parent_checkpoint_summary =
+            Some(crate::changelog::FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(old_root.commit_id),
+                first_parent_distance: 1,
+            });
         let mut old_manifest =
             test_commit_state_manifest(&old_root, CommitStateMutationInventory::default());
         old_manifest.replay_debt = CommitStateReplayDebt::default();
@@ -3823,6 +3834,7 @@ mod tests {
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
+                semantic_fingerprint: None,
             },
             metadata: None,
             snapshot: vec![1],
@@ -3890,6 +3902,7 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    semantic_fingerprint: None,
                 }],
             )
             .await
@@ -5499,6 +5512,7 @@ mod tests {
         let commits = [
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5512,6 +5526,7 @@ mod tests {
             },
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5525,6 +5540,7 @@ mod tests {
             },
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5538,6 +5554,7 @@ mod tests {
             },
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5741,6 +5758,7 @@ mod tests {
         let commits = vec![
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5754,6 +5772,7 @@ mod tests {
             },
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5767,6 +5786,7 @@ mod tests {
             },
             CommitRecord {
                 is_checkpoint: false,
+                first_parent_checkpoint_summary: None,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -6005,6 +6025,7 @@ mod tests {
         let commit_id = CommitId::for_test_label(label);
         CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -6033,6 +6054,7 @@ mod tests {
             parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -6400,6 +6422,7 @@ mod tests {
                     deleted: change.snapshot.is_none(),
                     created_at: change.created_at,
                     updated_at: change.created_at,
+                    semantic_fingerprint: None,
                 },
                 metadata: change.metadata.as_ref(),
                 snapshot: change.snapshot.as_deref(),

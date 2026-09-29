@@ -36,9 +36,10 @@ pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
-    ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
+    ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord,
+    FirstParentCheckpointSummary, CommitScanBatch,
     CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
-    commit_row_snapshot_json, next_first_parent_jump,
+    commit_row_snapshot_json, derive_first_parent_checkpoint_summary, next_first_parent_jump,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRoot, GcSweepSet};
 pub(crate) use types::{jsonb_option_ref_storage, jsonb_option_storage};

@@ -450,7 +450,17 @@ impl SessionTransactionManager {
                 }
             };
             if should_wait {
+                #[cfg(feature = "storage-benches")]
+                let profile_wait_started =
+                    crate::sql_profile::is_active().then(std::time::Instant::now);
                 notified.await;
+                #[cfg(feature = "storage-benches")]
+                if let Some(started) = profile_wait_started {
+                    crate::sql_profile::record_wait_or_read_phase(
+                        crate::sql_profile::WaitOrReadPhase::SessionTransactionAdmission,
+                        started.elapsed(),
+                    );
+                }
                 continue;
             }
             self.inner.state_changed.notify_waiters();

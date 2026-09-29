@@ -108,7 +108,21 @@ impl ScanSource {
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Self> {
-        self.fetch_rebind.as_ref().map(|rebind| rebind(fetch))
+        let rebind = self.fetch_rebind.as_ref()?.clone();
+        let mut rebound = rebind(fetch);
+        rebound.fetch_rebind = Some(rebind);
+        Some(rebound)
+    }
+
+    /// Rebuild this source when DataFusion proves a physical fetch can be
+    /// pushed through the operators above it. Keep the callback attached so a
+    /// later optimizer pass can replace or remove that fetch.
+    pub(super) fn with_fetch_rebind(
+        mut self,
+        rebind: impl Fn(Option<usize>) -> ScanSource + Send + Sync + 'static,
+    ) -> Self {
+        self.fetch_rebind = Some(Arc::new(rebind));
+        self
     }
 
     pub(super) fn open(
@@ -1440,6 +1454,7 @@ pub(crate) struct SpecScanExec {
     properties: Arc<PlanProperties>,
     statement_cache_key: Option<StatementScanKey>,
     physical_cache_key: PhysicalScanKey,
+    base_limit: Option<usize>,
     target_partitions: usize,
     probe_binding: Option<ScanProbeBinding>,
 }
@@ -1454,6 +1469,7 @@ impl SpecScanExec {
         constant_columns: &[String],
         probe_binding: Option<ScanProbeBinding>,
     ) -> Result<Self> {
+        let base_limit = physical_cache_key.limit;
         // A declared ordering only proves that each source fragment is sorted,
         // not that adjacent fragments have non-overlapping value ranges.
         // Keep ordered fragments separate unless the source can eventually
@@ -1519,6 +1535,7 @@ impl SpecScanExec {
             properties: Arc::new(properties),
             statement_cache_key,
             physical_cache_key,
+            base_limit,
             target_partitions,
             probe_binding,
         })
@@ -1668,7 +1685,12 @@ impl ExecutionPlan for SpecScanExec {
             return None;
         }
         let mut physical_cache_key = self.physical_cache_key.clone();
-        physical_cache_key.limit = fetch;
+        let effective_fetch = match (self.base_limit, fetch) {
+            (Some(base), Some(fetch)) => Some(base.min(fetch)),
+            (Some(base), None) => Some(base),
+            (None, fetch) => fetch,
+        };
+        physical_cache_key.limit = effective_fetch;
         Some(Arc::new(Self {
             table: Arc::clone(&self.table),
             schema: Arc::clone(&self.schema),
@@ -1677,6 +1699,7 @@ impl ExecutionPlan for SpecScanExec {
             properties: Arc::clone(&self.properties),
             statement_cache_key: None,
             physical_cache_key,
+            base_limit: self.base_limit,
             target_partitions: self.target_partitions,
             probe_binding: self.probe_binding.clone(),
         }))
@@ -2099,6 +2122,127 @@ mod scan_source_tests {
     fn int_batch(schema: SchemaRef, values: &[i64]) -> RecordBatch {
         let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
         RecordBatch::try_new(schema, vec![values]).expect("test batch should match schema")
+    }
+
+    #[tokio::test]
+    async fn scan_source_fetch_rebind_can_be_replaced_or_removed() {
+        let schema = int_schema("value");
+        let build_source: Arc<dyn Fn(Option<usize>) -> ScanSource + Send + Sync> = {
+            let schema = Arc::clone(&schema);
+            Arc::new(move |fetch| {
+                let schema = Arc::clone(&schema);
+                batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+                    let count = fetch.unwrap_or(10);
+                    let values = (0..count as i64).collect::<Vec<_>>();
+                    let batch = int_batch(Arc::clone(&schema), &values);
+                    Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        stream::iter([Ok(batch)]),
+                    )))
+                })
+            })
+        };
+        let source = build_source(None).with_fetch_rebind({
+            let build_source = Arc::clone(&build_source);
+            move |fetch| build_source(fetch)
+        });
+        let narrowed = source.with_fetch(Some(4)).unwrap();
+        let narrowed_again = narrowed.with_fetch(Some(2)).unwrap();
+        let unbounded_again = narrowed_again.with_fetch(None).unwrap();
+
+        assert_eq!(narrowed.load_single_batch().await.unwrap().num_rows(), 4);
+        assert_eq!(
+            narrowed_again.load_single_batch().await.unwrap().num_rows(),
+            2
+        );
+        assert_eq!(
+            unbounded_again
+                .load_single_batch()
+                .await
+                .unwrap()
+                .num_rows(),
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_fetch_rebinding_keeps_the_original_scan_limit_in_its_cache_key() {
+        let schema = int_schema("value");
+        let build_source: Arc<dyn Fn(Option<usize>) -> ScanSource + Send + Sync> = {
+            let schema = Arc::clone(&schema);
+            Arc::new(move |fetch| {
+                // The table provider's original planned limit remains a cap even
+                // when a later physical optimizer replaces or removes fetch.
+                let effective_fetch = match (Some(5), fetch) {
+                    (Some(base), Some(fetch)) => Some(base.min(fetch)),
+                    (Some(base), None) => Some(base),
+                    (None, fetch) => fetch,
+                };
+                let count = effective_fetch.unwrap_or(10);
+                let schema = Arc::clone(&schema);
+                batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+                    let batch =
+                        int_batch(Arc::clone(&schema), &(0..count as i64).collect::<Vec<_>>());
+                    Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        stream::iter([Ok(batch)]),
+                    )))
+                })
+            })
+        };
+        let source = build_source(Some(5)).with_fetch_rebind({
+            let build_source = Arc::clone(&build_source);
+            move |fetch| build_source(fetch)
+        });
+        let scan = SpecScanExec::new(
+            Arc::from("counted"),
+            PlannedScan {
+                schema: Arc::clone(&schema),
+                source,
+                ordering: None,
+            },
+            1,
+            None,
+            PhysicalScanKey {
+                table: Arc::from("counted"),
+                projection: None,
+                filters: Vec::new(),
+                limit: Some(5),
+            },
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let widened = scan.with_fetch(Some(10)).unwrap();
+        let widened = widened
+            .downcast_ref::<SpecScanExec>()
+            .expect("fetch rebind should preserve the scan exec");
+        assert_eq!(widened.fetch(), Some(5));
+        assert_eq!(widened.physical_cache_key().limit, Some(5));
+
+        let narrowed = widened.with_fetch(Some(2)).unwrap();
+        let narrowed = narrowed
+            .downcast_ref::<SpecScanExec>()
+            .expect("successive fetch rebind should preserve the scan exec");
+        assert_eq!(narrowed.fetch(), Some(2));
+        assert_eq!(narrowed.physical_cache_key().limit, Some(2));
+
+        let restored = narrowed.with_fetch(None).unwrap();
+        let restored = restored
+            .downcast_ref::<SpecScanExec>()
+            .expect("removing fetch should preserve the scan exec");
+        assert_eq!(restored.fetch(), Some(5));
+        assert_eq!(restored.physical_cache_key().limit, Some(5));
+        assert_eq!(
+            restored
+                .source
+                .load_single_batch()
+                .await
+                .unwrap()
+                .num_rows(),
+            5
+        );
     }
 
     struct CountingSpec {
