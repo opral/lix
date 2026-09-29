@@ -38,6 +38,7 @@ where
             request,
             None,
             provenance,
+            relation == "lix_file",
         )
         .await?;
         if request.retain_payloads {

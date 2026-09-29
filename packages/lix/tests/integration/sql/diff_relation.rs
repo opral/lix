@@ -43,6 +43,43 @@ simulation_test!(
                 Value::Jsonb(json!("first").into()),
             ]]
         );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!("SELECT count(*) FROM lix_diff('lix_key_value', '{baseline}', '{inserted}')"),
+            ).await,
+            vec![vec![Value::Integer(
+                select_rows(
+                    &session,
+                    &format!("SELECT key, diff_type FROM lix_diff('lix_key_value', '{baseline}', '{inserted}')"),
+                ).await.len() as i64,
+            )]],
+            "empty projection and payload projection agree on additions",
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT count(*) FROM lix_diff('lix_key_value', '{baseline}', '{inserted}') \
+                     WHERE to_value IS NOT NULL"
+                ),
+            )
+            .await,
+            vec![vec![Value::Integer(1)]],
+            "a count predicate on a side value must retain its payload demand",
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT count(*) FROM lix_diff('lix_key_value', '{baseline}', '{inserted}') \
+                     WHERE from_value IS NOT NULL"
+                ),
+            )
+            .await,
+            vec![vec![Value::Integer(0)]],
+            "a count predicate must evaluate the absent side value",
+        );
 
         assert_eq!(
             select_rows(
@@ -113,6 +150,32 @@ simulation_test!(
                 Value::Jsonb(json!("second").into()),
             ]]
         );
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'first' WHERE key = 'note'",
+                &[],
+            )
+            .await
+            .expect("semantic revert should succeed");
+        let reverted = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("reverted head should load")
+            .expect("reverted head should exist")
+            .to_string();
+        let full_revert = select_rows(
+            &session,
+            &format!("SELECT key, diff_type FROM lix_diff('lix_key_value', '{inserted}', '{reverted}')"),
+        ).await;
+        assert!(full_revert.is_empty(), "typed snapshot equality collapses a different-change-ID revert");
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!("SELECT count(*) FROM lix_diff('lix_key_value', '{inserted}', '{reverted}')"),
+            ).await,
+            vec![vec![Value::Integer(full_revert.len() as i64)]],
+            "count projection preserves semantic revert classification",
+        );
     }
 );
 
@@ -167,6 +230,18 @@ simulation_test!(
             .await,
             vec![vec![Value::Null, Value::Boolean(true)]],
             "global additions preserve the source relation's scope",
+        );
+        let global_full = select_rows(
+            &session,
+            &format!("SELECT key, diff_type FROM lix_diff('lix_key_value', '{global_before}', '{global_after}')"),
+        ).await;
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!("SELECT count(*) FROM lix_diff('lix_key_value', '{global_before}', '{global_after}')"),
+            ).await,
+            vec![vec![Value::Integer(global_full.len() as i64)]],
+            "count projection preserves global replacement winners",
         );
         assert_eq!(
             select_rows(
@@ -235,6 +310,18 @@ simulation_test!(
             vec![vec![Value::Text("modified".into()), Value::Jsonb(json!("global-value").into()), Value::Jsonb(json!("local-shadow").into())]],
             "effective classification and values do not depend on projecting provenance",
         );
+        let overlay_full = select_rows(
+            &session,
+            "SELECT key, diff_type FROM lix_diff('lix_key_value') WHERE key = 'shadowed'",
+        ).await;
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT count(*) FROM lix_diff('lix_key_value') WHERE key = 'shadowed'",
+            ).await,
+            vec![vec![Value::Integer(overlay_full.len() as i64)]],
+            "count projection preserves a local overlay over an inherited global row",
+        );
         assert_eq!(
             select_rows(
                 &session,
@@ -299,6 +386,18 @@ simulation_test!(
                 Value::Null,
             ]],
             "reversing a file addition swaps sides and inverts its classification",
+        );
+        let removed_full = select_rows(
+            &session,
+            &format!("SELECT id, diff_type FROM lix_diff('lix_file', '{inserted}', '{baseline}')"),
+        ).await;
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!("SELECT count(*) FROM lix_diff('lix_file', '{inserted}', '{baseline}')"),
+            ).await,
+            vec![vec![Value::Integer(removed_full.len() as i64)]],
+            "empty projection agrees with the full removed-file row",
         );
         let file_id = match &added[0][0] {
             Value::Text(id) => id.clone(),
@@ -467,11 +566,12 @@ simulation_test!(
             .await
             .expect("file delete should succeed");
 
-        assert!(
-            select_rows(&session, "SELECT id, diff_type FROM lix_diff('lix_file')",)
-                .await
-                .is_empty(),
-            "net-zero file churn must not appear in working review",
+        let full = select_rows(&session, "SELECT id, diff_type FROM lix_diff('lix_file')").await;
+        assert!(full.is_empty(), "net-zero file churn must not appear in working review");
+        assert_eq!(
+            select_rows(&session, "SELECT count(*) FROM lix_diff('lix_file')").await,
+            vec![vec![Value::Integer(full.len() as i64)]],
+            "empty projection agrees after net-zero add/delete churn",
         );
     }
 );
@@ -510,6 +610,18 @@ simulation_test!(
                 Value::Null,
                 Value::Text("/docs".to_string()),
             ]]
+        );
+        let directory_full = select_rows(
+            &session,
+            &format!("SELECT id, diff_type FROM lix_diff('lix_directory', '{baseline}', '{inserted}')"),
+        ).await;
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!("SELECT count(*) FROM lix_diff('lix_directory', '{baseline}', '{inserted}')"),
+            ).await,
+            vec![vec![Value::Integer(directory_full.len() as i64)]],
+            "count projection agrees on directory descriptor changes",
         );
 
         session

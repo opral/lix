@@ -1468,7 +1468,7 @@ mod tests {
                     status_text: "OK".to_owned(),
                     body: serde_json::to_vec(&serde_json::json!({
                         "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
-                        "syncProtocolVersion": 999,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION - 1,
                         "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
                         "sessionId": "session-from-incompatible-server",
                         "activeBranchId": "01920000-0000-7000-8000-000000001234",
@@ -2096,7 +2096,7 @@ mod tests {
             error.details(),
             Some(&serde_json::json!({
                 "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
-                "serverSyncProtocolVersion": 999,
+                "serverSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION - 1,
             }))
         );
     }

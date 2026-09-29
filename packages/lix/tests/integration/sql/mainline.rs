@@ -1,4 +1,4 @@
-use lix::Value;
+use lix::{CreateBranchOptions, Value};
 
 #[tokio::test]
 async fn mainline_checkpoint_history_uses_actual_endpoints_and_keeps_empty_log_entries() {
@@ -42,6 +42,53 @@ async fn mainline_checkpoint_history_uses_actual_endpoints_and_keeps_empty_log_e
     assert_eq!(
         state.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!("one")
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_log_window_preserves_conversation_id() {
+    let lix = crate::open_lix().await.unwrap();
+    let checkpoint = lix
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint('window conversation', NULL)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+
+    // This unbounded checkpoint scan takes the batched summary-window route.
+    let log = lix
+        .execute(
+            "SELECT commit_id, conversation_id FROM lix_log() \
+             WHERE is_checkpoint ORDER BY position",
+            &[],
+        )
+        .await
+        .unwrap();
+    let row = log
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("commit_id").ok().as_deref() == Some(checkpoint.as_str())
+        })
+        .expect("checkpoint should appear in the checkpoint log window");
+    let conversation_id = row
+        .get::<String>("conversation_id")
+        .expect("described checkpoint should keep its conversation ID");
+    let conversation = lix
+        .execute(
+            "SELECT title FROM lix_conversation WHERE id = $1",
+            &[Value::Text(conversation_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        conversation.rows()[0].get::<String>("title").unwrap(),
+        "window conversation"
     );
     lix.close().await.unwrap();
 }
@@ -139,27 +186,219 @@ async fn mainline_page_work_is_independent_of_older_retained_history() {
     lix.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_lazy() {
+    let lix = crate::open_lix().await.unwrap();
+    crate::sql2::take_checkpoint_retirement_work();
+    let baseline_nodes = lix
+        .execute("SELECT COUNT(*) AS nodes FROM lix_log()", &[])
+        .await
+        .unwrap();
+    let baseline_checkpoints = lix
+        .execute(
+            "SELECT COUNT(*) AS checkpoints FROM lix_log() WHERE is_checkpoint",
+            &[],
+        )
+        .await
+        .unwrap();
+    crate::sql2::take_checkpoint_retirement_work();
+    let baseline_nodes = baseline_nodes.rows()[0].get::<i64>("nodes").unwrap() as usize;
+    let baseline_checkpoints = baseline_checkpoints.rows()[0]
+        .get::<i64>("checkpoints")
+        .unwrap() as usize;
+    let mut checkpoint_ids = Vec::new();
+    for _ in 0..70 {
+        checkpoint_ids.push(lix.create_checkpoint().await.unwrap().commit_id);
+    }
+
+    crate::sql2::take_checkpoint_retirement_work();
+    crate::sql2::take_mainline_metadata_work();
+    let expected_nodes = baseline_nodes + checkpoint_ids.len();
+    let expected_checkpoints = baseline_checkpoints + checkpoint_ids.len();
+    let counted = lix
+        .execute(
+            "SELECT commit_id, position, count(*) OVER() AS total_count \
+             FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 10",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(counted.len(), 10);
+    for (index, row) in counted.rows().iter().enumerate() {
+        assert_eq!(row.get::<i64>("position").unwrap(), index as i64);
+        assert_eq!(
+            row.get::<i64>("total_count").unwrap(),
+            expected_checkpoints as i64
+        );
+        assert_eq!(
+            row.get::<String>("commit_id").unwrap(),
+            checkpoint_ids[checkpoint_ids.len() - 1 - index]
+        );
+    }
+    let retirement_work = crate::sql2::take_checkpoint_retirement_work();
+    let expected_windows = expected_nodes.div_ceil(64);
+    assert_eq!(
+        retirement_work,
+        (expected_windows, checkpoint_ids.len()),
+        "the page reads only the checkpoint keys created after counters were reset"
+    );
+    assert_eq!(
+        crate::sql2::take_mainline_metadata_work(),
+        (expected_windows, checkpoint_ids.len()),
+        "summary traversal skips the two bootstrap nodes while the logical count includes them"
+    );
+
+    crate::sql2::take_checkpoint_retirement_work();
+    crate::sql2::take_mainline_metadata_work();
+    let page = lix
+        .execute(
+            "SELECT commit_id, position FROM lix_log() \
+             WHERE is_checkpoint ORDER BY position LIMIT 5",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 5);
+    for (index, row) in page.rows().iter().enumerate() {
+        assert_eq!(row.get::<i64>("position").unwrap(), index as i64);
+        assert_eq!(
+            row.get::<String>("commit_id").unwrap(),
+            checkpoint_ids[checkpoint_ids.len() - 1 - index]
+        );
+    }
+    assert_eq!(crate::sql2::take_checkpoint_retirement_work(), (5, 5));
+    assert_eq!(crate::sql2::take_mainline_metadata_work(), (5, 5));
+
+    // A plain COUNT(*) asks DataFusion for no log columns. The zero-column
+    // projection still needs to preserve the source's row count while using
+    // the same bounded checkpoint windows.
+    crate::sql2::take_checkpoint_retirement_work();
+    crate::sql2::take_mainline_metadata_work();
+    let plain_count = lix
+        .execute(
+            "SELECT COUNT(*) AS checkpoints FROM lix_log() WHERE is_checkpoint",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plain_count.rows()[0].get::<i64>("checkpoints").unwrap(),
+        expected_checkpoints as i64
+    );
+    assert_eq!(
+        crate::sql2::take_checkpoint_retirement_work(),
+        (expected_windows, checkpoint_ids.len())
+    );
+    assert_eq!(
+        crate::sql2::take_mainline_metadata_work(),
+        (expected_windows, checkpoint_ids.len()),
+        "summary traversal skips the two bootstrap nodes while the logical count includes them"
+    );
+
+    crate::sql2::take_checkpoint_retirement_work();
+    crate::sql2::take_mainline_metadata_work();
+    let empty = lix
+        .execute(
+            "SELECT is_checkpoint FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 0",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(crate::sql2::take_checkpoint_retirement_work(), (0, 0));
+    assert_eq!(crate::sql2::take_mainline_metadata_work(), (0, 0));
+    lix.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn checkpoint_status_has_one_public_home_and_is_pinned_to_log_anchor() {
     let lix = crate::open_lix().await.unwrap();
-    lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('anchor-test','one')", &[]).await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_key_value (key,value) VALUES ('anchor-test','one')",
+        &[],
+    )
+    .await
+    .unwrap();
     let c = lix.create_checkpoint().await.unwrap().commit_id;
-    let undone = lix.execute("SELECT commit_id FROM lix_undo($1)", &[Value::Text(c.clone())]).await.unwrap();
+    let fork_branch = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "checkpoint status fork".into(),
+            from_commit_id: Some(c.clone()),
+        })
+        .await
+        .unwrap();
+    let fork = lix
+        .open_another_session()
+        .with_branch(fork_branch.id)
+        .await
+        .unwrap();
+    let fork_undone = fork
+        .execute(
+            "SELECT commit_id FROM lix_undo($1)",
+            &[Value::Text(c.clone())],
+        )
+        .await
+        .unwrap();
+    let fork_undo_anchor = fork_undone.rows()[0].get::<String>("commit_id").unwrap();
+    let undone = lix
+        .execute(
+            "SELECT commit_id FROM lix_undo($1)",
+            &[Value::Text(c.clone())],
+        )
+        .await
+        .unwrap();
     let u = undone.rows()[0].get::<String>("commit_id").unwrap();
-    let redone = lix.execute("SELECT commit_id FROM lix_redo($1)", &[Value::Text(u.clone())]).await.unwrap();
+    let redone = lix
+        .execute(
+            "SELECT commit_id FROM lix_redo($1)",
+            &[Value::Text(u.clone())],
+        )
+        .await
+        .unwrap();
     let r = redone.rows()[0].get::<String>("commit_id").unwrap();
-    for (anchor, active) in [(&c,true),(&u,false),(&r,true)] {
-        let log = lix.execute("SELECT is_checkpoint FROM lix_log($1) WHERE commit_id=$2", &[Value::Text(anchor.clone()), Value::Text(c.clone())]).await.unwrap();
+    for (anchor, active) in [(&c, true), (&u, false), (&r, true)] {
+        let log = lix
+            .execute(
+                "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id=$2",
+                &[Value::Text(anchor.clone()), Value::Text(c.clone())],
+            )
+            .await
+            .unwrap();
         assert_eq!(log.rows()[0].get::<bool>("is_checkpoint").unwrap(), active);
         let history = lix.execute("SELECT h.diff_type, h.lixcol_to_commit_id FROM lix_log($1) l JOIN lix_history('lix_key_value',$1) h ON h.lixcol_to_commit_id=l.commit_id WHERE l.is_checkpoint AND h.key='anchor-test'", &[Value::Text(anchor.clone())]).await.unwrap();
         assert_eq!(history.len(), usize::from(active));
         if active {
-            assert_eq!(history.rows()[0].get::<String>("lixcol_to_commit_id").unwrap(), c);
-            assert_eq!(history.rows()[0].get::<String>("diff_type").unwrap(), "added");
+            assert_eq!(
+                history.rows()[0]
+                    .get::<String>("lixcol_to_commit_id")
+                    .unwrap(),
+                c
+            );
+            assert_eq!(
+                history.rows()[0].get::<String>("diff_type").unwrap(),
+                "added"
+            );
         }
     }
-    for sql in ["SELECT is_checkpoint FROM lix_commit", "SELECT is_checkpoint_active FROM lix_log()", "SELECT lixcol_commit_is_checkpoint FROM lix_history('lix_key_value')"] {
-        assert!(lix.execute(sql, &[]).await.is_err(), "retired SQL must fail: {sql}");
+    let fork_log = lix
+        .execute(
+            "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id=$2",
+            &[Value::Text(fork_undo_anchor), Value::Text(c.clone())],
+        )
+        .await
+        .unwrap();
+    assert!(!fork_log.rows()[0].get::<bool>("is_checkpoint").unwrap());
+    for sql in [
+        "SELECT is_checkpoint FROM lix_commit",
+        "SELECT is_checkpoint_active FROM lix_log()",
+        "SELECT lixcol_commit_is_checkpoint FROM lix_history('lix_key_value')",
+    ] {
+        assert!(
+            lix.execute(sql, &[]).await.is_err(),
+            "retired SQL must fail: {sql}"
+        );
     }
+    fork.close().await.unwrap();
     lix.close().await.unwrap();
 }

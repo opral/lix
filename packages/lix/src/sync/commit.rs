@@ -286,9 +286,14 @@ pub struct SyncCommitMember {
     pub row_pk: serde_json::Value,
     pub deleted: bool,
     pub snapshot: Option<serde_json::Value>,
-    /// Canonical Schema v1 typed row payload, base64 encoded; absent for tombstones.
+    /// Base64 typed row payload: canonical wire bytes without a fingerprint,
+    /// exact durable bytes with one; absent for tombstones.
     pub snapshot_payload: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// Optional authenticated root/delta proof for authored live rows.
+    /// Absence preserves legacy wire bodies and selected references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_fingerprint: Option<String>,
     pub row_created_at: String,
     pub row_updated_at: String,
     pub change_account_id: String,
@@ -306,6 +311,7 @@ pub(crate) struct SyncCommitMemberRef<'a> {
     pub(crate) snapshot_json: Option<&'a str>,
     pub(crate) decoded_snapshot: Option<&'a crate::row_payload::TypedRow>,
     pub(crate) metadata_json: Option<&'a str>,
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
     pub(crate) row_created_at: LixTimestamp,
     pub(crate) row_updated_at: LixTimestamp,
     pub(crate) change_account_id: &'a str,
@@ -319,6 +325,63 @@ pub(crate) struct SyncCommitMemberRef<'a> {
 pub(crate) fn encode_sync_commit_member(
     member: SyncCommitMemberRef<'_>,
 ) -> Result<SyncCommitMember, LixError> {
+    let (semantic_fingerprint, snapshot_payload) = if let Some(expected) =
+        member.semantic_fingerprint
+    {
+        if !member.authored {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected sync commit member carries an authored semantic fingerprint",
+            ));
+        }
+        let snapshot = member
+            .decoded_snapshot
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "fingerprinted sync commit member has no live payload",
+                )
+            })?
+            .durable_payload()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("encode authored sync fingerprint payload: {error:?}"),
+                )
+            })?;
+        let metadata = parse_materialized_json(member.metadata_json, member.change_id, "metadata")?
+            .map(lix_schema::Jsonb::from_value);
+        let actual = crate::tracked_state::tracked_payload_semantic_fingerprint(
+            member.schema_key,
+            member.row_pk,
+            Some(snapshot.as_ref()),
+            metadata.as_ref(),
+        )?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "fingerprinted sync commit member has no live payload",
+            )
+        })?;
+        if actual != expected {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "sync commit member semantic fingerprint does not match its payload",
+            ));
+        }
+        (
+            Some(blake3::Hash::from_bytes(expected).to_hex().to_string()),
+            Some(encode_sync_row_payload_bytes(&snapshot)),
+        )
+    } else {
+        (
+            None,
+            member
+                .decoded_snapshot
+                .map(encode_sync_row_payload)
+                .transpose()?,
+        )
+    };
     Ok(SyncCommitMember {
         change_id: member.change_id.to_string(),
         authored: member.authored,
@@ -327,11 +390,9 @@ pub(crate) fn encode_sync_commit_member(
         row_pk: member.row_pk.as_typed_json_array_value()?,
         deleted: member.deleted,
         snapshot: parse_materialized_json(member.snapshot_json, member.change_id, "snapshot")?,
-        snapshot_payload: member
-            .decoded_snapshot
-            .map(encode_sync_row_payload)
-            .transpose()?,
+        snapshot_payload,
         metadata: parse_materialized_json(member.metadata_json, member.change_id, "metadata")?,
+        semantic_fingerprint,
         row_created_at: member.row_created_at.to_string(),
         row_updated_at: member.row_updated_at.to_string(),
         change_account_id: member.change_account_id.to_owned(),
@@ -345,7 +406,6 @@ pub(crate) fn encode_sync_commit_member(
 pub(crate) fn encode_sync_row_payload(
     row: &crate::row_payload::TypedRow,
 ) -> Result<String, LixError> {
-    use base64::Engine as _;
     let bytes = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
         &row.schema_fingerprint,
         &row.row_pk,
@@ -357,7 +417,27 @@ pub(crate) fn encode_sync_row_payload(
             format!("encode sync typed row: {error:?}"),
         )
     })?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    Ok(encode_sync_row_payload_bytes(&bytes))
+}
+
+/// Preserves the exact stored payload when an authenticated root proof is
+/// carried on the wire. The proof is over these bytes, so re-encoding the
+/// logical row would make it impossible for a receiver to verify the proof.
+pub(crate) fn encode_sync_row_payload_preserving_storage(
+    row: &crate::row_payload::TypedRow,
+) -> Result<String, LixError> {
+    let bytes = row.durable_payload().map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("encode sync stored typed row: {error:?}"),
+        )
+    })?;
+    Ok(encode_sync_row_payload_bytes(&bytes))
+}
+
+pub(crate) fn encode_sync_row_payload_bytes(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 pub(crate) fn decode_sync_row_payload(
@@ -365,6 +445,7 @@ pub(crate) fn decode_sync_row_payload(
     row_pk: &RowPk,
     snapshot: &serde_json::Value,
     payload: Option<&str>,
+    allow_stored_payload: bool,
 ) -> Result<Vec<u8>, LixError> {
     use base64::Engine as _;
     let invalid = |message: String| LixError::new(LixError::CODE_INVALID_PARAM, message);
@@ -379,11 +460,38 @@ pub(crate) fn decode_sync_row_payload(
         row_pk,
     )
     .map_err(|error| invalid(format!("invalid sync snapshotPayload: {}", error.message)))?;
+    let is_compact_engine_payload = match bytes.first().copied() {
+        Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION) => true,
+        Some(crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION) => {
+            crate::row_payload::decompress_engine_row_payload(&bytes)
+                .map_err(|error| invalid(format!("invalid sync snapshotPayload: {}", error.message)))?
+                .first()
+                .copied()
+                == Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION)
+        }
+        _ => false,
+    };
     if let Some((_, plan)) = crate::catalog::CatalogSnapshot::builtin().plan_for_key(schema_key) {
         let expected =
             crate::row_payload::TypedRow::from_normalized_json(plan, row_pk, snapshot)
                 .map_err(|error| invalid(format!("invalid sync snapshot: {}", error.message)))?;
-        if encode_sync_row_payload(&expected).map_err(|error| invalid(error.message))? != payload {
+        let canonical_wire_payload =
+            encode_sync_row_payload(&expected).map_err(|error| invalid(error.message))?;
+        // A proof-bearing payload retains its original durable encoding.
+        // Compact v3 frames are schema-bound by their decoder, including
+        // historical rows that omit newly nullable columns. Native v2/v5
+        // frames still require the full current built-in typed identity.
+        let matches_builtin = if allow_stored_payload && is_compact_engine_payload {
+            // Compact engine frames are schema-bound by the decoder. Older
+            // frames may omit newly nullable tail columns, where SQL NULL and
+            // JSON null have the same JSON projection but distinct typed rows.
+            true
+        } else if allow_stored_payload {
+            row == expected
+        } else {
+            payload == canonical_wire_payload
+        };
+        if !matches_builtin {
             return Err(invalid(format!(
                 "sync row for schema '{schema_key}' does not match its built-in schema"
             )));
@@ -396,7 +504,12 @@ pub(crate) fn decode_sync_row_payload(
             .to_json_value()
             .map_err(|error| invalid(error.message))?
             != *snapshot
-        || encode_sync_row_payload(&row).map_err(|error| invalid(error.message))? != payload
+        // Proof-bearing rows retain their source storage encoding so the
+        // fingerprint and imported root stay byte-identical. The durable
+        // decoder above validates the frame; the checks here bind its typed
+        // identity and JSON projection, and the caller verifies the digest.
+        || (!allow_stored_payload
+            && encode_sync_row_payload(&row).map_err(|error| invalid(error.message))? != payload)
     {
         return Err(invalid(format!(
             "sync row for schema '{schema_key}' has different content than its declared Schema v1 identity"
@@ -538,6 +651,24 @@ impl SyncCommit {
                     format!("sync commit member rowPk is invalid: {error}"),
                 )
             })?;
+            if let Some(fingerprint) = &member.semantic_fingerprint {
+                if !member.authored || member.deleted {
+                    return invalid(
+                        "sync semantic fingerprints are allowed only for authored live members",
+                    );
+                }
+                let parsed = blake3::Hash::from_hex(fingerprint).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync member semanticFingerprint must be a BLAKE3 digest",
+                    )
+                })?;
+                if parsed.to_hex().as_str() != fingerprint {
+                    return invalid(
+                        "sync member semanticFingerprint must use canonical lowercase hexadecimal",
+                    );
+                }
+            }
             let identity = (member.schema_key.clone(), member.file_id.clone(), row_pk);
             if previous
                 .as_ref()
@@ -671,6 +802,7 @@ where
                 snapshot_json: payload.snapshot_content.as_deref(),
                 decoded_snapshot: payload.decoded_snapshot.as_deref(),
                 metadata_json: payload.metadata.as_deref(),
+                semantic_fingerprint: member.value.semantic_fingerprint,
                 row_created_at: member.value.created_at,
                 row_updated_at: member.value.updated_at,
                 change_account_id: &member.change.account_id,
@@ -758,15 +890,18 @@ mod tests {
         let json = serde_json::json!({"id":"one", "count":42});
         let row = crate::row_payload::TypedRow::from_normalized_json(plan, &pk, &json).unwrap();
         let payload = encode_sync_row_payload(&row).unwrap();
-        decode_sync_row_payload("custom_sync", &pk, &json, Some(&payload)).unwrap();
-        assert!(decode_sync_row_payload("custom_sync", &pk, &json, None).is_err());
-        assert!(decode_sync_row_payload("custom_sync", &pk, &json, Some("invalid")).is_err());
+        decode_sync_row_payload("custom_sync", &pk, &json, Some(&payload), false).unwrap();
+        assert!(decode_sync_row_payload("custom_sync", &pk, &json, None, false).is_err());
+        assert!(
+            decode_sync_row_payload("custom_sync", &pk, &json, Some("invalid"), false).is_err()
+        );
         assert!(
             decode_sync_row_payload(
                 "custom_sync",
                 &pk,
                 &serde_json::json!({"id":"one", "count":43}),
-                Some(&payload)
+                Some(&payload),
+                false,
             )
             .is_err()
         );
@@ -775,18 +910,152 @@ mod tests {
                 "custom_sync",
                 &RowPk::single("other"),
                 &json,
-                Some(&payload)
+                Some(&payload),
+                false,
             )
             .unwrap_err()
             .code,
             LixError::CODE_INVALID_PARAM,
         );
         assert_eq!(
-            decode_sync_row_payload("custom_sync", &pk, &json, Some("Ag=="))
+            decode_sync_row_payload("custom_sync", &pk, &json, Some("Ag=="), false)
                 .unwrap_err()
                 .code,
             LixError::CODE_INVALID_PARAM,
             "malformed typed bytes are caller input errors, not internal failures",
+        );
+    }
+
+    #[test]
+    fn proof_bearing_builtin_payload_accepts_equivalent_durable_encoding() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("builtin key-value schema");
+        let row_pk = RowPk::single("stored-layout");
+        let snapshot = serde_json::json!({
+            "key": "stored-layout",
+            "value": { "nested": [1, true] },
+        });
+        let typed = crate::row_payload::TypedRow::from_normalized_json(plan, &row_pk, &snapshot)
+            .expect("normalize builtin row");
+        let stored_payload = typed
+            .durable_payload()
+            .expect("compact builtin payload");
+        let alternate_payload = crate::plugin::wire::typed::encode_native_row_payload(
+            &typed.schema_fingerprint,
+            &typed.row_pk,
+            &typed.row,
+        )
+        .expect("encode equivalent native storage payload");
+        assert_ne!(
+            stored_payload.as_ref(),
+            alternate_payload.as_slice(),
+            "test must use a durable encoding distinct from the compact builtin form"
+        );
+        let payload = encode_sync_row_payload_bytes(&alternate_payload);
+
+        assert_eq!(
+            decode_sync_row_payload("lix_key_value", &row_pk, &snapshot, Some(&payload), true)
+                .expect("proof-bearing equivalent durable payload"),
+            alternate_payload,
+        );
+        assert!(
+            decode_sync_row_payload("lix_key_value", &row_pk, &snapshot, Some(&payload), false)
+                .is_err(),
+            "proofless rows retain the canonical wire encoding requirement"
+        );
+        assert!(
+            decode_sync_row_payload(
+                "lix_key_value",
+                &row_pk,
+                &serde_json::json!({"key": "stored-layout", "value": false}),
+                Some(&payload),
+                true,
+            )
+            .is_err(),
+            "stored bytes cannot disagree with their JSON projection"
+        );
+
+        let wrong_schema = crate::plugin::wire::typed::encode_native_row_payload(
+            &[0; 32],
+            &typed.row_pk,
+            &typed.row,
+        )
+        .expect("encode mismatched native schema");
+        let mut compressed_native = vec![crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION];
+        compressed_native.extend_from_slice(&(wrong_schema.len() as u32).to_le_bytes());
+        compressed_native.extend_from_slice(&lz4_flex::block::compress(&wrong_schema));
+        assert!(
+            decode_sync_row_payload(
+                "lix_key_value",
+                &row_pk,
+                &snapshot,
+                Some(&encode_sync_row_payload_bytes(&compressed_native)),
+                true,
+            )
+            .is_err(),
+            "a compressed native frame must not bypass built-in schema validation"
+        );
+    }
+
+    #[test]
+    fn proof_bearing_compact_payload_accepts_omitted_nullable_tail_column() {
+        let historical_schema: lix_schema::Schema = serde_json::from_value(serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_key_value",
+            "columns": [{"name": "key", "type": "text", "nullable": false}],
+            "primary_key": ["key"]
+        }))
+        .expect("historical schema");
+        let historical = lix_schema::CompiledSchema::compile(&historical_schema)
+            .expect("compile historical schema");
+        let row_pk = RowPk::single("old-row");
+        let historical_row = lix_schema::Row::from([(
+            "key",
+            lix_schema::Value::Text("old-row".to_owned()),
+        )]);
+        let payload_bytes = crate::plugin::wire::typed::encode_engine_row_payload(
+            &historical,
+            &historical_row,
+        )
+        .expect("encode historical compact row");
+        let payload = encode_sync_row_payload_bytes(&payload_bytes);
+        let snapshot = serde_json::json!({"key": "old-row", "value": null});
+
+        assert_eq!(
+            decode_sync_row_payload("lix_key_value", &row_pk, &snapshot, Some(&payload), true)
+                .expect("proof-bearing historical compact row"),
+            payload_bytes,
+        );
+        let mut compressed = vec![crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION];
+        compressed.extend_from_slice(&(payload_bytes.len() as u32).to_le_bytes());
+        compressed.extend_from_slice(&lz4_flex::block::compress(&payload_bytes));
+        assert_eq!(
+            decode_sync_row_payload(
+                "lix_key_value",
+                &row_pk,
+                &snapshot,
+                Some(&encode_sync_row_payload_bytes(&compressed)),
+                true,
+            )
+            .expect("proof-bearing compressed historical compact row"),
+            compressed,
+        );
+        assert!(
+            decode_sync_row_payload("lix_key_value", &row_pk, &snapshot, Some(&payload), false)
+                .is_err(),
+            "proofless wire rows retain canonical encoding validation"
+        );
+        assert!(
+            decode_sync_row_payload(
+                "lix_key_value",
+                &row_pk,
+                &serde_json::json!({"key": "old-row", "value": false}),
+                Some(&payload),
+                true,
+            )
+            .is_err(),
+            "the stored compact row must agree with its JSON projection"
         );
     }
 
@@ -1165,6 +1434,7 @@ mod tests {
                 snapshot: Some(serde_json::json!({"id": label})),
                 snapshot_payload: Some(String::new()),
                 metadata: None,
+                semantic_fingerprint: None,
                 row_created_at: "2026-08-19T00:00:00Z".to_owned(),
                 row_updated_at: "2026-08-19T00:00:00Z".to_owned(),
                 change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
@@ -1297,6 +1567,7 @@ mod tests {
             snapshot: Some(serde_json::json!({ "id": "row" })),
             snapshot_payload: Some(String::new()),
             metadata: None,
+            semantic_fingerprint: None,
             row_created_at: "2026-08-19T00:00:00Z".to_owned(),
             row_updated_at: "2026-08-19T00:00:00Z".to_owned(),
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),

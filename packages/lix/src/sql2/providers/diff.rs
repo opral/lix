@@ -721,6 +721,7 @@ where
                         &route.request,
                         direct_candidates,
                         needs_global_provenance,
+                        relation.kind == DiffRelationKind::File,
                     )
                     .await;
                     let (diff, from_global_rows, to_global_rows) =
@@ -788,7 +789,9 @@ where
                     // Independent storage filters can overfetch a Cartesian
                     // superset. Preserve correlation before limits or output.
                     if let Some(refs) = &route.row_refs {
-                        rows.retain(|row| refs.contains(&(row.file_id.clone(), row.row_pk.clone())));
+                        rows.retain(|row| {
+                            refs.contains(&(row.file_id.clone(), row.row_pk.clone()))
+                        });
                     }
                     if !metadata_filters.is_empty() {
                         let metadata = diff_record_batch(
@@ -1189,6 +1192,7 @@ async fn effective_diff<S: StorageAdapterRead>(
     request: &TrackedStateDiffRequest,
     local_candidates: Option<TrackedStateDiff>,
     needs_global_provenance: bool,
+    file_relation: bool,
 ) -> Result<(
     TrackedStateDiff,
     HashSet<TrackedStateKey>,
@@ -1218,6 +1222,35 @@ async fn effective_diff<S: StorageAdapterRead>(
             .await
             .map_err(lix_error_to_datafusion_error)?,
     };
+    // A root-backed local live/live row is already the effective winner on
+    // both sides: `effective_row` gives a local row priority over the pinned
+    // base, and replacement scopes suppress only the base. Carry those
+    // classified identities forward without reloading both endpoint rows.
+    // Keep HOT candidates on their existing path because their working rows
+    // need not be represented by the immutable endpoint roots.
+    let mut direct_local_entries = BTreeMap::<TrackedStateKey, TrackedStateDiffEntry>::new();
+    if can_partition_rooted_file_local_winners(
+        file_relation,
+        hot_candidates,
+        request,
+        needs_global_provenance,
+    ) {
+        for entry in &local_candidates.entries {
+            if !is_direct_rooted_file_local_winner(entry) {
+                continue;
+            }
+            direct_local_entries.insert(
+                TrackedStateKey {
+                    schema_key: entry.identity.schema_key().to_owned(),
+                    file_id: entry.identity.file_id().map(str::to_owned),
+                    row_pk: entry.identity.row_pk().clone(),
+                },
+                entry.clone(),
+            );
+        }
+    }
+    #[cfg(all(test, feature = "storage-benches"))]
+    crate::sql_profile::record_file_local_diff_rows_reused(direct_local_entries.len());
     let mut candidates = BTreeSet::new();
     extend_diff_keys(&mut candidates, &local_candidates);
 
@@ -1236,12 +1269,23 @@ async fn effective_diff<S: StorageAdapterRead>(
             .map_err(lix_error_to_datafusion_error)?;
         extend_diff_keys(&mut candidates, &base_candidates);
     }
-    if candidates.is_empty() {
-        return Ok((TrackedStateDiff::default(), HashSet::new(), HashSet::new()));
+    let keys = candidates
+        .into_iter()
+        .filter(|key| !direct_local_entries.contains_key(key))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok((
+            TrackedStateDiff::from_entries(direct_local_entries.into_values().collect()),
+            HashSet::new(),
+            HashSet::new(),
+        ));
     }
-
-    let keys = candidates.into_iter().collect::<Vec<_>>();
-    let projection = ChangeRecordProjection::full();
+    let projection = ChangeRecordProjection {
+        snapshot_content: false,
+        metadata: true,
+        snapshot: true,
+        raw_snapshot: false,
+    };
     let from_local = tracked
         .load_projected_batch_at_commit(from_commit_id, &keys, &projection)
         .await
@@ -1260,7 +1304,7 @@ async fn effective_diff<S: StorageAdapterRead>(
 
     let identities = TrackedStateDiffIdentity::from_key_batch(keys.clone())
         .map_err(lix_error_to_datafusion_error)?;
-    let mut entries = Vec::with_capacity(keys.len());
+    let mut entries = direct_local_entries;
     let mut payloads = BTreeMap::new();
     let mut from_global_rows = HashSet::new();
     let mut to_global_rows = HashSet::new();
@@ -1286,38 +1330,63 @@ async fn effective_diff<S: StorageAdapterRead>(
         if after_global && after.is_some_and(|row| !row.deleted()) {
             to_global_rows.insert(key.clone());
         }
-        for row in [before, after].into_iter().flatten() {
-            payloads.entry(row.change_id()).or_insert_with(|| {
-                let snapshot = row
-                    .decoded_snapshot()
-                    .and_then(|snapshot| snapshot.durable_payload().ok())
-                    .map(|payload| payload.to_vec());
-                let metadata = row.metadata().and_then(|metadata| {
-                    serde_json::from_str(metadata.as_str())
-                        .ok()
-                        .map(lix_schema::Jsonb::from_value)
+        if request.retain_payloads {
+            for row in [before, after].into_iter().flatten() {
+                payloads.entry(row.change_id()).or_insert_with(|| {
+                    let snapshot = row
+                        .decoded_snapshot()
+                        .and_then(|snapshot| snapshot.durable_payload().ok())
+                        .map(|payload| payload.to_vec());
+                    let metadata = row.metadata().and_then(|metadata| {
+                        serde_json::from_str(metadata.as_str())
+                            .ok()
+                            .map(lix_schema::Jsonb::from_value)
+                    });
+                    (snapshot, metadata)
                 });
-                (snapshot, metadata)
-            });
+            }
         }
-        entries.push(TrackedStateDiffEntry {
-            identity: identity.clone(),
-            kind,
-            before: before.map(|row| diff_row(identity.clone(), row)),
-            after: after.map(|row| diff_row(identity, row)),
-        });
+        entries.insert(
+            key.clone(),
+            TrackedStateDiffEntry {
+                identity: identity.clone(),
+                kind,
+                before: before.map(|row| diff_row(identity.clone(), row)),
+                after: after.map(|row| diff_row(identity, row)),
+            },
+        );
     }
-    let payloads = TrackedStatePayloadBatch::from_payloads(
-        payloads
-            .into_iter()
-            .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
-    )
-    .map_err(lix_error_to_datafusion_error)?;
-    Ok((
-        TrackedStateDiff::from_entries_with_payloads(entries, payloads),
-        from_global_rows,
-        to_global_rows,
-    ))
+    // The counter intentionally measures rows actually captured for SQL diff
+    // payload output. Identity-only projections leave the map empty.
+    #[cfg(all(test, feature = "storage-benches"))]
+    crate::sql_profile::record_effective_payload_rows_captured(payloads.len());
+    let diff = if request.retain_payloads {
+        let payloads = TrackedStatePayloadBatch::from_payloads(
+            payloads
+                .into_iter()
+                .map(|(change_id, (snapshot, metadata))| (change_id, snapshot, metadata)),
+        )
+        .map_err(lix_error_to_datafusion_error)?;
+        TrackedStateDiff::from_entries_with_payloads(entries.into_values().collect(), payloads)
+    } else {
+        TrackedStateDiff::from_entries(entries.into_values().collect())
+    };
+    Ok((diff, from_global_rows, to_global_rows))
+}
+
+fn can_partition_rooted_file_local_winners(
+    file_relation: bool,
+    hot_candidates: bool,
+    request: &TrackedStateDiffRequest,
+    needs_global_provenance: bool,
+) -> bool {
+    file_relation && !hot_candidates && !request.retain_payloads && !needs_global_provenance
+}
+
+fn is_direct_rooted_file_local_winner(entry: &TrackedStateDiffEntry) -> bool {
+    entry.identity.schema_key() != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+        && entry.visible_before().is_some()
+        && entry.after.as_ref().is_some_and(|row| !row.deleted)
 }
 
 async fn load_local_replacement_scopes_for_keys<S: StorageAdapterRead>(
@@ -1453,7 +1522,11 @@ fn effective_snapshot_eq(
             (Ok(before), Ok(after)) => before.as_ref() == after.as_ref(),
             _ => false,
         },
-        _ => before.snapshot_content() == after.snapshot_content(),
+        (Some(_), None) | (None, Some(_)) => false,
+        // This demand projection omits derived JSON, so two absent typed
+        // snapshots cannot prove equality. The full-projection fallback is not
+        // appropriate for these hydrated live rows.
+        (None, None) => false,
     }
 }
 
@@ -1468,6 +1541,7 @@ fn diff_row(
         updated_at: row.updated_at(),
         change_id: row.change_id(),
         commit_id: row.commit_id(),
+        semantic_fingerprint: None,
         author_id: row.author_id().to_owned(),
     }
 }
@@ -2453,6 +2527,184 @@ mod tests {
     use datafusion::logical_expr::{col, lit};
 
     #[tokio::test]
+    async fn root_backed_file_diff_reuses_live_winners_and_resolves_base_tombstones() {
+        use crate::engine::Engine;
+        use crate::session::CreateBranchOptions;
+        use crate::{Memory, Value};
+
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("initialize memory storage");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("open memory engine");
+        let main = engine.open_session().await.expect("open main session");
+        let live_id = "01940000-0000-7000-8000-000000000001";
+        let removed_id = "01940000-0000-7000-8000-000000000002";
+        main.execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+            &[
+                Value::Text(live_id.into()),
+                Value::Text("/live.txt".into()),
+                Value::Blob(b"before-live".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("insert live file");
+        main.execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+            &[
+                Value::Text(removed_id.into()),
+                Value::Text("/removed.txt".into()),
+                Value::Blob(b"base-only".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("insert base-backed file");
+        main.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .await
+            .expect("seal branch base");
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "diff-winner-partition".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create root-backed branch");
+        main.close().await.expect("close main session");
+        let session = engine
+            .open_session_at(branch.id.clone())
+            .await
+            .expect("open branch session");
+
+        let read = engine
+            .storage()
+            .begin_read(Default::default())
+            .await
+            .expect("read branch control");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.id)
+            .await
+            .expect("load branch control")
+            .expect("branch control is present");
+        assert!(
+            TrackedHeadContext::new()
+                .reader(&read)
+                .root_current_base_commit(&branch.id, control.tracked_generation)
+                .await
+                .expect("load root current base")
+                .is_some(),
+            "fixture must use the root-backed current-base path"
+        );
+        drop(read);
+
+        session
+            .execute(
+                "UPDATE lix_file SET content = $2 WHERE id = $1",
+                &[
+                    Value::Text(live_id.into()),
+                    Value::Blob(b"after-live".to_vec().into()),
+                ],
+            )
+            .await
+            .expect("modify one live local winner");
+        session
+            .execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(removed_id.into())])
+            .await
+            .expect("tombstone one base-backed file");
+
+        let read = engine
+            .storage()
+            .begin_read(Default::default())
+            .await
+            .expect("read updated branch control");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.id)
+            .await
+            .expect("load updated branch control")
+            .expect("updated branch control is present");
+        assert!(
+            TrackedHeadContext::new()
+                .reader(&read)
+                .root_current_base_commit(&branch.id, control.tracked_generation)
+                .await
+                .expect("load updated root current base")
+                .is_some(),
+            "fixture must remain root-backed after both branch writes"
+        );
+        drop(read);
+
+        let full = session
+            .execute(
+                "SELECT id, diff_type, from_content, to_content IS NULL AS to_is_null \
+                 FROM lix_diff('lix_file') ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("read full mixed diff oracle");
+        let actual = full
+            .rows()
+            .iter()
+            .map(|row| {
+                Ok::<_, crate::LixError>((
+                    row.get::<String>("id")?,
+                    row.get::<String>("diff_type")?,
+                    row.get::<Vec<u8>>("from_content")?,
+                    row.get::<bool>("to_is_null")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read full diff columns");
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    live_id.to_owned(),
+                    "modified".to_owned(),
+                    b"before-live".to_vec(),
+                    false,
+                ),
+                (
+                    removed_id.to_owned(),
+                    "removed".to_owned(),
+                    b"base-only".to_vec(),
+                    true,
+                ),
+            ],
+            "the live/local winner is preserved while the tombstone resolves against the pinned base"
+        );
+
+        #[cfg(feature = "storage-benches")]
+        let (count, profile) = session
+            .execute_profiled("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("profile identity-only mixed diff");
+        #[cfg(not(feature = "storage-benches"))]
+        let count = session
+            .execute("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("count identity-only mixed diff");
+        assert_eq!(
+            count.rows()[0].get::<i64>("n").unwrap(),
+            actual.len() as i64,
+            "identity-only count must match the full diff oracle"
+        );
+        #[cfg(feature = "storage-benches")]
+        assert!(
+            profile.file_local_diff_rows_reused > 0,
+            "the count path should reuse at least the live/live local winner"
+        );
+        // Authenticated semantic proofs may validate the live/live pair without
+        // materializing either payload. The complete diff above remains the
+        // result oracle for this mixed live/tombstone case.
+        session.close().await.expect("close branch session");
+    }
+
+    #[tokio::test]
     async fn descriptor_reports_independent_missing_inputs_together() {
         use crate::storage_adapter::SharedStorageAdapterRead;
         use crate::tracked_state::NativeMetadataRef;
@@ -2822,6 +3074,19 @@ mod tests {
         )
         .await
         .expect("move ancestor");
+        let moved_file_full = lix
+            .execute("SELECT id, diff_type FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("expanded descendant path diff");
+        let moved_file_count = lix
+            .execute("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .await
+            .expect("expanded descendant path count");
+        assert_eq!(
+            moved_file_count.rows()[0].get::<i64>("n").unwrap(),
+            moved_file_full.rows().len() as i64,
+            "directory movement expands to the same logical descendant file rows",
+        );
         for query in [
             "SELECT count(*) AS n FROM lix_diff('lix_file')".to_owned(),
             format!("SELECT count(*) AS n FROM lix_diff('lix_file') WHERE id = '{file_id}'"),
@@ -3190,17 +3455,11 @@ mod tests {
     #[test]
     fn relation_diff_rejects_wrongly_typed_filesystem_row_refs() {
         for relation_name in ["lix_file", "lix_directory"] {
-            let relation = DiffRelation::from_catalog(
-                PublicCatalog::fixed_system(),
-                relation_name,
-            )
-            .expect("filesystem relation is registered");
-            let malformed = crate::row_ref::encode(
-                relation_name,
-                None,
-                &RowPk::single("not-a-uuid"),
-            )
-            .expect("codec accepts catalog-independent canonical payloads");
+            let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), relation_name)
+                .expect("filesystem relation is registered");
+            let malformed =
+                crate::row_ref::encode(relation_name, None, &RowPk::single("not-a-uuid"))
+                    .expect("codec accepts catalog-independent canonical payloads");
             let route = DiffRoute::from_filters(
                 &[col("row_ref").eq(lit(malformed.as_str()))],
                 &relation,

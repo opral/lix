@@ -25,10 +25,13 @@ where
     let (source, target) = if partial {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82,
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83,
         )
     } else {
-        (crate::init::REPOSITORY_PROTOCOL_V82, crate::init::REPOSITORY_PROTOCOL_VALUE)
+        (
+            crate::init::REPOSITORY_PROTOCOL_V82,
+            crate::init::REPOSITORY_PROTOCOL_V83,
+        )
     };
     super::publish::publish(
         adapter,
@@ -106,7 +109,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.before.format, Some(82));
-        assert_eq!(report.after.format, Some(83));
+        assert_eq!(report.after.format, Some(crate::init::CURRENT_FORMAT_VERSION));
         let lix = crate::open_lix().with_storage(storage.clone()).await.unwrap();
         let rows = lix.execute("SELECT id FROM lix_branch", &[]).await.unwrap();
         assert!(!rows.is_empty());

@@ -1607,6 +1607,7 @@ impl WorkingDiffVersion {
             updated_at: self.updated_at,
             change_id: self.change_id,
             commit_id: self.commit_id,
+            semantic_fingerprint: None,
             author_id: uuid::Uuid::from_bytes(self.author_id).to_string(),
         }
     }

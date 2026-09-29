@@ -341,7 +341,19 @@ pub(crate) struct ChangelogAppend {
 }
 
 /// Current on-disk shape of [`CommitRecord`].
-pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 7;
+pub(crate) const COMMIT_RECORD_FORMAT_VERSION: u32 = 8;
+
+/// Complete summary of checkpoint membership on a commit's strict first-
+/// parent ancestry. `None` means ancestry is sparse or otherwise unproven;
+/// `Some { previous_checkpoint_id: None, first_parent_distance: 0 }` proves
+/// that no earlier checkpoint exists on that lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct FirstParentCheckpointSummary {
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) previous_checkpoint_id: Option<CommitId>,
+    pub(crate) first_parent_distance: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -355,7 +367,9 @@ pub(crate) struct CommitRecord {
     /// packed, so v4 bytes do not decode as v5. Version 6 adds the pinned
     /// global base. This deliberately is not a parent edge: parents describe
     /// causal history, while the base describes the complete state resolved
-    /// by this commit.
+    /// by this commit. Version 7 adds immutable checkpoint membership.
+    /// Version 8 adds a validated nearest-checkpoint summary on the strict
+    /// first-parent lane.
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     /// Longest-path distance from a graph root. Every parent has a strictly
@@ -381,6 +395,10 @@ pub(crate) struct CommitRecord {
     pub(crate) touched_scope_digest: super::CommitTouchedScopeDigest,
     /// Immutable checkpoint membership (record v7), published with this commit.
     pub(crate) is_checkpoint: bool,
+    /// Complete nearest-checkpoint summary on the strict first-parent lane.
+    /// Record v8 adds this optional proof field.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) first_parent_checkpoint_summary: Option<FirstParentCheckpointSummary>,
 }
 
 impl CommitRecord {
@@ -390,6 +408,44 @@ impl CommitRecord {
     pub(crate) fn change_id(&self) -> ChangeId {
         self.commit_id.commit_change_id()
     }
+}
+
+/// Derives the nearest-checkpoint summary from only a commit's first parent.
+/// Missing or incomplete ancestry stays explicitly unavailable.
+pub(crate) fn derive_first_parent_checkpoint_summary(
+    parent_commit_ids: &[CommitId],
+    first_parent: Option<&CommitRecord>,
+) -> Result<Option<FirstParentCheckpointSummary>, LixError> {
+    let Some(parent_id) = parent_commit_ids.first() else {
+        return Ok(Some(FirstParentCheckpointSummary {
+            previous_checkpoint_id: None,
+            first_parent_distance: 0,
+        }));
+    };
+    let Some(parent) = first_parent.filter(|record| record.commit_id == *parent_id) else {
+        return Ok(None);
+    };
+    if parent.is_checkpoint {
+        return Ok(Some(FirstParentCheckpointSummary {
+            previous_checkpoint_id: Some(parent.commit_id),
+            first_parent_distance: 1,
+        }));
+    }
+    let Some(summary) = parent.first_parent_checkpoint_summary else {
+        return Ok(None);
+    };
+    let first_parent_distance = if summary.previous_checkpoint_id.is_some() {
+        summary
+            .first_parent_distance
+            .checked_add(1)
+            .ok_or_else(|| LixError::unknown("first-parent checkpoint distance exceeds u64"))?
+    } else {
+        0
+    };
+    Ok(Some(FirstParentCheckpointSummary {
+        previous_checkpoint_id: summary.previous_checkpoint_id,
+        first_parent_distance,
+    }))
 }
 
 /// Derives the one-pointer Myers jump owned by a new immutable commit.
@@ -455,7 +511,10 @@ pub(crate) fn next_first_parent_jump(
 
 #[cfg(test)]
 mod topology_tests {
-    use super::{CommitId, CommitRecord, next_first_parent_jump};
+    use super::{
+        CommitId, CommitRecord, FirstParentCheckpointSummary,
+        derive_first_parent_checkpoint_summary, next_first_parent_jump,
+    };
     use crate::common::LixTimestamp;
 
     #[test]
@@ -719,6 +778,7 @@ mod topology_tests {
         let commit_id = id(depth);
         CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -730,6 +790,90 @@ mod topology_tests {
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse("Myers test timestamp", "2026-08-11T00:00:00Z"),
         }
+    }
+
+    #[test]
+    fn checkpoint_summary_derives_only_from_complete_first_parent_history() {
+        let mut root = record(0, None, None);
+        root.first_parent_checkpoint_summary = derive_first_parent_checkpoint_summary(&[], None)
+            .expect("root derivation succeeds");
+        assert_eq!(
+            root.first_parent_checkpoint_summary,
+            Some(FirstParentCheckpointSummary {
+                previous_checkpoint_id: None,
+                first_parent_distance: 0,
+            })
+        );
+
+        let mut first_checkpoint = record(1, Some(root.commit_id), Some((root.commit_id, 1)));
+        first_checkpoint.is_checkpoint = true;
+        first_checkpoint.first_parent_checkpoint_summary =
+            derive_first_parent_checkpoint_summary(
+                &first_checkpoint.parent_commit_ids,
+                Some(&root),
+            )
+            .expect("checkpoint derivation succeeds");
+        assert_eq!(
+            first_checkpoint.first_parent_checkpoint_summary,
+            root.first_parent_checkpoint_summary
+        );
+
+        let mut ordinary = record(2, Some(first_checkpoint.commit_id), None);
+        ordinary.first_parent_checkpoint_summary = derive_first_parent_checkpoint_summary(
+            &ordinary.parent_commit_ids,
+            Some(&first_checkpoint),
+        )
+        .expect("ordinary derivation succeeds");
+        assert_eq!(
+            ordinary.first_parent_checkpoint_summary,
+            Some(FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(first_checkpoint.commit_id),
+                first_parent_distance: 1,
+            })
+        );
+
+        let mut second_checkpoint = record(3, Some(ordinary.commit_id), None);
+        second_checkpoint.is_checkpoint = true;
+        second_checkpoint.first_parent_checkpoint_summary =
+            derive_first_parent_checkpoint_summary(
+                &second_checkpoint.parent_commit_ids,
+                Some(&ordinary),
+            )
+            .expect("checkpoint chain derivation succeeds");
+        assert_eq!(
+            second_checkpoint.first_parent_checkpoint_summary,
+            Some(FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(first_checkpoint.commit_id),
+                first_parent_distance: 2,
+            })
+        );
+
+        let mut deep_secondary = record(100_000, None, None);
+        deep_secondary.is_checkpoint = true;
+        let merge_parents = [ordinary.commit_id, deep_secondary.commit_id];
+        let merge_summary = derive_first_parent_checkpoint_summary(
+            &merge_parents,
+            Some(&ordinary),
+        )
+        .expect("merge derivation succeeds");
+        assert_eq!(
+            merge_summary,
+            Some(FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(first_checkpoint.commit_id),
+                first_parent_distance: 2,
+            }),
+            "a secondary checkpoint and its inflated generation cannot move the first-parent cursor"
+        );
+
+        let unavailable_parent = record(9, Some(CommitId::for_test_label("missing-parent")), None);
+        assert_eq!(
+            derive_first_parent_checkpoint_summary(
+                &unavailable_parent.parent_commit_ids,
+                None,
+            )
+            .expect("missing boundary is a valid unknown summary"),
+            None
+        );
     }
 }
 

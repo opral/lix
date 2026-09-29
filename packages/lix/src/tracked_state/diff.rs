@@ -146,6 +146,10 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
+    /// Optional proof copied from the authenticated tree leaf so later
+    /// ancestry checks can compare the exact index value without rehydrating
+    /// payloads. Query projections do not expose this field.
+    pub(crate) semantic_fingerprint: Option<[u8; 32]>,
     pub(crate) author_id: String,
 }
 
@@ -443,14 +447,25 @@ where
     // index. Merge/checkpoint consumers retain full payload authority; SQL
     // consumers validate the allocation-free leaf index and avoid decoding
     // payload sidecars for added/removed rows.
-    let payloads = if request.retain_payloads {
-        reader
-            .validate_tree_diff_batch_and_load_payloads(&tree_diff)
-            .await?
+    let (payloads, fingerprints) = if request.retain_payloads {
+        (
+            reader
+                .validate_tree_diff_batch_and_load_payloads(&tree_diff)
+                .await?,
+            None,
+        )
+    } else if let Some(fingerprints) = reader
+        .try_validate_tree_diff_comparison_fingerprints(&tree_diff)
+        .await?
+    {
+        (TrackedStatePayloadBatch::default(), Some(fingerprints))
     } else {
-        reader
-            .load_tree_diff_comparison_payloads(&tree_diff)
-            .await?
+        (
+            reader
+                .load_tree_diff_comparison_payloads(&tree_diff)
+                .await?,
+            None,
+        )
     };
 
     // Rows are identity-only; payload equality needs the change records when
@@ -459,15 +474,25 @@ where
     // as no-diff). Reuse the records loaded for changed-row validation instead
     // of issuing a second changelog read.
 
-    let entries = classify_tree_diff_batch(tree_diff, &payloads)?;
+    let entries = classify_tree_diff_batch(tree_diff, &payloads, fingerprints.as_ref())?;
 
-    let diff = TrackedStateDiff::from_entries_with_payloads(entries, payloads);
+    let diff = if request.retain_payloads {
+        #[cfg(all(test, feature = "storage-benches"))]
+        crate::sql_profile::record_diff_payload_rows_retained(payloads.len());
+        TrackedStateDiff::from_entries_with_payloads(entries, payloads)
+    } else {
+        // Payloads remain available through classification because typed snapshots
+        // and metadata are required to collapse semantic reverts. Identity-only
+        // results have no consumer for them after that point.
+        TrackedStateDiff::from_entries(entries)
+    };
     Ok(diff)
 }
 
 fn classify_tree_diff_batch(
     tree_diff: TrackedStateTreeDiffBatch,
     payloads: &TrackedStatePayloadBatch,
+    fingerprints: Option<&HashMap<ChangeId, [u8; 32]>>,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
     let row_count = tree_diff.len();
     if row_count == 0 {
@@ -482,12 +507,20 @@ fn classify_tree_diff_batch(
     })?;
     let mut entries = Vec::with_capacity(row_count);
     for (ordinal, (before, after)) in before.into_iter().zip(after).enumerate() {
-        let Some(kind) = classify_diff_values(before.as_ref(), after.as_ref(), payloads) else {
+        let ordinal_u32 = u32::try_from(ordinal).expect("diff row count was bounded to u32");
+        let Some(kind) = classify_diff_values(
+            identities.schema_key(ordinal_u32),
+            identities.row_pk(ordinal_u32),
+            before.as_ref(),
+            after.as_ref(),
+            payloads,
+            fingerprints,
+        )? else {
             continue;
         };
         let identity = TrackedStateDiffIdentity::from_batch_ordinal(
             Arc::clone(&identities),
-            u32::try_from(ordinal).expect("diff row count was bounded to u32"),
+            ordinal_u32,
         );
         let before =
             before.map(|value| TrackedStateDiffRow::from_index_value(identity.clone(), value));
@@ -518,17 +551,20 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeS
 }
 
 fn classify_diff_values(
+    schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
     before: Option<&TrackedStateIndexValue>,
     after: Option<&TrackedStateIndexValue>,
     payloads: &TrackedStatePayloadBatch,
-) -> Option<TrackedStateDiffKind> {
-    match (is_live_value(before), is_live_value(after)) {
+    fingerprints: Option<&HashMap<ChangeId, [u8; 32]>>,
+) -> Result<Option<TrackedStateDiffKind>, LixError> {
+    Ok(match (is_live_value(before), is_live_value(after)) {
         (None, None) => None,
         (None, Some(_)) => Some(TrackedStateDiffKind::Added),
         (Some(_), None) => Some(TrackedStateDiffKind::Removed),
-        (Some(before), Some(after)) if tracked_value_payload_eq(before, after, payloads) => None,
+        (Some(before), Some(after)) if tracked_value_payload_eq(schema_key, row_pk, before, after, payloads, fingerprints)? => None,
         (Some(_), Some(_)) => Some(TrackedStateDiffKind::Modified),
-    }
+    })
 }
 
 fn is_live_value(row: Option<&TrackedStateIndexValue>) -> Option<&TrackedStateIndexValue> {
@@ -536,19 +572,45 @@ fn is_live_value(row: Option<&TrackedStateIndexValue>) -> Option<&TrackedStateIn
 }
 
 fn tracked_value_payload_eq(
+    schema_key: &str,
+    row_pk: &crate::row_pk::RowPk,
     left: &TrackedStateIndexValue,
     right: &TrackedStateIndexValue,
     payloads: &TrackedStatePayloadBatch,
-) -> bool {
+    fingerprints: Option<&HashMap<ChangeId, [u8; 32]>>,
+) -> Result<bool, LixError> {
     if left.change_id == right.change_id {
-        return true;
+        return Ok(true);
     }
-    match (payloads.get(left.change_id), payloads.get(right.change_id)) {
-        (Some(left), Some(right)) => {
-            left.snapshot == right.snapshot && left.metadata == right.metadata
-        }
-        _ => false,
+    if let Some(fingerprints) = fingerprints
+        && let (Some(left), Some(right)) = (
+            fingerprints.get(&left.change_id),
+            fingerprints.get(&right.change_id),
+        )
+    {
+        return Ok(left == right);
     }
+    let (Some(left), Some(right)) =
+        (payloads.get(left.change_id), payloads.get(right.change_id))
+    else {
+        return Ok(false);
+    };
+    if left.metadata != right.metadata {
+        return Ok(false);
+    }
+    if left.snapshot == right.snapshot {
+        return Ok(true);
+    }
+    let (Some(left_snapshot), Some(right_snapshot)) = (left.snapshot, right.snapshot) else {
+        return Ok(false);
+    };
+    let left = crate::row_payload::TypedRow::decode_durable_payload(
+        Arc::<[u8]>::from(left_snapshot), schema_key, row_pk,
+    )?;
+    let right = crate::row_payload::TypedRow::decode_durable_payload(
+        Arc::<[u8]>::from(right_snapshot), schema_key, row_pk,
+    )?;
+    Ok(left == right)
 }
 
 impl TrackedStateTreeDiffBatchBuilder {
@@ -1334,6 +1396,7 @@ impl TrackedStateDiffRow {
             updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
+            semantic_fingerprint: value.semantic_fingerprint,
             author_id: value.author_id,
         }
     }
@@ -1358,6 +1421,7 @@ impl TrackedStateDiffRow {
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            semantic_fingerprint: self.semantic_fingerprint,
         }
     }
 
@@ -1448,6 +1512,7 @@ mod tests {
             updated_at: ts("2024-01-01T00:00:00.000Z"),
             change_id,
             commit_id: CommitId::for_test_label("payload-commit"),
+            semantic_fingerprint: None,
             author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
         };
         let entry = TrackedStateDiffEntry {
@@ -1525,12 +1590,13 @@ mod tests {
             deleted,
             created_at,
             updated_at,
+            semantic_fingerprint: None,
         };
         let entry = |before: Option<TrackedStateIndexValue>| {
             let mut batch = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
             batch.push_shared(key(), before, Some(value(after_change_id, false)));
             let batch = batch.finish().expect("tree batch should seal");
-            classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default())
+            classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default(), None)
                 .expect("rows should classify")
                 .pop()
                 .expect("one entry")
@@ -1593,6 +1659,7 @@ mod tests {
                 deleted: false,
                 created_at,
                 updated_at,
+                semantic_fingerprint: None,
             }),
             Some(TrackedStateIndexValue {
                 change_id: ChangeId::for_test_label("delete-after"),
@@ -1601,10 +1668,11 @@ mod tests {
                 deleted: true,
                 created_at,
                 updated_at,
+                semantic_fingerprint: None,
             }),
         );
         let batch = batch.finish().expect("tree batch should seal");
-        let entry = classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default())
+        let entry = classify_tree_diff_batch(batch, &TrackedStatePayloadBatch::default(), None)
             .expect("rows should classify")
             .pop()
             .expect("one entry");
@@ -1646,12 +1714,13 @@ mod tests {
                     deleted: false,
                     created_at,
                     updated_at,
+                    semantic_fingerprint: None,
                 }),
             );
         }
         let tree_entries = tree_entries.finish().expect("tree batch should seal");
         assert_eq!(tree_entries.large_buffer_count(), 3);
-        let rows = classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default())
+        let rows = classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default(), None)
             .expect("tree rows should classify");
         assert_eq!(rows.len(), row_count);
         let first = &rows[0].identity;
@@ -1757,6 +1826,7 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    semantic_fingerprint: None,
                 }),
             );
         }
@@ -1834,12 +1904,14 @@ mod tests {
                     deleted: false,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    semantic_fingerprint: None,
                 }),
             );
         }
         let entries = classify_tree_diff_batch(
             tree_entries.finish().expect("tree batch should seal"),
             &TrackedStatePayloadBatch::default(),
+            None,
         )
         .expect("tree rows should classify");
         let source = TrackedStateDiff::from_entries(entries);
@@ -1870,6 +1942,133 @@ mod tests {
                 "merge pick {index} did not retain the same ordinal for its selected row"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_semantic_fingerprint_classifies_without_payload_batch() {
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let value = |change: &str, fingerprint| TrackedStateIndexValue {
+            change_id: ChangeId::for_test_label(change),
+            commit_id: CommitId::for_test_label(&format!("commit-{change}")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            semantic_fingerprint: fingerprint,
+        };
+        let empty_payloads = TrackedStatePayloadBatch::default();
+        let same = [0x5a; 32];
+        let before = value("before", Some(same));
+        let equal_after = value("after-equal", Some(same));
+        let mut fingerprints = HashMap::from([
+            (before.change_id, same),
+            (equal_after.change_id, same),
+        ]);
+        let row_pk = RowPk::single("row");
+        assert!(tracked_value_payload_eq(
+            "schema",
+            &row_pk,
+            &before,
+            &equal_after,
+            &empty_payloads,
+            Some(&fingerprints),
+        ).unwrap());
+        let row = TrackedStateDiffRow::from_index_value(
+            TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                schema_key: "schema".to_owned(),
+                file_id: None,
+                row_pk: RowPk::single("row"),
+            }),
+            before.clone(),
+        );
+        assert_eq!(row.index_value().semantic_fingerprint, Some(same));
+
+        let changed_after = value("after-changed", Some([0xa5; 32]));
+        fingerprints.insert(changed_after.change_id, [0xa5; 32]);
+        assert!(!tracked_value_payload_eq(
+            "schema",
+            &row_pk,
+            &before,
+            &changed_after,
+            &empty_payloads,
+            Some(&fingerprints),
+        ).unwrap());
+
+        let legacy_after = value("after-legacy", None);
+        assert!(
+            !tracked_value_payload_eq("schema", &row_pk, &before, &legacy_after, &empty_payloads, Some(&fingerprints)).unwrap(),
+            "an incomplete proof must not infer semantic equality without loading payloads"
+        );
+    }
+
+    #[test]
+    fn proofless_fallback_compares_typed_rows_across_durable_encodings() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .expect("built-in schema");
+        let row_pk = RowPk::single("proofless-row");
+        let typed = crate::row_payload::TypedRow::from_normalized_json(
+            plan,
+            &row_pk,
+            &serde_json::json!({"key":"proofless-row","value":{"same":true}}),
+        )
+        .unwrap();
+        let compact = typed.durable_payload().unwrap();
+        let native = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &typed.schema_fingerprint,
+            &typed.row_pk,
+            &typed.row,
+        )
+        .unwrap();
+        assert_ne!(compact.as_ref(), native.as_slice());
+        let before_id = ChangeId::for_test_label("proofless-compact");
+        let after_id = ChangeId::for_test_label("proofless-native");
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let value = |change_id| TrackedStateIndexValue {
+            change_id,
+            commit_id: CommitId::for_test_label("proofless-owner"),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            semantic_fingerprint: None,
+        };
+        let payloads = TrackedStatePayloadBatch::from_payloads([
+            (before_id, Some(compact.to_vec()), None),
+            (after_id, Some(native), None),
+        ])
+        .unwrap();
+        let incomplete_proofs = HashMap::from([(before_id, [9; 32])]);
+        assert!(tracked_value_payload_eq(
+            "lix_key_value", &row_pk, &value(before_id), &value(after_id),
+            &payloads, Some(&incomplete_proofs),
+        ).unwrap());
+        let sql_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("proofless-row".to_owned())),
+                ("value", lix_schema::Value::Null),
+            ]),
+        )
+        .unwrap();
+        let json_null = crate::row_payload::TypedRow::from_row(
+            plan,
+            lix_schema::Row::from([
+                ("key", lix_schema::Value::Text("proofless-row".to_owned())),
+                ("value", lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(serde_json::Value::Null))),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(sql_null.to_json_value().unwrap(), json_null.to_json_value().unwrap());
+        let null_payloads = TrackedStatePayloadBatch::from_payloads([
+            (before_id, Some(sql_null.durable_payload().unwrap().to_vec()), None),
+            (after_id, Some(json_null.durable_payload().unwrap().to_vec()), None),
+        ])
+        .unwrap();
+        assert!(!tracked_value_payload_eq(
+            "lix_key_value", &row_pk, &value(before_id), &value(after_id),
+            &null_payloads, None,
+        ).unwrap());
     }
 
     #[tokio::test]
@@ -2004,8 +2203,160 @@ mod tests {
         .await;
 
         let diff = diff(&storage, &tracked_state).await;
-
         assert!(diff.entries.is_empty());
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("identity-only read should open");
+        let diff = tracked_state
+            .reader(read)
+            .diff_commits(
+                "left",
+                "right",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("identity-only semantic revert should load");
+        assert!(
+            diff.entries.is_empty(),
+            "the joined payload read must retain exact before/after snapshot and metadata equality"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_semantic_fingerprints_skip_payload_decode_for_same_and_different_values() {
+        let same_rows_left = [row_with_value("row-a", None, "same-left", "same")];
+        let same_rows_right = [row_with_value("row-a", None, "same-right", "same")];
+        assert_ne!(
+            same_rows_left[0].change_id, same_rows_right[0].change_id,
+            "the equality witness must use distinct authored change IDs"
+        );
+        let (storage, tracked_state) =
+            seed_fingerprinted_roots(&same_rows_left, true, &same_rows_right, true).await;
+        crate::tracked_state::storage::reset_commit_delta_payload_decode_probe_for_test();
+        crate::tracked_state::storage::arm_point_replay_authority_batch_probe_for_test();
+
+        let diff = diff_identity_only(&storage, &tracked_state).await;
+
+        assert!(
+            diff.entries.is_empty(),
+            "distinct authored change ids with equal snapshot/metadata should be a semantic no-op"
+        );
+        assert_eq!(
+            crate::tracked_state::storage::take_commit_delta_payload_decode_probe_for_test(),
+            0,
+            "complete root+delta proofs should classify without decoding payload bodies"
+        );
+        assert!(
+            crate::tracked_state::storage::take_point_replay_authority_batch_probe_for_test()
+                .contains(&2),
+            "the comparison's two owner header/inventory pairs should be fetched in one batch"
+        );
+
+        let changed_rows_left = [row_with_value("row-a", None, "changed-left", "before")];
+        let changed_rows_right = [row_with_value("row-a", None, "changed-right", "after")];
+        assert_ne!(
+            changed_rows_left[0].change_id, changed_rows_right[0].change_id,
+            "the change witness must use distinct authored change IDs"
+        );
+        let (storage, tracked_state) =
+            seed_fingerprinted_roots(&changed_rows_left, true, &changed_rows_right, true).await;
+        crate::tracked_state::storage::reset_commit_delta_payload_decode_probe_for_test();
+
+        let diff = diff_identity_only(&storage, &tracked_state).await;
+
+        assert_eq!(
+            kinds(&diff),
+            vec![("row-a".to_owned(), TrackedStateDiffKind::Modified)],
+            "distinct authored fingerprints should retain actual semantic changes"
+        );
+        assert_eq!(
+            crate::tracked_state::storage::take_commit_delta_payload_decode_probe_for_test(),
+            0,
+            "complete root+delta proofs should not hydrate payload bodies for changed values either"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_delta_fingerprint_uses_payload_fallback() {
+        let left_rows = [row_with_value("row-a", None, "legacy-left", "same")];
+        let right_rows = [row_with_value("row-a", None, "fingerprinted-right", "same")];
+        let (storage, tracked_state) =
+            seed_fingerprinted_roots(&left_rows, false, &right_rows, true).await;
+        crate::tracked_state::storage::reset_commit_delta_payload_decode_probe_for_test();
+
+        let diff = diff_identity_only(&storage, &tracked_state).await;
+
+        assert!(
+            diff.entries.is_empty(),
+            "legacy deltas must retain exact payload equality semantics"
+        );
+        assert!(
+            crate::tracked_state::storage::take_commit_delta_payload_decode_probe_for_test() > 0,
+            "an incomplete delta proof must use the exact payload fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_only_diff_rejects_packed_delta_tree_value_mismatch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source",
+            None,
+            &[row("row-a", None, "source-change")],
+        )
+        .await
+        .expect("source root should write");
+        write_root_committed_for_test(&storage, &tracked_state, "right-corrupt", None, &[])
+            .await
+            .expect("corrupt endpoint manifest should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let source_diff = tracked_state
+            .reader(read)
+            .diff_commits("right-corrupt", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("source row should load");
+        let source_row = source_diff.entries[0]
+            .after
+            .as_ref()
+            .expect("source row should be live");
+        let (key, mut value) = source_row.clone().into_index_entry();
+        value.change_id = ChangeId::for_test_label("forged-tree-change");
+        stage_corrupt_commit_root(&storage, "right-corrupt", vec![(key, value)], Vec::new())
+            .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("identity-only read should open");
+        let error = tracked_state
+            .reader(read)
+            .diff_commits(
+                "source",
+                "right-corrupt",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect_err("tree value must agree with its authenticated packed delta row");
+        assert!(
+            error.message.contains("does not match commit")
+                && error.message.contains("delta index"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -3645,6 +3996,98 @@ mod tests {
             .await
             .expect("right root should write");
         (storage, tracked_state)
+    }
+
+    async fn seed_fingerprinted_roots(
+        left_rows: &[MaterializedTrackedStateRow],
+        left_has_fingerprints: bool,
+        right_rows: &[MaterializedTrackedStateRow],
+        right_has_fingerprints: bool,
+    ) -> (StorageAdapter, TrackedStateContext) {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_with_semantic_fingerprints_for_test(
+            &storage,
+            &tracked_state,
+            "left",
+            left_rows,
+            left_has_fingerprints,
+        )
+        .await
+        .expect("left fingerprinted test root should write");
+        write_root_with_semantic_fingerprints_for_test(
+            &storage,
+            &tracked_state,
+            "right",
+            right_rows,
+            right_has_fingerprints,
+        )
+        .await
+        .expect("right fingerprinted test root should write");
+        (storage, tracked_state)
+    }
+
+    async fn diff_identity_only(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+    ) -> TrackedStateDiff {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("identity-only read should open");
+        tracked_state
+            .reader(read)
+            .diff_commits(
+                "left",
+                "right",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("identity-only diff should load")
+    }
+
+    async fn write_root_with_semantic_fingerprints_for_test(
+        storage: &StorageAdapter,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+        rows: &[MaterializedTrackedStateRow],
+        with_fingerprints: bool,
+    ) -> Result<(), LixError> {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("root fixture read should open");
+        let mut writes = storage.new_write_set();
+        if with_fingerprints {
+            crate::test_support::stage_tracked_root_from_materialized_with_semantic_fingerprints(
+                &mut read,
+                &mut writes,
+                tracked_state,
+                commit_id,
+                None,
+                rows,
+            )
+            .await?;
+        } else {
+            crate::test_support::stage_tracked_root_from_materialized(
+                &mut read,
+                &mut writes,
+                tracked_state,
+                commit_id,
+                None,
+                rows,
+            )
+            .await?;
+        }
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fingerprint root fixture should commit");
+        Ok(())
     }
 
     async fn seed_parent_child_delta(

@@ -31,12 +31,10 @@ mod contract;
 mod current_coverage;
 mod http;
 mod native_dependencies;
-mod read_fulfillment;
-#[cfg(feature = "server-protocol")]
-pub(crate) use read_fulfillment::MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES;
-mod read_interest_prepare;
 pub(crate) mod native_metadata;
 mod native_metadata_walk;
+mod read_fulfillment;
+mod read_interest_prepare;
 #[cfg(feature = "server-protocol")]
 pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
 pub(crate) use native_metadata::NativeMetadataRequest;
@@ -86,6 +84,7 @@ pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
 pub(crate) use partial_interest_journal::{
     PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
+    validate_partial_read_interest_journal,
 };
 mod leased_descriptor;
 mod partial_replica;
@@ -117,9 +116,9 @@ pub(crate) use partial_replica::PARTIAL_REPLICA_DESCRIPTOR_VERSION;
 pub(crate) use partial_replica::PartialReplicaDescriptor;
 mod protocol;
 mod recovery;
-mod repository;
 #[cfg(feature = "server-protocol")]
 mod replica_retirement;
+mod repository;
 pub use recovery::{
     ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
     ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
@@ -169,27 +168,29 @@ pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead,
     SyncCheckpointInventoryPage, SyncCommitHeader, SyncEvent, SyncHistoryBoundary,
+    SyncFirstParentCheckpointSummary,
     SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
     SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
+};
+pub(crate) use read_fulfillment::{
+    MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES, ReadFulfillmentRequest,
+    ReadFulfillmentResponse, annotate_capture as annotate_read_fulfillment_capture,
+    discover as discover_read_fulfillment,
 };
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
 pub(crate) use repository::{
-    AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE, SYNC_REPLICA_RETIREMENT_SPACE,
-    SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE, authority_state_key,
-    load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
-    replica_state_key, stage_repository_transaction_event, stage_sync_restore_intents,
+    AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_RETIREMENT_SPACE,
+    SYNC_REPLICA_STATE_SPACE, SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE,
+    authority_state_key, load_pending_sync_export_commit_ids,
+    load_replayable_repository_event_commit_ids, replica_state_key,
+    stage_repository_transaction_event, stage_sync_restore_intents,
     validate_repository_transaction_event_transfer,
 };
 pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
     replica_repository_identity,
-};
-pub(crate) use read_fulfillment::{
-    ReadFulfillmentRequest, ReadFulfillmentResponse,
-    annotate_capture as annotate_read_fulfillment_capture,
-    discover as discover_read_fulfillment,
 };
 pub(crate) use runtime::{HydratedInputs, SyncDemand, SyncDemandRetry, SyncRuntime};
 pub(crate) use upload_plan::{
@@ -212,7 +213,10 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v19 attaches bounded authenticated native dependencies to exact metadata.
 // v20 adds operation-level read fulfillment for bounded typed dependency discovery.
 // v21 requires v2 native baseline leases, which v20 clients cannot renew.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 22;
+// v22 adds explicit filesystem path-index scopes to read-fulfillment recipes.
+// v24 carries authenticated semantic fingerprints in commit and snapshot rows;
+// older peers cannot reconstruct the resulting tracked-state root IDs.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 24;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -453,9 +457,7 @@ pub(crate) use bootstrap::durable_memory_for_test;
 mod partial_write_frontier;
 
 mod partial_candidate_prepare;
-pub(crate) use partial_candidate_prepare::{
-    PreparedCandidateState, prepare_candidate_state,
-};
+pub(crate) use partial_candidate_prepare::{PreparedCandidateState, prepare_candidate_state};
 
 mod pending_conversion;
 pub(crate) use pending_conversion::{

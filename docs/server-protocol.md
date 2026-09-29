@@ -93,7 +93,7 @@ Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected part
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are 64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 21` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
+All sync routes require exactly one `lix-sync-protocol-version: 24` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
 
 Bootstrap installs checkpoint headers alongside current branch heads and working bases. Historical checkpoint state remains deferred until an explicit history or snapshot read requests it; bootstrap does not scan every checkpoint state or fetch its binary content.
 
@@ -101,7 +101,7 @@ The live pull protocol has one repository cursor. It has no schema or branch fil
 
 ### Partial replica with on-demand sync
 
-Sync protocol 21 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
+Sync protocol 24 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
 
 The exact partial-attempt restart request accepts `abandon: true`. Lix uses this during automatic recovery to fence an unsupported active merge before adopting the server working set. An already committed merge receipt wins; otherwise the authority durably prevents delayed requests from reviving the abandoned attempt. Ordinary restarts omit this field and still require expiry.
 
@@ -167,7 +167,9 @@ To run a server, see [Hosting](./hosting.md).
 
 ### Typed sync rows
 
-Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding.
+Every live sync member and snapshot row includes `snapshotPayload`, a base64-encoded typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify the typed encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Rows without a semantic fingerprint use the canonical Schema v1 wire encoding; v24 proof-bearing rows may carry their stored typed payload encoding, including the built-in compressed form.
+
+Sync protocol v24 also carries `semanticFingerprint` on authored live members and exported live snapshot rows. It hashes a canonical typed-row encoding (including schema fingerprint, primary key, and typed values) and canonical metadata. Different durable encodings of the same typed row therefore share a fingerprint, while SQL NULL and JSON null remain distinct. Authored commit-delta leaves retain the proof; tracked roots retain row identity without it. Receivers verify any present fingerprint before import. Protocol v23 peers are rejected at the handshake because they do not understand the proof-bearing wire semantics.
 
 ## Reference-host provisioning
 

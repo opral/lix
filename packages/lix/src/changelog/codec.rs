@@ -163,6 +163,7 @@ mod tests {
         let base_commit_id = CommitId::for_test_label("codec-segment-base");
         let record = CommitRecord {
             is_checkpoint: true,
+            first_parent_checkpoint_summary: None,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             base_commit_id: None,

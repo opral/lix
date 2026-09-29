@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn only_explicit_archives_suspend_whole_recipes() {
         let recipe = |branches: &[&str]| LogicalReadInterest::FilesystemPaths {
-            file_ids: None,
+            scope: crate::filesystem::FilesystemPathIndexScope::All,
             branch_ids: branches.iter().map(|branch| (*branch).to_owned()).collect(),
             include_blob_refs: false,
             cache_small_blob_data: false,

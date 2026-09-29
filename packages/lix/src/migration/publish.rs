@@ -12,7 +12,7 @@ use crate::storage_adapter::{
 
 /// Fully preflighted physical mutations. Construction stays private so the
 /// executor cannot publish a partially validated migration.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct PublicationPlan {
     replacements: Vec<(StorageSpace, PutBatch)>,
     mutable_puts: Vec<(StorageSpace, PutBatch)>,

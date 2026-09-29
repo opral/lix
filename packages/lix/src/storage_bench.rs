@@ -1708,6 +1708,7 @@ where
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
             is_checkpoint: false,
+            first_parent_checkpoint_summary: None,
             // A realistic full-width digest, not `absent()`. Every commit-topology
             // consumer pays for this field whether or not it benefits, and
             // merge-base is the guard for exactly that cost — an `absent()`
@@ -2036,6 +2037,7 @@ where
                     deleted: false,
                     created_at,
                     updated_at: created_at,
+                    semantic_fingerprint: None,
                 },
                 snapshot: Some(snapshot.as_ref()),
                 metadata: None,

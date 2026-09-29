@@ -18,7 +18,7 @@ mod plan;
 mod planning_cache;
 mod providers;
 #[cfg(test)]
-pub(crate) use providers::take_mainline_work;
+pub(crate) use providers::{take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work};
 #[cfg(test)]
 pub(crate) use providers::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
 mod read_only;

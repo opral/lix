@@ -181,9 +181,10 @@ mod tests {
     /// Against the non-test build (`cargo check -p lix --all-features`), the
     /// only writers are:
     ///
-    /// * `changelog/context.rs` x2 -- `stage_transaction_append` and
-    ///   `stage_append_records`. **This is the choke point.** Its only
-    ///   production caller is `transaction/commit.rs`.
+    /// * `changelog/context.rs` x3 -- `stage_transaction_append`,
+    ///   `stage_append_records`, and proof-only summary enrichment. The first
+    ///   two create descriptors; sync import also uses the sparse append and
+    ///   proof-only enrichment paths.
     /// * `changelog/gc.rs` `.delete(` -- reclamation, which removes commit
     ///   records and never introduces a name.
     ///
@@ -250,8 +251,10 @@ mod tests {
         }
 
         let expected: std::collections::BTreeMap<String, usize> = [
-            // Production. The choke point every commit record enters through.
-            ("changelog/context.rs .stage(", 2),
+            // Production. Two calls create commit records; the third only
+            // monotonically enriches a locally proven summary without changing
+            // topology or identity, so the persisted path index is unaffected.
+            ("changelog/context.rs .stage(", 3),
             // Production. Reclamation only: removes records, introduces no name.
             ("changelog/gc.rs .delete(", 1),
             // Production. The v74->v75 offline migration rewrites every v5

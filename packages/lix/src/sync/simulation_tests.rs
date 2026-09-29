@@ -6,14 +6,14 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::engine::Engine;
 use crate::storage::Memory;
 use crate::support::fuzz_seeds;
 use crate::support::simulation_test::engine::{Simulation, SimulationMode, SimulationOptions};
-use crate::{ExecuteBatchStatement, Lix, LixError, Value, open_lix};
+use crate::{open_lix, ExecuteBatchStatement, Lix, LixError, Value};
 
 use super::runtime::{
     fetch_repository_snapshot, hydrate_error_for_test, register_blob_manifests, sync_iteration,
@@ -2136,6 +2136,12 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
             .collect::<Vec<_>>(),
         vec![first.clone()]
     );
+    assert!(
+        page.commit_headers[0]
+            .first_parent_checkpoint_summary
+            .is_none(),
+        "sparse inventory cannot certify an ancestry summary"
+    );
     let page2 = authority
         .sync_checkpoint_inventory(cursor, page.continuation.as_deref(), 1)
         .await
@@ -2149,18 +2155,22 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
         vec![abandoned.clone()]
     );
     assert!(page2.continuation.is_none());
+    assert!(
+        page2.commit_headers[0]
+            .first_parent_checkpoint_summary
+            .is_none(),
+        "a checkpoint inventory page must downgrade summaries without ancestry closure"
+    );
     let transport = AuthorityTransport::connected(authority.clone());
     transport
         .script
         .invalidate_inventory_once
         .store(true, Ordering::SeqCst);
     let replica = Replica::bootstrap(transport.clone()).await;
-    assert!(
-        !transport
-            .script
-            .invalidate_inventory_once
-            .load(Ordering::SeqCst)
-    );
+    assert!(!transport
+        .script
+        .invalidate_inventory_once
+        .load(Ordering::SeqCst));
     let flags = replica
         .lix
         .execute(
@@ -2188,6 +2198,30 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
             .await
             .unwrap()
             .is_none()
+    );
+    use crate::changelog::ChangelogReader as _;
+    let mut changelog = crate::changelog::ChangelogContext::new().reader(&read);
+    let commit_ids = [abandoned_id];
+    let records = changelog
+        .load_commits(crate::changelog::CommitLoadRequest {
+            commit_ids: &commit_ids,
+        })
+        .await
+        .unwrap();
+    let record = records
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .expect("sparse checkpoint record should remain present");
+    assert_eq!(
+        record.first_parent_checkpoint_summary,
+        Some(crate::changelog::FirstParentCheckpointSummary {
+            previous_checkpoint_id: Some(
+                crate::changelog::CommitId::parse_lix(&first, "first checkpoint").unwrap(),
+            ),
+            first_parent_distance: 1,
+        }),
+        "bootstrap may derive a direct checkpoint parent from locally present inventory records",
     );
     drop(read);
     let query = format!(
@@ -2222,6 +2256,426 @@ fn checkpoint_inventory_bootstrap_preserves_abandoned_state_base() {
             "::checkpoint_inventory_bootstrap_preserves_abandoned_state"
         ),
         checkpoint_inventory_bootstrap_preserves_abandoned_state,
+    );
+}
+
+#[test]
+fn ordinary_history_gap_uses_bounded_checkpoint_log_base() {
+    run_sync_simulation(
+        concat!(
+            module_path!(),
+            "::ordinary_history_gap_uses_bounded_checkpoint_log"
+        ),
+        ordinary_history_gap_uses_bounded_checkpoint_log,
+    );
+}
+
+async fn ordinary_history_gap_uses_bounded_checkpoint_log(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    let session_engine = Engine::new_with_adapter(
+        authority.storage_adapter(),
+        crate::engine::EngineOptions::new(),
+    )
+    .await
+    .expect("authority session engine should open");
+    let branch_id = authority
+        .active_branch_id()
+        .await
+        .expect("authority main branch should resolve");
+    let session = session_engine
+        .open_session_at(branch_id)
+        .await
+        .expect("persistent authority main-branch session should open");
+    let first_checkpoint = session
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('hydrate-summary-seed', 'present')",
+            &[],
+        )
+        .await
+        .expect("second checkpoint seed row should commit");
+    let second_checkpoint = session
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    let ordinary_count_before = session
+        .execute(
+            "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = false",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("n")
+        .unwrap();
+    for generation in 0..40 {
+        // Restoring between two distinct checkpoint states creates an actual
+        // ordinary first-parent node on every iteration. Ordinary table
+        // writes are represented by the next checkpoint's snapshot and do
+        // not reliably preserve one graph node apiece in this fixture.
+        let target = if generation % 2 == 0 {
+            &first_checkpoint
+        } else {
+            &second_checkpoint
+        };
+        session
+            .execute(
+                "SELECT commit_id FROM lix_restore($1)",
+                &[Value::Text(target.clone())],
+            )
+            .await
+            .expect("alternating restore should create an ordinary commit");
+    }
+    let ordinary_count_after = session
+        .execute(
+            "SELECT count(*) AS n FROM lix_log() WHERE is_checkpoint = false",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("n")
+        .unwrap();
+    assert_eq!(
+        ordinary_count_after - ordinary_count_before,
+        40,
+        "each alternating restore must add a visible non-checkpoint mainline node",
+    );
+    let head = session
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .expect("active branch head should decode");
+    let head_id = crate::changelog::CommitId::parse_lix(&head, "ordinary history head").unwrap();
+    {
+        let adapter = authority.storage_adapter();
+        let read = adapter
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .unwrap();
+        use crate::changelog::ChangelogReader as _;
+        let ids = [head_id];
+        let source = crate::changelog::ChangelogContext::new()
+            .reader(&read)
+            .load_commits(crate::changelog::CommitLoadRequest { commit_ids: &ids })
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("source checkpoint record should be present");
+        assert_eq!(
+            source.first_parent_checkpoint_summary,
+            Some(crate::changelog::FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(
+                    crate::changelog::CommitId::parse_lix(
+                        &second_checkpoint,
+                        "previous checkpoint",
+                    )
+                    .unwrap(),
+                ),
+                first_parent_distance: 40,
+            }),
+            "the ordinary head must retain the full forty-commit first-parent gap",
+        );
+    }
+
+    let fast_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                    FROM lix_log() WHERE is_checkpoint ORDER BY position ASC";
+    let scan_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                    FROM lix_log() WHERE is_checkpoint OR commit_id = '' ORDER BY position ASC";
+    crate::sql2::take_mainline_work();
+    let fast = session
+        .execute(fast_sql, &[])
+        .await
+        .expect("ordinary-head checkpoint log should use summaries");
+    let (fast_graph_reads, _) = crate::sql2::take_mainline_work();
+    crate::sql2::take_mainline_work();
+    let scan = session
+        .execute(scan_sql, &[])
+        .await
+        .expect("ordinary-head log scan should remain the correctness oracle");
+    let (scan_graph_reads, _) = crate::sql2::take_mainline_work();
+    assert_eq!(fast.rows(), scan.rows());
+    assert!(
+        fast_graph_reads < scan_graph_reads,
+        "forty-commit summary traversal should be bounded ({fast_graph_reads} reads) versus scan ({scan_graph_reads} reads)",
+    );
+    session
+        .close()
+        .await
+        .expect("authority session should close");
+    drop(session_engine);
+}
+
+#[test]
+fn inventory_then_hydrate_enriches_ordinary_history_summary_base() {
+    run_sync_simulation(
+        concat!(
+            module_path!(),
+            "::inventory_then_hydrate_enriches_ordinary_history_summary"
+        ),
+        inventory_then_hydrate_enriches_ordinary_history_summary,
+    );
+}
+
+async fn inventory_then_hydrate_enriches_ordinary_history_summary(_sim: Simulation) {
+    let authority = fresh_authority().await;
+    let first_checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
+    let transport = AuthorityTransport::connected(authority.clone());
+    let replica = Replica::bootstrap(transport).await;
+    let session_engine = Engine::new_with_adapter(
+        authority.storage_adapter(),
+        crate::engine::EngineOptions::new(),
+    )
+    .await
+    .expect("authority session engine should open");
+    let branch_id = authority
+        .active_branch_id()
+        .await
+        .expect("authority main branch should resolve");
+    let session = session_engine
+        .open_session_at(branch_id)
+        .await
+        .expect("persistent authority main-branch session should open");
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('hydrate-summary-seed', 'present')",
+            &[],
+        )
+        .await
+        .expect("second checkpoint seed row should commit");
+    let second_checkpoint = session
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    for generation in 0..40 {
+        let target = if generation % 2 == 0 {
+            &first_checkpoint
+        } else {
+            &second_checkpoint
+        };
+        session
+            .execute(
+                "SELECT commit_id FROM lix_restore($1)",
+                &[Value::Text(target.clone())],
+            )
+            .await
+            .expect("alternating restore should create an ordinary commit");
+    }
+    let target_head = session
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+    let target_id =
+        crate::changelog::CommitId::parse_lix(&target_head, "ordinary history head").unwrap();
+    {
+        let adapter = authority.storage_adapter();
+        let read = adapter
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .unwrap();
+        use crate::changelog::ChangelogReader as _;
+        let ids = [target_id];
+        let source = crate::changelog::ChangelogContext::new()
+            .reader(&read)
+            .load_commits(crate::changelog::CommitLoadRequest { commit_ids: &ids })
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("source ordinary head record should be present");
+        assert_eq!(
+            source.first_parent_checkpoint_summary,
+            Some(crate::changelog::FirstParentCheckpointSummary {
+                previous_checkpoint_id: Some(
+                    crate::changelog::CommitId::parse_lix(
+                        &second_checkpoint,
+                        "previous checkpoint",
+                    )
+                    .unwrap(),
+                ),
+                first_parent_distance: 40,
+            }),
+            "source ordinary head must preserve the forty-commit gap",
+        );
+    }
+
+    let sparse_history = authority
+        .sync_history(&target_head, 1)
+        .await
+        .expect("bounded history page should load a sparse header closure");
+    let mut sparse_headers = sparse_history.commit_headers.clone();
+    let sparse_target = sparse_headers
+        .iter_mut()
+        .find(|header| header.commit_id == target_head)
+        .expect("sparse page should include target header");
+    assert!(sparse_target.first_parent_checkpoint_summary.is_some());
+    sparse_target.first_parent_checkpoint_summary = None;
+    replica
+        .lix
+        .import_sync_history_headers(&sparse_headers)
+        .await
+        .expect("sparse ordinary-head headers should import without trusting summary hints");
+    let adapter = replica.lix.storage_adapter();
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    use crate::changelog::ChangelogReader as _;
+    let ids = [target_id];
+    let sparse = crate::changelog::ChangelogContext::new()
+        .reader(&read)
+        .load_commits(crate::changelog::CommitLoadRequest { commit_ids: &ids })
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .expect("sparse ordinary-head record should be present");
+    assert_eq!(sparse.first_parent_checkpoint_summary, None);
+    drop(read);
+
+    let history = authority
+        .sync_history(&target_head, 64)
+        .await
+        .expect("full ordinary-head history should load with its ancestry proof");
+    let mut boundary_rows = Vec::new();
+    for boundary in &history.boundaries {
+        let mut continuation = None;
+        loop {
+            let page = authority
+                .pull_sync_snapshot_rows(
+                    &boundary.commit_id,
+                    &boundary.commit_id,
+                    continuation.as_deref(),
+                    super::MAX_SYNC_REQUEST_ITEMS,
+                )
+                .await
+                .expect("checkpoint history boundary rows should load");
+            boundary_rows.extend(page.rows);
+            let Some(next) = page.continuation else {
+                break;
+            };
+            continuation = Some(next);
+        }
+    }
+    let (first_import, racing_import) = tokio::join!(
+        replica
+            .lix
+            .import_sync_history_headers(&history.commit_headers),
+        replica
+            .lix
+            .import_sync_history_headers(&history.commit_headers),
+    );
+    first_import.expect("complete history headers should locally prove summary enrichment");
+    racing_import.expect("racing identical header import should retry idempotently");
+    replica
+        .lix
+        .import_sync_history_boundaries(&history.commits, &history.boundaries, &boundary_rows)
+        .await
+        .expect("ordinary history bodies should hydrate");
+
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    let enriched = crate::changelog::ChangelogContext::new()
+        .reader(&read)
+        .load_commits(crate::changelog::CommitLoadRequest { commit_ids: &ids })
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .expect("hydrated ordinary-head record should remain present");
+    assert_eq!(
+        enriched.first_parent_checkpoint_summary,
+        Some(crate::changelog::FirstParentCheckpointSummary {
+            previous_checkpoint_id: Some(
+                crate::changelog::CommitId::parse_lix(&second_checkpoint, "previous checkpoint",)
+                    .unwrap(),
+            ),
+            first_parent_distance: 40,
+        }),
+        "hydrating a complete first-parent chain should monotonically enrich sparse metadata",
+    );
+    drop(read);
+
+    // A new descendant must derive from the enriched ordinary-head row.
+    reset_branch_for_test(&replica.lix, &target_head).await;
+    write_key_value(&replica.lix, "hydrate-summary-descendant", "present").await;
+    let descendant_commit = current_branch_head(&replica.lix).await;
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions::default())
+        .await
+        .unwrap();
+    let descendant_id =
+        [crate::changelog::CommitId::parse_lix(&descendant_commit, "descendant commit").unwrap()];
+    let descendant = crate::changelog::ChangelogContext::new()
+        .reader(&read)
+        .load_commits(crate::changelog::CommitLoadRequest {
+            commit_ids: &descendant_id,
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|(_, record)| record)
+        .expect("new descendant record should be present");
+    assert_eq!(
+        descendant.first_parent_checkpoint_summary,
+        Some(crate::changelog::FirstParentCheckpointSummary {
+            previous_checkpoint_id: Some(
+                crate::changelog::CommitId::parse_lix(&second_checkpoint, "previous checkpoint")
+                    .unwrap(),
+            ),
+            first_parent_distance: 41,
+        }),
+        "the new descendant should inherit the enriched summary from its ordinary parent",
+    );
+    drop(read);
+
+    let fast_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                    FROM lix_log() WHERE is_checkpoint ORDER BY position ASC";
+    let scan_sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position \
+                    FROM lix_log() WHERE is_checkpoint OR commit_id = '' ORDER BY position ASC";
+    crate::sql2::take_mainline_work();
+    let fast = replica
+        .lix
+        .execute(fast_sql, &[])
+        .await
+        .expect("hydrated ordinary-head log should use its summary");
+    let (fast_graph_reads, _) = crate::sql2::take_mainline_work();
+    crate::sql2::take_mainline_work();
+    let scan = replica
+        .lix
+        .execute(scan_sql, &[])
+        .await
+        .expect("ordinary log scan should remain the correctness oracle");
+    let (scan_graph_reads, _) = crate::sql2::take_mainline_work();
+    assert_eq!(fast.rows(), scan.rows());
+    assert!(
+        fast_graph_reads < scan_graph_reads,
+        "summary traversal should be bounded ({fast_graph_reads} reads) versus ancestry scan ({scan_graph_reads} reads)",
     );
 }
 
