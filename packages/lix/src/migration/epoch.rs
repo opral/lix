@@ -1475,6 +1475,15 @@ pub(super) async fn append_partial_serving_source_plan(
     Ok(())
 }
 
+pub(super) async fn restore_missing_partial_serving_witnesses<S>(
+    adapter: &StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    crate::sync::partial_serving::migrate_missing(adapter).await
+}
+
 /// Verify the candidate contains the exact witnesses derived from the source
 /// and include those bytes in the expected preservation digest.
 async fn append_partial_serving_preservation<S>(

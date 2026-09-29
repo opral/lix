@@ -302,7 +302,7 @@ where
     };
     let admission = super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
     if before.role == RepositoryRole::PartialReplica {
-        crate::sync::partial_serving::migrate_missing(&admission.adapter).await?;
+        super::epoch::restore_missing_partial_serving_witnesses(&admission.adapter).await?;
     }
     if before.role == RepositoryRole::Authority {
         super::authority_baseline_fence::upgrade_authority_native_baseline_fence(storage).await?;
