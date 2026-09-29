@@ -1629,7 +1629,7 @@ mod tests {
     use super::super::SyncTransportFuture;
     use super::super::http::{RawHttpRequest, RawHttpResponse};
     use super::super::native_metadata::NativeMetadataResponse;
-    use super::super::partial_state::stage_partial_replica_state;
+    use super::super::partial_bootstrap::stage_partial_bootstrap;
     use super::*;
     use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
@@ -2337,13 +2337,16 @@ mod tests {
             .bind_native_baseline_lease(state.baseline_lease())
             .unwrap();
         let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();
-        let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
         storage
             .commit_write_set(
                 writes,
                 StorageWriteOptions {
-                    preconditions: vec![guard],
+                    preconditions,
                     ..Default::default()
                 },
             )

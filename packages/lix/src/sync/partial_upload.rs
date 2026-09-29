@@ -461,6 +461,30 @@ async fn prepare_partial_ordinary_upload_inner(
 }
 
 #[cfg(test)]
+async fn seed_upload_receipt_fixture<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+    writes: crate::storage_adapter::StorageWriteSet,
+    guards: Vec<StoragePrecondition>,
+)
+where
+    S: crate::storage_adapter::Storage,
+{
+    use crate::storage::StorageWrite as _;
+
+    // These upload unit tests graft synthetic partial bookkeeping onto a
+    // native authority store. They do not construct a serving replica.
+    let mut write = adapter
+        .begin_migration_write(crate::storage_adapter::StorageWriteOptions {
+            preconditions: guards,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    writes.lower_into(&mut write).await.unwrap();
+    write.commit().await.unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
@@ -497,17 +521,7 @@ mod tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap(),
         );
-        adapter
-            .commit_partial_replica_write_set(
-                super::super::partial_replica_write_capability(),
-                writes,
-                crate::storage_adapter::StorageWriteOptions {
-                    preconditions: guards,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        seed_upload_receipt_fixture(&adapter, writes, guards).await;
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let attempt = "00000000-0000-7000-8000-000000002002";
         let prepared =
@@ -759,17 +773,7 @@ mod paging_and_resume_tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap(),
         );
-        storage
-            .commit_partial_replica_write_set(
-                super::super::partial_replica_write_capability(),
-                writes,
-                StorageWriteOptions {
-                    preconditions: guards,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        seed_upload_receipt_fixture(&storage, writes, guards).await;
         confirm_global(
             &storage,
             &state,
@@ -909,17 +913,7 @@ mod created_ref_prefix_tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap(),
         );
-        storage
-            .commit_partial_replica_write_set(
-                super::super::partial_replica_write_capability(),
-                writes,
-                crate::storage_adapter::StorageWriteOptions {
-                    preconditions: guards,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        seed_upload_receipt_fixture(&storage, writes, guards).await;
         let read = storage.begin_read(Default::default()).await.unwrap();
         let prefix = prepare_partial_ordinary_upload(
             &read,
@@ -1286,17 +1280,7 @@ mod confirmed_global_base_tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
                 .unwrap(),
         );
-        storage
-            .commit_partial_replica_write_set(
-                super::super::partial_replica_write_capability(),
-                writes,
-                StorageWriteOptions {
-                    preconditions: guards,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        seed_upload_receipt_fixture(&storage, writes, guards).await;
         let read = storage.begin_read(Default::default()).await.unwrap();
         let global = prepare_partial_ordinary_upload(
             &read,

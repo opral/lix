@@ -91,6 +91,7 @@ pub(crate) fn stage_partial_bootstrap(
         controls.push((branch.branch_id.as_str(), control));
     }
     preconditions.push(stage_partial_replica_state(writes, state, None)?);
+    writes.authorize_partial_bootstrap(super::partial_replica_write_capability());
     // This fresh local token identifies the fixed baseline's catalog; it does
     // not certify catalog coverage. Compilation still completes its native
     // scans before caching. Local schema commits rotate it atomically. Any
@@ -260,14 +261,17 @@ mod tests {
                 bytes: Bytes::from(vec![7u8; 16]),
             },
         );
-        adapter
-            .commit_partial_replica_write_set(
-                super::super::partial_replica_write_capability(),
-                corrupt,
-                Default::default(),
-            )
+        // Deliberately corrupt an already-admitted root to prove that opening
+        // rejects persisted inconsistency. The public adapter guard correctly
+        // prevents creating this invalid state through normal writes.
+        use crate::storage::{Storage as _, StorageWrite as _, WriteOptions};
+        let mut raw = adapter
+            .storage()
+            .begin_write(WriteOptions::default())
             .await
             .unwrap();
+        corrupt.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
         let opened = crate::engine::Engine::new_partial_replica(
             adapter,
             crate::engine::EngineOptions::new(),

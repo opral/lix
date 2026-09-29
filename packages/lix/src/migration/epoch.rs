@@ -1457,6 +1457,67 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
+/// Add the exact source-derived serving records to a migration digest plan.
+/// Missing legacy witnesses are derived by the same validator used by live
+/// partial writes; existing witnesses must already match their coordinates.
+pub(super) async fn append_partial_serving_source_plan(
+    source_read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    plan: &mut super::publish::PublicationPlan,
+) -> Result<(), LixError> {
+    let entries = crate::sync::partial_serving::preservation_entries(source_read).await?;
+    plan.put_mutable(
+        crate::sync::partial_serving::PARTIAL_SERVING_SPACE,
+        entries
+            .into_iter()
+            .map(|(_, key, bytes)| (key, bytes))
+            .collect(),
+    )?;
+    Ok(())
+}
+
+pub(super) async fn restore_missing_partial_serving_witnesses<S>(
+    adapter: &StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    crate::sync::partial_serving::migrate_missing(adapter).await
+}
+
+/// Verify the candidate contains the exact witnesses derived from the source
+/// and include those bytes in the expected preservation digest.
+async fn append_partial_serving_preservation<S>(
+    source_read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    target: &StorageAdapter<S>,
+    plan: &mut super::publish::PublicationPlan,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let entries = crate::sync::partial_serving::preservation_entries(source_read).await?;
+    let target_read = target.begin_read(ReadOptions::default()).await?;
+    for (branch_id, _, expected_bytes) in &entries {
+        let Some((_, target_bytes)) =
+            crate::sync::partial_serving::load(&target_read, branch_id).await?
+        else {
+            return Err(epoch_error("partial migration candidate witness is absent"));
+        };
+        if target_bytes.as_ref() != expected_bytes.as_slice() {
+            return Err(epoch_error(
+                "partial migration candidate witness disagrees with source-derived coordinates",
+            ));
+        }
+    }
+    plan.put_mutable(
+        crate::sync::partial_serving::PARTIAL_SERVING_SPACE,
+        entries
+            .into_iter()
+            .map(|(_, key, bytes)| (key, bytes))
+            .collect(),
+    )?;
+    Ok(())
+}
+
 /// Preservation checks run while the source is still the active rollback
 /// destination. Any failure rolls back the epoch claim before opening returns.
 async fn verify_migration_candidate<S>(
@@ -1516,6 +1577,19 @@ where
                         crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
                     )],
                 )?;
+            }
+            if partial {
+                append_partial_serving_preservation(
+                    &read,
+                    target,
+                    plan.get_or_insert_with(|| {
+                        super::publish::PublicationPlan::bounded(
+                            options.max_changes,
+                            options.max_preflight_bytes,
+                        )
+                    }),
+                )
+                .await?;
             }
             drop(read);
             if from_format <= 81 {
@@ -1827,15 +1901,12 @@ where
     {
         return Ok(());
     }
-    let legacy = StorageAdapter::new(storage.clone());
     for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
         .iter()
         .copied()
     {
-        legacy
-            .clear_space(
-                space,
-                WriteOptions {
+        let mut write = storage
+            .begin_write(WriteOptions {
                     await_durable: true,
                     preconditions: vec![Precondition::KeyValueEquals {
                         space: REPOSITORY_EPOCH_SPACE,
@@ -1843,10 +1914,20 @@ where
                         expected: active_pointer.clone(),
                     }],
                     ..WriteOptions::default()
+                })
+            .await
+            .map_err(storage_error)?;
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
                 },
             )
             .await
             .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
     }
     let mut write = storage
         .begin_write(WriteOptions {

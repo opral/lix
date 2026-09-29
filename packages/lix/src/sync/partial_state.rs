@@ -410,8 +410,22 @@ pub(super) fn stage_partial_replica_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageWrite;
     use crate::storage_adapter::{StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::{Memory, open_lix};
+
+    async fn commit_raw_fixture(
+        adapter: &StorageAdapter<Memory>,
+        writes: StorageWriteSet,
+        options: StorageWriteOptions,
+    ) -> Result<(), ()> {
+        let mut raw = adapter
+            .begin_migration_write(options)
+            .await
+            .map_err(|_| ())?;
+        writes.lower_into(&mut raw).await.map_err(|_| ())?;
+        raw.commit().await.map(|_| ()).map_err(|_| ())
+    }
 
     async fn state() -> PartialReplicaState {
         let authority = open_lix().await.unwrap();
@@ -463,8 +477,7 @@ mod tests {
                 partial_replica_state_key(),
                 bytes,
             );
-            adapter
-                .commit_write_set(writes, Default::default())
+            commit_raw_fixture(&adapter, writes, Default::default())
                 .await
                 .unwrap();
             let read = adapter.begin_read(Default::default()).await.unwrap();
@@ -487,17 +500,17 @@ mod tests {
         let adapter = StorageAdapter::new(Memory::new());
         let mut writes = adapter.new_write_set();
         let precondition = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![precondition],
-                    await_durable: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        commit_raw_fixture(
+            &adapter,
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![precondition],
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let read = adapter
             .begin_read(StorageReadOptions::default())
             .await
@@ -510,16 +523,16 @@ mod tests {
         let mut conflicting = adapter.new_write_set();
         let precondition = stage_partial_replica_state(&mut conflicting, &state, None).unwrap();
         assert!(
-            adapter
-                .commit_write_set(
-                    conflicting,
-                    StorageWriteOptions {
-                        preconditions: vec![precondition],
-                        ..Default::default()
-                    }
-                )
-                .await
-                .is_err()
+            commit_raw_fixture(
+                &adapter,
+                conflicting,
+                StorageWriteOptions {
+                    preconditions: vec![precondition],
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -548,8 +561,7 @@ mod tests {
                 bytes: serde_json::to_vec(&state).unwrap().into(),
             },
         );
-        adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
+        commit_raw_fixture(&adapter, writes, StorageWriteOptions::default())
             .await
             .unwrap();
         let read = adapter
@@ -581,6 +593,10 @@ struct PartialReplicaStateV1 {
 /// Owned epoch opening upgrades only bounded admission/upload metadata.
 /// Local controls and native data remain intact; pending attempts preserve
 /// their exact previously prepared wire requests without authority access.
+/// This uses the raw migration writer because a legacy receipt cannot pass the
+/// current partial-serving validator until its format has been upgraded. The
+/// detached candidate derives and validates its serving witness before it can
+/// be activated.
 pub(crate) async fn upgrade_owned_partial_receipt<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
 ) -> Result<Option<PartialReplicaState>, LixError>
@@ -601,8 +617,7 @@ where
     drop(read);
     if !writes.is_empty() {
         adapter
-            .commit_partial_replica_write_set(
-                super::partial_replica_write_capability(),
+            .commit_migration_write_set(
                 writes,
                 crate::storage_adapter::StorageWriteOptions {
                     await_durable: true,

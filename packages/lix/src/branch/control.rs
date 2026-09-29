@@ -420,6 +420,20 @@ fn encode_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     )
 }
 
+pub(crate) fn branch_head_control_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
+    encode_key(branch_id)
+}
+
+pub(crate) fn staged_branch_head_control(
+    writes: &StorageWriteSet,
+    branch_id: &str,
+) -> Result<Option<BranchHeadControl>, LixError> {
+    writes
+        .staged_value(BRANCH_HEAD_CONTROL_SPACE, &encode_key(branch_id)?)
+        .map(|bytes| decode_control(branch_id, &bytes))
+        .transpose()
+}
+
 fn encode_control(branch_id: &str, control: &BranchHeadControl) -> Result<Vec<u8>, LixError> {
     let payload = storage_codec::encode("branch-head control", control)?;
     let mut encoded = Vec::with_capacity(
@@ -607,6 +621,7 @@ fn decode_projected_value(
 #[cfg(test)]
 mod tests {
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::StorageWrite as _;
 
     use super::*;
 
@@ -667,10 +682,9 @@ mod tests {
             BRANCH_HEAD_CONTROL_SPACE,
             StorageKey(Bytes::from(encode_key(&existing.id).unwrap())),
         );
-        storage
-            .commit_write_set(writes, Default::default())
-            .await
-            .unwrap();
+        let mut write = storage.begin_migration_write(Default::default()).await.unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
         let read = storage.begin_read(Default::default()).await.unwrap();
         let reader = BranchHeadControlContext::new().reader(&read);
         let fresh = "00000000-0000-7000-8000-000000000098";
@@ -710,10 +724,9 @@ mod tests {
             crate::sync::partial_replica_state_key(),
             serde_json::to_vec(&state).unwrap(),
         );
-        storage
-            .commit_write_set(writes, Default::default())
-            .await
-            .unwrap();
+        let mut write = storage.begin_migration_write(Default::default()).await.unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
         let read = storage.begin_read(Default::default()).await.unwrap();
         let reader = BranchHeadControlContext::new().reader(&read);
         let fresh = "00000000-0000-7000-8000-000000000098".to_string();

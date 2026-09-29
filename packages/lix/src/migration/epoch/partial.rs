@@ -214,7 +214,8 @@ where
             }),
     );
     match adapter
-        .commit_write_set(
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
             writes,
             WriteOptions {
                 preconditions,

@@ -104,6 +104,7 @@ mod partial_upload_cycle;
 mod partial_working_diff_tests;
 pub(crate) use partial_push_state::PARTIAL_BRANCH_PUSH_SPACE;
 mod partial_state;
+pub(crate) mod partial_serving;
 pub(crate) use partial_state::{
     PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
     partial_replica_state_key,
@@ -237,7 +238,7 @@ pub(crate) struct PartialReplicaWriteCapability {
     _private: (),
 }
 
-fn partial_replica_write_capability() -> PartialReplicaWriteCapability {
+pub(crate) fn partial_replica_write_capability() -> PartialReplicaWriteCapability {
     PartialReplicaWriteCapability { _private: () }
 }
 

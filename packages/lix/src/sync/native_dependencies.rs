@@ -192,6 +192,7 @@ pub(super) async fn select(
 mod tests {
     use super::super::native_metadata::{NativeMetadataRequest, validate_native_metadata_response};
     use super::*;
+    use crate::storage::StorageWrite;
     use crate::open_lix;
 
     async fn fixture() -> (
@@ -337,16 +338,15 @@ mod tests {
         let adapter = StorageAdapter::new(crate::Memory::new());
         let mut writes = adapter.new_write_set();
         let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
-        adapter
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions: vec![guard],
-                    ..Default::default()
-                },
-            )
+        let mut raw = adapter
+            .begin_migration_write(StorageWriteOptions {
+                preconditions: vec![guard],
+                ..Default::default()
+            })
             .await
             .unwrap();
+        writes.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
         adapter.admit_partial_replica_writer(super::super::partial_replica_write_capability());
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let mut writes = adapter.new_write_set();

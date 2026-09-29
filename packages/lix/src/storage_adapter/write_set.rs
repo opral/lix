@@ -89,6 +89,7 @@ pub struct StorageWriteSet {
     // domain writer sharing this canonical write set from invalidating the
     // sweep's reachability proof before commit.
     changelog_gc_sealed: bool,
+    partial_bootstrap_authorized: bool,
 }
 
 impl fmt::Debug for StorageWriteSet {
@@ -248,6 +249,7 @@ pub struct StorageWriteSetArenaStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageWriteSetError {
+    Admission(crate::LixError),
     ConflictingSpaceDeclaration {
         existing: StorageSpace,
         incoming: StorageSpace,
@@ -281,6 +283,7 @@ impl StorageWriteSet {
             deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
+            partial_bootstrap_authorized: false,
         }
     }
 
@@ -295,6 +298,17 @@ impl StorageWriteSet {
 
     pub(crate) fn identity(&self) -> u64 {
         self.identity
+    }
+
+    pub(crate) fn authorize_partial_bootstrap(
+        &mut self,
+        _capability: crate::sync::PartialReplicaWriteCapability,
+    ) {
+        self.partial_bootstrap_authorized = true;
+    }
+
+    pub(crate) fn partial_bootstrap_authorized(&self) -> bool {
+        self.partial_bootstrap_authorized
     }
 
     /// Conservative encoded-size hint for contiguous backend write batches.
@@ -667,9 +681,11 @@ impl StorageWriteSet {
             deferred_final_puts,
             stats,
             changelog_gc_sealed,
+            partial_bootstrap_authorized,
             ..
         } = other;
         self.changelog_gc_sealed |= changelog_gc_sealed;
+        self.partial_bootstrap_authorized |= partial_bootstrap_authorized;
         for group in groups {
             let space = group.space;
             let target = self.group_mut(space);
@@ -740,10 +756,12 @@ impl StorageWriteSet {
             groups,
             exclusive_range_deletes,
             changelog_gc_sealed,
+            partial_bootstrap_authorized,
             ..
         } = self;
         let mut slice = Self::new();
         slice.changelog_gc_sealed = changelog_gc_sealed;
+        slice.partial_bootstrap_authorized = partial_bootstrap_authorized;
         let mut remaining_deletes = delete_budget;
         for group in groups {
             let (space, puts, deletes) = group.lower();
@@ -835,12 +853,37 @@ impl StorageWriteSet {
             .collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index
             .get(&space.id)
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
+            || self.exclusive_range_deletes.iter().any(|(candidate, _)| *candidate == space)
+    }
+
+    pub(crate) fn has_range_delete_in_space(&self, space: StorageSpace) -> bool {
+        self.exclusive_range_deletes.iter().any(|(candidate, _)| *candidate == space)
+    }
+
+    pub(crate) fn has_deletions_in_space(&self, space: StorageSpace) -> bool {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| !group.deletes.is_empty())
+            || self.has_range_delete_in_space(space)
+    }
+
+    pub(crate) fn has_range_delete_outside(&self, allowed: StorageSpace) -> bool {
+        self.exclusive_range_deletes
+            .iter()
+            .any(|(space, _)| *space != allowed)
+    }
+
+    pub(crate) fn staged_delete(&self, space: StorageSpace, key: &[u8]) -> bool {
+        self.group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| group.deletes.iter().any(|item| group.key_bytes(*item) == key))
     }
 
     /// Keys this write set already declares in `space`.
@@ -1177,6 +1220,7 @@ impl Default for StorageWriteSet {
             deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
+            partial_bootstrap_authorized: false,
         }
     }
 }
@@ -1384,6 +1428,7 @@ fn slice_bytes(bytes: &[u8], range: ArenaRange) -> &[u8] {
 impl fmt::Display for StorageWriteSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Admission(error) => write!(f, "{error}"),
             Self::ConflictingSpaceDeclaration { existing, incoming } => write!(
                 f,
                 "conflicting storage space declarations for {:?}: {existing} vs {incoming}",

@@ -382,7 +382,6 @@ pub(super) async fn analyze_native_divergence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_adapter::StorageWriteOptions;
     use crate::{Lix, Memory, open_lix};
 
     fn budget() -> PartialMergeBudget {
@@ -392,6 +391,31 @@ mod tests {
             max_local_payload_bytes: 1024 * 1024,
             max_remote_graph_records: 64,
         }
+    }
+
+    /// This fixture deliberately adds a bookkeeping receipt to complete native
+    /// stores. It is never opened as a partial engine, so seed it through the
+    /// backend and keep the production partial-serving admission guard out of
+    /// this reconciliation-only setup.
+    async fn seed_bookkeeping_fixture<S>(
+        storage: &crate::storage_adapter::StorageAdapter<S>,
+        writes: crate::storage_adapter::StorageWriteSet,
+        preconditions: Vec<StoragePrecondition>,
+    ) where
+        S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+    {
+        use crate::storage::StorageWrite as _;
+
+        let mut raw = storage
+            .begin_migration_write(crate::storage_adapter::StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        writes.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
     }
 
     // Complete native stores deliberately isolate reconciliation semantics from
@@ -472,17 +496,7 @@ mod tests {
             super::super::partial_state::stage_partial_replica_state(&mut writes, &old, None)
                 .unwrap(),
         );
-        storage
-            .commit_write_set(
-                writes,
-                StorageWriteOptions {
-                    preconditions,
-                    await_durable: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        seed_bookkeeping_fixture(&storage, writes, preconditions).await;
         (local, old, candidate)
     }
 

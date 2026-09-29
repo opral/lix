@@ -221,6 +221,12 @@ struct CheckpointRecoveryRefKey<'a> {
     branch_id: &'a str,
 }
 
+#[derive(musli::Decode)]
+#[musli(packed)]
+struct OwnedCheckpointRecoveryRefKey {
+    branch_id: String,
+}
+
 #[derive(Clone, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct StoredCheckpointRecoveryRef {
@@ -671,11 +677,23 @@ fn validate_checkpoint_gc_state(state: CheckpointGcState) -> Result<(), LixError
     Ok(())
 }
 
-fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
+pub(crate) fn recovery_ref_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode(
         "checkpoint recovery ref key",
         &CheckpointRecoveryRefKey { branch_id },
     )
+}
+
+pub(crate) fn recovery_ref_branch_id(key: &[u8]) -> Result<String, LixError> {
+    let decoded: OwnedCheckpointRecoveryRefKey =
+        storage_codec::decode("checkpoint recovery ref key", key)?;
+    if recovery_ref_key(&decoded.branch_id)? != key {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "checkpoint recovery ref key is not canonical",
+        ));
+    }
+    Ok(decoded.branch_id)
 }
 
 fn validate_stored_recovery_ref(
@@ -1298,6 +1316,7 @@ where
     .await?;
     chronology_roots.extend(uploads.roots);
     chronology_roots.extend(native_global_retention::load_global_migration_roots(store).await?);
+    chronology_roots.extend(crate::sync::partial_serving::retained_local_roots(store).await?);
     chronology_roots.extend(
         load_recovery_refs(store)
             .await?
@@ -2427,6 +2446,8 @@ fn retirement_is_proven(
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::StorageWrite;
+
     #[tokio::test]
     async fn authority_gc_refuses_partial_inventory_before_staging_any_mutation() {
         let authority = crate::open_lix().await.unwrap();
@@ -2446,10 +2467,12 @@ mod tests {
                 bytes: serde_json::to_vec(&state).unwrap().into(),
             },
         );
-        adapter
-            .commit_write_set(seed, StorageWriteOptions::default())
+        let mut raw = adapter
+            .begin_migration_write(StorageWriteOptions::default())
             .await
             .unwrap();
+        seed.lower_into(&mut raw).await.unwrap();
+        raw.commit().await.unwrap();
         let read = SharedStorageAdapterRead::new(
             adapter
                 .begin_read(StorageReadOptions::default())

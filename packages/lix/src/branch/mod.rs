@@ -10,9 +10,10 @@ pub(crate) use context::BranchContext;
 pub(crate) use control::BRANCH_HEAD_CONTROL_SPACE;
 pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
-    BranchHeadControlReader, BranchHeadTrackedReachability, branch_head_control_precondition,
+    BranchHeadControlReader, BranchHeadTrackedReachability, branch_head_control_key,
+    branch_head_control_precondition,
     encode_control_for_migration, stage_branch_head_control, stage_delete_branch_head_control,
-    canonicalize_control_for_migration,
+    canonicalize_control_for_migration, staged_branch_head_control,
 };
 pub(crate) use lifecycle::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 pub(crate) use stage_rows::{

@@ -302,6 +302,7 @@ where
             };
             let branch_ctx = Arc::new(BranchContext::new());
             let lix_id = if let Some(expected) = partial_admission {
+                crate::sync::partial_serving::migrate_missing(&storage).await?;
                 assert_partial_admission(storage.clone(), expected).await?
             } else {
                 assert_initialized(
@@ -889,124 +890,15 @@ where
                 "partial replica admission does not match the durable repository, account, remote and epoch",
             ));
         }
-        // These are local authoritative serving coordinates, not optional cache
-        // entries. Without a root marker HOT can interpret an absent row as empty.
-        // Validate only the two admitted branches, never enumerate the repository.
-        for branch in [
-            &expected.descriptor().selected_branch,
-            &expected.descriptor().global_branch,
-        ] {
-            let control = crate::branch::BranchHeadControlContext::new()
-                .reader(&read)
-                .load(&branch.branch_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                        "partial replica is missing its branch control",
-                    )
-                })?;
-            let key = crate::storage_adapter::StorageKey(bytes::Bytes::from(
-                crate::hot_state::hot_generation_scope_prefix(
-                    &branch.branch_id,
-                    control.tracked_generation,
-                ),
+        if !crate::sync::partial_serving::assert_admitted(&read, expected).await? {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial serving witness is absent after migration",
             ));
-            let marker = crate::storage_adapter::PointReadPlan::new(
-                crate::hot_state::ROOT_CURRENT_BASE_SPACE,
-                &[key],
-            )
-            .materialize(&read, Default::default())
-            .await?
-            .value
-            .pop()
-            .flatten();
-            let base = crate::changelog::CommitId::parse(&branch.head.commit_id).map_err(|_| {
-                LixError::new(
-                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                    "partial replica base ID is invalid",
-                )
-            })?;
-            let root = match &marker {
-                Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => {
-                    uuid::Uuid::from_slice(bytes).ok().map(crate::changelog::CommitId::from)
-                }
-                _ => None,
-            };
-            let admitted_root = control.tracked_generation
-                == expected.serving_generation(&branch.branch_id)? && root == Some(base);
-            // Undo can publish a complete local native root and rotate its HOT
-            // generation without changing the remote admission or upload cursor.
-            // Such a root is owned by the local first-parent interval. Reopening
-            // must retain that interval, rather than require its root to remain
-            // the original remote head (or replace it and lose pending edits).
-            let local_root = if !admitted_root
-                && control.tracked_generation != expected.serving_generation(&branch.branch_id)?
-                && root.is_some_and(|root| root != base) {
-                partial_local_root_is_owned(&read, control.head_commit_id, root.unwrap(), base).await?
-            } else {
-                false
-            };
-            if !admitted_root && !local_root {
-                let (root_commit_id, root_bytes) = match &marker {
-                    Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => (
-                        uuid::Uuid::from_slice(bytes).ok().map(|id| id.to_string()),
-                        Some(bytes.len()),
-                    ),
-                    _ => (None, None),
-                };
-                return Err(LixError::new(
-                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                    "partial replica native root serving coordinates disagree with its admitted base",
-                ).with_details(serde_json::json!({
-                    "branchId": branch.branch_id,
-                    "headCommitId": control.head_commit_id.to_string(),
-                    "servingGeneration": control.tracked_generation.to_string(),
-                    "expectedServingGeneration": expected.serving_generation(&branch.branch_id)?.to_string(),
-                    "rootCommitId": root_commit_id,
-                    "rootBytes": root_bytes,
-                    "expectedRootCommitId": base.to_string(),
-                })));
-            }
         }
         Ok(Arc::from(expected.repository_id()))
     })
     .await
-}
-
-/// Verify only the resident local interval, stopping at the admitted remote
-/// head. Never hydrate remote history during admission. The marker must name
-/// a native root on that interval, not merely any readable historical commit.
-async fn partial_local_root_is_owned(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-    head: crate::changelog::CommitId,
-    root: crate::changelog::CommitId,
-    base: crate::changelog::CommitId,
-) -> Result<bool, LixError> {
-    let headers = crate::tracked_state::load_commit_state_authority_ids(read, &[root]).await?;
-    if headers.into_iter().all(|header| header.is_none()) {
-        return Ok(false);
-    }
-    let context = CommitGraphContext::new();
-    let mut graph = context.reader(read);
-    let mut cursor = head;
-    let mut previous_generation = None;
-    let mut saw_root = false;
-    while cursor != base {
-        let Some(node) = graph.load_node(&cursor).await? else {
-            return Ok(false);
-        };
-        if previous_generation.is_some_and(|generation| node.generation >= generation) {
-            return Ok(false);
-        }
-        saw_root |= cursor == root;
-        let Some(parent) = node.parent_commit_ids.first() else {
-            return Ok(false);
-        };
-        previous_generation = Some(node.generation);
-        cursor = *parent;
-    }
-    Ok(saw_root)
 }
 
 async fn repository_has_changelog_commit(
