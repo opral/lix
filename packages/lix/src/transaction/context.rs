@@ -4604,9 +4604,22 @@ where
         {
             return Ok(index);
         }
-        let staged = self.staged_writes.staging_overlay()?;
-        let base = self.hot_state.snapshot_reader(read);
-        let rows = overlay_scan_batch(&base, &staged, &request.hot_state_request()).await?;
+        // Resolve scoped descriptors and their parent closure against the
+        // staged overlay. A broad hot_state_request drops the file scope and
+        // makes a loaded sparse file depend on unrelated filesystem rows.
+        let reader = TransactionReadHotStateReader {
+            base: self.hot_state.transaction_reader(
+                read.clone(),
+                Arc::clone(&self.branch_head_control_cache),
+            ),
+            read_store: read,
+            staged: self.staged_writes.staging_overlay()?,
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
+            // Internal bookkeeping does not join the SQL protected read set.
+            read_set: Arc::new(SqlReadSet::default()),
+        };
+        let rows = crate::filesystem::read_path_index_rows(&reader, request).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
         let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
@@ -14404,10 +14417,11 @@ where
         request: &FilesystemPathIndexRequest,
         file_ids: &[String],
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let request = request.clone().with_file_ids(Some(file_ids.to_vec()));
         if let Some(read_set) = self.recording_sql_read_set() {
-            read_set.record_path_index(&request.clone().with_file_ids(Some(file_ids.to_vec())));
+            read_set.record_path_index(&request);
         }
-        self.transaction_filesystem_path_index(request).await
+        self.transaction_filesystem_path_index(&request).await
     }
 
     async fn filesystem_path_index(

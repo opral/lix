@@ -1564,6 +1564,17 @@ impl NativeLixInner {
         serde_json::to_value(health).map_err(|error| LixError::unknown(error.to_string()))
     }
 
+    async fn prepare_offline_editing(&self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::prepare_offline_editing(lix).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::prepare_offline_editing(lix).await
+            }
+        }
+    }
+
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
         match self {
             Self::Memory(lix) => crate::session::SessionOperations::active_branch_id(lix).await,

@@ -2659,13 +2659,43 @@ where
         identity: &TrackedStateIdentity,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<Option<ChangeId>, LixError> {
-        self.ensure_cached_commit_delta_winners(commit_id, cache)
+        if let Some(winners) = cache.commit_delta_winners.get(commit_id) {
+            return Ok(winners.get(identity).copied());
+        }
+        // Membership of one tree row is an exact authenticated delta lookup.
+        // Scanning every winner pulls unrelated schemas into the write's
+        // dependency closure and makes a prepared sparse file uneditable offline.
+        self.load_cached_changelog_first_parent(commit_id, cache)
             .await?;
-        Ok(cache
-            .commit_delta_winners
-            .get(commit_id)
-            .and_then(|winners| winners.get(identity))
-            .copied())
+        let commit_id_typed = CommitId::parse_lix(commit_id, "commit-delta winner commit_id")?;
+        let state =
+            match storage::load_point_replay_commit_state(&self.store, commit_id_typed).await? {
+                Some(state) => state,
+                None => {
+                    return Err(storage::missing_commit_state_manifest_error(
+                        &self.store,
+                        commit_id_typed,
+                    )
+                    .await);
+                }
+            };
+        let key = TrackedStateKey {
+            schema_key: identity.schema_key.clone(),
+            file_id: identity.file_id.clone(),
+            row_pk: identity.row_pk.clone(),
+        };
+        let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
+            &self.store,
+            &state,
+            &[Bytes::from(encode_key(&key))],
+            &self.commit_delta_point_cache,
+        )
+        .await?;
+        Ok(values
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|value| value.change_id))
     }
 
     async fn ensure_cached_commit_delta_winners(

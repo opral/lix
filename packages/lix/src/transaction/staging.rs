@@ -3735,7 +3735,7 @@ impl crate::hot_state::StagedHotStateRows for PreparedSchemaOverlay<'_> {
                     row,
                     projection_includes_provisional_change_id(&request.projection),
                 ))
-                    .expect("prepared schema exact batch ordinal must fit u32")
+                .expect("prepared schema exact batch ordinal must fit u32")
             }));
         }
         MaterializedHotStateExactBatch::new(output.finish(), slots)
@@ -4578,11 +4578,10 @@ fn append_matching_staged_rows(
 fn projection_includes_provisional_change_id(
     projection: &crate::hot_state::HotStateProjection,
 ) -> bool {
-    projection.columns.is_empty()
-        || projection
-            .columns
-            .iter()
-            .any(|column| column == "change_id")
+    projection
+        .columns
+        .iter()
+        .any(|column| column == "change_id")
 }
 
 fn push_prepared_materialized(
@@ -4592,8 +4591,8 @@ fn push_prepared_materialized(
 ) -> usize {
     // Addressable tracked rows carry a transaction-local provisional ID until
     // commit materialization assigns their canonical commit-delta address.
-    // Keep that value in SQL's staged view when the caller asks for it; hide
-    // the nil placeholder used by paths that have not minted one yet.
+    // Expose it only to an explicit audit-column projection; ordinary scans
+    // must keep transaction-local IDs hidden.
     let change_id = if row.addressable_change_id && !row.untracked {
         include_provisional_change_id
             .then_some(row.change_id)

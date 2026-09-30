@@ -316,7 +316,7 @@ async fn try_execute_row_insert_batch(
         None
     } else {
         let raw_rows = write_rows.into_raw()?;
-        let committed = scan_row_conflict_candidates(ctx, &spec, &raw_rows)
+        let committed = scan_row_conflict_candidates(ctx, &spec, &raw_rows, false)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.row_insert_parameter_batch.conflict_scan"
@@ -748,7 +748,7 @@ async fn try_execute_row_update_batch(
         }
     }
     convert_sql_row_snapshots_to_typed(ctx, &spec, &mut write_rows)?;
-    certify_fileless_typed_sql_rows(ctx, &spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, &spec, &mut write_rows, plan)?;
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     #[cfg(test)]
     {
@@ -2682,7 +2682,7 @@ async fn row_upsert(
 
     let mut insert_rows =
         row_insert_batch(ctx, plan, spec, params, active_branch_commit_id).await?;
-    let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows).await?;
+    let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows, false).await?;
     let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
     let mut new_identities = std::collections::BTreeSet::new();
 
@@ -2807,7 +2807,7 @@ async fn row_insert_batch(
             }
         }
         convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
-        certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
+        certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows, plan)?;
         return Ok(write_rows);
     }
     let BoundWriteInput::Values(values) = &plan.bound.input else {
@@ -2831,7 +2831,7 @@ async fn row_insert_batch(
         )?;
     }
     convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
-    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows, plan)?;
     Ok(write_rows)
 }
 
@@ -2864,7 +2864,7 @@ async fn row_update(
         }
     }
     convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
-    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows, plan)?;
     stage_rows_with_postimage_returning(
         ctx,
         plan,
@@ -3251,7 +3251,18 @@ async fn stage_rows_with_postimage_returning(
         && !write_rows.is_empty()
         && (plan.bound.op == BoundWriteOp::Update || plan.bound.conflict.is_some())
     {
-        Some(scan_row_conflict_candidates(ctx, spec, &write_rows).await?)
+        let include_provisional_change_id =
+            plan.bound.returning.as_ref().is_some_and(|returning| {
+                returning.items.iter().any(|item| {
+                    item.expr
+                        .as_ref()
+                        .is_some_and(returning_expr_references_old_change_id)
+                })
+            });
+        Some(
+            scan_row_conflict_candidates(ctx, spec, &write_rows, include_provisional_change_id)
+                .await?,
+        )
     } else {
         None
     };
@@ -3382,7 +3393,13 @@ async fn row_staged_postimage_returning_rows(
     if write_rows.is_empty() {
         return Ok(Some(Vec::new()));
     }
-    let candidates = scan_row_conflict_candidates(ctx, spec, write_rows).await?;
+    let include_provisional_change_id = returning.items.iter().any(|item| {
+        item.expr
+            .as_ref()
+            .is_some_and(returning_expr_references_new_change_id)
+    });
+    let candidates =
+        scan_row_conflict_candidates(ctx, spec, write_rows, include_provisional_change_id).await?;
     // A staged audit projection needs the transaction-visible row, but it
     // must not look through every candidate again for every write row. Aside
     // from making large `RETURNING *` writes quadratic, that repeated search
@@ -3651,7 +3668,7 @@ async fn row_delete(
         }
     }
     convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
-    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows, plan)?;
     let rows_affected = stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     match (plan.bound.returning.as_ref(), returning_rows) {
         (Some(returning), Some(rows)) => Ok(SqlWriteResult::returning(
@@ -3740,8 +3757,8 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_author_id"
-            | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id"
+            | "lixcol_author_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
         BoundExpr::Literal(BoundLiteral::Null) => Some(crate::ResultColumnType::Null),
@@ -3961,6 +3978,7 @@ fn certify_fileless_typed_sql_rows(
     ctx: &dyn SqlWriteExecutionContext,
     spec: &SchemaSurfaceSpec,
     rows: &mut RawWriteBatch,
+    plan: &LogicalWritePlan,
 ) -> Result<(), LixError> {
     // Opening catalog plan IDs cannot certify images governed by a staged
     // amendment. The ordinary staging path resolves and validates each domain.
@@ -3973,6 +3991,21 @@ fn certify_fileless_typed_sql_rows(
     let Some(first) = rows.iter().next() else {
         return Ok(());
     };
+    // The certified fast lane uses a nil placeholder for addressable tracked
+    // IDs because canonical commit planning replaces it later. NEW change-ID
+    // RETURNING needs a real transaction-local value before that remap, so
+    // route only tracked writes that project it through generic preparation.
+    if !first.untracked
+        && plan.bound.returning.as_ref().is_some_and(|returning| {
+            returning.items.iter().any(|item| {
+                item.expr
+                    .as_ref()
+                    .is_some_and(returning_expr_references_new_change_id)
+            })
+        })
+    {
+        return Ok(());
+    }
     if rows.iter().any(|row| {
         row.untracked != first.untracked || row.schema_scope_branch_id() != ctx.active_branch_id()
     }) {
@@ -4137,6 +4170,7 @@ async fn scan_row_conflict_candidates(
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &SchemaSurfaceSpec,
     insert_rows: &RawWriteBatch,
+    include_provisional_change_id: bool,
 ) -> Result<MaterializedHotStateBatch, LixError> {
     #[cfg(feature = "storage-benches")]
     let _phase =
@@ -4162,6 +4196,21 @@ async fn scan_row_conflict_candidates(
     // of SQL conflict identity. A tracked INSERT therefore conflicts with an
     // existing untracked row (and vice versa); `DO UPDATE` then preserves the
     // existing row's retention through `append_row_replace_row_from_live`.
+    let projection = if include_provisional_change_id {
+        // Keep the complete post-image while marking the staged audit value as
+        // explicitly requested. The empty/default projection hides provisional
+        // change IDs from ordinary conflict scans.
+        HotStateProjection {
+            columns: vec![
+                "snapshot_content".to_string(),
+                "metadata".to_string(),
+                "snapshot".to_string(),
+                "change_id".to_string(),
+            ],
+        }
+    } else {
+        HotStateProjection::default()
+    };
     let rows = ctx
         .scan_hot_state_batch(&HotStateScanRequest {
             filter: HotStateFilter {
@@ -4172,6 +4221,7 @@ async fn scan_row_conflict_candidates(
                 include_tombstones: false,
                 ..HotStateFilter::default()
             },
+            projection,
             ..HotStateScanRequest::default()
         })
         .await?;
@@ -4696,7 +4746,7 @@ fn certified_row_insert_parameter_batch(
     let Some(mut rows) = rows else {
         return Ok(None);
     };
-    certify_fileless_typed_sql_rows(ctx, spec, &mut rows)?;
+    certify_fileless_typed_sql_rows(ctx, spec, &mut rows, plan)?;
     Ok(Some(CertifiedRowInsertParameterBatch::Raw(rows)))
 }
 
@@ -6499,7 +6549,11 @@ fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
         BoundExpr::Column(column)
             if matches!(
                 column.name.as_str(),
-                "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_author_id" | "lixcol_commit_id"
+                "lixcol_created_at"
+                    | "lixcol_updated_at"
+                    | "lixcol_change_id"
+                    | "lixcol_author_id"
+                    | "lixcol_commit_id"
             ) =>
         {
             true
@@ -6557,6 +6611,87 @@ fn bound_predicate_requires_staged_postimage(predicate: &BoundPredicate) -> bool
         BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
             .iter()
             .any(bound_predicate_requires_staged_postimage),
+        BoundPredicate::True | BoundPredicate::False => false,
+    }
+}
+
+fn returning_expr_references_new_change_id(expr: &BoundExpr) -> bool {
+    returning_expr_references_change_id(expr, crate::sql2::bind::expr::ReturningImage::New)
+}
+
+fn returning_expr_references_old_change_id(expr: &BoundExpr) -> bool {
+    returning_expr_references_change_id(expr, crate::sql2::bind::expr::ReturningImage::Old)
+}
+
+fn returning_expr_references_change_id(
+    expr: &BoundExpr,
+    image: crate::sql2::bind::expr::ReturningImage,
+) -> bool {
+    match expr {
+        BoundExpr::Column(column) => {
+            column.name == "lixcol_change_id"
+                && if image == crate::sql2::bind::expr::ReturningImage::Old {
+                    column.image == Some(crate::sql2::bind::expr::ReturningImage::Old)
+                } else {
+                    column.image != Some(crate::sql2::bind::expr::ReturningImage::Old)
+                }
+        }
+        BoundExpr::Cast { expr, .. } | BoundExpr::Not(expr) => {
+            returning_expr_references_change_id(expr, image)
+        }
+        BoundExpr::Function { args, .. } => args
+            .iter()
+            .any(|expr| returning_expr_references_change_id(expr, image)),
+        BoundExpr::Binary { left, right, .. } => {
+            returning_expr_references_change_id(left, image)
+                || returning_expr_references_change_id(right, image)
+        }
+        BoundExpr::Predicate(predicate) => bound_predicate_references_change_id(predicate, image),
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| returning_expr_references_change_id(expr, image))
+                || conditions.iter().any(|(condition, result)| {
+                    returning_expr_references_change_id(condition, image)
+                        || returning_expr_references_change_id(result, image)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|expr| returning_expr_references_change_id(expr, image))
+        }
+        BoundExpr::ExcludedColumn(_) | BoundExpr::Param(_) | BoundExpr::Literal(_) => false,
+    }
+}
+
+fn bound_predicate_references_change_id(
+    predicate: &BoundPredicate,
+    image: crate::sql2::bind::expr::ReturningImage,
+) -> bool {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            returning_expr_references_change_id(left, image)
+                || returning_expr_references_change_id(right, image)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            returning_expr_references_change_id(expr, image)
+                || returning_expr_references_change_id(pattern, image)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            returning_expr_references_change_id(expr, image)
+        }
+        BoundPredicate::In { expr, values } => {
+            returning_expr_references_change_id(expr, image)
+                || values
+                    .iter()
+                    .any(|expr| returning_expr_references_change_id(expr, image))
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
+            .iter()
+            .any(|predicate| bound_predicate_references_change_id(predicate, image)),
         BoundPredicate::True | BoundPredicate::False => false,
     }
 }

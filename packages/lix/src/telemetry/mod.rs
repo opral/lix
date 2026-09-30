@@ -2064,14 +2064,29 @@ mod tests {
             .unwrap_err();
         }
         let spans = completed.lock().unwrap();
-        for span in spans.iter() {
-            assert!(!span.end.attributes.iter().any(|attribute| {
-                attribute.key == "lix.payload.schema_kind"
-                    || attribute.key == "lix.payload.recipe_count"
-                    || attribute.key == "lix.payload.recipe_mask"
-                    || attribute.key == "lix.payload.required_input_count"
-            }));
-        }
+        // The allowed categorical field remains useful when numeric fields
+        // are out of bounds; each field is validated independently.
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.schema_kind",
+                    "file_descriptor",
+                ))
+        );
+        assert!(!spans[0].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.payload.recipe_count"
+                || attribute.key == "lix.payload.recipe_mask"
+                || attribute.key == "lix.payload.required_input_count"
+        }));
+        // Matching details on an unrelated error code grant no diagnostics.
+        assert!(!spans[1].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.payload.schema_kind"
+                || attribute.key == "lix.payload.recipe_count"
+                || attribute.key == "lix.payload.recipe_mask"
+                || attribute.key == "lix.payload.required_input_count"
+        }));
     }
 
     #[test]

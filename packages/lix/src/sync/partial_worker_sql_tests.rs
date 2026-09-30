@@ -66,6 +66,41 @@ impl RawHttpClient for AuthorityClient {
                     .as_str();
                 serde_json::to_value(self.authority.read_sync_fulfillment(&body, lease).await?)
                     .unwrap()
+            } else if url.path().ends_with("/sync/native-objects") {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {
+                    objects: Vec<NativeObjectRef>,
+                }
+                let body: Request = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let lease = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "lix-native-baseline-lease")
+                    .unwrap()
+                    .1
+                    .as_str();
+                serde_json::to_value(
+                    self.authority
+                        .read_sync_native_objects_leased(&body.objects, lease)
+                        .await?,
+                )
+                .unwrap()
+            } else if url.path().ends_with("/sync/native-object-range") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let lease = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "lix-native-baseline-lease")
+                    .unwrap()
+                    .1
+                    .as_str();
+                serde_json::to_value(
+                    self.authority
+                        .read_sync_native_object_range_leased(&body, lease)
+                        .await?,
+                )
+                .unwrap()
             } else if url.path().ends_with("/sync/native-metadata-walk") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 self.metadata.fetch_add(1, Ordering::SeqCst);
@@ -525,6 +560,182 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
     );
     shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
     worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reopen() {
+    let file_id = "dddddddd-0000-8000-8000-000000000004";
+    let authority = Arc::new(open_lix().await.unwrap());
+    authority
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/offline.txt', $2)",
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Blob(b"online baseline".to_vec().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let state = PartialReplicaState::from_leased(
+        format!("https://example.test/lix/{}", authority.lix_id()),
+        authority.active_account_id().into(),
+        "00000000-0000-7000-8000-000000003398".into(),
+        authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let memory = Memory::new();
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+    crate::init::stage_partial_repository_protocol(&mut writes);
+    drop(read);
+    storage
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let client = AuthorityClient::new(authority.clone(), false);
+    let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
+        .await
+        .unwrap();
+    transport
+        .bind_native_baseline_lease(state.baseline_lease())
+        .unwrap();
+    let (shutdown, shutdown_rx) =
+        tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine.clone()),
+        ),
+    );
+
+    let initial = lix
+        .execute(
+            "SELECT content FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        initial.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"online baseline"
+    );
+    lix.prepare_offline_editing().await.unwrap();
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+    drop(lix);
+    drop(engine);
+    drop(storage);
+
+    let storage = StorageAdapter::new(memory).with_session().await.unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let raw_session = session.clone();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let lix = Lix::from_partial_engine_for_test(engine, session, sender);
+    let edit = raw_session
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"first offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await;
+    let edited = match edit {
+        Ok(result) => result,
+        Err(error) => panic!("first raw offline file edit failed: {error:?}"),
+    };
+    assert_eq!(edited.rows_affected(), 1);
+
+    // A second write in the same explicit transaction must resolve the
+    // filesystem path index against the first staged write's overlay. Keep
+    // this scoped to the same file so the native closure does not need the
+    // rest of the sparse filesystem snapshot.
+    let mut transaction = raw_session.begin_transaction().await.unwrap();
+    let staged = transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"staged offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("offline file edit in transaction failed: {error:?}"));
+    assert_eq!(staged.rows_affected(), 1);
+    let staged_again = transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"second staged offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("second staged offline file edit failed: {error:?}"));
+    assert_eq!(staged_again.rows_affected(), 1);
+    transaction
+        .commit()
+        .await
+        .unwrap_or_else(|error| panic!("offline file edit transaction failed: {error:?}"));
+
+    let stored = raw_session
+        .execute(
+            "SELECT content FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"second staged offline edit"
+    );
     lix.close().await.unwrap();
 }
 

@@ -1939,7 +1939,9 @@ where
                     .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
                 match result {
                     Ok((result, commit, remap)) => {
-                        return Ok(result.with_commit(commit).remap_direct_new_change_ids(&remap));
+                        return Ok(result
+                            .with_commit(commit)
+                            .remap_direct_new_change_ids(&remap));
                     }
                     Err(error) => {
                         if retries.retry(&error).await {
@@ -2236,7 +2238,9 @@ where
                 )
                 .await
                 .map(|(result, commit, remap)| {
-                    result.with_commit(commit).remap_direct_new_change_ids(&remap)
+                    result
+                        .with_commit(commit)
+                        .remap_direct_new_change_ids(&remap)
                 })
                 .map_err(|error| normalize_sql_surface_error(error, sql))
             },
@@ -5844,6 +5848,57 @@ mod tests {
         engine.open_session().await.expect("session should open")
     }
 
+    /// Memory commits synchronously but deliberately rejects durable reads.
+    /// Receipt replay tests need a deterministic durable tier, so this test
+    /// wrapper treats the committed in-memory snapshot as that tier without
+    /// changing Memory's production capability contract.
+    #[derive(Clone, Debug)]
+    struct DurableMemoryStorage(Memory);
+
+    impl crate::storage_adapter::Storage for DurableMemoryStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.0.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            mut options: StorageReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            options.durability = StorageReadDurability::Visible;
+            self.0.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.0.begin_write(options).await
+        }
+    }
+
+    async fn open_durable_memory_session() -> SessionContext<DurableMemoryStorage> {
+        let storage = DurableMemoryStorage(Memory::new());
+        Engine::initialize(storage.clone())
+            .await
+            .expect("durable test storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized durable test storage should create engine");
+        engine
+            .open_session()
+            .await
+            .expect("durable test session should open")
+    }
+
     #[tokio::test]
     async fn filesystem_path_writes_keep_metadata_on_the_written_row() {
         let session = open_session().await;
@@ -5879,7 +5934,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(file.rows()[0].value("lixcol_metadata").unwrap(), &file_metadata);
+        assert_eq!(
+            file.rows()[0].value("lixcol_metadata").unwrap(),
+            &file_metadata
+        );
 
         let directory_metadata = Value::Jsonb(serde_json::json!({"owner": "folder"}).into());
         session
@@ -5900,7 +5958,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(directories.rows().len(), 2);
-        assert_eq!(directories.rows()[0].value("lixcol_metadata").unwrap(), &Value::Null);
+        assert_eq!(
+            directories.rows()[0].value("lixcol_metadata").unwrap(),
+            &Value::Null
+        );
         assert_eq!(
             directories.rows()[1].value("lixcol_metadata").unwrap(),
             &directory_metadata
@@ -5920,7 +5981,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(moved_file.rows()[0].value("lixcol_metadata").unwrap(), &file_metadata);
+        assert_eq!(
+            moved_file.rows()[0].value("lixcol_metadata").unwrap(),
+            &file_metadata
+        );
 
         session
             .execute(
@@ -6226,7 +6290,10 @@ mod tests {
             .expect("transaction-visible change ID should be text");
         assert_eq!(staged_change_id, visible_change_id);
 
-        transaction.commit().await.expect("transaction should commit");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
         let canonical_change_id = session
             .execute(
                 "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'provisional-returning'",
@@ -6242,7 +6309,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_returning_receipt_replays_the_canonical_change_id() {
-        let session = open_session().await;
+        let session = open_durable_memory_session().await;
         let branch_id = session
             .active_branch_id()
             .await
@@ -6305,7 +6372,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_batch_returning_receipt_replays_canonical_change_ids() {
-        let session = std::sync::Arc::new(open_session().await);
+        let session = std::sync::Arc::new(open_durable_memory_session().await);
         let branch_id = session
             .active_branch_id()
             .await
@@ -6358,16 +6425,16 @@ mod tests {
             .expect("batch rows should be readable");
         for result in &first {
             let row = &result.rows()[0];
-            let key = row.get::<String>("key").expect("returned key should be text");
+            let key = row
+                .get::<String>("key")
+                .expect("returned key should be text");
             let returned = row
                 .get::<String>("change_id")
                 .expect("returned change ID should be text");
             let canonical = persisted
                 .rows()
                 .iter()
-                .find(|row| {
-                    row.get::<String>("key").ok().as_deref() == Some(key.as_str())
-                })
+                .find(|row| row.get::<String>("key").ok().as_deref() == Some(key.as_str()))
                 .expect("each returned row should be persisted")
                 .get::<String>("lixcol_change_id")
                 .expect("persisted change ID should be text");
@@ -7144,10 +7211,7 @@ mod tests {
             "multi-column SQL still executes through DataFusion"
         );
         assert_eq!(
-            exact_filesystem_read_interest_route(
-                &prepared_file,
-                &[Value::Text(file_id.clone())]
-            ),
+            exact_filesystem_read_interest_route(&prepared_file, &[Value::Text(file_id.clone())]),
             Some(ExactFilesystemRead::Point(
                 ExactLixFileReadSelector::Id(file_id.clone()),
                 ExactLixFileReadColumn::Content,
@@ -7158,23 +7222,25 @@ mod tests {
         assert_eq!(
             exact_filesystem_read_interest_route(
                 &all_file_columns,
-                &[Value::Text("01920000-0000-7000-8000-0000000000a2".to_string())]
+                &[Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                )]
             ),
             Some(ExactFilesystemRead::Point(
-                ExactLixFileReadSelector::Id(
-                    "01920000-0000-7000-8000-0000000000a2".to_string()
-                ),
+                ExactLixFileReadSelector::Id("01920000-0000-7000-8000-0000000000a2".to_string()),
                 ExactLixFileReadColumn::Content,
             ))
         );
-        let broad_predicate = sql2::parse_statement(
-            "SELECT content FROM lix_file WHERE id = $1 OR path = $2",
-        )
-        .unwrap();
+        let broad_predicate =
+            sql2::parse_statement("SELECT content FROM lix_file WHERE id = $1 OR path = $2")
+                .unwrap();
         assert_eq!(
             exact_filesystem_read_interest_route(
                 &broad_predicate,
-                &[Value::Text(file_id.clone()), Value::Text("/other.md".to_string())]
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Text("/other.md".to_string())
+                ]
             ),
             None,
             "only a single exact identity may seed a file closure"
