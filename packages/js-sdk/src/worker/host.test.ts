@@ -348,6 +348,23 @@ test("worker host routes sync health to the local binding", async () => {
 	expect(binding.syncHealth).toHaveBeenCalledOnce();
 });
 
+test("worker host routes offline editing preparation to the local binding", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive: (message: WorkerInput) => void = () => undefined;
+	const endpoint: WorkerHostEndpoint = {
+		postMessage: (message) => { responses.push(message); },
+		onMessage: (listener) => { receive = listener; },
+	};
+	const prepareOfflineEditing = vi.fn(async () => undefined);
+	const binding = { prepareOfflineEditing, setTelemetryParent() {} } as unknown as LixBinding;
+	startWorkerHost(endpoint, async () => binding);
+	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" } } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "prepareOfflineEditing" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: undefined }));
+	expect(prepareOfflineEditing).toHaveBeenCalledOnce();
+});
+
 test("a credential callback from a nonresponsive page cannot leave opening pending", async () => {
 	vi.useFakeTimers();
 	try {

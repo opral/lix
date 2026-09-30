@@ -532,7 +532,15 @@ impl CommitDeltaPayloadIndexRef<'_> {
 pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change_record: crate::changelog::ChangeRecord,
+    /// The authenticated physical coordinate that produced this entry. For a
+    /// selected-source overlay this remains the coordinate of the canonical
+    /// source member, even when `value.commit_id` is rebased to the endpoint.
+    pub(crate) physical_locator: Option<CommitDeltaChangeLocator>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
+    /// Columnar owners expose the physical group/row to prove a selected
+    /// reference's base coordinate. Packed legacy owners have no comparable
+    /// group/row index and are proved by their manifest-routed exact key/value.
+    pub(crate) physical_group_coordinate: Option<TrackedStateBaseCoordinate>,
     author_present: bool,
     pub(crate) selected_ref: bool,
     selected_tombstone: bool,
@@ -9347,7 +9355,9 @@ where
             created_at: updated_at,
             origin_key,
         },
+        physical_locator: Some(locator),
         base_coordinate,
+        physical_group_coordinate: None,
         author_present,
         selected_ref: false,
         selected_tombstone: false,
@@ -10372,7 +10382,26 @@ async fn load_columnar_owned_entries(
                     change_id,
                     &parts.author_id,
                 )?,
+                physical_locator: Some(CommitDeltaChangeLocator {
+                    change_id,
+                    commit_id,
+                    segment_index: u32::try_from(
+                        global_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS,
+                    )
+                    .expect("columnar mutation segment fits u32"),
+                    ordinal: u16::try_from(
+                        global_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS,
+                    )
+                    .expect("columnar mutation ordinal fits u16"),
+                }),
                 base_coordinate: Some(TrackedStateBaseCoordinate {
+                    base_commit_id: commit_id,
+                    group_index: u32::try_from(group_index)
+                        .expect("columnar mutation group fits u32"),
+                    row_index: u32::try_from(row_index_in_group)
+                        .expect("columnar mutation row fits u32"),
+                }),
+                physical_group_coordinate: Some(TrackedStateBaseCoordinate {
                     base_commit_id: commit_id,
                     group_index: u32::try_from(group_index)
                         .expect("columnar mutation group fits u32"),
@@ -10410,6 +10439,172 @@ pub(crate) async fn load_commit_delta_entries(
         .map(|key| (commit_id, key))
         .collect::<Vec<_>>();
     load_owned_commit_delta_entries(store, &requests).await
+}
+
+/// Resolve the canonical authored locator for exact live rows whose mutable
+/// locator projection is absent. Every hop is a point read against an
+/// authenticated physical owner; selected references are followed through
+/// their recorded base coordinate until an authored payload is found.
+pub(crate) async fn load_exact_tracked_row_change_locators(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(
+        CommitId,
+        crate::changelog::ChangeId,
+        TrackedStateKey,
+        crate::common::LixTimestamp,
+    )],
+) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    type PendingExactOwner = (
+        usize,
+        CommitId,
+        crate::changelog::ChangeId,
+        TrackedStateKey,
+        crate::common::LixTimestamp,
+        Option<TrackedStateBaseCoordinate>,
+    );
+
+    let mut output = vec![None; requests.len()];
+    let mut visited = vec![BTreeSet::new(); requests.len()];
+    let point_cache = CommitDeltaPointReadCache::default();
+    let mut pending: Vec<PendingExactOwner> = requests
+        .iter()
+        .enumerate()
+        .map(|(index, (owner_commit_id, change_id, key, updated_at))| {
+            visited[index].insert(*owner_commit_id);
+            (
+                index,
+                *owner_commit_id,
+                *change_id,
+                key.clone(),
+                *updated_at,
+                None,
+            )
+        })
+        .collect();
+
+    // Old selected-reference chains have no per-row depth invariant. Keep
+    // traversal bounded by an explicit generous work budget and reject cycles;
+    // do not impose an arbitrary small compatibility cutoff on valid layouts.
+    const MAX_EXACT_OWNER_POINT_READS: usize = 65_536;
+    let mut exact_owner_point_reads = 0usize;
+    while !pending.is_empty() {
+        let owner_requests = pending
+            .iter()
+            .map(|(_, owner_commit_id, _, key, _, _)| (*owner_commit_id, key.clone()))
+            .collect::<Vec<_>>();
+        let attempted = exact_owner_point_reads.saturating_add(owner_requests.len());
+        if attempted > MAX_EXACT_OWNER_POINT_READS {
+            return Err(replacement_payload_error(
+                "exact tracked row recovery exceeded its bounded owner-read budget",
+            )
+            .with_details(serde_json::json!({
+                "payloadFailureReason": "exact_owner_point_read_budget_exhausted",
+                "attempted": attempted.min(MAX_EXACT_OWNER_POINT_READS + 1),
+                "budget": MAX_EXACT_OWNER_POINT_READS,
+            })));
+        }
+        exact_owner_point_reads = attempted;
+        let entries = load_owned_commit_delta_entries_with_point_cache_and_hydration(
+            store,
+            &owner_requests,
+            &point_cache,
+            false,
+        )
+        .await?;
+        let mut next = Vec::new();
+        for (
+            (
+                index,
+                owner_commit_id,
+                change_id,
+                key,
+                updated_at,
+                expected_coordinate,
+            ),
+            entry,
+        ) in pending.into_iter().zip(entries)
+        {
+            let entry = entry.ok_or_else(|| {
+                replacement_payload_error(&format!(
+                    "tracked change '{change_id}' is absent from its exact physical owner"
+                ))
+            })?;
+            if let Some(expected_coordinate) = expected_coordinate {
+                if expected_coordinate.base_commit_id != owner_commit_id {
+                    return Err(replacement_payload_error(&format!(
+                        "tracked change '{change_id}' selected coordinate names another physical owner"
+                    )));
+                }
+                if let Some(actual_coordinate) = entry.physical_group_coordinate
+                    && actual_coordinate != expected_coordinate
+                {
+                    return Err(replacement_payload_error(&format!(
+                        "tracked change '{change_id}' selected coordinate disagrees with its columnar owner row"
+                    )));
+                }
+            }
+            let record = &entry.change_record;
+            if entry.value.change_id != change_id
+                || entry.value.updated_at != updated_at
+                || entry.value.deleted
+                || record.change_id != change_id
+                || record.schema_key != key.schema_key
+                || record.file_id != key.file_id
+                || record.row_pk != key.row_pk
+                || record.created_at != updated_at
+                || (entry.physical_locator.is_some() && record.snapshot.is_none())
+            {
+                return Err(replacement_payload_error(&format!(
+                    "tracked change '{change_id}' exact owner has a different identity or lifetime"
+                )));
+            }
+            if let Some(locator) = entry.physical_locator {
+                if locator.change_id != change_id {
+                    return Err(replacement_payload_error(&format!(
+                        "tracked change '{change_id}' exact owner locator names another change"
+                    )));
+                }
+                output[index] = Some(locator);
+                continue;
+            }
+
+            let Some(base_coordinate) = entry.base_coordinate else {
+                return Err(replacement_payload_error(&format!(
+                    "tracked change '{change_id}' selected owner has no physical base coordinate"
+                )));
+            };
+            let next_owner = base_coordinate.base_commit_id;
+            if !visited[index].insert(next_owner) {
+                return Err(replacement_payload_error(&format!(
+                    "tracked change '{change_id}' selected owner has a cyclic base coordinate"
+                )));
+            }
+            next.push((
+                index,
+                next_owner,
+                change_id,
+                key,
+                updated_at,
+                Some(base_coordinate),
+            ));
+        }
+        pending = next;
+    }
+
+    output
+        .into_iter()
+        .map(|locator| {
+            locator.ok_or_else(|| {
+                replacement_payload_error(
+                    "exact tracked row lost its canonical physical change locator",
+                )
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn load_commit_delta_change_records(
@@ -10775,6 +10970,7 @@ pub(crate) async fn load_authoritative_live_change_records(
             continue;
         }
         let mut details = serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
             "payloadStandaloneStatus": standalone_status[index],
             "payloadPhysicalStatus": physical_status[index],
             "payloadPhysicalConflict": physical_conflict[index],
@@ -13646,7 +13842,12 @@ fn canonical_selected_live_change(
                 "tracked_state selected change '{}' has no canonical live payload",
                 selected.change_id
             ),
-        ));
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "payloadPhysicalStatus": "missing_snapshot",
+            "changeId": selected.change_id.to_string(),
+        })));
     }
     if author_present && selected_author_id != canonical.account_id {
         return Err(LixError::new(
@@ -13735,6 +13936,21 @@ pub(crate) async fn load_owned_commit_delta_entries_with_point_cache(
     requests: &[(CommitId, TrackedStateKey)],
     point_cache: &CommitDeltaPointReadCache,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    load_owned_commit_delta_entries_with_point_cache_and_hydration(
+        store,
+        requests,
+        point_cache,
+        true,
+    )
+    .await
+}
+
+async fn load_owned_commit_delta_entries_with_point_cache_and_hydration(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+    point_cache: &CommitDeltaPointReadCache,
+    hydrate_selected: bool,
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let owner_commit_ids = requests
         .iter()
         .map(|(commit_id, _)| *commit_id)
@@ -13766,6 +13982,7 @@ pub(crate) async fn load_owned_commit_delta_entries_with_point_cache(
         requests,
         Some(point_cache),
         Some(&authorities),
+        hydrate_selected,
     )
     .await?;
     let mut source_requests = Vec::new();
@@ -13816,6 +14033,7 @@ pub(crate) async fn load_owned_commit_delta_entries_with_point_cache(
         &source_requests,
         Some(point_cache),
         Some(&authorities),
+        hydrate_selected,
     )
     .await?;
     for source_commit_id in source_requests
@@ -13879,6 +14097,7 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
             keys,
             Some(point_cache),
             None,
+            true,
         )
         .await?;
         if output.iter().all(Option::is_some)
@@ -14171,6 +14390,7 @@ async fn load_local_owned_commit_delta_entries(
     requests: &[(CommitId, TrackedStateKey)],
     point_cache: Option<&CommitDeltaPointReadCache>,
     authorities: Option<&BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>>,
+    hydrate_selected: bool,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -14193,6 +14413,7 @@ async fn load_local_owned_commit_delta_entries(
             &keys,
             point_cache,
             authorities,
+            hydrate_selected,
         ))
         .await;
     }
@@ -14240,6 +14461,7 @@ async fn load_local_owned_commit_delta_entries(
             &keys,
             point_cache,
             authorities,
+            hydrate_selected,
         ))
         .await?;
         for (request_index, unique_index) in output_routes {
@@ -14255,6 +14477,7 @@ async fn load_inventory_part_entries_one_ordered(
     keys: &[TrackedStateKeyRef<'_>],
     state: &AuthenticatedReplayCommitStateManifest,
     point_cache: Option<&CommitDeltaPointReadCache>,
+    hydrate_selected: bool,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("ordered mutation inventory omitted its directory root")
@@ -14365,11 +14588,15 @@ async fn load_inventory_part_entries_one_ordered(
                 &payloads,
                 &encoded_keys[output_index],
                 commit_id,
+                u32::try_from(run.entry_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds u32"))?,
                 &state.change_account_id,
             )?;
         }
     }
-    hydrate_selected_loaded_entries(store, &mut output).await?;
+    if hydrate_selected {
+        hydrate_selected_loaded_entries(store, &mut output).await?;
+    }
     Ok(output)
 }
 
@@ -14384,6 +14611,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     keys: &[TrackedStateKeyRef<'_>],
     point_cache: Option<&CommitDeltaPointReadCache>,
     authorities: Option<&BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>>,
+    hydrate_selected: bool,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_ordered_load(keys.len());
@@ -14423,6 +14651,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             keys,
             &state,
             point_cache,
+            hydrate_selected,
         )
         .await;
     }
@@ -14489,10 +14718,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                                 &payloads,
                                 &encoded_key,
                                 commit_id,
+                                0,
                                 &manifest.account_id,
                             )?;
                         }
-                        hydrate_selected_loaded_entries(store, &mut output).await?;
+                        if hydrate_selected {
+                            hydrate_selected_loaded_entries(store, &mut output).await?;
+                        }
                         return Ok(output);
                     }
                     let decoded = decode_owned_commit_delta_segment(inline_segment, None)?;
@@ -14507,10 +14739,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &decoded.payloads,
                     &encoded_key,
                     commit_id,
+                    0,
                     &manifest.account_id,
                 )?;
             }
-            hydrate_selected_loaded_entries(store, &mut output).await?;
+            if hydrate_selected {
+                hydrate_selected_loaded_entries(store, &mut output).await?;
+            }
             return Ok(output);
         }
         if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS {
@@ -14522,10 +14757,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                         &decoded.payloads,
                         &encoded_key,
                         commit_id,
+                        0,
                         &manifest.account_id,
                     )?;
                 }
-                hydrate_selected_loaded_entries(store, &mut output).await?;
+                if hydrate_selected {
+                    hydrate_selected_loaded_entries(store, &mut output).await?;
+                }
                 return Ok(output);
             }
             let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
@@ -14536,10 +14774,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &payloads,
                     &encoded_key,
                     commit_id,
+                    0,
                     &manifest.account_id,
                 )?;
             }
-            hydrate_selected_loaded_entries(store, &mut output).await?;
+            if hydrate_selected {
+                hydrate_selected_loaded_entries(store, &mut output).await?;
+            }
             return Ok(output);
         }
         let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
@@ -14550,10 +14791,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                 &payloads,
                 &encoded_key,
                 commit_id,
+                0,
                 &manifest.account_id,
             )?;
         }
-        hydrate_selected_loaded_entries(store, &mut output).await?;
+        if hydrate_selected {
+            hydrate_selected_loaded_entries(store, &mut output).await?;
+        }
         return Ok(output);
     }
 
@@ -14655,6 +14899,8 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                                 &payloads,
                                 &encoded_keys[encoded_key],
                                 commit_id,
+                                u32::try_from(segment_index)
+                                    .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
                                 &manifest.account_id,
                             )?;
                         }
@@ -14677,12 +14923,16 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &decoded.payloads,
                     &encoded_keys[encoded_key],
                     commit_id,
+                    u32::try_from(segment_index)
+                        .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
                     &manifest.account_id,
                 )?;
             }
         }
         debug_assert!(missing.next().is_none());
-        hydrate_selected_loaded_entries(store, &mut output).await?;
+        if hydrate_selected {
+            hydrate_selected_loaded_entries(store, &mut output).await?;
+        }
         return Ok(output);
     }
     let segment_keys = segment_indices
@@ -14736,6 +14986,8 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                         &payloads,
                         &encoded_keys[encoded_key],
                         commit_id,
+                        u32::try_from(segment_index)
+                            .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
                         &manifest.account_id,
                     )?;
                 }
@@ -14753,6 +15005,8 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     payloads,
                     &encoded_keys[encoded_key],
                     commit_id,
+                    u32::try_from(segment_index)
+                        .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
                     &manifest.account_id,
                 )?;
             }
@@ -14787,16 +15041,19 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &payloads,
                     leaf_index,
                     commit_id,
+                    u32::try_from(segment_index)
+                        .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
                     &manifest.account_id,
                 )?);
                 leaf_index += 1;
             }
         }
     }
-    hydrate_selected_loaded_entries(store, &mut output).await?;
+    if hydrate_selected {
+        hydrate_selected_loaded_entries(store, &mut output).await?;
+    }
     Ok(output)
 }
-
 async fn hydrate_selected_loaded_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     entries: &mut [Option<LoadedCommitDeltaEntry>],
@@ -18573,6 +18830,7 @@ fn find_loaded_commit_delta_entry<S>(
     payloads: &CommitDeltaPayloadIndex<S>,
     target_key: &[u8],
     expected_commit_id: CommitId,
+    segment_index: u32,
     account_id: &str,
 ) -> Result<Option<LoadedCommitDeltaEntry>, LixError>
 where
@@ -18591,6 +18849,7 @@ where
         payloads,
         index,
         expected_commit_id,
+        segment_index,
         account_id,
     )?))
 }
@@ -18600,6 +18859,7 @@ fn load_commit_delta_entry_at_index<S>(
     payloads: &CommitDeltaPayloadIndex<S>,
     index: usize,
     expected_commit_id: CommitId,
+    segment_index: u32,
     account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError>
 where
@@ -18676,10 +18936,20 @@ where
         created_at: value.updated_at,
         origin_key,
     };
+    let ordinal = u16::try_from(index)
+        .expect("commit-delta segment row count fits the locator ordinal");
+    let change_id = change_record.change_id;
     Ok(LoadedCommitDeltaEntry {
         value,
         change_record,
+        physical_locator: authored.then_some(CommitDeltaChangeLocator {
+            change_id,
+            commit_id: expected_commit_id,
+            segment_index,
+            ordinal,
+        }),
         base_coordinate,
+        physical_group_coordinate: None,
         author_present,
         selected_ref,
         selected_tombstone,
@@ -21686,6 +21956,69 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn missing_change_locator_is_recovered_from_exact_physical_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let owner = CommitId::for_test_label("legacy-owner-without-change-locator");
+        let mut fixture = packed_commit_delta_fixtures().remove(1);
+        let mut legacy_change_uuid = *ChangeId::for_test_label(
+            "legacy-nondirect-change-without-locator",
+        )
+        .as_uuid()
+        .as_bytes();
+        // The only non-direct UUID address is the reserved zero ordinal.
+        legacy_change_uuid[12..].fill(0);
+        fixture.change_id = ChangeId::new(uuid::Uuid::from_bytes(legacy_change_uuid));
+        fixture.deleted = false;
+        assert!(super::direct_change_locator(fixture.change_id).is_none());
+
+        let deltas = commit_delta_refs(owner, std::slice::from_ref(&fixture));
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[false])
+            .expect("legacy physical owner should stage without direct addressing");
+        stage_fixture_manifest_with_author(
+            &mut writes,
+            owner,
+            staged.mutation_inventory(),
+            crate::ANONYMOUS_ACCOUNT_ID,
+        )
+        .expect("legacy physical owner manifest should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy physical owner should commit without a locator projection");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy physical owner read should open");
+        assert!(
+            super::load_canonical_change_locator(&read, fixture.change_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the fixture must exercise the locator-absent compatibility path"
+        );
+        let locators = super::load_exact_tracked_row_change_locators(
+            &read,
+            &[(owner, fixture.change_id, fixture.key(), fixture.updated_at)],
+        )
+        .await
+        .expect("exact physical owner should provide a canonical locator");
+        assert_eq!(locators.len(), 1);
+        assert_eq!(locators[0].change_id, fixture.change_id);
+        assert_eq!(locators[0].commit_id, owner);
+        let records = super::load_explicit_change_records_at_locators(&read, &locators)
+            .await
+            .expect("recovered locator must authenticate the physical authored payload");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].change_id, fixture.change_id);
+        assert_eq!(records[0].schema_key, fixture.schema_key);
+        assert_eq!(records[0].row_pk, fixture.row_pk);
+        assert_eq!(records[0].created_at, fixture.updated_at);
+        assert!(records[0].snapshot.is_some());
+    }
+
     fn native_snapshot_payload(row_pk: &RowPk, value: serde_json::Value) -> Vec<u8> {
         crate::row_payload::TypedRow::from_test_json_unchecked(row_pk, &value)
             .expect("test row should build")
@@ -22428,6 +22761,7 @@ mod tests {
             &legacy_payloads,
             0,
             selected,
+            0,
             crate::ANONYMOUS_ACCOUNT_ID,
         )
         .unwrap();

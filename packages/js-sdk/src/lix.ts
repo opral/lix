@@ -347,6 +347,23 @@ export class Lix {
 		return this.binding.syncHealth();
 	}
 
+	/**
+	 * Prepare the bounded baseline graph frontier needed by local writes on a
+	 * partial replica. This does not mutate or publish SQL data; file content,
+	 * plugins, and other query-specific inputs remain demand-driven.
+	 */
+	async prepareOfflineEditing(): Promise<void> {
+		const prepare = this.binding.prepareOfflineEditing;
+		if (typeof prepare !== "function") {
+			const error = new Error(
+				"offline editing preparation is unavailable for this Lix binding",
+			) as Error & { code: string };
+			error.code = "LIX_SYNC_MODE_MISMATCH";
+			throw error;
+		}
+		return this.#runOperation(() => prepare.call(this.binding));
+	}
+
 	async activeBranchId(): Promise<string> {
 		return this.#runOperation(() => this.binding.activeBranchId());
 	}

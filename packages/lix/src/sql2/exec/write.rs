@@ -11,6 +11,7 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::common::ExecuteStatementMetadata;
+use crate::sql2::bind::write::BoundWriteOp;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
@@ -337,6 +338,7 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
         return Ok(None);
     };
     validate_write_parameter_count(&write_plan.plan, parameter_batch.num_columns())?;
+    let direct_new_change_id_columns = direct_new_change_id_columns(&write_plan.plan);
     if let Some(results) = super::bound_public_write::try_execute_row_insert_parameter_batch(
         ctx,
         &write_plan.plan,
@@ -345,7 +347,10 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     .await
     .map_err(normalize_bound_public_write_error)?
     {
-        return Ok(Some(results));
+        return Ok(Some(attach_direct_new_change_id_columns(
+            results,
+            &direct_new_change_id_columns,
+        )));
     }
     super::bound_public_write::try_execute_row_update_parameter_batch(
         ctx,
@@ -354,6 +359,11 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     )
     .await
     .map_err(normalize_bound_public_write_error)
+    .map(|results| {
+        results.map(|results| {
+            attach_direct_new_change_id_columns(results, &direct_new_change_id_columns)
+        })
+    })
 }
 
 pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
@@ -371,6 +381,7 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
         return Ok(None);
     }
     validate_write_parameter_count(&write_plan.plan, first.len())?;
+    let direct_new_change_id_columns = direct_new_change_id_columns(&write_plan.plan);
     if let Some(results) = super::bound_public_write::try_execute_row_insert_value_batch(
         ctx,
         &write_plan.plan,
@@ -379,7 +390,10 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
     .await
     .map_err(normalize_bound_public_write_error)?
     {
-        return Ok(Some(results));
+        return Ok(Some(attach_direct_new_change_id_columns(
+            results,
+            &direct_new_change_id_columns,
+        )));
     }
     super::bound_public_write::try_execute_row_update_value_batch(
         ctx,
@@ -388,6 +402,30 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
     )
     .await
     .map_err(normalize_bound_public_write_error)
+    .map(|results| {
+        results.map(|results| {
+            attach_direct_new_change_id_columns(results, &direct_new_change_id_columns)
+        })
+    })
+}
+
+fn direct_new_change_id_columns(plan: &LogicalWritePlan) -> Vec<usize> {
+    plan.bound
+        .returning
+        .as_ref()
+        .map_or_else(Vec::new, |returning| {
+            returning.direct_new_change_id_columns(plan.bound.op == BoundWriteOp::Delete)
+        })
+}
+
+fn attach_direct_new_change_id_columns(
+    results: Vec<SqlWriteResult>,
+    columns: &[usize],
+) -> Vec<SqlWriteResult> {
+    results
+        .into_iter()
+        .map(|result| result.with_direct_new_change_id_columns(columns.to_vec()))
+        .collect()
 }
 
 #[cfg(test)]

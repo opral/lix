@@ -1715,6 +1715,37 @@ where
         self.engine.sync_mode().health().snapshot()
     }
 
+    /// Prepares the bounded baseline graph metadata required by local edits on
+    /// a partial replica. This performs no SQL mutation or publication. It is
+    /// an explicit opt-in so read-only opens keep their lazy metadata frontier;
+    /// file content, plugins, and other query-specific inputs remain demand-driven.
+    pub async fn prepare_offline_editing(&self) -> Result<(), LixError> {
+        if self.engine.sync_mode().role() != crate::sync::SyncRole::PartialReplica {
+            return Err(LixError::new(
+                "LIX_SYNC_MODE_MISMATCH",
+                "offline editing preparation requires a partial replica",
+            ));
+        }
+        let admission = self
+            .engine
+            .sync_mode()
+            .partial_admission()
+            .ok_or_else(|| LixError::unknown("partial replica lost its admission"))?;
+        if admission.active_account_id() != self.active_account_id() {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "offline editing preparation must use the authority-authenticated account",
+            ));
+        }
+        let demand_tx = self.sync_demand_tx.as_ref().ok_or_else(|| {
+            LixError::new(
+                "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED",
+                "partial replica has no active demand worker for offline editing preparation",
+            )
+        })?;
+        crate::sync::prepare_offline_editing(demand_tx).await
+    }
+
     /// Configures a deterministic, stream-first snapshot export.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
         let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
@@ -4431,7 +4462,7 @@ where
 #[path = "handle/session_open_retry_tests.rs"]
 mod session_open_retry_tests;
 
-#[cfg(all(test, feature = "server-protocol"))]
+#[cfg(test)]
 impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
     pub(crate) fn from_partial_engine_for_test(
         engine: Arc<Engine<StorageSession<S>>>,

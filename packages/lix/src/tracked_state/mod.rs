@@ -91,6 +91,7 @@ pub(crate) use storage::{
     load_change_record_by_id,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
+    load_exact_tracked_row_change_locators,
     load_commit_history_members_with_payloads_for_schemas, load_commit_mutation_directory_roots,
     load_commit_state_manifest, load_commit_state_manifests, load_exclusive_row_snapshots,
     load_local_commit_delta_members_with_payloads, load_local_selected_change_owner_commit_ids,

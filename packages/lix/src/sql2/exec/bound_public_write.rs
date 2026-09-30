@@ -1795,6 +1795,18 @@ pub(crate) async fn try_execute_bound_public_write(
         BoundWriteTarget::Row(surface) if bound_public_write_shape_supported(plan) => {
             execute_row_write(ctx, plan, surface, params)
                 .await
+                .map(|result| {
+                    result.with_direct_new_change_id_columns(
+                        plan.bound
+                            .returning
+                            .as_ref()
+                            .map_or_else(Vec::new, |returning| {
+                                returning.direct_new_change_id_columns(
+                                    plan.bound.op == BoundWriteOp::Delete,
+                                )
+                            }),
+                    )
+                })
                 .map(BoundPublicWriteExecution::Executed)
         }
         BoundWriteTarget::File(surface) => {

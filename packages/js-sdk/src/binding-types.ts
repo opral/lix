@@ -98,6 +98,7 @@ export type LixBinding = {
 		server: SyncServerBindingOptions,
 	): Promise<ReplicaRecoveryReceipt>;
 	syncHealth(): Promise<import("./types.js").SyncHealth>;
+	prepareOfflineEditing?(): Promise<void>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;

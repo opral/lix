@@ -60,6 +60,15 @@ macro_rules! wasm_session_methods {
                 crate::wasm::to_js(&health)
             }
 
+            #[wasm_bindgen(js_name = prepareOfflineEditing)]
+            pub async fn prepare_offline_editing(&self) -> Result<(), JsValue> {
+                self.instrument_operation(
+                    crate::session::SessionOperations::prepare_offline_editing(&self.inner),
+                )
+                .await
+                .map_err(crate::wasm::lix_error_to_js)
+            }
+
             #[wasm_bindgen(js_name = activeBranchId)]
             pub async fn active_branch_id(&self) -> Result<String, JsValue> {
                 self.instrument_operation(crate::session::SessionOperations::active_branch_id(

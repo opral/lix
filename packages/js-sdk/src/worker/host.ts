@@ -379,6 +379,18 @@ export function startWorkerHost(
                 return requiredLix(sessionId).recoverReplicaWithServer(operation.id, createSyncServerBridge(operation.server, operation.transportScope)!);
 			case "syncHealth":
 				return requiredLix(sessionId).syncHealth();
+			case "prepareOfflineEditing":
+				{
+					const binding = requiredLix(sessionId);
+					if (!binding.prepareOfflineEditing) {
+						const error = workerStateError(
+							"offline editing preparation is unavailable for this Lix binding",
+						);
+						error.code = "LIX_SYNC_MODE_MISMATCH";
+						throw error;
+					}
+					return binding.prepareOfflineEditing();
+				}
 			case "activeBranchId":
 				return requiredLix(sessionId).activeBranchId();
 			case "activeAccountId":

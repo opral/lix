@@ -12,6 +12,9 @@ pub(crate) struct SqlWriteResult {
     pub(crate) rows_affected: u64,
     pub(crate) returning: Option<SqlQueryResult>,
     pub(crate) checkpoint_telemetry: Option<(String, String)>,
+    /// Direct RETURNING columns whose new-image change IDs can be rebased once
+    /// commit materialization assigns canonical addresses.
+    pub(crate) direct_new_change_id_columns: Vec<usize>,
 }
 
 impl SqlWriteResult {
@@ -20,6 +23,7 @@ impl SqlWriteResult {
             rows_affected,
             returning: None,
             checkpoint_telemetry: None,
+            direct_new_change_id_columns: Vec::new(),
         }
     }
 
@@ -28,7 +32,13 @@ impl SqlWriteResult {
             rows_affected,
             returning: Some(returning),
             checkpoint_telemetry: None,
+            direct_new_change_id_columns: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_direct_new_change_id_columns(mut self, columns: Vec<usize>) -> Self {
+        self.direct_new_change_id_columns = columns;
+        self
     }
 
     pub(crate) fn checkpoint_function(

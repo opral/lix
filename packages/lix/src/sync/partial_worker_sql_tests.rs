@@ -14,6 +14,8 @@ pub(super) struct AuthorityClient {
     pub(super) metadata: Arc<AtomicUsize>,
     pub(super) first_accepted: Arc<tokio::sync::Notify>,
     pub(super) block_first: bool,
+    offline: Arc<std::sync::atomic::AtomicBool>,
+    offline_native_attempts: Arc<AtomicUsize>,
 }
 impl AuthorityClient {
     pub(super) fn new(authority: Arc<Lix<Memory>>, block_first: bool) -> Self {
@@ -24,6 +26,8 @@ impl AuthorityClient {
             chunks: Arc::default(),
             metadata: Arc::default(),
             first_accepted: Arc::default(),
+            offline: Arc::default(),
+            offline_native_attempts: Arc::default(),
         }
     }
 }
@@ -31,6 +35,24 @@ impl RawHttpClient for AuthorityClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             let url = url::Url::parse(&request.url).unwrap();
+            if self.offline.load(Ordering::SeqCst) {
+                if [
+                    "/sync/read-fulfillment",
+                    "/sync/native-metadata",
+                    "/sync/native-metadata-walk",
+                    "/sync/native-objects",
+                    "/sync/native-object-range",
+                ]
+                .iter()
+                .any(|suffix| url.path().ends_with(suffix))
+                {
+                    self.offline_native_attempts.fetch_add(1, Ordering::SeqCst);
+                }
+                return Err(LixError::new(
+                    "LIX_TRANSPORT_NETWORK",
+                    "test transport is offline",
+                ));
+            }
             let result = if request.method == http::Method::GET && !url.path().contains("/sync/") {
                 serde_json::json!({"protocolVersion":crate::SERVER_PROTOCOL_VERSION,"syncProtocolVersion":crate::sync::SYNC_PROTOCOL_VERSION,"lixId":self.authority.lix_id(),"sessionId":"partial-worker-authority","activeAccountId":self.authority.active_account_id()})
             } else if url.path().ends_with("/sync/read-fulfillment") {
@@ -54,6 +76,13 @@ impl RawHttpClient for AuthorityClient {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
                 serde_json::to_value(self.authority.read_sync_native_metadata(&body).await?)
                     .unwrap()
+            } else if url.path().ends_with("/sync/descriptor") {
+                // This test exercises demand preparation and local editing,
+                // not the unrelated background long-poll. Leave discovery
+                // pending so the worker can continue to serve foreground
+                // demands and cancel the poll when the test shuts down.
+                futures_util::future::pending::<()>().await;
+                unreachable!("pending descriptor discovery should be cancelled")
             } else if url.path().ends_with("/sync/retained-bodies") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 serde_json::to_value(
@@ -296,7 +325,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
 }
 
 #[tokio::test]
-async fn production_frontier_preparation_supports_thirty_local_appends() {
+async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() {
     let width = 16;
     let authority = Arc::new(open_lix().await.unwrap());
     let values = (0..width)
@@ -335,7 +364,10 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     )
     .unwrap();
     let memory = Memory::new();
-    let storage = StorageAdapter::new(memory.clone());
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     let mut writes = storage.new_write_set();
     let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
@@ -364,18 +396,7 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     let update = "UPDATE lix_key_value SET value=$2 WHERE key=$1";
     let select = "SELECT value FROM lix_key_value WHERE key=$1";
     let key = Value::Text("upload-000000".into());
-    let mut fetches = Fetches::default();
-    execute_hydrating(
-        &session,
-        &storage,
-        &state,
-        &authority,
-        update,
-        &[key.clone(), Value::Text("uploaded".into())],
-        &mut fetches,
-    )
-    .await
-    .unwrap();
+    let engine = Arc::new(engine);
 
     let client = AuthorityClient::new(authority.clone(), false);
     let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
@@ -387,58 +408,124 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    let worker = crate::sync::partial_runtime::run_partial_worker_with_changes(
-        storage.clone(),
-        Arc::new(state.clone()),
-        Some(transport),
-        || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
-        shutdown_rx,
-        receiver,
-        None,
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender.clone());
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine),
+        ),
     );
-    let caller = async {
-        // A resident baseline graph demand must still prepare its missing
-        // jump frontier through the real authenticated metadata transport.
-        let (response, done) = tokio::sync::oneshot::channel();
-        sender
-            .send(crate::sync::runtime::SyncDemand {
-                request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                    vec![NativeMetadataRef::CommitGraphRecord(
-                        state.descriptor().selected_branch.head.commit_id.clone(),
-                    )],
-                    LixError::unknown("prepare baseline write frontier"),
-                ),
-                response,
-            })
+    // Read-only bootstrap deliberately left this closure absent. The explicit
+    // API hydrates it through the admitted worker without executing a write.
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_some(),
+        "read-only bootstrap must leave write metadata lazy"
+    );
+    lix.prepare_offline_editing().await.unwrap();
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_none(),
+        "successful preparation must certify the bounded baseline frontier"
+    );
+    assert_eq!(
+        value(lix.execute(select, &[key.clone()]).await.unwrap()),
+        "baseline-39",
+        "frontier preparation must not execute a mutation as a side effect"
+    );
+    let prepared_fetches = client.metadata.load(Ordering::SeqCst);
+    assert!(
+        prepared_fetches > 0,
+        "fixture must exercise missing production frontier metadata"
+    );
+
+    // Closing and reopening both the adapter session and engine drops decoded
+    // process-local state. The next edit must depend on durably installed
+    // metadata rather than a warm Changelog/engine cache.
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+    drop(lix);
+    drop(storage);
+
+    // Reuse the same durable backing store through a fresh adapter/session.
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
             .await
             .unwrap();
-        done.await.unwrap().unwrap();
-        let prepared_fetches = client.metadata.load(Ordering::SeqCst);
-        assert!(
-            prepared_fetches > 0,
-            "fixture must exercise missing production frontier metadata"
-        );
-        for index in 0..30 {
-            session
-                .execute(
-                    update,
-                    &[key.clone(), Value::Text(format!("prepared-{index}"))],
-                )
-                .await
-                .unwrap();
-            session.execute(select, &[key.clone()]).await.unwrap();
-        }
-        assert_eq!(
-            client.metadata.load(Ordering::SeqCst),
-            prepared_fetches,
-            "prepared local appends must not require additional graph metadata"
-        );
-        assert_eq!(client.pushes.load(Ordering::SeqCst), 0);
-        shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
-    };
-    let (result, ()) = futures_util::join!(worker, caller);
-    result.unwrap();
-    session.close().await.unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let client = AuthorityClient::new(authority.clone(), false);
+    let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
+        .await
+        .unwrap();
+    transport
+        .bind_native_baseline_lease(state.baseline_lease())
+        .unwrap();
+    client.offline.store(true, Ordering::SeqCst);
+    let (shutdown, shutdown_rx) =
+        tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine),
+        ),
+    );
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_none(),
+        "the prepared selected/global graph frontier must survive adapter and engine reopen"
+    );
+    for index in 0..30 {
+        lix.execute(
+            update,
+            &[key.clone(), Value::Text(format!("prepared-{index}"))],
+        )
+        .await
+        .unwrap();
+        lix.execute(select, &[key.clone()]).await.unwrap();
+    }
+    assert_eq!(
+        client.offline_native_attempts.load(Ordering::SeqCst),
+        0,
+        "reopened local edits must not need remote native inputs"
+    );
+    assert_eq!(client.pushes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        value(lix.execute(select, &[key]).await.unwrap()),
+        "prepared-29"
+    );
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
 }
 
 #[derive(Clone)]

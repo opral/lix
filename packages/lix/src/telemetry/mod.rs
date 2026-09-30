@@ -744,6 +744,28 @@ pub(crate) struct InstrumentLixResult<F> {
     span: Option<ActiveTelemetrySpan>,
 }
 
+/// Recompute the coarse read-recipe mask from the private diagnostic marker.
+/// The marker itself is never exported; validating it here prevents stale or
+/// malformed summary fields from being attached to an unrelated error.
+fn native_read_recipe_mask(interests: &serde_json::Value) -> Option<u64> {
+    let interests = interests.get("interests")?.as_array()?;
+    let mut mask = 0_u64;
+    for interest in interests {
+        mask |= match interest.get("kind")?.as_str()? {
+            "exact" => 1,
+            "scan" => 2,
+            "file_content" => 4,
+            "filesystem_metadata" => 8,
+            "filesystem_paths" => 16,
+            "collection_generation" => 32,
+            "packed_identity_membership" => 64,
+            "diff" => 128,
+            _ => return None,
+        };
+    }
+    Some(mask)
+}
+
 impl<T, F> Future for InstrumentLixResult<F>
 where
     F: Future<Output = Result<T, crate::LixError>>,
@@ -776,6 +798,184 @@ where
                                         attributes.push(TelemetryAttribute::i64(attribute, value));
                                     }
                                 }
+                                if let Some("partial_receipt") = details
+                                    .get("migrationPhase")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.migration.phase",
+                                        "partial_receipt",
+                                    ));
+                                }
+                                if let Some(
+                                    value @ ("receipt_json_syntax"
+                                    | "receipt_json_data"
+                                    | "receipt_json_eof"
+                                    | "receipt_json_other"
+                                    | "unsupported_receipt_version"
+                                    | "descriptor_version_invalid"
+                                    | "branch_control_missing"
+                                    | "branch_incarnation_mismatch"
+                                    | "baseline_lease_invalid"
+                                    | "receipt_validation_failed"
+                                    | "v2_receipt_shape_invalid"
+                                    | "v2_descriptor_version_invalid"
+                                    | "v2_branch_control_missing"
+                                    | "v2_branch_incarnation_mismatch"
+                                    | "v2_receipt_json_syntax"
+                                    | "v2_receipt_json_data"
+                                    | "v2_receipt_json_eof"
+                                    | "v2_receipt_json_other"),
+                                ) = details
+                                    .get("failureReason")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.migration.failure_reason",
+                                        value,
+                                    ));
+                                }
+                                for (key, attribute) in [
+                                    ("jsonLine", "lix.migration.json_line"),
+                                    ("jsonColumn", "lix.migration.json_column"),
+                                ] {
+                                    if let Some(value) =
+                                        details.get(key).and_then(serde_json::Value::as_i64)
+                                    {
+                                        if (1..=16_384).contains(&value) {
+                                            attributes
+                                                .push(TelemetryAttribute::i64(attribute, value));
+                                        }
+                                    }
+                                }
+                                let receipt_version = details
+                                    .get("receiptVersion")
+                                    .and_then(serde_json::Value::as_u64);
+                                if let Some(value) = details
+                                    .get("missingField")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|value| match receipt_version {
+                                        Some(1) => matches!(
+                                            *value,
+                                            "version"
+                                                | "remoteId"
+                                                | "activeAccountId"
+                                                | "epochId"
+                                                | "descriptor"
+                                                | "baselineLease"
+                                                | "selectedServingGeneration"
+                                                | "globalServingGeneration"
+                                                | "descriptorVersion"
+                                                | "lixId"
+                                                | "defaultBranchId"
+                                                | "cursor"
+                                                | "selectedBranch"
+                                                | "globalBranch"
+                                                | "branchId"
+                                                | "createdAt"
+                                                | "updatedAt"
+                                                | "refChangeId"
+                                                | "head"
+                                                | "checkpoint"
+                                                | "commitId"
+                                                | "scopedRangeRootId"
+                                                | "scopedRangeRootDigest"
+                                                | "rowPkIndexRootId"
+                                                | "leaseId"
+                                                | "accountId"
+                                                | "roots"
+                                                | "expiresAtMs"
+                                        ),
+                                        Some(2) => matches!(
+                                            *value,
+                                            "version"
+                                                | "archivedBranchIds"
+                                                | "remoteId"
+                                                | "activeAccountId"
+                                                | "epochId"
+                                                | "descriptor"
+                                                | "baselineLease"
+                                                | "selectedServingGeneration"
+                                                | "globalServingGeneration"
+                                                | "descriptorVersion"
+                                                | "lixId"
+                                                | "defaultBranchId"
+                                                | "cursor"
+                                                | "selectedBranch"
+                                                | "globalBranch"
+                                                | "branchId"
+                                                | "createdAt"
+                                                | "updatedAt"
+                                                | "refChangeId"
+                                                | "head"
+                                                | "checkpoint"
+                                                | "commitId"
+                                                | "scopedRangeRootId"
+                                                | "scopedRangeRootDigest"
+                                                | "rowPkIndexRootId"
+                                                | "leaseId"
+                                                | "accountId"
+                                                | "roots"
+                                                | "expiresAtMs"
+                                        ),
+                                        Some(3) => matches!(
+                                            *value,
+                                            "version"
+                                                | "archivedBranchIds"
+                                                | "remoteId"
+                                                | "activeAccountId"
+                                                | "epochId"
+                                                | "descriptor"
+                                                | "baselineLease"
+                                                | "selectedServingGeneration"
+                                                | "globalServingGeneration"
+                                                | "descriptorVersion"
+                                                | "lixId"
+                                                | "defaultBranchId"
+                                                | "cursor"
+                                                | "selectedBranch"
+                                                | "globalBranch"
+                                                | "branchId"
+                                                | "createdAt"
+                                                | "updatedAt"
+                                                | "refChangeId"
+                                                | "authorId"
+                                                | "head"
+                                                | "checkpoint"
+                                                | "commitId"
+                                                | "scopedRangeRootId"
+                                                | "scopedRangeRootDigest"
+                                                | "rowPkIndexRootId"
+                                                | "leaseId"
+                                                | "accountId"
+                                                | "roots"
+                                                | "expiresAtMs"
+                                        ),
+                                        _ => *value == "version",
+                                    })
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.migration.missing_field",
+                                        value,
+                                    ));
+                                }
+                                if let Some(
+                                    value @ ("$"
+                                    | "$.descriptor.descriptorVersion"
+                                    | "$.descriptor.selectedBranch"
+                                    | "$.descriptor.globalBranch"
+                                    | "$.descriptor.selectedBranch.createdAt"
+                                    | "$.descriptor.globalBranch.createdAt"
+                                    | "$.baselineLease"),
+                                ) = details
+                                    .get("failurePath")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.migration.failure_path",
+                                        value,
+                                    ));
+                                }
                                 for (key, attribute) in [
                                     ("payloadStandaloneStatus", "lix.payload.standalone_status"),
                                     ("payloadPhysicalStatus", "lix.payload.physical_status"),
@@ -789,6 +989,82 @@ where
                                             .push(TelemetryAttribute::string(attribute, value));
                                     }
                                 }
+                                let payload_failure_reason = details
+                                    .get("payloadFailureReason")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|reason| {
+                                        matches!(
+                                            *reason,
+                                            "selected_change_payload_unavailable"
+                                                | "exact_owner_point_read_budget_exhausted"
+                                                | "selected_change_payload_recipe_mismatch"
+                                                | "selected_change_payload_identity_or_lifetime_mismatch"
+                                                | "selected_change_payload_locator_missing"
+                                                | "selected_change_payload_source_mismatch"
+                                                | "selected_change_payload_outside_descriptor_scope"
+                                                | "read_fulfillment_resident_input_conflict"
+                                                | "read_fulfillment_validation_failed"
+                                                | "read_fulfillment_install_failed"
+                                        )
+                                    });
+                                if let Some(reason) = payload_failure_reason {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.payload.failure_reason",
+                                        reason,
+                                    ));
+                                    if reason == "exact_owner_point_read_budget_exhausted"
+                                        && details.get("budget").and_then(serde_json::Value::as_u64)
+                                            == Some(65_536)
+                                        && details
+                                            .get("attempted")
+                                            .and_then(serde_json::Value::as_u64)
+                                            == Some(65_537)
+                                    {
+                                        attributes.push(TelemetryAttribute::i64(
+                                            "lix.payload.attempted",
+                                            65_537,
+                                        ));
+                                        attributes.push(TelemetryAttribute::i64(
+                                            "lix.payload.budget",
+                                            65_536,
+                                        ));
+                                    }
+                                }
+                                if let Some(
+                                    value @ ("pre_request_catalog"
+                                    | "read_fulfillment_validation"
+                                    | "read_fulfillment_install"),
+                                ) = details
+                                    .get("payloadPhase")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.payload.phase",
+                                        value,
+                                    ));
+                                }
+                                if let Some(
+                                    value @ ("registered_schema_identity_scan"
+                                    | "registered_schema_snapshot_load"),
+                                ) = details
+                                    .get("payloadOperation")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.payload.operation",
+                                        value,
+                                    ));
+                                }
+                                if let Some(change_id) = details
+                                    .get("changeId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                                {
+                                    attributes.push(TelemetryAttribute::string(
+                                        "lix.payload.change_id",
+                                        change_id.to_string(),
+                                    ));
+                                }
                                 for (key, attribute) in [
                                     ("payloadSourceDeferred", "lix.payload.source_deferred"),
                                     ("payloadPhysicalConflict", "lix.payload.physical_conflict"),
@@ -798,6 +1074,81 @@ where
                                     {
                                         attributes
                                             .push(TelemetryAttribute::boolean(attribute, value));
+                                    }
+                                }
+                                if let Some(interests) = details.get("readFulfillment") {
+                                    let interests_len = interests
+                                        .get("interests")
+                                        .and_then(serde_json::Value::as_array)
+                                        .map(Vec::len);
+                                    let count = details
+                                        .get("nativeReadRecipeCount")
+                                        .and_then(serde_json::Value::as_u64);
+                                    let mask = details
+                                        .get("nativeReadRecipeMask")
+                                        .and_then(serde_json::Value::as_u64);
+                                    let derived_mask = native_read_recipe_mask(interests);
+                                    if let (
+                                        Some(len),
+                                        Some(count),
+                                        Some(mask),
+                                        Some(derived_mask),
+                                    ) = (interests_len, count, mask, derived_mask)
+                                    {
+                                        if (1..=4096).contains(&count)
+                                            && usize::try_from(count).ok() == Some(len)
+                                            && mask <= 255
+                                            && mask == derived_mask
+                                        {
+                                            attributes.push(TelemetryAttribute::i64(
+                                                "lix.read.recipe_count",
+                                                i64::try_from(count).unwrap_or(0),
+                                            ));
+                                            attributes.push(TelemetryAttribute::i64(
+                                                "lix.read.recipe_mask",
+                                                i64::try_from(mask).unwrap_or(0),
+                                            ));
+                                        }
+                                    }
+                                }
+                                if error.code == "LIX_READ_FULFILLMENT_INVALID" {
+                                    if let Some(
+                                        value @ ("file_descriptor"
+                                        | "directory_descriptor"
+                                        | "binary_blob_ref"
+                                        | "plugin_registry"
+                                        | "account"
+                                        | "schema"
+                                        | "key_value"
+                                        | "other"),
+                                    ) = details
+                                        .get("payloadSchemaKind")
+                                        .and_then(serde_json::Value::as_str)
+                                    {
+                                        attributes.push(TelemetryAttribute::string(
+                                            "lix.payload.schema_kind",
+                                            value,
+                                        ));
+                                    }
+                                    for (key, attribute, max) in [
+                                        ("payloadRecipeCount", "lix.payload.recipe_count", 4096),
+                                        (
+                                            "payloadRequiredInputCount",
+                                            "lix.payload.required_input_count",
+                                            16_384,
+                                        ),
+                                        ("payloadRecipeMask", "lix.payload.recipe_mask", 255),
+                                    ] {
+                                        if let Some(value) = details
+                                            .get(key)
+                                            .and_then(serde_json::Value::as_u64)
+                                            .filter(|value| *value <= max)
+                                        {
+                                            attributes.push(TelemetryAttribute::i64(
+                                                attribute,
+                                                i64::try_from(value).unwrap_or(0),
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -1220,29 +1571,69 @@ mod tests {
         let span =
             ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
         let error = crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private payload")
-            .with_details(serde_json::json!({"receiptVersion": 2, "expectedReceiptVersion": 3, "payloadStandaloneStatus": "matched", "payloadPhysicalStatus": "private payload", "payloadSourceDeferred": true, "payloadPhysicalConflict": false, "secret": "private payload"}));
+            .with_details(serde_json::json!({
+                "receiptVersion": 2,
+                "expectedReceiptVersion": 3,
+                "migrationPhase": "partial_receipt",
+                "failureReason": "v2_branch_incarnation_mismatch",
+                "failurePath": "$.descriptor.selectedBranch.createdAt",
+                "payloadStandaloneStatus": "matched",
+                "payloadPhysicalStatus": "private payload",
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "changeId": "11111111-1111-4111-8111-111111111111",
+                "payloadSourceDeferred": true,
+                "payloadPhysicalConflict": false,
+                "secret": "private payload"
+            }));
         let result: Result<(), _> =
             futures_lite::future::block_on(instrument_lix_result(Some(span), async { Err(error) }));
         assert!(result.is_err());
-        let completed = completed.lock().unwrap();
+        let completed_guard = completed.lock().unwrap();
         assert_eq!(
-            completed[0].end.status,
+            completed_guard[0].end.status,
             Status::error("LIX_PARTIAL_REPLICA_STATE_INVALID")
         );
         assert!(
-            completed[0]
+            completed_guard[0]
                 .end
                 .attributes
                 .contains(&TelemetryAttribute::i64("lix.receipt.version", 2))
         );
         assert!(
-            completed[0]
+            completed_guard[0]
                 .end
                 .attributes
                 .contains(&TelemetryAttribute::i64("lix.receipt.expected_version", 3))
         );
         assert!(
-            completed[0]
+            completed_guard[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.phase",
+                    "partial_receipt"
+                ))
+        );
+        assert!(
+            completed_guard[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_reason",
+                    "v2_branch_incarnation_mismatch"
+                ))
+        );
+        assert!(
+            completed_guard[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_path",
+                    "$.descriptor.selectedBranch.createdAt"
+                ))
+        );
+        assert!(
+            completed_guard[0]
                 .end
                 .attributes
                 .contains(&TelemetryAttribute::string(
@@ -1251,7 +1642,7 @@ mod tests {
                 ))
         );
         assert!(
-            completed[0]
+            completed_guard[0]
                 .end
                 .attributes
                 .contains(&TelemetryAttribute::boolean(
@@ -1260,7 +1651,7 @@ mod tests {
                 ))
         );
         assert!(
-            completed[0]
+            completed_guard[0]
                 .end
                 .attributes
                 .contains(&TelemetryAttribute::boolean(
@@ -1268,7 +1659,572 @@ mod tests {
                     false
                 ))
         );
-        assert!(!format!("{:?}", completed[0]).contains("private payload"));
+        assert!(
+            completed_guard[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.failure_reason",
+                    "selected_change_payload_unavailable"
+                ))
+        );
+        assert!(
+            completed_guard[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.change_id",
+                    "11111111-1111-4111-8111-111111111111"
+                ))
+        );
+        assert!(!format!("{:?}", completed_guard[0]).contains("private payload"));
+        drop(completed_guard);
+
+        let unapproved =
+            crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private payload")
+                .with_details(serde_json::json!({
+                    "migrationPhase": "untrusted stage",
+                    "failureReason": "private parser input",
+                    "failurePath": "$.privateField"
+                }));
+        let second_span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(second_span), async {
+            Err::<(), _>(unapproved)
+        }))
+        .unwrap_err();
+        let completed_guard = completed.lock().unwrap();
+        assert!(!completed_guard[1].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.migration.phase"
+                || attribute.key == "lix.migration.failure_reason"
+                || attribute.key == "lix.migration.failure_path"
+        }));
+        assert!(!format!("{:?}", completed_guard[1]).contains("private parser input"));
+    }
+
+    #[test]
+    fn failed_operation_exports_bounded_owner_point_read_budget_diagnostic() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        let error = crate::LixError::new("LIX_INTERNAL_ERROR", "private details").with_details(
+            serde_json::json!({
+                "payloadFailureReason": "exact_owner_point_read_budget_exhausted",
+                "attempted": 65_537,
+                "budget": 65_536,
+                "payload": "private bytes",
+            }),
+        );
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.failure_reason",
+                    "exact_owner_point_read_budget_exhausted"
+                ))
+        );
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.payload.attempted", 65_537))
+        );
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.payload.budget", 65_536))
+        );
+        assert!(!format!("{:?}", spans[0]).contains("private bytes"));
+        drop(spans);
+
+        let invalid = crate::LixError::new("LIX_INTERNAL_ERROR", "private details").with_details(
+            serde_json::json!({
+                "payloadFailureReason": "exact_owner_point_read_budget_exhausted",
+                "attempted": 9_999_999,
+                "budget": 65_536,
+            }),
+        );
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(invalid)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            !spans[1]
+                .end
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "lix.payload.attempted"
+                    || attribute.key == "lix.payload.budget")
+        );
+    }
+
+    #[test]
+    fn failed_operation_exports_only_allowlisted_catalog_payload_boundary() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let error = crate::LixError::new("LIX_INTERNAL_ERROR", "private details").with_details(
+            serde_json::json!({
+                "payloadPhase": "pre_request_catalog",
+                "payloadOperation": "registered_schema_identity_scan",
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "private": "document bytes",
+            }),
+        );
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.phase",
+                    "pre_request_catalog"
+                ))
+        );
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.operation",
+                    "registered_schema_identity_scan"
+                ))
+        );
+        assert!(!format!("{:?}", spans[0]).contains("document bytes"));
+        drop(spans);
+
+        let invalid = crate::LixError::new("LIX_INTERNAL_ERROR", "private details").with_details(
+            serde_json::json!({
+                "payloadPhase": "private phase",
+                "payloadOperation": "private operation",
+            }),
+        );
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(invalid)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(!spans[1].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.payload.phase" || attribute.key == "lix.payload.operation"
+        }));
+    }
+
+    #[test]
+    fn failed_operation_exports_read_fulfillment_validation_cause() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let error = crate::LixError::new("LIX_READ_FULFILLMENT_INVALID", "private detail")
+            .with_details(serde_json::json!({
+                "payloadPhase": "read_fulfillment_validation",
+                "payloadFailureReason": "selected_change_payload_recipe_mismatch",
+                "payloadSchemaKind": "file_descriptor",
+                "payloadRecipeMask": 129,
+                "payloadRecipeCount": 2,
+                "payloadRequiredInputCount": 17,
+                "request": "private recipe data",
+            }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.phase",
+                    "read_fulfillment_validation"
+                ))
+        );
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.failure_reason",
+                    "selected_change_payload_recipe_mismatch"
+                ))
+        );
+        for attribute in [
+            TelemetryAttribute::string("lix.payload.schema_kind", "file_descriptor"),
+            TelemetryAttribute::i64("lix.payload.recipe_mask", 129),
+            TelemetryAttribute::i64("lix.payload.recipe_count", 2),
+            TelemetryAttribute::i64("lix.payload.required_input_count", 17),
+        ] {
+            assert!(spans[0].end.attributes.contains(&attribute));
+        }
+        assert!(!format!("{:?}", spans[0]).contains("private recipe data"));
+        drop(spans);
+
+        let invalid = crate::LixError::new("LIX_READ_FULFILLMENT_INVALID", "private detail")
+            .with_details(serde_json::json!({
+                "payloadPhase": "read_fulfillment_validation",
+                "payloadFailureReason": "raw validator detail",
+            }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(invalid)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[1]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.phase",
+                    "read_fulfillment_validation"
+                ))
+        );
+        assert!(
+            !spans[1]
+                .end
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "lix.payload.failure_reason")
+        );
+        assert!(!format!("{:?}", spans[1]).contains("raw validator detail"));
+        drop(spans);
+
+        let installation = crate::LixError::new(
+            "LIX_READ_FULFILLMENT_INVALID",
+            "canonical selected change payload identity or lifetime mismatch",
+        )
+        .with_details(serde_json::json!({
+            "payloadPhase": "read_fulfillment_install",
+            "payloadFailureReason": "selected_change_payload_identity_or_lifetime_mismatch",
+            "address": "private row identity",
+        }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(installation)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[2]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.phase",
+                    "read_fulfillment_install"
+                ))
+        );
+        assert!(
+            spans[2]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.failure_reason",
+                    "selected_change_payload_identity_or_lifetime_mismatch"
+                ))
+        );
+        assert!(!format!("{:?}", spans[2]).contains("private row identity"));
+    }
+
+    #[test]
+    fn native_read_recipe_summary_requires_a_matching_private_marker() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let error = crate::LixError::new("LIX_INTERNAL_ERROR", "private cause").with_details(
+            serde_json::json!({
+                "readFulfillment": {
+                    "interests": [
+                        { "kind": "exact", "schema_key": "private_schema", "row_pk": "private_row" },
+                        { "kind": "diff", "relation": "private_relation" }
+                    ]
+                },
+                "nativeReadRecipeCount": 2,
+                "nativeReadRecipeMask": 129,
+            }),
+        );
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+        let spans = completed.lock().unwrap();
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.read.recipe_count", 2))
+        );
+        assert!(
+            spans[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.read.recipe_mask", 129))
+        );
+        let serialized = format!("{:?}", spans[0]);
+        assert!(!serialized.contains("private_schema"));
+        assert!(!serialized.contains("private_row"));
+        drop(spans);
+
+        for (count, mask, kind) in [(3, 129, "exact"), (2, 1, "exact"), (2, 129, "private")] {
+            let error = crate::LixError::new("LIX_INTERNAL_ERROR", "private cause").with_details(
+                serde_json::json!({
+                    "readFulfillment": { "interests": [{ "kind": kind }, { "kind": "diff" }] },
+                    "nativeReadRecipeCount": count,
+                    "nativeReadRecipeMask": mask,
+                }),
+            );
+            let span = ActiveTelemetrySpan::start(
+                &sink,
+                TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()),
+            );
+            futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+                Err::<(), _>(error)
+            }))
+            .unwrap_err();
+        }
+        let spans = completed.lock().unwrap();
+        for span in &spans[1..] {
+            assert!(
+                !span
+                    .end
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.starts_with("lix.read."))
+            );
+        }
+    }
+
+    #[test]
+    fn payload_recipe_summaries_are_code_gated_and_bounded() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        for (code, details) in [
+            (
+                "LIX_READ_FULFILLMENT_INVALID",
+                serde_json::json!({
+                    "payloadSchemaKind": "file_descriptor",
+                    "payloadRecipeCount": 4097,
+                    "payloadRecipeMask": 256,
+                    "payloadRequiredInputCount": 16_385,
+                }),
+            ),
+            (
+                "LIX_INTERNAL_ERROR",
+                serde_json::json!({
+                    "payloadSchemaKind": "file_descriptor",
+                    "payloadRecipeCount": 2,
+                    "payloadRecipeMask": 129,
+                    "payloadRequiredInputCount": 17,
+                }),
+            ),
+        ] {
+            let error = crate::LixError::new(code, "private cause").with_details(details);
+            let span = ActiveTelemetrySpan::start(
+                &sink,
+                TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()),
+            );
+            futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+                Err::<(), _>(error)
+            }))
+            .unwrap_err();
+        }
+        let spans = completed.lock().unwrap();
+        for span in spans.iter() {
+            assert!(!span.end.attributes.iter().any(|attribute| {
+                attribute.key == "lix.payload.schema_kind"
+                    || attribute.key == "lix.payload.recipe_count"
+                    || attribute.key == "lix.payload.recipe_mask"
+                    || attribute.key == "lix.payload.required_input_count"
+            }));
+        }
+    }
+
+    #[test]
+    fn json_parser_diagnostics_are_bounded_and_field_allowlisted() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let error =
+            crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private parser text")
+                .with_details(serde_json::json!({
+                    "receiptVersion": 2,
+                    "migrationPhase": "partial_receipt",
+                    "failureReason": "v2_receipt_json_data",
+                    "failurePath": "$",
+                    "jsonLine": 12,
+                    "jsonColumn": 5,
+                    "missingField": "activeAccountId"
+                }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+
+        let error =
+            crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private parser text")
+                .with_details(serde_json::json!({
+                    "receiptVersion": 2,
+                    "migrationPhase": "partial_receipt",
+                    "failureReason": "v2_receipt_json_other",
+                    "failurePath": "$",
+                    "jsonLine": 16_385,
+                    "jsonColumn": 0,
+                    "missingField": "authorId"
+                }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+
+        let error =
+            crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private parser text")
+                .with_details(serde_json::json!({
+                    "receiptVersion": 3,
+                    "expectedReceiptVersion": 3,
+                    "migrationPhase": "partial_receipt",
+                    "failureReason": "receipt_json_data",
+                    "failurePath": "$",
+                    "jsonLine": 4,
+                    "jsonColumn": 6,
+                    "missingField": "authorId"
+                }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+
+        let error =
+            crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private parser text")
+                .with_details(serde_json::json!({
+                    "receiptVersion": 2,
+                    "expectedReceiptVersion": 3,
+                    "migrationPhase": "partial_receipt",
+                    "failureReason": "receipt_validation_failed",
+                    "failurePath": "$.baselineLease"
+                }));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        futures_lite::future::block_on(instrument_lix_result(Some(span), async {
+            Err::<(), _>(error)
+        }))
+        .unwrap_err();
+
+        let completed = completed.lock().unwrap();
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_reason",
+                    "v2_receipt_json_data"
+                ))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.migration.json_line", 12))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.migration.json_column", 5))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.missing_field",
+                    "activeAccountId"
+                ))
+        );
+        assert!(!completed[1].end.attributes.iter().any(|attribute| {
+            attribute.key == "lix.migration.json_line"
+                || attribute.key == "lix.migration.json_column"
+                || attribute.key == "lix.migration.missing_field"
+        }));
+        assert!(
+            completed[2]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.missing_field",
+                    "authorId"
+                ))
+        );
+        assert!(
+            completed[2]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_reason",
+                    "receipt_json_data"
+                ))
+        );
+        assert!(
+            completed[3]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_path",
+                    "$.baselineLease"
+                ))
+        );
+        assert!(
+            completed[3]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.migration.failure_reason",
+                    "receipt_validation_failed"
+                ))
+        );
+        assert!(!format!("{:?}", completed).contains("private parser text"));
     }
 
     #[test]

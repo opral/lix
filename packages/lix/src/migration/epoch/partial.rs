@@ -53,6 +53,8 @@ fn historical_receipt_migration_required(version: u32) -> LixError {
             "receiptVersion": version,
             "expectedReceiptVersion": 3,
             "migrationPhase": "partial_receipt",
+            "failureReason": "unsupported_receipt_version",
+            "failurePath": "$",
         }),
     )
 }
@@ -455,14 +457,24 @@ mod tests {
             let admitted = install_fresh_partial_epoch(storage.clone(), &state)
                 .await
                 .unwrap();
-            let mut historical = serde_json::to_value(&state).unwrap();
-            historical["version"] = serde_json::json!(version);
-            if version == 1 {
-                historical
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("archivedBranchIds");
-            }
+            let historical = if version == 99 {
+                let mut current = serde_json::to_value(&state).unwrap();
+                current["version"] = serde_json::json!(version);
+                current
+            } else {
+                let mut legacy: serde_json::Value = serde_json::from_slice(
+                    &crate::sync::released_v2_receipt_bytes_for_test(
+                        &state,
+                        if version == 1 { 1 } else { 2 },
+                    ),
+                )
+                .unwrap();
+                legacy["version"] = serde_json::json!(version);
+                if version == 1 {
+                    legacy.as_object_mut().unwrap().remove("archivedBranchIds");
+                }
+                legacy
+            };
             let mut writes = admitted.adapter.new_write_set();
             writes.put(
                 crate::sync::PARTIAL_REPLICA_STATE_SPACE,
@@ -509,6 +521,8 @@ mod tests {
                 assert_eq!(details["receiptVersion"], version);
                 assert_eq!(details["expectedReceiptVersion"], 3);
                 assert_eq!(details["migrationPhase"], "partial_receipt");
+                assert_eq!(details["failureReason"], "unsupported_receipt_version");
+                assert_eq!(details["failurePath"], "$");
             }
             assert_eq!(
                 durable_pointer(&storage).await.unwrap().unwrap().1,

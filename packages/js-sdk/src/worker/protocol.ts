@@ -115,6 +115,7 @@ export type WorkerOperation =
 			transportScope: number;
 	  }
 	| { kind: "syncHealth" }
+	| { kind: "prepareOfflineEditing" }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }

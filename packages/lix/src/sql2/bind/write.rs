@@ -1,4 +1,4 @@
-use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef};
+use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef, ReturningImage};
 use super::read::BoundRead;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
@@ -26,6 +26,29 @@ pub(crate) struct BoundWrite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundReturning {
     pub(crate) items: Vec<BoundReturningItem>,
+}
+
+impl BoundReturning {
+    /// Result columns that directly expose the new image's provisional change
+    /// ID. Only these cells may be rebased after commit materialization.
+    pub(crate) fn direct_new_change_id_columns(&self, delete: bool) -> Vec<usize> {
+        if delete {
+            return Vec::new();
+        }
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(
+                    item.expr.as_ref(),
+                    Some(BoundExpr::Column(column))
+                        if column.name == "lixcol_change_id"
+                            && column.image != Some(ReturningImage::Old)
+                )
+                .then_some(index)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

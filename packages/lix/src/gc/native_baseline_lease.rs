@@ -37,6 +37,27 @@ fn key(id: &str) -> Result<StorageKey, LixError> {
         .ok_or_else(|| invalid("lease ID must be a canonical UUID"))
 }
 impl NativeBaselineLease {
+    /// Reconstruct the exact bounded v1/v2 lease coordinates embedded in a
+    /// released partial-replica receipt. This is a local metadata promotion;
+    /// it does not renew expiry or grant server-side lease authority.
+    pub(crate) fn from_partial_receipt_fields(
+        version: u32,
+        lease_id: String,
+        account_id: String,
+        roots: Vec<String>,
+        expires_at_ms: u64,
+    ) -> Result<Self, LixError> {
+        let lease = Self {
+            version,
+            lease_id,
+            account_id,
+            roots,
+            expires_at_ms,
+        };
+        lease.validate()?;
+        Ok(lease)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         key(&self.lease_id)?;
         key(&self.account_id)?;

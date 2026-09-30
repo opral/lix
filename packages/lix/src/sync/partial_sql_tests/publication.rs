@@ -145,6 +145,22 @@ pub(super) async fn fixture_from_authority(
     SessionContext<Memory>,
     Arc<PartialReplicaState>,
 ) {
+    fixture_from_authority_with_storage(authority, account, Memory::new()).await
+}
+
+async fn fixture_from_authority_with_storage<S>(
+    authority: Lix<Memory>,
+    account: Option<&str>,
+    backing: S,
+) -> (
+    Lix<Memory>,
+    Arc<Engine<S>>,
+    SessionContext<S>,
+    Arc<PartialReplicaState>,
+)
+where
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+{
     let state = Arc::new(
         PartialReplicaState::new(
             format!("https://example.test/lix/{}", authority.lix_id()),
@@ -154,7 +170,7 @@ pub(super) async fn fixture_from_authority(
         )
         .unwrap(),
     );
-    let storage = StorageAdapter::new(Memory::new());
+    let storage = StorageAdapter::new(backing);
     let read = storage.begin_read(Default::default()).await.unwrap();
     let mut writes = storage.new_write_set();
     let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
@@ -218,7 +234,13 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .get::<String>("commit_id")
         .unwrap();
 
-    let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
+    let backing = crate::storage_adapter::StorageSession::acquire(
+        crate::sync::durable_memory_for_test(Memory::new()),
+    )
+    .await
+    .unwrap();
+    let (authority, engine, session, state) =
+        fixture_from_authority_with_storage(authority, None, backing).await;
     let mut fetches = Fetches::default();
     let undo = execute_hydrating(
         &session,
@@ -336,26 +358,67 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
     // one-time migration must certify the resident undo root without replacing
     // its unpublished head or row values.
     {
-        use crate::storage::{Storage as _, StorageWrite as _};
-        let mut raw = storage.storage().begin_write(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
         let mut keys = Vec::new();
         for branch in [&state.descriptor().selected_branch, &state.descriptor().global_branch] {
             let key = StorageKey(bytes::Bytes::copy_from_slice(
                 uuid::Uuid::parse_str(&branch.branch_id).unwrap().as_bytes(),
             ));
             if !keys.contains(&key) {
-                keys.push(key);
+                keys.push(key.clone());
+                writes.delete(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, key);
             }
         }
-        raw.delete_many(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, &keys)
+        storage
+            .commit_migration_write_set(writes, Default::default())
             .await
             .unwrap();
-        raw.commit().await.unwrap();
     }
+    // The branch has a real local undo and an unpublished edit. Rewrite only
+    // its receipt to the exact released-v2 wire shape and exercise the owned
+    // epoch migration before opening it again.
+    drop(session);
+    drop(engine);
+    let mut legacy_receipt = storage.new_write_set();
+    legacy_receipt.put(
+        crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+        crate::sync::partial_replica_state_key(),
+        crate::sync::released_v2_receipt_bytes_for_test(state.as_ref(), 2).to_vec(),
+    );
+    // This fixture is a pointerless v84 physical repository. Stage the exact
+    // historical marker on the legacy layout; the active-epoch format helper
+    // is intentionally not applicable before an epoch pointer exists.
+    legacy_receipt.put(
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        crate::init::REPOSITORY_PROTOCOL_KEY,
+        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
+    );
+    storage
+        .commit_migration_write_set(legacy_receipt, Default::default())
+        .await
+        .unwrap();
+    let migration = crate::migration::migrate_repository(storage.storage().clone())
+        .await
+        .expect("released-v2 receipt migration must preserve local undo and edits");
+    assert!(migration.semantic_preservation_verified);
+    // Explicit migration publishes a new active epoch while retaining the
+    // pointerless source as a recovery bank. Reopen through partial admission
+    // so this assertion observes the activated candidate rather than reading
+    // the retained v2 source directly.
+    let migrated_admission = crate::migration::admit_partial_epoch(storage.storage())
+        .await
+        .expect("migrated partial epoch must be admitted");
+    let storage = migrated_admission.adapter;
+    let migrated_state = Arc::new(migrated_admission.state);
     let (migrated, migrated_session) =
-        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &migrated_state)
             .await
             .expect("legacy local undo must migrate without losing pending work");
+    migrated.sync_mode().admit_partial_replica(
+        migrated_state.clone(),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     assert!(
         value(migrated_session.execute(
             "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
@@ -2350,7 +2413,10 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
         .unwrap()
         .unwrap();
     drop(read);
-    let mut legacy = serde_json::to_value(&state).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(
+        &crate::sync::released_v2_receipt_bytes_for_test(&state, 1),
+    )
+    .unwrap();
     legacy.as_object_mut().unwrap().remove("archivedBranchIds");
     legacy["version"] = serde_json::json!(1);
     let mut writes = storage.new_write_set();
@@ -2421,9 +2487,17 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
         .await
         .unwrap();
     assert!(admitted.state.archived_branch_ids().is_empty());
-    assert_eq!(admitted.state, state);
+    // The released v1 receipt carried a v1 baseline lease. Migration preserves
+    // its authority coordinates and expiry; it must not silently renew or
+    // promote that historical lease to the current version.
+    let mut expected_state = serde_json::to_value(&state).unwrap();
+    expected_state["baselineLease"]["version"] = serde_json::json!(1);
+    assert_eq!(serde_json::to_value(&admitted.state).unwrap(), expected_state);
+    let migrated_state = admitted.state.clone();
     assert_eq!(
-        admitted_controls(&admitted.adapter, &state).await.unwrap(),
+        admitted_controls(&admitted.adapter, &migrated_state)
+            .await
+            .unwrap(),
         before_controls
     );
     let read = admitted
@@ -2433,8 +2507,8 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
         .unwrap();
     let (after_record, after_push, _) = crate::sync::partial_push_state::load_partial_push_state(
         &read,
-        &state,
-        &state.descriptor().selected_branch.branch_id,
+        &migrated_state,
+        &migrated_state.descriptor().selected_branch.branch_id,
     )
     .await
     .unwrap();
@@ -2442,11 +2516,11 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     assert_eq!(after_record.prepared.as_ref(), Some(&pending_upload));
     drop(read);
     let (engine, session) =
-        Engine::new_partial_replica(admitted.adapter, EngineOptions::new(), &state)
+        Engine::new_partial_replica(admitted.adapter, EngineOptions::new(), &migrated_state)
             .await
             .unwrap();
     engine.sync_mode().admit_partial_replica(
-        Arc::new(state.clone()),
+        Arc::new(migrated_state.clone()),
         crate::sync::partial_replica_write_capability(),
     );
     assert_eq!(
@@ -2496,7 +2570,7 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
             .await
             .unwrap()
             .state,
-        state
+        migrated_state
     );
 }
 

@@ -682,6 +682,20 @@ test("sync health forwards the phase failures and cursor snapshot", async () => 
 	await expect(result).resolves.toEqual(health);
 });
 
+test("offline editing preparation is forwarded to the owning worker session", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	const binding = workerBinding(client, new BindingLease(() => undefined));
+	const result = binding.prepareOfflineEditing?.();
+	if (!result) throw new Error("expected offline editing operation");
+	const request = transport.sent.at(-1);
+	if (!request || !("id" in request)) throw new Error("expected worker request");
+	expect(request.operation).toEqual({ kind: "prepareOfflineEditing" });
+	transport.emit({ id: request.id, ok: true, value: undefined });
+	await expect(result).resolves.toBeUndefined();
+});
+
 test("an unanswered open rejects within its budget and disposes its connection", async () => {
 	vi.useFakeTimers();
 	try {

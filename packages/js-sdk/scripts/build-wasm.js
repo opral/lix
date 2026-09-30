@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -121,6 +122,12 @@ await run("wasm-bindgen", [
 	"--out-name",
 	"lix_js_sdk",
 ]);
+const wasmBytes = await readFile(join(outDir, "lix_js_sdk_bg.wasm"));
+const wasmSha256 = createHash("sha256").update(wasmBytes).digest("hex");
+await writeFile(
+	join(outDir, "lix_js_sdk_bg.asset.js"),
+	`export default ${JSON.stringify(wasmSha256)};\n`,
+);
 await removeSyncInitializer();
 // Source imports (`../wasm/lix_js_sdk.js`) resolve here for Node vitest.
 await rm(sourceOutDir, { recursive: true, force: true });

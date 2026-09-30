@@ -106,6 +106,11 @@ struct StoredExecuteResult {
     rows: Vec<Vec<StoredValue>>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
+    /// Transient binding provenance used to canonicalize the receipt before
+    /// the atomic storage write. It is deliberately not persisted: receipts
+    /// contain only the committed result returned on replay.
+    #[serde(skip)]
+    direct_new_change_id_columns: Vec<usize>,
     /// Receipts written before spans existed replay without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     commit: Option<StoredCommitSpan>,
@@ -233,6 +238,36 @@ impl ExecuteIdempotencyReceipt {
         }
     }
 
+    /// Rewrites only directly projected new-image change IDs before this
+    /// receipt is encoded into the same storage commit as its mutation.
+    pub(crate) fn remap_direct_new_change_ids(
+        &mut self,
+        remap: &std::collections::BTreeMap<String, String>,
+    ) {
+        if remap.is_empty() {
+            return;
+        }
+        for result in &mut self.results {
+            for row in &mut result.rows {
+                for &column_index in &result.direct_new_change_id_columns {
+                    let Some(StoredValue::Text(provisional)) = row.get_mut(column_index) else {
+                        continue;
+                    };
+                    if let Some(canonical) = remap.get(provisional) {
+                        *provisional = canonical.clone();
+                    }
+                }
+            }
+            result.direct_new_change_id_columns.clear();
+        }
+    }
+
+    pub(crate) fn requires_direct_new_change_id_remap(&self) -> bool {
+        self.results.iter().any(|result| {
+            !result.direct_new_change_id_columns.is_empty() && !result.rows.is_empty()
+        })
+    }
+
     pub(crate) fn into_single_result(self) -> Result<ExecuteResult, LixError> {
         let mut results = self.into_results()?;
         if results.len() != 1 {
@@ -270,6 +305,7 @@ impl StoredExecuteResult {
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),
+            direct_new_change_id_columns: result.direct_new_change_id_columns().to_vec(),
             commit: result.commit().map(|span| StoredCommitSpan {
                 before: span.before().to_owned(),
                 after: span.after().to_owned(),

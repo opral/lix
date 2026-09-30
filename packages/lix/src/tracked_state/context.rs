@@ -1205,6 +1205,7 @@ where
             tree_request.limit = request.limit;
         }
         let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
+        let catalog_identity_scan = request.is_catalog_identity_only();
         let durable_root = self.tree.load_root(&self.store, commit_id).await?;
         if request_has_exact_keys(&tree_request) || durable_root.is_some() {
             #[cfg(feature = "storage-benches")]
@@ -1267,7 +1268,7 @@ where
             if let Some(limit) = request.limit {
                 entries.truncate(limit);
             }
-            if let Some(root_id) = durable_root.as_ref() {
+            if let Some(root_id) = durable_root.as_ref() && !catalog_identity_scan {
                 self.restore_legacy_root_authors(root_id, &mut entries).await?;
             }
             return materialize_batch_from_index_entries(&self.store, entries, &materialization)
@@ -6472,7 +6473,7 @@ mod tests {
 
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::changelog::{ChangelogWriter, CommitRecord};
+    use crate::changelog::{ChangelogContext, ChangelogWriter, CommitRecord};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -12301,6 +12302,165 @@ mod tests {
                 .author_id,
             crate::SYSTEM_ACCOUNT_ID
         );
+    }
+
+    #[tokio::test]
+    async fn identity_only_v82_catalog_scan_does_not_require_the_missing_author_payload() {
+        let storage = StorageAdapter::new(Memory::new());
+        let context = TrackedStateContext::new();
+        let commit_id = CommitId::for_test_label("v82-catalog-identity-only");
+        let change_id = storage::change_id_from_packed_address(commit_id, 1);
+        let timestamp = crate::common::LixTimestamp::expect_parse(
+            "identity-only catalog timestamp",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut row = row("lix_account", "unused", "unused");
+        row.schema_key = "lix_registered_schema".to_owned();
+        row.commit_id = commit_id;
+        row.change_id = change_id;
+        row.author_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
+        row.created_at = timestamp.to_string();
+        row.updated_at = timestamp.to_string();
+
+        // Build an authorless v82 root entry, but deliberately omit both the
+        // standalone CHANGE_SPACE row and all commit-delta payloads. The
+        // schema-catalog caller filters this built-in row after reading its
+        // identity, so it must not require the discarded author payload.
+        let key = encoded_key_from_materialized_row(&row);
+        let value = encode_value_ref(TrackedStateIndexValueRef {
+            change_id,
+            commit_id,
+            author_id: &row.author_id,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            semantic_fingerprint: None,
+        });
+        let author_suffix_len = 2 + row.author_id.len();
+        let tail_end = value
+            .len()
+            .checked_sub(author_suffix_len)
+            .expect("encoded value should contain its author");
+        let mut legacy_leaf = vec![5, 1, 0, 0];
+        {
+            let mut write_varint = |mut value: u64| {
+                while value >= 0x80 {
+                    legacy_leaf.push((value as u8) | 0x80);
+                    value >>= 7;
+                }
+                legacy_leaf.push(value as u8);
+            };
+            write_varint(0);
+            write_varint(key.len() as u64);
+        }
+        legacy_leaf.extend_from_slice(&key);
+        legacy_leaf.extend_from_slice(&value[..16]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&value[16..32]);
+        legacy_leaf.push(0);
+        legacy_leaf.extend_from_slice(&value[32..tail_end]);
+        let root_hash = crate::tracked_state::codec::hash_bytes(&legacy_leaf);
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy graph read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(crate::changelog::ChangelogAppend {
+                commits: vec![CommitRecord {
+                    format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
+                    commit_id,
+                    generation: 0,
+                    parent_commit_ids: Vec::new(),
+                    base_commit_id: None,
+                    first_parent_jump_commit_id: commit_id,
+                    first_parent_jump_span: 0,
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    created_at: timestamp,
+                    touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
+                    is_checkpoint: false,
+                    first_parent_checkpoint_summary: None,
+                }],
+                changes: Vec::new(),
+            })
+            .await
+            .expect("commit graph node should stage without its old row payload");
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            root_hash.to_vec(),
+            legacy_leaf,
+        );
+        storage::stage_commit_state_manifest(
+            &mut writes,
+            &crate::tracked_state::types::CommitStateManifest {
+                incorporation: crate::tracked_state::types::CommitStateIncorporation::None,
+                commit_id,
+                change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                replay_debt: Default::default(),
+                mutations: Default::default(),
+                touched_scope_filter: Default::default(),
+                global_scope: false,
+                current_state_scoped_ranges: None,
+                row_pk_index_root_id: None,
+                snapshot_root: Some(Box::new(TrackedStateCommitRoot {
+                    commit_id,
+                    root_id: TrackedStateRootId::new(root_hash),
+                    parent_roots: Vec::new(),
+                    changed_key_count: 1,
+                    row_count_estimate: 1,
+                    tree_height: 1,
+                    complete_state_fence: false,
+                })),
+            },
+        )
+        .expect("identity-only legacy root manifest should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("identity-only legacy root should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy root read should open");
+        let mut reader = context.reader(read);
+        let identity_request = TrackedStateScanRequest {
+            filter: crate::tracked_state::TrackedStateFilter {
+                schema_keys: vec!["lix_registered_schema".to_owned()],
+                file_ids: vec![NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                columns: vec!["row_pk".to_owned()],
+            },
+            ..Default::default()
+        };
+        let identities = reader
+            .scan_batch_at_commit(&commit_id.to_string(), &identity_request)
+            .await
+            .expect("catalog identity scan must not hydrate an unneeded author payload");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities.into_rows()[0].row_pk, RowPk::single("lix_account"));
+
+        let mut ordinary_request = identity_request.clone();
+        ordinary_request.filter.file_ids.clear();
+        let error = reader
+            .scan_batch_at_commit(&commit_id.to_string(), &ordinary_request)
+            .await
+            .expect_err("ordinary scans still require the legacy author authority");
+        assert!(error.message.contains("no authoritative live payload"));
+
+        let invalid_identity_projection = TrackedStateScanRequest {
+            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned()],
+            },
+            ..identity_request
+        };
+        assert!(reader
+            .scan_batch_at_commit(&commit_id.to_string(), &invalid_identity_projection)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

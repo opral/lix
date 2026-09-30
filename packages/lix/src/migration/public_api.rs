@@ -734,11 +734,25 @@ mod tests {
                     .await
                     .unwrap();
             let expected = content_digest(&storage).await.unwrap();
-            let mut legacy_receipt = serde_json::to_value(&state).unwrap();
-            legacy_receipt["version"] = serde_json::json!(receipt_version);
-            if receipt_version == 1 {
-                legacy_receipt.as_object_mut().unwrap().remove("archivedBranchIds");
-            }
+            let current_receipt = serde_json::to_value(&state).unwrap();
+            let legacy_lease_version = if receipt_version == 1 || format <= 82 {
+                1
+            } else {
+                2
+            };
+            let legacy_receipt = if receipt_version == 3 {
+                current_receipt
+            } else {
+                let mut legacy: serde_json::Value = serde_json::from_slice(
+                    &crate::sync::released_v2_receipt_bytes_for_test(&state, legacy_lease_version),
+                )
+                .unwrap();
+                legacy["version"] = serde_json::json!(receipt_version);
+                if receipt_version == 1 {
+                    legacy.as_object_mut().unwrap().remove("archivedBranchIds");
+                }
+                legacy
+            };
             let mut writes = installed.adapter.new_write_set();
             if format <= 81 {
                 // A sparse cache cannot certify whole-collection completeness.
@@ -799,7 +813,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("format {format}, receipt {receipt_version} migration failed: {error:?}"));
             assert!(report.semantic_preservation_verified);
             assert_eq!(report.expected_content_digest, report.after_content_digest);
-            assert_eq!(report.after_content_digest, expected);
+            if receipt_version == 3 || legacy_lease_version == 2 {
+                assert_eq!(report.after_content_digest, expected);
+            }
             let lix = crate::open_lix()
                 .with_storage(storage.clone())
                 .await
@@ -807,13 +823,33 @@ mod tests {
             assert_eq!(lix.lix_id(), state.repository_id());
             assert_eq!(report.before.format, Some(format));
             lix.close().await.unwrap();
-            assert_eq!(content_digest(&storage).await.unwrap(), expected);
+            assert_eq!(
+                content_digest(&storage).await.unwrap(),
+                report.after_content_digest
+            );
             let admitted = super::super::epoch::admit_partial_epoch(&storage)
                 .await
                 .unwrap();
-            assert_eq!(admitted.state, state);
-            let read = admitted.adapter.begin_read(Default::default()).await.unwrap();
-            assert!(crate::sync::partial_serving::assert_admitted(&read, &state).await.unwrap());
+            let mut expected_state = serde_json::to_value(&state).unwrap();
+            if receipt_version < 3 {
+                expected_state["baselineLease"]["version"] =
+                    serde_json::json!(legacy_lease_version);
+            }
+            assert_eq!(
+                serde_json::to_value(&admitted.state).unwrap(),
+                expected_state,
+                "receipt {receipt_version} must preserve the original lease version"
+            );
+            let read = admitted
+                .adapter
+                .begin_read(Default::default())
+                .await
+                .unwrap();
+            assert!(
+                crate::sync::partial_serving::assert_admitted(&read, &state)
+                    .await
+                    .unwrap()
+            );
         }
     }
 

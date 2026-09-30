@@ -985,7 +985,15 @@ where
         crate::init::REPOSITORY_PROTOCOL_KEY,
     )
     .await?;
-    let partial_source_format = (intent == AdmissionIntent::PartialReplica)
+    // Explicit owned migration already knows the inspected repository role.
+    // Recognize exact partial protocol markers there too, so pointerless
+    // historical partial repositories are routed through the sparse partial
+    // candidate migrator instead of the full-layout marker parser. Ordinary
+    // full-repository opens still never reinterpret a partial marker.
+    let partial_source_format = matches!(
+        intent,
+        AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
+    )
         .then(|| source_marker.as_deref().and_then(partial_repository_format))
         .flatten();
     let legacy_status = match partial_source_format {
@@ -4523,7 +4531,7 @@ where
 }
 
 #[cfg(test)]
-pub(super) async fn stage_repository_format_for_test<S>(
+pub(crate) async fn stage_repository_format_for_test<S>(
     storage: &S,
     partial: bool,
     format: u32,

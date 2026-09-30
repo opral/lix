@@ -1,5 +1,6 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
@@ -584,10 +585,26 @@ where
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
     {
+        self.with_write_transaction_lending_spanned_with_change_id_remap(f)
+            .await
+            .map(|(value, commit, _)| (value, commit))
+    }
+
+    pub(crate) async fn with_write_transaction_lending_spanned_with_change_id_remap<T, F>(
+        &self,
+        f: F,
+    ) -> Result<(T, Option<CommitSpan>, BTreeMap<String, String>), LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+    {
         self.ensure_open()?;
         let write_access = self.begin_session_write_access().await?;
-        self.with_write_transaction_reserved_lending_spanned(write_access, f, |_| Ok(()))
-            .await
+        self.with_write_transaction_reserved_lending_spanned_with_change_id_remap(
+            write_access,
+            f,
+            |_| Ok(()),
+        )
+        .await
     }
 
     pub(super) async fn with_write_transaction_reserved_lending<T, F, A>(
@@ -613,6 +630,29 @@ where
         f: F,
         after_commit: A,
     ) -> Result<(T, Option<CommitSpan>), LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+        A: FnOnce(&T) -> Result<(), LixError>,
+    {
+        self.with_write_transaction_reserved_lending_spanned_with_change_id_remap(
+            write_access,
+            f,
+            after_commit,
+        )
+        .await
+        .map(|(value, commit, _)| (value, commit))
+    }
+
+    pub(super) async fn with_write_transaction_reserved_lending_spanned_with_change_id_remap<
+        T,
+        F,
+        A,
+    >(
+        &self,
+        write_access: SessionWriteAccess,
+        f: F,
+        after_commit: A,
+    ) -> Result<(T, Option<CommitSpan>, BTreeMap<String, String>), LixError>
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
         A: FnOnce(&T) -> Result<(), LixError>,
@@ -705,6 +745,7 @@ where
                     outcome
                         .active_branch_commit_span
                         .map(CommitSpan::from_commit_ids),
+                    outcome.canonical_change_id_remap,
                 ))
             }
             Err(error) => Err(error),

@@ -112,9 +112,9 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::read_set::{
-    SnapshotOverlapKind, SqlReadSet, SqlReadSetCheckpoint, WrittenRowIdentity, changed_footprint_rows,
-    changed_write_set_rows, snapshot_overlap_conflict, unvalidated_read_conflict,
-    write_set_footprints,
+    SnapshotOverlapKind, SqlReadSet, SqlReadSetCheckpoint, WrittenRowIdentity,
+    changed_footprint_rows, changed_write_set_rows, snapshot_overlap_conflict,
+    unvalidated_read_conflict, write_set_footprints,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staged_commit_changes::{
@@ -168,6 +168,8 @@ pub(crate) struct TransactionCommitOutcome {
     /// between. Equal when the transaction published no commit on that
     /// branch. `None` when the branch had no head to commit on.
     pub(crate) active_branch_commit_span: Option<(CommitId, CommitId)>,
+    /// Provisional new-image IDs replaced with canonical IDs in this commit.
+    pub(crate) canonical_change_id_remap: BTreeMap<String, String>,
 }
 
 fn typed_transaction_validation_counters(rows: &RawWriteBatch) -> WasmTransitionCounters {
@@ -829,6 +831,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
         ExecuteIdempotencyReceipt,
         Option<CommitId>,
     )>,
+    /// Commit materialization only collects canonical change-ID remaps when
+    /// an auto-committed direct `NEW.lixcol_change_id` result or durable
+    /// replay receipt needs those exact addresses.
+    capture_canonical_change_id_remap: bool,
     /// Storage-native metadata that must publish in the same backend commit as
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
@@ -1048,6 +1054,7 @@ type NativePreparationResult = Result<
         Vec<MaterializedHotStateRow>,
         Option<Vec<u8>>,
         Option<CatalogRevision>,
+        BTreeMap<String, String>,
     ),
     LixError,
 >;
@@ -1916,8 +1923,9 @@ where
         }
         let read_footprints = self.sql_read_set.entries();
         let registry = &self.opening_plugin_registry;
-        let file_scoped =
-            |schema_key: &str| schema_key == BLOB_REF_SCHEMA_KEY || registry.owns_schema(schema_key);
+        let file_scoped = |schema_key: &str| {
+            schema_key == BLOB_REF_SCHEMA_KEY || registry.owns_schema(schema_key)
+        };
         let write_footprints = write_set_footprints(
             prepared_writes
                 .state_rows
@@ -2641,6 +2649,7 @@ where
             native_merge_checkpoints: BTreeMap::new(),
             native_migration_branch_bridges: BTreeMap::new(),
             idempotency_receipt_source: None,
+            capture_canonical_change_id_remap: false,
             atomic_metadata_writes: None,
             atomic_metadata_preconditions: Vec::new(),
             sync_role: crate::sync::SyncRole::Disabled,
@@ -2748,6 +2757,7 @@ where
                 filesystem_delta_rows,
                 previous_filesystem_revision,
                 next_catalog_revision,
+                canonical_change_id_remap,
             ) = transaction
                 .prepare_storage_commit(runtime_functions, prepared_writes, materialize_span)
                 .await?;
@@ -2883,6 +2893,7 @@ where
                 active_branch_commit_span: transaction
                     .opening_active_branch_head
                     .map(|before| (before, published_active_branch_commit_id.unwrap_or(before))),
+                canonical_change_id_remap,
             })
         }
         .await;
@@ -3166,6 +3177,7 @@ where
                     &restore_targets,
                     &transaction.native_merge_checkpoints,
                     transaction.pending_undo_baseline.as_ref(),
+                    transaction.capture_canonical_change_id_remap,
                     prepared_writes,
                 )
                 .instrument(tracing::debug_span!(
@@ -3224,6 +3236,7 @@ where
                 }
                 let mut writes = materialized.writes;
                 let materialization_preconditions = materialized.preconditions;
+                let canonical_change_id_remap = materialized.canonical_change_id_remap;
                 let filesystem_delta_rows = if filesystem_delta_projectable {
                     materialized.filesystem_delta_rows
                 } else {
@@ -3258,14 +3271,20 @@ where
                         ),
                     );
                 }
-                // Re-encode the receipt after reconciliation moves the parent.
+                // Re-encode after commit materialization has both selected the
+                // actual parent and assigned canonical addressable change IDs.
+                // The result remap and its retry receipt then publish atomically.
                 if let Some((idempotency, mut receipt, staged_head)) =
                     transaction.idempotency_receipt_source.take()
-                    && staged_head != transaction.opening_active_branch_head
-                    && let Some(before) = transaction.opening_active_branch_head
                 {
-                    receipt.set_commit_before(&before.to_string());
-                    transaction.idempotency_receipt = Some(encode_receipt(&idempotency, &receipt)?);
+                    if staged_head != transaction.opening_active_branch_head
+                        && let Some(before) = transaction.opening_active_branch_head
+                    {
+                        receipt.set_commit_before(&before.to_string());
+                    }
+                    receipt.remap_direct_new_change_ids(&canonical_change_id_remap);
+                    transaction.idempotency_receipt =
+                        Some(encode_receipt(&idempotency, &receipt)?);
                 }
                 if let Some((key, value)) = transaction.idempotency_receipt.take() {
                     writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
@@ -3288,6 +3307,7 @@ where
                     filesystem_delta_rows,
                     previous_filesystem_revision,
                     next_catalog_revision,
+                    canonical_change_id_remap,
                 ))
 
         }).await
@@ -8982,6 +9002,7 @@ where
                 "a transaction may stage only one execute idempotency receipt",
             ));
         }
+        self.capture_canonical_change_id_remap |= receipt.requires_direct_new_change_id_remap();
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
         self.idempotency_receipt_source = Some((
             idempotency.clone(),
@@ -8989,6 +9010,10 @@ where
             self.opening_active_branch_head,
         ));
         Ok(())
+    }
+
+    pub(crate) fn require_canonical_change_id_remap(&mut self) {
+        self.capture_canonical_change_id_remap = true;
     }
 
     /// Returns the content identity of the SQL schema catalog captured when
@@ -9013,7 +9038,8 @@ where
             self.protect_sql_write_snapshot = true;
             // Checkpoint, restore and undo/redo decisions read branch history
             // and heads, which have no row-level validation.
-            self.sql_read_set.mark_unvalidated("lix checkpoint function");
+            self.sql_read_set
+                .mark_unvalidated("lix checkpoint function");
             self.record_sql_reads = true;
             return Ok(crate::sql2::SqlLogicalPlan::Checkpoint(plan));
         }
@@ -9920,10 +9946,7 @@ where
         read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         hot_state: Arc<HotStateContext>,
         file_views: Option<SessionFileViews>,
-    ) -> Result<
-        TransactionSqlReadExecutionContext<StorageImpl::Read<'static>>,
-        LixError,
-    > {
+    ) -> Result<TransactionSqlReadExecutionContext<StorageImpl::Read<'static>>, LixError> {
         Ok(TransactionSqlReadExecutionContext {
             active_branch_id: self.active_branch_id.clone(),
             active_account_id: self.active_account_id.clone(),
@@ -11254,8 +11277,13 @@ where
                 comment_expression,
                 selection,
             } => {
-                self.execute_create_checkpoint(title_expression, comment_expression, *selection, params)
-                    .await
+                self.execute_create_checkpoint(
+                    title_expression,
+                    comment_expression,
+                    *selection,
+                    params,
+                )
+                .await
             }
             crate::sql2::CheckpointFunctionPlan::UndoRedo {
                 redo,
@@ -11273,7 +11301,9 @@ where
                 self.execute_recovery_function(command, commits_query, *selection, params)
                     .await
             }
-            crate::sql2::CheckpointFunctionPlan::Full => self.execute_checkpoint_plan(None, None).await,
+            crate::sql2::CheckpointFunctionPlan::Full => {
+                self.execute_checkpoint_plan(None, None).await
+            }
             crate::sql2::CheckpointFunctionPlan::Empty => Ok(crate::sql2::DiffCommandOutcome {
                 rows_affected: 0,
                 commit_id: None,
@@ -11300,22 +11330,37 @@ where
         let query = format!("SELECT {title_expression} AS title, {comment_expression} AS comment");
         let statement = crate::sql2::parse_statement(&query)?;
         let query_params = recovery_query_params(&statement, &params)?;
-        let result = Box::pin(self.execute_read_sql_statement(query, statement, query_params)).await?;
+        let result =
+            Box::pin(self.execute_read_sql_statement(query, statement, query_params)).await?;
         let [row] = result.rows.as_slice() else {
-            return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint arguments must produce one row"));
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "checkpoint arguments must produce one row",
+            ));
         };
         let [title_value, comment_value] = row.as_slice() else {
-            return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint arguments must produce a title and comment"));
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "checkpoint arguments must produce a title and comment",
+            ));
         };
         let title = match title_value {
             Value::Text(title) => {
                 if title.trim().is_empty() || title.contains(['\n', '\r']) {
-                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint title must be nonblank and one line when present"));
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "checkpoint title must be nonblank and one line when present",
+                    ));
                 }
                 Some(title.clone())
             }
             Value::Null => None,
-            _ => return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint title must be TEXT or NULL")),
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "checkpoint title must be TEXT or NULL",
+                ));
+            }
         };
         let body = match comment_value {
             Value::Jsonb(comment) => {
@@ -11329,26 +11374,45 @@ where
                 Some(body)
             }
             Value::Null => None,
-            _ => return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint comment must be Zettel JSONB or NULL")
-                .with_hint("Bind a JSONB value as $2, or cast a Zettel JSON literal with ::jsonb.")),
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "checkpoint comment must be Zettel JSONB or NULL",
+                )
+                .with_hint(
+                    "Bind a JSONB value as $2, or cast a Zettel JSON literal with ::jsonb.",
+                ));
+            }
         };
-        let conversation_id = (title.is_some() || body.is_some())
-            .then(|| uuid::Uuid::now_v7().to_string());
+        let conversation_id =
+            (title.is_some() || body.is_some()).then(|| uuid::Uuid::now_v7().to_string());
         let outcome = match selection {
             crate::sql2::CheckpointFunctionPlan::Full => {
-                self.execute_checkpoint_plan(None, conversation_id.clone()).await?
+                self.execute_checkpoint_plan(None, conversation_id.clone())
+                    .await?
             }
             crate::sql2::CheckpointFunctionPlan::SelectionQuery(selection_sql) => {
                 let statement = crate::sql2::parse_statement(&selection_sql)?;
                 let selection_params = recovery_query_params(&statement, &params)?;
-                let result = Box::pin(self.execute_read_sql_statement(selection_sql, statement, selection_params)).await?;
+                let result = Box::pin(self.execute_read_sql_statement(
+                    selection_sql,
+                    statement,
+                    selection_params,
+                ))
+                .await?;
                 if result.columns.len() != 1 {
-                    return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint selection must return one row_ref column"));
+                    return Err(LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        "checkpoint selection must return one row_ref column",
+                    ));
                 }
                 let mut selections = Vec::with_capacity(result.rows.len());
                 for row in result.rows {
                     let [Value::RowRef(row_ref)] = row.as_slice() else {
-                        return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "checkpoint selection must contain non-null row references"));
+                        return Err(LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            "checkpoint selection must contain non-null row references",
+                        ));
                     };
                     let resolved = crate::row_ref::decode(row_ref)?;
                     selections.push(DiffCommandSelection {
@@ -11359,55 +11423,87 @@ where
                     });
                 }
                 if selections.is_empty() {
-                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint selection cannot be empty"));
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "checkpoint selection cannot be empty",
+                    ));
                 }
                 let selected_rows = selections.len() as u64;
-                let diff_ids = self.resolve_diff_command_selections(DiffCommand::CreateCheckpoint, &selections).await?;
-                let mut outcome = self.execute_checkpoint_plan(Some(diff_ids), conversation_id.clone()).await?;
+                let diff_ids = self
+                    .resolve_diff_command_selections(DiffCommand::CreateCheckpoint, &selections)
+                    .await?;
+                let mut outcome = self
+                    .execute_checkpoint_plan(Some(diff_ids), conversation_id.clone())
+                    .await?;
                 outcome.rows_affected = selected_rows;
                 outcome
             }
             crate::sql2::CheckpointFunctionPlan::Empty => {
-                return Err(LixError::new(LixError::CODE_INVALID_PARAM, "checkpoint selection cannot be empty"));
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "checkpoint selection cannot be empty",
+                ));
             }
-            _ => unreachable!("checkpoint selection parser emits only full, empty, or row references"),
+            _ => unreachable!(
+                "checkpoint selection parser emits only full, empty, or row references"
+            ),
         };
         let Some(conversation_id) = conversation_id else {
             return Ok(outcome);
         };
         let commit_id = outcome.commit_id.as_deref().ok_or_else(|| {
-            LixError::new(LixError::CODE_INTERNAL_ERROR, "checkpoint produced no commit ID")
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "checkpoint produced no commit ID",
+            )
         })?;
         let target = crate::row_ref::encode(
             "lix_commit",
             None,
             &RowPk::uuid_from_canonical(commit_id).map_err(|error| {
-                LixError::new(LixError::CODE_INTERNAL_ERROR, format!("invalid checkpoint commit ID: {error}"))
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("invalid checkpoint commit ID: {error}"),
+                )
             })?,
         )?;
         let mut rows = RawWriteBatch::new();
-        let mut description_rows = vec![("lix_conversation", conversation_id.clone(), serde_json::json!({
+        let mut description_rows = vec![(
+            "lix_conversation",
+            conversation_id.clone(),
+            serde_json::json!({
                 "id": conversation_id,
                 "target": target.as_str(),
                 "title": title,
                 "resolved": false,
-            }))];
+            }),
+        )];
         if let Some(body) = body {
             let comment_id = uuid::Uuid::now_v7().to_string();
-            description_rows.push(("lix_comment", comment_id.clone(), serde_json::json!({
-                "id": comment_id,
-                "conversation_id": conversation_id,
-                "body": body,
-            })));
+            description_rows.push((
+                "lix_comment",
+                comment_id.clone(),
+                serde_json::json!({
+                    "id": comment_id,
+                    "conversation_id": conversation_id,
+                    "body": body,
+                }),
+            ));
         }
         for (schema_key, id, snapshot) in description_rows {
             rows.push(TransactionWriteRow {
                 row_pk: Some(RowPk::uuid_from_canonical(&id).map_err(|error| {
-                    LixError::new(LixError::CODE_INTERNAL_ERROR, format!("invalid checkpoint conversation ID: {error}"))
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("invalid checkpoint conversation ID: {error}"),
+                    )
                 })?),
                 schema_key: schema_key.into(),
                 file_id: None,
-                snapshot: Some(TransactionJson::from_value(snapshot, "checkpoint conversation")?),
+                snapshot: Some(TransactionJson::from_value(
+                    snapshot,
+                    "checkpoint conversation",
+                )?),
                 metadata: None,
                 origin: None,
                 created_at: None,
@@ -11422,7 +11518,8 @@ where
         self.stage_write(TransactionWrite::Rows {
             mode: TransactionWriteMode::Insert,
             rows,
-        }).await?;
+        })
+        .await?;
         Ok(outcome)
     }
 
@@ -11739,7 +11836,9 @@ where
                 self.execute_recovery_patch(DiffCommand::Apply, diff_ids, selected_files)
                     .await
             }
-            CheckpointFunctionPlan::Recovery { .. } | CheckpointFunctionPlan::UndoRedo { .. } | CheckpointFunctionPlan::Create { .. } => {
+            CheckpointFunctionPlan::Recovery { .. }
+            | CheckpointFunctionPlan::UndoRedo { .. }
+            | CheckpointFunctionPlan::Create { .. } => {
                 unreachable!("nested recovery plans cannot be parsed")
             }
         }
@@ -12941,9 +13040,11 @@ fn close_and_validate_diff_command_selection(
                         target_entry.identity.file_id(),
                         target_entry.identity.row_pk(),
                     )?;
-                    for reference in child_plan.row_refs.iter().filter(|reference| {
-                        reference.on_delete != lix_schema::DeleteAction::Detach
-                    }) {
+                    for reference in child_plan
+                        .row_refs
+                        .iter()
+                        .filter(|reference| reference.on_delete != lix_schema::DeleteAction::Detach)
+                    {
                         let points_to_target = |snapshot: &JsonValue| {
                             snapshot.get(&reference.column).and_then(JsonValue::as_str)
                                 == Some(target.as_str())
@@ -14096,7 +14197,8 @@ where
     }
 
     fn sql_read_active_branch_commit_id(&self) -> Option<String> {
-        self.opening_active_branch_head.map(|commit_id| commit_id.to_string())
+        self.opening_active_branch_head
+            .map(|commit_id| commit_id.to_string())
     }
 
     async fn register_sql_read_dependencies(
@@ -14109,12 +14211,11 @@ where
     ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
         let read_store = self.opening_read();
         if requirements.needs_read_table_functions || !requirements.read_relation_names.is_empty() {
-            let read_ctx =
-                self.sql_read_execution_context(
-                    read_store.clone(),
-                    Arc::clone(&self.hot_state),
-                    None,
-                )?;
+            let read_ctx = self.sql_read_execution_context(
+                read_store.clone(),
+                Arc::clone(&self.hot_state),
+                None,
+            )?;
             if requirements.needs_read_table_functions {
                 crate::sql2::register_read_table_functions(
                     session,
@@ -14138,12 +14239,12 @@ where
         let active_branch_id = self.active_branch_id.clone();
         let root_graph: Option<Box<dyn crate::commit_graph::CommitGraphReader>> =
             if requirements.needs_root_commit_id {
-            Some(Box::new(
-                CommitGraphContext::new().reader(read_store.clone()),
-            ))
-        } else {
-            None
-        };
+                Some(Box::new(
+                    CommitGraphContext::new().reader(read_store.clone()),
+                ))
+            } else {
+                None
+            };
         if requirements.needs_working_diff_checkpoint_commit_id {
             self.sql_read_set
                 .mark_unvalidated("lix_working_diff_checkpoint_commit_id()");
@@ -14152,8 +14253,11 @@ where
             .needs_working_diff_checkpoint_commit_id
             .then_some(read_store);
         let root_commit_id = if let Some(root_graph) = root_graph {
-            crate::sql2::resolve_root_commit_id_from_graph(root_graph, active_branch_commit_id.clone())
-                .await?
+            crate::sql2::resolve_root_commit_id_from_graph(
+                root_graph,
+                active_branch_commit_id.clone(),
+            )
+            .await?
         } else {
             None
         };
@@ -14301,9 +14405,7 @@ where
         file_ids: &[String],
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
         if let Some(read_set) = self.recording_sql_read_set() {
-            read_set.record_path_index(
-                &request.clone().with_file_ids(Some(file_ids.to_vec())),
-            );
+            read_set.record_path_index(&request.clone().with_file_ids(Some(file_ids.to_vec())));
         }
         self.transaction_filesystem_path_index(request).await
     }

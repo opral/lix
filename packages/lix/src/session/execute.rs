@@ -161,6 +161,9 @@ pub struct ExecuteResult {
     /// Present on results of statements that committed a write.
     commit: Option<CommitSpan>,
     checkpoint_telemetry: Option<(String, String)>,
+    /// Direct new-image change ID columns retain provenance until commit
+    /// materialization replaces provisional IDs with canonical addresses.
+    direct_new_change_id_columns: Vec<usize>,
     #[cfg(feature = "storage-benches")]
     profile_provider_rows_examined: u64,
 }
@@ -277,6 +280,68 @@ impl ExecuteResult {
         self
     }
 
+    pub(crate) fn direct_new_change_id_columns(&self) -> &[usize] {
+        &self.direct_new_change_id_columns
+    }
+
+    pub(crate) fn needs_direct_new_change_id_remap(&self) -> bool {
+        !self.direct_new_change_id_columns.is_empty() && !self.rows().is_empty()
+    }
+
+    /// Rebase only the directly projected new-image change-ID cells whose
+    /// provenance was retained by SQL binding. The remap is derived during
+    /// this same commit's materialization; no post-commit SQL read is needed.
+    pub(crate) fn remap_direct_new_change_ids(
+        mut self,
+        remap: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        if self.direct_new_change_id_columns.is_empty() || remap.is_empty() {
+            self.direct_new_change_id_columns.clear();
+            return self;
+        }
+        let mut changed = false;
+        let rows = self
+            .rows()
+            .iter()
+            .map(|row| {
+                let mut values = row.values().to_vec();
+                for &column_index in &self.direct_new_change_id_columns {
+                    let Some(Value::Text(provisional)) = values.get_mut(column_index) else {
+                        continue;
+                    };
+                    if let Some(canonical) = remap.get(provisional) {
+                        *provisional = canonical.clone();
+                        changed = true;
+                    }
+                }
+                values
+            })
+            .collect::<Vec<_>>();
+        self.direct_new_change_id_columns.clear();
+        if !changed {
+            return self;
+        }
+
+        let file_view_mutations = self.file_view_mutations().to_vec();
+        let mut result = Self::from_query_parts(
+            self.columns().to_vec(),
+            self.column_types().to_vec(),
+            rows,
+            self.rows_affected,
+            self.notices().to_vec(),
+        )
+        .with_file_view_mutations(file_view_mutations);
+        result.statement_index = self.statement_index;
+        result.statement_label = self.statement_label;
+        result.commit = self.commit;
+        result.checkpoint_telemetry = self.checkpoint_telemetry;
+        #[cfg(feature = "storage-benches")]
+        {
+            result.profile_provider_rows_examined = self.profile_provider_rows_examined;
+        }
+        result
+    }
+
     fn with_batch_metadata(mut self, statement_index: usize, label: Option<String>) -> Self {
         self.statement_index = Some(statement_index);
         self.statement_label = label;
@@ -319,6 +384,7 @@ impl ExecuteResult {
             rows_affected,
             returning,
             checkpoint_telemetry,
+            direct_new_change_id_columns,
         } = result;
         let mut result = match returning {
             Some(result) => Self::from_query_parts(
@@ -331,6 +397,7 @@ impl ExecuteResult {
             None => Self::from_rows_affected(rows_affected),
         };
         result.checkpoint_telemetry = checkpoint_telemetry;
+        result.direct_new_change_id_columns = direct_new_change_id_columns;
         result
     }
 
@@ -342,6 +409,7 @@ impl ExecuteResult {
             rows_affected,
             commit: None,
             checkpoint_telemetry: None,
+            direct_new_change_id_columns: Vec::new(),
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -407,6 +475,7 @@ impl ExecuteResult {
             rows_affected,
             commit: None,
             checkpoint_telemetry: None,
+            direct_new_change_id_columns: Vec::new(),
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -442,6 +511,7 @@ impl ExecuteResult {
             rows_affected: 0,
             commit: None,
             checkpoint_telemetry: None,
+            direct_new_change_id_columns: Vec::new(),
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
         }
@@ -1836,7 +1906,7 @@ where
                 let options = options.clone();
                 let metadata = metadata.clone();
                 let result = self
-                    .with_write_transaction_reserved_lending_spanned(
+                    .with_write_transaction_reserved_lending_spanned_with_change_id_remap(
                         write_access,
                         async move |transaction| {
                             let previous_origin_key =
@@ -1853,7 +1923,11 @@ where
                                     &metadata,
                                 )
                                 .await?;
-                                Ok(ExecuteResult::from_sql_write_result(result))
+                                let result = ExecuteResult::from_sql_write_result(result);
+                                if result.needs_direct_new_change_id_remap() {
+                                    transaction.require_canonical_change_id_remap();
+                                }
+                                Ok(result)
                             }
                             .await;
                             transaction.replace_origin_key(previous_origin_key);
@@ -1864,7 +1938,9 @@ where
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
                 match result {
-                    Ok((result, commit)) => return Ok(result.with_commit(commit)),
+                    Ok((result, commit, remap)) => {
+                        return Ok(result.with_commit(commit).remap_direct_new_change_ids(&remap));
+                    }
                     Err(error) => {
                         if retries.retry(&error).await {
                             continue;
@@ -2122,7 +2198,7 @@ where
                 // owns its copy because its future may outlive this call's immediate
                 // stack frame while the write lease is held.
                 let idempotency_for_commit = idempotency.clone();
-                self.with_write_transaction_reserved_lending_spanned(
+                self.with_write_transaction_reserved_lending_spanned_with_change_id_remap(
                     write_access,
                     async move |transaction| {
                         let previous_origin_key =
@@ -2159,7 +2235,9 @@ where
                     |_| Ok(()),
                 )
                 .await
-                .map(|(result, commit)| result.with_commit(commit))
+                .map(|(result, commit, remap)| {
+                    result.with_commit(commit).remap_direct_new_change_ids(&remap)
+                })
                 .map_err(|error| normalize_sql_surface_error(error, sql))
             },
         )
@@ -2581,7 +2659,7 @@ where
         // nothing worth naming.
         let carries_span = parsed.contains_write()?;
         let result = self
-            .with_write_transaction_lending_spanned(async move |transaction| {
+            .with_write_transaction_lending_spanned_with_change_id_remap(async move |transaction| {
                 if let Some(results) = try_execute_transaction_parameter_batch(
                     transaction,
                     statements,
@@ -2596,6 +2674,12 @@ where
                     } else {
                         results
                     };
+                    if results
+                        .iter()
+                        .any(ExecuteResult::needs_direct_new_change_id_remap)
+                    {
+                        transaction.require_canonical_change_id_remap();
+                    }
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                         transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
@@ -2703,6 +2787,12 @@ where
                 } else {
                     results
                 };
+                if results
+                    .iter()
+                    .any(ExecuteResult::needs_direct_new_change_id_remap)
+                {
+                    transaction.require_canonical_change_id_remap();
+                }
                 if let Some(idempotency) = &idempotency {
                     let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                     transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
@@ -2710,7 +2800,7 @@ where
                 Ok(results)
             })
             .await
-            .map(|(results, commit)| {
+            .map(|(results, commit, remap)| {
                 if !carries_span {
                     return results;
                 }
@@ -2718,7 +2808,11 @@ where
                 // commits: the span the batch published.
                 results
                     .into_iter()
-                    .map(|result| result.with_commit(commit.clone()))
+                    .map(|result| {
+                        result
+                            .with_commit(commit.clone())
+                            .remap_direct_new_change_ids(&remap)
+                    })
                     .collect::<Vec<_>>()
             });
         result
@@ -3077,7 +3171,7 @@ where
             let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved_lending(
+                .with_write_transaction_reserved_lending_spanned_with_change_id_remap(
                     write_access,
                     async move |transaction| {
                         let tx_plan = transaction
@@ -3089,11 +3183,16 @@ where
                             mode,
                         )
                         .await?;
-                        Ok(ExecuteResult::from_sql_write_result(result))
+                        let result = ExecuteResult::from_sql_write_result(result);
+                        if result.needs_direct_new_change_id_remap() {
+                            transaction.require_canonical_change_id_remap();
+                        }
+                        Ok(result)
                     },
                     |_| Ok(()),
                 )
                 .await
+                .map(|(result, _, remap)| result.remap_direct_new_change_ids(&remap))
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
         self.execute(sql, params).await
@@ -6009,6 +6108,283 @@ mod tests {
             .commit()
             .await
             .expect("transaction should commit");
+    }
+
+    #[tokio::test]
+    async fn autocommit_returning_change_ids_are_canonical_and_old_images_stay_old() {
+        let session = open_session().await;
+        let inserted = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('canonical-returning', 'one') \
+                 RETURNING key AS record_key, \
+                           lixcol_change_id AS returned_change_id, \
+                           lower(lixcol_change_id) AS derived_change_id",
+                &[],
+            )
+            .await
+            .expect("autocommit insert should return its result");
+        let inserted_change_id = inserted.rows()[0]
+            .get::<String>("returned_change_id")
+            .expect("direct alias should be text");
+        let inserted_derived_change_id = inserted.rows()[0]
+            .get::<String>("derived_change_id")
+            .expect("derived change ID expression should be text");
+        let persisted_insert_change_id = session
+            .execute(
+                "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'canonical-returning'",
+                &[],
+            )
+            .await
+            .expect("inserted row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("persisted change ID should be text");
+        assert_eq!(inserted_change_id, persisted_insert_change_id);
+        assert_ne!(
+            inserted_derived_change_id, persisted_insert_change_id,
+            "an arbitrary expression remains the statement's provisional value"
+        );
+
+        let updated = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'canonical-returning' \
+                 RETURNING OLD.lixcol_change_id AS old_change_id, \
+                           NEW.lixcol_change_id AS new_change_id, \
+                           lixcol_change_id AS unqualified_change_id, *",
+                &[],
+            )
+            .await
+            .expect("autocommit update should return its result");
+        let row = &updated.rows()[0];
+        let old_change_id = row
+            .get::<String>("old_change_id")
+            .expect("OLD change ID should be text");
+        let new_change_id = row
+            .get::<String>("new_change_id")
+            .expect("NEW change ID should be text");
+        let unqualified_change_id = row
+            .get::<String>("unqualified_change_id")
+            .expect("unqualified change ID should be text");
+        let star_change_id = row
+            .get::<String>("lixcol_change_id")
+            .expect("star projection should include the change ID");
+        let persisted_update_change_id = session
+            .execute(
+                "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'canonical-returning'",
+                &[],
+            )
+            .await
+            .expect("updated row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("persisted change ID should be text");
+        assert_eq!(old_change_id, inserted_change_id);
+        assert_eq!(new_change_id, persisted_update_change_id);
+        assert_eq!(unqualified_change_id, persisted_update_change_id);
+        assert_eq!(star_change_id, persisted_update_change_id);
+        assert_ne!(old_change_id, new_change_id);
+    }
+
+    #[tokio::test]
+    async fn plain_autocommit_write_does_not_request_change_id_remapping() {
+        let session = open_session().await;
+        let result = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('plain-write-no-remap', 'one')",
+                &[],
+            )
+            .await
+            .expect("plain autocommit write should succeed");
+        assert!(!result.needs_direct_new_change_id_remap());
+        assert!(result.direct_new_change_id_columns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_returning_change_ids_remain_provisional() {
+        let session = open_session().await;
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let staged = transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('provisional-returning', 'one') \
+                 RETURNING lixcol_change_id AS change_id",
+                &[],
+            )
+            .await
+            .expect("explicit transaction should stage its insert");
+        let staged_change_id = staged.rows()[0]
+            .get::<String>("change_id")
+            .expect("staged change ID should be text");
+        let visible_change_id = transaction
+            .execute(
+                "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'provisional-returning'",
+                &[],
+            )
+            .await
+            .expect("staged row should be visible in its transaction")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("transaction-visible change ID should be text");
+        assert_eq!(staged_change_id, visible_change_id);
+
+        transaction.commit().await.expect("transaction should commit");
+        let canonical_change_id = session
+            .execute(
+                "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'provisional-returning'",
+                &[],
+            )
+            .await
+            .expect("committed row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("canonical change ID should be text");
+        assert_ne!(staged_change_id, canonical_change_id);
+    }
+
+    #[tokio::test]
+    async fn idempotent_returning_receipt_replays_the_canonical_change_id() {
+        let session = open_session().await;
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should load");
+        let idempotency = ExecuteIdempotency::new(
+            Some("returning-receipt-test".to_string()),
+            "canonical-returning-receipt".to_string(),
+            [19; 32],
+        )
+        .with_branch(branch_id);
+        let sql = "INSERT INTO lix_key_value (key, value) \
+                   VALUES ('canonical-receipt', 'once') \
+                   RETURNING lixcol_change_id AS change_id";
+
+        let first = session
+            .execute_with_kind(
+                sql,
+                &[],
+                ExecuteOptions::default(),
+                ExecuteStatementMetadata::default(),
+                "execute",
+                Some(idempotency.clone()),
+                true,
+            )
+            .await
+            .expect("idempotent write should commit");
+        let first_change_id = first.rows()[0]
+            .get::<String>("change_id")
+            .expect("returned change ID should be text");
+        let persisted_change_id = session
+            .execute(
+                "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'canonical-receipt'",
+                &[],
+            )
+            .await
+            .expect("committed row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("persisted change ID should be text");
+        assert_eq!(first_change_id, persisted_change_id);
+
+        let replay = session
+            .execute_with_kind(
+                sql,
+                &[],
+                ExecuteOptions::default(),
+                ExecuteStatementMetadata::default(),
+                "execute",
+                Some(idempotency),
+                true,
+            )
+            .await
+            .expect("retry should replay the durable receipt");
+        let replay_change_id = replay.rows()[0]
+            .get::<String>("change_id")
+            .expect("replayed change ID should be text");
+        assert_eq!(replay_change_id, persisted_change_id);
+        assert_eq!(first, replay);
+    }
+
+    #[tokio::test]
+    async fn idempotent_batch_returning_receipt_replays_canonical_change_ids() {
+        let session = std::sync::Arc::new(open_session().await);
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should load");
+        let idempotency = ExecuteIdempotency::new(
+            Some("batch-returning-receipt-test".to_string()),
+            "canonical-batch-returning-receipt".to_string(),
+            [23; 32],
+        )
+        .with_branch(branch_id);
+        let sql = "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+                   RETURNING key, lixcol_change_id AS change_id";
+        let statements = vec![
+            ExecuteBatchStatement {
+                label: Some("first".to_string()),
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("canonical-batch-a".to_string()),
+                    Value::Text("one".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                label: Some("second".to_string()),
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("canonical-batch-b".to_string()),
+                    Value::Text("two".to_string()),
+                ],
+            },
+        ];
+        let metadata = vec![ExecuteStatementMetadata::default(); statements.len()];
+
+        let first = session
+            .clone()
+            .execute_batch_with_idempotency_and_options_and_metadata(
+                statements.clone(),
+                ExecuteOptions::default(),
+                metadata.clone(),
+                Some(idempotency.clone()),
+            )
+            .await
+            .expect("idempotent write batch should commit");
+        let persisted = session
+            .execute(
+                "SELECT key, lixcol_change_id FROM lix_key_value \
+                 WHERE key IN ('canonical-batch-a', 'canonical-batch-b')",
+                &[],
+            )
+            .await
+            .expect("batch rows should be readable");
+        for result in &first {
+            let row = &result.rows()[0];
+            let key = row.get::<String>("key").expect("returned key should be text");
+            let returned = row
+                .get::<String>("change_id")
+                .expect("returned change ID should be text");
+            let canonical = persisted
+                .rows()
+                .iter()
+                .find(|row| {
+                    row.get::<String>("key").ok().as_deref() == Some(key.as_str())
+                })
+                .expect("each returned row should be persisted")
+                .get::<String>("lixcol_change_id")
+                .expect("persisted change ID should be text");
+            assert_eq!(returned, canonical);
+        }
+
+        let replay = session
+            .clone()
+            .execute_batch_with_idempotency_and_options_and_metadata(
+                statements,
+                ExecuteOptions::default(),
+                metadata,
+                Some(idempotency),
+            )
+            .await
+            .expect("retry should replay the durable batch receipt");
+        assert_eq!(first, replay);
     }
 
     #[derive(Clone)]
