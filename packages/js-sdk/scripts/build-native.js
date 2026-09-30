@@ -85,6 +85,12 @@ const args = [
 	cargoProfile,
 ];
 
+// Published native binaries do not need the local symbol table: it adds
+// ~107 MiB (.symtab + .strtab) to the linux-x64 addon. The N-API entry point
+// lives in the dynamic symbol table, which stripping keeps.
+if (cargoProfile === "release") {
+	args.push("--config", 'profile.release.strip="symbols"');
+}
 if (target) args.push("--target", target);
 if (migrationArtifact) args.push("--features", "offline-migration");
 args.push("--timings");
