@@ -760,10 +760,22 @@ where
                 if let Some(span) = this.span.take() {
                     match &result {
                         Ok(_) => span.finish(Status::Unset, Vec::new()),
-                        Err(error) => span.finish(
-                            Status::error(error.code.clone()),
-                            vec![TelemetryAttribute::string("error.type", error.code.clone())],
-                        ),
+                        Err(error) => {
+                            let mut attributes = vec![TelemetryAttribute::string("error.type", error.code.clone())];
+                            if let Some(details) = error.details.as_deref() {
+                                for (key, attribute) in [
+                                    ("receiptVersion", "lix.receipt.version"),
+                                    ("expectedReceiptVersion", "lix.receipt.expected_version"),
+                                    ("fromVersion", "lix.migration.from_version"),
+                                    ("toVersion", "lix.migration.to_version"),
+                                ] {
+                                    if let Some(value) = details.get(key).and_then(serde_json::Value::as_i64) {
+                                        attributes.push(TelemetryAttribute::i64(attribute, value));
+                                    }
+                                }
+                            }
+                            span.finish(Status::error(error.code.clone()), attributes);
+                        }
                     }
                 }
                 Poll::Ready(result)
@@ -1169,6 +1181,25 @@ mod tests {
             attribute.key == "lix.operation.cancelled"
                 && attribute.value == TelemetryValue::Boolean(true)
         }));
+    }
+
+    #[test]
+    fn failed_operation_exports_structural_migration_cause_without_error_payload() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&completed);
+        let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
+            captured.lock().unwrap().push(span);
+        }));
+        let span = ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        let error = crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private payload")
+            .with_details(serde_json::json!({"receiptVersion": 2, "expectedReceiptVersion": 3, "secret": "private payload"}));
+        let result: Result<(), _> = futures_lite::future::block_on(instrument_lix_result(Some(span), async { Err(error) }));
+        assert!(result.is_err());
+        let completed = completed.lock().unwrap();
+        assert_eq!(completed[0].end.status, Status::error("LIX_PARTIAL_REPLICA_STATE_INVALID"));
+        assert!(completed[0].end.attributes.contains(&TelemetryAttribute::i64("lix.receipt.version", 2)));
+        assert!(completed[0].end.attributes.contains(&TelemetryAttribute::i64("lix.receipt.expected_version", 3)));
+        assert!(!format!("{:?}", completed[0]).contains("private payload"));
     }
 
     #[test]

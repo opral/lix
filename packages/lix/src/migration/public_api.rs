@@ -712,7 +712,10 @@ mod tests {
 
     #[tokio::test]
     async fn partial_legacy_formats_to_v85_preserve_admission_and_resident_records_offline() {
-        for format in [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION] {
+        for (format, receipt_version) in [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION]
+            .into_iter()
+            .flat_map(|format| [1, 2, 3].map(|version| (format, version)))
+        {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
                 format!("https://example.test/lix/{}", authority.lix_id()),
@@ -732,11 +735,10 @@ mod tests {
                     .unwrap();
             let expected = content_digest(&storage).await.unwrap();
             let mut legacy_receipt = serde_json::to_value(&state).unwrap();
-            legacy_receipt["version"] = serde_json::json!(1);
-            legacy_receipt
-                .as_object_mut()
-                .unwrap()
-                .remove("archivedBranchIds");
+            legacy_receipt["version"] = serde_json::json!(receipt_version);
+            if receipt_version == 1 {
+                legacy_receipt.as_object_mut().unwrap().remove("archivedBranchIds");
+            }
             let mut writes = installed.adapter.new_write_set();
             if format <= 81 {
                 // A sparse cache cannot certify whole-collection completeness.
@@ -748,7 +750,7 @@ mod tests {
                     b"partial-cache".as_slice(),
                 );
             }
-            if format < crate::init::CURRENT_FORMAT_VERSION {
+            {
                 writes.put(
                     crate::sync::PARTIAL_REPLICA_STATE_SPACE,
                     crate::sync::partial_replica_state_key(),
@@ -794,7 +796,7 @@ mod tests {
             assert_ne!(content_digest(&storage).await.unwrap(), expected);
             let report = migrate_repository(storage.clone())
                 .await
-                .unwrap_or_else(|error| panic!("format {format} migration failed: {error:?}"));
+                .unwrap_or_else(|error| panic!("format {format}, receipt {receipt_version} migration failed: {error:?}"));
             assert!(report.semantic_preservation_verified);
             assert_eq!(report.expected_content_digest, report.after_content_digest);
             assert_eq!(report.after_content_digest, expected);

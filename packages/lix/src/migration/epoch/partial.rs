@@ -14,6 +14,49 @@ fn migration_required(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED", message)
 }
 
+const PARTIAL_RECEIPT_VERSION_PROBE_MAX_BYTES: usize = 16 * 1024;
+
+/// Classify only the explicitly supported historical receipt versions. This
+/// is a routing probe for an owned epoch migration, never an admission path:
+/// ordinary readers still decode and validate only the current receipt.
+pub(super) async fn historical_partial_receipt_version(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<Option<u32>, LixError> {
+    let value = crate::storage_adapter::PointReadPlan::new(
+        crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+        &[crate::sync::partial_replica_state_key()],
+    )
+    .materialize(read, Default::default())
+    .await?
+    .value
+    .pop()
+    .flatten();
+    let Some(ProjectedValue::FullValue(bytes)) = value else {
+        return Ok(None);
+    };
+    if bytes.len() > PARTIAL_RECEIPT_VERSION_PROBE_MAX_BYTES {
+        return Ok(None);
+    }
+    #[derive(serde::Deserialize)]
+    struct VersionEnvelope {
+        version: u32,
+    }
+    let Ok(envelope) = serde_json::from_slice::<VersionEnvelope>(&bytes) else {
+        return Ok(None);
+    };
+    Ok(matches!(envelope.version, 1 | 2).then_some(envelope.version))
+}
+
+fn historical_receipt_migration_required(version: u32) -> LixError {
+    migration_required("partial receipt version requires explicit epoch migration").with_details(
+        serde_json::json!({
+            "receiptVersion": version,
+            "expectedReceiptVersion": 3,
+            "migrationPhase": "partial_receipt",
+        }),
+    )
+}
+
 pub(super) async fn durable_pointer<S: Storage>(
     storage: &S,
 ) -> Result<Option<(PointerState, Bytes)>, LixError> {
@@ -131,10 +174,19 @@ where
             "partial replica repository protocol requires explicit migration",
         ));
     }
-    let Some((state, _)) = crate::sync::load_partial_replica_state(&read).await? else {
-        return Err(migration_required(
-            "existing full repositories require explicit conversion to a partial replica",
-        ));
+    let (state, _) = match crate::sync::load_partial_replica_state(&read).await {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return Err(migration_required(
+                "existing full repositories require explicit conversion to a partial replica",
+            ));
+        }
+        Err(error) => {
+            if let Some(version) = historical_partial_receipt_version(&read).await? {
+                return Err(historical_receipt_migration_required(version));
+            }
+            return Err(error);
+        }
     };
     drop(read);
     Ok(PartialEpochAdmission { adapter, state })
@@ -393,6 +445,77 @@ mod tests {
             admitted.adapter.begin_read(ReadOptions::default()).await,
             Err(StorageError::Fenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn current_format_historical_receipts_request_owned_migration() {
+        let state = state().await;
+        for version in [1, 2, 99] {
+            let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+            let admitted = install_fresh_partial_epoch(storage.clone(), &state)
+                .await
+                .unwrap();
+            let mut historical = serde_json::to_value(&state).unwrap();
+            historical["version"] = serde_json::json!(version);
+            if version == 1 {
+                historical
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("archivedBranchIds");
+            }
+            let mut writes = admitted.adapter.new_write_set();
+            writes.put(
+                crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                crate::sync::partial_replica_state_key(),
+                serde_json::to_vec(&historical).unwrap(),
+            );
+            use crate::storage_adapter::StorageWrite as _;
+            let mut write = admitted
+                .adapter
+                .begin_migration_write(Default::default())
+                .await
+                .unwrap();
+            writes.lower_into(&mut write).await.unwrap();
+            write.commit().await.unwrap();
+
+            let pointer_before = durable_pointer(&storage).await.unwrap().unwrap().1;
+            let read = admitted
+                .adapter
+                .begin_read(Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::sync::load_partial_replica_state(&read)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                "LIX_PARTIAL_REPLICA_STATE_INVALID",
+                "ordinary readers must continue to reject v{version}"
+            );
+            drop(read);
+            let error = admit_partial_epoch(&storage).await.err().unwrap();
+            assert_eq!(
+                error.code,
+                if version == 1 || version == 2 {
+                    "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED"
+                } else {
+                    "LIX_PARTIAL_REPLICA_STATE_INVALID"
+                },
+                "only supported historical versions may route to migration"
+            );
+            if version == 1 || version == 2 {
+                let details = error.details.as_ref().unwrap();
+                assert_eq!(details["receiptVersion"], version);
+                assert_eq!(details["expectedReceiptVersion"], 3);
+                assert_eq!(details["migrationPhase"], "partial_receipt");
+            }
+            assert_eq!(
+                durable_pointer(&storage).await.unwrap().unwrap().1,
+                pointer_before,
+                "classification must not mutate the active epoch"
+            );
+        }
     }
 
     #[tokio::test]

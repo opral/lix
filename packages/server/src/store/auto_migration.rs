@@ -197,7 +197,17 @@ mod tests {
                         assert_eq!(admission, AuthorityAdmission::current());
                         break;
                     }
-                    Err(error) if error.code == "LIX_REPOSITORY_MIGRATING" => {
+                    Err(
+                        AuthorityAdmissionError::Catalog(
+                            lix_sdk::server_protocol::LifecycleError {
+                                code: "LIX_REPOSITORY_MIGRATING",
+                                ..
+                            },
+                        )
+                        | AuthorityAdmissionError::Runtime(
+                            LixRuntimeError::Migrating { .. } | LixRuntimeError::Recovering,
+                        ),
+                    ) => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     other => panic!("unexpected admission: {other:?}"),
@@ -396,14 +406,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(
-            manager
-                .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
-                .await
-                .unwrap_err()
-                .code,
-            "LIX_PROTOCOL_VERSION_MISMATCH"
-        );
+        assert!(matches!(manager
+            .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
+            .await.unwrap_err(),
+            AuthorityAdmissionError::Catalog(error) if error.code == "LIX_PROTOCOL_VERSION_MISMATCH"
+        ));
         assert!(manager.state.lock().await.entries.is_empty());
         assert!(!manager.legacy_storage_present(ID).await.unwrap());
     }

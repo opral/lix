@@ -195,7 +195,7 @@ impl PartialReplicaState {
             ));
         }
         if self.version != STATE_VERSION {
-            return Err(invalid("unsupported partial replica state version"));
+            return Err(receipt_version_error("unsupported partial replica state version", self.version));
         }
         super::validate_sync_remote_id(&self.remote_id)?;
         for id in [
@@ -344,6 +344,14 @@ impl PartialReplicaState {
 
 fn invalid(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", message)
+}
+
+fn receipt_version_error(message: &str, version: u32) -> LixError {
+    invalid(message).with_details(serde_json::json!({
+        "receiptVersion": version,
+        "expectedReceiptVersion": STATE_VERSION,
+        "migrationPhase": "partial_receipt",
+    }))
 }
 
 /// One point read. The returned bytes fence a caller's later atomic update.
@@ -537,6 +545,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_v2_receipt_upgrade_preserves_archives_and_exact_source_guard() {
+        let mut expected = state().await;
+        expected.archived_branch_ids.push(uuid::Uuid::now_v7().to_string());
+        let mut legacy = expected.clone();
+        legacy.version = 2;
+        let bytes = Bytes::from(serde_json::to_vec(&legacy).unwrap());
+        let adapter = StorageAdapter::new(Memory::new());
+        let mut fixture = adapter.new_write_set();
+        fixture.put(PARTIAL_REPLICA_STATE_SPACE, partial_replica_state_key(), bytes.to_vec());
+        commit_raw_fixture(&adapter, fixture, Default::default()).await.unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let (upgraded, changed, guards) = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await.unwrap().unwrap();
+        assert!(changed);
+        assert_eq!(upgraded, expected);
+        assert!(matches!(&guards[0], StoragePrecondition::KeyValueEquals { expected, .. } if expected == &bytes));
+        assert_eq!(load_partial_replica_state(&read).await.unwrap_err().details.as_deref().unwrap()["receiptVersion"], 2);
+    }
+
+    #[tokio::test]
     async fn partial_opening_receipt_rejects_unknown_versions_before_staging() {
         let mut state = state().await;
         state.version += 1;
@@ -700,8 +729,22 @@ pub(crate) async fn prepare_owned_partial_receipt_upgrade(
             }],
         )));
     }
+    // v2 introduced archived branches. v3 changes the serving contract, not
+    // the receipt fields: preserve every admission coordinate and archive.
+    // The detached epoch candidate proves local controls/native roots before
+    // activation; v1's admission-base-only proof must not reject v2 local undo.
+    if version.version == 2 {
+        let mut state: PartialReplicaState = serde_json::from_slice(&bytes)
+            .map_err(|_| receipt_version_error("partial v2 receipt is malformed", 2))?;
+        state.version = STATE_VERSION;
+        state.validate()?;
+        let guard = stage_partial_replica_state(writes, &state, Some(bytes))?;
+        return Ok(Some((state, true, vec![guard])));
+    }
     if version.version != 1 {
-        return Err(invalid("unsupported partial receipt migration source"));
+        return Err(receipt_version_error(
+            "unsupported partial receipt migration source", version.version,
+        ));
     }
     let old: PartialReplicaStateV1 =
         serde_json::from_slice(&bytes).map_err(|_| invalid("partial v1 receipt is malformed"))?;

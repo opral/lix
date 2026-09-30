@@ -1,5 +1,5 @@
 use crate::LixRuntimeManager;
-use crate::store::{LixRuntimeError, LixService};
+use crate::store::{AuthorityAdmissionError, LixRuntimeError, LixService};
 use crate::telemetry::InFlightSqlRegistry;
 use axum::{
     Json, Router,
@@ -255,6 +255,41 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn repository_admission(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    let request_id = protocol_request_id(&state, &id, "admission");
+    let span = tracing::info_span!(
+        "lix.repository.admission",
+        "otel.name" = "Lix repository admission",
+        "otel.kind" = "server",
+        "http.request.method" = %request.method(),
+        "http.route" = "/lix/v1/{lix_id}/admission",
+        "lix.lix.id" = %id,
+        "lix.request.id" = %request_id,
+        "lix.request.phase" = "admission",
+        "http.response.status_code" = tracing::field::Empty,
+        "lix.error.code" = tracing::field::Empty,
+        "lix.error.source_code" = tracing::field::Empty,
+        "lix.migration.from_version" = tracing::field::Empty,
+        "lix.migration.to_version" = tracing::field::Empty,
+        "lix.receipt.version" = tracing::field::Empty,
+        "lix.receipt.expected_version" = tracing::field::Empty,
+        "otel.status_code" = tracing::field::Empty,
+    );
+    crate::telemetry::set_request_parent(&span, request.headers());
+    let response = repository_admission_inner(state, id, request)
+        .instrument(span.clone())
+        .await;
+    span.record("http.response.status_code", response.status().as_u16());
+    if response.status().is_client_error() || response.status().is_server_error() {
+        span.record("otel.status_code", "ERROR");
+    }
+    response
+}
+
+async fn repository_admission_inner(
+    state: AppState,
+    id: String,
     mut request: Request<Body>,
 ) -> Response {
     if !authorized(request.headers(), state.internal_token.as_deref()) {
@@ -327,9 +362,10 @@ async fn repository_admission(
                     None,
                 );
             }
-            Ok(Err(error)) => {
+            Ok(Err(AuthorityAdmissionError::Catalog(error))) => {
                 return protocol_error(error.status, error.code, error.message, None, None);
             }
+            Ok(Err(AuthorityAdmissionError::Runtime(error))) => return lix_error(error),
             Err(_) => {
                 return protocol_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -565,6 +601,11 @@ async fn lix_protocol_route(
         "lix.sql.active.fingerprints" = tracing::field::Empty,
         "http.response.status_code" = tracing::field::Empty,
         "lix.error.code" = tracing::field::Empty,
+        "lix.error.source_code" = tracing::field::Empty,
+        "lix.migration.from_version" = tracing::field::Empty,
+        "lix.migration.to_version" = tracing::field::Empty,
+        "lix.receipt.version" = tracing::field::Empty,
+        "lix.receipt.expected_version" = tracing::field::Empty,
         "otel.status_code" = tracing::field::Empty,
     );
     crate::telemetry::set_request_parent(&span, request.headers());
@@ -1033,6 +1074,8 @@ fn lix_error(error: LixRuntimeError) -> Response {
                 "fromVersion": from_version,
                 "toVersion": to_version,
                 "sourceCode": diagnostic.source_code,
+                "receiptVersion": diagnostic.receipt_version,
+                "expectedReceiptVersion": diagnostic.expected_receipt_version,
                 "operation": "lix_open",
                 "retryable": false,
             })),
@@ -1044,6 +1087,8 @@ fn lix_error(error: LixRuntimeError) -> Response {
             Some("Contact the service operator to recover the repository.".to_string()),
             Some(json!({
                 "sourceCode": diagnostic.source_code,
+                "receiptVersion": diagnostic.receipt_version,
+                "expectedReceiptVersion": diagnostic.expected_receipt_version,
                 "operation": "lix_open",
                 "retryable": false,
             })),
@@ -1156,7 +1201,26 @@ fn protocol_error(
     details: Option<serde_json::Value>,
 ) -> Response {
     let code = code.into();
-    tracing::Span::current().record("lix.error.code", code.as_str());
+    let span = tracing::Span::current();
+    span.record("lix.error.code", code.as_str());
+    if let Some(details) = &details {
+        for (key, attribute) in [
+            ("fromVersion", "lix.migration.from_version"),
+            ("toVersion", "lix.migration.to_version"),
+            ("receiptVersion", "lix.receipt.version"),
+            ("expectedReceiptVersion", "lix.receipt.expected_version"),
+        ] {
+            if let Some(value) = details.get(key).and_then(serde_json::Value::as_u64) {
+                span.record(attribute, value);
+            }
+        }
+        if let Some(source) = details
+            .get("sourceCode")
+            .and_then(serde_json::Value::as_str)
+        {
+            span.record("lix.error.source_code", source);
+        }
+    }
     (
         status,
         Json(ErrorEnvelope {
@@ -2055,6 +2119,8 @@ mod tests {
                     "fromVersion": 68,
                     "toVersion": 71,
                     "sourceCode": "LIX_ERROR_MIGRATION_FAILED",
+                    "receiptVersion": null,
+                    "expectedReceiptVersion": null,
                     "operation": "lix_open",
                     "retryable": false,
                 },
@@ -2080,6 +2146,8 @@ mod tests {
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
                     "sourceCode": "LIX_ERROR_REPOSITORY_UPGRADE",
+                    "receiptVersion": null,
+                    "expectedReceiptVersion": null,
                     "operation": "lix_open",
                     "retryable": false,
                 },

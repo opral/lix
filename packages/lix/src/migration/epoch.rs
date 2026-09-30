@@ -381,6 +381,7 @@ enum PointerState {
 enum AdmissionIntent {
     FullRepository,
     PartialReplica,
+    OwnedMigration,
 }
 
 pub(super) async fn inspect_layout<S: Storage>(
@@ -581,11 +582,12 @@ pub(crate) async fn admit_repository_with_server<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    admit_repository_with_options(
+    admit_repository_with_intent(
         storage,
         progress,
         server,
         super::MigrationOptions::default(),
+        AdmissionIntent::FullRepository,
     )
     .await
 }
@@ -624,9 +626,30 @@ where
         progress,
         server,
         options,
-        AdmissionIntent::FullRepository,
+        AdmissionIntent::OwnedMigration,
     )
     .await
+}
+
+async fn current_partial_receipt_requires_migration<S>(
+    storage: &S,
+    bank: EpochBank,
+    pointer: &Bytes,
+) -> Result<bool, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = StorageAdapter::for_epoch(storage.clone(), bank, pointer.clone());
+    // This classifies a migration route, not an admission. Full in-memory
+    // repositories support observed snapshots without durable reads; the
+    // detached migration still owns all source fences and activation barriers.
+    let read = adapter.begin_read(ReadOptions::default()).await?;
+    if !crate::init::is_partial_repository_protocol(&read).await? {
+        return Ok(false);
+    }
+    Ok(partial::historical_partial_receipt_version(&read)
+        .await?
+        .is_some())
 }
 
 async fn admit_repository_with_intent<S>(
@@ -656,9 +679,25 @@ where
                         crate::init::CURRENT_FORMAT_VERSION
                     )));
                 }
-                if format < crate::init::CURRENT_FORMAT_VERSION {
-                    // Keep cold migration/bootstrap state off the ordinary
-                    // open future's stack, including for filesystem adapters.
+                let current_partial_receipt_needs_migration = format
+                    == crate::init::CURRENT_FORMAT_VERSION
+                    && server.is_none()
+                    && matches!(
+                        intent,
+                        AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
+                    )
+                    && Box::pin(current_partial_receipt_requires_migration(
+                        storage, bank, &bytes,
+                    ))
+                    .await?;
+                if format < crate::init::CURRENT_FORMAT_VERSION
+                    || current_partial_receipt_needs_migration
+                {
+                    // Route both older physical formats and historical
+                    // current-format receipts through the detached,
+                    // source-fenced candidate path. Keep one cold migration
+                    // call site to avoid duplicating its large future
+                    // temporary in the ordinary open frame.
                     return Box::pin(migrate_active(
                         storage, bank, generation, format, bytes, progress, server, options, intent,
                     ))

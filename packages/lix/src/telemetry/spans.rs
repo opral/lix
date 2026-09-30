@@ -26,6 +26,10 @@ macro_rules! define_production_spans {
                         otel.name = tracing::field::Empty,
                         $($attr = tracing::field::Empty,)*
                         "error.type" = tracing::field::Empty,
+                        "lix.receipt.version" = tracing::field::Empty,
+                        "lix.receipt.expected_version" = tracing::field::Empty,
+                        "lix.migration.from_version" = tracing::field::Empty,
+                        "lix.migration.to_version" = tracing::field::Empty,
                         "lix.operation.cancelled" = tracing::field::Empty,
                     )
                 }
@@ -39,6 +43,10 @@ macro_rules! define_production_spans {
                         $($attr,)*
                         "otel.name",
                         "error.type",
+                        "lix.receipt.version",
+                        "lix.receipt.expected_version",
+                        "lix.migration.from_version",
+                        "lix.migration.to_version",
                         "lix.operation.cancelled",
                     ],
                     create_tracing_span: [<create_ $ident>],
