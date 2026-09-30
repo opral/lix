@@ -20,6 +20,28 @@ type Guest = {
   busy: boolean;
 };
 
+const COMPILER_PACKAGES = ["binaryen", "@bytecodealliance/jco-transpile"];
+
+/** Lazily loads the JS component compiler, whose packages are optional dependencies. */
+async function loadComponentCompiler(): Promise<typeof compileComponent> {
+  try {
+    return (await import("./index.js")).compileComponent;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ERR_MODULE_NOT_FOUND" &&
+      COMPILER_PACKAGES.some((name) => error.message.includes(`'${name}`))
+    ) {
+      throw new Error(
+        `Compiling a JS-hosted plugin component requires ${COMPILER_PACKAGES.join(" and ")}, which are optional dependencies of @lix-js/sdk. Install them (for example: npm install ${COMPILER_PACKAGES.join(" ")}).`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
 /** One isolated handle registry per engine runtime, shared by Node and browsers. */
 export function createComponentDispatch(
   browserCompiler?: typeof compileComponent,
@@ -66,7 +88,7 @@ export function createComponentDispatch(
           if (!(request.bytes instanceof Uint8Array))
             throw new Error("Missing component bytes");
           const compile =
-            browserCompiler ?? (await import("./index.js")).compileComponent;
+            browserCompiler ?? (await loadComponentCompiler());
           const factory = await compile(
             request.bytes,
             data.limits as ComponentLimits,

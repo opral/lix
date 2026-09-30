@@ -97,3 +97,22 @@ test("finished factory ownership survives request cleanup, while a canceled inst
     dispatch({ operation: "invoke", data: JSON.stringify(guest) }),
   ).rejects.toThrow("Unknown or busy component guest");
 });
+
+test("a missing optional compiler package produces an actionable error", async () => {
+  const missing = Object.assign(
+    new Error("Cannot find package 'binaryen' imported from /x/instrument.js"),
+    { code: "ERR_MODULE_NOT_FOUND" },
+  );
+  vi.resetModules();
+  // A throwing export getter stands in for a failed module resolution.
+  vi.doMock("./index.js", () => ({
+    get compileComponent(): never {
+      throw missing;
+    },
+  }));
+  const { createComponentDispatch: fresh } = await import("./dispatch.js");
+  await expect(fresh()(compile("no-compiler"))).rejects.toThrow(
+    /binaryen and @bytecodealliance\/jco-transpile/,
+  );
+  vi.doUnmock("./index.js");
+});
