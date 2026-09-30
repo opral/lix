@@ -30,6 +30,10 @@ macro_rules! define_production_spans {
                         "lix.receipt.expected_version" = tracing::field::Empty,
                         "lix.migration.from_version" = tracing::field::Empty,
                         "lix.migration.to_version" = tracing::field::Empty,
+                        "lix.payload.standalone_status" = tracing::field::Empty,
+                        "lix.payload.physical_status" = tracing::field::Empty,
+                        "lix.payload.source_deferred" = tracing::field::Empty,
+                        "lix.payload.physical_conflict" = tracing::field::Empty,
                         "lix.operation.cancelled" = tracing::field::Empty,
                     )
                 }
@@ -47,6 +51,10 @@ macro_rules! define_production_spans {
                         "lix.receipt.expected_version",
                         "lix.migration.from_version",
                         "lix.migration.to_version",
+                        "lix.payload.standalone_status",
+                        "lix.payload.physical_status",
+                        "lix.payload.source_deferred",
+                        "lix.payload.physical_conflict",
                         "lix.operation.cancelled",
                     ],
                     create_tracing_span: [<create_ $ident>],

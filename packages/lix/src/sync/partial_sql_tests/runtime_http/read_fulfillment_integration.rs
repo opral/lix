@@ -34,7 +34,7 @@ fn only_read_fulfillment(log: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) ->
 }
 
 #[tokio::test]
-async fn cold_ranged_read_is_pinned_and_full_read_pages_canonical_blob_inputs() {
+async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -155,6 +155,52 @@ async fn cold_ranged_read_is_pinned_and_full_read_pages_canonical_blob_inputs() 
             let _ = demand.response.send(result);
         }
     });
+
+    let selected_branch_id = replica
+        .active_branch_id()
+        .await
+        .expect("selected branch should be available after partial open");
+    log.lock().unwrap().clear();
+    let global_session = replica
+        .open_another_session()
+        .with_branch(crate::GLOBAL_BRANCH_ID)
+        .await
+        .expect("partial replica should open an independent global-branch session");
+    let default_branch = global_session
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = $1 AND lixcol_file_id IS NULL AND lixcol_untracked = false",
+            &[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())],
+        )
+        .await
+        .expect("global session should hydrate the repository default branch");
+    assert_eq!(default_branch.rows().len(), 1);
+    let default_branch_id = match default_branch.rows()[0]
+        .get::<Value>("value")
+        .expect("default branch id should decode")
+    {
+        Value::Jsonb(value) => value
+            .as_json_string()
+            .expect("default branch JSONB should contain a string"),
+        Value::Text(value) => value,
+        other => panic!("unexpected default branch value: {other:?}"),
+    };
+    assert_eq!(default_branch_id, authority.active_branch_id().await.unwrap());
+    assert!(
+        !fulfillment_requests(&log).is_empty(),
+        "cold global-branch metadata read must use read fulfillment"
+    );
+    global_session
+        .close()
+        .await
+        .expect("global-branch session should close");
+    assert_eq!(
+        replica
+            .active_branch_id()
+            .await
+            .expect("selected branch should remain available"),
+        selected_branch_id,
+        "opening and closing a global session must preserve the selected branch",
+    );
 
     // Exercise the receipt path inside one explicit transaction. The first
     // query is cold; the second query remains pinned after the authority

@@ -10494,6 +10494,29 @@ async fn deferred_standalone_sources(
     Ok(deferred)
 }
 
+fn authoritative_live_payload_candidate_status(
+    request: &AuthoritativeLiveChangeRequest,
+    record: Option<&crate::changelog::ChangeRecord>,
+) -> &'static str {
+    let Some(record) = record else {
+        return "absent";
+    };
+    if record.change_id != request.change_id
+        || record.schema_key != request.key.schema_key
+        || record.file_id != request.key.file_id
+        || record.row_pk != request.key.row_pk
+    {
+        return "identity_mismatch";
+    }
+    if record.snapshot.is_none() {
+        return "missing_snapshot";
+    }
+    if record.created_at != request.updated_at {
+        return "lifetime_mismatch";
+    }
+    "matched"
+}
+
 /// Commit selection must use the immutable authored payload when it is local.
 /// A standalone changelog row may be a stale projection of that payload; it
 /// remains a fallback for self-contained sparse checkpoints.
@@ -10529,6 +10552,13 @@ pub(crate) async fn load_authoritative_live_change_records(
             change_ids: &change_ids,
         })
         .await?;
+    let standalone_status = standalone
+        .iter()
+        .zip(requests)
+        .map(|((_, record), request)| {
+            authoritative_live_payload_candidate_status(request, record)
+        })
+        .collect::<Vec<_>>();
     let mut records = vec![None; requests.len()];
     let mut fallback_indices = Vec::new();
     for (index, ((request, (change_id, record)), slot)) in requests
@@ -10608,7 +10638,15 @@ pub(crate) async fn load_authoritative_live_change_records(
         .collect::<Vec<_>>();
     let physical = load_selected_change_records_by_ids_optional(store, &physical_ids).await?;
     let mut physical_conflict = vec![false; requests.len()];
+    let mut physical_status = vec!["absent"; requests.len()];
     for (index, candidate) in physical_indices.into_iter().zip(physical) {
+        let candidate_status = authoritative_live_payload_candidate_status(
+            &requests[index],
+            candidate.as_ref(),
+        );
+        if candidate_status != "absent" {
+            physical_status[index] = candidate_status;
+        }
         if candidate
             .as_ref()
             .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
@@ -10636,6 +10674,13 @@ pub(crate) async fn load_authoritative_live_change_records(
     }
     let direct = load_commit_delta_change_records_for_owners(store, &direct_requests).await?;
     for (index, record) in direct_outputs.into_iter().zip(direct) {
+        let candidate_status =
+            authoritative_live_payload_candidate_status(&requests[index], record.as_ref());
+        if candidate_status != "absent"
+            && (physical_status[index] == "absent" || candidate_status == "matched")
+        {
+            physical_status[index] = candidate_status;
+        }
         if record
             .as_ref()
             .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
@@ -10656,6 +10701,13 @@ pub(crate) async fn load_authoritative_live_change_records(
         .collect::<Vec<_>>();
     let endpoint = load_commit_delta_change_records_for_owners(store, &endpoint_requests).await?;
     for (index, record) in endpoint_outputs.into_iter().zip(endpoint) {
+        let candidate_status =
+            authoritative_live_payload_candidate_status(&requests[index], record.as_ref());
+        if candidate_status != "absent"
+            && (physical_status[index] == "absent" || candidate_status == "matched")
+        {
+            physical_status[index] = candidate_status;
+        }
         if record
             .as_ref()
             .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
@@ -10694,6 +10746,13 @@ pub(crate) async fn load_authoritative_live_change_records(
         }
         let located = load_commit_delta_change_records_for_owners(store, &owners).await?;
         for (index, record) in outputs.into_iter().zip(located) {
+            let candidate_status =
+                authoritative_live_payload_candidate_status(&requests[index], record.as_ref());
+            if candidate_status != "absent"
+                && (physical_status[index] == "absent" || candidate_status == "matched")
+            {
+                physical_status[index] = candidate_status;
+            }
             if record
                 .as_ref()
                 .is_some_and(|record| authoritative_live_change_matches(&requests[index], record))
@@ -10707,23 +10766,36 @@ pub(crate) async fn load_authoritative_live_change_records(
             records[index] = fallback;
         }
     }
-    requests
-        .iter()
-        .zip(records)
-        .map(|(request, record)| {
-            record
-                .filter(|record| authoritative_live_change_matches(request, record))
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "change '{}' has no authoritative live payload at source commit '{}'",
-                            request.change_id, request.source_commit_id
-                        ),
-                    )
-                })
-        })
-        .collect()
+    let mut loaded = Vec::with_capacity(requests.len());
+    for (index, (request, record)) in requests.iter().zip(records).enumerate() {
+        if let Some(record) = record.filter(|record| {
+            authoritative_live_change_matches(request, record)
+        }) {
+            loaded.push(record);
+            continue;
+        }
+        let mut details = serde_json::json!({
+            "payloadStandaloneStatus": standalone_status[index],
+            "payloadPhysicalStatus": physical_status[index],
+            "payloadPhysicalConflict": physical_conflict[index],
+            "changeId": request.change_id.to_string(),
+            "sourceCommitId": request.source_commit_id.to_string(),
+        });
+        if let Ok(source_deferred) =
+            commit_history_is_deferred(store, request.source_commit_id).await
+        {
+            details["payloadSourceDeferred"] = serde_json::json!(source_deferred);
+        }
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "change '{}' has no authoritative live payload at source commit '{}'",
+                request.change_id, request.source_commit_id
+            ),
+        )
+        .with_details(details));
+    }
+    Ok(loaded)
 }
 
 fn authoritative_live_change_matches(
@@ -26471,6 +26543,12 @@ mod tests {
         .await
         .expect_err("standalone fallback must check canonical change lifetime");
         assert!(error.message.contains("no authoritative live payload"), "{error:?}");
+        let details = error.details.expect("payload failure should expose safe diagnostics");
+        assert_eq!(details["payloadStandaloneStatus"], "absent");
+        assert_eq!(details["payloadPhysicalStatus"], "lifetime_mismatch");
+        assert_eq!(details["payloadSourceDeferred"], false);
+        assert_eq!(details["payloadPhysicalConflict"], false);
+        assert_eq!(details["changeId"], row.change_id.to_string());
     }
 
     #[tokio::test]

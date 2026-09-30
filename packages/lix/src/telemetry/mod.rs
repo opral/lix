@@ -761,7 +761,8 @@ where
                     match &result {
                         Ok(_) => span.finish(Status::Unset, Vec::new()),
                         Err(error) => {
-                            let mut attributes = vec![TelemetryAttribute::string("error.type", error.code.clone())];
+                            let mut attributes =
+                                vec![TelemetryAttribute::string("error.type", error.code.clone())];
                             if let Some(details) = error.details.as_deref() {
                                 for (key, attribute) in [
                                     ("receiptVersion", "lix.receipt.version"),
@@ -769,8 +770,34 @@ where
                                     ("fromVersion", "lix.migration.from_version"),
                                     ("toVersion", "lix.migration.to_version"),
                                 ] {
-                                    if let Some(value) = details.get(key).and_then(serde_json::Value::as_i64) {
+                                    if let Some(value) =
+                                        details.get(key).and_then(serde_json::Value::as_i64)
+                                    {
                                         attributes.push(TelemetryAttribute::i64(attribute, value));
+                                    }
+                                }
+                                for (key, attribute) in [
+                                    ("payloadStandaloneStatus", "lix.payload.standalone_status"),
+                                    ("payloadPhysicalStatus", "lix.payload.physical_status"),
+                                ] {
+                                    if let Some(
+                                        value @ ("absent" | "matched" | "identity_mismatch"
+                                        | "missing_snapshot" | "lifetime_mismatch"),
+                                    ) = details.get(key).and_then(serde_json::Value::as_str)
+                                    {
+                                        attributes
+                                            .push(TelemetryAttribute::string(attribute, value));
+                                    }
+                                }
+                                for (key, attribute) in [
+                                    ("payloadSourceDeferred", "lix.payload.source_deferred"),
+                                    ("payloadPhysicalConflict", "lix.payload.physical_conflict"),
+                                ] {
+                                    if let Some(value) =
+                                        details.get(key).and_then(serde_json::Value::as_bool)
+                                    {
+                                        attributes
+                                            .push(TelemetryAttribute::boolean(attribute, value));
                                     }
                                 }
                             }
@@ -1190,15 +1217,57 @@ mod tests {
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
             captured.lock().unwrap().push(span);
         }));
-        let span = ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&ENGINE_OPEN, Vec::new()));
         let error = crate::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private payload")
-            .with_details(serde_json::json!({"receiptVersion": 2, "expectedReceiptVersion": 3, "secret": "private payload"}));
-        let result: Result<(), _> = futures_lite::future::block_on(instrument_lix_result(Some(span), async { Err(error) }));
+            .with_details(serde_json::json!({"receiptVersion": 2, "expectedReceiptVersion": 3, "payloadStandaloneStatus": "matched", "payloadPhysicalStatus": "private payload", "payloadSourceDeferred": true, "payloadPhysicalConflict": false, "secret": "private payload"}));
+        let result: Result<(), _> =
+            futures_lite::future::block_on(instrument_lix_result(Some(span), async { Err(error) }));
         assert!(result.is_err());
         let completed = completed.lock().unwrap();
-        assert_eq!(completed[0].end.status, Status::error("LIX_PARTIAL_REPLICA_STATE_INVALID"));
-        assert!(completed[0].end.attributes.contains(&TelemetryAttribute::i64("lix.receipt.version", 2)));
-        assert!(completed[0].end.attributes.contains(&TelemetryAttribute::i64("lix.receipt.expected_version", 3)));
+        assert_eq!(
+            completed[0].end.status,
+            Status::error("LIX_PARTIAL_REPLICA_STATE_INVALID")
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.receipt.version", 2))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::i64("lix.receipt.expected_version", 3))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::string(
+                    "lix.payload.standalone_status",
+                    "matched"
+                ))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::boolean(
+                    "lix.payload.source_deferred",
+                    true
+                ))
+        );
+        assert!(
+            completed[0]
+                .end
+                .attributes
+                .contains(&TelemetryAttribute::boolean(
+                    "lix.payload.physical_conflict",
+                    false
+                ))
+        );
         assert!(!format!("{:?}", completed[0]).contains("private payload"));
     }
 
