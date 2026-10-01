@@ -615,8 +615,20 @@ async fn pending_conversion_journal_blocks_format_upgrade_without_changing_sourc
     let authority = Authority::new().await;
     for format in [81, 82] {
         let memory = crate::Memory::new();
-        let storage =
-            old_replica_with_recovery_data(&authority, EpochBank::A, false, true, memory).await;
+        let source = old_replica_with_recovery_data(
+            &authority,
+            EpochBank::A,
+            false,
+            true,
+            memory.clone(),
+        )
+        .await;
+        drop(source);
+        let storage = crate::storage_adapter::StorageSession::acquire(
+            crate::sync::durable_memory_for_test(memory),
+        )
+        .await
+        .unwrap();
         let adapter = StorageAdapter::for_epoch_unfenced(storage.clone(), EpochBank::A);
         let (
             PointerState::Active {

@@ -1547,6 +1547,65 @@ fn scan_recipe_selects_change_identity(
     }
 }
 
+/// Current tracked-row reads prepare the branch plugin registry as a native
+/// executable dependency. The registry itself is not part of a custom schema
+/// scan's filter, so authorize only its reserved fileless identity when the
+/// same recipe also selected another canonical row in that branch.
+fn plugin_registry_dependency_matches(
+    interest: &LogicalReadInterest,
+    dependency: &ReadInput,
+    inputs: &[ReadInput],
+) -> bool {
+    use crate::plugin::runtime::PLUGIN_REGISTRY_KEY;
+
+    let ReadInputAddress::ChangeRecord {
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+        ..
+    } = &dependency.address
+    else {
+        return false;
+    };
+    if schema_key != "lix_key_value"
+        || file_id.is_some()
+        || row_pk.as_single_string().ok() != Some(PLUGIN_REGISTRY_KEY)
+        || !matches!(
+            interest,
+            LogicalReadInterest::Scan { .. } | LogicalReadInterest::Exact { .. }
+        )
+    {
+        return false;
+    }
+
+    inputs.iter().any(|input| {
+        let ReadInputAddress::ChangeRecord {
+            branch_id: selected_branch_id,
+            schema_key: selected_schema_key,
+            file_id: selected_file_id,
+            row_pk: selected_row_pk,
+            ..
+        } = &input.address
+        else {
+            return false;
+        };
+        if selected_branch_id != branch_id
+            || (selected_schema_key == "lix_key_value"
+                && selected_row_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY))
+        {
+            return false;
+        }
+        scan_recipe_selects_change_identity(
+            interest,
+            selected_branch_id,
+            selected_schema_key,
+            selected_file_id.as_deref(),
+            selected_row_pk,
+        )
+    })
+}
+
 #[derive(Default)]
 struct ReadFulfillmentPayloadContext {
     filesystem_path_rows: Vec<crate::hot_state::MaterializedHotStateRow>,
@@ -2068,7 +2127,7 @@ fn validate_complete(
                     schema_key,
                     file_id.as_deref(),
                     row_pk,
-                )
+                ) || plugin_registry_dependency_matches(interest, input, &response.inputs)
             });
         if !selected_by_recipe {
             return Err(
@@ -2866,6 +2925,161 @@ mod tests {
         let mut limited = make_scan();
         limited.limit = Some(1);
         assert!(!selects(&limited, InterestDomain::Combined));
+    }
+
+    #[test]
+    fn plugin_registry_dependency_requires_a_selected_tracked_row() {
+        use crate::plugin::runtime::PLUGIN_REGISTRY_KEY;
+
+        let branch = "branch";
+        let row_pk = crate::row_pk::RowPk::single("row");
+        let make_input = |label: &str,
+                          branch_id: &str,
+                          schema_key: &str,
+                          file_id: Option<&str>,
+                          row_pk: crate::row_pk::RowPk| {
+            ReadInput {
+                address: ReadInputAddress::ChangeRecord {
+                    change_id: format!("change-{label}"),
+                    source_commit_id: format!("source-{label}"),
+                    branch_id: branch_id.to_owned(),
+                    schema_key: schema_key.to_owned(),
+                    file_id: file_id.map(str::to_owned),
+                    row_pk,
+                    updated_at: "2025-01-01T00:00:00.000Z".to_owned(),
+                    payload_digest: [0; 32],
+                },
+                bytes: Vec::new(),
+            }
+        };
+        let row_input = make_input("row", branch, "merge_test_row", None, row_pk.clone());
+        let registry_input = make_input(
+            "registry",
+            branch,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        let scan = LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec!["merge_test_row".to_owned()],
+                    branch_ids: vec![branch.to_owned()],
+                    row_pks: vec![row_pk.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            domain: InterestDomain::Tracked,
+        };
+        let inputs = vec![row_input.clone(), registry_input.clone()];
+
+        assert!(plugin_registry_dependency_matches(
+            &scan,
+            &registry_input,
+            &inputs,
+        ));
+        assert!(
+            !plugin_registry_dependency_matches(
+                &scan,
+                &registry_input,
+                std::slice::from_ref(&registry_input),
+            ),
+            "a registry row alone cannot prove a returned-row dependency"
+        );
+
+        let unrelated_key = make_input(
+            "unrelated",
+            branch,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single("ordinary-setting"),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &unrelated_key,
+            &inputs,
+        ));
+
+        let wrong_branch_registry = make_input(
+            "wrong-branch-registry",
+            "other-branch",
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &wrong_branch_registry,
+            &inputs,
+        ));
+
+        let file_scoped_registry = make_input(
+            "file-scoped-registry",
+            branch,
+            "lix_key_value",
+            Some("file"),
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &file_scoped_registry,
+            &inputs,
+        ));
+
+        let untracked_scan = LogicalReadInterest::Scan {
+            request: match &scan {
+                LogicalReadInterest::Scan { request, .. } => request.clone(),
+                _ => unreachable!(),
+            },
+            domain: InterestDomain::Untracked,
+        };
+        assert!(!plugin_registry_dependency_matches(
+            &untracked_scan,
+            &registry_input,
+            &inputs,
+        ));
+
+        let exact = LogicalReadInterest::Exact {
+            rows: vec![crate::hot_state::ExactReadIdentity {
+                branch_id: branch.to_owned(),
+                schema_key: "merge_test_row".to_owned(),
+                file_id: None,
+                row_pk: row_pk.clone(),
+            }],
+            projection: crate::hot_state::HotStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: false,
+        };
+        assert!(plugin_registry_dependency_matches(
+            &exact,
+            &registry_input,
+            &inputs,
+        ));
+
+        // Branch scans implicitly read global candidates for overlay
+        // resolution, so the registry dependency must be accepted from the
+        // global branch when the selected tracked row is also global.
+        let global_row = make_input(
+            "global-row",
+            crate::GLOBAL_BRANCH_ID,
+            "merge_test_row",
+            None,
+            row_pk.clone(),
+        );
+        let global_registry = make_input(
+            "global-registry",
+            crate::GLOBAL_BRANCH_ID,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        let global_inputs = vec![global_row, global_registry.clone()];
+        assert!(plugin_registry_dependency_matches(
+            &scan,
+            &global_registry,
+            &global_inputs,
+        ));
     }
 
     #[test]
