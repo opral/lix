@@ -736,7 +736,6 @@ fn error_reporting_is_not_disabled_by_unsampled_remote_context() {
 
 #[test]
 fn streaming_request_does_not_hide_independent_engine_errors() {
-    use lix_sdk::telemetry::{TelemetrySpanEnd, TelemetrySpanStart, spans};
     let exporter = RecordingExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -750,13 +749,10 @@ fn streaming_request_does_not_hide_independent_engine_errors() {
         set_request_parent(&request, &HeaderMap::new(), false);
         request.in_scope(|| {
             set_request_actor(Some(ACCOUNT_ID));
-            let query = server_sink(dispatch.clone())
-                .start_span(TelemetrySpanStart::new(&spans::SQL_QUERY, Vec::new()));
-            query.finish(TelemetrySpanEnd {
-                duration_ns: 1,
-                status: opentelemetry::trace::Status::error("LIX_TYPE_MISMATCH"),
-                attributes: Vec::new(),
-            });
+            let query = tracing::info_span!("SELECT");
+            query.set_parent(request.context()).unwrap();
+            initialize_engine_span(&query);
+            query.set_status(opentelemetry::trace::Status::error("LIX_TYPE_MISMATCH"));
         });
     });
     provider.force_flush().unwrap();
