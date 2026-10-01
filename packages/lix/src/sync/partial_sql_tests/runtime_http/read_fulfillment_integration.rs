@@ -36,8 +36,7 @@ impl RawHttpClient for ReadOnlyProductionClient {
                     "/sync/native-metadata",
                     "/sync/native-metadata-walk",
                 ]
-                .iter()
-                .any(|suffix| route == *suffix),
+                .contains(&route),
                 "DELETE" => route == "/session",
                 _ => false,
             });

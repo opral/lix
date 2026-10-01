@@ -1319,6 +1319,22 @@ where
     }
     let source =
         StorageAdapter::for_epoch(storage.clone(), source_bank, active_source_bytes.clone());
+    if pending_conversion_journal::source_bank_has_pending_conversion_journal(
+        storage,
+        &bank_code(source_bank),
+    )
+    .await?
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
+            "a pending conversion attempt is tied to this source epoch; format migration stopped before changing the active source",
+        )
+        .with_details(serde_json::json!({
+            "sourcePreserved": true,
+            "migrationPhase": "candidate_format_migration",
+            "failureReason": "pending_conversion_journal",
+        })));
+    }
     emit_migrating(progress, from_format);
     let target_bank = if server.is_some() || matches!(source_bank, EpochBank::Generation(_)) {
         replica_generation_bank(

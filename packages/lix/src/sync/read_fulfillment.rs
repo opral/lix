@@ -495,6 +495,37 @@ impl ReadFulfillmentRequest {
             return Err(invalid("historical diff recipes require history discovery"));
         }
         for interest in &self.interests {
+            let selected_branch_id = self.descriptor.selected_branch.branch_id.as_str();
+            let global_branch_id = self.descriptor.global_branch.branch_id.as_str();
+            let branch_is_in_descriptor =
+                |branch_id: &str| branch_id == selected_branch_id || branch_id == global_branch_id;
+            let branch_scope_is_in_descriptor = match interest {
+                LogicalReadInterest::FilesystemMetadata { branch_ids, .. }
+                | LogicalReadInterest::FilesystemPaths { branch_ids, .. } => {
+                    branch_ids.iter().all(|id| branch_is_in_descriptor(id))
+                }
+                LogicalReadInterest::FileContent { request, .. }
+                | LogicalReadInterest::Scan { request, .. } => request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .all(|id| branch_is_in_descriptor(id)),
+                LogicalReadInterest::CollectionGeneration { branch_id, .. }
+                | LogicalReadInterest::PackedIdentityMembership { branch_id, .. } => {
+                    branch_is_in_descriptor(branch_id)
+                }
+                LogicalReadInterest::Exact { rows, .. } => rows
+                    .iter()
+                    .all(|row| branch_is_in_descriptor(&row.branch_id)),
+                LogicalReadInterest::Diff { branch_id, .. } => {
+                    branch_id.as_deref().is_none_or(branch_is_in_descriptor)
+                }
+            };
+            if !branch_scope_is_in_descriptor {
+                return Err(invalid(
+                    "read interest branch scope is outside the descriptor",
+                ));
+            }
             let LogicalReadInterest::Scan { request, domain } = interest else {
                 continue;
             };
@@ -654,7 +685,7 @@ impl ReadInputAddress {
 fn canonical_change_id(value: &str) -> Result<crate::changelog::ChangeId, LixError> {
     let id = crate::changelog::ChangeId::parse(value)
         .map_err(|_| invalid("change payload ID must be a canonical UUID"))?;
-    if id.to_string() != value {
+    if id != value {
         return Err(invalid("change payload ID must be a canonical UUID"));
     }
     Ok(id)
@@ -663,7 +694,7 @@ fn canonical_change_id(value: &str) -> Result<crate::changelog::ChangeId, LixErr
 fn canonical_commit_id(value: &str) -> Result<crate::changelog::CommitId, LixError> {
     let id = crate::changelog::CommitId::parse(value)
         .map_err(|_| invalid("change payload source must be a canonical UUID"))?;
-    if id.to_string() != value {
+    if id != value {
         return Err(invalid("change payload source must be a canonical UUID"));
     }
     Ok(id)
@@ -1378,10 +1409,7 @@ fn scan_selects_change_identity(
             .schema_keys
             .iter()
             .any(|candidate| candidate == schema_key)
-        || !filter
-            .branch_ids
-            .iter()
-            .any(|candidate| candidate == branch_id)
+        || !branch_is_selected_by_scan(&filter.branch_ids, branch_id)
         || (!filter.row_pks.is_empty()
             && !filter.row_pks.iter().any(|candidate| candidate == row_pk))
         || !crate::tracked_state::row_pk_satisfies_bounds(
@@ -1407,6 +1435,18 @@ fn scan_selects_change_identity(
         && filter.declared_column_eq.is_none()
         && filter.declared_column_range.is_none()
         && !filter.include_tombstones
+}
+
+/// Branch-scoped scans physically read global rows as candidates for the
+/// branch/global visibility overlay. A canonical payload may therefore name
+/// the global source branch even though the logical recipe names only the
+/// selected branch. Keep the exception tied to that implicit global read.
+fn branch_is_selected_by_scan(branch_ids: &[String], branch_id: &str) -> bool {
+    branch_ids.iter().any(|candidate| candidate == branch_id)
+        || (branch_id == crate::GLOBAL_BRANCH_ID
+            && branch_ids
+                .iter()
+                .any(|candidate| candidate != crate::GLOBAL_BRANCH_ID))
 }
 
 fn scan_recipe_selects_change_identity(
@@ -1507,6 +1547,407 @@ fn scan_recipe_selects_change_identity(
     }
 }
 
+#[derive(Default)]
+struct ReadFulfillmentPayloadContext {
+    filesystem_path_rows: Vec<crate::hot_state::MaterializedHotStateRow>,
+    plugin_owner_schemas: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+#[derive(Default)]
+struct FileContentPayloadSelection {
+    file_ids: BTreeSet<String>,
+    path_change_ids: BTreeSet<crate::changelog::ChangeId>,
+}
+
+impl ReadFulfillmentPayloadContext {
+    fn new(inputs: &[ReadInput]) -> Result<Self, LixError> {
+        use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+
+        let mut path_rows = Vec::new();
+        let mut plugin_owner_schemas = BTreeMap::new();
+        let mut path_row_identities = BTreeSet::new();
+        let mut plugin_owner_identities = BTreeSet::new();
+        for input in inputs {
+            let ReadInputAddress::ChangeRecord {
+                branch_id,
+                schema_key,
+                file_id,
+                row_pk,
+                ..
+            } = &input.address
+            else {
+                continue;
+            };
+            if !matches!(
+                schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+            ) && !(schema_key == "lix_key_value"
+                && row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+            {
+                continue;
+            }
+            let row = change_payload_row(input).ok_or_else(|| {
+                invalid("read fulfillment contains an invalid filesystem or plugin owner row")
+            })?;
+            if matches!(
+                schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+            ) {
+                let identity = (
+                    branch_id.clone(),
+                    schema_key.clone(),
+                    row_pk.clone(),
+                    file_id.clone(),
+                );
+                if !path_row_identities.insert(identity) {
+                    return Err(invalid(
+                        "read fulfillment contains duplicate filesystem row identities",
+                    ));
+                }
+                path_rows.push(row.clone());
+            }
+            if schema_key == "lix_key_value"
+                && row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && !row.deleted
+            {
+                let file_id = file_id
+                    .as_deref()
+                    .ok_or_else(|| invalid("plugin owner row is missing its file identity"))?;
+                let snapshot = row
+                    .snapshot_content
+                    .as_deref()
+                    .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+                    .ok_or_else(|| invalid("plugin owner row has an invalid snapshot"))?;
+                let owner =
+                    crate::plugin::runtime::PluginFileOwner::from_snapshot(file_id, &snapshot)
+                        .map_err(|_| invalid("plugin owner row failed canonical validation"))?;
+                if !plugin_owner_identities.insert((branch_id.clone(), owner.file_id().to_owned()))
+                {
+                    return Err(invalid(
+                        "read fulfillment contains duplicate plugin owner identities",
+                    ));
+                }
+                plugin_owner_schemas.insert(
+                    (branch_id.clone(), owner.file_id().to_owned()),
+                    owner.schema_keys().iter().cloned().collect(),
+                );
+            }
+        }
+        Ok(Self {
+            filesystem_path_rows: path_rows,
+            plugin_owner_schemas,
+        })
+    }
+
+    fn selected_files(&self, interest: &LogicalReadInterest) -> FileContentPayloadSelection {
+        let LogicalReadInterest::FileContent {
+            request,
+            file_ids,
+            directory_ids,
+            root_directory,
+            path_predicate,
+            ..
+        } = interest
+        else {
+            return FileContentPayloadSelection::default();
+        };
+        if file_ids.as_ref().is_some_and(Vec::is_empty)
+            || directory_ids.as_ref().is_some_and(Vec::is_empty)
+        {
+            return FileContentPayloadSelection::default();
+        }
+        let mut selected = FileContentPayloadSelection::default();
+        if !self.filesystem_path_rows.is_empty() {
+            let visible_path_rows = crate::hot_state::resolve_visible_batch(
+                crate::hot_state::MaterializedHotStateBatch::from_rows(
+                    self.filesystem_path_rows.clone(),
+                ),
+                crate::hot_state::MaterializedHotStateBatch::default(),
+                &crate::hot_state::VisibilityRequest {
+                    branch_scope: crate::hot_state::VisibilityBranchScope::BranchIds {
+                        branch_ids: request.filter.branch_ids.clone(),
+                    },
+                    include_tombstones: false,
+                    limit: None,
+                },
+            );
+            let index =
+                crate::filesystem::FilesystemPathIndex::from_live_batch(&visible_path_rows).ok();
+            if let Some(index) = index {
+                let entries = index.entries();
+                let directories = entries
+                    .iter()
+                    .filter(|entry| entry.kind == crate::filesystem::FilesystemPathKind::Directory)
+                    .map(|entry| {
+                        (
+                            (entry.live_row().branch_id.clone(), entry.id().to_owned()),
+                            entry,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                for entry in &entries {
+                    if entry.kind != crate::filesystem::FilesystemPathKind::File
+                        || !file_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.iter().any(|id| id == entry.id()))
+                        || (directory_ids.as_ref().is_some_and(|ids| {
+                            entry
+                                .parent_id
+                                .as_ref()
+                                .is_none_or(|parent| !ids.iter().any(|id| id == parent))
+                        }))
+                        || (*root_directory && entry.parent_id.is_some())
+                        || !file_path_interest_matches(path_predicate, &entry.path)
+                    {
+                        continue;
+                    }
+                    let row = entry.live_row();
+                    if scan_selects_change_identity(
+                        request,
+                        InterestDomain::Combined,
+                        &row.branch_id,
+                        &row.schema_key,
+                        row.file_id.as_deref(),
+                        &row.row_pk,
+                    ) {
+                        selected.file_ids.insert(entry.id().to_owned());
+                        let selected_row = entry.live_row();
+                        if let Some(change_id) = selected_row.change_id {
+                            selected.path_change_ids.insert(change_id);
+                        }
+                        if let Some(blob_row) = entry.blob_ref_live_row()
+                            && let Some(change_id) = blob_row.change_id
+                        {
+                            selected.path_change_ids.insert(change_id);
+                        }
+                        let mut parent_id = entry.parent_id.clone();
+                        while let Some(directory_id) = parent_id {
+                            let Some(directory) = directories
+                                .get(&(selected_row.branch_id.clone(), directory_id.clone()))
+                            else {
+                                break;
+                            };
+                            if let Some(change_id) = directory.live_row().change_id {
+                                selected.path_change_ids.insert(change_id);
+                            }
+                            parent_id = directory.parent_id.clone();
+                        }
+                    }
+                }
+                return selected;
+            }
+        }
+
+        // An explicit file-id recipe can still prove the identity without
+        // reconstructing a path index. Path and directory predicates require
+        // descriptor evidence, so they fail closed when that evidence is not
+        // in this closure.
+        if *root_directory
+            || directory_ids.is_some()
+            || !matches!(path_predicate, crate::hot_state::FilePathInterest::All)
+        {
+            return selected;
+        }
+        if let Some(file_ids) = file_ids {
+            selected.file_ids.extend(file_ids.iter().cloned());
+        } else {
+            selected
+                .file_ids
+                .extend(
+                    request
+                        .filter
+                        .file_ids
+                        .iter()
+                        .filter_map(|candidate| match candidate {
+                            crate::NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+                            crate::NullableKeyFilter::Any | crate::NullableKeyFilter::Null => None,
+                        }),
+                );
+        }
+        selected
+    }
+}
+
+fn change_payload_row(input: &ReadInput) -> Option<crate::hot_state::MaterializedHotStateRow> {
+    let ReadInputAddress::ChangeRecord {
+        change_id,
+        source_commit_id,
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+        updated_at,
+        ..
+    } = &input.address
+    else {
+        return None;
+    };
+    let change_id = canonical_change_id(change_id).ok()?;
+    let source_commit_id = canonical_commit_id(source_commit_id).ok()?;
+    let updated_at = canonical_timestamp(updated_at).ok()?;
+    let record = crate::changelog::decode_change_record(&input.bytes, change_id).ok()?;
+    let deleted = record.snapshot.is_none();
+    let snapshot_content = match record.snapshot {
+        Some(snapshot) => Some(
+            crate::row_payload::TypedRow::decode_durable_payload(
+                Arc::from(snapshot),
+                schema_key,
+                row_pk,
+            )
+            .ok()?
+            .to_json_shared()
+            .ok()?,
+        ),
+        None => None,
+    };
+    Some(crate::hot_state::MaterializedHotStateRow {
+        row_pk: row_pk.clone(),
+        schema_key: schema_key.clone(),
+        file_id: file_id.clone(),
+        snapshot_content,
+        metadata: record.metadata.map(|metadata| metadata.to_string().into()),
+        deleted,
+        created_at: record.created_at,
+        updated_at,
+        global: branch_id == crate::GLOBAL_BRANCH_ID,
+        change_id: Some(change_id),
+        author_id: record.account_id,
+        commit_id: Some(source_commit_id),
+        untracked: false,
+        branch_id: branch_id.clone().into(),
+    })
+}
+
+fn file_path_interest_matches(predicate: &crate::hot_state::FilePathInterest, path: &str) -> bool {
+    use crate::hot_state::{
+        FilePathInterest as Interest, FilePathInterestComparison as Comparison,
+    };
+    match predicate {
+        Interest::All => true,
+        Interest::Comparison { operation, value } => match operation {
+            Comparison::Equal => path == value,
+            Comparison::LessThan => path < value.as_str(),
+            Comparison::LessThanOrEqual => path <= value.as_str(),
+            Comparison::GreaterThan => path > value.as_str(),
+            Comparison::GreaterThanOrEqual => path >= value.as_str(),
+        },
+        Interest::In { values } => values.iter().any(|value| value == path),
+        Interest::LowercaseContains { value } => path.to_lowercase().contains(value),
+        Interest::And { left, right } => {
+            file_path_interest_matches(left, path) && file_path_interest_matches(right, path)
+        }
+        Interest::Or { left, right } => {
+            file_path_interest_matches(left, path) || file_path_interest_matches(right, path)
+        }
+    }
+}
+
+/// File-content reads also prepare the selected file's plugin owner and
+/// plugin-declared row schemas. The owner record is the authority for which
+/// non-native schemas belong to a file; a shared branch scan alone cannot
+/// admit unrelated rows.
+#[cfg(test)]
+fn file_content_recipe_selects_change_identity(
+    interest: &LogicalReadInterest,
+    inputs: &[ReadInput],
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    let Ok(context) = ReadFulfillmentPayloadContext::new(inputs) else {
+        return false;
+    };
+    let selected_files = context.selected_files(interest);
+    file_content_recipe_selects_change_identity_with_context(
+        interest,
+        &context,
+        &selected_files,
+        None,
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+    )
+}
+
+fn file_content_recipe_selects_change_identity_with_context(
+    interest: &LogicalReadInterest,
+    context: &ReadFulfillmentPayloadContext,
+    selected_files: &FileContentPayloadSelection,
+    change_id: Option<crate::changelog::ChangeId>,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    use crate::plugin::runtime::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY};
+
+    let LogicalReadInterest::FileContent {
+        request,
+        directory_ids,
+        root_directory,
+        path_predicate,
+        ..
+    } = interest
+    else {
+        return false;
+    };
+    if !branch_is_selected_by_scan(&request.filter.branch_ids, branch_id) {
+        return false;
+    }
+
+    if schema_key == "lix_key_value" {
+        match row_pk.as_single_string().ok() {
+            Some(PLUGIN_REGISTRY_KEY) => {
+                return file_id.is_none()
+                    && request
+                        .filter
+                        .schema_keys
+                        .iter()
+                        .any(|schema| schema == "lix_file_descriptor");
+            }
+            Some(PLUGIN_OWNER_KEY) => {
+                return file_id.is_some_and(|file_id| selected_files.file_ids.contains(file_id));
+            }
+            _ => return false,
+        }
+    }
+
+    if request
+        .filter
+        .schema_keys
+        .iter()
+        .any(|schema| schema == schema_key)
+        && scan_selects_change_identity(
+            request,
+            InterestDomain::Combined,
+            branch_id,
+            schema_key,
+            file_id,
+            row_pk,
+        )
+    {
+        let path_scoped = *path_predicate != crate::hot_state::FilePathInterest::All
+            || *root_directory
+            || directory_ids.is_some();
+        let path_identity_selected = !path_scoped
+            || change_id
+                .is_some_and(|change_id| selected_files.path_change_ids.contains(&change_id));
+        if path_identity_selected {
+            return true;
+        }
+    }
+
+    file_id.is_some_and(|file_id| {
+        selected_files.file_ids.contains(file_id)
+            && context
+                .plugin_owner_schemas
+                .get(&(branch_id.to_owned(), file_id.to_owned()))
+                .is_some_and(|schemas| schemas.contains(schema_key))
+    })
+}
+
 fn payload_schema_kind(schema: &str) -> &'static str {
     match schema {
         "lix_file_descriptor" => "file_descriptor",
@@ -1573,6 +2014,20 @@ fn validate_complete(
             return Err(invalid("read fulfillment omitted a required input"));
         }
     }
+    let payload_context = if request
+        .interests
+        .iter()
+        .any(|interest| matches!(interest, LogicalReadInterest::FileContent { .. }))
+    {
+        ReadFulfillmentPayloadContext::new(&response.inputs)?
+    } else {
+        ReadFulfillmentPayloadContext::default()
+    };
+    let selected_file_ids = request
+        .interests
+        .iter()
+        .map(|interest| payload_context.selected_files(interest))
+        .collect::<Vec<_>>();
     for input in &response.inputs {
         let ReadInputAddress::ChangeRecord {
             change_id,
@@ -1593,15 +2048,28 @@ fn validate_complete(
                 "canonical change payload is outside the descriptor branch scope",
             ));
         }
-        let selected_by_recipe = request.interests.iter().any(|interest| {
-            scan_recipe_selects_change_identity(
-                interest,
-                branch_id,
-                schema_key,
-                file_id.as_deref(),
-                row_pk,
-            )
-        });
+        let selected_by_recipe = request
+            .interests
+            .iter()
+            .enumerate()
+            .any(|(index, interest)| {
+                scan_recipe_selects_change_identity(
+                    interest,
+                    branch_id,
+                    schema_key,
+                    file_id.as_deref(),
+                    row_pk,
+                ) || file_content_recipe_selects_change_identity_with_context(
+                    interest,
+                    &payload_context,
+                    &selected_file_ids[index],
+                    canonical_change_id(change_id).ok(),
+                    branch_id,
+                    schema_key,
+                    file_id.as_deref(),
+                    row_pk,
+                )
+            });
         if !selected_by_recipe {
             return Err(
                 invalid("canonical change payload has no matching row recipe").with_details(
@@ -2322,6 +2790,18 @@ mod tests {
         assert!(selects(&make_scan(), InterestDomain::Tracked));
         assert!(!selects(&make_scan(), InterestDomain::Untracked));
 
+        assert!(
+            scan_selects_change_identity(
+                &make_scan(),
+                InterestDomain::Combined,
+                crate::GLOBAL_BRANCH_ID,
+                "schema",
+                None,
+                &row_pk,
+            ),
+            "a branch scan includes global candidates for visibility overlay"
+        );
+
         let mut broad_scan = make_scan();
         broad_scan.filter.row_pks.clear();
         assert!(
@@ -2386,6 +2866,319 @@ mod tests {
         let mut limited = make_scan();
         limited.limit = Some(1);
         assert!(!selects(&limited, InterestDomain::Combined));
+    }
+
+    #[test]
+    fn file_content_recipe_authorizes_only_selected_plugin_inputs() {
+        use crate::plugin::runtime::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner};
+
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-0000000000d2";
+        let file_row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id).unwrap();
+        let file_snapshot = serde_json::json!({
+            "id": file_id,
+            "directory_id": null,
+            "name": "target.csv",
+        });
+        let file_payload = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_file_descriptor",
+            &file_row_pk,
+            &file_snapshot,
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap()
+        .to_vec();
+        let file_change_id = crate::changelog::ChangeId::for_test_label("file-content-file");
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(6);
+        let file_record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: file_change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_file_descriptor".to_owned(),
+            row_pk: file_row_pk.clone(),
+            file_id: Some(file_id.to_owned()),
+            snapshot: Some(file_payload),
+            metadata: None,
+            created_at,
+            origin_key: None,
+        };
+        let file_input = ReadInput {
+            address: ReadInputAddress::ChangeRecord {
+                change_id: file_change_id.to_string(),
+                source_commit_id: crate::changelog::CommitId::for_test_label(
+                    "file-content-file-source",
+                )
+                .to_string(),
+                branch_id: branch.to_owned(),
+                schema_key: file_record.schema_key.clone(),
+                file_id: file_record.file_id.clone(),
+                row_pk: file_row_pk,
+                updated_at: created_at.to_string(),
+                payload_digest: [0; 32],
+            },
+            bytes: crate::changelog::encode_change_record(&file_record).unwrap(),
+        };
+        let owner_row_pk = crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY);
+        let owner = PluginFileOwner::new(file_id, "plugin_csv", vec!["csv_row".into()]).unwrap();
+        let owner_snapshot = owner.to_snapshot().unwrap();
+        let owner_payload = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_key_value",
+            &owner_row_pk,
+            &owner_snapshot,
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap()
+        .to_vec();
+        let change_id = crate::changelog::ChangeId::for_test_label("file-content-owner");
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(7);
+        let record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: owner_row_pk.clone(),
+            file_id: Some(file_id.to_owned()),
+            snapshot: Some(owner_payload),
+            metadata: None,
+            created_at,
+            origin_key: None,
+        };
+        let owner_input = ReadInput {
+            address: ReadInputAddress::ChangeRecord {
+                change_id: change_id.to_string(),
+                source_commit_id: crate::changelog::CommitId::for_test_label(
+                    "file-content-owner-source",
+                )
+                .to_string(),
+                branch_id: branch.to_owned(),
+                schema_key: record.schema_key.clone(),
+                file_id: record.file_id.clone(),
+                row_pk: owner_row_pk.clone(),
+                updated_at: created_at.to_string(),
+                payload_digest: [0; 32],
+            },
+            bytes: crate::changelog::encode_change_record(&record).unwrap(),
+        };
+        let inputs = vec![file_input, owner_input];
+        let interest = LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".into(),
+                        "lix_binary_blob_ref".into(),
+                        "lix_directory_descriptor".into(),
+                    ],
+                    branch_ids: vec![branch.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::In {
+                values: vec!["/target.csv".into()],
+            },
+            byte_range: None,
+        };
+
+        assert!(file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "lix_key_value",
+            Some(file_id),
+            &owner_row_pk,
+        ));
+        assert!(file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "csv_row",
+            Some(file_id),
+            &crate::row_pk::RowPk::single("row"),
+        ));
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "other_plugin_row",
+            Some(file_id),
+            &crate::row_pk::RowPk::single("row"),
+        ));
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "csv_row",
+            Some("01920000-0000-7000-8000-0000000000d3"),
+            &crate::row_pk::RowPk::single("foreign-row"),
+        ));
+
+        let registry_row_pk = crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY);
+        assert!(
+            file_content_recipe_selects_change_identity(
+                &interest,
+                &[],
+                branch,
+                "lix_key_value",
+                None,
+                &registry_row_pk,
+            ),
+            "file content needs the exact branch plugin registry row"
+        );
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &[],
+            branch,
+            "lix_key_value",
+            None,
+            &crate::row_pk::RowPk::single("unrelated-setting"),
+        ));
+    }
+
+    #[test]
+    fn file_content_path_selection_uses_the_effective_branch_global_overlay() {
+        let selected_branch = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-0000000000d2";
+        let directory_id = "01920000-0000-7000-8000-0000000000d3";
+        let make_input = |branch_id: &str,
+                          schema_key: &str,
+                          id: &str,
+                          file_id: Option<&str>,
+                          name: &str,
+                          directory_id: Option<&str>,
+                          label: &str| {
+            let row_pk = crate::row_pk::RowPk::uuid_from_canonical(id).unwrap();
+            let snapshot = if schema_key == "lix_file_descriptor" {
+                serde_json::json!({
+                    "id": id,
+                    "directory_id": directory_id,
+                    "name": name,
+                })
+            } else {
+                serde_json::json!({
+                    "id": id,
+                    "parent_id": directory_id,
+                    "name": name,
+                })
+            };
+            let payload =
+                crate::row_payload::TypedRow::from_builtin_json(schema_key, &row_pk, &snapshot)
+                    .unwrap()
+                    .durable_payload()
+                    .unwrap()
+                    .to_vec();
+            let change_id = crate::changelog::ChangeId::for_test_label(label);
+            let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(8);
+            let record = crate::changelog::ChangeRecord {
+                format_version: 2,
+                change_id,
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                schema_key: schema_key.to_owned(),
+                row_pk: row_pk.clone(),
+                file_id: file_id.map(str::to_owned),
+                snapshot: Some(payload),
+                metadata: None,
+                created_at,
+                origin_key: None,
+            };
+            ReadInput {
+                address: ReadInputAddress::ChangeRecord {
+                    change_id: change_id.to_string(),
+                    source_commit_id: crate::changelog::CommitId::for_test_label(&format!(
+                        "{label}-source"
+                    ))
+                    .to_string(),
+                    branch_id: branch_id.to_owned(),
+                    schema_key: schema_key.to_owned(),
+                    file_id: file_id.map(str::to_owned),
+                    row_pk,
+                    updated_at: created_at.to_string(),
+                    payload_digest: [0; 32],
+                },
+                bytes: crate::changelog::encode_change_record(&record).unwrap(),
+            }
+        };
+        // Filesystem parents retain their global scope. The global file
+        // lives under a global directory; its selected-branch override moves
+        // to the selected branch's root rather than referencing that separate
+        // global parent scope.
+        let inputs = vec![
+            make_input(
+                crate::GLOBAL_BRANCH_ID,
+                "lix_directory_descriptor",
+                directory_id,
+                None,
+                "global-dir",
+                None,
+                "overlay-global-directory",
+            ),
+            make_input(
+                crate::GLOBAL_BRANCH_ID,
+                "lix_file_descriptor",
+                file_id,
+                Some(file_id),
+                "old.csv",
+                Some(directory_id),
+                "overlay-global-file",
+            ),
+            make_input(
+                selected_branch,
+                "lix_file_descriptor",
+                file_id,
+                Some(file_id),
+                "new.csv",
+                None,
+                "overlay-selected-file",
+            ),
+        ];
+        let make_interest = |path: &str| LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".into(),
+                        "lix_directory_descriptor".into(),
+                        "lix_binary_blob_ref".into(),
+                    ],
+                    branch_ids: vec![selected_branch.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::In {
+                values: vec![path.into()],
+            },
+            byte_range: None,
+        };
+        let context = ReadFulfillmentPayloadContext::new(&inputs).unwrap();
+        assert!(
+            !context
+                .selected_files(&make_interest("/global-dir/old.csv"))
+                .file_ids
+                .contains(file_id)
+        );
+        assert!(
+            context
+                .selected_files(&make_interest("/new.csv"))
+                .file_ids
+                .contains(file_id)
+        );
+
+        let global_only_context = ReadFulfillmentPayloadContext::new(&inputs[..2]).unwrap();
+        assert!(
+            global_only_context
+                .selected_files(&make_interest("/global-dir/old.csv"))
+                .file_ids
+                .contains(file_id)
+        );
     }
 
     #[tokio::test]
@@ -2695,8 +3488,20 @@ mod tests {
         for (branch, schema, file, row, expected) in [
             ("branch", "lix_directory_descriptor", None, &other_key, true),
             ("branch", "lix_file_descriptor", Some(id), &key, true),
-            ("branch", "lix_file_descriptor", Some(other), &other_key, false),
-            ("other-branch", "lix_directory_descriptor", None, &other_key, false),
+            (
+                "branch",
+                "lix_file_descriptor",
+                Some(other),
+                &other_key,
+                false,
+            ),
+            (
+                "other-branch",
+                "lix_directory_descriptor",
+                None,
+                &other_key,
+                false,
+            ),
             ("branch", "lix_binary_blob_ref", Some(id), &key, false),
             ("branch", "lix_account", None, &key, false),
         ] {

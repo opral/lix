@@ -611,6 +611,158 @@ async fn interrupted_checkpoint_rewrite_reopens_from_server_without_historical_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_conversion_journal_blocks_format_upgrade_without_changing_source() {
+    let authority = Authority::new().await;
+    for format in [81, 82] {
+        let memory = crate::Memory::new();
+        let storage =
+            old_replica_with_recovery_data(&authority, EpochBank::A, false, true, memory).await;
+        let adapter = StorageAdapter::for_epoch_unfenced(storage.clone(), EpochBank::A);
+        let (
+            PointerState::Active {
+                bank,
+                generation,
+                publication,
+                ..
+            },
+            old_pointer,
+        ) = load_pointer(&storage).await.unwrap().unwrap()
+        else {
+            panic!("active source expected")
+        };
+
+        let marker = match format {
+            81 => crate::init::REPOSITORY_PROTOCOL_V81,
+            82 => crate::init::REPOSITORY_PROTOCOL_V82,
+            _ => unreachable!(),
+        };
+        let mut write = adapter
+            .begin_migration_write(WriteOptions::default())
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                single_put(
+                    crate::init::REPOSITORY_PROTOCOL_KEY,
+                    Bytes::from_static(marker),
+                ),
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        let source_pointer = encode_pointer(PointerState::Active {
+            bank,
+            generation,
+            format,
+            publication,
+        });
+        replace_pointer(&storage, &old_pointer, &source_pointer)
+            .await
+            .unwrap();
+
+        let read = adapter.begin_read(ReadOptions::default()).await.unwrap();
+        let source_proof = crate::sync::inspect_replica_rebuild_source(&read, format)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            source_proof.recovery_required,
+            "fixture has local pending work"
+        );
+        let controls = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .scan()
+            .await
+            .unwrap();
+        let branch_id = controls
+            .iter()
+            .find(|(branch_id, _)| branch_id.as_str() != crate::GLOBAL_BRANCH_ID)
+            .map(|(branch_id, _)| branch_id.clone())
+            .expect("replica has a non-global branch");
+        drop(read);
+
+        let id = || uuid::Uuid::now_v7().to_string();
+        let base = id();
+        let request = crate::sync::PartialMergeRequest {
+            attempt_id: id(),
+            branch_id: branch_id.clone(),
+            base_commit_id: base.clone(),
+            expected_authority_head_commit_id: id(),
+            captured_local_head_commit_id: id(),
+            checkpoint_commit_id: id(),
+            expected_authority_checkpoint_commit_id: id(),
+            captured_local_checkpoint_commit_id: id(),
+            global_head_commit_id: id(),
+            global_checkpoint_commit_id: id(),
+        };
+        let journal = PendingConversionJournal {
+            version: 2,
+            native_source_pin: Some(id()),
+            native_pin_cleaned: false,
+            source_bank: bank_code(bank),
+            manifest_digest: [9; 32],
+            accepted_tip: base,
+            request,
+            prepared_tip: Some(id()),
+            receipt: None,
+            restart: None,
+            restart_receipt: None,
+        };
+        let raw = pending_conversion_journal::persist_pending_conversion_journal(
+            &storage,
+            &source_pointer,
+            &source_proof.repository_id,
+            &source_proof.account_id,
+            &journal,
+            None,
+        )
+        .await
+        .unwrap();
+        let content_before = crate::migration::public_api::content_digest(&storage)
+            .await
+            .unwrap();
+
+        let error =
+            match admit_repository_with_server(&storage, None, Some(&authority.options())).await {
+                Ok(_) => panic!("pending conversion attempt must block format migration"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error.code,
+            "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED"
+        );
+        assert_eq!(
+            error.details.as_deref().unwrap()["failureReason"],
+            "pending_conversion_journal"
+        );
+        assert_eq!(
+            load_pointer(&storage).await.unwrap().unwrap().1,
+            source_pointer,
+            "the migration must stop before claiming or replacing the active source"
+        );
+        let (_, persisted) = pending_conversion_journal::load_pending_conversion_journal(
+            &storage,
+            &bank_code(bank),
+            &source_proof.repository_id,
+            &source_proof.account_id,
+            &branch_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted, raw, "the exact attempt remains durable");
+        assert_eq!(
+            crate::migration::public_api::content_digest(&storage)
+                .await
+                .unwrap(),
+            content_before,
+            "local pending rows remain unchanged"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows() {
     let authority = Authority::new().await;
     let memory = crate::Memory::new();

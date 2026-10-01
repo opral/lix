@@ -293,7 +293,7 @@ impl ExecuteResult {
     /// this same commit's materialization; no post-commit SQL read is needed.
     pub(crate) fn remap_direct_new_change_ids(
         mut self,
-        remap: &std::collections::BTreeMap<String, String>,
+        remap: &BTreeMap<String, String>,
     ) -> Self {
         if self.direct_new_change_id_columns.is_empty() || remap.is_empty() {
             self.direct_new_change_id_columns.clear();
@@ -5855,7 +5855,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct DurableMemoryStorage(Memory);
 
-    impl crate::storage_adapter::Storage for DurableMemoryStorage {
+    impl Storage for DurableMemoryStorage {
         type Read<'a>
             = MemoryRead
         where
@@ -6372,7 +6372,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_batch_returning_receipt_replays_canonical_change_ids() {
-        let session = std::sync::Arc::new(open_durable_memory_session().await);
+        let session = Arc::new(open_durable_memory_session().await);
         let branch_id = session
             .active_branch_id()
             .await

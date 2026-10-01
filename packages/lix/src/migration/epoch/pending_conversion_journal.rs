@@ -119,6 +119,73 @@ pub(crate) async fn load_pending_conversion_journal<S: Storage>(
     }
     Ok(Some((journal, raw)))
 }
+
+/// A candidate format migration may not strand an attempt journal under the
+/// source bank it is replacing. Journals live in the outer epoch space, so
+/// they are intentionally absent from the bank copy. Scan only this bounded
+/// metadata prefix before claiming a new epoch and fail closed if the journal
+/// inventory is too large to prove that the source bank has no pending work.
+pub(crate) async fn source_bank_has_pending_conversion_journal<S: Storage>(
+    storage: &S,
+    bank: &str,
+) -> Result<bool, LixError> {
+    const MAX_JOURNALS_TO_INSPECT: usize = 4096;
+    // Preflight observes all visible publications under the epoch pointer
+    // fence. It must also work with canonical Memory behavior tests.
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .await
+        .map_err(storage_error)?;
+    let mut cursor = read
+        .begin_scan(
+            REPOSITORY_EPOCH_SPACE,
+            KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"partial-conversion/"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"partial-conversion0"))),
+            },
+            BeginScanOptions {
+                projection: CoreProjection::FullValue,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    let mut inspected = 0usize;
+    while let Some(entries) = cursor.next_chunk().await.map_err(storage_error)? {
+        for entry in entries {
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_JOURNALS_TO_INSPECT {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
+                    "conversion journal inventory exceeds the safe migration probe bound; source remains active and unchanged",
+                ));
+            }
+            let ProjectedValue::FullValue(raw) = entry.value else {
+                return Err(epoch_error(
+                    "conversion journal payload missing during migration preflight",
+                ));
+            };
+            if raw.len() > 4096 {
+                return Err(epoch_error(
+                    "conversion journal exceeds bound during migration preflight",
+                ));
+            }
+            let journal: PendingConversionJournal =
+                serde_json::from_slice(&raw).map_err(|error| epoch_error(error.to_string()))?;
+            journal.validate()?;
+            // An unfinished journal is a recovery root even when its bank
+            // field is damaged. Its hashed key cannot establish ownership
+            // from the payload alone; fail closed on all incomplete attempts.
+            if journal.source_bank == bank
+                || journal.receipt.is_none()
+                || (journal.native_source_pin.is_some() && !journal.native_pin_cleaned)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
 /// Every network transition requires this durable write first. The source
 /// pointer claim fences concurrent conversion; key CAS fences delayed replies.
 /// Reacquiring a claim after rollback does NOT change the journal key/attempt.
@@ -277,6 +344,72 @@ mod tests {
         assert_eq!(recovered.request, journal.request);
         assert_eq!(recovered.prepared_tip, Some(target));
         assert_eq!(load_pointer(&storage).await.unwrap().unwrap().1, original);
+
+        // Damage the payload after rollback while leaving the hashed key and
+        // active source pointer untouched. The incomplete attempt must still
+        // block replacement, and coordinate-based loading must reject the
+        // changed source-bank field.
+        let journal_key = journal_key(
+            &bank_code(bank),
+            &repository,
+            &account,
+            &journal.request.branch_id,
+        )
+        .unwrap();
+        let persisted = Bytes::from(serde_json::to_vec(&journal).unwrap());
+        let mut corrupted = journal.clone();
+        corrupted.source_bank = if bank_code(bank) == "a" {
+            "b".to_owned()
+        } else {
+            "a".to_owned()
+        };
+        corrupted.validate().unwrap();
+        let corrupted_bytes = Bytes::from(serde_json::to_vec(&corrupted).unwrap());
+        let mut write = storage
+            .begin_write(WriteOptions {
+                preconditions: vec![Precondition::KeyValueEquals {
+                    space: REPOSITORY_EPOCH_SPACE,
+                    key: journal_key.clone(),
+                    expected: persisted,
+                }],
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        write
+            .put_many(
+                REPOSITORY_EPOCH_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: journal_key,
+                        value: StoredValue {
+                            bytes: corrupted_bytes,
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+
+        assert!(
+            source_bank_has_pending_conversion_journal(&storage, &bank_code(bank))
+                .await
+                .unwrap()
+        );
+        let load_error = load_pending_conversion_journal(
+            &storage,
+            &bank_code(bank),
+            &repository,
+            &account,
+            &journal.request.branch_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(load_error.message, "conversion journal source changed");
+        assert_eq!(load_pointer(&storage).await.unwrap().unwrap().1, original);
+
         drop(storage);
         let reopened = crate::open_lix().with_storage(backing).await.unwrap();
         assert_eq!(
