@@ -35,11 +35,10 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "npm run clean && npm run build:native && npm run build:migration:native && npm run build:wasm && npm run build:migration:wasm && npm run build:ts",
-		"build:browser": "npm run clean && npm run build:wasm && npm run build:migration:wasm && npm run build:ts",
+		"build": "npm run clean && npm run build:native && npm run build:migration:native && npm run build:wasm && npm run build:ts",
+		"build:browser": "npm run clean && npm run build:wasm && npm run build:ts",
 		"build:native": "node ./scripts/build-native.js",
 		"build:wasm": "node ./scripts/build-wasm.js",
-		"build:migration:wasm": "LIX_OFFLINE_MIGRATION=1 node ./scripts/build-wasm.js",
 		"build:migration:native": "LIX_OFFLINE_MIGRATION=1 node ./scripts/build-native.js",
 		"build:wasm:dev": "LIX_WASM_PROFILE=dev node ./scripts/build-wasm.js",
 		"benchmark:plugin-reopen": "node ./scripts/benchmark-plugin-reopen.mjs",

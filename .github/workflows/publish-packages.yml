@@ -514,11 +514,6 @@ jobs:
         working-directory: packages/js-sdk
         run: npm run build:wasm
 
-      - name: Build migration WASM
-        if: steps.browser.outputs.reuse != 'true'
-        working-directory: packages/js-sdk
-        run: npm run build:migration:wasm
-
       - name: Upload release browser binaries
         uses: actions/upload-artifact@v4
         with:
@@ -577,7 +572,6 @@ jobs:
       - name: Restore generated WASM source links
         run: |
           ln -s ../dist/wasm packages/js-sdk/src/wasm
-          ln -s ../dist/migration-wasm packages/js-sdk/src/migration-wasm
 
       - name: Build JS SDK TypeScript
         working-directory: packages/js-sdk
@@ -675,7 +669,6 @@ jobs:
       - name: Restore generated WASM source link
         run: |
           ln -s ../dist/wasm packages/js-sdk/src/wasm
-          ln -s ../dist/migration-wasm packages/js-sdk/src/migration-wasm
 
       - name: Test JS SDK package
         working-directory: packages/js-sdk
