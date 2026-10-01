@@ -733,3 +733,48 @@ fn error_reporting_is_not_disabled_by_unsampled_remote_context() {
     );
     assert!(span.span_context().is_sampled());
 }
+
+#[test]
+fn streaming_request_does_not_hide_independent_engine_errors() {
+    use lix_sdk::telemetry::{TelemetrySpanEnd, TelemetrySpanStart, spans};
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        let request = tracing::info_span!("lix.protocol.request");
+        set_request_parent(&request, &HeaderMap::new(), false);
+        request.in_scope(|| {
+            set_request_actor(Some(ACCOUNT_ID));
+            let query = server_sink(dispatch.clone())
+                .start_span(TelemetrySpanStart::new(&spans::SQL_QUERY, Vec::new()));
+            query.finish(TelemetrySpanEnd {
+                duration_ns: 1,
+                status: opentelemetry::trace::Status::error("LIX_TYPE_MISMATCH"),
+                attributes: Vec::new(),
+            });
+        });
+    });
+    provider.force_flush().unwrap();
+    let spans = exporter.0.lock().unwrap();
+    let failed = spans
+        .iter()
+        .find(|span| matches!(span.status, opentelemetry::trace::Status::Error { .. }))
+        .unwrap();
+    assert!(
+        !failed
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "lix.error.owner")
+    );
+    assert!(
+        failed
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "lix.account_id" && a.value.as_str() == ACCOUNT_ID)
+    );
+}

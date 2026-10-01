@@ -30,7 +30,11 @@ use tracing_subscriber::{
 
 /// Extract only W3C trace context. Invalid or missing headers deliberately start
 /// a new trace instead of inheriting an unrelated ambient task context.
-pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap) {
+pub(crate) fn set_request_parent(
+    span: &tracing::Span,
+    headers: &http::HeaderMap,
+    owns_engine_errors: bool,
+) {
     struct Headers<'a>(&'a http::HeaderMap);
     impl Extractor for Headers<'_> {
         fn get(&self, key: &str) -> Option<&str> {
@@ -42,7 +46,10 @@ pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap
     }
     let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
         .extract_with_context(&opentelemetry::Context::new(), &Headers(headers))
-        .with_value(ProtocolErrorBoundary::default());
+        .with_value(ProtocolErrorBoundary {
+            actor: Arc::default(),
+            owns_engine_errors,
+        });
     let _ = span.set_parent(parent);
     span.set_attribute("lix.error.owner", "boundary");
 }
@@ -50,13 +57,16 @@ pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap
 /// One logical protocol failure belongs to its request, not every failed child.
 /// The shared actor is populated only after the host authenticates the principal.
 #[derive(Clone, Debug, Default)]
-struct ProtocolErrorBoundary(Arc<Mutex<Option<String>>>);
+struct ProtocolErrorBoundary {
+    actor: Arc<Mutex<Option<String>>>,
+    owns_engine_errors: bool,
+}
 
 pub(crate) fn set_request_actor(account: Option<&str>) {
     let span = tracing::Span::current();
     if let Some(boundary) = span.context().get::<ProtocolErrorBoundary>() {
         *boundary
-            .0
+            .actor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = account.map(str::to_owned);
     }
@@ -112,9 +122,13 @@ pub(crate) fn record_failure_details(span: &tracing::Span, details: &serde_json:
 
 fn initialize_engine_span(span: &tracing::Span) {
     if let Some(boundary) = span.context().get::<ProtocolErrorBoundary>() {
-        span.set_attribute("lix.error.owner", "diagnostic");
+        // Observations can fail independently after successful HTTP headers.
+        // Their engine diagnostics must not be suppressed by the request span.
+        if boundary.owns_engine_errors {
+            span.set_attribute("lix.error.owner", "diagnostic");
+        }
         if let Some(account) = boundary
-            .0
+            .actor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()

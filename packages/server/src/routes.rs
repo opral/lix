@@ -276,7 +276,7 @@ async fn repository_admission(
         "lix.receipt.expected_version" = tracing::field::Empty,
         "otel.status_code" = tracing::field::Empty,
     );
-    crate::telemetry::set_request_parent(&span, request.headers());
+    crate::telemetry::set_request_parent(&span, request.headers(), true);
     let response = repository_admission_inner(state, id, request)
         .instrument(span.clone())
         .await;
@@ -608,7 +608,11 @@ async fn lix_protocol_route(
         "lix.receipt.expected_version" = tracing::field::Empty,
         "otel.status_code" = tracing::field::Empty,
     );
-    crate::telemetry::set_request_parent(&span, request.headers());
+    crate::telemetry::set_request_parent(
+        &span,
+        request.headers(),
+        !protocol_path.trim_start_matches('/').starts_with("observe"),
+    );
     let response = lix_protocol_inner(state, lix_id, protocol_path, request_id, request)
         .instrument(span.clone())
         .await;
