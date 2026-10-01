@@ -25,7 +25,6 @@ function fixture(t) {
 	const tree = git("rev-parse", "HEAD^{tree}");
 	for (const path of [
 		"wasm/lix_js_sdk.js", "wasm/lix_js_sdk.d.ts", "wasm/lix_js_sdk_bg.wasm",
-		"migration-wasm/lix_js_sdk.js", "migration-wasm/lix_js_sdk.d.ts", "migration-wasm/lix_js_sdk_bg.wasm",
 	]) write(`packages/js-sdk/dist/${path}`, path);
 	const manifest = describeBrowser(root, revision, {});
 	write("ci-artifact/browser.json", JSON.stringify(manifest));
@@ -36,13 +35,13 @@ function fixture(t) {
 	return { root, write, git, revision, tree, manifest, downloaded };
 }
 
-test("same-tree merge restores both WASM variants, but never downloaded TypeScript", t => {
+test("same-tree merge restores the shared WASM engine, but never downloaded TypeScript", t => {
 	const f = fixture(t);
 	f.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--allow-empty", "-m", "merge");
 	f.write("download/packages/js-sdk/dist/index.js", "untrusted TypeScript output");
 	rmSync(join(f.root, "packages/js-sdk/dist"), { recursive: true });
 	restoreReleaseBrowser(f.root, f.downloaded, f.revision, {});
-	assert.equal(realpathSync(join(f.root, "packages/js-sdk/src/migration-wasm")), join(f.root, "packages/js-sdk/dist/migration-wasm"));
+	assert.equal(realpathSync(join(f.root, "packages/js-sdk/src/wasm")), join(f.root, "packages/js-sdk/dist/wasm"));
 	assert.equal(readFileSync(join(f.root, "packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm"), "utf8"), "wasm/lix_js_sdk_bg.wasm");
 	assert.throws(() => readFileSync(join(f.root, "packages/js-sdk/dist/index.js")), /ENOENT/);
 });
@@ -51,7 +50,7 @@ for (const [name, mutate] of [
 	["wrong revision", f => f.revision = "other"],
 	["changed source tree", f => { f.write("new-source", "changed"); f.git("add", "new-source"); f.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "changed"); }],
 	["changed build script or toolchain", f => f.write("rust-toolchain.toml", "different toolchain")],
-	["missing migration WASM", f => rmSync(join(f.downloaded, "packages/js-sdk/dist/migration-wasm/lix_js_sdk_bg.wasm"))],
+	["missing WASM", f => rmSync(join(f.downloaded, "packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm"))],
 	["corrupt binary", f => f.write("download/packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm", "corrupt")],
 	["legacy provenance", f => { delete f.manifest.releaseBuild; f.write("download/ci-artifact/browser.json", JSON.stringify(f.manifest)); }],
 	["symlink payload", f => { rmSync(join(f.downloaded, "packages/js-sdk/dist/wasm"), { recursive: true }); symlinkSync(join(f.root, "packages/js-sdk/dist/wasm"), join(f.downloaded, "packages/js-sdk/dist/wasm")); }],
@@ -126,7 +125,7 @@ test("identical-tree promotion seeds validated binaries without compiling or cop
   assert.throws(() => readFileSync(join(f.root, ".ci-sdk-cache/browser/dist/index.js")), /ENOENT/);
   assert.throws(() => prepareMergedBrowserCache(f.root, "wrong-revision", {}), /does not match/);
   assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, { LIX_WASM_PROFILE: "dev" }), /does not match/);
-  f.write("packages/js-sdk/dist/migration-wasm/lix_js_sdk_bg.wasm", "corrupt");
+  f.write("packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm", "corrupt");
   assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, {}), /checksum/);
 });
 

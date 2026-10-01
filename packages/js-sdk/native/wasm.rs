@@ -1873,7 +1873,6 @@ fn hosted_create_builder(value: JsValue) -> Result<lix::CreateLixBuilder, JsValu
     Ok(builder)
 }
 
-#[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = convertJsStorageReplicaToPartial)]
 pub async fn convert_js_storage_replica_to_partial(
     provider: JsStorageProvider,
@@ -1884,7 +1883,6 @@ pub async fn convert_js_storage_replica_to_partial(
         .await
         .map(|_| ())
 }
-#[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = retryJsStorageReplicaMigrationCleanup)]
 pub async fn retry_js_storage_replica_migration_cleanup(
     provider: JsStorageProvider,
@@ -1892,7 +1890,6 @@ pub async fn retry_js_storage_replica_migration_cleanup(
 ) -> Result<u32, JsValue> {
     closed_js_replica_operation(provider, server, None, true).await
 }
-#[cfg(feature = "offline-migration")]
 async fn closed_js_replica_operation(
     provider: JsStorageProvider,
     server: JsValue,
@@ -1960,9 +1957,8 @@ pub async fn inspect_js_storage_repository(
     to_js(&report)
 }
 
-/// Detached migration artifact only. Caller owns the physical source lock and
+/// Explicit maintenance operation. Caller owns the physical source lock and
 /// destination publication/recovery lifecycle.
-#[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = migrateJsStorageRepository)]
 pub async fn migrate_js_storage_repository(
     provider: JsStorageProvider,

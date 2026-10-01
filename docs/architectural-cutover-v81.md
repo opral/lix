@@ -16,7 +16,7 @@ The historical v80→81 step changes only the protocol marker. Its digest exclud
 
 `embedded_repository_id` records the portable identity inside the validated repository. A hosted URL/catalog identity can intentionally differ after cloning or restoration. Preserve that original catalog mapping through cutover; an embedded identity or physical prefix alone does not authorize adopting an orphan. Candidate engine admission alone is not a preservation proof.
 
-The ordinary native and WASM SDK artifacts include the Rust lifecycle needed for automatic opening. The separate `@lix-js/sdk/migration` entry remains available for operator conversion and recovery workflows; normal application opening does not depend on loading it.
+The ordinary native and WASM SDK artifacts include the Rust lifecycle needed for automatic opening. The separate `@lix-js/sdk/migration` JavaScript entry remains available for operator conversion and recovery workflows and shares the ordinary WASM engine; normal application opening does not depend on loading that entry.
 
 Direct operator migration APIs neither close a supplied provider nor publish a browser active-store pointer. An operator workflow must preserve physical-lock exclusion, retained sources, crash-safe publication, and detection of late edits from old offline tabs. A new epoch flag cannot fence an old bundle that does not read it.
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+	existsSync,
 	mkdtempSync,
 	mkdirSync,
 	readFileSync,
@@ -93,9 +94,6 @@ for (const runtime of ["native", "browser"]) {
 			"dist/wasm/lix_js_sdk.js",
 			"dist/wasm/lix_js_sdk.d.ts",
 			"dist/wasm/lix_js_sdk_bg.wasm",
-		"dist/migration-wasm/lix_js_sdk.js",
-		"dist/migration-wasm/lix_js_sdk.d.ts",
-		"dist/migration-wasm/lix_js_sdk_bg.wasm",
 			...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 		])
 			write(`sdk/${path}`);
@@ -103,8 +101,13 @@ for (const runtime of ["native", "browser"]) {
 		assert.equal(validCache(cache, runtime, "key"), true);
 		assert.equal(validCache(cache, runtime, "other-key"), false);
 		rmSync(sdk, { recursive: true });
+		write("sdk/dist/migration-wasm/lix_js_sdk_bg.wasm", "obsolete engine");
+		mkdirSync(join(sdk, "src"));
+		symlinkSync("../dist/migration-wasm", join(sdk, "src/migration-wasm"), "dir");
 		restoreBinaries(sdk, cache, runtime, "key");
 		assert.equal(realpathSync(join(sdk, "src/wasm")), join(sdk, "dist/wasm"));
+		assert.equal(existsSync(join(sdk, "dist/migration-wasm")), false);
+		assert.equal(existsSync(join(sdk, "src/migration-wasm")), false);
 		assert.equal(
 			readFileSync(join(sdk, "dist/wasm/lix_js_sdk.js"), "utf8"),
 			"sdk/dist/wasm/lix_js_sdk.js",
