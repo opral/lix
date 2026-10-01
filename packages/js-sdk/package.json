@@ -55,10 +55,12 @@
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"optionalDependencies": {
+		"@bytecodealliance/jco-transpile": "0.13.0",
 		"@lix-js/sdk-darwin-arm64": "0.18.1",
 		"@lix-js/sdk-linux-arm64": "0.18.1",
 		"@lix-js/sdk-linux-x64": "0.18.1",
-		"@lix-js/sdk-win32-x64": "0.18.1"
+		"@lix-js/sdk-win32-x64": "0.18.1",
+		"binaryen": "130.0.0"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",
@@ -69,8 +71,6 @@
 		"vitest": "4.1.10"
 	},
 	"dependencies": {
-		"@bytecodealliance/jco-transpile": "0.13.0",
-		"binaryen": "130.0.0",
 		"fflate": "^0.8.3"
 	}
 }
