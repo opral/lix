@@ -1815,7 +1815,7 @@ pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
             "line": error.origin().line(),
             "column": error.origin().column(),
         });
-        if let Ok(origin) = to_js(&origin) {
+        if let Ok(origin) = to_js_json_value(&origin) {
             let _ = Reflect::set(object, &JsValue::from_str("rustOrigin"), &origin);
         }
     }
