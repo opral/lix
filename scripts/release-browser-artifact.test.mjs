@@ -8,7 +8,7 @@ import { cacheKey, validCache } from "./ci-sdk-cache.mjs";
 import { downloadVerifiedArchive, downloadMergedBrowser, describeBrowser, prepareMergedBrowserCache, matchesBrowserBuild, restoreReleaseBrowser, selectReleaseBrowser } from "./release-browser-artifact.mjs";
 
 function fixture(t) {
-	const root = mkdtempSync(join(tmpdir(), "release-browser-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "release-browser-")));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const write = (path, content) => {
 		mkdirSync(dirname(join(root, path)), { recursive: true });
