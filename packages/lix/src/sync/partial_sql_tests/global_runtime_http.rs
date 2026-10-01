@@ -420,7 +420,8 @@ async fn run_concurrent_global_creation(newer_global: bool) {
     transport
         .bind_native_baseline_lease(current.baseline_lease())
         .unwrap();
-    // Ordinary foreground observation owns cold-input hydration after adoption.
+    // These parameterized scopes were not retained before adoption, so their
+    // first foreground observations still hydrate their newly requested inputs.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
     let reads = async {
         for (key, expected) in [("race", "after-capture"), ("resident", "unchanged")] {

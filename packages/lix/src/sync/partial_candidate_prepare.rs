@@ -1,5 +1,5 @@
-//! Stage coherent candidate controls; branch switching can additionally warm
-//! retained native recipes. No SQL is replayed or state published here.
+//! Stage coherent candidate controls and the supplied native read recipes.
+//! No SQL is replayed or state published here.
 use super::partial_replica::PartialReplicaDescriptor;
 use crate::LixError;
 use crate::hot_state::{HotStateContext, LogicalReadInterest};
@@ -389,9 +389,8 @@ where
             );
     }
     let staged = Arc::new(staged);
-    // Clean adoption publishes coherent coordinates, not the union of every
-    // previously read query. Missing inputs are hydrated by each subsequent
-    // foreground operation against its pinned serving basis.
+    // Callers that supply a moving snapshot warm its exact current-basis
+    // dependencies. A caller without one receives only coherent coordinates.
     let Some(interests) = interests else {
         return Ok(PreparedCandidateState {
             writes: staged,

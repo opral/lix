@@ -856,6 +856,42 @@ async fn prepare_hydrating_with_deadline<
             hydrate_metadata(&storage, old, authority, address, &mut Fetches::default())
                 .await
                 .unwrap();
+        } else if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
+            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap()
+        {
+            let key = hash.to_hex();
+            assert!(seen.insert(format!("manifest:{key}")), "{error}");
+            let wire = authority
+                .get_sync_blob_manifest(&key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("authority lacks requested blob manifest {key}"));
+            let wire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            super::super::partial_blob::install_manifest(&storage, old, hash, &wire)
+                .await
+                .unwrap();
+        } else if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+            let ids = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("chunkIds"))
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("chunk demand lacks IDs: {error}"));
+            for id in ids {
+                let id = id
+                    .as_str()
+                    .unwrap_or_else(|| panic!("invalid chunk demand: {error}"));
+                assert!(seen.insert(format!("chunk:{id}")), "{error}");
+                let hash = crate::binary_cas::ChunkHash::from_hex(id).unwrap();
+                let bytes = authority
+                    .get_sync_chunk(id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("authority lacks requested chunk {id}"));
+                super::super::partial_blob::install_chunk(&storage, old, hash, &bytes)
+                    .await
+                    .unwrap();
+            }
         } else {
             panic!("candidate failed: {error:?}");
         }
@@ -933,32 +969,7 @@ async fn unavailable_historical_recipe_does_not_block_moving_negative_scope() {
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    let missing = session.execute(sql, &[]).await.unwrap_err();
-    assert!(
-        NativeObjectRef::from_missing_error(&missing)
-            .unwrap()
-            .is_some()
-            || NativeMetadataRef::from_missing_error(&missing)
-                .unwrap()
-                .is_some(),
-        "{missing:?}"
-    );
-    assert!(
-        value(
-            execute_hydrating(
-                &session,
-                &storage,
-                &next,
-                &authority,
-                sql,
-                &[],
-                &mut Fetches::default()
-            )
-            .await
-            .unwrap()
-        )
-        .contains("arrived")
-    );
+    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
     assert_eq!(
         session.execute(&history_sql, &[]).await.unwrap().rows(),
         history.rows(),
@@ -1036,7 +1047,7 @@ async fn unavailable_moving_recipe_does_not_block_unrelated_publication() {
 }
 
 #[tokio::test]
-async fn remote_publication_adopts_before_hydrating_previously_read_scope() {
+async fn remote_publication_prepares_previously_read_scope_before_adoption() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();
     let sql = "SELECT value FROM lix_key_value WHERE key='future'";
@@ -1080,32 +1091,7 @@ async fn remote_publication_adopts_before_hydrating_previously_read_scope() {
         engine.sync_mode().partial_admission().as_deref(),
         Some(next.as_ref())
     );
-    let missing = session.execute(sql, &[]).await.unwrap_err();
-    assert!(
-        NativeObjectRef::from_missing_error(&missing)
-            .unwrap()
-            .is_some()
-            || NativeMetadataRef::from_missing_error(&missing)
-                .unwrap()
-                .is_some(),
-        "{missing:?}"
-    );
-    assert!(
-        value(
-            execute_hydrating(
-                &session,
-                &storage,
-                &next,
-                &authority,
-                sql,
-                &[],
-                &mut Fetches::default()
-            )
-            .await
-            .unwrap()
-        )
-        .contains("arrived")
-    );
+    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
     // Fresh engine and session prove this is durable native state, not merely
     // a cached query result held by the original SQL execution.
     let (reopened, reopened_session) =
@@ -1119,7 +1105,7 @@ async fn remote_publication_adopts_before_hydrating_previously_read_scope() {
 }
 
 #[tokio::test]
-async fn remote_publication_accepts_new_interest_after_candidate_preparation() {
+async fn remote_publication_rejects_new_interest_after_candidate_preparation() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();
     execute_hydrating(
@@ -1158,6 +1144,17 @@ async fn remote_publication_accepts_new_interest_after_candidate_preparation() {
     )
     .await
     .unwrap();
+    let error = publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .expect_err("an interest registered after candidate preparation must fence adoption");
+    assert_eq!(error.code, "LIX_PARTIAL_READ_INTEREST_CHANGED");
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(old.as_ref()),
+        "a stale candidate must leave the old generation admitted"
+    );
+
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
@@ -1167,17 +1164,118 @@ async fn remote_publication_accepts_new_interest_after_candidate_preparation() {
     );
     assert!(
         value(
-            execute_hydrating(
-                &session,
-                &storage,
-                &next,
-                &authority,
-                "SELECT value FROM lix_key_value WHERE key='resident'",
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .await
+                .unwrap()
+        )
+        .contains("remote")
+    );
+    assert!(
+        session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key='new-negative-interest'",
                 &[],
-                &mut Fetches::default()
             )
             .await
             .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn remote_publication_cas_rejects_interest_journal_changed_by_another_registry() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    let registry = engine.sync_mode().read_interests().unwrap();
+    let prepared_revision = registry.snapshot().unwrap().revision;
+
+    // A second engine has its own in-memory revision counter, like another
+    // owner process, but persists recipes to the same native journal.
+    let (other_engine, other_session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &old)
+            .await
+            .unwrap();
+    other_engine
+        .sync_mode()
+        .admit_partial_replica(old.clone(), crate::sync::partial_replica_write_capability());
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let other_scope = "SELECT value FROM lix_key_value WHERE key='separate-registry-negative'";
+    assert!(
+        execute_hydrating(
+            &other_session,
+            &storage,
+            &old,
+            &authority,
+            other_scope,
+            &[],
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap()
+        .rows()
+        .is_empty()
+    );
+    assert_eq!(
+        registry.snapshot().unwrap().revision,
+        prepared_revision,
+        "the first engine cannot see the separate registry revision"
+    );
+
+    let error = publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .expect_err("the durable journal token must fence cross-registry recipe changes");
+    assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(old.as_ref()),
+        "a candidate that omitted a persisted recipe must not advance admission"
+    );
+
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .execute(other_scope, &[])
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+    assert!(
+        value(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .await
+                .unwrap()
         )
         .contains("remote")
     );
@@ -1838,7 +1936,7 @@ async fn remote_global_publication_invalidates_active_account_proof() {
 }
 
 #[tokio::test]
-async fn remote_global_publication_hydrates_global_session_sql_and_catalog_on_demand() {
+async fn remote_global_publication_prepares_global_session_sql_and_catalog_before_adoption() {
     let account = uuid::Uuid::now_v7().to_string();
     let (authority, engine, _selected, old) = fixture_with_account(Some(&account)).await;
     let storage = engine.storage();
@@ -1907,17 +2005,6 @@ async fn remote_global_publication_hydrates_global_session_sql_and_catalog_on_de
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    execute_hydrating(
-        &global,
-        &storage,
-        &next,
-        &authority,
-        sql,
-        &params,
-        &mut Fetches::default(),
-    )
-    .await
-    .unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     let revision_before_read = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await

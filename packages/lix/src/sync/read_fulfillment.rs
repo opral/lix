@@ -1549,7 +1549,7 @@ fn scan_recipe_selects_change_identity(
 
 /// Current tracked-row reads prepare the branch plugin registry as a native
 /// executable dependency. The registry itself is not part of a custom schema
-/// scan's filter, so authorize only its reserved fileless identity when the
+/// recipe's filter, so authorize only its reserved fileless identity when the
 /// same recipe also selected another canonical row in that branch.
 fn plugin_registry_dependency_matches(
     interest: &LogicalReadInterest,
@@ -1573,7 +1573,10 @@ fn plugin_registry_dependency_matches(
         || row_pk.as_single_string().ok() != Some(PLUGIN_REGISTRY_KEY)
         || !matches!(
             interest,
-            LogicalReadInterest::Scan { .. } | LogicalReadInterest::Exact { .. }
+            LogicalReadInterest::Scan { .. }
+                | LogicalReadInterest::Exact { .. }
+                | LogicalReadInterest::FilesystemMetadata { .. }
+                | LogicalReadInterest::FilesystemPaths { .. }
         )
     {
         return false;
@@ -3053,6 +3056,31 @@ mod tests {
         };
         assert!(plugin_registry_dependency_matches(
             &exact,
+            &registry_input,
+            &inputs,
+        ));
+
+        let directory = make_input(
+            "directory",
+            branch,
+            "lix_directory_descriptor",
+            None,
+            row_pk.clone(),
+        );
+        let directory_inputs = vec![directory, registry_input.clone()];
+        let directory_paths = LogicalReadInterest::FilesystemPaths {
+            scope: crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+            branch_ids: vec![branch.to_owned()],
+            include_blob_refs: false,
+            cache_small_blob_data: false,
+        };
+        assert!(plugin_registry_dependency_matches(
+            &directory_paths,
+            &registry_input,
+            &directory_inputs,
+        ));
+        assert!(!plugin_registry_dependency_matches(
+            &directory_paths,
             &registry_input,
             &inputs,
         ));

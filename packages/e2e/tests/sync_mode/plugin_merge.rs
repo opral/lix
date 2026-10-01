@@ -57,6 +57,131 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
     stop_server(server).await;
 }
 
+#[tokio::test]
+async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
+    let (storage, setup) = open_authority().await;
+    setup
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/test_plugin_column_merger.lixplugin',$1)",
+            &[Value::Blob(column_merger_archive().into())],
+        )
+        .await
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO lix_directory(path) VALUES('/library'),('/library/entries')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let registry = setup
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key='lix_plugin_registry_v2'",
+            &[],
+        )
+        .await
+        .expect("plugin installation should persist its registry row");
+    assert_eq!(registry.rows().len(), 1);
+
+    // This exact native query seeds DirectoryOnly path-index interest as well
+    // as metadata interest. Capture expected rows before opening a fresh replica.
+    let read = "SELECT id, path, name, lixcol_updated_at FROM lix_directory \
+        WHERE parent_id IS NULL ORDER BY name";
+    let expected = setup
+        .execute(read, &[])
+        .await
+        .expect("authority root directory listing");
+    let expected_rows = expected
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<String>("path").unwrap(),
+                row.get::<String>("name").unwrap(),
+                row.get::<String>("lixcol_updated_at").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        expected_rows
+            .iter()
+            .any(|(_, path, _, _)| path == "/library")
+    );
+    setup.close().await.unwrap();
+
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server) = serve(storage, probe.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    let execute_requests_before = probe.execute_requests.load(Ordering::Acquire);
+    let registry_fulfillments_before = probe
+        .directory_registry_fulfillments
+        .load(Ordering::Acquire);
+
+    // This is deliberately the first SQL operation on the empty replica. It
+    // must fulfill the selected directory rows and their plugin-registry side
+    // dependency over native HTTP instead of falling back to authority SQL.
+    let result = replica
+        .execute(read, &[])
+        .await
+        .expect("cold root directory listing should hydrate successfully");
+    let actual_rows = result
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<String>("path").unwrap(),
+                row.get::<String>("name").unwrap(),
+                row.get::<String>("lixcol_updated_at").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_rows, expected_rows);
+    assert_eq!(
+        probe.execute_requests.load(Ordering::Acquire),
+        execute_requests_before,
+        "the directory query must execute natively after read fulfillment",
+    );
+    assert!(
+        result
+            .notices()
+            .iter()
+            .all(|notice| notice.code != "LIX_AUTHORITY_SQL")
+    );
+    assert!(
+        probe
+            .directory_registry_fulfillments
+            .load(Ordering::Acquire)
+            > registry_fulfillments_before,
+        "read fulfillment should include the reserved registry key and a same-branch directory witness",
+    );
+    replica.close().await.unwrap();
+
+    let offline_replica = open_replica_offline(directory.path()).await;
+    let offline = offline_replica
+        .execute(read, &[])
+        .await
+        .expect("hydrated directory rows should remain available after offline reopen");
+    let offline_rows = offline
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<String>("path").unwrap(),
+                row.get::<String>("name").unwrap(),
+                row.get::<String>("lixcol_updated_at").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(offline_rows, expected_rows);
+    offline_replica.close().await.unwrap();
+    stop_server(server).await;
+}
+
 fn column_merger_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
         "CARGO_CDYLIB_FILE_TEST_PLUGIN_COLUMN_MERGER_test_plugin_column_merger"

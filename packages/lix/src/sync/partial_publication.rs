@@ -1,6 +1,6 @@
-//! Atomic adoption of coherent authority coordinates. Structural inputs are
-//! prepared before publication; ordinary query inputs hydrate on demand after
-//! adoption. Explicit branch switching can additionally warm retained recipes.
+//! Atomic adoption of coherent authority coordinates. Structural inputs and
+//! retained moving-read dependencies are prepared before publication; no query
+//! or application mutation is replayed while warming a candidate.
 use std::sync::Arc;
 
 use super::http::CandidateBaselineDeadline;
@@ -100,6 +100,12 @@ where
         .read_interests()
         .ok_or_else(|| conflict("partial publication has no retained interests"))?;
     let storage = engine.storage();
+    // A failed cold foreground read can have registered a valid logical
+    // recipe before discovering its missing native inputs. Persist that
+    // recipe union before pinning the candidate reader so both the prepared
+    // native inputs and the journal CAS guards describe one basis.
+    super::partial_interest_journal::flush_partial_read_interests(&storage, &previous, &registry)
+        .await?;
     let read = storage.begin_read(Default::default()).await?;
     let (actual, receipt) = load_partial_replica_state(&read)
         .await?
@@ -107,11 +113,14 @@ where
     if &actual != previous.as_ref() {
         return Err(conflict("partial publication admission changed"));
     }
-    // Validate/restore the inventory without fencing its contents: adoption
-    // neither evaluates nor overwrites recipes registered by concurrent reads.
-    super::partial_interest_journal::restore_candidate_read_interests(&read, &previous, &registry)
-        .await?;
-    let mut preconditions = Vec::new();
+    // Merge the durable inventory before taking the moving snapshot. Candidate
+    // preparation replays that snapshot against the unpublished coordinates;
+    // publication later fences its full registry revision.
+    let mut preconditions = super::partial_interest_journal::restore_candidate_read_interests(
+        &read, &previous, &registry,
+    )
+    .await?;
+    let interests = registry.moving_current_snapshot()?;
     let mut writes = storage.new_write_set();
     let mut changed = false;
     if policy == PartialRecoveryPolicy::AuthorityWins {
@@ -280,7 +289,9 @@ where
     }
     // This bridge owns and drops the coherent read. Only the exact evaluated
     // staged values and their source/fresh-generation guards can escape.
-    let prepared = engine.prepare_partial_candidate(read, &next).await?;
+    let prepared = engine
+        .prepare_partial_candidate(read, &next, &interests)
+        .await?;
     preconditions.extend(prepared.source_control_guards);
     let candidate_writes = Arc::try_unwrap(prepared.writes)
         .map_err(|_| conflict("candidate evaluator retained a publication write capability"))?;
@@ -290,7 +301,7 @@ where
         branch_switch_completion: None,
         previous,
         next,
-        interests_revision: None,
+        interests_revision: Some(interests.revision()),
         deadline,
         writes,
         preconditions,

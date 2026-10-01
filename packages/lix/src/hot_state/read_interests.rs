@@ -391,6 +391,28 @@ impl ReadInterestRegistry {
             .retain(|interest| interest.follows_branch_state());
         Ok(MovingReadInterestSnapshot(snapshot))
     }
+    /// Current-basis publication does not reevaluate a diff pinned to any
+    /// fixed historical endpoint. Its immutable historical inputs remain
+    /// retained, while explicit branch switching continues to use the full
+    /// moving snapshot above. The snapshot keeps the full registry revision
+    /// so publication still fences every newly registered recipe.
+    pub(crate) fn moving_current_snapshot(&self) -> Result<MovingReadInterestSnapshot, LixError> {
+        let mut snapshot = self.snapshot()?;
+        snapshot.interests.retain(|interest| {
+            interest.follows_branch_state()
+                && !matches!(
+                    interest.as_ref(),
+                    LogicalReadInterest::Diff {
+                        from: DiffInterestEndpoint::Fixed(_),
+                        ..
+                    } | LogicalReadInterest::Diff {
+                        to: DiffInterestEndpoint::Fixed(_),
+                        ..
+                    }
+                )
+        });
+        Ok(MovingReadInterestSnapshot(snapshot))
+    }
     /// Serialize a basis-only publication with foreground operations. The
     /// publisher does not evaluate or replace the retained recipe inventory.
     pub(crate) async fn begin_basis_publication(self: &Arc<Self>) -> ReadInterestPublication {
@@ -583,6 +605,38 @@ mod tests {
                 .code,
             "LIX_PARTIAL_READ_INTEREST_CHANGED"
         );
+    }
+
+    #[test]
+    fn current_basis_snapshot_skips_fixed_diff_endpoints_but_keeps_current_scopes() {
+        use DiffInterestEndpoint::*;
+        let registry = ReadInterestRegistry::new(16, 16384);
+        let current = [
+            diff_recipe(WorkingCheckpoint, ActiveHead),
+            negative_recipe(),
+        ];
+        for recipe in [
+            diff_recipe(Fixed("old".into()), Fixed("new".into())),
+            diff_recipe(Fixed("old".into()), ActiveHead),
+            diff_recipe(ActiveHead, Fixed("old".into())),
+            current[0].clone(),
+            current[1].clone(),
+        ] {
+            registry.register(recipe).unwrap();
+        }
+        let revision = registry.snapshot().unwrap().revision;
+        let snapshot = registry.moving_current_snapshot().unwrap();
+        assert_eq!(snapshot.revision(), revision);
+        assert_eq!(snapshot.as_read_snapshot().interests.len(), current.len());
+        for recipe in current {
+            assert!(
+                snapshot
+                    .as_read_snapshot()
+                    .interests
+                    .iter()
+                    .any(|actual| actual.as_ref() == &recipe)
+            );
+        }
     }
 
     #[test]
