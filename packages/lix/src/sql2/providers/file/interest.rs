@@ -104,7 +104,9 @@ pub(crate) async fn prepare_native_file_metadata_interest(
         return Ok(());
     }
     let mut request = FilesystemPathIndexRequest::new(branch_ids.to_vec());
-    if !directory {
+    if directory {
+        request = request.with_directories_only();
+    } else {
         request = request.with_file_ids(file_ids.map(<[String]>::to_vec));
     }
     let index = paths.path_index(&request).await?;

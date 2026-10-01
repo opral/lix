@@ -1487,7 +1487,7 @@ fn scan_recipe_selects_change_identity(
             // output predicates. Its ancestor descriptors are dependencies
             // even when they are absent from the final SQL result.
             let scope = if *directory {
-                crate::filesystem::FilesystemPathIndexScope::All
+                crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly
             } else {
                 file_ids.clone().map_or(
                     crate::filesystem::FilesystemPathIndexScope::All,
@@ -1606,6 +1606,82 @@ fn plugin_registry_dependency_matches(
             selected_file_id.as_deref(),
             selected_row_pk,
         )
+    })
+}
+
+/// Exact executable-owner reads accompany native file rows, including the
+/// file descriptors used by metadata/path replay. Admit only the reserved,
+/// canonically decoded owner of a separately recipe-selected same-branch file.
+fn plugin_owner_dependency_matches(
+    interest: &LogicalReadInterest,
+    dependency: &ReadInput,
+    inputs: &[ReadInput],
+) -> bool {
+    use crate::plugin::runtime::{PLUGIN_OWNER_KEY, PluginFileOwner};
+    let ReadInputAddress::ChangeRecord {
+        branch_id,
+        schema_key,
+        file_id: Some(file_id),
+        row_pk,
+        ..
+    } = &dependency.address
+    else {
+        return false;
+    };
+    if schema_key != "lix_key_value" || row_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY) {
+        return false;
+    }
+    let Some(row) = change_payload_row(dependency) else {
+        return false;
+    };
+    if !row.deleted {
+        let Some(snapshot) = row
+            .snapshot_content
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+        else {
+            return false;
+        };
+        if PluginFileOwner::from_snapshot(file_id, &snapshot).is_err() {
+            return false;
+        }
+    }
+    let Ok(file_pk) = crate::row_pk::RowPk::uuid_from_canonical(file_id) else {
+        return false;
+    };
+    inputs.iter().any(|input| {
+        let ReadInputAddress::ChangeRecord {
+            branch_id: selected_branch,
+            schema_key: selected_schema,
+            file_id: selected_file,
+            row_pk: selected_pk,
+            ..
+        } = &input.address
+        else {
+            return false;
+        };
+        if selected_branch != branch_id
+            || (selected_schema == "lix_key_value"
+                && selected_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+        {
+            return false;
+        }
+        let same_file = match selected_schema.as_str() {
+            "lix_file_descriptor" | "lix_binary_blob_ref" => {
+                selected_pk == &file_pk
+                    && selected_file.as_deref().is_none_or(|file| file == file_id)
+            }
+            "lix_directory_descriptor" => false,
+            _ => selected_file.as_deref() == Some(file_id.as_str()),
+        };
+        same_file
+            && scan_recipe_selects_change_identity(
+                interest,
+                selected_branch,
+                selected_schema,
+                selected_file.as_deref(),
+                selected_pk,
+            )
     })
 }
 
@@ -2131,6 +2207,7 @@ fn validate_complete(
                     file_id.as_deref(),
                     row_pk,
                 ) || plugin_registry_dependency_matches(interest, input, &response.inputs)
+                    || plugin_owner_dependency_matches(interest, input, &response.inputs)
             });
         if !selected_by_recipe {
             return Err(
@@ -3203,6 +3280,167 @@ mod tests {
             },
             bytes: crate::changelog::encode_change_record(&record).unwrap(),
         };
+        let metadata = LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![branch.into()],
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        };
+        let owner_inputs = vec![file_input.clone(), owner_input.clone()];
+        assert!(plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &owner_inputs
+        ));
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            std::slice::from_ref(&owner_input)
+        ));
+        let mut directory_metadata = metadata.clone();
+        if let LogicalReadInterest::FilesystemMetadata { directory, .. } = &mut directory_metadata {
+            *directory = true;
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &directory_metadata,
+            &owner_input,
+            &owner_inputs
+        ));
+        let directories_only = LogicalReadInterest::FilesystemPaths {
+            scope: crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+            branch_ids: vec![branch.into()],
+            include_blob_refs: false,
+            cache_small_blob_data: false,
+        };
+        assert!(!plugin_owner_dependency_matches(
+            &directories_only,
+            &owner_input,
+            &owner_inputs
+        ));
+        let exact_file = LogicalReadInterest::Exact {
+            rows: vec![crate::hot_state::ExactReadIdentity {
+                schema_key: "lix_file_descriptor".into(),
+                branch_id: branch.into(),
+                file_id: Some(file_id.into()),
+                row_pk: file_record.row_pk.clone(),
+            }],
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["snapshot_content".into()],
+            },
+            untracked: Some(false),
+            include_tombstones: false,
+        };
+        assert!(plugin_owner_dependency_matches(
+            &exact_file,
+            &owner_input,
+            &owner_inputs
+        ));
+        let scanned_file = LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec!["lix_file_descriptor".into()],
+                    branch_ids: vec![branch.into()],
+                    file_ids: vec![crate::NullableKeyFilter::Value(file_id.into())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            domain: InterestDomain::Tracked,
+        };
+        assert!(plugin_owner_dependency_matches(
+            &scanned_file,
+            &owner_input,
+            &owner_inputs
+        ));
+        let mut directory_witness = file_input.clone();
+        if let ReadInputAddress::ChangeRecord { schema_key, .. } = &mut directory_witness.address {
+            *schema_key = "lix_directory_descriptor".into();
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &[directory_witness, owner_input.clone()]
+        ));
+        let mut wrong_file_pk = file_input.clone();
+        if let ReadInputAddress::ChangeRecord { row_pk, .. } = &mut wrong_file_pk.address {
+            *row_pk =
+                crate::row_pk::RowPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000d3")
+                    .unwrap();
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &[wrong_file_pk, owner_input.clone()]
+        ));
+        let mut wrong_branch = file_input.clone();
+        if let ReadInputAddress::ChangeRecord { branch_id, .. } = &mut wrong_branch.address {
+            *branch_id = crate::GLOBAL_BRANCH_ID.into();
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &[wrong_branch, owner_input.clone()]
+        ));
+        let mut wrong_file = file_input.clone();
+        if let ReadInputAddress::ChangeRecord {
+            file_id, row_pk, ..
+        } = &mut wrong_file.address
+        {
+            *file_id = Some("01920000-0000-7000-8000-0000000000d3".into());
+            *row_pk =
+                crate::row_pk::RowPk::uuid_from_canonical(file_id.as_deref().unwrap()).unwrap();
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &[wrong_file, owner_input.clone()]
+        ));
+        let mut tombstone_record = record.clone();
+        tombstone_record.snapshot = None;
+        let mut tombstone = owner_input.clone();
+        tombstone.bytes = crate::changelog::encode_change_record(&tombstone_record).unwrap();
+        assert!(plugin_owner_dependency_matches(
+            &metadata,
+            &tombstone,
+            &owner_inputs
+        ));
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &tombstone,
+            std::slice::from_ref(&tombstone)
+        ));
+        let mut fileless_record = file_record.clone();
+        fileless_record.file_id = None;
+        let mut fileless_descriptor = file_input.clone();
+        if let ReadInputAddress::ChangeRecord { file_id, .. } = &mut fileless_descriptor.address {
+            *file_id = None;
+        }
+        fileless_descriptor.bytes =
+            crate::changelog::encode_change_record(&fileless_record).unwrap();
+        assert!(plugin_owner_dependency_matches(
+            &metadata,
+            &owner_input,
+            &[fileless_descriptor, owner_input.clone()]
+        ));
+        let mut malformed_owner = owner_input.clone();
+        malformed_owner.bytes.clear();
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &malformed_owner,
+            &owner_inputs
+        ));
+        let mut ordinary_key = owner_input.clone();
+        if let ReadInputAddress::ChangeRecord { row_pk, .. } = &mut ordinary_key.address {
+            *row_pk = crate::row_pk::RowPk::single("unrelated-setting");
+        }
+        assert!(!plugin_owner_dependency_matches(
+            &metadata,
+            &ordinary_key,
+            &owner_inputs
+        ));
+
         let inputs = vec![file_input, owner_input];
         let interest = LogicalReadInterest::FileContent {
             request: crate::hot_state::HotStateScanRequest {
