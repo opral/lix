@@ -1192,8 +1192,8 @@ where
         &self,
         sql: &str,
     ) -> Result<ExecutionDisposition, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        execution_disposition(&statement)
+        let statement = self.sql_planning_cache.parse_statement(sql).map_err(sql2::binding_rejection)?;
+        execution_disposition(&statement).map_err(sql2::binding_rejection)
     }
 
     /// Classifies an atomic SQL batch for a caller that owns its transport
@@ -1210,9 +1210,9 @@ where
             let parsed = self
                 .sql_planning_cache
                 .parse_statement(&statement.sql)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?;
+                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?;
             if execution_disposition(&parsed)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?
+                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?
                 == ExecutionDisposition::Durable
             {
                 return Ok(ExecutionDisposition::Durable);

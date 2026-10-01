@@ -616,7 +616,16 @@ async fn lix_protocol_route(
         span.record("lix.request.phase", "completed");
     }
     span.record("http.response.status_code", response.status().as_u16());
-    if response.status().is_server_error() {
+    if let Some(error) = response
+        .extensions()
+        .get::<server_protocol::ProtocolErrorDiagnostics>()
+    {
+        span.record("lix.error.code", error.code.as_str());
+        if let Some(details) = &error.details {
+            crate::telemetry::record_failure_details(&span, details);
+        }
+    }
+    if response.status().is_client_error() || response.status().is_server_error() {
         span.record("otel.status_code", "ERROR");
     }
     let (parts, body) = response.into_parts();
@@ -679,6 +688,11 @@ async fn lix_protocol_inner(
                 );
             }
         };
+    crate::telemetry::set_request_actor(
+        trusted_principal
+            .as_ref()
+            .map(|principal| principal.account_id.as_str()),
+    );
     let principal = trusted_principal.map_or(ServerProtocolPrincipal::Anonymous, |principal| {
         ServerProtocolPrincipal::Authenticated {
             account_id: principal.account_id,
@@ -1201,6 +1215,13 @@ fn protocol_error(
     details: Option<serde_json::Value>,
 ) -> Response {
     let code = code.into();
+    let mut details = match details {
+        Some(serde_json::Value::Object(fields)) => fields,
+        Some(value) => serde_json::Map::from_iter([("cause".into(), value)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert("exceptionOwner".into(), "protocol".into());
+    let details = Some(serde_json::Value::Object(details));
     let span = tracing::Span::current();
     span.record("lix.error.code", code.as_str());
     if let Some(details) = &details {
@@ -1832,6 +1853,7 @@ mod tests {
             json!({
                 "code": "LIX_ERROR_UNAUTHENTICATED",
                 "message": "Invalid internal service token.",
+                "details": {"exceptionOwner": "protocol"},
             })
         );
 
@@ -2062,6 +2084,7 @@ mod tests {
                 "message": "This lix uses an unsupported storage format.",
                 "hint": "Create a new lix.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "operation": "lix_open",
                     "retryable": false,
                 },
@@ -2085,6 +2108,7 @@ mod tests {
                 "message": "The lix repository is being migrated.",
                 "hint": "Retry after the migration completes.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "fromVersion": 68,
                     "toVersion": 71,
                     "operation": "lix_open",
@@ -2116,6 +2140,7 @@ mod tests {
                 "message": "The lix repository migration failed. The migration could not copy repository data because the destination write precondition failed.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "fromVersion": 68,
                     "toVersion": 71,
                     "sourceCode": "LIX_ERROR_MIGRATION_FAILED",
@@ -2145,6 +2170,7 @@ mod tests {
                 "message": "The lix repository upgrade failed. The migration could not complete. The service operator can inspect the server logs for the underlying cause.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "sourceCode": "LIX_ERROR_REPOSITORY_UPGRADE",
                     "receiptVersion": null,
                     "expectedReceiptVersion": null,
@@ -2168,6 +2194,7 @@ mod tests {
                 "code": "LIX_INTERNAL_ERROR",
                 "message": "Unable to open lix.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "operation": "lix_open",
                     "retryable": false,
                 },
@@ -2191,6 +2218,7 @@ mod tests {
                 "message": "The lix service cache needs operator repair.",
                 "hint": "Contact the service operator to repair the cache and restart the server.",
                 "details": {
+                    "exceptionOwner": "protocol",
                     "operation": "lix_open",
                     "retryable": false,
                 },

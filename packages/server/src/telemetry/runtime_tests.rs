@@ -31,9 +31,7 @@ fn sink(provider: &SdkTracerProvider) -> Arc<dyn TelemetrySink> {
             .with_tracer(provider.tracer("lix-server"))
             .with_filter(EnvFilter::new(OTEL_TELEMETRY_FILTER)),
     );
-    Arc::new(OpenTelemetryTracingSink::new(tracing::Dispatch::new(
-        subscriber,
-    )))
+    Arc::new(server_sink(tracing::Dispatch::new(subscriber)))
 }
 
 async fn handshake(app: &Router, account: Option<&str>, session: Option<&str>) -> String {
@@ -634,4 +632,104 @@ async fn admission_failure_exports_cause_status_and_remote_trace() {
         );
     }
     assert!(!format!("{:?}", span.attributes).contains("test-internal-token"));
+}
+
+#[tokio::test]
+async fn nested_sql_rejection_has_one_owner_and_canonical_actor() {
+    use tracing::instrument::WithSubscriber as _;
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let registry = InFlightSqlRegistry::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
+            .with(InFlightSqlLayer {
+                registry: registry.clone(),
+            }),
+    );
+    let manager = crate::LixRuntimeManager::new_in_memory_with_telemetry(
+        1,
+        Arc::new(server_sink(dispatch.clone())),
+    );
+    manager.provision_test_repositories().await;
+    let app = crate::router(
+        manager.clone(),
+        Some("test-internal-token".into()),
+        Duration::from_secs(60),
+        registry,
+    );
+    async {
+        let session = handshake(&app, Some(ACCOUNT_ID), None).await;
+        for _ in 0..2 {
+            let response = app.clone().oneshot(Request::builder()
+                .method("POST").uri(format!("/lix/v1/{LIX_ID}/execute"))
+                .header("authorization", "Bearer test-internal-token")
+                .header("x-lix-account-id", ACCOUNT_ID)
+                .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
+                .header(lix_sdk::server_protocol::SESSION_ID_HEADER, &session)
+                .header("traceparent", "00-44444444444444444444444444444444-eeeeeeeeeeeeeeee-01")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+                .body(Body::from(json!({ "sql": "INSERT INTO lix_file (path, content) VALUES ('/private.txt', 'private secret')" }).to_string())).unwrap()).await.unwrap();
+            assert!(response.status().is_client_error());
+            let body: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            assert_eq!(body["error"]["code"], "LIX_TYPE_MISMATCH");
+            assert_eq!(body["error"]["details"]["exceptionOwner"], "protocol");
+        }
+    }.with_subscriber(dispatch).await;
+    provider.force_flush().unwrap();
+    let spans = exporter.0.lock().unwrap().clone();
+    let field = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+        span.attributes
+            .iter()
+            .find(|a| a.key.as_str() == key)
+            .map(|a| a.value.as_str().to_string())
+    };
+    let failed: Vec<_> = spans
+        .iter()
+        .filter(|span| matches!(span.status, opentelemetry::trace::Status::Error { .. }))
+        .collect();
+    let owners: Vec<_> = failed
+        .iter()
+        .filter(|span| field(span, "lix.error.owner").as_deref() == Some("boundary"))
+        .collect();
+    assert_eq!(
+        owners.len(),
+        2,
+        "two independent failures in the same trace"
+    );
+    assert!(failed.len() > owners.len(), "nested diagnostics retained");
+    for span in failed {
+        assert_eq!(field(span, "lix.account_id").as_deref(), Some(ACCOUNT_ID));
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "44444444444444444444444444444444"
+        );
+        assert!(matches!(
+            field(span, "lix.error.owner").as_deref(),
+            Some("boundary" | "diagnostic")
+        ));
+        assert!(!format!("{:?}", span.attributes).contains("private secret"));
+    }
+    manager.shutdown().await.unwrap();
+}
+
+#[test]
+fn error_reporting_is_not_disabled_by_unsampled_remote_context() {
+    use opentelemetry::trace::{Span as _, TraceContextExt as _, Tracer as _};
+    let provider = provider_from_endpoint(None).unwrap();
+    let remote = opentelemetry::trace::SpanContext::new(
+        opentelemetry::trace::TraceId::from_hex("11111111111111111111111111111111").unwrap(),
+        opentelemetry::trace::SpanId::from_hex("aaaaaaaaaaaaaaaa").unwrap(),
+        opentelemetry::trace::TraceFlags::default(),
+        true,
+        opentelemetry::trace::TraceState::default(),
+    );
+    let span = provider.tracer("test").start_with_context(
+        "failure boundary",
+        &opentelemetry::Context::new().with_remote_span_context(remote),
+    );
+    assert!(span.span_context().is_sampled());
 }

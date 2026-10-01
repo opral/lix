@@ -5102,7 +5102,12 @@ impl From<LixError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let terminal_storage = self.body.is_terminal_storage_error();
+        let diagnostics = ProtocolErrorDiagnostics {
+            code: self.body.error.code.clone(),
+            details: self.body.error.details.as_deref().cloned(),
+        };
         let mut response = (self.status, Json(self.body)).into_response();
+        response.extensions_mut().insert(diagnostics);
         if terminal_storage {
             response.extensions_mut().insert(TerminalStorageResponse);
         }
@@ -5237,6 +5242,13 @@ struct ErrorBody {
     details: Option<Box<serde_json::Value>>,
 }
 
+/// Sanitized response metadata for a host's exception-owning boundary.
+#[derive(Clone, Debug)]
+pub struct ProtocolErrorDiagnostics {
+    pub code: String,
+    pub details: Option<serde_json::Value>,
+}
+
 impl ErrorEnvelope {
     fn from_lix_error(error: &LixError) -> Self {
         Self::from_parts(
@@ -5253,12 +5265,18 @@ impl ErrorEnvelope {
         hint: Option<String>,
         details: Option<serde_json::Value>,
     ) -> Self {
+        let mut details = match details {
+            Some(serde_json::Value::Object(fields)) => fields,
+            Some(value) => serde_json::Map::from_iter([("cause".into(), value)]),
+            None => serde_json::Map::new(),
+        };
+        details.insert("exceptionOwner".into(), "protocol".into());
         Self {
             error: ErrorBody {
                 code: code.into(),
                 message: message.into(),
                 hint,
-                details: details.map(Box::new),
+                details: Some(Box::new(serde_json::Value::Object(details))),
             },
         }
     }
@@ -9743,6 +9761,7 @@ mod tests {
         assert_eq!(
             error.body.error.details.as_deref(),
             Some(&serde_json::json!({
+                "exceptionOwner": "protocol",
                 "clientSyncProtocolVersion": 999,
                 "serverSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
             }))

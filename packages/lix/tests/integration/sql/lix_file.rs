@@ -1546,7 +1546,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_rejects_non_binary_content_from_select,
+    lix_file_insert_reports_unsupported_query_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1565,11 +1565,9 @@ simulation_test!(
             )
             .await
             .expect_err("non-binary content from SELECT should be rejected");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert_eq!(
-            error.hint(),
-            Some("Use CAST($1 AS BYTEA) with a text parameter for file contents.")
-        );
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.hint().unwrap().contains("lix_restore"));
+        assert_eq!(error.details.as_ref().unwrap()["outcome"], "not_committed");
 
         let result = session
             .execute(

@@ -3991,7 +3991,7 @@ mod tests {
             error["error"]["details"],
             json!({
                 "retryable": false,
-                "outcome": "unknown",
+                "outcome": "unknown", "exceptionOwner": "protocol",
             })
         );
 

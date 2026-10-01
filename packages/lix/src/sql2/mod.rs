@@ -1,4 +1,5 @@
 mod bind;
+pub(crate) use bind::error::rejected as binding_rejection;
 mod branch_ref;
 mod branch_scope;
 mod catalog;
