@@ -1229,22 +1229,7 @@ fn protocol_error(
     let span = tracing::Span::current();
     span.record("lix.error.code", code.as_str());
     if let Some(details) = &details {
-        for (key, attribute) in [
-            ("fromVersion", "lix.migration.from_version"),
-            ("toVersion", "lix.migration.to_version"),
-            ("receiptVersion", "lix.receipt.version"),
-            ("expectedReceiptVersion", "lix.receipt.expected_version"),
-        ] {
-            if let Some(value) = details.get(key).and_then(serde_json::Value::as_u64) {
-                span.record(attribute, value);
-            }
-        }
-        if let Some(source) = details
-            .get("sourceCode")
-            .and_then(serde_json::Value::as_str)
-        {
-            span.record("lix.error.source_code", source);
-        }
+        crate::telemetry::record_failure_details(&span, details);
     }
     (
         status,
