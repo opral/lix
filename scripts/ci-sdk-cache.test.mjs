@@ -21,7 +21,7 @@ import {
 } from "./ci-sdk-cache.mjs";
 
 function fixture(t) {
-	const root = mkdtempSync(join(tmpdir(), "lix-binaries-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "lix-binaries-")));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const write = (path, content = path) => {
 		mkdirSync(dirname(join(root, path)), { recursive: true });
