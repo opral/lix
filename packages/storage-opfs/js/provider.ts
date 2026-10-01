@@ -14,6 +14,7 @@ import type {
 	LixStoragePrecondition,
 	LixStorageProjectedValue,
 	LixStorageProvider,
+	LixStorageProviderOpenProfile,
 	LixStorageRead,
 	LixStorageReadOptions,
 	LixStorageScanOrder,
@@ -102,6 +103,21 @@ CREATE INDEX lix_read_history_generation ON lix_read_history(generation);
 
 const STORAGE_SESSION_METADATA_KEY = "session-token";
 
+function profileNow(): number {
+	try {
+		const value = globalThis.performance?.now?.();
+		if (typeof value === "number" && Number.isFinite(value)) return value;
+	} catch {
+		// Timing is observational and must not affect storage initialization.
+	}
+	return Date.now();
+}
+
+function profileElapsed(startedAt: number): number {
+	const duration = profileNow() - startedAt;
+	return Number.isFinite(duration) ? Math.min(86_400_000, Math.max(0, duration)) : 0;
+}
+
 let sqliteModule: Promise<SqliteInit> | undefined;
 const pools = new Map<string, Promise<SAHPoolUtil>>();
 
@@ -121,6 +137,7 @@ export class OpfsBackend implements LixStorageProvider {
 	#sessionToken: string | undefined;
 	#closed = false;
 	readonly #partialOwners = new PartialOwnerLifetimes();
+	readonly #openingProfile: LixStorageProviderOpenProfile;
 
 	private constructor(
 		private readonly storageName: string,
@@ -128,18 +145,23 @@ export class OpfsBackend implements LixStorageProvider {
 		pool: SAHPoolUtil,
 		releaseLock: () => Promise<void>,
 		sessionToken: string | undefined,
+		openingProfile: LixStorageProviderOpenProfile,
 	) {
 		this.#database = database;
 		this.#pool = pool;
 		this.#releaseLock = releaseLock;
 		this.#sessionToken = sessionToken;
+		this.#openingProfile = openingProfile;
 	}
 
 	static async open(
 		name: string,
 		onOwnershipAcquired?: () => void,
 	): Promise<OpfsBackend> {
+		const openStartedAt = profileNow();
+		const lockStartedAt = profileNow();
 		const releaseLock = await acquireOpfsLock(name);
+		const lockWaitMs = profileElapsed(lockStartedAt);
 		onOwnershipAcquired?.();
 		let pool: SAHPoolUtil | undefined;
 		let database: OpfsSAHPoolDatabase | undefined;
@@ -150,17 +172,26 @@ export class OpfsBackend implements LixStorageProvider {
 					"This browser does not expose the Origin Private File System",
 				);
 			}
+			const sqliteStartedAt = profileNow();
 			const sqlite3 = await initializeSqlite();
+			const sqliteInitMs = profileElapsed(sqliteStartedAt);
+			const poolStartedAt = profileNow();
 			pool = await getPool(sqlite3, name);
+			const poolOpenMs = profileElapsed(poolStartedAt);
 			database = new pool.OpfsSAHPoolDb("/repository.sqlite3");
 			configureSqliteOpfsDurability(database);
+			const schemaStartedAt = profileNow();
 			database.exec(SQLITE_SCHEMA);
 			database.exec(READ_HISTORY_SCHEMA);
+			const schemaInitMs = profileElapsed(schemaStartedAt);
 			const sessionToken = database.selectValue(
 				"SELECT value FROM lix_storage_metadata WHERE key = ?",
 				[STORAGE_SESSION_METADATA_KEY],
 			) as string | undefined;
-			return new OpfsBackend(name, database, pool, releaseLock, sessionToken);
+			return new OpfsBackend(name, database, pool, releaseLock, sessionToken, {
+				openMs: profileElapsed(openStartedAt),
+				opfs: { lockWaitMs, sqliteInitMs, poolOpenMs, schemaInitMs },
+			});
 		} catch (error) {
 			try {
 				database?.close();
@@ -171,6 +202,13 @@ export class OpfsBackend implements LixStorageProvider {
 			await releaseLock();
 			throw error;
 		}
+	}
+
+	openingProfile(): LixStorageProviderOpenProfile {
+		return {
+			openMs: this.#openingProfile.openMs,
+			opfs: { ...this.#openingProfile.opfs! },
+		};
 	}
 
 	acquirePartialReplicaOwner(sessionToken: string) {

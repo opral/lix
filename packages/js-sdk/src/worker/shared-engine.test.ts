@@ -119,8 +119,24 @@ test("root admission records the exact frozen opening credentials", async () => 
   expect(sent).toEqual(["old-token"]);
 });
 
-test("later attachments report no repeated initialization or migration", async () => {
-  const report = { format: 79, initialized: true, migrations: [] };
+test("later attachments report no repeated initialization, migration, or host work", async () => {
+  const report = {
+    format: 79,
+    initialized: true,
+    migrations: [],
+    hostProfile: {
+      version: 1 as const,
+      wasm: {
+        waitMs: 4,
+        realmReused: false,
+        source: "network" as const,
+        cacheStatus: "miss" as const,
+        fetchMs: 3,
+      },
+      componentCompiler: { importMs: 1, initializeMs: 2 },
+      nativeBindingOpenMs: 5,
+    },
+  };
   const close = vi.fn(async () => {});
   const child = { close, activeAccountId: async () => "account-a" } as unknown as LixBinding;
   const root = {

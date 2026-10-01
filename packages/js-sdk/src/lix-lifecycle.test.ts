@@ -8,6 +8,18 @@ test("Lix captures an immutable open report", () => {
 		initialized: false,
 		migration: { fromFormat: 74, toFormat: 75 },
 		migrations: [{ scope: "local", fromFormat: 74, toFormat: 75 }],
+		hostProfile: {
+			version: 1 as const,
+			wasm: {
+				waitMs: 8,
+				realmReused: false,
+				source: "network" as const,
+				cacheStatus: "miss" as const,
+				fetchMs: 6,
+			},
+			componentCompiler: { importMs: 1, initializeMs: 2 },
+			nativeBindingOpenMs: 3,
+		},
 	};
 	const binding = {
 		openReport: vi.fn(() => source),
@@ -17,17 +29,33 @@ test("Lix captures an immutable open report", () => {
 	source.format = 76;
 	source.migration.fromFormat = 73;
 	source.migrations[0]!.fromFormat = 73;
+	source.hostProfile.wasm.waitMs = 99;
 
 	expect(lix.openReport).toEqual({
 		format: 75,
 		initialized: false,
 		migration: { fromFormat: 74, toFormat: 75 },
 		migrations: [{ scope: "local", fromFormat: 74, toFormat: 75 }],
+		hostProfile: {
+			version: 1,
+			wasm: {
+				waitMs: 8,
+				realmReused: false,
+				source: "network",
+				cacheStatus: "miss",
+				fetchMs: 6,
+			},
+			componentCompiler: { importMs: 1, initializeMs: 2 },
+			nativeBindingOpenMs: 3,
+		},
 	});
 	expect(Object.isFrozen(lix.openReport)).toBe(true);
 	expect(Object.isFrozen(lix.openReport?.migrations)).toBe(true);
 	expect(Object.isFrozen(lix.openReport?.migrations[0])).toBe(true);
 	expect(Object.isFrozen(lix.openReport?.migration)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.hostProfile)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.hostProfile?.wasm)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.hostProfile?.componentCompiler)).toBe(true);
 });
 
 test("managed Lix close rejects new work and drains an in-flight branch switch", async () => {

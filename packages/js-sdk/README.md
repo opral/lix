@@ -94,6 +94,23 @@ show “Upgrading repository” with an indeterminate indicator instead of inven
 a percentage. Progress callbacks are observational and cannot change the result
 of opening.
 
+### Opening profiles
+
+`lix.openReport.initialized` distinguishes initialization during this open from
+existing native state. A browser open that creates the engine also exposes an
+immutable `lix.openReport.hostProfile` with wall-clock waits for WASM loading,
+component-compiler import/initialization, storage-provider startup and the
+native binding open. OPFS providers report lock, SQLite, pool and schema waits.
+These timings observe existing operations and perform no additional I/O.
+
+WASM cache/source fields record the actual loading branch. Reusing a realm
+reports only this caller's initialization wait, never a previous caller's
+fetch/compile costs. A handle attached to an existing shared engine omits the
+historical host profile. Initialization and migration facts remain separate.
+Imports can overlap, and provider opening can be nested inside creation; do not
+sum these wall-clock waits as exclusive CPU costs. Profiles are available on
+successful completed opens; progress and owner spans diagnose earlier failures.
+
 ### Compatibility metadata
 
 Raw HTTP integrations can obtain this SDK's protocol versions without loading

@@ -29,3 +29,49 @@ test("normal WASM opening upgrades released OPFS history without a migration art
   try { expect(reopened.openReport?.migrations).toEqual([]); }
   finally { await reopened.close(); }
 }, 120_000);
+
+test("host opening profile separates a fresh OPFS store from its persisted reopen", async () => {
+	const name = `host-profile-${crypto.randomUUID()}`;
+	const first = await openLix({ storage: new OpfsStorage({ name }) });
+	try {
+		expect(first.openReport?.initialized).toBe(true);
+		const profile = first.openReport?.hostProfile;
+		expect(profile?.version).toBe(1);
+		expect(profile?.wasm.waitMs).toEqual(expect.any(Number));
+		expect(profile?.wasm.source).toMatch(/^(bundled|cache|network|realm)$/);
+		expect(profile?.componentCompiler.importMs).toEqual(expect.any(Number));
+		expect(profile?.componentCompiler.initializeMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.moduleImportMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.createMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.openMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.opfs?.lockWaitMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.opfs?.sqliteInitMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.opfs?.poolOpenMs).toEqual(expect.any(Number));
+		expect(profile?.provider?.opfs?.schemaInitMs).toEqual(expect.any(Number));
+		expect(profile?.nativeBindingOpenMs).toEqual(expect.any(Number));
+	} finally {
+		await first.close();
+	}
+
+	const reopened = await openLix({ storage: new OpfsStorage({ name }) });
+	try {
+		expect(reopened.openReport?.initialized).toBe(false);
+		expect(reopened.openReport?.hostProfile?.provider?.opfs).toEqual({
+			lockWaitMs: expect.any(Number),
+			sqliteInitMs: expect.any(Number),
+			poolOpenMs: expect.any(Number),
+			schemaInitMs: expect.any(Number),
+		});
+		const wasm = reopened.openReport?.hostProfile?.wasm;
+		if (wasm?.realmReused) {
+			expect(wasm).toEqual({
+				waitMs: expect.any(Number),
+				realmReused: true,
+				source: "realm",
+				cacheStatus: "not_consulted",
+			});
+		}
+	} finally {
+		await reopened.close();
+	}
+}, 120_000);

@@ -75,10 +75,43 @@ export type LixOpenMigration = LixOpenMigrationReport & {
 	scope: "local" | "authority";
 };
 
+/** Host-side startup waits measured around work already performed by the SDK. */
+export type LixOpenHostProfile = {
+	version: 1;
+	wasm: {
+		waitMs: number;
+		realmReused: boolean;
+		source: "bundled" | "cache" | "network" | "realm";
+		cacheStatus: "hit" | "miss" | "corrupt" | "unavailable" | "not_consulted";
+		fetchMs?: number;
+		compileMs?: number;
+		initializeMs?: number;
+	};
+	componentCompiler: {
+		importMs: number;
+		initializeMs: number;
+	};
+	provider?: {
+		moduleImportMs: number;
+		createMs: number;
+		/** Physical provider open; overlaps createMs when supplied by the provider. */
+		openMs?: number;
+		opfs?: {
+			lockWaitMs: number;
+			sqliteInitMs: number;
+			poolOpenMs: number;
+			schemaInitMs: number;
+		};
+	};
+	nativeBindingOpenMs: number;
+};
+
 /** Immutable facts about how a Lix handle was opened. */
 export type LixOpenReport = {
 	format: number;
 	initialized: boolean;
+	/** Actual waits at the JavaScript host boundary; omitted for shared attachments. */
+	hostProfile?: LixOpenHostProfile;
 	/** @deprecated Use migrations for scoped upgrade reports. */
 	migration?: LixOpenMigrationReport;
 	migrations: readonly LixOpenMigration[];
