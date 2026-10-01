@@ -201,6 +201,8 @@ struct HttpProbe {
     fulfilled_chunks: AtomicU64,
     fulfilled_chunk_ids: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
     directory_registry_fulfillments: AtomicU64,
+    fulfilled_file_descriptors: AtomicU64,
+    fulfilled_plugin_owners: AtomicU64,
     chunk_gets: AtomicU64,
     chunk_puts: AtomicU64,
     reject_requests: AtomicBool,
@@ -3178,6 +3180,19 @@ where
                         continue;
                     };
                     match address["schema_key"].as_str() {
+                        Some("lix_file_descriptor") => {
+                            probe
+                                .fulfilled_file_descriptors
+                                .fetch_add(1, Ordering::Release);
+                        }
+                        Some("lix_key_value")
+                            if address["row_pk"][0]["value"].as_str()
+                                == Some("lix_plugin_owner_v2") =>
+                        {
+                            probe
+                                .fulfilled_plugin_owners
+                                .fetch_add(1, Ordering::Release);
+                        }
                         Some("lix_directory_descriptor") => {
                             directory_branches.insert(branch_id.to_owned());
                         }
@@ -3489,7 +3504,10 @@ async fn partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
             .expect("seed checkpoint file");
     }
     let last_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("checkpoint filesystem")
         .rows()[0]
@@ -3552,9 +3570,7 @@ async fn partial_checkpoint_repository_reads_state_on_a_sparse_replica() {
             &[Value::Text(last_checkpoint)],
         )
         .await
-        .expect(
-            "root diff with paths at the partial checkpoint executes on the authority",
-        );
+        .expect("root diff with paths at the partial checkpoint executes on the authority");
     assert_eq!(diff.rows().len(), 4, "resolved paths for all four files");
 
     replica

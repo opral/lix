@@ -28,7 +28,10 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
         "incoming"
     );
     authority.execute("UPDATE merge_test_row SET body='Alice said HELLO.\n\nBob said goodbye.',label='authority-first' WHERE id='0198b7a1-0000-7000-8000-000000000001'", &[]).await;
-    replica.close().await.expect("close offline replica before reconnecting");
+    replica
+        .close()
+        .await
+        .expect("close offline replica before reconnecting");
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
     let expected = "Alice said HELLO.\n\nBob said GOODBYE.";
@@ -75,6 +78,35 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
         .await
         .unwrap();
 
+    // A parsed file retains a real executable owner. The folder query must
+    // avoid hydrating that unrelated file state; the later file-ID query must
+    // admit its owner. The Library exposed both paths after creating Markdown.
+    setup
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_csv.lixplugin',$1)",
+            &[Value::Blob(csv_archive().into())],
+        )
+        .await
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES('/library/owned.csv',$1)",
+            &[Value::Blob(b"name,value\nproof,one\n".to_vec().into())],
+        )
+        .await
+        .unwrap();
+    let owners = setup
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key='lix_plugin_owner_v2'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !owners.rows().is_empty(),
+        "the fixture must contain a real parsed-file owner"
+    );
+
     let registry = setup
         .execute(
             "SELECT key FROM lix_key_value WHERE key='lix_plugin_registry_v2'",
@@ -83,6 +115,15 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
         .await
         .expect("plugin installation should persist its registry row");
     assert_eq!(registry.rows().len(), 1);
+
+    let file_rows = setup
+        .execute(
+            "SELECT id FROM lix_file WHERE path='/library/owned.csv'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let owned_file_id = file_rows.rows()[0].get::<String>("id").unwrap();
 
     // This exact native query seeds DirectoryOnly path-index interest as well
     // as metadata interest. Capture expected rows before opening a fresh replica.
@@ -158,9 +199,45 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
             > registry_fulfillments_before,
         "read fulfillment should include the reserved registry key and a same-branch directory witness",
     );
+    assert_eq!(
+        probe.fulfilled_file_descriptors.load(Ordering::Acquire),
+        0,
+        "directory preparation must not hydrate unrelated file descriptors"
+    );
+    assert_eq!(
+        probe.fulfilled_plugin_owners.load(Ordering::Acquire),
+        0,
+        "directory preparation must not hydrate any file's executable owner"
+    );
+    let file_read = "SELECT id,path,name FROM lix_file WHERE id=$1";
+    let file_params = [Value::Text(owned_file_id.clone())];
+    let selected_file = replica
+        .execute(file_read, &file_params)
+        .await
+        .expect("first file metadata read must admit its own executable owner");
+    assert_eq!(
+        selected_file.rows()[0].get::<String>("path").unwrap(),
+        "/library/owned.csv"
+    );
+    assert!(
+        probe.fulfilled_plugin_owners.load(Ordering::Acquire) > 0,
+        "the file metadata regression must exercise owner payload admission"
+    );
+    assert_eq!(
+        probe.execute_requests.load(Ordering::Acquire),
+        execute_requests_before
+    );
     replica.close().await.unwrap();
 
     let offline_replica = open_replica_offline(directory.path()).await;
+    let offline_file = offline_replica
+        .execute(file_read, &file_params)
+        .await
+        .unwrap();
+    assert_eq!(
+        offline_file.rows()[0].get::<String>("path").unwrap(),
+        "/library/owned.csv"
+    );
     let offline = offline_replica
         .execute(read, &[])
         .await
