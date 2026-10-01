@@ -381,6 +381,7 @@ enum PointerState {
 enum AdmissionIntent {
     FullRepository,
     PartialReplica,
+    OwnedMigration,
 }
 
 pub(super) async fn inspect_layout<S: Storage>(
@@ -581,11 +582,12 @@ pub(crate) async fn admit_repository_with_server<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    admit_repository_with_options(
+    admit_repository_with_intent(
         storage,
         progress,
         server,
         super::MigrationOptions::default(),
+        AdmissionIntent::FullRepository,
     )
     .await
 }
@@ -624,9 +626,30 @@ where
         progress,
         server,
         options,
-        AdmissionIntent::FullRepository,
+        AdmissionIntent::OwnedMigration,
     )
     .await
+}
+
+async fn current_partial_receipt_requires_migration<S>(
+    storage: &S,
+    bank: EpochBank,
+    pointer: &Bytes,
+) -> Result<bool, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = StorageAdapter::for_epoch(storage.clone(), bank, pointer.clone());
+    // This classifies a migration route, not an admission. Full in-memory
+    // repositories support observed snapshots without durable reads; the
+    // detached migration still owns all source fences and activation barriers.
+    let read = adapter.begin_read(ReadOptions::default()).await?;
+    if !crate::init::is_partial_repository_protocol(&read).await? {
+        return Ok(false);
+    }
+    Ok(partial::historical_partial_receipt_version(&read)
+        .await?
+        .is_some())
 }
 
 async fn admit_repository_with_intent<S>(
@@ -656,9 +679,25 @@ where
                         crate::init::CURRENT_FORMAT_VERSION
                     )));
                 }
-                if format < crate::init::CURRENT_FORMAT_VERSION {
-                    // Keep cold migration/bootstrap state off the ordinary
-                    // open future's stack, including for filesystem adapters.
+                let current_partial_receipt_needs_migration = format
+                    == crate::init::CURRENT_FORMAT_VERSION
+                    && server.is_none()
+                    && matches!(
+                        intent,
+                        AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
+                    )
+                    && Box::pin(current_partial_receipt_requires_migration(
+                        storage, bank, &bytes,
+                    ))
+                    .await?;
+                if format < crate::init::CURRENT_FORMAT_VERSION
+                    || current_partial_receipt_needs_migration
+                {
+                    // Route both older physical formats and historical
+                    // current-format receipts through the detached,
+                    // source-fenced candidate path. Keep one cold migration
+                    // call site to avoid duplicating its large future
+                    // temporary in the ordinary open frame.
                     return Box::pin(migrate_active(
                         storage, bank, generation, format, bytes, progress, server, options, intent,
                     ))
@@ -946,7 +985,15 @@ where
         crate::init::REPOSITORY_PROTOCOL_KEY,
     )
     .await?;
-    let partial_source_format = (intent == AdmissionIntent::PartialReplica)
+    // Explicit owned migration already knows the inspected repository role.
+    // Recognize exact partial protocol markers there too, so pointerless
+    // historical partial repositories are routed through the sparse partial
+    // candidate migrator instead of the full-layout marker parser. Ordinary
+    // full-repository opens still never reinterpret a partial marker.
+    let partial_source_format = matches!(
+        intent,
+        AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
+    )
         .then(|| source_marker.as_deref().and_then(partial_repository_format))
         .flatten();
     let legacy_status = match partial_source_format {
@@ -1272,6 +1319,22 @@ where
     }
     let source =
         StorageAdapter::for_epoch(storage.clone(), source_bank, active_source_bytes.clone());
+    if pending_conversion_journal::source_bank_has_pending_conversion_journal(
+        storage,
+        &bank_code(source_bank),
+    )
+    .await?
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
+            "a pending conversion attempt is tied to this source epoch; format migration stopped before changing the active source",
+        )
+        .with_details(serde_json::json!({
+            "sourcePreserved": true,
+            "migrationPhase": "candidate_format_migration",
+            "failureReason": "pending_conversion_journal",
+        })));
+    }
     emit_migrating(progress, from_format);
     let target_bank = if server.is_some() || matches!(source_bank, EpochBank::Generation(_)) {
         replica_generation_bank(
@@ -4484,7 +4547,7 @@ where
 }
 
 #[cfg(test)]
-pub(super) async fn stage_repository_format_for_test<S>(
+pub(crate) async fn stage_repository_format_for_test<S>(
     storage: &S,
     partial: bool,
     format: u32,

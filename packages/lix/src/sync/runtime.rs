@@ -86,6 +86,9 @@ pub(super) enum SyncDemandRequest {
     ChunksWithRead(Vec<String>, LixError),
     /// Wait for the partial owner to settle local work before changing branches.
     ReconcilePartial,
+    /// Hydrate the bounded immutable baseline graph frontier needed by local
+    /// writes, without executing or publishing a mutation.
+    PrepareOfflineEditing,
     /// Hydrate immutable inputs without moving an explicit transaction snapshot.
     Pinned(Box<SyncDemandRequest>),
     #[cfg(test)]
@@ -380,6 +383,15 @@ pub(super) fn native_sync_demand_request_for_error(
     if error.automatic_retry_is_forbidden() {
         return Ok(None);
     }
+    if let Some(locator) =
+        crate::sync::read_fulfillment::selected_change_payload_locator(error)
+        && crate::sync::read_fulfillment::interests_for_error(error)?.is_some()
+    {
+        return Ok(Some(SyncDemandRequest::NativeMetadata(
+            vec![locator],
+            error.clone(),
+        )));
+    }
     if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
         crate::binary_cas::BlobManifestRequired::from_error(error)?
     {
@@ -424,6 +436,10 @@ pub(super) fn native_sync_demand_request_for_error(
 
 fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, LixError> {
     match request {
+        SyncDemandRequest::PrepareOfflineEditing => Err(LixError::new(
+            "LIX_SYNC_MODE_MISMATCH",
+            "offline editing preparation requires a partial replica",
+        )),
         SyncDemandRequest::NativeObject(_, error)
         | SyncDemandRequest::NativeObjects(_, error)
         | SyncDemandRequest::NativeMetadata(_, error)
@@ -453,6 +469,16 @@ pub(crate) async fn reconcile_partial_before_branch_switch(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
 ) -> Result<(), LixError> {
     send_sync_demand(demand_tx, SyncDemandRequest::ReconcilePartial)
+        .await
+        .map(|_| ())
+}
+
+/// Prepare the currently admitted partial replica's bounded write frontier.
+/// This request is deliberately explicit so read-only opens stay lazy.
+pub(crate) async fn prepare_offline_editing(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+) -> Result<(), LixError> {
+    send_sync_demand(demand_tx, SyncDemandRequest::PrepareOfflineEditing)
         .await
         .map(|_| ())
 }
@@ -1054,7 +1080,9 @@ where
             | SyncDemandRequest::NativeObjects(_, _)
             | SyncDemandRequest::NativeMetadata(_, _)
             | SyncDemandRequest::BlobManifest(_, _) => {}
-            SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {}
+            SyncDemandRequest::ReconcilePartial
+            | SyncDemandRequest::PrepareOfflineEditing
+            | SyncDemandRequest::Pinned(_) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
             SyncDemandRequest::ChunksWithRead(ids, _) => chunk_ids.extend(ids),
@@ -1102,6 +1130,10 @@ fn resolve_sync_demand_results(
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
             | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
+            SyncDemandRequest::PrepareOfflineEditing => Err(LixError::new(
+                "LIX_SYNC_MODE_MISMATCH",
+                "offline editing preparation requires a partial replica",
+            )),
             SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {
                 Err(LixError::new(
                     "LIX_SYNC_MODE_MISMATCH",
@@ -1720,6 +1752,10 @@ where
         | Some(SyncDemandRequest::NativeObjects(_, original))
         | Some(SyncDemandRequest::NativeMetadata(_, original))
         | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
+        Some(SyncDemandRequest::PrepareOfflineEditing) => Err(LixError::new(
+            "LIX_SYNC_MODE_MISMATCH",
+            "offline editing preparation requires a partial replica",
+        )),
         Some(SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_)) => Err(
             LixError::unknown("partial reconciliation requires a partial owner"),
         ),

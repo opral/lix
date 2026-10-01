@@ -8,11 +8,11 @@ use crate::storage_adapter::*;
 use crate::tracked_state::{NativeMetadataRef, NativeObjectRef};
 use crate::{
     LixError,
-    hot_state::{LogicalReadInterest, ReadInterestRegistry},
+    hot_state::{InterestDomain, LogicalReadInterest, ReadInterestRegistry},
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -32,12 +32,90 @@ fn invalid(message: &str) -> LixError {
     LixError::new("LIX_READ_FULFILLMENT_INVALID", message)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ClientFailurePhase {
+    Validation,
+    Installation,
+}
+
+impl ClientFailurePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Validation => "read_fulfillment_validation",
+            Self::Installation => "read_fulfillment_install",
+        }
+    }
+}
+
+/// Add bounded context where a client receives or installs a validly framed
+/// read-fulfillment response. Never copy parser text, addresses, row values,
+/// or storage diagnostics into these stable telemetry fields.
+pub(crate) fn annotate_client_failure(mut error: LixError, phase: ClientFailurePhase) -> LixError {
+    if error.code != "LIX_READ_FULFILLMENT_INVALID" {
+        return error;
+    }
+    let known_reason = error
+        .details
+        .as_ref()
+        .and_then(|details| details.get("payloadFailureReason"))
+        .and_then(|value| value.as_str())
+        .filter(|reason| {
+            matches!(
+                *reason,
+                "selected_change_payload_identity_or_lifetime_mismatch"
+                    | "selected_change_payload_recipe_mismatch"
+                    | "selected_change_payload_locator_missing"
+                    | "selected_change_payload_source_mismatch"
+                    | "selected_change_payload_outside_descriptor_scope"
+                    | "read_fulfillment_resident_input_conflict"
+            )
+        })
+        .map(str::to_owned);
+    let failure_reason = known_reason.as_deref().or(match error.message.as_str() {
+        "canonical selected change payload identity or lifetime mismatch" => {
+            Some("selected_change_payload_identity_or_lifetime_mismatch")
+        }
+        "canonical change payload has no matching row recipe" => {
+            Some("selected_change_payload_recipe_mismatch")
+        }
+        "canonical change payload has no selected source locator" => {
+            Some("selected_change_payload_locator_missing")
+        }
+        "canonical change payload source disagrees with its selected locator" => {
+            Some("selected_change_payload_source_mismatch")
+        }
+        "canonical change payload is outside the descriptor branch scope" => {
+            Some("selected_change_payload_outside_descriptor_scope")
+        }
+        "read fulfillment conflicts with resident input" => {
+            Some("read_fulfillment_resident_input_conflict")
+        }
+        _ => Some(match phase {
+            ClientFailurePhase::Validation => "read_fulfillment_validation_failed",
+            ClientFailurePhase::Installation => "read_fulfillment_install_failed",
+        }),
+    });
+    let details = error
+        .details
+        .get_or_insert_with(|| Box::new(serde_json::json!({})));
+    if let Some(details) = details.as_object_mut() {
+        details.insert("payloadPhase".into(), serde_json::json!(phase.as_str()));
+        if let Some(failure_reason) = failure_reason {
+            details.insert(
+                "payloadFailureReason".into(),
+                serde_json::json!(failure_reason),
+            );
+        }
+    }
+    error
+}
+
 fn preserves_local_mutable_native_overlay(address: &ReadInputAddress) -> bool {
     matches!(
         address,
         ReadInputAddress::Metadata(
             NativeMetadataRef::CommitGraphRecord(_) | NativeMetadataRef::ChangeLocator(_)
-        )
+        ) | ReadInputAddress::ChangeRecord { .. }
     )
 }
 
@@ -212,8 +290,33 @@ pub(crate) fn annotate_capture(
         .get_or_insert_with(|| Box::new(serde_json::json!({})));
     if let Some(details) = details.as_object_mut() {
         details.insert(MARKER.into(), serde_json::json!({"interests": interests}));
+        details.insert("nativeReadRecipeCount".into(), interests.len().into());
+        let recipe_mask = interests.iter().fold(0_u16, |mask, interest| {
+            mask | payload_recipe_mask(std::slice::from_ref(*interest))
+        });
+        details.insert("nativeReadRecipeMask".into(), recipe_mask.into());
     }
     error
+}
+
+/// A selected live change can be absent from a sparse replica even when all
+/// immutable index nodes are present. Demand its canonical locator through
+/// the captured recipe so the authority returns the paired change payload.
+/// Full replicas never use this recovery path.
+pub(crate) fn selected_change_payload_locator(error: &LixError) -> Option<NativeMetadataRef> {
+    if error.code != LixError::CODE_INTERNAL_ERROR {
+        return None;
+    }
+    let details = error.details.as_ref()?;
+    if details.get("payloadFailureReason")?.as_str()? != "selected_change_payload_unavailable" {
+        return None;
+    }
+    let change_id = details.get("changeId")?.as_str()?;
+    let parsed = uuid::Uuid::parse_str(change_id).ok()?;
+    if parsed.to_string() != change_id {
+        return None;
+    }
+    Some(NativeMetadataRef::ChangeLocator(change_id.to_owned()))
 }
 
 pub(super) fn interests_for_error(
@@ -266,6 +369,20 @@ pub(crate) struct ReadContinuation {
 pub(crate) enum ReadInputAddress {
     Metadata(NativeMetadataRef),
     Object(NativeObjectRef),
+    /// A canonical changelog payload selected by one descriptor-scoped row
+    /// identity. The payload itself is mutable in CHANGE_SPACE, so its exact
+    /// row lifetime and source owner travel with the typed input.
+    ChangeRecord {
+        change_id: String,
+        source_commit_id: String,
+        branch_id: String,
+        schema_key: String,
+        file_id: Option<String>,
+        #[serde(with = "row_pk_payload")]
+        row_pk: crate::row_pk::RowPk,
+        updated_at: String,
+        payload_digest: [u8; 32],
+    },
     BlobManifest([u8; 32]),
     BlobChunk([u8; 32]),
 }
@@ -320,6 +437,31 @@ mod payload {
     }
 }
 
+/// `RowPk`'s ordinary JSON form intentionally erases UUID-vs-text component
+/// types for SQL-facing values. Read-fulfillment identities cross the wire and
+/// must preserve that distinction so clients can revalidate the canonical row
+/// payload against the selected identity.
+mod row_pk_payload {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        row_pk: &crate::row_pk::RowPk,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        row_pk
+            .as_typed_json_array_value()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<crate::row_pk::RowPk, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        crate::row_pk::RowPk::from_typed_json_array_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -352,8 +494,62 @@ impl ReadFulfillmentRequest {
         {
             return Err(invalid("historical diff recipes require history discovery"));
         }
-        let mut required = std::collections::BTreeSet::new();
+        for interest in &self.interests {
+            let selected_branch_id = self.descriptor.selected_branch.branch_id.as_str();
+            let global_branch_id = self.descriptor.global_branch.branch_id.as_str();
+            let branch_is_in_descriptor =
+                |branch_id: &str| branch_id == selected_branch_id || branch_id == global_branch_id;
+            let branch_scope_is_in_descriptor = match interest {
+                LogicalReadInterest::FilesystemMetadata { branch_ids, .. }
+                | LogicalReadInterest::FilesystemPaths { branch_ids, .. } => {
+                    branch_ids.iter().all(|id| branch_is_in_descriptor(id))
+                }
+                LogicalReadInterest::FileContent { request, .. }
+                | LogicalReadInterest::Scan { request, .. } => request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .all(|id| branch_is_in_descriptor(id)),
+                LogicalReadInterest::CollectionGeneration { branch_id, .. }
+                | LogicalReadInterest::PackedIdentityMembership { branch_id, .. } => {
+                    branch_is_in_descriptor(branch_id)
+                }
+                LogicalReadInterest::Exact { rows, .. } => rows
+                    .iter()
+                    .all(|row| branch_is_in_descriptor(&row.branch_id)),
+                LogicalReadInterest::Diff { branch_id, .. } => {
+                    branch_id.as_deref().is_none_or(branch_is_in_descriptor)
+                }
+            };
+            if !branch_scope_is_in_descriptor {
+                return Err(invalid(
+                    "read interest branch scope is outside the descriptor",
+                ));
+            }
+            let LogicalReadInterest::Scan { request, domain } = interest else {
+                continue;
+            };
+            if request.is_catalog_identity_only_scan() {
+                let branch_id = request.filter.branch_ids.first();
+                if *domain != InterestDomain::Tracked
+                    || branch_id.is_none_or(|branch_id| {
+                        branch_id != &self.descriptor.selected_branch.branch_id
+                            && branch_id != &self.descriptor.global_branch.branch_id
+                    })
+                {
+                    return Err(invalid(
+                        "schema catalog identity scans are restricted to descriptor branches",
+                    ));
+                }
+            }
+        }
+        let mut required = BTreeSet::new();
         for address in &self.required {
+            if matches!(address, ReadInputAddress::ChangeRecord { .. }) {
+                return Err(invalid(
+                    "canonical change payloads are selected by the read recipe",
+                ));
+            }
             if !required.insert(address.coordinate()?) {
                 return Err(invalid("duplicate required read input"));
             }
@@ -391,6 +587,13 @@ impl ReadInputAddress {
                 address.space(),
                 StorageKey(Bytes::from(address.storage_key())),
             ),
+            Self::ChangeRecord { change_id, .. } => {
+                let change_id = canonical_change_id(change_id)?;
+                (
+                    crate::changelog::CHANGE_SPACE,
+                    StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())),
+                )
+            }
             Self::BlobManifest(hash) => (
                 BINARY_CAS_MANIFEST_SPACE,
                 StorageKey(Bytes::copy_from_slice(hash)),
@@ -405,6 +608,34 @@ impl ReadInputAddress {
         match self {
             Self::Metadata(address) => super::native_metadata::validate_bytes(address, bytes),
             Self::Object(address) => address.validate(bytes),
+            Self::ChangeRecord {
+                change_id,
+                source_commit_id,
+                schema_key,
+                file_id,
+                row_pk,
+                updated_at,
+                payload_digest,
+                ..
+            } => {
+                let change_id = canonical_change_id(change_id)?;
+                canonical_commit_id(source_commit_id)?;
+                let updated_at = canonical_timestamp(updated_at)?;
+                let record = crate::changelog::decode_change_record(bytes, change_id)
+                    .map_err(|_| invalid("invalid canonical selected change payload"))?;
+                if record.schema_key != *schema_key
+                    || record.file_id != *file_id
+                    || record.row_pk != *row_pk
+                    || record.snapshot.is_none()
+                    || record.created_at != updated_at
+                    || blake3::hash(bytes).as_bytes() != payload_digest
+                {
+                    return Err(invalid(
+                        "canonical selected change payload identity or lifetime mismatch",
+                    ));
+                }
+                Ok(())
+            }
             Self::BlobManifest(hash) => {
                 let wire: super::SyncBlobManifest = serde_json::from_slice(bytes)
                     .map_err(|_| invalid("invalid canonical blob input"))?;
@@ -425,6 +656,57 @@ impl ReadInputAddress {
             }
         }
     }
+
+    fn validate_existing_mutable_value(
+        &self,
+        bytes: &[u8],
+        canonical_bytes: &[u8],
+    ) -> Result<(), LixError> {
+        match self {
+            Self::ChangeRecord { change_id, .. } => {
+                let change_id = canonical_change_id(change_id)?;
+                self.validate(canonical_bytes)?;
+                let existing = crate::changelog::decode_change_record(bytes, change_id)
+                    .map_err(|_| invalid("invalid resident mutable change payload"))?;
+                let canonical = crate::changelog::decode_change_record(canonical_bytes, change_id)
+                    .map_err(|_| invalid("invalid canonical mutable change payload"))?;
+                if existing != canonical || existing.snapshot.is_none() {
+                    return Err(invalid(
+                        "resident mutable change payload does not match canonical identity or lifetime",
+                    ));
+                }
+                Ok(())
+            }
+            _ => self.validate(bytes),
+        }
+    }
+}
+
+fn canonical_change_id(value: &str) -> Result<crate::changelog::ChangeId, LixError> {
+    let id = crate::changelog::ChangeId::parse(value)
+        .map_err(|_| invalid("change payload ID must be a canonical UUID"))?;
+    if id != value {
+        return Err(invalid("change payload ID must be a canonical UUID"));
+    }
+    Ok(id)
+}
+
+fn canonical_commit_id(value: &str) -> Result<crate::changelog::CommitId, LixError> {
+    let id = crate::changelog::CommitId::parse(value)
+        .map_err(|_| invalid("change payload source must be a canonical UUID"))?;
+    if id != value {
+        return Err(invalid("change payload source must be a canonical UUID"));
+    }
+    Ok(id)
+}
+
+fn canonical_timestamp(value: &str) -> Result<crate::common::LixTimestamp, LixError> {
+    let timestamp = crate::common::LixTimestamp::parse(value)
+        .map_err(|_| invalid("change payload timestamp must be canonical"))?;
+    if timestamp.to_string() != value {
+        return Err(invalid("change payload timestamp must be canonical"));
+    }
+    Ok(timestamp)
 }
 
 fn append_receipt_input(
@@ -433,7 +715,9 @@ fn append_receipt_input(
     coordinate: (StorageSpace, StorageKey),
 ) -> Result<(), LixError> {
     match address {
-        ReadInputAddress::Metadata(_) | ReadInputAddress::Object(_) => {
+        ReadInputAddress::Metadata(_)
+        | ReadInputAddress::Object(_)
+        | ReadInputAddress::ChangeRecord { .. } => {
             receipt.keys.push(coordinate);
         }
         ReadInputAddress::BlobChunk(hash) => {
@@ -907,8 +1191,13 @@ async fn discover_with_read(
     // physical rows (notably direct ChangeLocator values). Merge those typed
     // inputs into the same observation map as physical reads so one operation
     // closes its complete native dependency graph.
+    let mut explicit_selected_inputs = Vec::new();
     for input in logical_inputs {
         input.address.validate(&input.bytes)?;
+        if matches!(&input.address, ReadInputAddress::ChangeRecord { .. }) {
+            explicit_selected_inputs.push(input);
+            continue;
+        }
         let (space, key) = input.address.coordinate()?;
         let observed = StorageProjectedValue::FullValue(Bytes::from(input.bytes));
         observations
@@ -936,6 +1225,21 @@ async fn discover_with_read(
         }
     }
     let mut inputs = typed.into_values().collect::<Vec<_>>();
+    for input in explicit_selected_inputs {
+        let coordinate = input.address.coordinate()?;
+        if let Some(existing) = inputs
+            .iter()
+            .find(|existing| existing.address.coordinate().ok().as_ref() == Some(&coordinate))
+        {
+            if existing.bytes != input.bytes {
+                return Err(invalid(
+                    "selected change payload conflicts with observed input",
+                ));
+            }
+            continue;
+        }
+        inputs.push(input);
+    }
     for input in required_chunks {
         if !inputs
             .iter()
@@ -1042,7 +1346,7 @@ pub(crate) fn validate_response(
         ));
     }
     let mut bytes = 0usize;
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for input in &response.inputs {
         bytes = bytes
             .checked_add(input.bytes.len())
@@ -1082,6 +1386,658 @@ pub(crate) fn validate_response(
     }
     Ok(())
 }
+/// A scan can select a canonical row payload when its identity satisfies the
+/// recipe's exact filters. An empty `row_pks` list is the native wildcard
+/// used by ordinary SQL scans; it still constrains the identity through the
+/// schema, branch, file, and row-bound filters below. The server may return a
+/// typed payload only for an identity actually selected while replaying that
+/// scan, not for arbitrary mutable CHANGE_SPACE values.
+fn scan_selects_change_identity(
+    scan: &crate::hot_state::HotStateScanRequest,
+    domain: InterestDomain,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    let filter = &scan.filter;
+    if scan.limit.is_some()
+        || domain == InterestDomain::Untracked
+        || filter.untracked == Some(true)
+        || filter.rows != crate::hot_state::HotStateRowFilter::All
+        || !filter
+            .schema_keys
+            .iter()
+            .any(|candidate| candidate == schema_key)
+        || !branch_is_selected_by_scan(&filter.branch_ids, branch_id)
+        || (!filter.row_pks.is_empty()
+            && !filter.row_pks.iter().any(|candidate| candidate == row_pk))
+        || !crate::tracked_state::row_pk_satisfies_bounds(
+            row_pk,
+            filter.row_pk_lower.as_ref(),
+            filter.row_pk_upper.as_ref(),
+        )
+        || (!filter.file_ids.is_empty()
+            && !filter.file_ids.iter().any(|candidate| match candidate {
+                crate::NullableKeyFilter::Any => true,
+                crate::NullableKeyFilter::Null => file_id.is_none(),
+                crate::NullableKeyFilter::Value(expected) => file_id == Some(expected.as_str()),
+            }))
+    {
+        return false;
+    }
+
+    // These predicates need row contents, indexed values, or tombstone state
+    // that the wire identity alone cannot prove. Reject them here instead of
+    // trying to approximate their selection semantics.
+    filter.global.is_none()
+        && filter.constraints.is_empty()
+        && filter.declared_column_eq.is_none()
+        && filter.declared_column_range.is_none()
+        && !filter.include_tombstones
+}
+
+/// Branch-scoped scans physically read global rows as candidates for the
+/// branch/global visibility overlay. A canonical payload may therefore name
+/// the global source branch even though the logical recipe names only the
+/// selected branch. Keep the exception tied to that implicit global read.
+fn branch_is_selected_by_scan(branch_ids: &[String], branch_id: &str) -> bool {
+    branch_ids.iter().any(|candidate| candidate == branch_id)
+        || (branch_id == crate::GLOBAL_BRANCH_ID
+            && branch_ids
+                .iter()
+                .any(|candidate| candidate != crate::GLOBAL_BRANCH_ID))
+}
+
+fn scan_recipe_selects_change_identity(
+    interest: &LogicalReadInterest,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    match interest {
+        LogicalReadInterest::Exact {
+            rows, untracked, ..
+        } => {
+            *untracked != Some(true)
+                && rows.iter().any(|row| {
+                    row.branch_id == branch_id
+                        && row.schema_key == schema_key
+                        && row.file_id.as_deref() == file_id
+                        && row.row_pk == *row_pk
+                })
+        }
+        LogicalReadInterest::Scan { request, domain } => {
+            scan_selects_change_identity(request, *domain, branch_id, schema_key, file_id, row_pk)
+        }
+        LogicalReadInterest::FilesystemMetadata {
+            directory,
+            branch_ids,
+            file_ids,
+            directory_ids,
+            ..
+        } => {
+            if file_ids.as_ref().is_some_and(Vec::is_empty)
+                || directory_ids.as_ref().is_some_and(Vec::is_empty)
+            {
+                return false;
+            }
+            // Metadata replay constructs this path index before applying
+            // output predicates. Its ancestor descriptors are dependencies
+            // even when they are absent from the final SQL result.
+            let scope = if *directory {
+                crate::filesystem::FilesystemPathIndexScope::All
+            } else {
+                file_ids.clone().map_or(
+                    crate::filesystem::FilesystemPathIndexScope::All,
+                    crate::filesystem::FilesystemPathIndexScope::FileIds,
+                )
+            };
+            scan_recipe_selects_change_identity(
+                &LogicalReadInterest::FilesystemPaths {
+                    scope,
+                    branch_ids: branch_ids.clone(),
+                    include_blob_refs: false,
+                    cache_small_blob_data: false,
+                },
+                branch_id,
+                schema_key,
+                file_id,
+                row_pk,
+            )
+        }
+        LogicalReadInterest::FilesystemPaths {
+            scope,
+            branch_ids,
+            include_blob_refs,
+            cache_small_blob_data,
+        } => {
+            // Use the same native schema/branch recipe as path-index replay.
+            // File-scoped consumers still read directory descriptors to resolve
+            // ancestors, but cannot select another file's descriptor or blob.
+            let scan = crate::filesystem::FilesystemPathIndexRequest::new(branch_ids.clone())
+                .with_scope(scope.clone())
+                .with_blob_refs(*include_blob_refs || *cache_small_blob_data)
+                .hot_state_request();
+            if !scan_selects_change_identity(
+                &scan,
+                InterestDomain::Combined,
+                branch_id,
+                schema_key,
+                file_id,
+                row_pk,
+            ) {
+                return false;
+            }
+            match scope {
+                crate::filesystem::FilesystemPathIndexScope::FileIds(ids)
+                    if schema_key != "lix_directory_descriptor" =>
+                {
+                    ids.iter().any(|id| {
+                        crate::row_pk::RowPk::uuid_from_canonical(id)
+                            .is_ok_and(|expected| expected == *row_pk)
+                            && file_id.is_none_or(|file| file == id)
+                    })
+                }
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Current tracked-row reads prepare the branch plugin registry as a native
+/// executable dependency. The registry itself is not part of a custom schema
+/// recipe's filter, so authorize only its reserved fileless identity when the
+/// same recipe also selected another canonical row in that branch.
+fn plugin_registry_dependency_matches(
+    interest: &LogicalReadInterest,
+    dependency: &ReadInput,
+    inputs: &[ReadInput],
+) -> bool {
+    use crate::plugin::runtime::PLUGIN_REGISTRY_KEY;
+
+    let ReadInputAddress::ChangeRecord {
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+        ..
+    } = &dependency.address
+    else {
+        return false;
+    };
+    if schema_key != "lix_key_value"
+        || file_id.is_some()
+        || row_pk.as_single_string().ok() != Some(PLUGIN_REGISTRY_KEY)
+        || !matches!(
+            interest,
+            LogicalReadInterest::Scan { .. }
+                | LogicalReadInterest::Exact { .. }
+                | LogicalReadInterest::FilesystemMetadata { .. }
+                | LogicalReadInterest::FilesystemPaths { .. }
+        )
+    {
+        return false;
+    }
+
+    inputs.iter().any(|input| {
+        let ReadInputAddress::ChangeRecord {
+            branch_id: selected_branch_id,
+            schema_key: selected_schema_key,
+            file_id: selected_file_id,
+            row_pk: selected_row_pk,
+            ..
+        } = &input.address
+        else {
+            return false;
+        };
+        if selected_branch_id != branch_id
+            || (selected_schema_key == "lix_key_value"
+                && selected_row_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY))
+        {
+            return false;
+        }
+        scan_recipe_selects_change_identity(
+            interest,
+            selected_branch_id,
+            selected_schema_key,
+            selected_file_id.as_deref(),
+            selected_row_pk,
+        )
+    })
+}
+
+#[derive(Default)]
+struct ReadFulfillmentPayloadContext {
+    filesystem_path_rows: Vec<crate::hot_state::MaterializedHotStateRow>,
+    plugin_owner_schemas: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+#[derive(Default)]
+struct FileContentPayloadSelection {
+    file_ids: BTreeSet<String>,
+    path_change_ids: BTreeSet<crate::changelog::ChangeId>,
+}
+
+impl ReadFulfillmentPayloadContext {
+    fn new(inputs: &[ReadInput]) -> Result<Self, LixError> {
+        use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+
+        let mut path_rows = Vec::new();
+        let mut plugin_owner_schemas = BTreeMap::new();
+        let mut path_row_identities = BTreeSet::new();
+        let mut plugin_owner_identities = BTreeSet::new();
+        for input in inputs {
+            let ReadInputAddress::ChangeRecord {
+                branch_id,
+                schema_key,
+                file_id,
+                row_pk,
+                ..
+            } = &input.address
+            else {
+                continue;
+            };
+            if !matches!(
+                schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+            ) && !(schema_key == "lix_key_value"
+                && row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY))
+            {
+                continue;
+            }
+            let row = change_payload_row(input).ok_or_else(|| {
+                invalid("read fulfillment contains an invalid filesystem or plugin owner row")
+            })?;
+            if matches!(
+                schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+            ) {
+                let identity = (
+                    branch_id.clone(),
+                    schema_key.clone(),
+                    row_pk.clone(),
+                    file_id.clone(),
+                );
+                if !path_row_identities.insert(identity) {
+                    return Err(invalid(
+                        "read fulfillment contains duplicate filesystem row identities",
+                    ));
+                }
+                path_rows.push(row.clone());
+            }
+            if schema_key == "lix_key_value"
+                && row_pk.as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
+                && !row.deleted
+            {
+                let file_id = file_id
+                    .as_deref()
+                    .ok_or_else(|| invalid("plugin owner row is missing its file identity"))?;
+                let snapshot = row
+                    .snapshot_content
+                    .as_deref()
+                    .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+                    .ok_or_else(|| invalid("plugin owner row has an invalid snapshot"))?;
+                let owner =
+                    crate::plugin::runtime::PluginFileOwner::from_snapshot(file_id, &snapshot)
+                        .map_err(|_| invalid("plugin owner row failed canonical validation"))?;
+                if !plugin_owner_identities.insert((branch_id.clone(), owner.file_id().to_owned()))
+                {
+                    return Err(invalid(
+                        "read fulfillment contains duplicate plugin owner identities",
+                    ));
+                }
+                plugin_owner_schemas.insert(
+                    (branch_id.clone(), owner.file_id().to_owned()),
+                    owner.schema_keys().iter().cloned().collect(),
+                );
+            }
+        }
+        Ok(Self {
+            filesystem_path_rows: path_rows,
+            plugin_owner_schemas,
+        })
+    }
+
+    fn selected_files(&self, interest: &LogicalReadInterest) -> FileContentPayloadSelection {
+        let LogicalReadInterest::FileContent {
+            request,
+            file_ids,
+            directory_ids,
+            root_directory,
+            path_predicate,
+            ..
+        } = interest
+        else {
+            return FileContentPayloadSelection::default();
+        };
+        if file_ids.as_ref().is_some_and(Vec::is_empty)
+            || directory_ids.as_ref().is_some_and(Vec::is_empty)
+        {
+            return FileContentPayloadSelection::default();
+        }
+        let mut selected = FileContentPayloadSelection::default();
+        if !self.filesystem_path_rows.is_empty() {
+            let visible_path_rows = crate::hot_state::resolve_visible_batch(
+                crate::hot_state::MaterializedHotStateBatch::from_rows(
+                    self.filesystem_path_rows.clone(),
+                ),
+                crate::hot_state::MaterializedHotStateBatch::default(),
+                &crate::hot_state::VisibilityRequest {
+                    branch_scope: crate::hot_state::VisibilityBranchScope::BranchIds {
+                        branch_ids: request.filter.branch_ids.clone(),
+                    },
+                    include_tombstones: false,
+                    limit: None,
+                },
+            );
+            let index =
+                crate::filesystem::FilesystemPathIndex::from_live_batch(&visible_path_rows).ok();
+            if let Some(index) = index {
+                let entries = index.entries();
+                let directories = entries
+                    .iter()
+                    .filter(|entry| entry.kind == crate::filesystem::FilesystemPathKind::Directory)
+                    .map(|entry| {
+                        (
+                            (entry.live_row().branch_id.clone(), entry.id().to_owned()),
+                            entry,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                for entry in &entries {
+                    if entry.kind != crate::filesystem::FilesystemPathKind::File
+                        || !file_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.iter().any(|id| id == entry.id()))
+                        || (directory_ids.as_ref().is_some_and(|ids| {
+                            entry
+                                .parent_id
+                                .as_ref()
+                                .is_none_or(|parent| !ids.iter().any(|id| id == parent))
+                        }))
+                        || (*root_directory && entry.parent_id.is_some())
+                        || !file_path_interest_matches(path_predicate, &entry.path)
+                    {
+                        continue;
+                    }
+                    let row = entry.live_row();
+                    if scan_selects_change_identity(
+                        request,
+                        InterestDomain::Combined,
+                        &row.branch_id,
+                        &row.schema_key,
+                        row.file_id.as_deref(),
+                        &row.row_pk,
+                    ) {
+                        selected.file_ids.insert(entry.id().to_owned());
+                        let selected_row = entry.live_row();
+                        if let Some(change_id) = selected_row.change_id {
+                            selected.path_change_ids.insert(change_id);
+                        }
+                        if let Some(blob_row) = entry.blob_ref_live_row()
+                            && let Some(change_id) = blob_row.change_id
+                        {
+                            selected.path_change_ids.insert(change_id);
+                        }
+                        let mut parent_id = entry.parent_id.clone();
+                        while let Some(directory_id) = parent_id {
+                            let Some(directory) = directories
+                                .get(&(selected_row.branch_id.clone(), directory_id.clone()))
+                            else {
+                                break;
+                            };
+                            if let Some(change_id) = directory.live_row().change_id {
+                                selected.path_change_ids.insert(change_id);
+                            }
+                            parent_id = directory.parent_id.clone();
+                        }
+                    }
+                }
+                return selected;
+            }
+        }
+
+        // An explicit file-id recipe can still prove the identity without
+        // reconstructing a path index. Path and directory predicates require
+        // descriptor evidence, so they fail closed when that evidence is not
+        // in this closure.
+        if *root_directory
+            || directory_ids.is_some()
+            || !matches!(path_predicate, crate::hot_state::FilePathInterest::All)
+        {
+            return selected;
+        }
+        if let Some(file_ids) = file_ids {
+            selected.file_ids.extend(file_ids.iter().cloned());
+        } else {
+            selected
+                .file_ids
+                .extend(
+                    request
+                        .filter
+                        .file_ids
+                        .iter()
+                        .filter_map(|candidate| match candidate {
+                            crate::NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+                            crate::NullableKeyFilter::Any | crate::NullableKeyFilter::Null => None,
+                        }),
+                );
+        }
+        selected
+    }
+}
+
+fn change_payload_row(input: &ReadInput) -> Option<crate::hot_state::MaterializedHotStateRow> {
+    let ReadInputAddress::ChangeRecord {
+        change_id,
+        source_commit_id,
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+        updated_at,
+        ..
+    } = &input.address
+    else {
+        return None;
+    };
+    let change_id = canonical_change_id(change_id).ok()?;
+    let source_commit_id = canonical_commit_id(source_commit_id).ok()?;
+    let updated_at = canonical_timestamp(updated_at).ok()?;
+    let record = crate::changelog::decode_change_record(&input.bytes, change_id).ok()?;
+    let deleted = record.snapshot.is_none();
+    let snapshot_content = match record.snapshot {
+        Some(snapshot) => Some(
+            crate::row_payload::TypedRow::decode_durable_payload(
+                Arc::from(snapshot),
+                schema_key,
+                row_pk,
+            )
+            .ok()?
+            .to_json_shared()
+            .ok()?,
+        ),
+        None => None,
+    };
+    Some(crate::hot_state::MaterializedHotStateRow {
+        row_pk: row_pk.clone(),
+        schema_key: schema_key.clone(),
+        file_id: file_id.clone(),
+        snapshot_content,
+        metadata: record.metadata.map(|metadata| metadata.to_string().into()),
+        deleted,
+        created_at: record.created_at,
+        updated_at,
+        global: branch_id == crate::GLOBAL_BRANCH_ID,
+        change_id: Some(change_id),
+        author_id: record.account_id,
+        commit_id: Some(source_commit_id),
+        untracked: false,
+        branch_id: branch_id.clone().into(),
+    })
+}
+
+fn file_path_interest_matches(predicate: &crate::hot_state::FilePathInterest, path: &str) -> bool {
+    use crate::hot_state::{
+        FilePathInterest as Interest, FilePathInterestComparison as Comparison,
+    };
+    match predicate {
+        Interest::All => true,
+        Interest::Comparison { operation, value } => match operation {
+            Comparison::Equal => path == value,
+            Comparison::LessThan => path < value.as_str(),
+            Comparison::LessThanOrEqual => path <= value.as_str(),
+            Comparison::GreaterThan => path > value.as_str(),
+            Comparison::GreaterThanOrEqual => path >= value.as_str(),
+        },
+        Interest::In { values } => values.iter().any(|value| value == path),
+        Interest::LowercaseContains { value } => path.to_lowercase().contains(value),
+        Interest::And { left, right } => {
+            file_path_interest_matches(left, path) && file_path_interest_matches(right, path)
+        }
+        Interest::Or { left, right } => {
+            file_path_interest_matches(left, path) || file_path_interest_matches(right, path)
+        }
+    }
+}
+
+/// File-content reads also prepare the selected file's plugin owner and
+/// plugin-declared row schemas. The owner record is the authority for which
+/// non-native schemas belong to a file; a shared branch scan alone cannot
+/// admit unrelated rows.
+#[cfg(test)]
+fn file_content_recipe_selects_change_identity(
+    interest: &LogicalReadInterest,
+    inputs: &[ReadInput],
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    let Ok(context) = ReadFulfillmentPayloadContext::new(inputs) else {
+        return false;
+    };
+    let selected_files = context.selected_files(interest);
+    file_content_recipe_selects_change_identity_with_context(
+        interest,
+        &context,
+        &selected_files,
+        None,
+        branch_id,
+        schema_key,
+        file_id,
+        row_pk,
+    )
+}
+
+fn file_content_recipe_selects_change_identity_with_context(
+    interest: &LogicalReadInterest,
+    context: &ReadFulfillmentPayloadContext,
+    selected_files: &FileContentPayloadSelection,
+    change_id: Option<crate::changelog::ChangeId>,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &crate::row_pk::RowPk,
+) -> bool {
+    use crate::plugin::runtime::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY};
+
+    let LogicalReadInterest::FileContent {
+        request,
+        directory_ids,
+        root_directory,
+        path_predicate,
+        ..
+    } = interest
+    else {
+        return false;
+    };
+    if !branch_is_selected_by_scan(&request.filter.branch_ids, branch_id) {
+        return false;
+    }
+
+    if schema_key == "lix_key_value" {
+        match row_pk.as_single_string().ok() {
+            Some(PLUGIN_REGISTRY_KEY) => {
+                return file_id.is_none()
+                    && request
+                        .filter
+                        .schema_keys
+                        .iter()
+                        .any(|schema| schema == "lix_file_descriptor");
+            }
+            Some(PLUGIN_OWNER_KEY) => {
+                return file_id.is_some_and(|file_id| selected_files.file_ids.contains(file_id));
+            }
+            _ => return false,
+        }
+    }
+
+    if request
+        .filter
+        .schema_keys
+        .iter()
+        .any(|schema| schema == schema_key)
+        && scan_selects_change_identity(
+            request,
+            InterestDomain::Combined,
+            branch_id,
+            schema_key,
+            file_id,
+            row_pk,
+        )
+    {
+        let path_scoped = *path_predicate != crate::hot_state::FilePathInterest::All
+            || *root_directory
+            || directory_ids.is_some();
+        let path_identity_selected = !path_scoped
+            || change_id
+                .is_some_and(|change_id| selected_files.path_change_ids.contains(&change_id));
+        if path_identity_selected {
+            return true;
+        }
+    }
+
+    file_id.is_some_and(|file_id| {
+        selected_files.file_ids.contains(file_id)
+            && context
+                .plugin_owner_schemas
+                .get(&(branch_id.to_owned(), file_id.to_owned()))
+                .is_some_and(|schemas| schemas.contains(schema_key))
+    })
+}
+
+fn payload_schema_kind(schema: &str) -> &'static str {
+    match schema {
+        "lix_file_descriptor" => "file_descriptor",
+        "lix_directory_descriptor" => "directory_descriptor",
+        "lix_binary_blob_ref" => "binary_blob_ref",
+        "lix_plugin_registry" => "plugin_registry",
+        "lix_account" => "account",
+        "lix_schema" => "schema",
+        "lix_key_value" => "key_value",
+        _ => "other",
+    }
+}
+
+fn payload_recipe_mask(interests: &[LogicalReadInterest]) -> u16 {
+    interests.iter().fold(0, |mask, interest| {
+        mask | match interest {
+            LogicalReadInterest::Exact { .. } => 1,
+            LogicalReadInterest::Scan { .. } => 2,
+            LogicalReadInterest::FileContent { .. } => 4,
+            LogicalReadInterest::FilesystemMetadata { .. } => 8,
+            LogicalReadInterest::FilesystemPaths { .. } => 16,
+            LogicalReadInterest::CollectionGeneration { .. } => 32,
+            LogicalReadInterest::PackedIdentityMembership { .. } => 64,
+            LogicalReadInterest::Diff { .. } => 128,
+        }
+    })
+}
+
 fn validate_complete(
     request: &ReadFulfillmentRequest,
     response: &ReadFulfillmentResponse,
@@ -1098,7 +2054,7 @@ fn validate_complete(
         ));
     }
     let mut bytes = 0usize;
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for input in &response.inputs {
         bytes = bytes
             .checked_add(input.bytes.len())
@@ -1118,6 +2074,95 @@ fn validate_complete(
             .any(|input| &input.address == required)
         {
             return Err(invalid("read fulfillment omitted a required input"));
+        }
+    }
+    let payload_context = if request
+        .interests
+        .iter()
+        .any(|interest| matches!(interest, LogicalReadInterest::FileContent { .. }))
+    {
+        ReadFulfillmentPayloadContext::new(&response.inputs)?
+    } else {
+        ReadFulfillmentPayloadContext::default()
+    };
+    let selected_file_ids = request
+        .interests
+        .iter()
+        .map(|interest| payload_context.selected_files(interest))
+        .collect::<Vec<_>>();
+    for input in &response.inputs {
+        let ReadInputAddress::ChangeRecord {
+            change_id,
+            source_commit_id,
+            branch_id,
+            schema_key,
+            file_id,
+            row_pk,
+            ..
+        } = &input.address
+        else {
+            continue;
+        };
+        if branch_id != &request.descriptor.selected_branch.branch_id
+            && branch_id != &request.descriptor.global_branch.branch_id
+        {
+            return Err(invalid(
+                "canonical change payload is outside the descriptor branch scope",
+            ));
+        }
+        let selected_by_recipe = request
+            .interests
+            .iter()
+            .enumerate()
+            .any(|(index, interest)| {
+                scan_recipe_selects_change_identity(
+                    interest,
+                    branch_id,
+                    schema_key,
+                    file_id.as_deref(),
+                    row_pk,
+                ) || file_content_recipe_selects_change_identity_with_context(
+                    interest,
+                    &payload_context,
+                    &selected_file_ids[index],
+                    canonical_change_id(change_id).ok(),
+                    branch_id,
+                    schema_key,
+                    file_id.as_deref(),
+                    row_pk,
+                ) || plugin_registry_dependency_matches(interest, input, &response.inputs)
+            });
+        if !selected_by_recipe {
+            return Err(
+                invalid("canonical change payload has no matching row recipe").with_details(
+                    serde_json::json!({
+                        "payloadFailureReason": "selected_change_payload_recipe_mismatch",
+                        "payloadPhase": "read_fulfillment_validation",
+                        "payloadSchemaKind": payload_schema_kind(schema_key),
+                        "payloadRecipeMask": payload_recipe_mask(&request.interests),
+                        "payloadRecipeCount": request.interests.len(),
+                        "payloadRequiredInputCount": request.required.len(),
+                        "branchId": branch_id,
+                        "changeId": change_id,
+                        "sourceCommitId": source_commit_id
+                    }),
+                ),
+            );
+        }
+        let locator_address =
+            ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id.clone()));
+        let locator = response
+            .inputs
+            .iter()
+            .find(|candidate| candidate.address == locator_address)
+            .ok_or_else(|| invalid("canonical change payload has no selected source locator"))?;
+        let parsed_change = canonical_change_id(change_id)?;
+        let parsed_source = canonical_commit_id(source_commit_id)?;
+        let source = crate::tracked_state::decode_change_locator(parsed_change, &locator.bytes)?;
+        if source.commit_id != parsed_source {
+            return Err(invalid(
+                "canonical change payload source disagrees with its selected locator",
+            ));
         }
     }
     Ok(())
@@ -1168,6 +2213,27 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
     if request.epoch_id != state.epoch_id() || request.descriptor != *state.descriptor() {
         return Err(invalid("read fulfillment basis changed"));
     }
+    let payload_change_ids = response
+        .inputs
+        .iter()
+        .filter_map(|input| match &input.address {
+            ReadInputAddress::ChangeRecord { change_id, .. } => Some(change_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let paired_change_locator_ids = response
+        .inputs
+        .iter()
+        .filter_map(|input| match &input.address {
+            ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id))
+                if payload_change_ids.contains(change_id) =>
+            {
+                Some(change_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut stale_mutable_observations = Vec::<(StorageSpace, StorageKey, Bytes)>::new();
     loop {
         let read = storage.begin_read(Default::default()).await?;
         let Some((actual, receipt)) =
@@ -1392,6 +2458,89 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
                     append_receipt_input(&mut hydrated, &input.address, (space, key))?;
                 }
                 Some(StorageProjectedValue::FullValue(bytes))
+                    if matches!(&input.address, ReadInputAddress::ChangeRecord { .. }) =>
+                {
+                    if request.required.contains(&input.address) {
+                        return Err(invalid(
+                            "canonical selected change payload cannot replace a required input",
+                        ));
+                    }
+                    // CHANGE_SPACE is a rebuildable projection. This payload
+                    // has already been bound to an exact row recipe and its
+                    // canonical physical source by `validate_complete`; heal
+                    // a stale decodable resident value with an exact compare
+                    // so a concurrent local write is never overwritten.
+                    input.address.validate(&input.bytes)?;
+                    if let Some((_, _, initially_observed)) = stale_mutable_observations
+                        .iter()
+                        .find(|(observed_space, observed_key, _)| {
+                            observed_space == &space && observed_key == &key
+                        })
+                    {
+                        if initially_observed != &bytes {
+                            return Err(invalid(
+                                "resident change payload changed during canonical repair",
+                            ));
+                        }
+                    } else {
+                        stale_mutable_observations.push((space, key.clone(), bytes.clone()));
+                    }
+                    preconditions.push(StoragePrecondition::KeyValueEquals {
+                        space,
+                        key: key.clone(),
+                        expected: bytes,
+                    });
+                    writes.put(
+                        space,
+                        key.clone(),
+                        StorageValue {
+                            bytes: Bytes::copy_from_slice(&input.bytes),
+                        },
+                    );
+                    append_receipt_input(&mut hydrated, &input.address, (space, key))?;
+                }
+                Some(StorageProjectedValue::FullValue(bytes))
+                    if matches!(
+                        &input.address,
+                        ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id))
+                            if paired_change_locator_ids.contains(change_id)
+                    ) =>
+                {
+                    // A locator paired with this exact selected-row payload
+                    // is part of the validated canonical closure. Heal a
+                    // stale but decodable projection with CAS even when the
+                    // locator was explicitly required: its paired payload and
+                    // source were already checked against the exact recipe.
+                    input.address.validate(&input.bytes)?;
+                    if let Some((_, _, initially_observed)) = stale_mutable_observations
+                        .iter()
+                        .find(|(observed_space, observed_key, _)| {
+                            observed_space == &space && observed_key == &key
+                        })
+                    {
+                        if initially_observed != &bytes {
+                            return Err(invalid(
+                                "resident mutable payload changed during canonical repair",
+                            ));
+                        }
+                    } else {
+                        stale_mutable_observations.push((space, key.clone(), bytes.clone()));
+                    }
+                    preconditions.push(StoragePrecondition::KeyValueEquals {
+                        space,
+                        key: key.clone(),
+                        expected: bytes,
+                    });
+                    writes.put(
+                        space,
+                        key.clone(),
+                        StorageValue {
+                            bytes: Bytes::copy_from_slice(&input.bytes),
+                        },
+                    );
+                    append_receipt_input(&mut hydrated, &input.address, (space, key))?;
+                }
+                Some(StorageProjectedValue::FullValue(bytes))
                     if preserves_local_mutable_native_overlay(&input.address)
                         && !request.required.contains(&input.address) =>
                 {
@@ -1400,13 +2549,17 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
                     // The closure warms absent immutable inputs; it must not
                     // overwrite that local overlay when the authority's
                     // optional observation has a different value.
-                    input.address.validate(&bytes)?;
+                    input
+                        .address
+                        .validate_existing_mutable_value(&bytes, &input.bytes)?;
                     preconditions.push(StoragePrecondition::KeyValueEquals {
                         space,
                         key: key.clone(),
                         expected: bytes.clone(),
                     });
-                    append_receipt_input(&mut hydrated, &input.address, (space, key))?;
+                    if !matches!(&input.address, ReadInputAddress::ChangeRecord { .. }) {
+                        append_receipt_input(&mut hydrated, &input.address, (space, key))?;
+                    }
                     continue;
                 }
                 Some(_) => {
@@ -1575,7 +2728,7 @@ async fn export_blob_inputs(
                 None
             }
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     let mut payload_bytes = 0usize;
     for (blob, selection) in selections {
         let metadata = load_metadata_many(read, &[blob])
@@ -1608,8 +2761,8 @@ async fn export_blob_inputs(
             bytes,
         });
         let mut offset = 0u64;
-        let mut selected = std::collections::BTreeSet::new();
-        let mut anchors = std::collections::BTreeSet::new();
+        let mut selected = BTreeSet::new();
+        let mut anchors = BTreeSet::new();
         for chunk in &manifest.chunks {
             let end = offset + chunk.size_bytes;
             if selection.full
@@ -1678,6 +2831,598 @@ mod tests {
         (request, response)
     }
 
+    #[test]
+    fn scan_change_payload_recipe_requires_a_safe_identity_match() {
+        let row_pk = crate::row_pk::RowPk::single("row");
+        let make_scan = || crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec!["schema".to_owned()],
+                row_pks: vec![row_pk.clone()],
+                branch_ids: vec!["branch".to_owned()],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let selects = |scan: &crate::hot_state::HotStateScanRequest, domain| {
+            scan_selects_change_identity(scan, domain, "branch", "schema", None, &row_pk)
+        };
+
+        assert!(selects(&make_scan(), InterestDomain::Combined));
+        assert!(selects(&make_scan(), InterestDomain::Tracked));
+        assert!(!selects(&make_scan(), InterestDomain::Untracked));
+
+        assert!(
+            scan_selects_change_identity(
+                &make_scan(),
+                InterestDomain::Combined,
+                crate::GLOBAL_BRANCH_ID,
+                "schema",
+                None,
+                &row_pk,
+            ),
+            "a branch scan includes global candidates for visibility overlay"
+        );
+
+        let mut broad_scan = make_scan();
+        broad_scan.filter.row_pks.clear();
+        assert!(
+            selects(&broad_scan, InterestDomain::Combined),
+            "an empty row key list is a wildcard when schema and branch remain scoped"
+        );
+
+        let mut broad_without_schema = broad_scan.clone();
+        broad_without_schema.filter.schema_keys.clear();
+        assert!(!selects(&broad_without_schema, InterestDomain::Combined));
+
+        let mut broad_wrong_schema = broad_scan.clone();
+        broad_wrong_schema.filter.schema_keys[0] = "other_schema".to_owned();
+        assert!(!selects(&broad_wrong_schema, InterestDomain::Combined));
+
+        let mut broad_without_branch = broad_scan.clone();
+        broad_without_branch.filter.branch_ids.clear();
+        assert!(!selects(&broad_without_branch, InterestDomain::Combined));
+
+        let mut broad_wrong_branch = broad_scan.clone();
+        broad_wrong_branch.filter.branch_ids[0] = "other_branch".to_owned();
+        assert!(!selects(&broad_wrong_branch, InterestDomain::Combined));
+
+        let mut wrong_schema = make_scan();
+        wrong_schema.filter.schema_keys[0] = "other_schema".to_owned();
+        assert!(!selects(&wrong_schema, InterestDomain::Combined));
+
+        let mut wrong_branch = make_scan();
+        wrong_branch.filter.branch_ids[0] = "other_branch".to_owned();
+        assert!(!selects(&wrong_branch, InterestDomain::Combined));
+
+        let mut wrong_row = make_scan();
+        wrong_row.filter.row_pks[0] = crate::row_pk::RowPk::single("other_row");
+        assert!(!selects(&wrong_row, InterestDomain::Combined));
+
+        let mut wrong_file = make_scan();
+        wrong_file.filter.file_ids[0] = crate::NullableKeyFilter::Value("file".to_owned());
+        assert!(!selects(&wrong_file, InterestDomain::Combined));
+
+        let mut untracked_only = make_scan();
+        untracked_only.filter.untracked = Some(true);
+        assert!(!selects(&untracked_only, InterestDomain::Combined));
+
+        let mut content_predicate = make_scan();
+        content_predicate
+            .filter
+            .constraints
+            .push(crate::hot_state::ScanConstraint {
+                field: crate::hot_state::ScanField::RowPk,
+                operator: crate::hot_state::ScanOperator::Eq(crate::Value::Text("row".to_owned())),
+            });
+        assert!(!selects(&content_predicate, InterestDomain::Combined));
+
+        let mut global_scope = make_scan();
+        global_scope.filter.global = Some(false);
+        assert!(!selects(&global_scope, InterestDomain::Combined));
+
+        let mut tombstones = make_scan();
+        tombstones.filter.include_tombstones = true;
+        assert!(!selects(&tombstones, InterestDomain::Combined));
+
+        let mut limited = make_scan();
+        limited.limit = Some(1);
+        assert!(!selects(&limited, InterestDomain::Combined));
+    }
+
+    #[test]
+    fn plugin_registry_dependency_requires_a_selected_tracked_row() {
+        use crate::plugin::runtime::PLUGIN_REGISTRY_KEY;
+
+        let branch = "branch";
+        let row_pk = crate::row_pk::RowPk::single("row");
+        let make_input = |label: &str,
+                          branch_id: &str,
+                          schema_key: &str,
+                          file_id: Option<&str>,
+                          row_pk: crate::row_pk::RowPk| {
+            ReadInput {
+                address: ReadInputAddress::ChangeRecord {
+                    change_id: format!("change-{label}"),
+                    source_commit_id: format!("source-{label}"),
+                    branch_id: branch_id.to_owned(),
+                    schema_key: schema_key.to_owned(),
+                    file_id: file_id.map(str::to_owned),
+                    row_pk,
+                    updated_at: "2025-01-01T00:00:00.000Z".to_owned(),
+                    payload_digest: [0; 32],
+                },
+                bytes: Vec::new(),
+            }
+        };
+        let row_input = make_input("row", branch, "merge_test_row", None, row_pk.clone());
+        let registry_input = make_input(
+            "registry",
+            branch,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        let scan = LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec!["merge_test_row".to_owned()],
+                    branch_ids: vec![branch.to_owned()],
+                    row_pks: vec![row_pk.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            domain: InterestDomain::Tracked,
+        };
+        let inputs = vec![row_input.clone(), registry_input.clone()];
+
+        assert!(plugin_registry_dependency_matches(
+            &scan,
+            &registry_input,
+            &inputs,
+        ));
+        assert!(
+            !plugin_registry_dependency_matches(
+                &scan,
+                &registry_input,
+                std::slice::from_ref(&registry_input),
+            ),
+            "a registry row alone cannot prove a returned-row dependency"
+        );
+
+        let unrelated_key = make_input(
+            "unrelated",
+            branch,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single("ordinary-setting"),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &unrelated_key,
+            &inputs,
+        ));
+
+        let wrong_branch_registry = make_input(
+            "wrong-branch-registry",
+            "other-branch",
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &wrong_branch_registry,
+            &inputs,
+        ));
+
+        let file_scoped_registry = make_input(
+            "file-scoped-registry",
+            branch,
+            "lix_key_value",
+            Some("file"),
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        assert!(!plugin_registry_dependency_matches(
+            &scan,
+            &file_scoped_registry,
+            &inputs,
+        ));
+
+        let untracked_scan = LogicalReadInterest::Scan {
+            request: match &scan {
+                LogicalReadInterest::Scan { request, .. } => request.clone(),
+                _ => unreachable!(),
+            },
+            domain: InterestDomain::Untracked,
+        };
+        assert!(!plugin_registry_dependency_matches(
+            &untracked_scan,
+            &registry_input,
+            &inputs,
+        ));
+
+        let exact = LogicalReadInterest::Exact {
+            rows: vec![crate::hot_state::ExactReadIdentity {
+                branch_id: branch.to_owned(),
+                schema_key: "merge_test_row".to_owned(),
+                file_id: None,
+                row_pk: row_pk.clone(),
+            }],
+            projection: crate::hot_state::HotStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: false,
+        };
+        assert!(plugin_registry_dependency_matches(
+            &exact,
+            &registry_input,
+            &inputs,
+        ));
+
+        let directory = make_input(
+            "directory",
+            branch,
+            "lix_directory_descriptor",
+            None,
+            row_pk.clone(),
+        );
+        let directory_inputs = vec![directory, registry_input.clone()];
+        let directory_paths = LogicalReadInterest::FilesystemPaths {
+            scope: crate::filesystem::FilesystemPathIndexScope::DirectoriesOnly,
+            branch_ids: vec![branch.to_owned()],
+            include_blob_refs: false,
+            cache_small_blob_data: false,
+        };
+        assert!(plugin_registry_dependency_matches(
+            &directory_paths,
+            &registry_input,
+            &directory_inputs,
+        ));
+        assert!(!plugin_registry_dependency_matches(
+            &directory_paths,
+            &registry_input,
+            &inputs,
+        ));
+
+        // Branch scans implicitly read global candidates for overlay
+        // resolution, so the registry dependency must be accepted from the
+        // global branch when the selected tracked row is also global.
+        let global_row = make_input(
+            "global-row",
+            crate::GLOBAL_BRANCH_ID,
+            "merge_test_row",
+            None,
+            row_pk.clone(),
+        );
+        let global_registry = make_input(
+            "global-registry",
+            crate::GLOBAL_BRANCH_ID,
+            "lix_key_value",
+            None,
+            crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY),
+        );
+        let global_inputs = vec![global_row, global_registry.clone()];
+        assert!(plugin_registry_dependency_matches(
+            &scan,
+            &global_registry,
+            &global_inputs,
+        ));
+    }
+
+    #[test]
+    fn file_content_recipe_authorizes_only_selected_plugin_inputs() {
+        use crate::plugin::runtime::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner};
+
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-0000000000d2";
+        let file_row_pk = crate::row_pk::RowPk::uuid_from_canonical(file_id).unwrap();
+        let file_snapshot = serde_json::json!({
+            "id": file_id,
+            "directory_id": null,
+            "name": "target.csv",
+        });
+        let file_payload = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_file_descriptor",
+            &file_row_pk,
+            &file_snapshot,
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap()
+        .to_vec();
+        let file_change_id = crate::changelog::ChangeId::for_test_label("file-content-file");
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(6);
+        let file_record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: file_change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_file_descriptor".to_owned(),
+            row_pk: file_row_pk.clone(),
+            file_id: Some(file_id.to_owned()),
+            snapshot: Some(file_payload),
+            metadata: None,
+            created_at,
+            origin_key: None,
+        };
+        let file_input = ReadInput {
+            address: ReadInputAddress::ChangeRecord {
+                change_id: file_change_id.to_string(),
+                source_commit_id: crate::changelog::CommitId::for_test_label(
+                    "file-content-file-source",
+                )
+                .to_string(),
+                branch_id: branch.to_owned(),
+                schema_key: file_record.schema_key.clone(),
+                file_id: file_record.file_id.clone(),
+                row_pk: file_row_pk,
+                updated_at: created_at.to_string(),
+                payload_digest: [0; 32],
+            },
+            bytes: crate::changelog::encode_change_record(&file_record).unwrap(),
+        };
+        let owner_row_pk = crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY);
+        let owner = PluginFileOwner::new(file_id, "plugin_csv", vec!["csv_row".into()]).unwrap();
+        let owner_snapshot = owner.to_snapshot().unwrap();
+        let owner_payload = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_key_value",
+            &owner_row_pk,
+            &owner_snapshot,
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap()
+        .to_vec();
+        let change_id = crate::changelog::ChangeId::for_test_label("file-content-owner");
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(7);
+        let record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: owner_row_pk.clone(),
+            file_id: Some(file_id.to_owned()),
+            snapshot: Some(owner_payload),
+            metadata: None,
+            created_at,
+            origin_key: None,
+        };
+        let owner_input = ReadInput {
+            address: ReadInputAddress::ChangeRecord {
+                change_id: change_id.to_string(),
+                source_commit_id: crate::changelog::CommitId::for_test_label(
+                    "file-content-owner-source",
+                )
+                .to_string(),
+                branch_id: branch.to_owned(),
+                schema_key: record.schema_key.clone(),
+                file_id: record.file_id.clone(),
+                row_pk: owner_row_pk.clone(),
+                updated_at: created_at.to_string(),
+                payload_digest: [0; 32],
+            },
+            bytes: crate::changelog::encode_change_record(&record).unwrap(),
+        };
+        let inputs = vec![file_input, owner_input];
+        let interest = LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".into(),
+                        "lix_binary_blob_ref".into(),
+                        "lix_directory_descriptor".into(),
+                    ],
+                    branch_ids: vec![branch.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::In {
+                values: vec!["/target.csv".into()],
+            },
+            byte_range: None,
+        };
+
+        assert!(file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "lix_key_value",
+            Some(file_id),
+            &owner_row_pk,
+        ));
+        assert!(file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "csv_row",
+            Some(file_id),
+            &crate::row_pk::RowPk::single("row"),
+        ));
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "other_plugin_row",
+            Some(file_id),
+            &crate::row_pk::RowPk::single("row"),
+        ));
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &inputs,
+            branch,
+            "csv_row",
+            Some("01920000-0000-7000-8000-0000000000d3"),
+            &crate::row_pk::RowPk::single("foreign-row"),
+        ));
+
+        let registry_row_pk = crate::row_pk::RowPk::single(PLUGIN_REGISTRY_KEY);
+        assert!(
+            file_content_recipe_selects_change_identity(
+                &interest,
+                &[],
+                branch,
+                "lix_key_value",
+                None,
+                &registry_row_pk,
+            ),
+            "file content needs the exact branch plugin registry row"
+        );
+        assert!(!file_content_recipe_selects_change_identity(
+            &interest,
+            &[],
+            branch,
+            "lix_key_value",
+            None,
+            &crate::row_pk::RowPk::single("unrelated-setting"),
+        ));
+    }
+
+    #[test]
+    fn file_content_path_selection_uses_the_effective_branch_global_overlay() {
+        let selected_branch = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-0000000000d2";
+        let directory_id = "01920000-0000-7000-8000-0000000000d3";
+        let make_input = |branch_id: &str,
+                          schema_key: &str,
+                          id: &str,
+                          file_id: Option<&str>,
+                          name: &str,
+                          directory_id: Option<&str>,
+                          label: &str| {
+            let row_pk = crate::row_pk::RowPk::uuid_from_canonical(id).unwrap();
+            let snapshot = if schema_key == "lix_file_descriptor" {
+                serde_json::json!({
+                    "id": id,
+                    "directory_id": directory_id,
+                    "name": name,
+                })
+            } else {
+                serde_json::json!({
+                    "id": id,
+                    "parent_id": directory_id,
+                    "name": name,
+                })
+            };
+            let payload =
+                crate::row_payload::TypedRow::from_builtin_json(schema_key, &row_pk, &snapshot)
+                    .unwrap()
+                    .durable_payload()
+                    .unwrap()
+                    .to_vec();
+            let change_id = crate::changelog::ChangeId::for_test_label(label);
+            let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(8);
+            let record = crate::changelog::ChangeRecord {
+                format_version: 2,
+                change_id,
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                schema_key: schema_key.to_owned(),
+                row_pk: row_pk.clone(),
+                file_id: file_id.map(str::to_owned),
+                snapshot: Some(payload),
+                metadata: None,
+                created_at,
+                origin_key: None,
+            };
+            ReadInput {
+                address: ReadInputAddress::ChangeRecord {
+                    change_id: change_id.to_string(),
+                    source_commit_id: crate::changelog::CommitId::for_test_label(&format!(
+                        "{label}-source"
+                    ))
+                    .to_string(),
+                    branch_id: branch_id.to_owned(),
+                    schema_key: schema_key.to_owned(),
+                    file_id: file_id.map(str::to_owned),
+                    row_pk,
+                    updated_at: created_at.to_string(),
+                    payload_digest: [0; 32],
+                },
+                bytes: crate::changelog::encode_change_record(&record).unwrap(),
+            }
+        };
+        // Filesystem parents retain their global scope. The global file
+        // lives under a global directory; its selected-branch override moves
+        // to the selected branch's root rather than referencing that separate
+        // global parent scope.
+        let inputs = vec![
+            make_input(
+                crate::GLOBAL_BRANCH_ID,
+                "lix_directory_descriptor",
+                directory_id,
+                None,
+                "global-dir",
+                None,
+                "overlay-global-directory",
+            ),
+            make_input(
+                crate::GLOBAL_BRANCH_ID,
+                "lix_file_descriptor",
+                file_id,
+                Some(file_id),
+                "old.csv",
+                Some(directory_id),
+                "overlay-global-file",
+            ),
+            make_input(
+                selected_branch,
+                "lix_file_descriptor",
+                file_id,
+                Some(file_id),
+                "new.csv",
+                None,
+                "overlay-selected-file",
+            ),
+        ];
+        let make_interest = |path: &str| LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".into(),
+                        "lix_directory_descriptor".into(),
+                        "lix_binary_blob_ref".into(),
+                    ],
+                    branch_ids: vec![selected_branch.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::In {
+                values: vec![path.into()],
+            },
+            byte_range: None,
+        };
+        let context = ReadFulfillmentPayloadContext::new(&inputs).unwrap();
+        assert!(
+            !context
+                .selected_files(&make_interest("/global-dir/old.csv"))
+                .file_ids
+                .contains(file_id)
+        );
+        assert!(
+            context
+                .selected_files(&make_interest("/new.csv"))
+                .file_ids
+                .contains(file_id)
+        );
+
+        let global_only_context = ReadFulfillmentPayloadContext::new(&inputs[..2]).unwrap();
+        assert!(
+            global_only_context
+                .selected_files(&make_interest("/global-dir/old.csv"))
+                .file_ids
+                .contains(file_id)
+        );
+    }
+
     #[tokio::test]
     async fn read_closure_rejects_corruption_omission_and_wrong_admission() {
         let (request, response) = fixture().await;
@@ -1719,6 +3464,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_identity_scan_recipes_are_limited_to_descriptor_branches() {
+        let (mut request, _) = fixture().await;
+        let catalog_scan = crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec!["lix_registered_schema".into()],
+                branch_ids: vec![request.descriptor.selected_branch.branch_id.clone()],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                untracked: Some(false),
+                ..Default::default()
+            },
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["row_pk".into()],
+            },
+            ..Default::default()
+        };
+        request.interests = vec![LogicalReadInterest::Scan {
+            request: catalog_scan.clone(),
+            domain: InterestDomain::Tracked,
+        }];
+        request.validate(&request.descriptor.lix_id).unwrap();
+
+        let mut wrong_domain = request.clone();
+        wrong_domain.interests = vec![LogicalReadInterest::Scan {
+            request: catalog_scan.clone(),
+            domain: InterestDomain::Untracked,
+        }];
+        assert!(
+            wrong_domain
+                .validate(&wrong_domain.descriptor.lix_id)
+                .is_err()
+        );
+
+        let mut wrong_branch = request.clone();
+        let LogicalReadInterest::Scan {
+            request: scan_request,
+            ..
+        } = &mut wrong_branch.interests[0]
+        else {
+            unreachable!();
+        };
+        scan_request.filter.branch_ids = vec!["unleased-branch".into()];
+        assert!(
+            wrong_branch
+                .validate(&wrong_branch.descriptor.lix_id)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn read_continuation_rejects_replay_skips_and_closure_changes() {
         let (mut request, mut response) = fixture().await;
         request.continuation = Some(ReadContinuation {
@@ -1739,6 +3533,408 @@ mod tests {
         assert!(validate_response(&request, &response).is_err());
         request.continuation.as_mut().unwrap().next_input = usize::MAX;
         assert!(request.validate(&request.descriptor.lix_id).is_err());
+    }
+
+    #[test]
+    fn canonical_change_overlay_preserves_only_the_exact_live_payload() {
+        let change_id = crate::changelog::ChangeId::for_test_label("overlay-change");
+        let source_commit_id = crate::changelog::CommitId::for_test_label("overlay-owner");
+        let row_pk = crate::row_pk::RowPk::single("row");
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(7);
+        let record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: row_pk.clone(),
+            file_id: None,
+            snapshot: Some(vec![1, 2, 3]),
+            metadata: None,
+            created_at,
+            origin_key: None,
+        };
+        let canonical = crate::changelog::encode_change_record(&record).unwrap();
+        let address = ReadInputAddress::ChangeRecord {
+            change_id: change_id.to_string(),
+            source_commit_id: source_commit_id.to_string(),
+            branch_id: "branch".to_owned(),
+            schema_key: record.schema_key.clone(),
+            file_id: None,
+            row_pk: row_pk.clone(),
+            updated_at: created_at.to_string(),
+            payload_digest: *blake3::hash(&canonical).as_bytes(),
+        };
+
+        address
+            .validate_existing_mutable_value(&canonical, &canonical)
+            .expect("an exact canonical live overlay is safe to preserve");
+
+        let mut stale_identity = record.clone();
+        stale_identity.schema_key = "other_schema".to_owned();
+        let stale_identity = crate::changelog::encode_change_record(&stale_identity).unwrap();
+        assert!(
+            address
+                .validate_existing_mutable_value(&stale_identity, &canonical)
+                .is_err()
+        );
+
+        let mut stale_lifetime = record.clone();
+        stale_lifetime.created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(8);
+        let stale_lifetime = crate::changelog::encode_change_record(&stale_lifetime).unwrap();
+        assert!(
+            address
+                .validate_existing_mutable_value(&stale_lifetime, &canonical)
+                .is_err()
+        );
+
+        let mut stale_tombstone = record;
+        stale_tombstone.snapshot = None;
+        let stale_tombstone = crate::changelog::encode_change_record(&stale_tombstone).unwrap();
+        assert!(
+            address
+                .validate_existing_mutable_value(&stale_tombstone, &canonical)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn captured_missing_read_exports_recipe_shape_without_row_payloads() {
+        let capture = ReadInterestRegistry::new(16, 4096);
+        capture
+            .register(LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::All,
+                branch_ids: vec!["branch".into()],
+                include_blob_refs: false,
+                cache_small_blob_data: false,
+            })
+            .unwrap();
+        let error = annotate_capture(
+            LixError::new(LixError::CODE_INTERNAL_ERROR, "missing native dependency"),
+            Some(&capture),
+        );
+        let details = error.details.unwrap();
+        assert_eq!(details["nativeReadRecipeCount"], serde_json::json!(1));
+        assert_eq!(details["nativeReadRecipeMask"], serde_json::json!(16));
+        assert!(details.get("readFulfillment").is_some());
+    }
+
+    #[test]
+    fn selected_change_payload_wire_identity_preserves_uuid_component_types() {
+        let id = uuid::Uuid::now_v7().to_string();
+        let uuid_row_pk = crate::row_pk::RowPk::uuid_from_canonical(&id).unwrap();
+        let string_row_pk = crate::row_pk::RowPk::single(id);
+        assert_ne!(uuid_row_pk, string_row_pk);
+        let address = ReadInputAddress::ChangeRecord {
+            change_id: uuid::Uuid::now_v7().to_string(),
+            source_commit_id: uuid::Uuid::now_v7().to_string(),
+            branch_id: "branch".to_owned(),
+            schema_key: "lix_account".to_owned(),
+            file_id: None,
+            row_pk: uuid_row_pk.clone(),
+            updated_at: "2026-09-30T00:00:00.000Z".to_owned(),
+            payload_digest: [0; 32],
+        };
+
+        let encoded = serde_json::to_vec(&address).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            wire.pointer("/address/row_pk/0/type"),
+            Some(&serde_json::json!("uuid"))
+        );
+        let decoded: ReadInputAddress = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, address);
+        let ReadInputAddress::ChangeRecord { row_pk, .. } = decoded else {
+            unreachable!("the typed row address round-trips as a ChangeRecord")
+        };
+        assert_eq!(row_pk, uuid_row_pk);
+        assert_ne!(row_pk, string_row_pk);
+    }
+
+    #[test]
+    fn filesystem_path_recipe_selects_only_its_native_scope() {
+        assert_eq!(payload_schema_kind("private_custom_schema"), "other");
+        let id = "00000000-0000-7000-8000-000000000031";
+        let other = "00000000-0000-7000-8000-000000000032";
+        let key = crate::row_pk::RowPk::uuid_from_canonical(id).unwrap();
+        let other_key = crate::row_pk::RowPk::uuid_from_canonical(other).unwrap();
+        let mut interest = LogicalReadInterest::FilesystemPaths {
+            scope: crate::filesystem::FilesystemPathIndexScope::FileIds(vec![id.into()]),
+            branch_ids: vec!["branch".into()],
+            include_blob_refs: true,
+            cache_small_blob_data: false,
+        };
+        assert_eq!(payload_recipe_mask(std::slice::from_ref(&interest)), 16);
+        assert!(scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_file_descriptor",
+            Some(id),
+            &key
+        ));
+        assert!(scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_binary_blob_ref",
+            Some(id),
+            &key
+        ));
+        assert!(scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_directory_descriptor",
+            None,
+            &other_key
+        ));
+        assert!(!scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_file_descriptor",
+            Some(other),
+            &other_key
+        ));
+        assert!(!scan_recipe_selects_change_identity(
+            &interest,
+            "other-branch",
+            "lix_file_descriptor",
+            Some(id),
+            &key
+        ));
+        assert!(!scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_account",
+            None,
+            &key
+        ));
+        if let LogicalReadInterest::FilesystemPaths {
+            include_blob_refs, ..
+        } = &mut interest
+        {
+            *include_blob_refs = false;
+        }
+        assert!(!scan_recipe_selects_change_identity(
+            &interest,
+            "branch",
+            "lix_binary_blob_ref",
+            Some(id),
+            &key
+        ));
+        let metadata = LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec!["branch".into()],
+            file_ids: Some(vec![id.into()]),
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        };
+        for (branch, schema, file, row, expected) in [
+            ("branch", "lix_directory_descriptor", None, &other_key, true),
+            ("branch", "lix_file_descriptor", Some(id), &key, true),
+            (
+                "branch",
+                "lix_file_descriptor",
+                Some(other),
+                &other_key,
+                false,
+            ),
+            (
+                "other-branch",
+                "lix_directory_descriptor",
+                None,
+                &other_key,
+                false,
+            ),
+            ("branch", "lix_binary_blob_ref", Some(id), &key, false),
+            ("branch", "lix_account", None, &key, false),
+        ] {
+            assert_eq!(
+                scan_recipe_selects_change_identity(&metadata, branch, schema, file, row),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_file_path_recipe_payloads_validate_after_wire_roundtrip() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_file(path, content) VALUES('/cold.txt', CAST('text' AS BYTEA))",
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = authority
+            .execute(
+                "SELECT id, lixcol_change_id AS change_id FROM lix_file WHERE path='/cold.txt'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let file_id = rows.rows()[0].get::<String>("id").unwrap();
+        let change_id = rows.rows()[0].get::<String>("change_id").unwrap();
+        let adapter = authority.storage_adapter();
+        let mut writes = adapter.new_write_set();
+        writes.delete(
+            crate::changelog::CHANGE_SPACE,
+            StorageKey(Bytes::copy_from_slice(
+                canonical_change_id(&change_id)
+                    .unwrap()
+                    .as_uuid()
+                    .as_bytes(),
+            )),
+        );
+        adapter
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let request = ReadFulfillmentRequest {
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![
+                LogicalReadInterest::FileContent {
+                    request: crate::hot_state::HotStateScanRequest {
+                        filter: crate::hot_state::HotStateFilter {
+                            schema_keys: vec![
+                                "lix_file_descriptor".to_owned(),
+                                "lix_binary_blob_ref".to_owned(),
+                                "lix_directory_descriptor".to_owned(),
+                            ],
+                            branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                            ..Default::default()
+                        },
+                        projection: crate::hot_state::HotStateProjection {
+                            columns: vec!["snapshot_content".to_owned()],
+                        },
+                        limit: None,
+                    },
+                    file_ids: Some(vec![file_id.clone()]),
+                    directory_ids: None,
+                    root_directory: false,
+                    indexed: true,
+                    path_predicate: crate::hot_state::FilePathInterest::All,
+                    byte_range: None,
+                },
+                LogicalReadInterest::FilesystemPaths {
+                    scope: crate::filesystem::FilesystemPathIndexScope::FileIds(vec![
+                        file_id.clone(),
+                    ]),
+                    branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                    include_blob_refs: true,
+                    cache_small_blob_data: false,
+                },
+            ],
+            required: vec![
+                ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id)),
+                ReadInputAddress::Metadata(NativeMetadataRef::CommitGraphRecord(
+                    leased.descriptor.selected_branch.head.commit_id.clone(),
+                )),
+            ],
+            continuation: None,
+        };
+        let request: ReadFulfillmentRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let response = authority
+            .read_sync_fulfillment(&request, &leased.lease.lease_id)
+            .await
+            .unwrap();
+        assert!(response.inputs.iter().any(|input| matches!(&input.address, ReadInputAddress::ChangeRecord { schema_key, .. } if schema_key == "lix_file_descriptor" || schema_key == "lix_binary_blob_ref")), "the test must exercise a selected mutable payload");
+        let response: ReadFulfillmentResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        validate_complete(&request, &response).unwrap();
+        let other =
+            crate::row_pk::RowPk::uuid_from_canonical("00000000-0000-7000-8000-000000000032")
+                .unwrap();
+        for input in &response.inputs {
+            if let ReadInputAddress::ChangeRecord {
+                branch_id,
+                schema_key,
+                file_id,
+                ..
+            } = &input.address
+            {
+                if schema_key != "lix_directory_descriptor" {
+                    assert!(!request.interests.iter().any(|interest| {
+                        scan_recipe_selects_change_identity(
+                            interest,
+                            branch_id,
+                            schema_key,
+                            file_id.as_deref(),
+                            &other,
+                        )
+                    }));
+                }
+            }
+        }
+        authority.close().await.unwrap();
+    }
+
+    #[test]
+    fn client_install_failure_annotation_exports_only_bounded_reason_and_phase() {
+        let prefixed = LixError::new(
+            "LIX_READ_FULFILLMENT_INVALID",
+            "fulfill native read: private context",
+        )
+        .with_details(
+            serde_json::json!({"payloadFailureReason": "selected_change_payload_recipe_mismatch"}),
+        );
+        let annotated = annotate_client_failure(prefixed, ClientFailurePhase::Validation);
+        assert_eq!(
+            annotated
+                .details
+                .as_ref()
+                .unwrap()
+                .get("payloadFailureReason"),
+            Some(&serde_json::json!(
+                "selected_change_payload_recipe_mismatch"
+            ))
+        );
+        let error = LixError::new(
+            "LIX_READ_FULFILLMENT_INVALID",
+            "canonical selected change payload identity or lifetime mismatch",
+        )
+        .with_details(serde_json::json!({"privateAddress": "secret row value"}));
+        let error = annotate_client_failure(error, ClientFailurePhase::Installation);
+        let details = error.details.unwrap();
+        assert_eq!(
+            details.get("payloadPhase"),
+            Some(&serde_json::json!("read_fulfillment_install"))
+        );
+        assert_eq!(
+            details.get("payloadFailureReason"),
+            Some(&serde_json::json!(
+                "selected_change_payload_identity_or_lifetime_mismatch"
+            ))
+        );
+
+        let generic = LixError::new("LIX_READ_FULFILLMENT_INVALID", "private validation detail");
+        let generic = annotate_client_failure(generic, ClientFailurePhase::Validation);
+        let details = generic.details.unwrap();
+        assert_eq!(
+            details.get("payloadPhase"),
+            Some(&serde_json::json!("read_fulfillment_validation"))
+        );
+        assert_eq!(
+            details.get("payloadFailureReason"),
+            Some(&serde_json::json!("read_fulfillment_validation_failed"))
+        );
+
+        let unrelated = LixError::new("LIX_STORAGE_IO", "private storage failure");
+        let unrelated = annotate_client_failure(unrelated, ClientFailurePhase::Installation);
+        assert!(unrelated.details.is_none());
     }
 
     #[tokio::test]
@@ -1806,6 +4002,532 @@ mod tests {
             .find(|input| input.address == ReadInputAddress::Metadata(address.clone()))
             .expect("required direct locator should be returned");
         crate::sync::native_metadata::validate_bytes(&address, &input.bytes).unwrap();
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_scan_row_closes_its_canonical_change_payload() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('closure-payload-row', 'value')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = authority
+            .execute(
+                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'closure-payload-row'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let change_id = rows.rows()[0]
+            .get::<String>("id")
+            .unwrap()
+            .parse::<crate::changelog::ChangeId>()
+            .unwrap();
+        // Exercise the historical cold case: the mutable standalone projection
+        // is missing, but the exact row's canonical physical owner remains.
+        let storage = authority.storage_adapter();
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::changelog::CHANGE_SPACE,
+            StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())),
+        );
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let change = change_id.to_string();
+        let request = ReadFulfillmentRequest {
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_key_value".to_owned()],
+                        row_pks: vec![crate::row_pk::RowPk::single("closure-payload-row")],
+                        branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        untracked: None,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                domain: InterestDomain::Combined,
+            }],
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change.clone()),
+            )],
+            continuation: None,
+        };
+        let response = authority
+            .read_sync_fulfillment(&request, &leased.lease.lease_id)
+            .await
+            .unwrap();
+        validate_complete(&request, &response)
+            .expect("an exact row identity selected by a scan is a valid payload recipe");
+
+        // Re-sign a response against a recipe that differs only in its row
+        // identity. This reaches the recipe authorization check rather than
+        // failing earlier on the request or closure digest.
+        let mut wrong_recipe = request.clone();
+        let LogicalReadInterest::Scan { request: scan, .. } = &mut wrong_recipe.interests[0] else {
+            unreachable!("the fixture uses one Scan recipe")
+        };
+        scan.filter.row_pks[0] = crate::row_pk::RowPk::single("different-row");
+        let mut wrong_response = response.clone();
+        wrong_response.request_digest = wrong_recipe.digest().unwrap();
+        let wrong_closure_digest = input_digest(&wrong_recipe, &wrong_response.inputs).unwrap();
+        wrong_response.closure_digest = wrong_closure_digest;
+        let error = validate_complete(&wrong_recipe, &wrong_response)
+            .expect_err("a payload for a different row must not be authorized by the scan");
+        assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("payloadFailureReason")),
+            Some(&serde_json::json!(
+                "selected_change_payload_recipe_mismatch"
+            )),
+        );
+
+        let expected_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
+        assert!(
+            response.inputs.iter().any(|input| {
+                matches!(input.address, ReadInputAddress::ChangeRecord { .. })
+                    && input.address.coordinate().is_ok_and(|(space, key)| {
+                        space == crate::changelog::CHANGE_SPACE && key == expected_key
+                    })
+            }),
+            "the selected scan-row recipe must transfer its canonical physical payload even when CHANGE_SPACE is absent"
+        );
+        let canonical_input = response
+            .inputs
+            .iter()
+            .find(|input| matches!(input.address, ReadInputAddress::ChangeRecord { .. }))
+            .expect("selected row must include its canonical change payload");
+        let canonical_record =
+            crate::changelog::decode_change_record(&canonical_input.bytes, change_id).unwrap();
+        let locator_address = NativeMetadataRef::ChangeLocator(change.clone());
+        let canonical_locator_input = response
+            .inputs
+            .iter()
+            .find(|input| input.address == ReadInputAddress::Metadata(locator_address.clone()))
+            .expect("selected row must include its canonical change locator");
+        let canonical_locator =
+            crate::tracked_state::decode_change_locator(change_id, &canonical_locator_input.bytes)
+                .unwrap();
+        let canonical_source_commit_id = match &canonical_input.address {
+            ReadInputAddress::ChangeRecord {
+                source_commit_id, ..
+            } => source_commit_id,
+            _ => unreachable!("canonical input was selected as a ChangeRecord"),
+        };
+        assert_eq!(
+            canonical_locator.commit_id.to_string(),
+            *canonical_source_commit_id,
+            "selected locator and payload must share their exact physical source"
+        );
+        let stale_locator = crate::tracked_state::CommitDeltaChangeLocator {
+            change_id,
+            commit_id: crate::changelog::CommitId::for_test_label(
+                "stale-but-decodable-selected-locator-owner",
+            ),
+            segment_index: 0,
+            ordinal: 0,
+        };
+        assert_ne!(stale_locator.commit_id, canonical_locator.commit_id);
+        let stale_locator_bytes = crate::tracked_state::encode_change_locator(stale_locator);
+        crate::sync::native_metadata::validate_bytes(&locator_address, &stale_locator_bytes)
+            .expect("stale fixture locator is still structurally valid");
+        let mut stale_record = canonical_record.clone();
+        stale_record.schema_key = "lix_file_descriptor".to_owned();
+        let stale_bytes = crate::changelog::encode_change_record(&stale_record).unwrap();
+        let partial_state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            authority.active_account_id().to_owned(),
+            request.epoch_id.clone(),
+            request.descriptor.clone(),
+        )
+        .unwrap();
+        let partial_storage = StorageAdapter::new(Memory::new());
+        let locator_key = crate::sync::native_metadata::key(&locator_address).unwrap();
+        let mut admission_writes = partial_storage.new_write_set();
+        let admission = crate::sync::partial_state::stage_partial_replica_state(
+            &mut admission_writes,
+            &partial_state,
+            None,
+        )
+        .unwrap();
+        let mut migration = partial_storage
+            .begin_migration_write(StorageWriteOptions {
+                preconditions: vec![admission],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        admission_writes.lower_into(&mut migration).await.unwrap();
+        migration.commit().await.unwrap();
+        partial_storage
+            .admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+        let change_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
+        let pending_id =
+            crate::changelog::ChangeId::for_test_label("unrelated-local-pending-change");
+        assert_ne!(pending_id, change_id);
+        let pending_record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: pending_id,
+            account_id: authority.active_account_id().to_owned(),
+            schema_key: "lix_key_value".to_owned(),
+            row_pk: crate::row_pk::RowPk::single("unrelated-local-pending-row"),
+            file_id: None,
+            snapshot: Some(vec![4, 5, 6]),
+            metadata: None,
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(9),
+            origin_key: None,
+        };
+        let pending_bytes = crate::changelog::encode_change_record(&pending_record).unwrap();
+        let pending_key = StorageKey(Bytes::copy_from_slice(pending_id.as_uuid().as_bytes()));
+        let mut stale_writes = partial_storage.new_write_set();
+        stale_writes.put(
+            crate::changelog::CHANGE_SPACE,
+            change_key.clone(),
+            StorageValue {
+                bytes: Bytes::from(stale_bytes),
+            },
+        );
+        stale_writes.put(
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            locator_key.clone(),
+            StorageValue {
+                bytes: Bytes::from(stale_locator_bytes.clone()),
+            },
+        );
+        stale_writes.put(
+            crate::changelog::CHANGE_SPACE,
+            pending_key.clone(),
+            StorageValue {
+                bytes: Bytes::from(pending_bytes.clone()),
+            },
+        );
+        partial_storage
+            .commit_partial_replica_write_set(
+                crate::sync::partial_replica_write_capability(),
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: vec![
+                        StoragePrecondition::KeyAbsent {
+                            space: crate::changelog::CHANGE_SPACE,
+                            key: change_key.clone(),
+                        },
+                        StoragePrecondition::KeyAbsent {
+                            space: crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                            key: locator_key.clone(),
+                        },
+                        StoragePrecondition::KeyAbsent {
+                            space: crate::changelog::CHANGE_SPACE,
+                            key: pending_key.clone(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        install(&partial_storage, &partial_state, &request, &response)
+            .await
+            .expect("canonical selected payload must replace its stale projection");
+        let read = partial_storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let installed = PointReadPlan::new(
+            crate::changelog::CHANGE_SPACE,
+            std::slice::from_ref(&change_key),
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .expect("canonical payload should be installed");
+        assert_eq!(installed.as_ref(), canonical_input.bytes.as_slice());
+        let installed_locator = PointReadPlan::new(
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            std::slice::from_ref(&locator_key),
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .expect("canonical locator should replace its stale projection");
+        assert_eq!(
+            installed_locator.as_ref(),
+            canonical_locator_input.bytes.as_slice()
+        );
+        assert_eq!(
+            crate::tracked_state::decode_change_locator(change_id, &installed_locator).unwrap(),
+            canonical_locator,
+            "next locator resolution must use the exact selected source"
+        );
+        let pending = PointReadPlan::new(
+            crate::changelog::CHANGE_SPACE,
+            std::slice::from_ref(&pending_key),
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .expect("unrelated local pending payload should remain installed");
+        assert_eq!(pending.as_ref(), pending_bytes.as_slice());
+
+        // Repeat with an optional locator response. A valid resident locator
+        // is mutable state too, but this exact payload pairing proves the
+        // canonical address strongly enough to repair it with CAS.
+        let optional_request = ReadFulfillmentRequest {
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::CommitGraphRecord(
+                    request.descriptor.selected_branch.head.commit_id.clone(),
+                ),
+            )],
+            ..request.clone()
+        };
+        let optional_response = authority
+            .read_sync_fulfillment(&optional_request, &leased.lease.lease_id)
+            .await
+            .unwrap();
+        partial_storage
+            .commit_partial_replica_write_set(
+                crate::sync::partial_replica_write_capability(),
+                {
+                    let mut writes = partial_storage.new_write_set();
+                    writes.put(
+                        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                        locator_key.clone(),
+                        StorageValue {
+                            bytes: Bytes::from(stale_locator_bytes),
+                        },
+                    );
+                    writes
+                },
+                StorageWriteOptions {
+                    preconditions: vec![StoragePrecondition::KeyValueEquals {
+                        space: crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                        key: locator_key.clone(),
+                        expected: installed_locator,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        install(
+            &partial_storage,
+            &partial_state,
+            &optional_request,
+            &optional_response,
+        )
+        .await
+        .expect("paired optional canonical locator should repair a stale projection");
+        let read = partial_storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let repaired_optional_locator = PointReadPlan::new(
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            std::slice::from_ref(&locator_key),
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .expect("optional canonical locator should remain installed");
+        assert_eq!(
+            repaired_optional_locator.as_ref(),
+            canonical_locator_input.bytes.as_slice()
+        );
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broad_account_scan_closes_only_its_scoped_canonical_payloads() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let account_id = uuid::Uuid::now_v7().to_string();
+        authority
+            .ensure_account(&account_id, "Read fulfillment fixture", "human")
+            .await
+            .unwrap();
+        let global = authority
+            .open_another_session()
+            .with_branch(crate::GLOBAL_BRANCH_ID)
+            .await
+            .unwrap();
+        let rows = global
+            .execute(
+                "SELECT lixcol_change_id AS id FROM lix_account WHERE id = $1 AND lixcol_untracked = false LIMIT 10",
+                &[crate::Value::Text(account_id.clone())],
+            )
+            .await
+            .unwrap();
+        let change_id = rows.rows()[0]
+            .get::<String>("id")
+            .unwrap()
+            .parse::<crate::changelog::ChangeId>()
+            .unwrap();
+
+        // Exercise the same broad, row-key-free recipe emitted for the
+        // production `SELECT id FROM lix_account ... LIMIT 10` scan. LIMIT is
+        // applied above this native scan, so its recipe intentionally carries
+        // no row keys or native limit.
+        let leased = authority
+            .leased_partial_replica_descriptor(Some(crate::GLOBAL_BRANCH_ID))
+            .await
+            .unwrap();
+        let change = change_id.to_string();
+        let request = ReadFulfillmentRequest {
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_account".to_owned()],
+                        branch_ids: vec![crate::GLOBAL_BRANCH_ID.to_owned()],
+                        // Empty row_pks and file_ids mean wildcard, as in the
+                        // production native scan. The schema and branch remain
+                        // explicit and descriptor-scoped.
+                        untracked: None,
+                        ..Default::default()
+                    },
+                    projection: crate::hot_state::HotStateProjection {
+                        columns: vec!["id".to_owned()],
+                    },
+                    limit: None,
+                },
+                domain: InterestDomain::Combined,
+            }],
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change.clone()),
+            )],
+            continuation: None,
+        };
+
+        // Simulate an old physical repository where the mutable standalone
+        // changelog projection is missing while the selected row's owner is
+        // still present in its canonical commit delta.
+        let storage = authority.storage_adapter();
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::changelog::CHANGE_SPACE,
+            StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())),
+        );
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = authority
+            .read_sync_fulfillment(&request, &leased.lease.lease_id)
+            .await
+            .unwrap();
+        // Exercise the HTTP serde boundary that otherwise collapses an
+        // account UUID row key into an indistinguishable string component.
+        let response: ReadFulfillmentResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        validate_complete(&request, &response)
+            .expect("row-key-free account scan must authorize its exact returned rows");
+
+        let expected_row_pk = crate::row_pk::RowPk::uuid_from_canonical(&account_id).unwrap();
+        let mut selected_record = None;
+        for input in &response.inputs {
+            let ReadInputAddress::ChangeRecord {
+                change_id: selected_change_id,
+                source_commit_id,
+                branch_id,
+                schema_key,
+                file_id,
+                row_pk,
+                ..
+            } = &input.address
+            else {
+                continue;
+            };
+            assert_eq!(schema_key, "lix_account");
+            assert_eq!(branch_id, crate::GLOBAL_BRANCH_ID);
+            assert_eq!(file_id, &None);
+
+            let locator_address = ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(
+                selected_change_id.clone(),
+            ));
+            let locator_input = response
+                .inputs
+                .iter()
+                .find(|candidate| candidate.address == locator_address)
+                .expect("every selected payload must retain its canonical locator");
+            let parsed_change = canonical_change_id(selected_change_id).unwrap();
+            let locator =
+                crate::tracked_state::decode_change_locator(parsed_change, &locator_input.bytes)
+                    .unwrap();
+            assert_eq!(locator.commit_id.to_string(), *source_commit_id);
+
+            if row_pk == &expected_row_pk {
+                selected_record = Some(selected_change_id.clone());
+            }
+        }
+        assert_eq!(
+            selected_record.as_deref(),
+            Some(change.as_str()),
+            "the account row selected by SQL must have its canonical payload in the closure"
+        );
+
+        global.close().await.unwrap();
         authority.close().await.unwrap();
     }
 

@@ -584,7 +584,123 @@ where
         let _ = crate::tracked_state::load_commit_state_manifest(read, commit_id).await?;
     }
 
-    Ok(locators
+    let identity_rows = identities.iter().collect::<Vec<_>>();
+    let mut payload_requests = Vec::new();
+    let mut locator_fallback_requests = Vec::new();
+    let mut locator_fallback_ids = std::collections::BTreeSet::new();
+    for index in 0..batch.len() {
+        let Some(row) = batch.row(index) else {
+            continue;
+        };
+        let Some(change_id) = row.change_id() else {
+            continue;
+        };
+        let Some((branch_id, key)) = identity_rows.get(index).copied() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "exact tracked row has no corresponding requested identity",
+            ));
+        };
+        let locator = locators.get(&change_id);
+        let source_commit_id = locator
+            .map(|locator| locator.commit_id)
+            .or_else(|| row.commit_id())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked change '{change_id}' has neither an authoritative locator nor an exact-row owner"
+                    ),
+                )
+            })?;
+        if locator.is_none() {
+            locator_fallback_ids.insert(change_id);
+            locator_fallback_requests.push((
+                source_commit_id,
+                change_id,
+                key.clone(),
+                row.updated_at(),
+            ));
+        }
+        payload_requests.push((
+            branch_id.clone(),
+            crate::tracked_state::AuthoritativeLiveChangeRequest {
+                change_id,
+                source_commit_id,
+                key: key.clone(),
+                updated_at: row.updated_at(),
+            },
+        ));
+    }
+
+    // Older physical layouts may have an exact selected row and its physical
+    // owner while lacking the rebuildable CHANGE_LOCATOR projection. Recover
+    // the canonical authored locator through exact-key, authenticated point
+    // reads; selected-reference chains are followed by their recorded base
+    // coordinates, never by scanning a commit or inventing an ordinal.
+    let fallback_locators = crate::tracked_state::load_exact_tracked_row_change_locators(
+        read,
+        &locator_fallback_requests,
+    )
+    .await?;
+    let mut fallback_owner_commits = std::collections::BTreeSet::new();
+    for ((_, change_id, _, _), locator) in locator_fallback_requests
+        .iter()
+        .zip(fallback_locators)
+    {
+        fallback_owner_commits.insert(locator.commit_id);
+        locators.insert(*change_id, locator);
+    }
+    for commit_id in fallback_owner_commits {
+        let _ = crate::tracked_state::load_commit_state_manifest(read, commit_id).await?;
+    }
+    for (_, request) in &mut payload_requests {
+        if locator_fallback_ids.contains(&request.change_id) {
+            request.source_commit_id = locators
+                .get(&request.change_id)
+                .expect("fallback locator was recovered")
+                .commit_id;
+        }
+    }
+
+    // CHANGE_SPACE is mutable, so raw physical observations are deliberately
+    // not part of the generic immutable closure. Resolve every selected row
+    // through the changelog's canonical authority policy: a valid standalone
+    // payload is preferred, while an absent or stale projection can fall back
+    // to the exact physical owner selected by the locator. In either case the
+    // resolver enforces row identity and lifetime before producing wire data.
+    let resolved_payloads = crate::tracked_state::load_authoritative_live_change_records(
+        read,
+        &payload_requests
+            .iter()
+            .map(|(_, request)| crate::tracked_state::AuthoritativeLiveChangeRequest {
+                change_id: request.change_id,
+                source_commit_id: request.source_commit_id,
+                key: request.key.clone(),
+                updated_at: request.updated_at,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let mut payload_inputs = Vec::with_capacity(resolved_payloads.len());
+    for ((branch_id, request), record) in payload_requests.into_iter().zip(resolved_payloads) {
+        let bytes = crate::changelog::encode_change_record(&record)?;
+        payload_inputs.push(crate::sync::read_fulfillment::ReadInput {
+            address: crate::sync::read_fulfillment::ReadInputAddress::ChangeRecord {
+                change_id: request.change_id.to_string(),
+                source_commit_id: request.source_commit_id.to_string(),
+                branch_id,
+                schema_key: request.key.schema_key,
+                file_id: request.key.file_id,
+                row_pk: request.key.row_pk,
+                updated_at: request.updated_at.to_string(),
+                payload_digest: *blake3::hash(&bytes).as_bytes(),
+            },
+            bytes,
+        });
+    }
+
+    let mut inputs = locators
         .into_iter()
         .map(
             |(change_id, locator)| crate::sync::read_fulfillment::ReadInput {
@@ -594,7 +710,9 @@ where
                 bytes: crate::tracked_state::encode_change_locator(locator),
             },
         )
-        .collect())
+        .collect::<Vec<_>>();
+    inputs.extend(payload_inputs);
+    Ok(inputs)
 }
 
 /// Reproduce the path-index eager-blob policy while routing the actual CAS

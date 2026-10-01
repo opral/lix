@@ -134,6 +134,14 @@ Returns the local partial-replica worker's health without querying SQL or fetchi
 
 Successful local reads do not clear sync failures. `running` means no known worker failure, not guaranteed server freshness. Other modes report `inactive`. Call this method before closing the JavaScript session.
 
+### prepareOfflineEditing()
+
+```ts
+await lix.prepareOfflineEditing();
+```
+
+For a partial replica, explicitly fetches the bounded immutable graph metadata used to validate and append local writes. Call it while connected before relying on the next local edit offline. It performs no SQL mutation or publication and keeps read-only opens lazy. File contents, plugins, and other operation-specific inputs remain demand-driven, so this does not make arbitrary SQL workloads offline-ready. Other sync modes reject the call.
+
 ### execute()
 
 ```ts
@@ -278,7 +286,7 @@ SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to d
 
 A conflict error's `details` say what overlapped: `reason` is `readSetChanged` or `writeSetChanged` with `overlaps` listing up to eight `{ branchId, schemaKey, fileId, rowPk }` identities (and `overlapCount` the total), `unvalidatedReadChanged` with `source` naming the read that has no row-level validation (including a concurrent schema catalog change), `staleSnapshotNotRebased` when the transaction's writes (for example untracked or global rows) cannot be rebased onto a newer head, or `commitRaced` when another commit won the final atomic publication. `retryable` is `true` in every case. Start a new transaction and rerun its statements against current state, or use `lix.transaction()` to do that automatically.
 
-Rows returned by `RETURNING` inside a transaction are provisional. Report a publication as successful only after `commit()` succeeds. Automatic `execute()` and `executeBatch()` can rerun the whole statement or batch after a known failed transaction. Explicit transactions remain caller-controlled.
+Rows returned by `RETURNING` inside an explicit transaction are provisional until `commit()` succeeds. Auto-committed `execute()` and `executeBatch()` return canonical `lixcol_change_id` values for direct new-image projections after the commit; `OLD` projections retain the prior ID. Automatic calls can rerun the whole statement or batch after a known failed transaction. Explicit transactions remain caller-controlled.
 
 Set `maxAutoCommitRetries` to cap these replays across both transaction contention and expired transaction snapshots. The initial attempt does not count; `0` returns the first failure without re-executing the transaction. When omitted, Lix permits up to 16 contention retries and separately bounds expired-snapshot recovery by its existing time budget. An explicit cap cannot extend that expiry budget. This option does not control pure-read recovery, idempotency receipt lookups, or network retries.
 

@@ -20,6 +20,23 @@ test("only exact same-worker proof grants offline local attachment, never a remo
   await expect(cache.verify(url, [["Authorization", "rotated"]], identity, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
   await expect(new SharedAdmissionCache().verify(url, headers, identity, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
 });
+test("a browser known offline skips the admission probe but still requires its exact cached proof", async () => {
+  const cache = new SharedAdmissionCache();
+  cache.record(url, headers, identity);
+  const transport = vi.fn(async () => Response.json(identity));
+  vi.stubGlobal("navigator", {onLine: false});
+  try {
+    await expect(cache.verify(url, headers, identity,
+      () => requestAdmission(url, headers, transport))).resolves.toEqual({identity, online: false});
+    expect(transport).not.toHaveBeenCalled();
+    await expect(cache.verify(url, [["Authorization", "Bearer rotated"]], identity,
+      () => requestAdmission(url, [["Authorization", "Bearer rotated"]], transport)))
+      .rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+    expect(transport).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
 test.each(["LIX_ADMISSION_AUTH_REJECTED", "LIX_TRANSPORT_CONTRACT", "LIX_TRANSPORT_CALLBACK", "LIX_TRANSPORT_ABORTED", "LIX_ADMISSION_EPOCH"])("%s never uses offline fallback", async code => {
   const cache = new SharedAdmissionCache(); cache.record(url, headers, identity);
   await expect(cache.verify(url, headers, identity, async () => {throw new HttpTransportError(code, "failed");})).rejects.toMatchObject({code});
@@ -46,7 +63,7 @@ test.each([401,403])("HTTP %s is authorization rejection", async status => {
   await expect(requestAdmission(url, headers, async () => new Response(null, {status}))).rejects.toMatchObject({code: "LIX_ADMISSION_AUTH_REJECTED"});
 });
 test("admission rejects mismatched epoch and repository", async () => {
-  await expect(requestAdmission(url, headers, async () => Response.json({...identity, protocolEpoch: 15}))).rejects.toMatchObject({code: "LIX_ADMISSION_EPOCH"});
+  await expect(requestAdmission(url, headers, async () => Response.json({...identity, protocolEpoch: ADMISSION_PROTOCOL_EPOCH - 1}))).rejects.toMatchObject({code: "LIX_ADMISSION_EPOCH"});
   await expect(requestAdmission(url, headers, async () => Response.json({...identity, storageEpoch: 80}))).rejects.toMatchObject({code: "LIX_ADMISSION_EPOCH"});
   await expect(requestAdmission(url, headers, async () => Response.json({...identity, repositoryId: identity.principalId}))).rejects.toMatchObject({code: "LIX_ADMISSION_PROTOCOL"});
 });

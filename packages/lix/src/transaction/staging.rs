@@ -3702,7 +3702,11 @@ impl crate::hot_state::StagedHotStateRows for PreparedSchemaOverlay<'_> {
         let mut output = MaterializedHotStateBatchBuilder::with_capacity(self.rows.len());
         for &row in &self.rows {
             if staged_row_identity_matches_scan(row, request, false) {
-                push_prepared_materialized(&mut output, row);
+                push_prepared_materialized(
+                    &mut output,
+                    row,
+                    projection_includes_provisional_change_id(&request.projection),
+                );
             }
         }
         Ok(output.finish())
@@ -3726,8 +3730,12 @@ impl crate::hot_state::StagedHotStateRows for PreparedSchemaOverlay<'_> {
                     && (request.include_tombstones || !row.is_deleted())
             });
             slots.push(row.map(|row| {
-                u32::try_from(push_prepared_materialized(&mut output, row))
-                    .expect("prepared schema exact batch ordinal must fit u32")
+                u32::try_from(push_prepared_materialized(
+                    &mut output,
+                    row,
+                    projection_includes_provisional_change_id(&request.projection),
+                ))
+                .expect("prepared schema exact batch ordinal must fit u32")
             }));
         }
         MaterializedHotStateExactBatch::new(output.finish(), slots)
@@ -3947,8 +3955,12 @@ impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
                 continue;
             } else {
                 slots[request_index] = Some(
-                    u32::try_from(push_prepared_materialized(&mut builder, row))
-                        .expect("staged exact batch ordinal must fit u32"),
+                    u32::try_from(push_prepared_materialized(
+                        &mut builder,
+                        row,
+                        projection_includes_provisional_change_id(&request.projection),
+                    ))
+                    .expect("staged exact batch ordinal must fit u32"),
                 );
             }
         }
@@ -4554,15 +4566,41 @@ fn append_matching_staged_rows(
             continue;
         };
         if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_row) {
-            push_prepared_materialized(output, row);
+            push_prepared_materialized(
+                output,
+                row,
+                projection_includes_provisional_change_id(&request.projection),
+            );
         }
     }
+}
+
+fn projection_includes_provisional_change_id(
+    projection: &crate::hot_state::HotStateProjection,
+) -> bool {
+    projection
+        .columns
+        .iter()
+        .any(|column| column == "change_id")
 }
 
 fn push_prepared_materialized(
     output: &mut MaterializedHotStateBatchBuilder,
     row: PreparedStateRowRef<'_>,
+    include_provisional_change_id: bool,
 ) -> usize {
+    // Addressable tracked rows carry a transaction-local provisional ID until
+    // commit materialization assigns their canonical commit-delta address.
+    // Expose it only to an explicit audit-column projection; ordinary scans
+    // must keep transaction-local IDs hidden.
+    let change_id = if row.addressable_change_id && !row.untracked {
+        include_provisional_change_id
+            .then_some(row.change_id)
+            .flatten()
+            .filter(|change_id| !change_id.as_uuid().is_nil())
+    } else {
+        row.change_id
+    };
     let ordinal = output.push_materialized_ref_with_author(
         row.row_pk,
         row.schema_key.as_str(),
@@ -4573,9 +4611,7 @@ fn push_prepared_materialized(
         row.created_at,
         row.updated_at,
         row.global,
-        (!row.addressable_change_id || row.untracked)
-            .then_some(row.change_id)
-            .flatten(),
+        change_id,
         row.commit_id,
         row.untracked,
         row.author_id,

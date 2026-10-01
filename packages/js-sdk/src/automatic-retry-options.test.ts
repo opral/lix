@@ -29,3 +29,19 @@ test("forwards the zero retry cap for statements and batches", async () => {
 	expect(execute).toHaveBeenCalledWith("SELECT 1", [], { maxAutoCommitRetries: 0 });
 	expect(executeBatch).toHaveBeenCalledWith(expect.any(Array), { maxAutoCommitRetries: 0 });
 });
+
+test("prepares offline editing through the active Lix binding", async () => {
+	const prepareOfflineEditing = vi.fn(async () => undefined);
+	const lix = new Lix({ prepareOfflineEditing } as unknown as LixBinding);
+
+	await expect(lix.prepareOfflineEditing()).resolves.toBeUndefined();
+	expect(prepareOfflineEditing).toHaveBeenCalledOnce();
+});
+
+test("reports when a custom binding cannot prepare offline editing", async () => {
+	const lix = new Lix({} as unknown as LixBinding);
+
+	await expect(lix.prepareOfflineEditing()).rejects.toMatchObject({
+		code: "LIX_SYNC_MODE_MISMATCH",
+	});
+});

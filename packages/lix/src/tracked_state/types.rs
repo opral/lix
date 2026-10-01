@@ -699,6 +699,21 @@ pub(crate) struct TrackedStateScanRequest {
     pub(crate) limit: Option<usize>,
 }
 
+impl TrackedStateScanRequest {
+    pub(crate) fn is_catalog_identity_only(&self) -> bool {
+        self.filter.schema_keys.len() == 1
+            && self.filter.schema_keys[0] == "lix_registered_schema"
+            && self.filter.row_pks.is_empty()
+            && self.filter.row_pk_lower.is_none()
+            && self.filter.row_pk_upper.is_none()
+            && self.filter.file_ids.len() == 1
+            && matches!(&self.filter.file_ids[0], NullableKeyFilter::Null)
+            && self.read_columns.columns.len() == 1
+            && self.read_columns.columns[0] == "row_pk"
+            && self.limit.is_none()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TrackedStateMutation {
     pub(crate) encoded_key: Bytes,

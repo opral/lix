@@ -109,6 +109,8 @@ pub(crate) use partial_state::{
     PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
     partial_replica_state_key,
 };
+#[cfg(test)]
+pub(crate) use partial_state::tests::released_v2_receipt_bytes_for_test;
 mod platform;
 #[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
@@ -174,10 +176,12 @@ pub(crate) use protocol::{
     SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 pub(crate) use read_fulfillment::{
-    MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES, ReadFulfillmentRequest,
-    ReadFulfillmentResponse, annotate_capture as annotate_read_fulfillment_capture,
+    ReadFulfillmentRequest, ReadFulfillmentResponse,
+    annotate_capture as annotate_read_fulfillment_capture,
     discover as discover_read_fulfillment,
 };
+#[cfg(feature = "server-protocol")]
+pub(crate) use read_fulfillment::MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES;
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
@@ -193,7 +197,9 @@ pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
     replica_repository_identity,
 };
-pub(crate) use runtime::{HydratedInputs, SyncDemand, SyncDemandRetry, SyncRuntime};
+pub(crate) use runtime::{
+    HydratedInputs, SyncDemand, SyncDemandRetry, SyncRuntime, prepare_offline_editing,
+};
 pub(crate) use upload_plan::{
     SYNC_UPLOAD_GENERATION_SPACE, stage_invalidate as stage_upload_plan_invalidation,
 };
@@ -217,7 +223,9 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v22 adds explicit filesystem path-index scopes to read-fulfillment recipes.
 // v24 carries authenticated semantic fingerprints in commit and snapshot rows;
 // older peers cannot reconstruct the resulting tracked-state root IDs.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 24;
+// v25 adds typed canonical CHANGE_SPACE payloads to descriptor-scoped exact
+// row closures; older peers cannot decode this new read-fulfillment input.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 25;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

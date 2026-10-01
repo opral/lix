@@ -571,3 +571,67 @@ async fn node_client_trace_integration() {
     }
     manager.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn admission_failure_exports_cause_status_and_remote_trace() {
+    use tracing::instrument::WithSubscriber as _;
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+    );
+    let manager = crate::LixRuntimeManager::new_in_memory(1);
+    let app = crate::router(
+        manager,
+        Some("test-internal-token".into()),
+        Duration::from_secs(60),
+        InFlightSqlRegistry::default(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/lix/v1/{LIX_ID}/admission"))
+                .header("authorization", "Bearer test-internal-token")
+                .header("lix-sync-protocol-version", "0")
+                .header(
+                    "traceparent",
+                    "00-44444444444444444444444444444444-dddddddddddddddd-01",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .with_subscriber(dispatch)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    provider.force_flush().unwrap();
+    let spans = exporter.0.lock().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.name == "Lix repository admission")
+        .unwrap();
+    assert_eq!(
+        span.span_context.trace_id().to_string(),
+        "44444444444444444444444444444444"
+    );
+    assert_eq!(span.parent_span_id.to_string(), "dddddddddddddddd");
+    assert!(matches!(
+        span.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    for (key, expected) in [
+        ("lix.error.code", "LIX_PROTOCOL_VERSION_MISMATCH"),
+        ("http.response.status_code", "409"),
+        ("lix.request.phase", "admission"),
+    ] {
+        assert!(
+            span.attributes
+                .iter()
+                .any(|attr| attr.key.as_str() == key && attr.value.as_str() == expected)
+        );
+    }
+    assert!(!format!("{:?}", span.attributes).contains("test-internal-token"));
+}

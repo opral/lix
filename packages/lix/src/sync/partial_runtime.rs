@@ -293,6 +293,11 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             Ok(complete)
         }
         SyncDemandRequest::NativeMetadata(addresses, error) => {
+            if super::read_fulfillment::selected_change_payload_locator(error).is_some() {
+                // A resident locator does not imply its selected mutable
+                // payload is resident. Re-evaluate the captured recipe.
+                return Ok(false);
+            }
             let required =
                 crate::tracked_state::NativeHistoryFrontier::required_len(error, addresses.len())?;
             let addresses = &addresses[..required];
@@ -331,6 +336,11 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             Box::pin(demand_is_resident(storage, state, request)).await
         }
         SyncDemandRequest::ReconcilePartial => Ok(false),
+        SyncDemandRequest::PrepareOfflineEditing => Ok(
+            super::partial_write_frontier::next_missing_baseline_write_frontier(storage, state)
+                .await?
+                .is_none(),
+        ),
         SyncDemandRequest::History(_) => Err(LixError::new(
             "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED",
             "partial replica requires a typed native address for history dependencies",
@@ -445,9 +455,17 @@ fn hydrate_exact_demand_with_receipt<
             _ => None,
         };
         if let Some(error) = error
-            && let Some(interests) = super::read_fulfillment::interests_for_error(error)?
+            && let Some(interests) =
+                super::read_fulfillment::interests_for_error(error).map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Validation,
+                    )
+                })?
         {
             use super::read_fulfillment::ReadInputAddress;
+            let selected_payload_locator =
+                super::read_fulfillment::selected_change_payload_locator(error);
             let frontier = match &request {
                 SyncDemandRequest::NativeObject(address, _) => {
                     vec![ReadInputAddress::Object(*address)]
@@ -479,6 +497,15 @@ fn hydrate_exact_demand_with_receipt<
             // authority to supply genuinely absent inputs.
             let mut required = Vec::new();
             for address in frontier {
+                if selected_payload_locator
+                    .as_ref()
+                    .is_some_and(|locator| address == ReadInputAddress::Metadata(locator.clone()))
+                {
+                    // The locator is an authenticated anchor for the selected
+                    // change even when an older local projection is present.
+                    required.push(address);
+                    continue;
+                }
                 let resident = match &address {
                     ReadInputAddress::Object(object) => {
                         native_object_is_resident(storage, state, *object).await?
@@ -508,6 +535,12 @@ fn hydrate_exact_demand_with_receipt<
                         )
                         .await?
                     }
+                    ReadInputAddress::ChangeRecord { .. } => {
+                        return Err(LixError::new(
+                            "LIX_READ_FULFILLMENT_INVALID",
+                            "mutable change payloads cannot be required frontier inputs",
+                        ));
+                    }
                 };
                 if !resident {
                     required.push(address);
@@ -526,8 +559,22 @@ fn hydrate_exact_demand_with_receipt<
                 required,
                 continuation: None,
             };
-            let response = super::read_fulfillment::fetch(transport, &fulfillment).await?;
-            return super::read_fulfillment::install(storage, state, &fulfillment, &response).await;
+            let response = super::read_fulfillment::fetch(transport, &fulfillment)
+                .await
+                .map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Validation,
+                    )
+                })?;
+            return super::read_fulfillment::install(storage, state, &fulfillment, &response)
+                .await
+                .map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Installation,
+                    )
+                });
         }
         let history_inputs = match &request {
             SyncDemandRequest::NativeMetadata(addresses, error) if allow_metadata_walk => {
@@ -650,6 +697,15 @@ fn hydrate_exact_demand_with_receipt<
             }
             SyncDemandRequest::Pinned(request) => {
                 hydrate_demand_with_receipt(storage, state, transport, *request).await
+            }
+            SyncDemandRequest::PrepareOfflineEditing => {
+                super::partial_write_frontier::prepare_baseline_write_frontier(
+                    storage,
+                    state,
+                    |address| hydrate_metadata(storage, state, transport, address),
+                )
+                .await?;
+                Ok(HydratedInputs::default())
             }
             SyncDemandRequest::ReconcilePartial => Err(LixError::unknown(
                 "reconciliation must run through the partial owner",

@@ -347,9 +347,16 @@ where
             ..HotStateScanRequest::default()
         };
         let identities = if schema_domain.untracked() {
-            hot_state.scan_batch(&request).await?
+            hot_state.scan_batch(&request).await.map_err(|error| {
+                annotate_catalog_operation(error, "registered_schema_identity_scan")
+            })?
         } else {
-            hot_state.scan_tracked_batch(&request).await?
+            hot_state
+                .scan_tracked_batch(&request)
+                .await
+                .map_err(|error| {
+                    annotate_catalog_operation(error, "registered_schema_identity_scan")
+                })?
         };
         // Engine schemas come from the embedded catalog. Their historical
         // registration projections cannot override that authority, so do not
@@ -386,7 +393,8 @@ where
                 untracked: Some(schema_domain.untracked()),
                 include_tombstones: false,
             })
-            .await?
+            .await
+            .map_err(|error| annotate_catalog_operation(error, "registered_schema_snapshot_load"))?
             .into_present_batch();
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
@@ -396,6 +404,34 @@ where
     Ok(CatalogRows {
         domains: catalog_rows,
     })
+}
+
+fn annotate_catalog_operation(mut error: LixError, operation: &'static str) -> LixError {
+    if error
+        .details
+        .as_deref()
+        .is_some_and(|details| !details.is_object())
+    {
+        // Keep unexpected non-object error details intact. The telemetry
+        // normalizer will simply omit the operation marker in this case.
+        return error;
+    }
+
+    let details = error
+        .details
+        .get_or_insert_with(|| Box::new(JsonValue::Object(Default::default())));
+    let JsonValue::Object(details) = details.as_mut() else {
+        unreachable!("non-object details returned above")
+    };
+    details.insert(
+        "payloadPhase".to_owned(),
+        JsonValue::String("pre_request_catalog".to_owned()),
+    );
+    details.insert(
+        "payloadOperation".to_owned(),
+        JsonValue::String(operation.to_owned()),
+    );
+    error
 }
 
 fn facts_from_catalog_rows(catalog_rows: &CatalogRows) -> Result<Vec<SchemaCatalogFact>, LixError> {
@@ -511,6 +547,31 @@ mod tests {
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
     use crate::hot_state::MaterializedHotStateRow;
+
+    #[test]
+    fn catalog_operation_annotation_preserves_existing_diagnostics() {
+        let error =
+            LixError::new(LixError::CODE_INTERNAL_ERROR, "private message").with_details(json!({
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "changeId": "11111111-1111-4111-8111-111111111111",
+            }));
+        let annotated = annotate_catalog_operation(error, "registered_schema_identity_scan");
+        assert_eq!(
+            annotated.details.as_deref(),
+            Some(&json!({
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "changeId": "11111111-1111-4111-8111-111111111111",
+                "payloadPhase": "pre_request_catalog",
+                "payloadOperation": "registered_schema_identity_scan",
+            }))
+        );
+
+        let non_object = LixError::new(LixError::CODE_INTERNAL_ERROR, "private message")
+            .with_details(json!("private detail"));
+        let unchanged =
+            annotate_catalog_operation(non_object.clone(), "registered_schema_snapshot_load");
+        assert_eq!(unchanged, non_object);
+    }
 
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {

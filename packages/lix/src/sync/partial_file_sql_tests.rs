@@ -119,7 +119,8 @@ async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
         )
         .await
         .unwrap();
-    let (authority, engine, session, old) = publication::fixture_from_authority(authority, None).await;
+    let (authority, engine, session, old) =
+        publication::fixture_from_authority(authority, None).await;
     let storage = engine.storage();
     let sql = "SELECT content FROM lix_file WHERE id = $1";
     let params = [Value::Text(id.to_owned())];
@@ -152,19 +153,26 @@ async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
             path_predicate: crate::hot_state::FilePathInterest::All, ..
         } if file_ids == &[id.to_owned()]
     )));
-    assert!(interests.interests.iter().any(|interest| matches!(
-        interest.as_ref(),
-        crate::hot_state::LogicalReadInterest::Scan { request, .. }
-            if request.filter.schema_keys == vec![
-                "lix_binary_blob_ref".to_owned(),
-                "lix_file_descriptor".to_owned(),
-            ] && request.filter.file_ids == vec![crate::NullableKeyFilter::Value(id.to_owned())]
-    )), "direct exact-ID route must capture its narrowed live-row demand");
+    assert!(
+        interests.interests.iter().any(|interest| matches!(
+            interest.as_ref(),
+            crate::hot_state::LogicalReadInterest::Scan { request, .. }
+                if request.filter.schema_keys == vec![
+                    "lix_binary_blob_ref".to_owned(),
+                    "lix_file_descriptor".to_owned(),
+                ] && request.filter.file_ids == vec![crate::NullableKeyFilter::Value(id.to_owned())]
+        )),
+        "direct exact-ID route must capture its narrowed live-row demand"
+    );
 
+    let remote_bytes = vec![0x5a; 1024];
     authority
         .execute(
-            "UPDATE lix_file SET path = '/after.bin' WHERE id = $1",
-            &params,
+            "UPDATE lix_file SET path = '/after.bin', content = $2 WHERE id = $1",
+            &[
+                Value::Text(id.to_owned()),
+                Value::Blob(remote_bytes.clone().into()),
+            ],
         )
         .await
         .unwrap();
@@ -178,26 +186,37 @@ async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
     crate::sync::partial_publication::publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    execute_file_hydrating(
-        &session,
-        &storage,
-        &next,
-        &authority,
-        sql,
-        &params,
-        &mut FileFetches::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(content(session.execute(sql, &params).await.unwrap()), bytes);
     assert_eq!(
-        session.execute("SELECT path FROM lix_file WHERE id = $1", &params)
+        content(session.execute(sql, &params).await.unwrap()),
+        remote_bytes,
+        "candidate adoption must stage the newly selected file bytes before publication"
+    );
+    assert_eq!(
+        session
+            .execute("SELECT path FROM lix_file WHERE id = $1", &params)
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("path")
             .unwrap(),
         "/after.bin"
+    );
+
+    let local_bytes = vec![0xa5; 1024];
+    session
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(local_bytes.clone().into()),
+                Value::Text(id.to_owned()),
+            ],
+        )
+        .await
+        .expect("the first edit after remote adoption must use the prepared write frontier");
+    assert_eq!(
+        content(session.execute(sql, &params).await.unwrap()),
+        local_bytes,
+        "the first local edit must read its prepared file inputs without foreground hydration"
     );
 }
 

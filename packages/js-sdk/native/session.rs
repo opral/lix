@@ -46,6 +46,7 @@ pub(crate) trait SessionOperations: Sized {
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError>;
     async fn sync_health(&self) -> Result<lix::SyncHealth, LixError>;
+    async fn prepare_offline_editing(&self) -> Result<(), LixError>;
     async fn active_branch_id(&self) -> Result<String, LixError>;
     async fn active_account_id(&self) -> Result<String, LixError>;
     async fn create_branch(
@@ -138,6 +139,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
 
     async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
         Ok(Lix::sync_health(self))
+    }
+    async fn prepare_offline_editing(&self) -> Result<(), LixError> {
+        Lix::prepare_offline_editing(self).await
     }
     async fn active_branch_id(&self) -> Result<String, LixError> {
         Lix::active_branch_id(self).await
@@ -331,6 +335,12 @@ mod remote {
         async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
             // Remote SQL sessions have no local replica synchronization worker.
             Ok(lix::SyncHealth::default())
+        }
+        async fn prepare_offline_editing(&self) -> Result<(), LixError> {
+            Err(LixError::new(
+                "LIX_SYNC_MODE_MISMATCH",
+                "offline editing preparation requires a partial replica",
+            ))
         }
         async fn active_branch_id(&self) -> Result<String, LixError> {
             ClientCore::active_branch_id(self).await

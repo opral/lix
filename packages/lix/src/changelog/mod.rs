@@ -14,7 +14,7 @@ mod store;
 mod test_support;
 mod types;
 
-pub(crate) use codec::decode_change_record;
+pub(crate) use codec::{decode_change_record, encode_change_record};
 #[cfg(test)]
 pub(crate) use codec::encode_commit_record;
 pub(crate) use context::{CHECKPOINT_INVENTORY_SPACE, ChangelogContext};

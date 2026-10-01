@@ -11565,12 +11565,21 @@ async fn hot_working_diff_entries(
         if !packed_base_matches_file_filter(base_ref, &filter.file_ids) {
             continue;
         }
-        let Ok(members) =
-            crate::tracked_state::scan_commit_delta_members(store, base_ref.commit_id).await
+        // A filtered working diff must not require packed payload parts for
+        // unrelated schemas. The authenticated delta scan routes only the
+        // requested schema ranges; finer identity predicates remain below.
+        let Ok(members) = crate::tracked_state::scan_commit_delta_values(
+            store,
+            base_ref.commit_id,
+            &filter.schema_keys,
+        )
+        .await
         else {
             return Ok(None);
         };
-        for (key, value) in members {
+        for row in members.iter() {
+            let key = row.key_ref();
+            let value = row.value();
             if !packed_identity_matches_filter(
                 &key.schema_key,
                 &key.row_pk,
@@ -11582,11 +11591,11 @@ async fn hot_working_diff_entries(
             let identity = HeadIdentity {
                 branch_id: branch_id.to_string(),
                 generation,
-                schema_key: key.schema_key,
-                row_pk: key.row_pk,
-                file_id: key.file_id,
+                schema_key: key.schema_key.to_owned(),
+                row_pk: key.row_pk.clone(),
+                file_id: key.file_id.map(str::to_owned),
             };
-            let version = packed_compact_working_diff_version(&value);
+            let version = packed_compact_working_diff_version(value);
             match selected.entry(identity) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(Some(version));

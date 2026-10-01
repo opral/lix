@@ -188,6 +188,7 @@ pub(crate) async fn commit_prepared_writes(
         &BTreeMap::new(),
         &BTreeMap::new(),
         None,
+        false,
         prepared_writes,
     )
     .await?;
@@ -217,6 +218,9 @@ pub(crate) struct MaterializedCommit {
     /// from another commit alters the visible filesystem without appearing in
     /// these rows, and the caller must rebuild for those shapes.
     pub(crate) filesystem_delta_rows: Vec<MaterializedHotStateRow>,
+    /// Provisional new-image IDs rewritten to their canonical commit-delta
+    /// IDs during this exact materialization.
+    pub(crate) canonical_change_id_remap: BTreeMap<String, String>,
     /// Canonical protocol commits emitted only for an Authority transaction's
     /// atomic transfer-size preflight. Other roles leave this empty and avoid
     /// protocol DTO and JSON parsing work.
@@ -244,6 +248,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     native_merge_checkpoints: &BTreeMap<String, CommitId>,
     undo_baseline: Option<&UndoBaselinePublication>,
+    capture_canonical_change_id_remap: bool,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -511,6 +516,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             writes,
             preconditions,
             filesystem_delta_rows: Vec::new(),
+            canonical_change_id_remap: BTreeMap::new(),
             sync_commits: Vec::new(),
             published_branch_controls: BTreeMap::new(),
             inherited_catalog_changed: false,
@@ -553,6 +559,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &replacement_generations,
         &ordered_replacements,
         capture_sync_commits,
+        capture_canonical_change_id_remap,
     ))
     .await?;
 
@@ -824,6 +831,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         writes,
         preconditions,
         filesystem_delta_rows,
+        canonical_change_id_remap: staged_delta_index.canonical_change_id_remap,
         sync_commits,
         published_branch_controls,
         inherited_catalog_changed: staged_hot_heads.inherited_catalog_changed,
@@ -916,6 +924,7 @@ struct StagedCommitDeltaIndex {
     inventories: BTreeMap<CommitId, CommitStateMutationInventory>,
     sync_ordered_change_ids: BTreeMap<CommitId, Vec<ChangeId>>,
     ordered_replacement_assignments: BTreeMap<CommitId, OrderedAddressableCommitDeltaStage>,
+    canonical_change_id_remap: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1944,11 +1953,14 @@ async fn stage_tracked_commit_delta_index(
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     capture_sync_commits: bool,
+    capture_canonical_change_id_remap: bool,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
     let mut sync_ordered_change_ids = BTreeMap::new();
     let mut ordered_replacement_assignments = BTreeMap::new();
+    let mut canonical_change_id_remap = capture_canonical_change_id_remap
+        .then(BTreeMap::<String, String>::new);
     let commit_rows = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit))
@@ -2157,6 +2169,17 @@ async fn stage_tracked_commit_delta_index(
             };
             if let Some(ordered_stage) = ordered_stage {
                 inventories.insert(root.commit_id, ordered_stage.mutation_inventory().clone());
+                for (&row_index, canonical) in state_row_indices
+                    .iter()
+                    .zip(ordered_stage.assigned_change_ids())
+                {
+                    let row = state_rows.row(row_index);
+                    if row.addressable_change_id {
+                        if let Some(remap) = &mut canonical_change_id_remap {
+                            record_canonical_change_id_remap(remap, row.change_id, canonical)?;
+                        }
+                    }
+                }
                 if capture_sync_commits {
                     sync_ordered_change_ids.insert(
                         root.commit_id,
@@ -2313,6 +2336,13 @@ async fn stage_tracked_commit_delta_index(
                     "addressable tracked row received no commit-delta address",
                 ));
             }
+            if let Some(remap) = &mut canonical_change_id_remap {
+                record_canonical_change_id_remap(
+                    remap,
+                    state_rows.row(row_index).change_id,
+                    change_id,
+                )?;
+            }
             state_rows.set_change_id(row_index, Some(change_id));
         }
         stage_change_locators(writes, &staged.authored_locators);
@@ -2322,7 +2352,38 @@ async fn stage_tracked_commit_delta_index(
         inventories,
         sync_ordered_change_ids,
         ordered_replacement_assignments,
+        canonical_change_id_remap: canonical_change_id_remap.unwrap_or_default(),
     })
+}
+
+fn record_canonical_change_id_remap(
+    remap: &mut BTreeMap<String, String>,
+    provisional: Option<ChangeId>,
+    canonical: ChangeId,
+) -> Result<(), LixError> {
+    let Some(provisional) = provisional else {
+        return Ok(());
+    };
+    // Dense certified batches use the nil value as an internal placeholder.
+    // RETURNING audit projections take the row-oriented path and therefore
+    // have unique generated provisional IDs; never turn a shared placeholder
+    // into an ambiguous result remap.
+    if provisional == ChangeId::default() || provisional == canonical {
+        return Ok(());
+    }
+    let provisional = provisional.to_string();
+    let canonical = canonical.to_string();
+    match remap.get(&provisional) {
+        Some(existing) if existing != &canonical => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "provisional change ID maps to more than one canonical commit-delta ID",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            remap.insert(provisional, canonical);
+            Ok(())
+        }
+    }
 }
 
 #[expect(clippy::too_many_arguments)]

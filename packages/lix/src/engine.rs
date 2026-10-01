@@ -227,11 +227,12 @@ where
         &self,
         read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,
         target: &crate::sync::PartialReplicaState,
+        interests: &crate::hot_state::MovingReadInterestSnapshot,
     ) -> Result<crate::sync::PreparedCandidateState, LixError> {
         crate::session::prepare_partial_candidate_read_scope::<StorageImpl>(
             read,
             target,
-            None,
+            Some(interests),
             self.plugin_host.clone(),
             self.hot_state.fork_for_native_candidate(),
             false,

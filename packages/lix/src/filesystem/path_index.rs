@@ -631,6 +631,44 @@ impl FilesystemPathIndex {
         self.files_by_id.values_equal_by(id, |key| key.id.as_str())
     }
 
+    /// Projects a complete cached view into the file-ID scope requested by a
+    /// point read. Keep only matching file lanes and the exact directory
+    /// ancestry already resolved for each lane. This lets a warm full index
+    /// serve a narrow request without exposing unrelated entries or scanning
+    /// the backing store again.
+    fn project_file_ids(&self, file_ids: &[String]) -> Self {
+        let mut entries = BTreeMap::<FilesystemPathEntryIdentity, FilesystemPathEntry>::new();
+        for file_id in file_ids {
+            for file in self.exact_file_id_entries(file_id) {
+                let identity = entry_identity(&file);
+                if entries.insert(identity, file.as_ref().clone()).is_some() {
+                    continue;
+                }
+
+                let mut parent_identity = file.parent_identity.clone();
+                while let Some(identity) = parent_identity {
+                    if entries.contains_key(&identity) {
+                        break;
+                    }
+                    let Some(parent) = self.entries_by_identity.get(&identity) else {
+                        break;
+                    };
+                    parent_identity = parent.parent_identity.clone();
+                    entries.insert(identity, parent.as_ref().clone());
+                }
+            }
+        }
+
+        let file_count = entries
+            .values()
+            .filter(|entry| entry.kind == FilesystemPathKind::File)
+            .count();
+        let mut projected =
+            Self::from_validated_entries(entries.into_values().collect(), file_count);
+        projected.generation = self.generation.clone();
+        projected
+    }
+
     pub(crate) fn range_entries(
         &self,
         lower: Bound<&str>,
@@ -1527,11 +1565,7 @@ impl FilesystemPathIndexCache {
     /// Admit one-off exact-ID requests to a bounded row route. Repeated exact
     /// scopes benefit from a revision-checked path index after two direct reads.
     /// Bounded LRU state cannot affect results.
-    pub(crate) fn prefer_direct_exact_content(
-        &self,
-        branch_ids: &[String],
-        file_id: &str,
-    ) -> bool {
+    pub(crate) fn prefer_direct_exact_content(&self, branch_ids: &[String], file_id: &str) -> bool {
         self.prefer_direct_exact_request(&Self::exact_request(branch_ids, file_id, true))
     }
 
@@ -1636,7 +1670,21 @@ impl FilesystemPathIndexCache {
             .entries
             .lock()
             .expect("filesystem path cache lock poisoned");
-        let Some(index) = entries.iter().position(|candidate| candidate.key == key) else {
+        let exact = entries.iter().position(|candidate| candidate.key == key);
+        let covering_all = exact
+            .is_none()
+            .then(|| match &request.scope {
+                FilesystemPathIndexScope::FileIds(_) => entries.iter().position(|candidate| {
+                    candidate.key.scope == FilesystemPathIndexScope::All
+                        && candidate.key.branch_ids == key.branch_ids
+                        && candidate.key.revision == key.revision
+                        && candidate.key.include_blob_refs == key.include_blob_refs
+                        && candidate.key.cache_small_blob_data == key.cache_small_blob_data
+                }),
+                FilesystemPathIndexScope::All | FilesystemPathIndexScope::DirectoriesOnly => None,
+            })
+            .flatten();
+        let Some(index) = exact.or(covering_all) else {
             #[cfg(test)]
             PATH_INDEX_CACHE_MISSES.with(|misses| misses.set(misses.get().saturating_add(1)));
             return None;
@@ -1646,7 +1694,14 @@ impl FilesystemPathIndexCache {
         let entry = entries.remove(index);
         let result = Arc::clone(&entry.index);
         entries.push(entry);
-        Some(result)
+        drop(entries);
+
+        match &request.scope {
+            FilesystemPathIndexScope::FileIds(file_ids) if covering_all.is_some() => {
+                Some(Arc::new(result.project_file_ids(file_ids)))
+            }
+            _ => Some(result),
+        }
     }
 
     pub(crate) fn insert(
@@ -2103,10 +2158,8 @@ mod tests {
         cache.insert(&request, Some(&[1]), Arc::new(index));
         assert!(!cache.prefer_direct_exact_content(&branch, id));
         cache.clear();
-        let blobless = path_index_from_rows(vec![file_row(
-            id, None, "note.txt", &branch[0], false,
-        )])
-        .unwrap();
+        let blobless =
+            path_index_from_rows(vec![file_row(id, None, "note.txt", &branch[0], false)]).unwrap();
         cache.insert(&request, None, Arc::new(blobless));
         assert!(!cache.prefer_direct_exact_content(&branch, id));
     }
@@ -2463,8 +2516,16 @@ mod tests {
             "directory listing work should be independent of unrelated files"
         );
 
+        // The full and directory-only probes above populate this reader's
+        // cache. Use a fresh context to measure a cold scoped build rather
+        // than a valid projection from the already-warm full index.
+        let scoped_hot = crate::hot_state::HotStateContext::new(
+            crate::tracked_state::TrackedStateContext::new(),
+            crate::commit_graph::CommitGraphContext::new(),
+        );
+        let scoped_reader = scoped_hot.reader(&read);
         reset_full_rebuild_stats();
-        let index = reader.path_index(&request).await.unwrap();
+        let index = scoped_reader.path_index(&request).await.unwrap();
         let (_, scoped_rows) = full_rebuild_stats();
         assert!(
             full_domain_rows >= 400,
@@ -2487,7 +2548,10 @@ mod tests {
             vec!["/top", "/top/nested", "/top/nested/a.bin"]
         );
         assert!(
-            Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()),
+            Arc::ptr_eq(
+                &index,
+                &scoped_reader.path_index(&request).await.unwrap()
+            ),
             "scoped reads reuse the revision cache"
         );
         let root = request.clone().with_file_ids(Some(vec![root_id]));
@@ -2611,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_path_index_cache_separates_selection_and_evicts_on_revision_change() {
+    fn scoped_path_index_cache_projects_covering_all_and_evicts_on_revision_change() {
         let cache = FilesystemPathIndexCache::default();
         let full = FilesystemPathIndexRequest::new(vec!["branch".to_owned()]);
         let directories = full
@@ -2633,7 +2697,11 @@ mod tests {
             Arc::new(FilesystemPathIndex::default()),
         );
         let full_index = cache.insert(&full, Some(&[1]), Arc::new(FilesystemPathIndex::default()));
-        assert!(cache.get(&b, Some(&[1])).is_none());
+        let projected_b = cache
+            .get(&b, Some(&[1]))
+            .expect("matching full view should cover a file-ID selection");
+        assert!(projected_b.entries().is_empty());
+        assert!(!Arc::ptr_eq(&projected_b, &full_index));
         assert!(Arc::ptr_eq(&index, &cache.get(&a, Some(&[1])).unwrap()));
         assert!(Arc::ptr_eq(
             &directory_index,
@@ -2645,11 +2713,99 @@ mod tests {
         ));
         cache.advance_committed(Some(&[1]), Some(&[2]), &[]);
         assert!(cache.get(&a, Some(&[1])).is_none());
-        assert!(cache.get(&a, Some(&[2])).is_none());
+        assert!(
+            cache
+                .get(&a, Some(&[2]))
+                .expect("advanced full view should cover the file-ID selection")
+                .entries()
+                .is_empty()
+        );
         assert!(cache.get(&directories, Some(&[1])).is_none());
         assert!(cache.get(&full, Some(&[1])).is_none());
         assert!(cache.get(&directories, Some(&[2])).is_some());
         assert!(cache.get(&full, Some(&[2])).is_some());
+    }
+
+    #[test]
+    fn covering_all_cache_projects_only_requested_files_and_parent_lanes() {
+        let branch = vec!["branch-a".to_owned()];
+        let all = FilesystemPathIndexRequest::new(branch.clone());
+        let exact = all.clone().with_file_ids(Some(vec!["selected".to_owned()]));
+        let full = Arc::new(
+            path_index_from_rows(vec![
+                directory_row("root", None, "root", &branch[0], false),
+                directory_row("nested", Some("root"), "nested", &branch[0], false),
+                file_row("selected", Some("nested"), "selected.md", &branch[0], false),
+                file_row(
+                    "unselected",
+                    Some("root"),
+                    "unselected.md",
+                    &branch[0],
+                    false,
+                ),
+            ])
+            .expect("full index should build"),
+        );
+        let cache = FilesystemPathIndexCache::default();
+        cache.insert(&all, Some(&[5]), full);
+
+        let projected = cache.get(&exact, Some(&[5])).expect("covering full index");
+        assert_eq!(projected.generation(), Some([5].as_slice()));
+        assert_eq!(projected.kind_count(FilesystemPathKind::File), 1);
+        assert_eq!(projected.kind_count(FilesystemPathKind::Directory), 2);
+        assert_eq!(
+            projected
+                .entries()
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/root", "/root/nested", "/root/nested/selected.md"]
+        );
+        assert!(projected.exact_file_id_entries("unselected").is_empty());
+
+        let selected_only_cache = FilesystemPathIndexCache::default();
+        selected_only_cache.insert(&exact, Some(&[5]), Arc::new(projected.as_ref().clone()));
+        let another_id = all.with_file_ids(Some(vec!["unselected".to_owned()]));
+        assert!(selected_only_cache.get(&another_id, Some(&[5])).is_none());
+    }
+
+    #[test]
+    fn covering_all_cache_requires_matching_revision_branch_and_projection() {
+        let branch_a = FilesystemPathIndexRequest::new(vec!["branch-a".to_owned()]);
+        let exact = branch_a
+            .clone()
+            .with_file_ids(Some(vec!["selected".to_owned()]));
+        let index = Arc::new(FilesystemPathIndex::default());
+
+        let cache = FilesystemPathIndexCache::default();
+        cache.insert(&branch_a, Some(&[5]), Arc::clone(&index));
+        assert!(cache.get(&exact, Some(&[6])).is_none());
+        let branch_b = FilesystemPathIndexRequest::new(vec!["branch-b".to_owned()]);
+        assert!(
+            cache
+                .get(
+                    &branch_b.with_file_ids(Some(vec!["selected".to_owned()])),
+                    Some(&[5])
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&exact.clone().with_blob_refs(true), Some(&[5]))
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&exact.clone().with_cached_blob_data(true), Some(&[5]))
+                .is_none()
+        );
+
+        let only_file_scope = FilesystemPathIndexCache::default();
+        only_file_scope.insert(&exact, Some(&[5]), index);
+        assert!(
+            only_file_scope.get(&branch_a, Some(&[5])).is_none(),
+            "a narrow file view cannot cover the full index"
+        );
     }
 
     #[test]

@@ -22,6 +22,6 @@ RETURNING supports searched and simple `CASE` expressions, including `OLD` and `
 
 These image semantics follow PostgreSQL 18. Custom image aliases using `RETURNING WITH (OLD AS ..., NEW AS ...)` are not supported.
 
-Returning rows describe a statement, including no-op updates. Two statements that change A to B and then B to A return both transitions, while an endpoint diff can be empty. Use the committed operation's `commit` receipt with `lix_diff` for the transaction's net changes. Rows returned inside an explicit transaction are provisional until commit succeeds. A failing RETURNING expression rolls back that statement's writes.
+Returning rows describe a statement, including no-op updates. Two statements that change A to B and then B to A return both transitions, while an endpoint diff can be empty. Use the committed operation's `commit` receipt with `lix_diff` for the transaction's net changes. Rows returned inside an explicit transaction are provisional until commit succeeds. Auto-committed writes return canonical `lixcol_change_id` values for direct new-image projections after commit materialization; `OLD.lixcol_change_id` remains the prior image. A failing RETURNING expression rolls back that statement's writes.
 
 File bytes are materialized only when needed by a predicate, assignment, or a requested image. Select file IDs or paths when the caller only needs metadata. RETURNING provides accurate write images; overwrite protection additionally requires validating the caller's expected state inside the write transaction.

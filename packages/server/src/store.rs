@@ -187,6 +187,8 @@ struct ManagerState {
 pub(crate) struct MigrationDiagnostic {
     pub source_code: Option<&'static str>,
     pub message: &'static str,
+    pub receipt_version: Option<u32>,
+    pub expected_receipt_version: Option<u32>,
 }
 
 impl MigrationDiagnostic {
@@ -197,6 +199,10 @@ impl MigrationDiagnostic {
         let source_code = source.and_then(|error| match error.code.as_str() {
             "LIX_ERROR_MIGRATION_FAILED" => Some("LIX_ERROR_MIGRATION_FAILED"),
             "LIX_ERROR_REPOSITORY_UPGRADE" => Some("LIX_ERROR_REPOSITORY_UPGRADE"),
+            "LIX_PARTIAL_REPLICA_STATE_INVALID" => Some("LIX_PARTIAL_REPLICA_STATE_INVALID"),
+            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH" => {
+                Some("LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH")
+            }
             _ => None,
         });
         let message = match source {
@@ -210,9 +216,18 @@ impl MigrationDiagnostic {
                 "The migration could not complete. The service operator can inspect the server logs for the underlying cause."
             }
         };
+        let version = |key: &str| {
+            source
+                .and_then(|error| error.details.as_deref())
+                .and_then(|details| details.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
         Self {
             source_code,
             message,
+            receipt_version: version("receiptVersion"),
+            expected_receipt_version: version("expectedReceiptVersion"),
         }
     }
 }
@@ -2564,6 +2579,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn migration_diagnostic_keeps_structural_receipt_versions_without_private_payload() {
+        let error = anyhow::Error::new(lix_sdk::LixError::new(
+            "LIX_PARTIAL_REPLICA_STATE_INVALID", "private storage payload",
+        ).with_details(serde_json::json!({"receiptVersion": 2, "expectedReceiptVersion": 3, "secret": "private storage payload"})));
+        let diagnostic = MigrationDiagnostic::from_error(&error);
+        assert_eq!(
+            diagnostic.source_code,
+            Some("LIX_PARTIAL_REPLICA_STATE_INVALID")
+        );
+        assert_eq!(diagnostic.receipt_version, Some(2));
+        assert_eq!(diagnostic.expected_receipt_version, Some(3));
+        assert!(!format!("{diagnostic:?}").contains("private storage payload"));
+    }
+
     #[tokio::test]
     async fn failed_migration_remains_terminal_for_every_caller() {
         let manager = memory_manager(1).await;
@@ -4181,6 +4211,12 @@ struct RepositoryRecord {
     retired: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum AuthorityAdmissionError {
+    Catalog(lix_sdk::server_protocol::LifecycleError),
+    Runtime(LixRuntimeError),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AuthorityAdmission {
@@ -4255,14 +4291,14 @@ impl LixRuntimeManager {
         self: &Arc<Self>,
         id: &str,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<AuthorityAdmission>, lix_sdk::server_protocol::LifecycleError> {
+    ) -> Result<Option<AuthorityAdmission>, AuthorityAdmissionError> {
         use lix_sdk::server_protocol::LifecycleError;
         let record = self.repository_record(id).await.map_err(|_| {
-            LifecycleError::new(
+            AuthorityAdmissionError::Catalog(LifecycleError::new(
                 http::StatusCode::SERVICE_UNAVAILABLE,
                 "LIX_CATALOG_UNAVAILABLE",
                 "Repository admission metadata is unavailable.",
-            )
+            ))
         })?;
         let Some(record) = record.filter(|record| record.state == "live") else {
             return Ok(None);
@@ -4271,11 +4307,11 @@ impl LixRuntimeManager {
             if admission.storage_epoch > lix_sdk::CURRENT_STORAGE_FORMAT_VERSION
                 || admission.protocol_epoch > lix_sdk::SYNC_PROTOCOL_VERSION
             {
-                return Err(LifecycleError::new(
+                return Err(AuthorityAdmissionError::Catalog(LifecycleError::new(
                     http::StatusCode::CONFLICT,
                     "LIX_PROTOCOL_VERSION_MISMATCH",
                     "The repository requires a newer Lix server.",
-                ));
+                )));
             }
             if admission.storage_epoch == lix_sdk::CURRENT_STORAGE_FORMAT_VERSION {
                 return Ok(Some(AuthorityAdmission::current()));
@@ -4287,19 +4323,15 @@ impl LixRuntimeManager {
             .min(Duration::from_secs(1));
         match tokio::time::timeout(opening_wait, self.get(id)).await {
             Ok(Ok(_)) => Ok(Some(AuthorityAdmission::current())),
-            Err(_) | Ok(Err(LixRuntimeError::Migrating { .. } | LixRuntimeError::Recovering)) => {
-                Err(LifecycleError::new(
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    "LIX_REPOSITORY_MIGRATING",
-                    "The repository is being upgraded. Retry this request.",
-                ))
-            }
-            Ok(Err(LixRuntimeError::NotFound)) => Ok(None),
-            Ok(Err(_)) => Err(LifecycleError::new(
+            Err(_) => Err(AuthorityAdmissionError::Catalog(LifecycleError::new(
                 http::StatusCode::SERVICE_UNAVAILABLE,
-                "LIX_REPOSITORY_OPEN_FAILED",
-                "The repository could not be opened. Its existing data is retained.",
-            )),
+                "LIX_REPOSITORY_MIGRATING",
+                "The repository is being upgraded. Retry this request.",
+            ))),
+            Ok(Err(LixRuntimeError::NotFound)) => Ok(None),
+            // Keep the same typed cause/status/details as ordinary protocol
+            // requests. A terminal migration is not transient unavailability.
+            Ok(Err(error)) => Err(AuthorityAdmissionError::Runtime(error)),
         }
     }
 
@@ -5295,7 +5327,10 @@ mod admission_tests {
             .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "LIX_REPOSITORY_OPEN_FAILED");
+        assert!(
+            matches!(error, AuthorityAdmissionError::Runtime(_)),
+            "admission must preserve the runtime failure rather than mask it as a generic 503"
+        );
         assert_eq!(
             store
                 .get(&path)
@@ -5308,6 +5343,69 @@ mod admission_tests {
             original.as_bytes()
         );
         assert!(!manager.legacy_storage_present(ID).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn admission_preserves_terminal_migration_cause_and_status() {
+        use tower::ServiceExt as _;
+        let manager = LixRuntimeManager::new_in_memory(1);
+        let (store, prefix) = manager.catalog_store();
+        let path = ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json"));
+        store
+            .put(
+                &path,
+                serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]})
+                    .to_string()
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let diagnostic = MigrationDiagnostic::from_error(&anyhow::Error::new(
+            lix_sdk::LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", "private payload")
+                .with_details(serde_json::json!({"receiptVersion":2,"expectedReceiptVersion":3})),
+        ));
+        manager.state.lock().await.failed_upgrades.insert(
+            ID.to_string(),
+            FailedUpgrade::Versioned(FailedMigration {
+                diagnostic,
+                from_version: 84,
+                to_version: 85,
+            }),
+        );
+        let app = crate::router(
+            manager,
+            Some("test-token".to_owned()),
+            Duration::from_secs(30),
+            Default::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lix/v1/{ID}/admission"))
+                    .header("authorization", "Bearer test-token")
+                    .header(
+                        "lix-sync-protocol-version",
+                        lix_sdk::SYNC_PROTOCOL_VERSION.to_string(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "LIX_ERROR_MIGRATION_FAILED");
+        assert_eq!(
+            body["error"]["details"]["sourceCode"],
+            "LIX_PARTIAL_REPLICA_STATE_INVALID"
+        );
+        assert_eq!(body["error"]["details"]["receiptVersion"], 2);
+        assert_eq!(body["error"]["details"]["expectedReceiptVersion"], 3);
+        assert_eq!(body["error"]["details"]["retryable"], false);
+        assert!(!String::from_utf8_lossy(&bytes).contains("private payload"));
     }
 
     #[tokio::test]

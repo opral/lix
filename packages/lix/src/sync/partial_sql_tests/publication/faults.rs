@@ -218,7 +218,7 @@ async fn prepared_fault_fixture_with_deadline(
 #[tokio::test]
 async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
     tokio::time::timeout(Duration::from_secs(10),async {
-        let (engine,session,old,next,prepared,fault,authority)=prepared_fault_fixture().await;
+        let (engine,session,old,next,prepared,fault,_authority)=prepared_fault_fixture().await;
         fault.mode.store(1,Ordering::SeqCst);
         let mut caller=Box::pin(publish_prepared_partial(engine.clone(),prepared));
         tokio::select! {
@@ -237,9 +237,7 @@ async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
         let mut query=Box::pin(session.execute("SELECT value FROM lix_key_value WHERE key='resident'",&[]));
         assert!(tokio::time::timeout(Duration::from_millis(30),&mut query).await.is_err(),"direct SQL escaped publication gate before acknowledgement");
         fault.release.notify_one();
-        let missing = query.await.unwrap_err();
-        assert!(NativeObjectRef::from_missing_error(&missing).unwrap().is_some()
-            || NativeMetadataRef::from_missing_error(&missing).unwrap().is_some(), "{missing:?}");
+        assert!(value(query.await.unwrap()).contains("remote"));
         // Gate acquisition by SQL establishes that the owned publisher finished
         // its ACK and state swap. Its final guard drop may be scheduled next.
         let _new_owner = loop {
@@ -252,8 +250,7 @@ async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
         assert_eq!(engine.sync_mode().partial_admission().as_deref(),Some(next.as_ref()));
         let (reopened,fresh)=Engine::new_partial_replica(engine.storage(),EngineOptions::new(),&next).await.unwrap();
         reopened.sync_mode().admit_partial_replica(next.clone(),crate::sync::partial_replica_write_capability());
-        assert!(value(execute_hydrating(&fresh, &reopened.storage(), &next, &authority,
-            "SELECT value FROM lix_key_value WHERE key='resident'", &[], &mut Fetches::default()).await.unwrap()).contains("remote"));
+        assert!(value(fresh.execute("SELECT value FROM lix_key_value WHERE key='resident'", &[]).await.unwrap()).contains("remote"));
     }).await.expect("publication cancellation test timed out");
 }
 

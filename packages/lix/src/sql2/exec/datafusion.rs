@@ -1442,6 +1442,23 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
+    let direct_new_change_id_columns = plan
+        .bound
+        .returning
+        .as_ref()
+        .map_or_else(Vec::new, |returning| {
+            returning.direct_new_change_id_columns(plan.bound.op == BoundWriteOp::Delete)
+        });
+    execute_datafusion_write_logical_plan_inner(ctx, plan, params)
+        .await
+        .map(|result| result.with_direct_new_change_id_columns(direct_new_change_id_columns))
+}
+
+async fn execute_datafusion_write_logical_plan_inner(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Result<SqlWriteResult, LixError> {
     validate_bound_write_input(plan, params)?;
     let table_name = write_target_table_name(plan)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan), plan).await?;

@@ -200,6 +200,7 @@ struct HttpProbe {
     fulfilled_manifests: AtomicU64,
     fulfilled_chunks: AtomicU64,
     fulfilled_chunk_ids: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
+    directory_registry_fulfillments: AtomicU64,
     chunk_gets: AtomicU64,
     chunk_puts: AtomicU64,
     reject_requests: AtomicBool,
@@ -3167,8 +3168,33 @@ where
             .expect("collect bounded fulfillment")
             .to_bytes();
         let response: JsonValue = serde_json::from_slice(&bytes).expect("fulfillment JSON");
+        let mut registry_branches = std::collections::BTreeSet::new();
+        let mut directory_branches = std::collections::BTreeSet::new();
         for input in response["inputs"].as_array().expect("fulfillment inputs") {
             match input["address"]["kind"].as_str() {
+                Some("change_record") => {
+                    let address = &input["address"]["address"];
+                    let Some(branch_id) = address["branch_id"].as_str() else {
+                        continue;
+                    };
+                    match address["schema_key"].as_str() {
+                        Some("lix_directory_descriptor") => {
+                            directory_branches.insert(branch_id.to_owned());
+                        }
+                        Some("lix_key_value")
+                            if address["row_pk"]
+                                .as_array()
+                                .and_then(|parts| parts.first())
+                                .and_then(|part| part["type"].as_str())
+                                == Some("string")
+                                && address["row_pk"][0]["value"].as_str()
+                                    == Some("lix_plugin_registry_v2") =>
+                        {
+                            registry_branches.insert(branch_id.to_owned());
+                        }
+                        _ => {}
+                    }
+                }
                 Some("blob_manifest") => {
                     probe.fulfilled_manifests.fetch_add(1, Ordering::Release);
                 }
@@ -3181,6 +3207,14 @@ where
                 }
                 _ => {}
             }
+        }
+        if registry_branches
+            .iter()
+            .any(|branch_id| directory_branches.contains(branch_id))
+        {
+            probe
+                .directory_registry_fulfillments
+                .fetch_add(1, Ordering::Release);
         }
         ServerProtocolBody::full(bytes)
     } else if is_partial_merge && parts.status == StatusCode::CONFLICT {

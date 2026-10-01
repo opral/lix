@@ -56,6 +56,10 @@ simulation_test!(
                 .any(|column| column == "lixcol_commit_id"),
             "wildcard should include the final audit columns"
         );
+        assert!(wildcard.rows().iter().all(|row| matches!(
+            row.value("lixcol_change_id"),
+            Ok(Value::Text(change_id)) if !change_id.is_empty()
+        )));
 
         let updated = session
             .execute(
@@ -86,7 +90,7 @@ simulation_test!(
             Value::Text(updated_title),
             Value::Text(created_at),
             Value::Text(updated_at),
-            Value::Null,
+            Value::Text(change_id),
             Value::Text(commit_id),
         ] = updated.rows()[0].values()
         else {
@@ -94,9 +98,17 @@ simulation_test!(
         };
         assert_eq!(returned_id, &id);
         assert_eq!(updated_title, "Updated through RETURNING");
-        // Addressable tracked writes intentionally hide the staged change ID
-        // from transaction-visible state. RETURNING matches SELECT and keeps
-        // it NULL until that visibility boundary exposes it.
+        let persisted_change_id = session
+            .execute(
+                "SELECT lixcol_change_id FROM returning_task WHERE id = $1",
+                &[Value::Text(id.clone())],
+            )
+            .await
+            .expect("updated row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("persisted change ID should be text");
+        assert_eq!(change_id, &persisted_change_id);
         for value in [created_at, updated_at, commit_id] {
             assert!(
                 !value.is_empty(),
@@ -943,7 +955,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[Value::Text(path.into()), Value::Blob(b"before".to_vec().into())],
+                &[
+                    Value::Text(path.into()),
+                    Value::Blob(b"before".to_vec().into()),
+                ],
             )
             .await
             .unwrap();
@@ -1023,7 +1038,10 @@ simulation_test!(
         );
 
         let stored = session
-            .execute("SELECT content FROM lix_file WHERE path = $1", &[Value::Text(path.into())])
+            .execute(
+                "SELECT content FROM lix_file WHERE path = $1",
+                &[Value::Text(path.into())],
+            )
             .await
             .unwrap();
         assert_rows_eq(stored, vec![vec![original_content]]);

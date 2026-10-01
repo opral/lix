@@ -225,6 +225,56 @@ mod tests {
             "public JSON remains intentionally unchanged"
         );
     }
+
+    #[test]
+    fn catalog_identity_scan_shape_survives_registry_codec_and_deduplicates() {
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec!["lix_registered_schema".into()],
+                branch_ids: vec![crate::GLOBAL_BRANCH_ID.into()],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                untracked: Some(false),
+                ..Default::default()
+            },
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["row_pk".into()],
+            },
+            ..Default::default()
+        };
+        assert!(request.is_catalog_identity_only_scan());
+        let interest = LogicalReadInterest::Scan {
+            request: request.clone(),
+            domain: InterestDomain::Tracked,
+        };
+        let encoded = serde_json::to_vec(&interest).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["request"]["filter"]["schema_keys"][0], "lix_registered_schema");
+        assert_eq!(
+            serde_json::from_slice::<LogicalReadInterest>(&encoded).unwrap(),
+            interest
+        );
+
+        let registry = ReadInterestRegistry::new(4, 16 * 1024);
+        registry.register(interest.clone()).unwrap();
+        let persisted = serde_json::to_vec(
+            &registry
+                .snapshot()
+                .unwrap()
+                .interests
+                .iter()
+                .map(|recipe| recipe.as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let restored = ReadInterestRegistry::new(4, 16 * 1024);
+        restored
+            .merge_persisted(serde_json::from_slice(&persisted).unwrap())
+            .unwrap();
+        assert_eq!(restored.snapshot().unwrap().interests.len(), 1);
+        restored.register(interest.clone()).unwrap();
+        assert_eq!(restored.snapshot().unwrap().interests.len(), 1);
+
+    }
     #[test]
     fn registry_restore_preserves_distinct_uuid_and_text_recipes() {
         let registry = ReadInterestRegistry::new(16, 64 * 1024);

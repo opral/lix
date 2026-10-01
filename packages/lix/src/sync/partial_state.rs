@@ -15,7 +15,10 @@ use crate::storage_adapter::{
     ValueSemantics,
 };
 
-use super::partial_replica::PartialReplicaDescriptor;
+use super::partial_replica::{
+    PARTIAL_REPLICA_DESCRIPTOR_VERSION, PartialReplicaBranch, PartialReplicaCommitRoots,
+    PartialReplicaDescriptor,
+};
 
 pub(crate) const PARTIAL_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0007_0019),
@@ -105,9 +108,13 @@ impl PartialReplicaState {
             partial_replica_state_key(),
             MAX_STATE_BYTES,
             move |bytes| {
-                let state: PartialReplicaState = serde_json::from_slice(bytes)
-                    .map_err(|_| invalid("partial read admission is malformed"))?;
-                state.validate()?;
+                let version =
+                    partial_receipt_version(bytes, "partial read admission version is malformed")?;
+                let state = decode_current_partial_receipt(
+                    bytes,
+                    version,
+                    "partial read admission is malformed",
+                )?;
                 if state.repository_id() != expected_repository
                     || state.remote_id() != expected_remote
                     || state.active_account_id() != expected_account
@@ -195,7 +202,7 @@ impl PartialReplicaState {
             ));
         }
         if self.version != STATE_VERSION {
-            return Err(invalid("unsupported partial replica state version"));
+            return Err(receipt_version_error("unsupported partial replica state version", self.version));
         }
         super::validate_sync_remote_id(&self.remote_id)?;
         for id in [
@@ -346,6 +353,78 @@ fn invalid(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_REPLICA_STATE_INVALID", message)
 }
 
+fn receipt_failure(
+    error: LixError,
+    version: Option<u32>,
+    failure_reason: &'static str,
+    failure_path: &'static str,
+) -> LixError {
+    let mut details = serde_json::json!({
+        "expectedReceiptVersion": STATE_VERSION,
+        "migrationPhase": "partial_receipt",
+        "failureReason": failure_reason,
+        "failurePath": failure_path,
+    });
+    if let Some(version) = version {
+        details["receiptVersion"] = serde_json::json!(version);
+    }
+    error.with_details(details)
+}
+
+fn receipt_version_error(message: &str, version: u32) -> LixError {
+    receipt_failure(
+        invalid(message),
+        Some(version),
+        "unsupported_receipt_version",
+        "$",
+    )
+}
+
+fn partial_receipt_version(bytes: &[u8], message: &str) -> Result<u32, LixError> {
+    let probe: PartialReplicaReceiptVersion = serde_json::from_slice(bytes)
+        .map_err(|error| receipt_json_parse_error(error, None, message))?;
+    Ok(probe.version)
+}
+
+fn decode_current_partial_receipt(
+    bytes: &[u8],
+    version: u32,
+    message: &str,
+) -> Result<PartialReplicaState, LixError> {
+    if version != STATE_VERSION {
+        return Err(receipt_version_error(
+            "partial receipt requires owned migration",
+            version,
+        ));
+    }
+    let state: PartialReplicaState = serde_json::from_slice(bytes)
+        .map_err(|error| receipt_json_parse_error(error, Some(version), message))?;
+    validate_partial_receipt_state(&state, version)?;
+    Ok(state)
+}
+
+fn validate_partial_receipt_state(
+    state: &PartialReplicaState,
+    version: u32,
+) -> Result<(), LixError> {
+    let roots = super::leased_descriptor::descriptor_roots(&state.descriptor)
+        .map_err(|error| receipt_failure(error, Some(version), "receipt_validation_failed", "$"))?;
+    state
+        .baseline_lease
+        .validate_for_roots(&state.active_account_id, &roots)
+        .map_err(|error| {
+            receipt_failure(
+                error,
+                Some(version),
+                "baseline_lease_invalid",
+                "$.baselineLease",
+            )
+        })?;
+    state
+        .validate()
+        .map_err(|error| receipt_failure(error, Some(version), "receipt_validation_failed", "$"))
+}
+
 /// One point read. The returned bytes fence a caller's later atomic update.
 pub(crate) async fn load_partial_replica_state(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -360,14 +439,24 @@ pub(crate) async fn load_partial_replica_state(
         return Ok(None);
     };
     let StorageProjectedValue::FullValue(bytes) = value else {
-        return Err(invalid("partial replica state read omitted its value"));
+        return Err(receipt_failure(
+            invalid("partial replica state read omitted its value"),
+            None,
+            "receipt_validation_failed",
+            "$",
+        ));
     };
     if bytes.len() > MAX_STATE_BYTES {
-        return Err(invalid("partial replica state exceeds its metadata bound"));
+        return Err(receipt_failure(
+            invalid("partial replica state exceeds its metadata bound"),
+            None,
+            "receipt_validation_failed",
+            "$",
+        ));
     }
-    let state: PartialReplicaState = serde_json::from_slice(&bytes)
-        .map_err(|_| invalid("partial replica state is malformed"))?;
-    state.validate()?;
+    let version = partial_receipt_version(&bytes, "partial replica state version is malformed")?;
+    let state =
+        decode_current_partial_receipt(&bytes, version, "partial replica state is malformed")?;
     Ok(Some((state, bytes)))
 }
 
@@ -408,7 +497,7 @@ pub(super) fn stage_partial_replica_state(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::StorageWrite;
     use crate::storage_adapter::{StorageAdapter, StorageReadOptions, StorageWriteOptions};
@@ -436,6 +525,207 @@ mod tests {
             authority.partial_replica_descriptor(None).await.unwrap(),
         )
         .unwrap()
+    }
+
+    async fn state_with_global_selected() -> PartialReplicaState {
+        let authority = open_lix().await.unwrap();
+        let descriptor = authority
+            .partial_replica_descriptor(Some(crate::GLOBAL_BRANCH_ID))
+            .await
+            .unwrap();
+        let state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            "00000000-0000-7000-8000-000000000099".to_owned(),
+            descriptor,
+        )
+        .unwrap();
+        authority.close().await.unwrap();
+        state
+    }
+
+    async fn state_with_distinct_selected_and_global_branches() -> PartialReplicaState {
+        let authority = open_lix().await.unwrap();
+        let selected = authority
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "receipt-migration-selected".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let descriptor = authority
+            .partial_replica_descriptor(Some(&selected.id))
+            .await
+            .unwrap();
+        let state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            "00000000-0000-7000-8000-000000000099".to_owned(),
+            descriptor,
+        )
+        .unwrap();
+        authority.close().await.unwrap();
+        state
+    }
+
+    /// Wire shape written by the released v2 receipt writer at
+    /// 62713991a. That writer embeds descriptor v1, whose branch coordinates
+    /// predate authorId, and a v1 native-baseline lease.
+    pub(crate) fn released_v2_receipt_bytes_for_test(
+        state: &PartialReplicaState,
+        lease_version: u32,
+    ) -> Bytes {
+        assert!(matches!(lease_version, 1 | 2));
+        let encode_roots = |roots: &PartialReplicaCommitRoots| {
+            serde_json::json!({
+                "commitId": roots.commit_id,
+                "scopedRangeRootId": roots.scoped_range_root_id,
+                "scopedRangeRootDigest": roots.scoped_range_root_digest,
+                "rowPkIndexRootId": roots.row_pk_index_root_id,
+            })
+        };
+        let encode_branch = |branch: &PartialReplicaBranch| {
+            serde_json::json!({
+                "branchId": branch.branch_id,
+                "createdAt": branch.created_at,
+                "updatedAt": branch.updated_at,
+                "refChangeId": branch.ref_change_id,
+                "head": encode_roots(&branch.head),
+                "checkpoint": encode_roots(&branch.checkpoint),
+            })
+        };
+        let descriptor = serde_json::json!({
+            "descriptorVersion": 1,
+            "lixId": state.descriptor.lix_id,
+            "defaultBranchId": state.descriptor.default_branch_id,
+            "cursor": state.descriptor.cursor,
+            "selectedBranch": encode_branch(&state.descriptor.selected_branch),
+            "globalBranch": encode_branch(&state.descriptor.global_branch),
+        });
+        // Explicitly name the released lease-v1/v2 keys. This fixture must not
+        // inherit future fields from the current NativeBaselineLease serializer.
+        let current_lease = serde_json::to_value(&state.baseline_lease).unwrap();
+        let baseline_lease = serde_json::json!({
+            "version": lease_version,
+            "leaseId": current_lease["leaseId"],
+            "accountId": current_lease["accountId"],
+            "roots": current_lease["roots"],
+            "expiresAtMs": current_lease["expiresAtMs"],
+        });
+        let value = serde_json::json!({
+            "version": 2,
+            "archivedBranchIds": state.archived_branch_ids,
+            "remoteId": state.remote_id,
+            "activeAccountId": state.active_account_id,
+            "epochId": state.epoch_id,
+            "descriptor": descriptor,
+            "baselineLease": baseline_lease,
+            "selectedServingGeneration": state.selected_serving_generation,
+            "globalServingGeneration": state.global_serving_generation,
+        });
+        let exact_keys = |value: &serde_json::Value, expected: &[&str]| {
+            let actual = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected = expected
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, expected);
+        };
+        exact_keys(
+            &value,
+            &[
+                "version",
+                "archivedBranchIds",
+                "remoteId",
+                "activeAccountId",
+                "epochId",
+                "descriptor",
+                "baselineLease",
+                "selectedServingGeneration",
+                "globalServingGeneration",
+            ],
+        );
+        exact_keys(
+            &value["descriptor"],
+            &[
+                "descriptorVersion",
+                "lixId",
+                "defaultBranchId",
+                "cursor",
+                "selectedBranch",
+                "globalBranch",
+            ],
+        );
+        for branch in ["selectedBranch", "globalBranch"] {
+            exact_keys(
+                &value["descriptor"][branch],
+                &[
+                    "branchId",
+                    "createdAt",
+                    "updatedAt",
+                    "refChangeId",
+                    "head",
+                    "checkpoint",
+                ],
+            );
+            for roots in ["head", "checkpoint"] {
+                exact_keys(
+                    &value["descriptor"][branch][roots],
+                    &[
+                        "commitId",
+                        "scopedRangeRootId",
+                        "scopedRangeRootDigest",
+                        "rowPkIndexRootId",
+                    ],
+                );
+            }
+        }
+        exact_keys(
+            &value["baselineLease"],
+            &["version", "leaseId", "accountId", "roots", "expiresAtMs"],
+        );
+        Bytes::from(serde_json::to_vec(&value).unwrap())
+    }
+
+    async fn install_legacy_receipt_fixture(
+        state: &PartialReplicaState,
+        receipt: Bytes,
+    ) -> StorageAdapter<Memory> {
+        let adapter = StorageAdapter::new(Memory::new());
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut bootstrap = adapter.new_write_set();
+        crate::init::stage_partial_repository_protocol(&mut bootstrap);
+        let preconditions =
+            crate::sync::partial_bootstrap::stage_partial_bootstrap(&read, &mut bootstrap, state)
+                .unwrap();
+        drop(read);
+        commit_raw_fixture(
+            &adapter,
+            bootstrap,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut fixture = adapter.new_write_set();
+        fixture.put(
+            PARTIAL_REPLICA_STATE_SPACE,
+            partial_replica_state_key(),
+            receipt.to_vec(),
+        );
+        commit_raw_fixture(&adapter, fixture, Default::default())
+            .await
+            .unwrap();
+        adapter
     }
 
     #[tokio::test]
@@ -537,6 +827,357 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_v2_receipt_upgrade_preserves_archives_and_exact_source_guard() {
+        let mut expected = state_with_global_selected().await;
+        assert_eq!(
+            expected.descriptor.selected_branch.branch_id,
+            expected.descriptor.global_branch.branch_id
+        );
+        expected.descriptor.selected_branch.author_id =
+            "00000000-0000-7000-8000-000000000111".to_owned();
+        expected.descriptor.global_branch.author_id =
+            "00000000-0000-7000-8000-000000000111".to_owned();
+        expected
+            .archived_branch_ids
+            .push(uuid::Uuid::now_v7().to_string());
+        expected.validate().unwrap();
+        let bytes = released_v2_receipt_bytes_for_test(&expected, 2);
+        let adapter = install_legacy_receipt_fixture(&expected, bytes.clone()).await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let (upgraded, changed, guards) = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(changed);
+        assert_eq!(upgraded, expected);
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            StoragePrecondition::KeyValueEquals { space, key, expected: source }
+                if *space == PARTIAL_REPLICA_STATE_SPACE
+                    && key == &partial_replica_state_key()
+                    && source == &bytes
+        )));
+        let unique_branches = [
+            upgraded.descriptor.selected_branch.branch_id.as_str(),
+            upgraded.descriptor.global_branch.branch_id.as_str(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+        assert_eq!(
+            guards.len(),
+            1 + unique_branches,
+            "receipt CAS and one exact source-control guard per recovered author"
+        );
+        assert_eq!(
+            unique_branches, 1,
+            "selected/global share one source control"
+        );
+        assert_eq!(
+            load_partial_replica_state(&read)
+                .await
+                .unwrap_err()
+                .details
+                .as_deref()
+                .unwrap()["receiptVersion"],
+            2
+        );
+        drop(read);
+        adapter
+            .commit_migration_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            load_partial_replica_state(&read).await.unwrap().unwrap().0,
+            expected,
+            "the guarded v2 promotion should publish the current receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_v2_receipt_upgrade_rejects_a_stale_source_control() {
+        let mut expected = state_with_distinct_selected_and_global_branches().await;
+        assert_ne!(
+            expected.descriptor.selected_branch.branch_id,
+            expected.descriptor.global_branch.branch_id
+        );
+        expected.descriptor.selected_branch.author_id =
+            "00000000-0000-7000-8000-000000000111".to_owned();
+        expected.descriptor.global_branch.author_id =
+            "00000000-0000-7000-8000-000000000111".to_owned();
+        expected
+            .archived_branch_ids
+            .push(uuid::Uuid::now_v7().to_string());
+        expected.validate().unwrap();
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            released_v2_receipt_bytes_for_test(&expected, 1),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let (_, changed, guards) = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            guards.len(),
+            3,
+            "receipt CAS plus distinct selected/global controls"
+        );
+        let global_control_key = StorageKey(Bytes::from(
+            crate::branch::branch_head_control_key(&expected.descriptor.global_branch.branch_id)
+                .unwrap(),
+        ));
+        assert!(guards.iter().any(|guard| matches!(
+            guard,
+            StoragePrecondition::KeyValueEquals { space, key, .. }
+                if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE
+                    && key == &global_control_key
+        )));
+        let source_control = crate::branch::observe_branch_control_coordinate(
+            &read,
+            &expected.descriptor.global_branch.branch_id,
+        )
+        .await
+        .unwrap()
+        .control
+        .unwrap();
+        drop(read);
+
+        let mut changed_control = source_control;
+        changed_control.current_state_revision += 1;
+        let mut concurrent = adapter.new_write_set();
+        crate::branch::stage_branch_head_control(
+            &mut concurrent,
+            &expected.descriptor.global_branch.branch_id,
+            changed_control,
+        )
+        .unwrap();
+        adapter
+            .commit_migration_write_set(concurrent, Default::default())
+            .await
+            .unwrap();
+        let error = adapter
+            .commit_migration_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                crate::storage_adapter::StorageError::PreconditionFailed(_)
+            )
+        ));
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            load_partial_replica_state(&read)
+                .await
+                .unwrap_err()
+                .details
+                .as_deref()
+                .unwrap()["receiptVersion"],
+            2,
+            "a source race must leave the old receipt unpublished"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_migration_rejects_unsupported_descriptor_and_future_receipt_versions() {
+        let expected = state().await;
+        let mut missing_field: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 2)).unwrap();
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("archivedBranchIds");
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&missing_field).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "receipt_json_data");
+        assert_eq!(details["failurePath"], "$");
+        assert_eq!(details["missingField"], "archivedBranchIds");
+        assert!((1..=MAX_STATE_BYTES as u64).contains(&details["jsonLine"].as_u64().unwrap()));
+        assert!((1..=MAX_STATE_BYTES as u64).contains(&details["jsonColumn"].as_u64().unwrap()));
+        assert!(
+            writes.is_empty(),
+            "rejected migration must stage no changes"
+        );
+
+        let mut unexpected_field: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 2)).unwrap();
+        unexpected_field["descriptor"]["selectedBranch"]["authorId"] =
+            serde_json::json!("00000000-0000-7000-8000-000000000111");
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&unexpected_field).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "receipt_json_data");
+        assert_eq!(details["failurePath"], "$");
+        assert!(details.get("missingField").is_none());
+        assert!(
+            writes.is_empty(),
+            "unexpected current-only fields stay invalid"
+        );
+
+        let mut malformed: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 2)).unwrap();
+        malformed["descriptor"]["descriptorVersion"] = serde_json::json!(2);
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&malformed).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "descriptor_version_invalid");
+        assert_eq!(details["failurePath"], "$.descriptor.descriptorVersion");
+        assert_eq!(details["receiptVersion"], 2);
+        assert_eq!(details["expectedReceiptVersion"], STATE_VERSION);
+        assert!(
+            writes.is_empty(),
+            "rejected migration must stage no changes"
+        );
+
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 2)).unwrap();
+        future["version"] = serde_json::json!(99);
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&future).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["receiptVersion"], 99);
+        assert_eq!(details["expectedReceiptVersion"], STATE_VERSION);
+        assert_eq!(details["failureReason"], "unsupported_receipt_version");
+        assert_eq!(details["failurePath"], "$");
+        assert!(writes.is_empty(), "unknown versions must remain invalid");
+    }
+
+    #[tokio::test]
+    async fn partial_receipt_diagnostics_cover_probe_v1_v3_and_baseline_lease_failures() {
+        let expected = state().await;
+
+        let adapter = install_legacy_receipt_fixture(&expected, Bytes::from_static(b"{}")).await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let error = load_partial_replica_state(&read).await.unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "receipt_json_data");
+        assert_eq!(details["failurePath"], "$");
+        assert_eq!(details["missingField"], "version");
+        assert!(details.get("receiptVersion").is_none());
+        drop(read);
+
+        let mut current: serde_json::Value = serde_json::to_value(&expected).unwrap();
+        current["descriptor"]["selectedBranch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorId");
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&current).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let error = load_partial_replica_state(&read).await.unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "receipt_json_data");
+        assert_eq!(details["receiptVersion"], STATE_VERSION);
+        assert_eq!(details["missingField"], "authorId");
+        drop(read);
+
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 1)).unwrap();
+        v1["version"] = serde_json::json!(1);
+        v1.as_object_mut().unwrap().remove("archivedBranchIds");
+        v1["baselineLease"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expiresAtMs");
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&v1).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "receipt_json_data");
+        assert_eq!(details["receiptVersion"], 1);
+        assert_eq!(details["missingField"], "expiresAtMs");
+        assert!(writes.is_empty());
+        drop(read);
+
+        let mut invalid_lease: serde_json::Value =
+            serde_json::from_slice(&released_v2_receipt_bytes_for_test(&expected, 1)).unwrap();
+        invalid_lease["version"] = serde_json::json!(1);
+        invalid_lease
+            .as_object_mut()
+            .unwrap()
+            .remove("archivedBranchIds");
+        invalid_lease["baselineLease"]["version"] = serde_json::json!(99);
+        let adapter = install_legacy_receipt_fixture(
+            &expected,
+            Bytes::from(serde_json::to_vec(&invalid_lease).unwrap()),
+        )
+        .await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = prepare_owned_partial_receipt_upgrade(&read, &mut writes)
+            .await
+            .unwrap_err();
+        let details = error.details.as_deref().unwrap();
+        assert_eq!(details["failureReason"], "baseline_lease_invalid");
+        assert_eq!(details["failurePath"], "$.baselineLease");
+        assert_eq!(details["receiptVersion"], 1);
+        assert!(writes.is_empty());
+    }
+
+    #[tokio::test]
     async fn partial_opening_receipt_rejects_unknown_versions_before_staging() {
         let mut state = state().await;
         state.version += 1;
@@ -577,6 +1218,9 @@ mod tests {
 
 // Private to the one-way owned-open migration. Ordinary readers and HOT policy
 // decoders accept only the current receipt version.
+// Frozen on-disk shapes from the released v1/v2 receipt writers. These must
+// stay independent of the current descriptor: v2 serialized descriptor v1,
+// whose branch coordinates predate the required authorId field.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PartialReplicaStateV1 {
@@ -584,10 +1228,370 @@ struct PartialReplicaStateV1 {
     remote_id: String,
     active_account_id: String,
     epoch_id: String,
-    descriptor: PartialReplicaDescriptor,
-    baseline_lease: crate::gc::NativeBaselineLease,
+    descriptor: PartialReplicaDescriptorV1,
+    baseline_lease: PartialBaselineLeaseV1V2,
     selected_serving_generation: String,
     global_serving_generation: String,
+}
+
+#[derive(Deserialize)]
+struct PartialReplicaReceiptVersion {
+    version: u32,
+}
+
+// Baseline-lease wire shape embedded in released partial receipts. Versions 1
+// and 2 use the same five coordinates; keep this decoder independent from the
+// current GC lease type so future fields cannot silently alter receipt parsing.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialBaselineLeaseV1V2 {
+    version: u32,
+    lease_id: String,
+    account_id: String,
+    roots: Vec<String>,
+    expires_at_ms: u64,
+}
+
+impl PartialBaselineLeaseV1V2 {
+    fn into_native(self) -> Result<crate::gc::NativeBaselineLease, LixError> {
+        crate::gc::NativeBaselineLease::from_partial_receipt_fields(
+            self.version,
+            self.lease_id,
+            self.account_id,
+            self.roots,
+            self.expires_at_ms,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialReplicaStateV2 {
+    version: u32,
+    archived_branch_ids: Vec<String>,
+    remote_id: String,
+    active_account_id: String,
+    epoch_id: String,
+    descriptor: PartialReplicaDescriptorV1,
+    baseline_lease: PartialBaselineLeaseV1V2,
+    selected_serving_generation: String,
+    global_serving_generation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialReplicaDescriptorV1 {
+    descriptor_version: u32,
+    lix_id: String,
+    default_branch_id: String,
+    cursor: u64,
+    selected_branch: PartialReplicaBranchV1,
+    global_branch: PartialReplicaBranchV1,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialReplicaBranchV1 {
+    branch_id: String,
+    created_at: String,
+    updated_at: String,
+    ref_change_id: String,
+    head: PartialReplicaCommitRootsV1,
+    checkpoint: PartialReplicaCommitRootsV1,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialReplicaCommitRootsV1 {
+    commit_id: String,
+    scoped_range_root_id: Option<[u8; 32]>,
+    scoped_range_root_digest: Option<[u8; 32]>,
+    row_pk_index_root_id: Option<[u8; 32]>,
+}
+
+impl From<PartialReplicaCommitRootsV1> for PartialReplicaCommitRoots {
+    fn from(roots: PartialReplicaCommitRootsV1) -> Self {
+        Self {
+            commit_id: roots.commit_id,
+            scoped_range_root_id: roots.scoped_range_root_id,
+            scoped_range_root_digest: roots.scoped_range_root_digest,
+            row_pk_index_root_id: roots.row_pk_index_root_id,
+        }
+    }
+}
+
+impl PartialReplicaBranchV1 {
+    fn promote(self, author_id: String) -> PartialReplicaBranch {
+        PartialReplicaBranch {
+            branch_id: self.branch_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            ref_change_id: self.ref_change_id,
+            author_id,
+            head: self.head.into(),
+            checkpoint: self.checkpoint.into(),
+        }
+    }
+}
+
+fn legacy_receipt_error(
+    version: u32,
+    message: &str,
+    failure: Option<(&'static str, &'static str)>,
+) -> LixError {
+    let (reason, path) = failure.unwrap_or(("receipt_validation_failed", "$"));
+    receipt_failure(invalid(message), Some(version), reason, path)
+}
+
+fn receipt_json_parse_error(
+    error: serde_json::Error,
+    version: Option<u32>,
+    message: &str,
+) -> LixError {
+    let failure_reason = match error.classify() {
+        serde_json::error::Category::Syntax => "receipt_json_syntax",
+        serde_json::error::Category::Data => "receipt_json_data",
+        serde_json::error::Category::Eof => "receipt_json_eof",
+        serde_json::error::Category::Io => "receipt_json_other",
+    };
+    let mut details = serde_json::json!({});
+    if let Some(version) = version {
+        details["receiptVersion"] = serde_json::json!(version);
+    }
+    details["expectedReceiptVersion"] = serde_json::json!(STATE_VERSION);
+    details["migrationPhase"] = serde_json::json!("partial_receipt");
+    details["failureReason"] = serde_json::json!(failure_reason);
+    details["failurePath"] = serde_json::json!("$");
+    let line = error.line().min(MAX_STATE_BYTES);
+    let column = error.column().min(MAX_STATE_BYTES);
+    if line > 0 {
+        details["jsonLine"] = serde_json::json!(line);
+    }
+    if column > 0 {
+        details["jsonColumn"] = serde_json::json!(column);
+    }
+    if let Some(field) = known_missing_receipt_field(&error, version) {
+        details["missingField"] = serde_json::json!(field);
+    }
+    invalid(message).with_details(details)
+}
+
+fn known_missing_receipt_field(
+    error: &serde_json::Error,
+    version: Option<u32>,
+) -> Option<&'static str> {
+    if error.classify() != serde_json::error::Category::Data {
+        return None;
+    }
+    let message = error.to_string();
+    let missing = message.strip_prefix("missing field `")?.split_once('`')?.0;
+    // These lists are frozen receipt wire fields. The raw parser string and
+    // any unrecognized field name are never included in diagnostics.
+    const V1_FIELDS: &[&str] = &[
+        "version",
+        "remoteId",
+        "activeAccountId",
+        "epochId",
+        "descriptor",
+        "baselineLease",
+        "selectedServingGeneration",
+        "globalServingGeneration",
+        "descriptorVersion",
+        "lixId",
+        "defaultBranchId",
+        "cursor",
+        "selectedBranch",
+        "globalBranch",
+        "branchId",
+        "createdAt",
+        "updatedAt",
+        "refChangeId",
+        "head",
+        "checkpoint",
+        "commitId",
+        "scopedRangeRootId",
+        "scopedRangeRootDigest",
+        "rowPkIndexRootId",
+        "leaseId",
+        "accountId",
+        "roots",
+        "expiresAtMs",
+    ];
+    const V2_FIELDS: &[&str] = &[
+        "version",
+        "archivedBranchIds",
+        "remoteId",
+        "activeAccountId",
+        "epochId",
+        "descriptor",
+        "baselineLease",
+        "selectedServingGeneration",
+        "globalServingGeneration",
+        "descriptorVersion",
+        "lixId",
+        "defaultBranchId",
+        "cursor",
+        "selectedBranch",
+        "globalBranch",
+        "branchId",
+        "createdAt",
+        "updatedAt",
+        "refChangeId",
+        "head",
+        "checkpoint",
+        "commitId",
+        "scopedRangeRootId",
+        "scopedRangeRootDigest",
+        "rowPkIndexRootId",
+        "leaseId",
+        "accountId",
+        "roots",
+        "expiresAtMs",
+    ];
+    const V3_FIELDS: &[&str] = &[
+        "version",
+        "archivedBranchIds",
+        "remoteId",
+        "activeAccountId",
+        "epochId",
+        "descriptor",
+        "baselineLease",
+        "selectedServingGeneration",
+        "globalServingGeneration",
+        "descriptorVersion",
+        "lixId",
+        "defaultBranchId",
+        "cursor",
+        "selectedBranch",
+        "globalBranch",
+        "branchId",
+        "createdAt",
+        "updatedAt",
+        "refChangeId",
+        "authorId",
+        "head",
+        "checkpoint",
+        "commitId",
+        "scopedRangeRootId",
+        "scopedRangeRootDigest",
+        "rowPkIndexRootId",
+        "leaseId",
+        "accountId",
+        "roots",
+        "expiresAtMs",
+    ];
+    const VERSION_PROBE_FIELDS: &[&str] = &["version"];
+    let fields = match version {
+        Some(1) => V1_FIELDS,
+        Some(2) => V2_FIELDS,
+        Some(STATE_VERSION) => V3_FIELDS,
+        Some(_) => return None,
+        None => VERSION_PROBE_FIELDS,
+    };
+    fields.iter().copied().find(|field| *field == missing)
+}
+
+async fn promote_legacy_descriptor(
+    read: &(impl StorageAdapterRead + ?Sized),
+    descriptor: PartialReplicaDescriptorV1,
+    receipt_version: u32,
+) -> Result<(PartialReplicaDescriptor, Vec<StoragePrecondition>), LixError> {
+    if descriptor.descriptor_version != 1 {
+        return Err(legacy_receipt_error(
+            receipt_version,
+            "partial legacy descriptor version is unsupported",
+            Some((
+                "descriptor_version_invalid",
+                "$.descriptor.descriptorVersion",
+            )),
+        ));
+    }
+
+    async fn author_from_source_control(
+        read: &(impl StorageAdapterRead + ?Sized),
+        branch: &PartialReplicaBranchV1,
+        receipt_version: u32,
+        branch_path: &'static str,
+    ) -> Result<(String, StoragePrecondition), LixError> {
+        let observation = crate::branch::observe_branch_control_coordinate(read, &branch.branch_id)
+            .await
+            .map_err(|error| {
+                receipt_failure(
+                    error,
+                    Some(receipt_version),
+                    "receipt_validation_failed",
+                    branch_path,
+                )
+            })?;
+        let Some(control) = observation.control else {
+            return Err(legacy_receipt_error(
+                receipt_version,
+                "legacy partial admission lost its local branch control",
+                Some(("branch_control_missing", branch_path)),
+            ));
+        };
+        if crate::common::LixTimestamp::parse(&branch.created_at).ok() != Some(control.created_at) {
+            let path = if branch_path == "$.descriptor.selectedBranch" {
+                "$.descriptor.selectedBranch.createdAt"
+            } else {
+                "$.descriptor.globalBranch.createdAt"
+            };
+            return Err(legacy_receipt_error(
+                receipt_version,
+                "legacy partial branch incarnation differs from its local control",
+                Some(("branch_incarnation_mismatch", path)),
+            ));
+        }
+        let guard = crate::branch::branch_head_control_precondition(
+            &branch.branch_id,
+            observation.raw_token,
+        )
+        .map_err(|error| {
+            receipt_failure(
+                error,
+                Some(receipt_version),
+                "receipt_validation_failed",
+                branch_path,
+            )
+        })?;
+        Ok((control.author_id_string(), guard))
+    }
+
+    let (selected_author, selected_guard) = author_from_source_control(
+        read,
+        &descriptor.selected_branch,
+        receipt_version,
+        "$.descriptor.selectedBranch",
+    )
+    .await?;
+    let (global_author, global_guard) =
+        if descriptor.global_branch.branch_id == descriptor.selected_branch.branch_id {
+            (selected_author.clone(), None)
+        } else {
+            let (author, guard) = author_from_source_control(
+                read,
+                &descriptor.global_branch,
+                receipt_version,
+                "$.descriptor.globalBranch",
+            )
+            .await?;
+            (author, Some(guard))
+        };
+    let mut guards = vec![selected_guard];
+    if let Some(guard) = global_guard {
+        guards.push(guard);
+    }
+    Ok((
+        PartialReplicaDescriptor {
+            descriptor_version: PARTIAL_REPLICA_DESCRIPTOR_VERSION,
+            lix_id: descriptor.lix_id,
+            default_branch_id: descriptor.default_branch_id,
+            cursor: descriptor.cursor,
+            selected_branch: descriptor.selected_branch.promote(selected_author),
+            global_branch: descriptor.global_branch.promote(global_author),
+        },
+        guards,
+    ))
 }
 
 /// Owned epoch opening upgrades only bounded admission/upload metadata.
@@ -675,21 +1679,27 @@ pub(crate) async fn prepare_owned_partial_receipt_upgrade(
     let bytes = match value {
         None => return Ok(None),
         Some(StorageProjectedValue::FullValue(bytes)) => bytes,
-        Some(_) => return Err(invalid("partial receipt migration omitted its value")),
+        Some(_) => {
+            return Err(receipt_failure(
+                invalid("partial receipt migration omitted its value"),
+                None,
+                "receipt_validation_failed",
+                "$",
+            ));
+        }
     };
     if bytes.len() > MAX_STATE_BYTES {
-        return Err(invalid("partial receipt migration exceeds metadata bound"));
+        return Err(receipt_failure(
+            invalid("partial receipt migration exceeds metadata bound"),
+            None,
+            "receipt_validation_failed",
+            "$",
+        ));
     }
-    #[derive(Deserialize)]
-    struct Version {
-        version: u32,
-    }
-    let version: Version = serde_json::from_slice(&bytes)
-        .map_err(|_| invalid("partial receipt version is malformed"))?;
-    if version.version == STATE_VERSION {
-        let state: PartialReplicaState =
-            serde_json::from_slice(&bytes).map_err(|_| invalid("partial receipt is malformed"))?;
-        state.validate()?;
+    let version = partial_receipt_version(&bytes, "partial receipt version is malformed")?;
+    if version == STATE_VERSION {
+        let state =
+            decode_current_partial_receipt(&bytes, version, "partial receipt is malformed")?;
         return Ok(Some((
             state,
             false,
@@ -700,27 +1710,83 @@ pub(crate) async fn prepare_owned_partial_receipt_upgrade(
             }],
         )));
     }
-    if version.version != 1 {
-        return Err(invalid("unsupported partial receipt migration source"));
+    // v2 introduced archived branches, but it still embeds descriptor v1.
+    // Descriptor v2 later added branch author IDs, so the current state type
+    // cannot decode an actual v2 receipt. Decode the frozen v2 shape, recover
+    // only the absent author coordinates from source-owned branch controls,
+    // and preserve every other receipt field byte-for-byte in the CAS guard.
+    // The detached epoch candidate proves local controls/native roots before
+    // activation; an admission-base-only proof would reject valid v2 local undo.
+    if version == 2 {
+        let old: PartialReplicaStateV2 = serde_json::from_slice(&bytes).map_err(|error| {
+            receipt_json_parse_error(
+                error,
+                Some(2),
+                "partial v2 receipt does not match its released wire shape",
+            )
+        })?;
+        if old.version != 2 {
+            return Err(legacy_receipt_error(
+                2,
+                "partial v2 receipt version changed",
+                Some(("receipt_validation_failed", "$")),
+            ));
+        }
+        let (descriptor, mut guards) = promote_legacy_descriptor(read, old.descriptor, 2).await?;
+        let baseline_lease = old.baseline_lease.into_native().map_err(|error| {
+            receipt_failure(error, Some(2), "baseline_lease_invalid", "$.baselineLease")
+        })?;
+        let state = PartialReplicaState {
+            version: STATE_VERSION,
+            archived_branch_ids: old.archived_branch_ids,
+            remote_id: old.remote_id,
+            active_account_id: old.active_account_id,
+            epoch_id: old.epoch_id,
+            descriptor,
+            baseline_lease,
+            selected_serving_generation: old.selected_serving_generation,
+            global_serving_generation: old.global_serving_generation,
+        };
+        validate_partial_receipt_state(&state, 2)?;
+        guards.push(
+            stage_partial_replica_state(writes, &state, Some(bytes)).map_err(|error| {
+                receipt_failure(error, Some(2), "receipt_validation_failed", "$")
+            })?,
+        );
+        return Ok(Some((state, true, guards)));
     }
-    let old: PartialReplicaStateV1 =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("partial v1 receipt is malformed"))?;
+    if version != 1 {
+        return Err(receipt_version_error(
+            "unsupported partial receipt migration source",
+            version,
+        ));
+    }
+    let old: PartialReplicaStateV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        receipt_json_parse_error(error, Some(1), "partial v1 receipt is malformed")
+    })?;
     if old.version != 1 {
-        return Err(invalid("partial v1 receipt version changed"));
+        return Err(legacy_receipt_error(
+            1,
+            "partial v1 receipt version changed",
+            None,
+        ));
     }
+    let (descriptor, mut guards) = promote_legacy_descriptor(read, old.descriptor, 1).await?;
+    let baseline_lease = old.baseline_lease.into_native().map_err(|error| {
+        receipt_failure(error, Some(1), "baseline_lease_invalid", "$.baselineLease")
+    })?;
     let state = PartialReplicaState {
         version: STATE_VERSION,
         archived_branch_ids: Vec::new(),
         remote_id: old.remote_id,
         active_account_id: old.active_account_id,
         epoch_id: old.epoch_id,
-        descriptor: old.descriptor,
-        baseline_lease: old.baseline_lease,
+        descriptor,
+        baseline_lease,
         selected_serving_generation: old.selected_serving_generation,
         global_serving_generation: old.global_serving_generation,
     };
-    state.validate()?;
-    let mut guards = Vec::new();
+    validate_partial_receipt_state(&state, 1)?;
     let mut visited = std::collections::BTreeSet::new();
     for branch in [
         &state.descriptor.selected_branch,
@@ -729,14 +1795,36 @@ pub(crate) async fn prepare_owned_partial_receipt_upgrade(
         if !visited.insert(branch.branch_id.clone()) {
             continue;
         }
-        let observation =
-            crate::branch::observe_branch_control_coordinate(read, &branch.branch_id).await?;
-        let control = observation
-            .control
-            .ok_or_else(|| invalid("legacy partial admission lost its local control"))?;
-        if control.tracked_generation != state.serving_generation(&branch.branch_id)? {
-            return Err(invalid(
+        let branch_path = if branch.branch_id == state.descriptor.selected_branch.branch_id {
+            "$.descriptor.selectedBranch"
+        } else {
+            "$.descriptor.globalBranch"
+        };
+        let observation = crate::branch::observe_branch_control_coordinate(read, &branch.branch_id)
+            .await
+            .map_err(|error| {
+                receipt_failure(error, Some(1), "receipt_validation_failed", branch_path)
+            })?;
+        let control = observation.control.ok_or_else(|| {
+            legacy_receipt_error(
+                1,
+                "legacy partial admission lost its local control",
+                Some(("branch_control_missing", branch_path)),
+            )
+        })?;
+        let serving_generation = state.serving_generation(&branch.branch_id).map_err(|error| {
+            receipt_failure(
+                error,
+                Some(1),
+                "receipt_validation_failed",
+                branch_path,
+            )
+        })?;
+        if control.tracked_generation != serving_generation {
+            return Err(legacy_receipt_error(
+                1,
                 "legacy partial serving generation disagrees with its owner",
+                Some(("receipt_validation_failed", branch_path)),
             ));
         }
         let marker_key = StorageKey(Bytes::from(crate::hot_state::hot_generation_scope_prefix(
@@ -748,32 +1836,44 @@ pub(crate) async fn prepare_owned_partial_receipt_upgrade(
             std::slice::from_ref(&marker_key),
         )
         .materialize(read, Default::default())
-        .await?
+        .await
+        .map_err(|error| {
+            receipt_failure(error.into(), Some(1), "receipt_validation_failed", branch_path)
+        })?
         .value
         .pop()
         .flatten();
         let Some(StorageProjectedValue::FullValue(marker)) = marker else {
-            return Err(invalid(
+            return Err(legacy_receipt_error(
+                1,
                 "legacy partial admission lost its native root marker",
+                Some(("receipt_validation_failed", branch_path)),
             ));
         };
-        let base =
-            crate::changelog::CommitId::parse_lix(&branch.head.commit_id, "legacy partial base")?;
+        let base = crate::changelog::CommitId::parse_lix(
+            &branch.head.commit_id,
+            "legacy partial base",
+        )
+        .map_err(|error| {
+            receipt_failure(error, Some(1), "receipt_validation_failed", branch_path)
+        })?;
         if marker.as_ref() != base.as_uuid().as_bytes() {
-            return Err(invalid(
+            return Err(legacy_receipt_error(
+                1,
                 "legacy partial native root disagrees with its owner",
+                Some(("receipt_validation_failed", branch_path)),
             ));
         }
-        guards.push(crate::branch::branch_head_control_precondition(
-            &branch.branch_id,
-            observation.raw_token,
-        )?);
         guards.push(StoragePrecondition::KeyValueEquals {
             space: crate::hot_state::ROOT_CURRENT_BASE_SPACE,
             key: marker_key,
             expected: marker,
         });
     }
-    guards.push(stage_partial_replica_state(writes, &state, Some(bytes))?);
+    guards.push(
+        stage_partial_replica_state(writes, &state, Some(bytes)).map_err(|error| {
+            receipt_failure(error, Some(1), "receipt_validation_failed", "$")
+        })?,
+    );
     Ok(Some((state, true, guards)))
 }

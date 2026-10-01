@@ -14,6 +14,8 @@ pub(super) struct AuthorityClient {
     pub(super) metadata: Arc<AtomicUsize>,
     pub(super) first_accepted: Arc<tokio::sync::Notify>,
     pub(super) block_first: bool,
+    offline: Arc<std::sync::atomic::AtomicBool>,
+    offline_native_attempts: Arc<AtomicUsize>,
 }
 impl AuthorityClient {
     pub(super) fn new(authority: Arc<Lix<Memory>>, block_first: bool) -> Self {
@@ -24,6 +26,8 @@ impl AuthorityClient {
             chunks: Arc::default(),
             metadata: Arc::default(),
             first_accepted: Arc::default(),
+            offline: Arc::default(),
+            offline_native_attempts: Arc::default(),
         }
     }
 }
@@ -31,6 +35,24 @@ impl RawHttpClient for AuthorityClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             let url = url::Url::parse(&request.url).unwrap();
+            if self.offline.load(Ordering::SeqCst) {
+                if [
+                    "/sync/read-fulfillment",
+                    "/sync/native-metadata",
+                    "/sync/native-metadata-walk",
+                    "/sync/native-objects",
+                    "/sync/native-object-range",
+                ]
+                .iter()
+                .any(|suffix| url.path().ends_with(suffix))
+                {
+                    self.offline_native_attempts.fetch_add(1, Ordering::SeqCst);
+                }
+                return Err(LixError::new(
+                    "LIX_TRANSPORT_NETWORK",
+                    "test transport is offline",
+                ));
+            }
             let result = if request.method == http::Method::GET && !url.path().contains("/sync/") {
                 serde_json::json!({"protocolVersion":crate::SERVER_PROTOCOL_VERSION,"syncProtocolVersion":crate::sync::SYNC_PROTOCOL_VERSION,"lixId":self.authority.lix_id(),"sessionId":"partial-worker-authority","activeAccountId":self.authority.active_account_id()})
             } else if url.path().ends_with("/sync/read-fulfillment") {
@@ -44,6 +66,41 @@ impl RawHttpClient for AuthorityClient {
                     .as_str();
                 serde_json::to_value(self.authority.read_sync_fulfillment(&body, lease).await?)
                     .unwrap()
+            } else if url.path().ends_with("/sync/native-objects") {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {
+                    objects: Vec<NativeObjectRef>,
+                }
+                let body: Request = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let lease = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "lix-native-baseline-lease")
+                    .unwrap()
+                    .1
+                    .as_str();
+                serde_json::to_value(
+                    self.authority
+                        .read_sync_native_objects_leased(&body.objects, lease)
+                        .await?,
+                )
+                .unwrap()
+            } else if url.path().ends_with("/sync/native-object-range") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let lease = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "lix-native-baseline-lease")
+                    .unwrap()
+                    .1
+                    .as_str();
+                serde_json::to_value(
+                    self.authority
+                        .read_sync_native_object_range_leased(&body, lease)
+                        .await?,
+                )
+                .unwrap()
             } else if url.path().ends_with("/sync/native-metadata-walk") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 self.metadata.fetch_add(1, Ordering::SeqCst);
@@ -54,6 +111,13 @@ impl RawHttpClient for AuthorityClient {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
                 serde_json::to_value(self.authority.read_sync_native_metadata(&body).await?)
                     .unwrap()
+            } else if url.path().ends_with("/sync/descriptor") {
+                // This test exercises demand preparation and local editing,
+                // not the unrelated background long-poll. Leave discovery
+                // pending so the worker can continue to serve foreground
+                // demands and cancel the poll when the test shuts down.
+                futures_util::future::pending::<()>().await;
+                unreachable!("pending descriptor discovery should be cancelled")
             } else if url.path().ends_with("/sync/retained-bodies") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 serde_json::to_value(
@@ -296,7 +360,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
 }
 
 #[tokio::test]
-async fn production_frontier_preparation_supports_thirty_local_appends() {
+async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() {
     let width = 16;
     let authority = Arc::new(open_lix().await.unwrap());
     let values = (0..width)
@@ -335,7 +399,10 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     )
     .unwrap();
     let memory = Memory::new();
-    let storage = StorageAdapter::new(memory.clone());
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     let mut writes = storage.new_write_set();
     let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
@@ -364,18 +431,7 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     let update = "UPDATE lix_key_value SET value=$2 WHERE key=$1";
     let select = "SELECT value FROM lix_key_value WHERE key=$1";
     let key = Value::Text("upload-000000".into());
-    let mut fetches = Fetches::default();
-    execute_hydrating(
-        &session,
-        &storage,
-        &state,
-        &authority,
-        update,
-        &[key.clone(), Value::Text("uploaded".into())],
-        &mut fetches,
-    )
-    .await
-    .unwrap();
+    let engine = Arc::new(engine);
 
     let client = AuthorityClient::new(authority.clone(), false);
     let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
@@ -387,58 +443,300 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
     let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    let worker = crate::sync::partial_runtime::run_partial_worker_with_changes(
-        storage.clone(),
-        Arc::new(state.clone()),
-        Some(transport),
-        || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
-        shutdown_rx,
-        receiver,
-        None,
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender.clone());
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine),
+        ),
     );
-    let caller = async {
-        // A resident baseline graph demand must still prepare its missing
-        // jump frontier through the real authenticated metadata transport.
-        let (response, done) = tokio::sync::oneshot::channel();
-        sender
-            .send(crate::sync::runtime::SyncDemand {
-                request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                    vec![NativeMetadataRef::CommitGraphRecord(
-                        state.descriptor().selected_branch.head.commit_id.clone(),
-                    )],
-                    LixError::unknown("prepare baseline write frontier"),
-                ),
-                response,
-            })
+    // Read-only bootstrap deliberately left this closure absent. The explicit
+    // API hydrates it through the admitted worker without executing a write.
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_some(),
+        "read-only bootstrap must leave write metadata lazy"
+    );
+    lix.prepare_offline_editing().await.unwrap();
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_none(),
+        "successful preparation must certify the bounded baseline frontier"
+    );
+    assert_eq!(
+        value(lix.execute(select, &[key.clone()]).await.unwrap()),
+        "baseline-39",
+        "frontier preparation must not execute a mutation as a side effect"
+    );
+    let prepared_fetches = client.metadata.load(Ordering::SeqCst);
+    assert!(
+        prepared_fetches > 0,
+        "fixture must exercise missing production frontier metadata"
+    );
+
+    // Closing and reopening both the adapter session and engine drops decoded
+    // process-local state. The next edit must depend on durably installed
+    // metadata rather than a warm Changelog/engine cache.
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+    drop(lix);
+    drop(storage);
+
+    // Reuse the same durable backing store through a fresh adapter/session.
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
             .await
             .unwrap();
-        done.await.unwrap().unwrap();
-        let prepared_fetches = client.metadata.load(Ordering::SeqCst);
-        assert!(
-            prepared_fetches > 0,
-            "fixture must exercise missing production frontier metadata"
-        );
-        for index in 0..30 {
-            session
-                .execute(
-                    update,
-                    &[key.clone(), Value::Text(format!("prepared-{index}"))],
-                )
-                .await
-                .unwrap();
-            session.execute(select, &[key.clone()]).await.unwrap();
-        }
-        assert_eq!(
-            client.metadata.load(Ordering::SeqCst),
-            prepared_fetches,
-            "prepared local appends must not require additional graph metadata"
-        );
-        assert_eq!(client.pushes.load(Ordering::SeqCst), 0);
-        shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let client = AuthorityClient::new(authority.clone(), false);
+    let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
+        .await
+        .unwrap();
+    transport
+        .bind_native_baseline_lease(state.baseline_lease())
+        .unwrap();
+    client.offline.store(true, Ordering::SeqCst);
+    let (shutdown, shutdown_rx) =
+        tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine),
+        ),
+    );
+    assert!(
+        crate::sync::partial_write_frontier::next_missing_baseline_write_frontier(&storage, &state)
+            .await
+            .unwrap()
+            .is_none(),
+        "the prepared selected/global graph frontier must survive adapter and engine reopen"
+    );
+    for index in 0..30 {
+        lix.execute(
+            update,
+            &[key.clone(), Value::Text(format!("prepared-{index}"))],
+        )
+        .await
+        .unwrap();
+        lix.execute(select, &[key.clone()]).await.unwrap();
+    }
+    assert_eq!(
+        client.offline_native_attempts.load(Ordering::SeqCst),
+        0,
+        "reopened local edits must not need remote native inputs"
+    );
+    assert_eq!(client.pushes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        value(lix.execute(select, &[key]).await.unwrap()),
+        "prepared-29"
+    );
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reopen() {
+    let file_id = "dddddddd-0000-8000-8000-000000000004";
+    let authority = Arc::new(open_lix().await.unwrap());
+    authority
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/offline.txt', $2)",
+            &[
+                Value::Text(file_id.to_owned()),
+                Value::Blob(b"online baseline".to_vec().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let state = PartialReplicaState::from_leased(
+        format!("https://example.test/lix/{}", authority.lix_id()),
+        authority.active_account_id().into(),
+        "00000000-0000-7000-8000-000000003398".into(),
+        authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let memory = Memory::new();
+    let storage = StorageAdapter::new(memory.clone())
+        .with_session()
+        .await
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+    crate::init::stage_partial_repository_protocol(&mut writes);
+    drop(read);
+    storage
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let client = AuthorityClient::new(authority.clone(), false);
+    let transport = HttpSyncTransport::connect_with(client.clone(), state.remote_id())
+        .await
+        .unwrap();
+    transport
+        .bind_native_baseline_lease(state.baseline_lease())
+        .unwrap();
+    let (shutdown, shutdown_rx) =
+        tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
+    let worker = tokio::spawn(
+        crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            Arc::new(state.clone()),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine.clone()),
+        ),
+    );
+
+    let initial = lix
+        .execute(
+            "SELECT content FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        initial.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"online baseline"
+    );
+    lix.prepare_offline_editing().await.unwrap();
+    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+    worker.await.unwrap().unwrap();
+    lix.close().await.unwrap();
+    drop(lix);
+    drop(engine);
+    drop(storage);
+
+    let storage = StorageAdapter::new(memory).with_session().await.unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let engine = Arc::new(engine);
+    let raw_session = session.clone();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let lix = Lix::from_partial_engine_for_test(engine, session, sender);
+    let edit = raw_session
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"first offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await;
+    let edited = match edit {
+        Ok(result) => result,
+        Err(error) => panic!("first raw offline file edit failed: {error:?}"),
     };
-    let (result, ()) = futures_util::join!(worker, caller);
-    result.unwrap();
-    session.close().await.unwrap();
+    assert_eq!(edited.rows_affected(), 1);
+
+    // A second write in the same explicit transaction must resolve the
+    // filesystem path index against the first staged write's overlay. Keep
+    // this scoped to the same file so the native closure does not need the
+    // rest of the sparse filesystem snapshot.
+    let mut transaction = raw_session.begin_transaction().await.unwrap();
+    let staged = transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"staged offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("offline file edit in transaction failed: {error:?}"));
+    assert_eq!(staged.rows_affected(), 1);
+    let staged_again = transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"second staged offline edit".to_vec().into()),
+                Value::Text(file_id.to_owned()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("second staged offline file edit failed: {error:?}"));
+    assert_eq!(staged_again.rows_affected(), 1);
+    transaction
+        .commit()
+        .await
+        .unwrap_or_else(|error| panic!("offline file edit transaction failed: {error:?}"));
+
+    let stored = raw_session
+        .execute(
+            "SELECT content FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"second staged offline edit"
+    );
+    lix.close().await.unwrap();
 }
 
 #[derive(Clone)]

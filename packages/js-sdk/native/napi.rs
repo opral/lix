@@ -340,6 +340,7 @@ enum LixCommand {
         deferred: NativeDeferred<serde_json::Value>,
     },
     SyncHealth(NativeDeferred<serde_json::Value>),
+    PrepareOfflineEditing(NativeUnitDeferred),
     ActiveBranchId(NativeStringDeferred),
     ActiveAccountId(NativeStringDeferred),
     CreateBranch {
@@ -986,6 +987,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             }
             LixCommand::RecoverReplica { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::SyncHealth(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::PrepareOfflineEditing(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -1101,6 +1103,11 @@ fn handle_lix_command(
         }
         LixCommand::SyncHealth(deferred) => {
             let result = block_on!(state.lix.sync_health());
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::PrepareOfflineEditing(deferred) => {
+            let result = block_on!(state.lix.prepare_offline_editing());
             settle_deferred(deferred, result);
             None
         }
@@ -1361,6 +1368,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::SyncHealth(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::PrepareOfflineEditing(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::ActiveBranchId(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1552,6 +1562,17 @@ impl NativeLixInner {
             }
         };
         serde_json::to_value(health).map_err(|error| LixError::unknown(error.to_string()))
+    }
+
+    async fn prepare_offline_editing(&self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::prepare_offline_editing(lix).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::prepare_offline_editing(lix).await
+            }
+        }
     }
 
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
@@ -2388,6 +2409,14 @@ impl NativeLix {
             env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, LixCommand::SyncHealth);
+        Ok(promise)
+    }
+
+    #[napi(js_name = "prepareOfflineEditing")]
+    pub fn prepare_offline_editing<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::PrepareOfflineEditing);
         Ok(promise)
     }
 

@@ -1682,6 +1682,33 @@ impl HotStateFilter {
     }
 }
 
+impl HotStateScanRequest {
+    /// Whether this is the narrowly scoped catalog identity scan that may
+    /// avoid restoring legacy v82 author payloads. Keep the shape check here
+    /// so every tracked scan execution path enforces the same contract.
+    pub(crate) fn is_catalog_identity_only_scan(&self) -> bool {
+        let filter = &self.filter;
+        filter.rows == HotStateRowFilter::All
+            && filter.schema_keys.len() == 1
+            && filter.schema_keys[0] == "lix_registered_schema"
+            && filter.row_pks.is_empty()
+            && filter.row_pk_lower.is_none()
+            && filter.row_pk_upper.is_none()
+            && filter.branch_ids.len() == 1
+            && filter.file_ids.len() == 1
+            && matches!(&filter.file_ids[0], NullableKeyFilter::Null)
+            && filter.untracked == Some(false)
+            && filter.global.is_none()
+            && filter.constraints.is_empty()
+            && filter.declared_column_eq.is_none()
+            && filter.declared_column_range.is_none()
+            && !filter.include_tombstones
+            && self.projection.columns.len() == 1
+            && self.projection.columns[0] == "row_pk"
+            && self.limit.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) enum HotStateRowFilter {
     #[default]

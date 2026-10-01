@@ -1,8 +1,8 @@
-//! Live observation hydrates its own new basis after coordinate publication.
+//! Live observation receives its prepared current basis after publication.
 use super::*;
 
 #[tokio::test]
-async fn observer_hydrates_after_lazy_baseline_adoption() {
+async fn observer_receives_prepared_current_basis_after_publication() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
@@ -133,19 +133,13 @@ async fn observer_hydrates_after_lazy_baseline_adoption() {
             Some(engine.clone()),
         );
         let observe = async {
-            // Publication must not have warmed the previously observed query.
-            let missing = session.execute(sql, &[]).await.unwrap_err();
-            assert!(
-                NativeObjectRef::from_missing_error(&missing)
-                    .unwrap()
-                    .is_some()
-                    || NativeMetadataRef::from_missing_error(&missing)
-                        .unwrap()
-                        .is_some(),
-                "{missing:?}"
+            assert_eq!(
+                session.execute(sql, &[]).await.unwrap().rows()[0]
+                    .get::<serde_json::Value>("value").unwrap(),
+                "after"
             );
-            // The real observer demand sender and runtime HTTP dispatcher now
-            // hydrate and retry; no manual execute_hydrating helper is involved.
+            // The observer event is driven by publication of the prepared basis;
+            // no observer-triggered hydration is needed to read it.
             let changed = events.next().await.unwrap().unwrap();
             assert!(changed.sequence > initial.sequence);
             assert_eq!(
@@ -171,5 +165,5 @@ async fn observer_hydrates_after_lazy_baseline_adoption() {
         worker.await.unwrap();
     })
     .await
-    .expect("observer must hydrate and deliver the newly admitted basis");
+    .expect("observer must receive the newly admitted basis");
 }
