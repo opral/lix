@@ -1795,20 +1795,16 @@ pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
         &JsValue::from_str("code"),
         &JsValue::from_str(&error.code),
     );
-    if let Some(hint) = error.hint {
-        let _ = Reflect::set(
-            object,
-            &JsValue::from_str("hint"),
-            &JsValue::from_str(&hint),
-        );
+    if let Some(hint) = &error.hint {
+        let _ = Reflect::set(object, &JsValue::from_str("hint"), &JsValue::from_str(hint));
     }
-    if let Some(details) = error.details {
+    if let Some(details) = &error.details {
         if let Some(status) = details.get("httpStatus").and_then(|value| value.as_u64()) {
             let status = JsValue::from_f64(status as f64);
             let _ = Reflect::set(object, &JsValue::from_str("status"), &status);
             let _ = Reflect::set(object, &JsValue::from_str("httpStatus"), &status);
         }
-        if let Ok(details) = to_js_json_value(&details) {
+        if let Ok(details) = to_js_json_value(details) {
             let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
         }
     }
