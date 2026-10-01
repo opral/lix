@@ -4933,23 +4933,29 @@ fn required_non_empty(value: Option<String>, field: &'static str) -> Result<Stri
 pub(super) struct ApiError {
     status: StatusCode,
     body: ErrorEnvelope,
+    origin: crate::ErrorOrigin,
 }
 
 impl ApiError {
+    #[track_caller]
     fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status,
             body: ErrorEnvelope::from_parts(code, message, None, None),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             body: ErrorEnvelope::from_parts("LIX_INVALID_ARGUMENT", message, None, None),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn payload_too_large(limit: usize) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -4958,6 +4964,7 @@ impl ApiError {
         )
     }
 
+    #[track_caller]
     fn sync_response_too_large(operation: &str, limit: usize) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -4966,6 +4973,7 @@ impl ApiError {
         )
     }
 
+    #[track_caller]
     fn sync_push_event_too_large(limit: usize) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -4974,6 +4982,7 @@ impl ApiError {
         )
     }
 
+    #[track_caller]
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -4982,6 +4991,7 @@ impl ApiError {
         )
     }
 
+    #[track_caller]
     fn account_mismatch() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -4991,9 +5001,11 @@ impl ApiError {
                 None,
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn session_required() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -5003,9 +5015,11 @@ impl ApiError {
                 None,
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn invalid_session_id(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -5015,9 +5029,11 @@ impl ApiError {
                 None,
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn blob_base_missing(
         base_sha256: String,
         parameter_index: usize,
@@ -5038,9 +5054,11 @@ impl ApiError {
                 Some("retry the request with the complete blob".to_string()),
                 Some(details),
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn session_gone() -> Self {
         Self {
             status: StatusCode::GONE,
@@ -5050,9 +5068,11 @@ impl ApiError {
                 None,
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn capacity() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -5062,9 +5082,11 @@ impl ApiError {
                 Some("retry after an active request or observation stream closes".to_string()),
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn snapshot_capacity() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -5074,9 +5096,11 @@ impl ApiError {
                 Some("retry after the active snapshot export completes".to_string()),
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     fn server_closed() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -5086,6 +5110,7 @@ impl ApiError {
                 None,
                 None,
             ),
+            origin: crate::ErrorOrigin::caller(),
         }
     }
 }
@@ -5095,6 +5120,7 @@ impl From<LixError> for ApiError {
         Self {
             status: status_for_lix_error(&error),
             body: ErrorEnvelope::from_lix_error(&error),
+            origin: *error.origin(),
         }
     }
 }
@@ -5105,6 +5131,7 @@ impl IntoResponse for ApiError {
         let diagnostics = ProtocolErrorDiagnostics {
             code: self.body.error.code.clone(),
             details: self.body.error.details.as_deref().cloned(),
+            origin: self.origin,
         };
         let mut response = (self.status, Json(self.body)).into_response();
         response.extensions_mut().insert(diagnostics);
@@ -5247,6 +5274,8 @@ struct ErrorBody {
 pub struct ProtocolErrorDiagnostics {
     pub code: String,
     pub details: Option<serde_json::Value>,
+    /// Original Rust error producer site, distinct from a JavaScript stack.
+    pub origin: crate::ErrorOrigin,
 }
 
 impl ErrorEnvelope {

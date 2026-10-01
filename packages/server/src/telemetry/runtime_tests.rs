@@ -341,9 +341,33 @@ async fn protocol_requests_export_remote_parents_without_cross_request_context()
             .iter()
             .find(|s| s.span_context.trace_id().to_string() == trace)
             .unwrap();
+        let string_attribute = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| attribute.value.as_str().to_string())
+        };
         assert_eq!(span.parent_span_id.to_string(), parent);
         assert!(span.parent_span_is_remote);
         assert_eq!(span.span_context.trace_state().header(), "vendor=opaque");
+        assert_eq!(
+            string_attribute("rust_origin.kind").as_deref(),
+            Some("source_location")
+        );
+        assert_eq!(
+            string_attribute("rust_stacktrace_status").as_deref(),
+            Some("not_captured")
+        );
+        assert!(string_attribute("code.filepath").is_some_and(|file| {
+            file.starts_with("packages/server/") && file.ends_with("routes.rs")
+        }));
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "code.lineno"
+                && matches!(
+                    &attribute.value,
+                    opentelemetry::Value::I64(line) if *line > 0
+                )
+        }));
     }
     let root = requests
         .iter()
@@ -701,6 +725,33 @@ async fn nested_sql_rejection_has_one_owner_and_canonical_actor() {
         "two independent failures in the same trace"
     );
     assert!(failed.len() > owners.len(), "nested diagnostics retained");
+    let native_sql_error = owners
+        .iter()
+        .find(|span| field(span, "lix.error.code").as_deref() == Some("LIX_TYPE_MISMATCH"))
+        .expect("protocol owner span for native SQL error");
+    assert_eq!(
+        field(native_sql_error, "rust_origin.kind").as_deref(),
+        Some("source_location")
+    );
+    assert_eq!(
+        field(native_sql_error, "rust_stacktrace_status").as_deref(),
+        Some("not_captured")
+    );
+    let source_file = field(native_sql_error, "code.filepath").expect("native source path");
+    assert!(
+        source_file.starts_with("packages/lix/"),
+        "unexpected native source path: {source_file}"
+    );
+    assert!(
+        native_sql_error.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "code.lineno"
+                && matches!(
+                    attribute.value,
+                    opentelemetry::Value::I64(line) if line > 0
+                )
+        }),
+        "owner span should retain the native source line"
+    );
     for span in failed {
         assert_eq!(field(span, "lix.account_id").as_deref(), Some(ACCOUNT_ID));
         assert_eq!(

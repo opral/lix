@@ -1812,6 +1812,22 @@ pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
             let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
         }
     }
+    if let Some(file) = error.origin().repository_relative_file() {
+        let origin = serde_json::json!({
+            "kind": "source_location",
+            "file": file,
+            "line": error.origin().line(),
+            "column": error.origin().column(),
+        });
+        if let Ok(origin) = to_js(&origin) {
+            let _ = Reflect::set(object, &JsValue::from_str("rustOrigin"), &origin);
+        }
+    }
+    let _ = Reflect::set(
+        object,
+        &JsValue::from_str("rustStacktraceStatus"),
+        &JsValue::from_str("not_captured"),
+    );
     js_error.into()
 }
 

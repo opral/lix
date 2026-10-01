@@ -189,7 +189,7 @@ pub use schema::{
 /// PostgreSQL-derived Lix Schema v1 model and validation API.
 pub use lix_schema as schema_v1;
 
-pub use common::LixError;
+pub use common::{ErrorOrigin, LixError};
 pub use common::{
     Blob, Json, LixNotice, NullableKeyFilter, ResultColumnType, RowRef, SharedStr, SqlQueryResult,
     Value,

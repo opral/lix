@@ -9,11 +9,55 @@ use super::file_open_probe::{TimedClient, authority_execute};
 use super::*;
 use crate::sync::SyncTransport;
 use crate::sync::http::{RawHttpClient, RawHttpRequest, RawHttpResponse};
+use std::collections::BTreeSet;
 
 #[derive(Clone)]
 struct ReadOnlyProductionClient {
     client: reqwest::Client,
     repo_path: String,
+}
+
+#[derive(Clone)]
+struct CaptureBlobInputsClient {
+    inner: Client,
+    manifests: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    chunks: Arc<std::sync::Mutex<BTreeSet<String>>>,
+}
+
+impl RawHttpClient for CaptureBlobInputsClient {
+    fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+        let fulfillment = request.url.ends_with("/sync/read-fulfillment");
+        Box::pin(async move {
+            let response = self.inner.send(request).await?;
+            if fulfillment && (200..300).contains(&response.status) {
+                let response: crate::sync::read_fulfillment::ReadFulfillmentResponse =
+                    serde_json::from_slice(&response.body).map_err(|_| {
+                        LixError::new(
+                            "TEST_INVALID_READ_FULFILLMENT",
+                            "authority returned an invalid read fulfillment response",
+                        )
+                    })?;
+                for input in response.inputs {
+                    match input.address {
+                        crate::sync::read_fulfillment::ReadInputAddress::BlobManifest(hash) => {
+                            self.manifests
+                                .lock()
+                                .expect("captured manifest lock")
+                                .insert(crate::binary_cas::BlobId::from_bytes(hash).to_hex());
+                        }
+                        crate::sync::read_fulfillment::ReadInputAddress::BlobChunk(hash) => {
+                            self.chunks
+                                .lock()
+                                .expect("captured chunk lock")
+                                .insert(crate::binary_cas::ChunkHash::from_bytes(hash).to_hex());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(response)
+        })
+    }
 }
 
 impl RawHttpClient for ReadOnlyProductionClient {
@@ -130,6 +174,23 @@ fn only_read_fulfillment(log: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) ->
         .unwrap()
         .iter()
         .all(|entry| entry["operation"] == "read-fulfillment")
+}
+
+async fn observe_first<S>(
+    lix: &Lix<S>,
+    sql: &str,
+    params: &[Value],
+) -> Result<ExecuteResult, LixError>
+where
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+{
+    let mut events = lix.observe(sql, params)?;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(20), events.next())
+        .await
+        .map_err(|_| LixError::new("LIX_TEST_OBSERVE_TIMEOUT", "observe did not yield its first result"))??
+        .ok_or_else(|| LixError::new("LIX_TEST_OBSERVE_ENDED", "observe ended before its first result"))?;
+    events.close();
+    Ok(event.rows)
 }
 
 #[tokio::test]
@@ -620,4 +681,189 @@ fn report_production_probe_error(operation: &str, error: &LixError) {
         uuid_field("changeId"),
         uuid_field("sourceCommitId"),
     );
+}
+
+#[tokio::test]
+async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() {
+    let backing = Memory::new();
+    let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let large_id = "0193182b-2a72-7ed5-9015-76bf271af336";
+    let small_id = "0193182b-2a72-7ed5-9015-76bf271af337";
+    let large_bytes = vec![0x19; 300 * 1024];
+    let small_bytes = vec![0x5a; 16 * 1024];
+    authority
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)",
+            &[
+                Value::Text(large_id.into()),
+                Value::Blob(large_bytes.clone().into()),
+                Value::Text(small_id.into()),
+                Value::Blob(small_bytes.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let large_blob_id = crate::binary_cas::BlobId::from_content(&large_bytes).to_hex();
+    let small_blob_id = crate::binary_cas::BlobId::from_content(&small_bytes).to_hex();
+
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
+    let manifests = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let chunks = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let transport = HttpSyncTransport::connect_with(
+        CaptureBlobInputsClient {
+            inner: Client {
+                server,
+                lose_body: Arc::new(AtomicBool::new(false)),
+            },
+            manifests: Arc::clone(&manifests),
+            chunks: Arc::clone(&chunks),
+        },
+        &format!("https://example.test/lix/{}", authority.lix_id()),
+    )
+    .await
+    .unwrap();
+    let leased = transport.partial_replica_descriptor(None).await.unwrap();
+    let state = Arc::new(
+        PartialReplicaState::from_leased(
+            transport.protocol_url().into(),
+            authority.active_account_id().into(),
+            uuid::Uuid::now_v7().to_string(),
+            leased.wire,
+        )
+        .unwrap(),
+    );
+    transport
+        .bind_native_baseline_lease(state.baseline_lease())
+        .unwrap();
+    let storage = StorageAdapter::new(
+        crate::storage_adapter::StorageSession::acquire(Memory::new())
+            .await
+            .unwrap(),
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+    crate::init::stage_partial_repository_protocol(&mut writes);
+    drop(read);
+    storage
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    let engine = Arc::new(engine);
+    engine.sync_mode().admit_partial_replica(
+        state.clone(),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
+    let worker_storage = storage.clone();
+    let worker_state = state.clone();
+    let worker_transport = transport.clone();
+    let worker = tokio::spawn(async move {
+        while let Some(demand) = receiver.recv().await {
+            let result = crate::sync::partial_runtime::hydrate_demand_with_receipt(
+                &worker_storage,
+                &worker_state,
+                &worker_transport,
+                demand.request,
+            )
+            .await;
+            let _ = demand.response.send(result);
+        }
+    });
+
+    let registered_schemas = observe_first(
+        &replica,
+            "SELECT schema_key, value, lixcol_file_id, lixcol_metadata, \
+             lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
+             lixcol_author_id, lixcol_commit_id, lixcol_untracked \
+             FROM lix_registered_schema LIMIT $1 OFFSET $2",
+        &[Value::Integer(10), Value::Integer(0)],
+    )
+        .await
+        .expect("projected registered-schema read should hydrate over HTTP");
+    assert!(!registered_schemas.is_empty());
+    let working_diff = observe_first(
+        &replica,
+        "SELECT count(*) AS file_count FROM lix_diff('lix_file')",
+        &[],
+    )
+        .await
+        .expect("working-diff count should resolve its native read dependencies");
+    assert_eq!(working_diff.len(), 1);
+    let active_account = observe_first(
+        &replica,
+            "SELECT id, name FROM lix_account WHERE id = lix_active_account_id()",
+        &[],
+    )
+        .await
+        .expect("active-account read should hydrate over HTTP");
+    assert_eq!(active_account.len(), 1);
+
+    let preview = observe_first(
+        &replica,
+            "SELECT id, path, CASE WHEN OCTET_LENGTH(content) <= $1 THEN content END AS content, \
+             OCTET_LENGTH(content) AS size_bytes FROM lix_file \
+             WHERE id IN ($2, $3) ORDER BY path",
+            &[
+                Value::Integer(32 * 1024),
+                Value::Text(large_id.into()),
+                Value::Text(small_id.into()),
+            ],
+    )
+        .await
+        .expect("bounded preview should fetch only eligible content over HTTP");
+    assert_eq!(preview.len(), 2);
+    let large = preview
+        .rows()
+        .iter()
+        .find(|row| row.get::<String>("id").unwrap() == large_id)
+        .expect("large file row");
+    assert_eq!(large.get::<Value>("content").unwrap(), Value::Null);
+    assert_eq!(
+        large.get::<i64>("size_bytes").unwrap(),
+        i64::try_from(large_bytes.len()).unwrap()
+    );
+    let small = preview
+        .rows()
+        .iter()
+        .find(|row| row.get::<String>("id").unwrap() == small_id)
+        .expect("small file row");
+    assert_eq!(small.get::<Vec<u8>>("content").unwrap(), small_bytes);
+    assert_eq!(
+        small.get::<i64>("size_bytes").unwrap(),
+        i64::try_from(small_bytes.len()).unwrap()
+    );
+    assert_eq!(*manifests.lock().unwrap(), BTreeSet::from([small_blob_id]));
+    let expected_chunks = crate::binary_cas::CanonicalBlobManifest::from_bytes(&small_bytes)
+        .chunks
+        .into_iter()
+        .map(|chunk| chunk.hash.to_hex())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(*chunks.lock().unwrap(), expected_chunks);
+    assert!(!manifests.lock().unwrap().contains(&large_blob_id));
+
+    replica.close().await.unwrap();
+    worker.abort();
+    authority.close().await.unwrap();
 }

@@ -24,6 +24,7 @@ fn merge_error(error: LixError) -> ApiError {
     ApiError {
         status,
         body: ErrorEnvelope::from_lix_error(&error),
+        origin: *error.origin(),
     }
 }
 pub(super) fn retained_bodies<S>(

@@ -2,6 +2,13 @@ export type LixJsError = Error & {
 	code?: string;
 	details?: unknown;
 	hint?: string;
+	readonly rustOrigin?: Readonly<{
+		kind: "source_location";
+		file: string;
+		line: number;
+		column: number;
+	}>;
+	readonly rustStacktraceStatus?: "not_captured";
 };
 
 export function invalidArgument(

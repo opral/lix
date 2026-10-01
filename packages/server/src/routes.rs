@@ -270,6 +270,11 @@ async fn repository_admission(
         "http.response.status_code" = tracing::field::Empty,
         "lix.error.code" = tracing::field::Empty,
         "lix.error.source_code" = tracing::field::Empty,
+        "rust_origin.kind" = tracing::field::Empty,
+        "code.filepath" = tracing::field::Empty,
+        "code.lineno" = tracing::field::Empty,
+        "code.column" = tracing::field::Empty,
+        "rust_stacktrace_status" = tracing::field::Empty,
         "lix.migration.from_version" = tracing::field::Empty,
         "lix.migration.to_version" = tracing::field::Empty,
         "lix.receipt.version" = tracing::field::Empty,
@@ -281,6 +286,12 @@ async fn repository_admission(
         .instrument(span.clone())
         .await;
     span.record("http.response.status_code", response.status().as_u16());
+    if let Some(error) = response
+        .extensions()
+        .get::<server_protocol::ProtocolErrorDiagnostics>()
+    {
+        record_protocol_error_diagnostics(&span, error);
+    }
     if response.status().is_client_error() || response.status().is_server_error() {
         span.record("otel.status_code", "ERROR");
     }
@@ -602,6 +613,11 @@ async fn lix_protocol_route(
         "http.response.status_code" = tracing::field::Empty,
         "lix.error.code" = tracing::field::Empty,
         "lix.error.source_code" = tracing::field::Empty,
+        "rust_origin.kind" = tracing::field::Empty,
+        "code.filepath" = tracing::field::Empty,
+        "code.lineno" = tracing::field::Empty,
+        "code.column" = tracing::field::Empty,
+        "rust_stacktrace_status" = tracing::field::Empty,
         "lix.migration.from_version" = tracing::field::Empty,
         "lix.migration.to_version" = tracing::field::Empty,
         "lix.receipt.version" = tracing::field::Empty,
@@ -624,10 +640,7 @@ async fn lix_protocol_route(
         .extensions()
         .get::<server_protocol::ProtocolErrorDiagnostics>()
     {
-        span.record("lix.error.code", error.code.as_str());
-        if let Some(details) = &error.details {
-            crate::telemetry::record_failure_details(&span, details);
-        }
+        record_protocol_error_diagnostics(&span, error);
     }
     if response.status().is_client_error() || response.status().is_server_error() {
         span.record("otel.status_code", "ERROR");
@@ -1211,6 +1224,24 @@ struct ErrorBody {
     details: Option<serde_json::Value>,
 }
 
+fn record_protocol_error_diagnostics(
+    span: &tracing::Span,
+    error: &server_protocol::ProtocolErrorDiagnostics,
+) {
+    span.record("lix.error.code", error.code.as_str());
+    if let Some(details) = &error.details {
+        crate::telemetry::record_failure_details(span, details);
+    }
+    span.record("rust_stacktrace_status", "not_captured");
+    if let Some(file) = error.origin.repository_relative_file() {
+        span.record("rust_origin.kind", "source_location");
+        span.record("code.filepath", file.as_str());
+        span.record("code.lineno", i64::from(error.origin.line()));
+        span.record("code.column", i64::from(error.origin.column()));
+    }
+}
+
+#[track_caller]
 fn protocol_error(
     status: StatusCode,
     code: impl Into<String>,
@@ -1219,6 +1250,7 @@ fn protocol_error(
     details: Option<serde_json::Value>,
 ) -> Response {
     let code = code.into();
+    let message = message.into();
     let mut details = match details {
         Some(serde_json::Value::Object(fields)) => fields,
         Some(value) => serde_json::Map::from_iter([("cause".into(), value)]),
@@ -1226,23 +1258,28 @@ fn protocol_error(
     };
     details.insert("exceptionOwner".into(), "protocol".into());
     let details = Some(serde_json::Value::Object(details));
+    let source_error = lix_sdk::LixError::new(code.clone(), message.clone());
+    let diagnostics = server_protocol::ProtocolErrorDiagnostics {
+        code: code.clone(),
+        details: details.clone(),
+        origin: *source_error.origin(),
+    };
     let span = tracing::Span::current();
-    span.record("lix.error.code", code.as_str());
-    if let Some(details) = &details {
-        crate::telemetry::record_failure_details(&span, details);
-    }
-    (
+    record_protocol_error_diagnostics(&span, &diagnostics);
+    let mut response = (
         status,
         Json(ErrorEnvelope {
             error: ErrorBody {
                 code,
-                message: message.into(),
+                message,
                 hint,
                 details,
             },
         }),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(diagnostics);
+    response
 }
 
 trait RetryAfterResponse {

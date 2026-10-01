@@ -87,8 +87,7 @@ async fn descriptor_only_file_diff_and_history_hydrate_selected_bytes() {
                 .map(|chunk| chunk.hash.to_hex())
         })
         .collect::<BTreeSet<_>>();
-    let mut blob_fetches = 0;
-    let mut chunk_fetches = 0;
+    let mut fetches = Fetches::default();
     for source in [
         format!("lix_diff('lix_file', '{before}', '{after}')"),
         "lix_diff('lix_file')".into(),
@@ -97,93 +96,17 @@ async fn descriptor_only_file_diff_and_history_hydrate_selected_bytes() {
         let sql = format!(
             "SELECT from_content, to_content FROM {source} WHERE id = '{id}' AND diff_type = 'modified'"
         );
-        let mut fetches = Fetches::default();
-        let mut attempts = 0;
-        let result = loop {
-            attempts += 1;
-            assert!(attempts < 20, "content hydration must make progress");
-            let error = match execute_hydrating(
-                &session,
-                &storage,
-                &state,
-                &authority,
-                &sql,
-                &[],
-                &mut fetches,
-            )
-            .await
-            {
-                Ok(result) => break result,
-                Err(error) => error,
-            };
-            let mut writes = storage.new_write_set();
-            let read = storage.begin_read(Default::default()).await.unwrap();
-            let mut preconditions = Vec::new();
-            match error.code.as_str() {
-                "LIX_PARTIAL_BLOB_MANIFEST_REQUIRED" => {
-                    let demand = crate::binary_cas::BlobManifestRequired::from_error(&error)
-                        .unwrap()
-                        .unwrap();
-                    let id = demand.0.to_hex();
-                    assert!(allowed.contains(&id), "unrelated blob demanded: {id}");
-                    let wire = authority
-                        .get_sync_blob_manifest(&id)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    let manifest = super::super::blob::decode_manifest(&wire).unwrap();
-                    crate::binary_cas::stage_deferred_canonical_manifest(
-                        &read,
-                        &mut writes,
-                        &manifest,
-                    )
-                    .await
-                    .unwrap();
-                    blob_fetches += 1;
-                }
-                "LIX_SYNC_CHUNKS_REQUIRED" => {
-                    for value in error.details.as_ref().unwrap()["chunkIds"]
-                        .as_array()
-                        .unwrap()
-                    {
-                        let id = value.as_str().unwrap();
-                        assert!(
-                            allowed_chunks.contains(id),
-                            "unrelated chunk demanded: {id}"
-                        );
-                        let bytes = authority.get_sync_chunk(id).await.unwrap().unwrap();
-                        crate::binary_cas::stage_verified_raw_chunk(
-                            &mut writes,
-                            crate::binary_cas::ChunkHash::from_hex(id).unwrap(),
-                            &bytes,
-                        )
-                        .unwrap();
-                        chunk_fetches += 1;
-                    }
-                }
-                _ => panic!("unexpected content demand: {error:?}"),
-            }
-            crate::binary_cas::stage_transfer_publication_fence(
-                &read,
-                &mut writes,
-                &mut preconditions,
-            )
-            .await
-            .unwrap();
-            drop(read);
-            storage
-                .commit_partial_replica_write_set(
-                    super::super::partial_replica_write_capability(),
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        await_durable: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
-        };
+        let result = execute_hydrating(
+            &session,
+            &storage,
+            &state,
+            &authority,
+            &sql,
+            &[],
+            &mut fetches,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.len(), 1, "{source}");
         assert_eq!(
             result.rows()[0].get::<Vec<u8>>("from_content").unwrap(),
@@ -194,8 +117,152 @@ async fn descriptor_only_file_diff_and_history_hydrate_selected_bytes() {
             after_bytes
         );
     }
-    assert_eq!(blob_fetches, 2, "each selected endpoint fetched once");
-    assert!(chunk_fetches >= 2);
+    assert_eq!(
+        fetches.blob_manifest_ids,
+        allowed.into_iter().collect(),
+        "only the selected endpoints' manifests should be fetched"
+    );
+    assert_eq!(
+        fetches.chunk_ids, allowed_chunks,
+        "only selected endpoint chunks should be fetched"
+    );
+    session.close().await.unwrap();
+    authority.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn descriptor_only_preview_hydrates_only_content_within_the_case_limit() {
+    let authority = open_lix().with_storage(Memory::new()).await.unwrap();
+    let large_id = "0193182b-2a72-7ed5-9015-76bf271af334";
+    let small_id = "0193182b-2a72-7ed5-9015-76bf271af335";
+    let large_bytes = vec![b'l'; 300 * 1024];
+    let small_bytes = b"small preview".to_vec();
+    authority
+        .execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)",
+            &[
+                Value::Text(large_id.into()),
+                Value::Blob(large_bytes.clone().into()),
+                Value::Text(small_id.into()),
+                Value::Blob(small_bytes.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let large_blob_id = crate::binary_cas::BlobId::from_content(&large_bytes).to_hex();
+    let small_blob_id = crate::binary_cas::BlobId::from_content(&small_bytes).to_hex();
+    let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+    let state = PartialReplicaState::new(
+        format!("https://example.test/lix/{}", authority.lix_id()),
+        crate::ANONYMOUS_ACCOUNT_ID.into(),
+        uuid::Uuid::now_v7().to_string(),
+        descriptor,
+    )
+    .unwrap();
+    let storage = StorageAdapter::new(Memory::new());
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+    crate::init::stage_partial_repository_protocol(&mut writes);
+    drop(read);
+    storage
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        std::sync::Arc::new(state.clone()),
+        super::super::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(super::super::partial_replica_write_capability());
+
+    for (label, sql, params) in [
+        (
+            "registered schema projection",
+            "SELECT schema_key, value, lixcol_file_id, lixcol_metadata, \
+             lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
+             lixcol_author_id, lixcol_commit_id, lixcol_untracked \
+             FROM lix_registered_schema LIMIT $1 OFFSET $2",
+            vec![Value::Integer(10), Value::Integer(0)],
+        ),
+        (
+            "working diff count",
+            "SELECT count(*) AS file_count FROM lix_diff('lix_file')",
+            Vec::new(),
+        ),
+        (
+            "active account projection",
+            "SELECT id, name FROM lix_account WHERE id = lix_active_account_id()",
+            Vec::new(),
+        ),
+    ] {
+        execute_hydrating(
+            &session,
+            &storage,
+            &state,
+            &authority,
+            sql,
+            &params,
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("partial {label} query failed: {error:?}"));
+    }
+
+    let mut fetches = Fetches::default();
+    let result = execute_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        "SELECT id, path, CASE WHEN OCTET_LENGTH(content) <= $1 THEN content END AS content, \
+         OCTET_LENGTH(content) AS size_bytes FROM lix_file \
+         WHERE id IN ($2, $3) ORDER BY path",
+        &[
+            Value::Integer(1024),
+            Value::Text(large_id.into()),
+            Value::Text(small_id.into()),
+        ],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.len(), 2);
+    let large_row = result
+        .rows()
+        .iter()
+        .find(|row| row.get::<String>("id").unwrap() == large_id)
+        .expect("large file row");
+    assert_eq!(large_row.get::<Value>("content").unwrap(), Value::Null);
+    assert_eq!(
+        large_row.get::<i64>("size_bytes").unwrap(),
+        i64::try_from(large_bytes.len()).unwrap()
+    );
+    let small_row = result
+        .rows()
+        .iter()
+        .find(|row| row.get::<String>("id").unwrap() == small_id)
+        .expect("small file row");
+    assert_eq!(
+        small_row.get::<Vec<u8>>("content").unwrap(),
+        small_bytes
+    );
+    assert_eq!(
+        small_row.get::<i64>("size_bytes").unwrap(),
+        i64::try_from(small_bytes.len()).unwrap()
+    );
+    assert_eq!(fetches.blob_manifest_ids, BTreeSet::from([small_blob_id]));
+    assert!(!fetches.blob_manifest_ids.contains(&large_blob_id));
     session.close().await.unwrap();
     authority.close().await.unwrap();
 }

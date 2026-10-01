@@ -3460,6 +3460,18 @@ fn create_lix_error<'env>(env: &'env Env, error: &LixError) -> Result<Object<'en
     if let Some(details) = &error.details {
         js_error.set_named_property("details", details.as_ref().clone())?;
     }
+    if let Some(file) = error.origin().repository_relative_file() {
+        js_error.set_named_property(
+            "rustOrigin",
+            serde_json::json!({
+                "kind": "source_location",
+                "file": file,
+                "line": error.origin().line(),
+                "column": error.origin().column(),
+            }),
+        )?;
+    }
+    js_error.set_named_property("rustStacktraceStatus", "not_captured")?;
     Ok(js_error)
 }
 

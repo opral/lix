@@ -3407,6 +3407,7 @@ where
                 || matches!(
                     plan.projection,
                     sql2::LateLixFileProjection::OctetLength
+                        | sql2::LateLixFileProjection::BoundedContent { .. }
                         | sql2::LateLixFileProjection::Substring { .. }
                 )
         });
@@ -3418,6 +3419,7 @@ where
                     statement,
                     Some((
                         plan.data_column_index,
+                        plan.size_column_indices,
                         plan.file_id_column_index,
                         plan.projection,
                     )),
@@ -3451,7 +3453,13 @@ where
         .await?;
         drop(read_session);
         drop(ctx);
-        if let Some((data_column_index, file_id_column_index, projection)) = late_file_projection {
+        if let Some((
+            data_column_index,
+            size_column_indices,
+            file_id_column_index,
+            projection,
+        )) = late_file_projection
+        {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(read_hot.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
@@ -3485,7 +3493,25 @@ where
                         self.plugin_host.clone(),
                         &mut materialized,
                         data_column_index,
+                        &size_column_indices,
                         file_id_column_index,
+                    )
+                    .await?;
+                }
+                sql2::LateLixFileProjection::BoundedContent { max_size } => {
+                    hydrate_lix_file_bounded_content_result(
+                        &active_branch_id,
+                        Arc::clone(&hot_state),
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        file_view_collector.clone(),
+                        &mut materialized,
+                        data_column_index,
+                        &size_column_indices,
+                        file_id_column_index,
+                        max_size,
                     )
                     .await?;
                 }
@@ -3821,6 +3847,7 @@ async fn hydrate_lix_file_size_result(
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     query: &mut SqlQueryResult,
     data_column_index: usize,
+    size_column_indices: &[usize],
     file_id_column_index: Option<usize>,
 ) -> Result<(), LixError> {
     let file_ids = late_lix_file_ids(query, file_id_column_index);
@@ -3831,6 +3858,15 @@ async fn hydrate_lix_file_size_result(
         ));
     };
     *column_type = ResultColumnType::Integer;
+    for size_column_index in size_column_indices {
+        let Some(column_type) = query.column_types.get_mut(*size_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size result was missing a projected size column type",
+            ));
+        };
+        *column_type = ResultColumnType::Integer;
+    }
     let paths = late_lix_file_placeholder_paths(query, data_column_index)?;
     if paths.is_empty() {
         return Ok(());
@@ -3870,12 +3906,187 @@ async fn hydrate_lix_file_size_result(
                 "late lix_file size placeholder was not a path",
             ));
         };
-        *placeholder = size_by_path.get(&path).cloned().ok_or_else(|| {
+        let size = size_by_path.get(&path).cloned().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("late lix_file size lookup did not return '{path}'"),
             )
         })?;
+        *placeholder = size.clone();
+        for size_column_index in size_column_indices {
+            let Some(placeholder) = row.get_mut(*size_column_index) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file size result was missing a projected size placeholder",
+                ));
+            };
+            let Value::Text(size_path) = std::mem::replace(placeholder, Value::Null) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file size placeholder was not a path",
+                ));
+            };
+            if size_path != path {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file size placeholders referenced different paths",
+                ));
+            }
+            *placeholder = size.clone();
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_lix_file_bounded_content_result(
+    active_branch_id: &str,
+    hot_state: Arc<dyn crate::hot_state::HotStateReader>,
+    filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
+    session_file_views: Option<sql2::SessionFileViews>,
+    query: &mut SqlQueryResult,
+    data_column_index: usize,
+    size_column_indices: &[usize],
+    file_id_column_index: Option<usize>,
+    max_size: i64,
+) -> Result<(), LixError> {
+    let file_ids = late_lix_file_ids(query, file_id_column_index);
+    let Some(column_type) = query.column_types.get_mut(data_column_index) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "late lix_file bounded content result was missing its column type",
+        ));
+    };
+    *column_type = ResultColumnType::Blob;
+    for size_column_index in size_column_indices {
+        let Some(column_type) = query.column_types.get_mut(*size_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file bounded content result was missing a size column type",
+            ));
+        };
+        *column_type = ResultColumnType::Integer;
+    }
+
+    let paths = late_lix_file_placeholder_paths(query, data_column_index)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let sizes = sql2::execute_exact_lix_file_size_batch_read(
+        active_branch_id,
+        Arc::clone(&hot_state),
+        Arc::clone(&filesystem_path_index),
+        Arc::clone(&branch_ref),
+        Arc::clone(&blob_reader),
+        plugin_host.clone(),
+        None,
+        file_ids.as_ref(),
+        &paths,
+    )
+    .await?;
+    let mut size_by_path = BTreeMap::new();
+    for row in sizes.rows {
+        let [Value::Text(path), Value::Integer(size)] = row.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file bounded size lookup returned an invalid row",
+            ));
+        };
+        if *size < 0 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file bounded size lookup returned a negative size",
+            ));
+        }
+        size_by_path.insert(path.clone(), *size);
+    }
+
+    let selected_paths = paths
+        .iter()
+        .filter(|path| size_by_path.get(*path).is_some_and(|size| *size <= max_size))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut content_by_path = BTreeMap::new();
+    if !selected_paths.is_empty() {
+        let hydrated = sql2::execute_exact_lix_file_batch_read(
+            active_branch_id,
+            Arc::clone(&hot_state),
+            filesystem_path_index,
+            branch_ref,
+            blob_reader,
+            plugin_host,
+            session_file_views,
+            None,
+            file_ids.as_ref(),
+            &selected_paths,
+            None,
+        )
+        .await?;
+        for row in hydrated.rows {
+            let [Value::Text(path), content] = row.as_slice() else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file bounded content hydration returned an invalid row",
+                ));
+            };
+            content_by_path.insert(path.clone(), content.clone());
+        }
+        query.notices.extend(hydrated.notices);
+    }
+
+    for row in &mut query.rows {
+        let Some(placeholder) = row.get_mut(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file bounded content result was missing its placeholder column",
+            ));
+        };
+        let Value::Text(path) = std::mem::replace(placeholder, Value::Null) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file bounded content placeholder was not a path",
+            ));
+        };
+        let size = size_by_path.get(&path).copied().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("late lix_file bounded size lookup did not return '{path}'"),
+            )
+        })?;
+        *placeholder = if size <= max_size {
+            content_by_path.get(&path).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("late lix_file bounded content hydration did not return '{path}'"),
+                )
+            })?
+        } else {
+            Value::Null
+        };
+        for size_column_index in size_column_indices {
+            let Some(placeholder) = row.get_mut(*size_column_index) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file bounded content result was missing a size placeholder",
+                ));
+            };
+            let Value::Text(size_path) = std::mem::replace(placeholder, Value::Null) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file bounded size placeholder was not a path",
+                ));
+            };
+            if size_path != path {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file bounded size placeholder referenced a different path",
+                ));
+            }
+            *placeholder = Value::Integer(size);
+        }
     }
     Ok(())
 }
