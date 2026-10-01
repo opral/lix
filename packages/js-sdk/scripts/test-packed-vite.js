@@ -118,13 +118,12 @@ try {
 		/^entry\.browser-.*\.js$/,
 		"browser worker",
 	);
-	const workerSource = await readFile(join(assetsDir, browserWorker), "utf8");
-	// Detached migration contributes a separate engine artifact. The normal
-	// worker must still reference exactly one engine directly.
+	// Normal opening and maintenance must emit one shared engine. Vite may
+	// place its URL in a shared JavaScript chunk rather than the worker itself.
 	const engineWasm = findBuiltAsset(
-		builtAssets.filter((file) => workerSource.includes(file)),
+		builtAssets,
 		/^lix_js_sdk_bg-.*\.wasm$/,
-		"normal worker engine WASM",
+		"shared engine WASM",
 	);
 	const browserJavaScriptSources = await Promise.all(
 		builtAssets
@@ -136,8 +135,8 @@ try {
 		"The browser bundle does not reference the emitted browser worker",
 	);
 	assert.ok(
-		workerSource.includes(engineWasm),
-		"The browser worker does not reference the emitted engine WASM",
+		browserJavaScriptSources.some((source) => source.includes(engineWasm)),
+		"The browser JavaScript does not reference the emitted engine WASM",
 	);
 	assert.ok(
 		builtAssets.every((file) => !file.startsWith("entry.node-")),

@@ -11,8 +11,7 @@ const repoRoot = join(packageDir, "..", "..");
 const profile = process.env.LIX_WASM_PROFILE ?? "release";
 const cargoProfile = profile === "release" ? "release" : "dev";
 const artifactProfile = cargoProfile === "release" ? "release" : "debug";
-const migrationArtifact = process.env.LIX_OFFLINE_MIGRATION === "1";
-const artifactDirectory = migrationArtifact ? "migration-wasm" : "wasm";
+const artifactDirectory = "wasm";
 const outDir = join(packageDir, "dist", artifactDirectory);
 const sourceOutDir = join(packageDir, "src", artifactDirectory);
 
@@ -92,7 +91,6 @@ const cargoArgs = [
 if (cargoProfile === "release") {
 	cargoArgs.push("--config", "profile.release.package.lix.codegen-units=4");
 }
-if (migrationArtifact) cargoArgs.push("--features", "offline-migration");
 if (process.env.LIX_WASM_STORAGE_BENCH === "1") {
 	cargoArgs.push("--features", "storage-bridge-bench");
 }
@@ -111,6 +109,9 @@ const wasmArtifact = join(
 	artifactProfile,
 	"lix_js_sdk.wasm",
 );
+// Remove outputs from the former two-artifact layout before packaging.
+await rm(join(packageDir, "dist", "migration-wasm"), { recursive: true, force: true });
+await rm(join(packageDir, "src", "migration-wasm"), { recursive: true, force: true });
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
 await run("wasm-bindgen", [

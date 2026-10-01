@@ -9,6 +9,10 @@ const wasm = vi.hoisted(() => ({
 
 vi.mock("./wasm/lix_js_sdk.js", () => ({
 	default: wasm.init,
+	convertJsStorageReplicaToPartial: vi.fn(),
+	retryJsStorageReplicaMigrationCleanup: vi.fn(),
+	inspectJsStorageRepository: vi.fn(),
+	migrateJsStorageRepository: vi.fn(),
 	openRemote: wasm.openRemote,
 	openMemory: wasm.openMemory,
 	openMemoryFromSnapshot: vi.fn(),
@@ -89,7 +93,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 test.each(["node", "browser with locks", "browser without locks"])(
-	"local and remote opens share one WASM initialization: %s",
+	"local, remote and maintenance operations share one WASM initialization: %s",
 	async (environment) => {
 		const { openRemoteLixBinding } = await import("./remote/client.js");
 		const { openMemoryWasmBinding } = await import("./binding.node-wasm.js");
@@ -112,12 +116,14 @@ test.each(["node", "browser with locks", "browser without locks"])(
 			: openLixBinding({ kind: "memory" });
 		const remote = openRemoteLixBinding(options);
 		const secondRemote = openRemoteLixBinding(options);
+		const { initializeMigration } = await import("./migration-binding.browser.js");
+		const migration = initializeMigration();
 		await vi.waitFor(() => expect(wasm.init).toHaveBeenCalled());
 		expect(wasm.openMemory).not.toHaveBeenCalled();
 		expect(wasm.openRemote).not.toHaveBeenCalled();
 
 		initialization.resolve();
-		await Promise.all([local, remote, secondRemote]);
+		await Promise.all([local, remote, secondRemote, migration]);
 		expect(wasm.init).toHaveBeenCalledTimes(1);
 		expect(wasm.openMemory).toHaveBeenCalledTimes(1);
 		expect(wasm.openRemote).toHaveBeenCalledTimes(2);
@@ -249,17 +255,20 @@ test("online compile failures report a safe phase and cache status", async () =>
 test("a failed initialization is shared, then a later call retries", async () => {
 	const { openRemoteLixBinding } = await import("./remote/client.js");
 	const { openMemoryWasmBinding } = await import("./binding.node-wasm.js");
+	const { initializeMigration } = await import("./migration-binding.browser.js");
 	const failure = new Error("WASM initialization failed");
 	const firstInitialization = Promise.withResolvers<void>();
 	wasm.init.mockReturnValueOnce(firstInitialization.promise).mockResolvedValueOnce(undefined);
 
 	const local = openMemoryWasmBinding();
 	const remote = openRemoteLixBinding(options);
+	const maintenance = initializeMigration();
 	await vi.waitFor(() => expect(wasm.init).toHaveBeenCalledOnce());
 	firstInitialization.reject(failure);
-	await expect(Promise.all([local, remote])).rejects.toBe(failure);
+	await expect(Promise.all([local, remote, maintenance])).rejects.toBe(failure);
 
 	await expect(openRemoteLixBinding(options)).resolves.toBeDefined();
+	await expect(initializeMigration()).resolves.toBeUndefined();
 	expect(wasm.init).toHaveBeenCalledTimes(2);
 	expect(wasm.openMemory).not.toHaveBeenCalled();
 	expect(wasm.openRemote).toHaveBeenCalledOnce();
