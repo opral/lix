@@ -346,7 +346,10 @@ async fn repository_admission_inner(
         );
     }
     let principal = match take_trusted_principal(&mut request, state.internal_token.is_some()) {
-        Ok(Some(principal)) => principal.account_id,
+        Ok(Some(principal)) => {
+            crate::telemetry::set_request_actor(Some(&principal.account_id));
+            principal.account_id
+        }
         Ok(None) => "00000000-0000-7000-8000-000000000002".to_owned(),
         Err(message) => {
             return protocol_error(

@@ -659,6 +659,63 @@ async fn admission_failure_exports_cause_status_and_remote_trace() {
 }
 
 #[tokio::test]
+async fn admission_failure_retains_authenticated_actor_without_cross_request_leaks() {
+    use tracing::instrument::WithSubscriber as _;
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+    );
+    let app = crate::router(
+        crate::LixRuntimeManager::new_in_memory(1),
+        Some("test-internal-token".into()),
+        Duration::from_secs(60),
+        InFlightSqlRegistry::default(),
+    );
+    for account in [Some(ACCOUNT_ID), None] {
+        let mut request = Request::builder()
+            .uri(format!("/lix/v1/{LIX_ID}/admission"))
+            .header("authorization", "Bearer test-internal-token")
+            .header(
+                "lix-sync-protocol-version",
+                lix_sdk::SYNC_PROTOCOL_VERSION.to_string(),
+            );
+        if let Some(account) = account {
+            request = request.header("x-lix-account-id", account);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        provider.force_flush().unwrap();
+        let spans = exporter.0.lock().unwrap();
+        let span = spans
+            .iter()
+            .rev()
+            .find(|span| span.name == "Lix repository admission")
+            .unwrap();
+        let actor = span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "lix.account_id");
+        assert_eq!(
+            actor.map(|attribute| attribute.value.as_str().to_string()),
+            account.map(str::to_owned)
+        );
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+    }
+}
+
+#[tokio::test]
 async fn nested_sql_rejection_has_one_owner_and_canonical_actor() {
     use tracing::instrument::WithSubscriber as _;
     let exporter = RecordingExporter::default();
