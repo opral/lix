@@ -30,7 +30,6 @@ use super::write::{
     BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
     BoundWriteTarget, DirectoryWriteSurface, FileWriteSurface, RowWriteSurface,
 };
-use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 
 #[cfg(test)]
 pub(crate) fn bind_statement(
@@ -57,7 +56,7 @@ pub(crate) fn bind_statement_with_catalog(
         _ => Err(super::error::unsupported(format!(
             "SQL statement is not supported by Lix SQL: {statement}"
         ))),
-    }
+    }.map_err(super::error::rejected)
 }
 
 fn bind_sql_statement(
@@ -661,10 +660,11 @@ fn bind_insert_input(
             .any(|column| column.table == "lix_file" && column.name == "content")
         {
             return Err(LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                "lix_file.content expects binary content",
+                LixError::CODE_UNSUPPORTED_SQL,
+                "query-based INSERT into lix_file.content is not supported",
             )
-            .with_hint(LIX_FILE_CONTENT_CAST_HINT));
+            .with_hint("Use INSERT ... VALUES with bound binary content. To restore historical rows, use SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_file', NULL, $2)]).")
+            .with_details(serde_json::json!({"capability": "file_content_query_insert"})));
         }
         let statement =
             DataFusionStatement::Statement(Box::new(SqlStatement::Query(Box::new(source.clone()))));
@@ -1609,6 +1609,19 @@ impl ParamBinder {
 mod tests {
     use super::*;
     use datafusion::sql::parser::Statement as DataFusionStatement;
+
+    #[test]
+    fn query_file_content_insertion_reports_capability_and_non_commit() {
+        for expression in ["content", "CAST(content AS BYTEA)"] {
+            let sql = format!("INSERT INTO lix_file (id, path, content) SELECT id, path, {expression} FROM lix_as_of('lix_file', $1) WHERE id = $2");
+            let statement = crate::sql2::parse_statement(&sql).unwrap();
+            let error = bind_statement(&statement, &[], "main").unwrap_err();
+            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+            assert_eq!(error.details.as_ref().unwrap()["outcome"], "not_committed");
+            assert!(error.hint.as_ref().unwrap().contains("lix_restore"));
+            assert!(!error.message.contains("expects binary"));
+        }
+    }
 
     #[test]
     fn bind_statement_rejects_removed_restore_scalar_syntax() {

@@ -83,11 +83,25 @@ fn statement_end(
         Ok(result) => (Status::Unset, statement_result_attributes(result)),
         Err(error) => (
             Status::error(error.code.clone()),
-            vec![
-                TelemetryAttribute::string("error.type", error.code.clone()),
-            ],
+            error_attributes(error),
         ),
     }
+}
+
+fn error_attributes(error: &LixError) -> Vec<TelemetryAttribute> {
+    let mut attributes = vec![
+        TelemetryAttribute::string("error.type", error.code.clone()),
+        TelemetryAttribute::string("rust_stacktrace_status", "not_captured"),
+    ];
+    if let Some(file) = error.origin().repository_relative_file() {
+        attributes.extend([
+            TelemetryAttribute::string("rust_origin.kind", "source_location"),
+            TelemetryAttribute::string("code.filepath", file),
+            TelemetryAttribute::i64("code.lineno", i64::from(error.origin().line())),
+            TelemetryAttribute::i64("code.column", i64::from(error.origin().column())),
+        ]);
+    }
+    attributes
 }
 
 fn statement_result_attributes(result: &ExecuteResult) -> Vec<TelemetryAttribute> {
@@ -244,9 +258,7 @@ pub(crate) fn finish_operation<T>(span: ActiveTelemetrySpan, result: &Result<T, 
         Ok(_) => span.finish(Status::Unset, Vec::new()),
         Err(error) => span.finish(
             Status::error(error.code.clone()),
-            vec![
-                TelemetryAttribute::string("error.type", error.code.clone()),
-            ],
+            error_attributes(error),
         ),
     }
 }
@@ -265,7 +277,7 @@ pub(crate) fn finish_single_statement_batch(
         ),
         Err(error) => span.finish(
             Status::error(error.code.clone()),
-            vec![TelemetryAttribute::string("error.type", error.code.clone())],
+            error_attributes(error),
         ),
     }
 }
@@ -644,6 +656,47 @@ mod tests {
                 _ => None,
             })
         })
+    }
+
+    #[test]
+    fn sql_errors_export_a_sanitized_rust_origin_without_a_fake_stack() {
+        let expected_line = line!() + 1;
+        let error = LixError::new("LIX_TEST_ERROR", "failure");
+        let (_, attributes) = statement_end(&Err(error));
+        let string_attribute = |key: &str| {
+            attributes.iter().find_map(|attribute| {
+                (attribute.key == key)
+                    .then_some(&attribute.value)
+                    .and_then(|value| match value {
+                        crate::telemetry::TelemetryValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+            })
+        };
+        let i64_attribute = |key: &str| {
+            attributes.iter().find_map(|attribute| {
+                (attribute.key == key)
+                    .then_some(&attribute.value)
+                    .and_then(|value| match value {
+                        crate::telemetry::TelemetryValue::I64(value) => Some(*value),
+                        _ => None,
+                    })
+            })
+        };
+        assert_eq!(
+            string_attribute("rust_stacktrace_status"),
+            Some("not_captured")
+        );
+        assert_eq!(string_attribute("rust_origin.kind"), Some("source_location"));
+        assert_eq!(i64_attribute("code.lineno"), Some(i64::from(expected_line)));
+        assert!(attributes
+            .iter()
+            .all(|attribute| attribute.key != "exception.stacktrace"));
+        let file = string_attribute("code.filepath").expect("source file should be exported");
+        assert!(file.starts_with("packages/"), "unexpected source path: {file}");
+        assert!(file.ends_with(".rs"), "unexpected source path: {file}");
+        assert!(!file.split('/').any(|part| part == ".."));
+        assert!(i64_attribute("code.column").is_some_and(|column| column > 0));
     }
 
     #[test]

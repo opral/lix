@@ -1,6 +1,71 @@
 use std::fmt::Write as _;
+use std::panic::Location;
 
 use serde_json::{Value as JsonValue, json};
+
+/// Source location where a structured Lix error was created.
+///
+/// This identifies the Rust producer site. It is distinct from a JavaScript
+/// stack, which is captured by the JavaScript runtime when a binding surfaces
+/// an error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ErrorOrigin {
+    file: &'static str,
+    line: u32,
+    column: u32,
+}
+
+impl ErrorOrigin {
+    #[track_caller]
+    pub(crate) fn caller() -> Self {
+        let caller = Location::caller();
+        Self {
+            file: caller.file(),
+            line: caller.line(),
+            column: caller.column(),
+        }
+    }
+
+    /// Returns a repository-relative Rust source path when the compiler path
+    /// contains the repository's `packages/` root. Machine-local prefixes and
+    /// ambiguous crate-relative paths are deliberately omitted.
+    pub fn repository_relative_file(&self) -> Option<String> {
+        let path = self.file.replace('\\', "/");
+        let path = path.strip_prefix("./").unwrap_or(&path);
+        let path = if let Some(root) = path.find("/packages/") {
+            &path[root + 1..]
+        } else {
+            path
+        };
+        if !path.starts_with("packages/")
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return None;
+        }
+        Some(path.to_owned())
+    }
+
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    pub fn column(&self) -> u32 {
+        self.column
+    }
+}
+
+impl std::fmt::Debug for ErrorOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ErrorOrigin")
+            .field("file", &self.repository_relative_file())
+            .field("line", &self.line)
+            .field("column", &self.column)
+            .finish()
+    }
+}
 
 /// Structured error type surfaced by Lix to every SDK binding.
 ///
@@ -27,9 +92,17 @@ pub struct LixError {
     pub message: String,
     pub hint: Option<String>,
     pub details: Option<Box<JsonValue>>,
+    /// Rust source site that created this error.
+    pub(crate) origin: ErrorOrigin,
 }
 
 impl LixError {
+    /// Rust source location that created this error, when its path can be
+    /// represented without exposing a machine-local build directory.
+    pub fn origin(&self) -> &ErrorOrigin {
+        &self.origin
+    }
+
     /// True fallback — use when no more specific category fits. Producing
     /// sites should prefer the categorized codes below whenever possible;
     /// the SDK contract is that `LIX_ERROR_UNKNOWN` is the *last* resort,
@@ -252,19 +325,23 @@ impl LixError {
                 })
     }
 
+    #[track_caller]
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
             hint: None,
             details: None,
+            origin: ErrorOrigin::caller(),
         }
     }
 
+    #[track_caller]
     pub fn unknown(message: impl Into<String>) -> Self {
         Self::new("LIX_ERROR_UNKNOWN", message)
     }
 
+    #[track_caller]
     pub fn branch_not_found(
         branch_id: impl Into<String>,
         operation: impl Into<String>,
@@ -284,6 +361,7 @@ impl LixError {
         }))
     }
 
+    #[track_caller]
     pub fn commit_not_found(
         commit_id: impl Into<String>,
         operation: impl Into<String>,
@@ -305,6 +383,7 @@ impl LixError {
 
     /// A row could not be normalized because its schema is outside the
     /// transaction's visible commit graph and durability scope.
+    #[track_caller]
     pub fn schema_not_visible(
         schema_key: impl Into<String>,
         entity_commit_id: Option<impl Into<String>>,
@@ -368,10 +447,12 @@ impl LixError {
 
     /// Construct an internal invariant failure with the entity coordinates
     /// needed to turn the surfaced error into an actionable bug report.
+    #[track_caller]
     pub fn internal_invariant(message: impl Into<String>, entities: JsonValue) -> Self {
         Self::new(Self::CODE_INTERNAL_ERROR, message).with_details(entities)
     }
 
+    #[track_caller]
     pub fn ambiguous_merge_base(
         left_commit_id: impl Into<String>,
         right_commit_id: impl Into<String>,
@@ -390,6 +471,7 @@ impl LixError {
         }))
     }
 
+    #[track_caller]
     pub fn invalid_self_merge(branch_id: impl Into<String>) -> Self {
         let branch_id = branch_id.into();
         Self::new(
@@ -616,6 +698,41 @@ mod tests {
     fn new_defaults_hint_to_none() {
         let err = LixError::new("CODE", "desc");
         assert_eq!(err.hint, None);
+    }
+
+    #[test]
+    fn new_captures_the_rust_error_producer_site() {
+        let expected_line = line!() + 1;
+        let error = LixError::new("CODE", "desc");
+        assert_eq!(error.origin().line(), expected_line);
+        assert!(error.origin().column() > 0);
+    }
+
+    #[test]
+    fn source_path_export_strips_build_roots_and_rejects_unsafe_paths() {
+        let origin = |file| ErrorOrigin {
+            file,
+            line: 1,
+            column: 1,
+        };
+        assert_eq!(
+            origin("/build/agent/work/lix/packages/lix/src/sql.rs")
+                .repository_relative_file()
+                .as_deref(),
+            Some("packages/lix/src/sql.rs")
+        );
+        assert_eq!(
+            origin("packages/storage-filesystem/src/filesystem.rs")
+                .repository_relative_file()
+                .as_deref(),
+            Some("packages/storage-filesystem/src/filesystem.rs")
+        );
+        assert!(origin("/build/agent/src/sql.rs")
+            .repository_relative_file()
+            .is_none());
+        assert!(origin("packages/lix/../private.rs")
+            .repository_relative_file()
+            .is_none());
     }
 
     #[test]

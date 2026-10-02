@@ -171,6 +171,58 @@ test("a verified browser module survives a new worker realm and an offline reope
 	expect(wasm.init).toHaveBeenCalledTimes(2);
 });
 
+test("successful Wasm initialization reports cache work once and only current wait on realm reuse", async () => {
+	const { storage } = makeCacheStorage();
+	useBrowserGlobals(storage);
+	const fetchWasm = vi.fn(async (_input: URL) => wasmResponse());
+	vi.stubGlobal("fetch", fetchWasm);
+	wasm.init.mockResolvedValue(undefined);
+
+	const { initializeWasmWithProfile } = await import("./wasm-init.js");
+	const first = await initializeWasmWithProfile();
+	expect(first.profile).toMatchObject({
+		realmReused: false,
+		source: "network",
+		cacheStatus: "miss",
+	});
+	for (const name of ["waitMs", "fetchMs", "compileMs", "initializeMs"] as const) {
+		expect(first.profile[name]).toEqual(expect.any(Number));
+		expect(first.profile[name]).toBeGreaterThanOrEqual(0);
+	}
+
+	const second = await initializeWasmWithProfile();
+	expect(second.profile).toEqual({
+		waitMs: expect.any(Number),
+		realmReused: true,
+		source: "realm",
+		cacheStatus: "not_consulted",
+	});
+	expect(fetchWasm).toHaveBeenCalledTimes(1);
+	expect(wasm.init).toHaveBeenCalledTimes(1);
+});
+
+test("a successful cached Wasm compile reports cache as the actual source", async () => {
+	const { entries, storage } = makeCacheStorage();
+	useBrowserGlobals(storage);
+	const moduleUrl = new URL("./wasm/lix_js_sdk_bg.wasm", import.meta.url);
+	entries.set(cacheUrl(moduleUrl).href, wasmResponse());
+	const fetchWasm = vi.fn(async (_input: URL) => wasmResponse());
+	vi.stubGlobal("fetch", fetchWasm);
+	wasm.init.mockResolvedValue(undefined);
+
+	const { initializeWasmWithProfile } = await import("./wasm-init.js");
+	const result = await initializeWasmWithProfile();
+	expect(result.profile).toMatchObject({
+		realmReused: false,
+		source: "cache",
+		cacheStatus: "hit",
+	});
+	expect(result.profile.compileMs).toEqual(expect.any(Number));
+	expect(result.profile.initializeMs).toEqual(expect.any(Number));
+	expect(result.profile).not.toHaveProperty("fetchMs");
+	expect(fetchWasm).not.toHaveBeenCalled();
+});
+
 test("a corrupt cached response is deleted and replaced by a compiled response", async () => {
 	const { cache, entries, storage } = makeCacheStorage();
 	useBrowserGlobals(storage);
@@ -181,9 +233,10 @@ test("a corrupt cached response is deleted and replaced by a compiled response",
 	vi.stubGlobal("fetch", fetchWasm);
 	wasm.init.mockResolvedValue(undefined);
 
-	const { initializeWasm } = await import("./wasm-init.js");
-	await initializeWasm();
+	const { initializeWasmWithProfile } = await import("./wasm-init.js");
+	const result = await initializeWasmWithProfile();
 
+	expect(result.profile).toMatchObject({ source: "network", cacheStatus: "corrupt" });
 	expect(cache.delete).toHaveBeenCalledExactlyOnceWith(cacheKeyUrl.href);
 	expect(fetchWasm).toHaveBeenCalledExactlyOnceWith(moduleUrl);
 	expect(cache.put).toHaveBeenCalledTimes(1);
@@ -203,8 +256,10 @@ test.each(["open", "put"])(
 		vi.stubGlobal("fetch", vi.fn(async (_input: URL) => wasmResponse()));
 		wasm.init.mockResolvedValue(undefined);
 
-		const { initializeWasm } = await import("./wasm-init.js");
-		await expect(initializeWasm()).resolves.toBeUndefined();
+		const { initializeWasmWithProfile } = await import("./wasm-init.js");
+		const result = await initializeWasmWithProfile();
+		expect(result.profile.source).toBe("network");
+		expect(result.profile.cacheStatus).toBe(failedOperation === "open" ? "unavailable" : "miss");
 		expect(wasm.init).toHaveBeenCalledOnce();
 	},
 );

@@ -56,6 +56,7 @@ impl WireValue {
                         message: "cannot encode non-finite float value to wire format".to_string(),
                         hint: None,
                         details: None,
+                        origin: crate::ErrorOrigin::caller(),
                     });
                 }
                 Ok(Self::Float { value: *value })
@@ -91,6 +92,7 @@ impl WireValue {
                             .to_string(),
                         hint: None,
                         details: None,
+                        origin: crate::ErrorOrigin::caller(),
                     });
                 }
                 Ok(Value::Real(value))
@@ -108,6 +110,7 @@ impl WireValue {
                         message: format!("failed to decode wire blob base64: {error}"),
                         hint: None,
                         details: None,
+                        origin: crate::ErrorOrigin::caller(),
                     })?;
                 Ok(Value::Blob(decoded.into()))
             }

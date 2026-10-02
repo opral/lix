@@ -15,7 +15,7 @@ pub(crate) mod timestamp;
 pub(crate) mod types;
 pub(crate) mod wire;
 
-pub use error::LixError;
+pub use error::{ErrorOrigin, LixError};
 pub(crate) use exact_batch::{ExactBatch, ExactValue};
 pub use execution_metadata::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
 #[cfg(feature = "server-protocol")]

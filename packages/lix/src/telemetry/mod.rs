@@ -284,6 +284,8 @@ pub(crate) fn new_span_context(parent: Option<&SpanContext>) -> SpanContext {
     )
 }
 
+type SpanInitializer = Arc<dyn Fn(&tracing::Span) + Send + Sync>;
+
 /// OpenTelemetry-compliant adapter from engine telemetry into `tracing`.
 ///
 /// `dispatch` must contain a `tracing-opentelemetry` layer. Capturing it at
@@ -292,6 +294,7 @@ pub(crate) fn new_span_context(parent: Option<&SpanContext>) -> SpanContext {
 #[derive(Clone)]
 pub struct OpenTelemetryTracingSink {
     dispatch: tracing::Dispatch,
+    span_initializer: Option<SpanInitializer>,
 }
 
 impl std::fmt::Debug for OpenTelemetryTracingSink {
@@ -304,7 +307,17 @@ impl std::fmt::Debug for OpenTelemetryTracingSink {
 
 impl OpenTelemetryTracingSink {
     pub fn new(dispatch: tracing::Dispatch) -> Self {
-        Self { dispatch }
+        Self { dispatch, span_initializer: None }
+    }
+
+    /// Lets a host attach boundary ownership and identity to engine diagnostics.
+    /// Called after the parent and engine attributes have been installed.
+    pub fn with_span_initializer(
+        mut self,
+        initialize: impl Fn(&tracing::Span) + Send + Sync + 'static,
+    ) -> Self {
+        self.span_initializer = Some(Arc::new(initialize));
+        self
     }
 }
 
@@ -325,7 +338,7 @@ impl TelemetrySink for OpenTelemetryTracingSink {
             let span = (start.descriptor.create_tracing_span)();
             if let Some(parent) = start.parent_span_context.as_ref() {
                 span.set_parent(
-                    OpenTelemetryContext::new().with_remote_span_context(parent.clone()),
+                    tracing::Span::current().context().with_remote_span_context(parent.clone()),
                 )
                 .expect("tracing-opentelemetry rejected the Lix span parent");
             }
@@ -334,6 +347,9 @@ impl TelemetrySink for OpenTelemetryTracingSink {
             }
             for attribute in &start.attributes {
                 record_attribute(&span, attribute);
+            }
+            if let Some(initialize) = &self.span_initializer {
+                initialize(&span);
             }
             let span_context = span.context().span().span_context().clone();
             assert!(

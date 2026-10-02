@@ -1,4 +1,5 @@
 import { createComponentDispatch } from "./component-host/dispatch.js";
+import type { LixOpenHostProfile } from "./types.js";
 import type {
 	LixStorageConfig,
 	LixBinding,
@@ -9,7 +10,7 @@ import type {
 	OpenProgressDispatch,
 	SnapshotRestoreBinding,
 } from "./binding-types.js";
-import { initializeWasm } from "./wasm-init.js";
+import { initializeWasm, initializeWasmWithProfile } from "./wasm-init.js";
 import { restoreSnapshot } from "./snapshot-restore.js";
 
 // Generated before TypeScript compilation and emitted beside this module.
@@ -32,48 +33,78 @@ export async function openLixBinding(
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
+	const hostProfile: LixOpenHostProfile = {
+		version: 1,
+		wasm: {
+			waitMs: 0,
+			realmReused: false,
+			source: "bundled",
+			cacheStatus: "not_consulted",
+		},
+		componentCompiler: { importMs: 0, initializeMs: 0 },
+		nativeBindingOpenMs: 0,
+	};
 	// Load the plugin runtime alongside WASM and finish before the repository
 	// can be used offline. Start after the worker has initialized its module
 	// loader: Vite's dynamic-import wrapper is unavailable at module evaluation.
-	const componentCompiler = import("./component-host/index.js");
-	await initializeWasm();
-	const { compileComponent, initializeComponentCompiler } = await componentCompiler;
+	const compilerImportStartedAt = profileNow();
+	const componentCompiler = import("./component-host/index.js").then((module) => {
+		hostProfile.componentCompiler.importMs = profileElapsed(compilerImportStartedAt);
+		return module;
+	});
+	const wasmInitialization = initializeWasmWithProfile();
+	const [{ profile: wasmProfile }, compiler] = await Promise.all([
+		wasmInitialization,
+		componentCompiler,
+	]);
+	hostProfile.wasm = wasmProfile;
+	const { compileComponent, initializeComponentCompiler } = compiler;
+	const compilerInitializeStartedAt = profileNow();
 	await initializeComponentCompiler();
+	hostProfile.componentCompiler.initializeMs = profileElapsed(compilerInitializeStartedAt);
 	const componentDispatch = createComponentDispatch(compileComponent);
 	switch (storage.kind) {
-		case "memory":
-			return (
-				snapshot
-					? restoreSnapshot(
-							snapshot,
-							openMemoryFromSnapshot(
-								telemetry,
-								telemetryParent,
-								openProgress,
-								componentDispatch,
-								storage.durability,
-							) as SnapshotRestoreBinding<LixBinding>,
-						)
-					: openMemory(
+		case "memory": {
+			const nativeOpenStartedAt = profileNow();
+			const bindingPromise = snapshot
+				? restoreSnapshot(
+					snapshot,
+					openMemoryFromSnapshot(
 						telemetry,
 						telemetryParent,
-						server,
 						openProgress,
 						componentDispatch,
 						storage.durability,
-					)
-			) as Promise<LixBinding>;
+					) as SnapshotRestoreBinding<LixBinding>,
+				)
+				: openMemory(
+					telemetry,
+					telemetryParent,
+					server,
+					openProgress,
+					componentDispatch,
+					storage.durability,
+				) as Promise<LixBinding>;
+			const binding = await bindingPromise;
+			hostProfile.nativeBindingOpenMs = profileElapsed(nativeOpenStartedAt);
+			return withHostProfile(binding, hostProfile);
+		}
 		case "jsStorage": {
+			const moduleImportStartedAt = profileNow();
 			const module = (await import(
 				/* @vite-ignore */ storage.moduleUrl
 			)) as unknown as LixStorageProviderModule;
+			const moduleImportMs = profileElapsed(moduleImportStartedAt);
 			if (typeof module.createLixStorageProvider !== "function") {
 				throw new TypeError(
 					`Storage provider module '${storage.moduleUrl}' does not export createLixStorageProvider()`,
 				);
 			}
+			const providerCreateStartedAt = profileNow();
 			const provider = await module.createLixStorageProvider(storage.options);
+			const providerCreateMs = profileElapsed(providerCreateStartedAt);
 			try {
+				const nativeOpenStartedAt = profileNow();
 				const binding = (await (snapshot
 					? restoreSnapshot(
 							snapshot,
@@ -95,7 +126,17 @@ export async function openLixBinding(
 							componentDispatch,
 							storage.durability,
 						))) as unknown as LixBinding;
-				return binding;
+				hostProfile.nativeBindingOpenMs = profileElapsed(nativeOpenStartedAt);
+				const providerProfile = readProviderProfile(provider);
+				hostProfile.provider = {
+					moduleImportMs,
+					createMs: providerCreateMs,
+					...(providerProfile.openMs === undefined
+						? {}
+						: { openMs: providerProfile.openMs }),
+					...(providerProfile.opfs ? { opfs: providerProfile.opfs } : {}),
+				};
+				return withHostProfile(binding, hostProfile);
 			} catch (error) {
 				await provider.close().catch(() => undefined);
 				throw error;
@@ -104,6 +145,72 @@ export async function openLixBinding(
 		case "filesystem":
 			throw new Error("FilesystemStorage is only available in Node.js");
 	}
+}
+
+function withHostProfile(
+	binding: LixBinding,
+	hostProfile: LixOpenHostProfile,
+): LixBinding {
+	return new Proxy(binding, {
+		get(target, property) {
+			if (property === "openReport") {
+				return () => {
+					const report = target.openReport?.();
+					return report ? { ...report, hostProfile } : undefined;
+				};
+			}
+			const value = Reflect.get(target, property, target) as unknown;
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+function profileNow(): number {
+	try {
+		const value = globalThis.performance?.now?.();
+		if (typeof value === "number" && Number.isFinite(value)) return value;
+	} catch {
+		// Timing is observational and must not affect opening.
+	}
+	return Date.now();
+}
+
+function profileElapsed(startedAt: number): number {
+	const duration = profileNow() - startedAt;
+	return Number.isFinite(duration) ? Math.min(86_400_000, Math.max(0, duration)) : 0;
+}
+
+function readProviderProfile(
+	provider: import("./storage-adapter.js").LixStorageProvider,
+): Pick<NonNullable<LixOpenHostProfile["provider"]>, "openMs" | "opfs"> {
+	try {
+		const profile = provider.openingProfile?.();
+		if (!profile || typeof profile !== "object") return {};
+		const openMs = safeDuration(profile.openMs);
+		const opfsProfile = profile.opfs;
+		const lockWaitMs = safeDuration(opfsProfile?.lockWaitMs);
+		const sqliteInitMs = safeDuration(opfsProfile?.sqliteInitMs);
+		const poolOpenMs = safeDuration(opfsProfile?.poolOpenMs);
+		const schemaInitMs = safeDuration(opfsProfile?.schemaInitMs);
+		return {
+			...(openMs === undefined ? {} : { openMs }),
+			...(lockWaitMs === undefined ||
+			sqliteInitMs === undefined ||
+			poolOpenMs === undefined ||
+			schemaInitMs === undefined
+				? {}
+				: { opfs: { lockWaitMs, sqliteInitMs, poolOpenMs, schemaInitMs } }),
+		};
+	} catch {
+		// Optional diagnostics must never turn a successful provider open into a failure.
+		return {};
+	}
+}
+
+function safeDuration(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.min(86_400_000, Math.max(0, value))
+		: undefined;
 }
 
 export async function createHostedBinding(

@@ -182,6 +182,15 @@ export type SerializedWorkerError = {
 	code?: string;
 	hint?: string;
 	details?: unknown;
+	rustOrigin?: SerializedRustErrorOrigin;
+	rustStacktraceStatus?: "not_captured";
+};
+
+export type SerializedRustErrorOrigin = {
+	kind: "source_location";
+	file: string;
+	line: number;
+	column?: number;
 };
 
 export type WorkerResponse =
@@ -212,7 +221,10 @@ export function serializeWorkerError(error: unknown, depth = 0): SerializedWorke
 		code?: unknown;
 		hint?: unknown;
 		details?: unknown;
+		rustOrigin?: unknown;
+		rustStacktraceStatus?: unknown;
 	};
+	const rustOrigin = safeSerializedRustErrorOrigin(lixError.rustOrigin);
 	return {
 		name: error.name,
 		message: redactDiagnostic(error.message),
@@ -220,7 +232,15 @@ export function serializeWorkerError(error: unknown, depth = 0): SerializedWorke
 		code: typeof lixError.code === "string" ? lixError.code : undefined,
 		hint: typeof lixError.hint === "string" ? redactDiagnostic(lixError.hint) : undefined,
 		details: redactDetails(lixError.details),
-        cause: depth < 3 && error.cause !== undefined ? serializeWorkerError(error.cause, depth + 1) : undefined,
+		rustOrigin,
+		rustStacktraceStatus:
+			lixError.rustStacktraceStatus === "not_captured"
+				? "not_captured"
+				: undefined,
+		cause:
+			depth < 3 && error.cause !== undefined
+				? serializeWorkerError(error.cause, depth + 1)
+				: undefined,
 	};
 }
 
@@ -229,13 +249,54 @@ export function deserializeWorkerError(error: SerializedWorkerError): Error {
 		code?: string;
 		hint?: string;
 		details?: unknown;
+		rustOrigin?: SerializedRustErrorOrigin;
+		rustStacktraceStatus?: "not_captured";
 	};
 	restored.name = error.name;
 	restored.stack = error.stack;
 	restored.code = error.code;
 	restored.hint = error.hint;
 	restored.details = error.details;
+	restored.rustOrigin = safeSerializedRustErrorOrigin(error.rustOrigin);
+	restored.rustStacktraceStatus =
+		error.rustStacktraceStatus === "not_captured"
+			? "not_captured"
+			: undefined;
 	return restored;
+}
+
+function safeSerializedRustErrorOrigin(
+	value: unknown,
+): SerializedRustErrorOrigin | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const origin = value as {
+		kind?: unknown;
+		file?: unknown;
+		line?: unknown;
+		column?: unknown;
+	};
+	if (
+		origin.kind !== "source_location" ||
+		typeof origin.file !== "string" ||
+		!/^packages[/][A-Za-z0-9_-]{1,80}[/](?:[A-Za-z0-9_.-]+[/])*[A-Za-z0-9_.-]+[.]rs$/.test(
+			origin.file,
+		) ||
+		origin.file.split("/").some((part) => part === "." || part === "..") ||
+		!Number.isSafeInteger(origin.line) ||
+		(origin.line as number) < 1 ||
+		(origin.line as number) > 1_000_000
+	)
+		return undefined;
+	return {
+		kind: "source_location",
+		file: origin.file,
+		line: origin.line as number,
+		...(Number.isSafeInteger(origin.column) &&
+		(origin.column as number) >= 0 &&
+		(origin.column as number) <= 100_000_000
+			? { column: origin.column as number }
+			: {}),
+	};
 }
 
 function redactDiagnostic(value: string): string {

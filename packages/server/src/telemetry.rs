@@ -9,7 +9,7 @@ use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig
 use opentelemetry_sdk::{
     runtime,
     trace::{
-        BatchConfigBuilder, SdkTracerProvider, SpanExporter,
+        BatchConfigBuilder, Sampler, SdkTracerProvider, SpanExporter,
         span_processor_with_async_runtime::BatchSpanProcessor,
     },
 };
@@ -30,7 +30,11 @@ use tracing_subscriber::{
 
 /// Extract only W3C trace context. Invalid or missing headers deliberately start
 /// a new trace instead of inheriting an unrelated ambient task context.
-pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap) {
+pub(crate) fn set_request_parent(
+    span: &tracing::Span,
+    headers: &http::HeaderMap,
+    owns_engine_errors: bool,
+) {
     struct Headers<'a>(&'a http::HeaderMap);
     impl Extractor for Headers<'_> {
         fn get(&self, key: &str) -> Option<&str> {
@@ -41,8 +45,101 @@ pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap
         }
     }
     let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
-        .extract_with_context(&opentelemetry::Context::new(), &Headers(headers));
+        .extract_with_context(&opentelemetry::Context::new(), &Headers(headers))
+        .with_value(ProtocolErrorBoundary {
+            actor: Arc::default(),
+            owns_engine_errors,
+        });
     let _ = span.set_parent(parent);
+    span.set_attribute("lix.error.owner", "boundary");
+}
+
+/// One logical protocol failure belongs to its request, not every failed child.
+/// The shared actor is populated only after the host authenticates the principal.
+#[derive(Clone, Debug, Default)]
+struct ProtocolErrorBoundary {
+    actor: Arc<Mutex<Option<String>>>,
+    owns_engine_errors: bool,
+}
+
+pub(crate) fn set_request_actor(account: Option<&str>) {
+    let span = tracing::Span::current();
+    if let Some(boundary) = span.context().get::<ProtocolErrorBoundary>() {
+        *boundary
+            .actor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = account.map(str::to_owned);
+    }
+    if let Some(account) = account {
+        span.set_attribute("lix.account_id", account.to_owned());
+    }
+}
+
+/// Copy only structural diagnostics; SQL, parameters and thrown messages stay private.
+pub(crate) fn record_failure_details(span: &tracing::Span, details: &serde_json::Value) {
+    for (key, attribute) in [
+        ("sourceCode", "lix.error.source_code"),
+        ("migrationPhase", "lix.migration.phase"),
+        ("fromVersion", "lix.migration.from_version"),
+        ("toVersion", "lix.migration.to_version"),
+        ("failureReason", "lix.migration.failure_reason"),
+        ("failurePath", "lix.migration.failure_path"),
+        ("jsonLine", "lix.migration.json_line"),
+        ("jsonColumn", "lix.migration.json_column"),
+        ("missingField", "lix.migration.missing_field"),
+        ("receiptVersion", "lix.receipt.version"),
+        ("expectedReceiptVersion", "lix.receipt.expected_version"),
+        ("payloadFailureReason", "lix.payload.failure_reason"),
+        ("payloadStandaloneStatus", "lix.payload.standalone_status"),
+        ("payloadPhysicalStatus", "lix.payload.physical_status"),
+        ("payloadPhase", "lix.payload.phase"),
+        ("payloadOperation", "lix.payload.operation"),
+        ("payloadSchemaKind", "lix.payload.schema_kind"),
+        ("payloadRecipeCount", "lix.payload.recipe_count"),
+        ("payloadRecipeMask", "lix.payload.recipe_mask"),
+        (
+            "payloadRequiredInputCount",
+            "lix.payload.required_input_count",
+        ),
+        ("nativeReadRecipeCount", "lix.read.recipe_count"),
+        ("nativeReadRecipeMask", "lix.read.recipe_mask"),
+        ("retryable", "lix.error.retryable"),
+        ("outcome", "lix.commit.outcome"),
+        ("executionPhase", "lix.execution.phase"),
+    ] {
+        match details.get(key) {
+            Some(serde_json::Value::String(value)) => span.set_attribute(attribute, value.clone()),
+            Some(serde_json::Value::Number(value)) => {
+                if let Some(value) = value.as_i64() {
+                    span.set_attribute(attribute, value);
+                }
+            }
+            Some(serde_json::Value::Bool(value)) => span.set_attribute(attribute, *value),
+            _ => {}
+        }
+    }
+}
+
+fn initialize_engine_span(span: &tracing::Span) {
+    if let Some(boundary) = span.context().get::<ProtocolErrorBoundary>() {
+        // Observations can fail independently after successful HTTP headers.
+        // Their engine diagnostics must not be suppressed by the request span.
+        if boundary.owns_engine_errors {
+            span.set_attribute("lix.error.owner", "diagnostic");
+        }
+        if let Some(account) = boundary
+            .actor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            span.set_attribute("lix.account_id", account.clone());
+        }
+    }
+}
+
+fn server_sink(dispatch: tracing::Dispatch) -> OpenTelemetryTracingSink {
+    OpenTelemetryTracingSink::new(dispatch).with_span_initializer(initialize_engine_span)
 }
 
 fn service_resource() -> opentelemetry_sdk::Resource {
@@ -327,7 +424,7 @@ pub fn init() -> TelemetryRuntime {
     TelemetryRuntime {
         trace_provider: provider,
         in_flight_sql,
-        lix_sink: Arc::new(OpenTelemetryTracingSink::new(dispatch)),
+        lix_sink: Arc::new(server_sink(dispatch)),
     }
 }
 
@@ -355,6 +452,7 @@ fn provider_from_endpoint_and_headers(
 ) -> Result<SdkTracerProvider> {
     let Some(endpoint) = endpoint else {
         return Ok(SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
             .with_resource(service_resource())
             .build());
     };
@@ -368,6 +466,7 @@ fn provider_from_endpoint_and_headers(
         .build()
         .context("build OTLP HTTP exporter")?;
     Ok(SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
         .with_resource(service_resource())
         .with_span_processor(batch_span_processor(exporter))
         .build())

@@ -1725,7 +1725,7 @@ simulation_test!(
                  SELECT '/query-null-content.txt', NULL \
                  FROM information_schema.tables \
                  WHERE table_name = 'lix_file'",
-                LixError::CODE_TYPE_MISMATCH,
+                LixError::CODE_UNSUPPORTED_SQL,
             ),
         ] {
             let error = session

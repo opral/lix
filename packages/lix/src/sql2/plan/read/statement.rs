@@ -181,6 +181,9 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
 pub(crate) struct LateMaterializedLixFileContentRead {
     pub(crate) statement: Box<DataFusionStatement>,
     pub(crate) data_column_index: usize,
+    /// Projected OCTET_LENGTH(content) columns that were replaced by path
+    /// placeholders and must be filled from resident blob-size metadata.
+    pub(crate) size_column_indices: Vec<usize>,
     /// Index of a projected file ID, derived from its source expression.
     /// Output aliases never determine the selector identity.
     pub(crate) file_id_column_index: Option<usize>,
@@ -191,12 +194,16 @@ pub(crate) struct LateMaterializedLixFileContentRead {
 pub(crate) enum LateLixFileProjection {
     Content,
     OctetLength,
+    BoundedContent { max_size: i64 },
     Substring { start: i64, length: u64 },
 }
 
 impl LateLixFileProjection {
     pub(crate) fn acknowledges_content(&self) -> bool {
-        matches!(self, Self::Content | Self::Substring { .. })
+        matches!(
+            self,
+            Self::Content | Self::BoundedContent { .. } | Self::Substring { .. }
+        )
     }
 }
 
@@ -230,24 +237,45 @@ pub(crate) fn late_materialized_lix_file_content_read(
         return None;
     };
 
-    let mut data_column_index = None;
-    let mut data_output_name = None;
-    let mut data_projection = None;
+    let mut content_projection = None;
+    let mut size_column_indices = Vec::new();
+    let mut late_output_names = Vec::new();
     let mut file_id_column_index = None;
-    let mut replacement = None;
+    let mut replacements = Vec::new();
     let mut removed_parameters = Vec::new();
     for (index, item) in select.projection.iter().enumerate() {
         let expression = projection_source_expression(item)?;
+        if let Some((max_size, output_name, path_expression, threshold_parameter)) =
+            bounded_content_case_projection(item, expression, &qualifier, params)
+        {
+            if content_projection.is_some() {
+                return None;
+            }
+            content_projection = Some((
+                index,
+                LateLixFileProjection::BoundedContent { max_size },
+            ));
+            late_output_names.push(output_name.value.to_ascii_lowercase());
+            replacements.push((index, path_expression, output_name));
+            removed_parameters.push(threshold_parameter);
+            continue;
+        }
         if let Some((projection, output_name, path_expression, projection_parameters)) =
             replaceable_lix_file_content_projection(item, expression, &qualifier, params)
         {
-            if data_column_index.is_some() {
-                return None;
+            if projection == LateLixFileProjection::OctetLength {
+                size_column_indices.push(index);
+            } else {
+                if content_projection.is_some() {
+                    return None;
+                }
+                content_projection = Some((
+                    index,
+                    projection,
+                ));
             }
-            data_column_index = Some(index);
-            data_output_name = Some(output_name.value.to_ascii_lowercase());
-            data_projection = Some(projection);
-            replacement = Some((path_expression, output_name));
+            late_output_names.push(output_name.value.to_ascii_lowercase());
+            replacements.push((index, path_expression, output_name));
             removed_parameters.extend(projection_parameters);
         } else {
             if direct_projection_identifier(expression).is_none()
@@ -264,14 +292,34 @@ pub(crate) fn late_materialized_lix_file_content_read(
             }
         }
     }
-    let data_column_index = data_column_index?;
-    let data_output_name = data_output_name?;
-    let data_projection = data_projection?;
-    let (path_expression, output_name) = replacement?;
-    select.projection[data_column_index] = SelectItem::ExprWithAlias {
-        expr: path_expression,
-        alias: output_name,
+    if replacements.is_empty() {
+        return None;
+    }
+    if !size_column_indices.is_empty()
+        && content_projection
+            .as_ref()
+            .is_some_and(|(_, projection)| {
+                !matches!(projection, LateLixFileProjection::BoundedContent { .. })
+            })
+    {
+        return None;
+    }
+    for (index, path_expression, output_name) in replacements {
+        select.projection[index] = SelectItem::ExprWithAlias {
+            expr: path_expression,
+            alias: output_name,
+        };
+    }
+    let (data_column_index, data_projection) = match content_projection {
+        Some(content) => content,
+        None => {
+            let first_size = *size_column_indices.first()?;
+            (first_size, LateLixFileProjection::OctetLength)
+        }
     };
+    if data_projection == LateLixFileProjection::OctetLength {
+        size_column_indices.retain(|index| *index != data_column_index);
+    }
 
     if select
         .selection
@@ -291,7 +339,11 @@ pub(crate) fn late_materialized_lix_file_content_read(
             order.with_fill.is_some()
                 || expression_mentions_column(&order.expr, "content")
                 || direct_column_name(&order.expr)
-                    .is_none_or(|column| column == data_output_name)
+                    .is_none_or(|column| {
+                        late_output_names
+                            .iter()
+                            .any(|name| name == &column.to_ascii_lowercase())
+                    })
         }) {
             return None;
         }
@@ -318,9 +370,52 @@ pub(crate) fn late_materialized_lix_file_content_read(
     Some(LateMaterializedLixFileContentRead {
         statement: Box::new(statement),
         data_column_index,
+        size_column_indices,
         file_id_column_index,
         projection: data_projection,
     })
+}
+
+fn bounded_content_case_projection(
+    item: &SelectItem,
+    expression: &Expr,
+    qualifier: &Ident,
+    params: &[Value],
+) -> Option<(i64, Ident, Expr, Expr)> {
+    let Expr::Case {
+        operand: None,
+        conditions,
+        else_result,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    if conditions.len() != 1
+        || else_result
+            .as_deref()
+            .is_some_and(|otherwise| !matches!(otherwise, Expr::Value(value) if value.value == SqlValue::Null))
+    {
+        return None;
+    }
+    let condition = &conditions[0].condition;
+    let Expr::BinaryOp { left, op: BinaryOperator::LtEq, right } = condition else {
+        return None;
+    };
+    if !is_octet_length_of_content(left, qualifier) {
+        return None;
+    }
+    let max_size = integer_expression(right, params)?;
+    let content = &conditions[0].result;
+    let path_expression = direct_file_content_path_expression(content, qualifier)?.clone();
+    let output_name = match item {
+        SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+        SelectItem::UnnamedExpr(_) => Ident::with_quote('"', expression.to_string()),
+        SelectItem::QualifiedWildcard(..)
+        | SelectItem::Wildcard(..)
+        | SelectItem::ExprWithAliases { .. } => return None,
+    };
+    Some((max_size, output_name, path_expression, right.as_ref().clone()))
 }
 
 fn projection_source_expression(item: &SelectItem) -> Option<&Expr> {
@@ -354,7 +449,9 @@ fn replaceable_lix_file_content_projection(
         SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
         SelectItem::UnnamedExpr(_) => match &projection {
             LateLixFileProjection::Content => direct_projection_identifier(expression)?.clone(),
-            LateLixFileProjection::OctetLength | LateLixFileProjection::Substring { .. } => {
+            LateLixFileProjection::OctetLength
+            | LateLixFileProjection::BoundedContent { .. }
+            | LateLixFileProjection::Substring { .. } => {
                 Ident::with_quote('"', expression.to_string())
             }
         },
@@ -1196,6 +1293,51 @@ mod tests {
         let rewritten = slice_plan.statement.to_string();
         assert!(rewritten.contains("$1 IS NOT NULL"));
         assert!(rewritten.contains("$2 IS NOT NULL"));
+    }
+
+    #[test]
+    fn bounded_content_case_keeps_null_and_unsupported_thresholds_on_sql_path() {
+        let statement = sql2::parse_statement(
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= $1 THEN content END AS preview \
+             FROM lix_file",
+        )
+        .unwrap();
+        assert!(late_materialized_lix_file_content_read(
+            &statement,
+            &[Value::Null]
+        )
+        .is_none());
+        assert!(late_materialized_lix_file_content_read(
+            &statement,
+            &[Value::Text("10".into())]
+        )
+        .is_none());
+        assert!(late_materialized_lix_file_content_read(&statement, &[]).is_none());
+
+        for sql in [
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= 10 THEN content ELSE 'large' END AS preview FROM lix_file",
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= 10 THEN upper(content) END AS preview FROM lix_file",
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= 10 THEN content WHEN path = '/x' THEN content END AS preview FROM lix_file",
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= 10 THEN content END AS preview FROM lix_file WHERE content IS NOT NULL",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                late_materialized_lix_file_content_read(&statement, &[]),
+                None,
+                "unsupported CASE semantics must stay on the ordinary SQL path: {sql}"
+            );
+        }
+
+        let negative = sql2::parse_statement(
+            "SELECT CASE WHEN OCTET_LENGTH(content) <= -1 THEN content END AS preview FROM lix_file",
+        )
+        .unwrap();
+        let plan = late_materialized_lix_file_content_read(&negative, &[])
+            .expect("negative thresholds still have an exact all-false CASE meaning");
+        assert_eq!(
+            plan.projection,
+            LateLixFileProjection::BoundedContent { max_size: -1 }
+        );
     }
 
     #[test]

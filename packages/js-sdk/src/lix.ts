@@ -26,6 +26,7 @@ import type {
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenAnotherSessionOptions,
+	LixOpenHostProfile,
 	LixOpenReport,
 	ReplicaRecoverySource,
 	ReplicaRecoveryExport,
@@ -74,6 +75,24 @@ export function createHostedFromLix(
 	return create(server);
 }
 
+function freezeHostProfile(profile: LixOpenHostProfile): LixOpenHostProfile {
+	return Object.freeze({
+		...profile,
+		wasm: Object.freeze({ ...profile.wasm }),
+		componentCompiler: Object.freeze({ ...profile.componentCompiler }),
+		...(profile.provider
+			? {
+					provider: Object.freeze({
+						...profile.provider,
+						...(profile.provider.opfs
+							? { opfs: Object.freeze({ ...profile.provider.opfs }) }
+							: {}),
+					}),
+				}
+			: {}),
+	});
+}
+
 export class Lix {
 	readonly #openReport: LixOpenReport | undefined;
 	/** Immutable facts about this handle's successful opening. */
@@ -111,6 +130,9 @@ export class Lix {
 		this.#openReport = report
 			? Object.freeze({
 					...report,
+					...(report.hostProfile
+						? { hostProfile: freezeHostProfile(report.hostProfile) }
+						: {}),
 					migrations: Object.freeze(
 						report.migrations.map((migration) =>
 							Object.freeze({ ...migration }),

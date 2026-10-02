@@ -289,12 +289,15 @@ export function createRepositoryHost() {
 						return new Proxy(binding, {
 							get(target, property) {
 								if (property === "openReport")
-									return () =>
-										opensRoot
-											? report
-											: report
-												? { ...report, initialized: false, migrations: [] }
-												: undefined;
+									return () => {
+										if (opensRoot) return report;
+										if (!report) return undefined;
+										return {
+											format: report.format,
+											initialized: false,
+											migrations: [],
+										};
+									};
 								const value = Reflect.get(target, property, target);
 								return typeof value === "function" ? value.bind(target) : value;
 							},
