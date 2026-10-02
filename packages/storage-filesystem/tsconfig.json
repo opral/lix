@@ -12,6 +12,12 @@
 		"verbatimModuleSyntax": true,
 		"skipLibCheck": true
 	},
-	"include": ["js/index.ts"],
-	"exclude": ["dist", "node_modules"]
+	"include": [
+		"js/**/*.ts"
+	],
+	"exclude": [
+		"dist",
+		"node_modules",
+		"js/**/*.test.ts"
+	]
 }

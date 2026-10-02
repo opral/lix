@@ -3426,10 +3426,6 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "lix",
- "lix-storage-filesystem",
- "mimalloc",
- "napi",
- "napi-derive",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -3441,6 +3437,28 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "lix_storage_filesystem_node"
+version = "0.18.1"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "chrono",
+ "futures-lite",
+ "lix",
+ "lix-storage-filesystem",
+ "mimalloc",
+ "napi",
+ "napi-derive",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

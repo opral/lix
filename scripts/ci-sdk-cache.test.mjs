@@ -94,7 +94,6 @@ for (const runtime of ["native", "browser"]) {
 			"dist/wasm/lix_js_sdk.js",
 			"dist/wasm/lix_js_sdk.d.ts",
 			"dist/wasm/lix_js_sdk_bg.wasm",
-			...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 		])
 			write(`sdk/${path}`);
 		saveBinaries(sdk, cache, runtime, "key");

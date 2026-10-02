@@ -7,15 +7,9 @@ import { pathToFileURL } from "node:url";
 export function sdkBuildPlan(runtime, root, env = process.env, cpus = availableParallelism()) {
   if (!["native", "browser"].includes(runtime)) throw new Error(`Invalid SDK runtime: ${runtime}`);
   const phases = [
-    ...(runtime === "native" ? [
-      ["native", "build-native.js", { LIX_OFFLINE_MIGRATION: "0" }],
-      ["migration-native", "build-native.js", { LIX_OFFLINE_MIGRATION: "1" }],
-    ] : []),
-    ["wasm", "build-wasm.js", { LIX_OFFLINE_MIGRATION: "0", LIX_WASM_PROFILE: runtime === "native" ? "dev" : "release" }],
+    ["wasm", "build-wasm.js", { LIX_OFFLINE_MIGRATION: "0", LIX_WASM_PROFILE: "release" }],
   ];
-  // Isolate target directories: sharing one would serialize Cargo on its lock
-  // and allow regular/migration cdylibs to overwrite each other before copying.
-  // Keep the sum of Cargo job limits within this single runner's CPU budget.
+  // The SDK builds only WASM; filesystem native compilation belongs to its package.
   const jobs = Math.max(1, Math.floor(cpus / phases.length));
   return phases.map(([name, script, overrides]) => ({
     name, script: join(root, "packages/js-sdk/scripts", script),

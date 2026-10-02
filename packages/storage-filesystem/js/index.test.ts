@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { FilesystemStorage } from "./index.js";
 
-	describe("FilesystemStorage", () => {
+describe("FilesystemStorage", () => {
 	test("mirrors the Rust new(path) defaults", () => {
 		const storage = new FilesystemStorage({ path: "./repository" });
 
@@ -11,13 +11,14 @@ import { FilesystemStorage } from "./index.js";
 			kind: "filesystem",
 			path: "./repository",
 			syncAllFiles: true,
+			runtimeModuleUrl: expect.stringMatching(/native-binding\.js$/),
 		});
 	});
 
 	test("rejects an empty path", () => {
-		expect(
-			() => new FilesystemStorage({ path: "" }),
-		).toThrow("FilesystemStorage requires a non-empty path");
+		expect(() => new FilesystemStorage({ path: "" })).toThrow(
+			"FilesystemStorage requires a non-empty path",
+		);
 	});
 
 	test("requires openLix before synchronization controls", async () => {

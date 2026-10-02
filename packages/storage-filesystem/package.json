@@ -19,10 +19,13 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "npm run clean && tsc -p tsconfig.json",
+		"build": "npm run clean && npm run build:native && npm run build:ts",
 		"clean": "node -e \"import('node:fs/promises').then(({ rm }) => rm('dist', { recursive: true, force: true }))\"",
 		"test": "vitest run",
-		"typecheck": "tsc -p tsconfig.test.json --noEmit"
+		"typecheck": "tsc -p tsconfig.test.json --noEmit",
+		"build:native": "node ./scripts/build-native.js",
+		"build:ts": "tsc -p tsconfig.json",
+		"prepare:native-package": "node ./scripts/prepare-native-package.js"
 	},
 	"peerDependencies": {
 		"@lix-js/sdk": "0.18.1"
@@ -31,5 +34,11 @@
 		"@types/node": "^24.10.2",
 		"typescript": "^5.5.4",
 		"vitest": "4.1.10"
+	},
+	"optionalDependencies": {
+		"@lix-js/storage-filesystem-linux-x64": "0.18.1",
+		"@lix-js/storage-filesystem-linux-arm64": "0.18.1",
+		"@lix-js/storage-filesystem-darwin-arm64": "0.18.1",
+		"@lix-js/storage-filesystem-win32-x64": "0.18.1"
 	}
 }

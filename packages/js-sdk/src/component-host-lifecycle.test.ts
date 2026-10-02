@@ -5,16 +5,16 @@ import { expect, test } from "vitest";
 const execFileAsync = promisify(execFile);
 
 test("closing a native plugin runtime releases Node's event loop while the binding stays reachable", async () => {
-	const bindingUrl = new URL("../dist/binding.node.js", import.meta.url).href;
+	const bindingUrl = new URL("../../storage-filesystem/dist/native-binding.js", import.meta.url).href;
 	const pluginArchivePath = new URL(
 		"../../lix/tests/fixtures/plugin-api/v2/plugin_csv.lixplugin",
 		import.meta.url,
 	).pathname;
 	const script = `
   import { readFile } from "node:fs/promises";
-  import { openNativeLixBinding } from ${JSON.stringify(bindingUrl)};
+  import { openLixBinding } from ${JSON.stringify(bindingUrl)};
   import { Value } from ${JSON.stringify(new URL("../dist/value.js", import.meta.url).href)};
-  const binding = await openNativeLixBinding({ kind: "memory" });
+  const binding = await openLixBinding({ kind: "memory" });
   globalThis.closedBinding = binding;
   const execute = (sql, params) => binding.execute(sql, params.map(value => Value.from(value)._toNative()));
   const csvArchive = new Uint8Array(await readFile(${JSON.stringify(pluginArchivePath)}));

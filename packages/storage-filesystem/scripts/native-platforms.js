@@ -6,7 +6,7 @@ export const nativePlatforms = [
 ];
 
 export function nativePackageName(suffix) {
-	return `@lix-js/sdk-${suffix}`;
+	return `@lix-js/storage-filesystem-${suffix}`;
 }
 
 export function nativePlatformForCurrentProcess() {

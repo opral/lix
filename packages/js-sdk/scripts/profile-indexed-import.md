@@ -14,7 +14,7 @@ Build matching native and JavaScript SDK artifacts first:
 ```sh
 cd packages/js-sdk
 npm ci
-npm run build:native
+npm --prefix ../storage-filesystem run build:native
 npm run build:ts
 node scripts/profile-indexed-import.mjs > indexed-import.json
 ```

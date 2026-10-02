@@ -6,29 +6,28 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = join(__dirname, "..");
-const manifestPath = join(packageDir, "Cargo.toml");
+const manifestPath = join(packageDir, "../storage-filesystem-native/Cargo.toml");
 const target = process.env.LIX_NATIVE_TARGET;
 const requestedProfile = process.env.LIX_NATIVE_PROFILE ?? "release";
 const cargoProfile = requestedProfile === "debug" ? "dev" : requestedProfile;
 const artifactProfile =
 	cargoProfile === "dev" || cargoProfile === "test" ? "debug" : cargoProfile;
 const targetArtifacts = {
-	"aarch64-unknown-linux-gnu": "liblix_js_sdk.so",
-	"x86_64-unknown-linux-gnu": "liblix_js_sdk.so",
-	"aarch64-apple-darwin": "liblix_js_sdk.dylib",
-	"x86_64-pc-windows-msvc": "lix_js_sdk.dll",
+	"aarch64-unknown-linux-gnu": "liblix_storage_filesystem_node.so",
+	"x86_64-unknown-linux-gnu": "liblix_storage_filesystem_node.so",
+	"aarch64-apple-darwin": "liblix_storage_filesystem_node.dylib",
+	"x86_64-pc-windows-msvc": "lix_storage_filesystem_node.dll",
 };
 if (target && !Object.hasOwn(targetArtifacts, target)) {
 	throw new Error(`Unsupported native target: ${target}`);
 }
 const artifactName = target ? targetArtifacts[target] :
 	process.platform === "darwin"
-		? "liblix_js_sdk.dylib"
+		? "liblix_storage_filesystem_node.dylib"
 		: process.platform === "win32"
-			? "lix_js_sdk.dll"
-			: "liblix_js_sdk.so";
-const migrationArtifact = process.env.LIX_OFFLINE_MIGRATION === "1";
-const destination = join(packageDir, migrationArtifact ? "lix_js_sdk_migration.node" : "lix_js_sdk.node");
+			? "lix_storage_filesystem_node.dll"
+			: "liblix_storage_filesystem_node.so";
+const destination = join(packageDir, "lix_storage_filesystem.node");
 
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
@@ -92,7 +91,6 @@ if (cargoProfile === "release") {
 	args.push("--config", 'profile.release.strip="symbols"');
 }
 if (target) args.push("--target", target);
-if (migrationArtifact) args.push("--features", "offline-migration");
 args.push("--timings");
 
 await run("cargo", args);

@@ -62,7 +62,7 @@ export function workerExecArgv(execArgv: readonly string[]): string[] {
 	return filtered;
 }
 
-/// Native Lix already owns a dedicated serialized engine actor. Routing it
+/// Native filesystem Lix already owns a dedicated serialized engine actor. Routing it
 /// through a second JavaScript worker adds two message-port hops per query
 /// without adding isolation or concurrency.
 export const openDirectLixBinding = async (
@@ -73,6 +73,7 @@ export const openDirectLixBinding = async (
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding | undefined> => {
+	if (storage.kind !== "filesystem") return undefined;
 	return openLixBinding(
 		storage,
 		telemetry,

@@ -330,16 +330,16 @@ test("tokenless npm publishing retains a GitHub-hosted runner and OIDC permissio
 
 test("ARM64 release artifacts are tested on ARM hardware before publishing", () => {
 	const armWorkflow = readFileSync(resolve(repositoryRoot, ".github/workflows/build-js-sdk-arm64.yml"), "utf8");
-	const armRelease = publishWorkflow.split("\n  build-js-sdk-arm64:\n")[1].split("\n  build-js-sdk-native-packages:\n")[0];
+	const armRelease = publishWorkflow.split("\n  build-js-sdk-arm64:\n")[1].split("\n  build-filesystem-native-packages:\n")[0];
 	assert.match(armRelease, /uses: \.\/\.github\/workflows\/build-js-sdk-arm64\.yml/);
 	assert.match(armRelease, /ref: \$\{\{ needs\.release-version\.outputs\.release_sha \}\}/);
 	assert.match(armWorkflow, /LIX_NATIVE_TARGET: aarch64-unknown-linux-gnu/);
-	assert.match(armWorkflow, /readelf -h lix_js_sdk\.node \| grep -q 'Machine:\.\*AArch64'/);
+	assert.match(armWorkflow, /readelf -h lix_storage_filesystem\.node \| grep -q 'Machine:\.\*AArch64'/);
 	const armTest = armWorkflow.split("\n  test:\n")[1];
 	assert.match(armTest, /needs: build/);
 	assert.match(armTest, /runs-on: ubicloud-standard-8-arm-ubuntu-2404/);
-	assert.match(armTest, /name: js-sdk-native-linux-arm64/);
-	assert.match(armTest, /npx vitest run src\/binding\.node\.test\.ts/);
+	assert.match(armTest, /name: filesystem-native-linux-arm64/);
+	assert.match(armTest, /node scripts\/test-native-binary\.cjs/);
 	const rustPublish = publishWorkflow.split("\n  publish-rust-crates:\n")[1].split("\n  publish-js-sdk:\n")[0];
 	assert.match(rustPublish, /needs:[\s\S]*?- build-js-sdk-arm64/);
 });
@@ -361,12 +361,12 @@ test("explicit artifact mode reuses producers without emitting release readiness
     assert.match(selector, /echo 'server=true'/);
 });
 
-test("release assembly consumes browser artifacts and tests consume the matrix's two Linux binaries", () => {
-	const native = publishWorkflow.split("\n  build-js-sdk-native-packages:\n")[1].split("\n  build-js-sdk-browser:\n")[0];
+test("release assembly consumes browser artifacts and tests consume the filesystem matrix's Linux binary", () => {
+	const native = publishWorkflow.split("\n  build-filesystem-native-packages:\n")[1].split("\n  build-js-sdk-browser:\n")[0];
 	assert.match(native, /run: npm run build:native/);
-	assert.match(native, /if: matrix\.suffix == 'linux-x64'[\s\S]*?run: npm run build:migration:native/);
-	assert.match(native, /name: js-sdk-linux-test-binaries/);
-	assert.match(native, /packages\/js-sdk\/lix_js_sdk_migration\.node/);
+	assert.doesNotMatch(native, /build:migration:native/);
+	assert.match(native, /name: filesystem-linux-test-binary/);
+	assert.match(native, /packages\/storage-filesystem\/lix_storage_filesystem\.node/);
 	const assembly = publishWorkflow.split("\n  build-js-sdk:\n")[1].split("\n  test-js-sdk:\n")[0];
 	assert.match(assembly, /needs: \[release-version, build-js-sdk-browser\]/);
 	assert.match(assembly, /name: js-sdk-browser-binaries/);
@@ -377,8 +377,8 @@ test("release assembly consumes browser artifacts and tests consume the matrix's
 		assert.match(job, /name: js-sdk-package-build\n\s+path: packages\/js-sdk\/dist/);
 	}
 	const tests = publishWorkflow.split("\n  test-js-sdk:\n")[1].split("\n  publish-rust-crates:\n")[0];
-	assert.match(tests, /needs:[\s\S]*?- build-js-sdk-native-packages/);
-	assert.match(tests, /name: js-sdk-linux-test-binaries\n\s+path: packages\/js-sdk/);
+	assert.match(tests, /needs:[\s\S]*?- build-filesystem-native-packages/);
+	assert.match(tests, /name: filesystem-linux-test-binary\n\s+path: packages\/storage-filesystem/);
 });
 
 test("release browser reuse validates provenance before skipping each expensive phase", () => {

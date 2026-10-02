@@ -621,11 +621,11 @@ jobs:
         run: node scripts/ci-sdk-cache.mjs check '${{ matrix.runtime }}' '${{ steps.binary-key.outputs.key }}'
 
       - name: Prepare Linux build runner
-        if: steps.binary-cache.outputs.reuse != 'true'
+        if: matrix.runtime == 'native' || steps.binary-cache.outputs.reuse != 'true'
         uses: ./.github/actions/prepare-linux-runner
 
       - name: Install LLVM build dependencies
-        if: matrix.runtime == 'native' && steps.binary-cache.outputs.reuse != 'true'
+        if: matrix.runtime == 'native'
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang mold
@@ -637,7 +637,7 @@ jobs:
           sudo apt-get install -y mold
 
       - name: Restore Rust cache
-        if: steps.binary-cache.outputs.reuse != 'true'
+        if: matrix.runtime == 'native' || steps.binary-cache.outputs.reuse != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           # Native uses test/dev profiles; Browser uses release Wasm. A single
@@ -648,7 +648,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore compiler cache
-        if: steps.binary-cache.outputs.reuse != 'true'
+        if: matrix.runtime == 'native' || steps.binary-cache.outputs.reuse != 'true'
         uses: ./.github/actions/compiler-cache
         with:
           scope: sdk-${{ matrix.runtime }}
@@ -708,6 +708,7 @@ jobs:
         if: matrix.runtime == 'native'
         working-directory: packages/storage-filesystem
         run: |
+          npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps ../js-sdk
           npm run build
           npm run typecheck
           npm test

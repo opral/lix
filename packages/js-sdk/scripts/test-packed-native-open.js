@@ -7,26 +7,80 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 const sdk = join(dirname(fileURLToPath(import.meta.url)), "..");
+const filesystem = join(sdk, "../storage-filesystem");
 const temporary = mkdtempSync(join(tmpdir(), "lix-packed-native-open-"));
-const run = (command, args, cwd = sdk) => execFileSync(command, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
-const pack = (directory) => join(temporary, JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temporary], directory))[0].filename);
+const run = (command, args, cwd = sdk) =>
+	execFileSync(command, args, {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "inherit"],
+	});
+const pack = (directory) =>
+	join(
+		temporary,
+		JSON.parse(
+			run(
+				"npm",
+				["pack", "--json", "--pack-destination", temporary],
+				directory,
+			),
+		)[0].filename,
+	);
 try {
-  const nativeDirectory = run(process.execPath, ["scripts/prepare-native-package.js", `--out=${join(temporary, "native")}`]).trim();
-  const app = join(temporary, "app");
-  mkdirSync(app);
-  writeFileSync(join(app, "package.json"), '{"private":true,"type":"module"}\n');
-  run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--omit=optional", pack(sdk), pack(nativeDirectory), pack(join(sdk, "../storage-filesystem"))], app);
-  const repository = join(app, "repository");
-  mkdirSync(repository);
-  run("tar", ["-xzf", join(sdk, "test-fixtures/filesystem-v0.16.0/repository.tar.gz"), "-C", repository]);
-  writeFileSync(join(app, "verify.mjs"), `
+	const nativeDirectory = run(
+		process.execPath,
+		["scripts/prepare-native-package.js", `--out=${join(temporary, "native")}`],
+		filesystem,
+	).trim();
+	const app = join(temporary, "app");
+	mkdirSync(app);
+	writeFileSync(
+		join(app, "package.json"),
+		'{"private":true,"type":"module"}\n',
+	);
+	run(
+		"npm",
+		[
+			"install",
+			"--ignore-scripts",
+			"--no-audit",
+			"--no-fund",
+			"--omit=optional",
+			pack(sdk),
+			pack(nativeDirectory),
+			pack(join(sdk, "../storage-filesystem")),
+		],
+		app,
+	);
+	const repository = join(app, "repository");
+	mkdirSync(repository);
+	run("tar", [
+		"-xzf",
+		join(sdk, "test-fixtures/filesystem-v0.16.0/repository.tar.gz"),
+		"-C",
+		repository,
+	]);
+	writeFileSync(
+		join(app, "verify.mjs"),
+		`
 import assert from 'node:assert/strict';
 import {openLix} from '@lix-js/sdk';
+import {createRequire} from 'node:module';
+import {readFile} from 'node:fs/promises';
+const require = createRequire(import.meta.url);
+assert.equal(JSON.parse(await readFile('./node_modules/@lix-js/sdk/package.json', 'utf8')).optionalDependencies, undefined);
+const memory = await openLix();
+try { assert.equal((await memory.execute('SELECT 42 AS answer')).rows[0].answer, 42); }
+finally { await memory.close(); }
+assert.deepEqual(Object.keys(require.cache).filter(path => path.endsWith('.node')), []);
 import {FilesystemStorage} from '@lix-js/storage-filesystem';
 const events = [];
 const storage = () => new FilesystemStorage({path: './repository'});
 const lix = await openLix({storage: storage(), onProgress: event => events.push(event)});
 try {
+  const addons = Object.keys(require.cache).filter(path => path.endsWith('.node'));
+  assert.equal(addons.length, 1);
+  assert.ok(addons[0].includes('storage-filesystem-'));
   assert.equal(lix.openReport.initialized, false);
   assert.equal(lix.openReport.migrations.length, 1);
   assert.equal(lix.openReport.migrations[0].scope, 'local');
@@ -48,8 +102,11 @@ const reopened = await openLix({storage: storage()});
 try { assert.deepEqual(reopened.openReport.migrations, []); }
 finally { await reopened.close(); }
 console.log('Released 0.16.0 filesystem upgrade through installed native package passed');
-`);
-  const result = run(process.execPath, ["verify.mjs"], app);
-  assert.match(result, /passed/);
-  process.stdout.write(result);
-} finally { rmSync(temporary, { recursive: true, force: true }); }
+`,
+	);
+	const result = run(process.execPath, ["verify.mjs"], app);
+	assert.match(result, /passed/);
+	process.stdout.write(result);
+} finally {
+	rmSync(temporary, { recursive: true, force: true });
+}

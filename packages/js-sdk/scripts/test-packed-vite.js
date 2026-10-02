@@ -153,7 +153,7 @@ try {
 		["Node worker_threads import", "worker_threads"],
 		["Node binding module", "binding.node"],
 		["native Node binding", "lix_js_sdk.node"],
-		["native Node package", "@lix-js/sdk-darwin-arm64"],
+		["native filesystem package", "@lix-js/storage-filesystem-darwin-arm64"],
 	]) {
 		assert.ok(
 			!browserJavaScript.includes(nodeRuntimeMarker),

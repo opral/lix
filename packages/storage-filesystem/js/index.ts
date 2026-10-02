@@ -26,6 +26,7 @@ export class FilesystemStorage {
 		readonly version: 1;
 		readonly config: {
 			readonly kind: "filesystem";
+			readonly runtimeModuleUrl: string;
 			readonly path: string;
 			readonly syncAllFiles: boolean;
 		};
@@ -52,6 +53,7 @@ export class FilesystemStorage {
 			version: 1,
 			config: {
 				kind: "filesystem",
+				runtimeModuleUrl: new URL("./native-binding.js", import.meta.url).href,
 				path: this.path,
 				syncAllFiles: this.syncAllFiles,
 			},
