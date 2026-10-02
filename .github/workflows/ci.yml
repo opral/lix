@@ -708,7 +708,7 @@ jobs:
         if: matrix.runtime == 'native'
         working-directory: packages/storage-filesystem
         run: |
-          npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps ../js-sdk
+          node scripts/link-sdk.js
           npm run build
           npm run typecheck
           npm test

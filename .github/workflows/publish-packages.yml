@@ -573,7 +573,7 @@ jobs:
       - name: Build filesystem storage package
         working-directory: packages/storage-filesystem
         run: |
-          npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps ../js-sdk
+          node scripts/link-sdk.js
           npm run build:ts
 
       - name: Build OPFS storage package
@@ -667,7 +667,7 @@ jobs:
 
       - name: Link local SDK for filesystem runtime
         working-directory: packages/storage-filesystem
-        run: npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps ../js-sdk
+        run: node scripts/link-sdk.js
 
       - name: Test JS SDK package
         working-directory: packages/js-sdk
