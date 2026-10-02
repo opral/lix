@@ -971,6 +971,12 @@ fn registry_key(path: &Path) -> Result<PathBuf, StorageError> {
 }
 
 fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
+    // RocksDB appends forward-slash filenames, which Windows rejects under
+    // the verbatim prefix returned by canonicalize. Simplify only when the
+    // ordinary Win32 path has the same meaning; keep registry keys canonical.
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+
     let mut database_options = Options::default();
     database_options.create_if_missing(true);
     database_options.create_missing_column_families(true);
@@ -1077,6 +1083,21 @@ mod tests {
         ] {
             assert!(!super::is_repository_lock_contention(message), "{message}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_path_opens_and_shares_the_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database");
+        std::fs::create_dir(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let storage = RocksDB::open(&canonical).unwrap();
+        let alias = RocksDB::open(&path).unwrap();
+        assert!(Arc::ptr_eq(&storage.inner, &alias.inner));
+        drop(alias);
+        drop(storage);
+        RocksDB::open(&canonical).unwrap();
     }
 
     #[cfg(windows)]

@@ -407,6 +407,10 @@ jobs:
           path: packages/storage-filesystem/lix_storage_filesystem.node
           if-no-files-found: error
 
+      - name: Test native binary on its target platform
+        working-directory: packages/storage-filesystem
+        run: node scripts/test-native-binary.cjs
+
       - name: Prepare filesystem storage native package
         working-directory: packages/storage-filesystem
         run: npm run prepare:native-package -- --suffix=${{ matrix.suffix }}

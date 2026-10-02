@@ -3375,6 +3375,7 @@ version = "0.19.0"
 dependencies = [
  "blake3",
  "bytes",
+ "dunce",
  "futures-lite",
  "lix",
  "rocksdb",
