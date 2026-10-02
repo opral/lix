@@ -49,15 +49,33 @@ export function createWorkerConnection(): WorkerConnection {
 }
 
 export function workerExecArgv(execArgv: readonly string[]): string[] {
+	// Workers share process-wide V8/TLS/heap configuration. Node's test runner
+	// expands those defaults into execArgv, but Workers reject them when supplied
+	// explicitly. Forward only module loading and permission options instead.
+	const valueOptions = new Set([
+		"--conditions", "-C", "--require", "-r", "--import",
+		"--loader", "--experimental-loader",
+		"--allow-fs-read", "--allow-fs-write",
+	]);
+	const flagOptions = new Set([
+		"--permission", "--experimental-permission",
+		"--experimental-strip-types", "--no-experimental-strip-types",
+		"--experimental-transform-types", "--no-experimental-transform-types",
+		"--enable-source-maps", "--no-enable-source-maps",
+		"--preserve-symlinks", "--preserve-symlinks-main",
+	]);
 	const filtered: string[] = [];
 	for (let index = 0; index < execArgv.length; index++) {
 		const arg = execArgv[index];
-		if (arg === "--input-type") {
-			index += 1;
-			continue;
+		const option = arg.split("=", 1)[0];
+		if (valueOptions.has(option)) {
+			filtered.push(arg);
+			if (arg === option && index + 1 < execArgv.length) {
+				filtered.push(execArgv[++index]);
+			}
+		} else if (flagOptions.has(option) || option.startsWith("--allow-")) {
+			filtered.push(arg);
 		}
-		if (arg === "--expose-gc" || arg.startsWith("--input-type=")) continue;
-		filtered.push(arg);
 	}
 	return filtered;
 }
