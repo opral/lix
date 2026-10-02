@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.19.0 - 2026-10-02
+
+### Minor
+
+- Move Node.js native binaries from `@lix-js/sdk` to `@lix-js/storage-filesystem`. The SDK uses WASM for memory and JavaScript storage sessions and no longer installs native platform packages. Filesystem sessions retain the existing Rust engine, RocksDB adapter, synchronization, exclusive locking, and migration support. Install matching SDK/filesystem versions with optional dependencies enabled.
+
+### Patch
+
+- Keep metadata supplied on a file or directory path write on that row. Automatically created parent directories now have no metadata instead of inheriting the written row's metadata.
+- Fix native partial directory metadata reads after creating a plugin-managed file. Read fulfillment now accepts the reserved executable-owner dependency only alongside a directly selected canonical row for the same file and physical branch. Malformed owners and unrelated keys, files, directories or branches remain rejected.
+
+  Directory metadata preparation now uses the same directory-only path index as query execution, avoiding unrelated file descriptors and executable owners during cold folder listing.
+- Fix first offline file edits in prepared native partial replicas and cold file/directory reads in repositories with installed plugins.
+
+  Partial reads now retain the selected file and its required native dependencies. Incoming synchronization prepares retained moving scopes before exposing the new serving generation, so an already prepared document can continue reading and editing locally. Format upgrades preserve pending conversion journals and stop with recoverable diagnostics when local work cannot be safely converted.
+- Bind partial replica serving coordinates to durable witnesses, preserve them while migrating older repositories, and reject writes that would invalidate their commit ancestry.
+- The JavaScript SDK now ships one WebAssembly engine for ordinary opening and maintenance operations, removing the duplicate migration WASM download. The `@lix-js/sdk/migration` API remains available and shares engine initialization with normal bindings. Source builds and artifact consumers should use `build:wasm` and `dist/wasm` instead of the removed `build:migration:wasm` script and `dist/migration-wasm` directory.
+- Reduced the install size of the `@lix-js/sdk` native binary packages.
+
+  Release builds of the native addon now strip the local symbol table, which shrinks the linux-x64 binary from 471 MB to 358 MB without changing its behavior.
+- Fix opening filesystem repositories on Windows by passing compatible paths to RocksDB, and test native binaries on each release platform before publishing.
+
 ## 0.18.1 - 2026-09-25
 
 ### Minor
