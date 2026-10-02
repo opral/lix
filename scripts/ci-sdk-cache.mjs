@@ -76,14 +76,13 @@ export function cacheKey(root, runtime, env = process.env) {
 		);
 		hash.update("\0");
 	}
-	return `sdk-binaries-v4-${runtime}-${hash.digest("hex")}`;
+	return `sdk-binaries-v5-${runtime}-${hash.digest("hex")}`;
 }
 
 function outputs(runtime) {
 	validateRuntime(runtime);
 	return [
 		"dist/wasm",
-		...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 	];
 }
 

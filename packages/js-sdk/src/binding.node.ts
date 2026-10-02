@@ -1,375 +1,84 @@
-import { createComponentDispatch, type ComponentDispatch } from "./component-host/dispatch.js";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
 import type {
-	LixStorageConfig,
 	LixBinding,
-	ObserveEventsBinding,
-	SyncServerBindingOptions,
+	LixStorageConfig,
 	TelemetryDispatch,
 	TelemetryParentContext,
+	SyncServerBindingOptions,
 	OpenProgressDispatch,
-	SnapshotRestoreBinding,
 } from "./binding-types.js";
-import { restoreSnapshot } from "./snapshot-restore.js";
 
-type NativeAddon = {
-	createHosted(
-		url: string,
-		headers: [string, string][],
-		idempotencyKey?: string,
-	): Promise<import("./types.js").HostedLix>;
-	deleteHosted(url: string, headers: [string, string][]): Promise<void>;
-	Lix: {
-		openMemory(
-			telemetry?: (request: Uint8Array) => void,
-			telemetryParentJson?: string,
-			serverUrl?: string,
-			serverHeaders?: [string, string][],
-			openProgress?: (progressJson: string) => void,
-			componentDispatch?: ComponentDispatch,
-			durability?: import("./types.js").Durability,
-		): Promise<NativeLixBinding>;
-		openMemoryFromSnapshot(
-			telemetry?: (request: Uint8Array) => void,
-			telemetryParentJson?: string,
-			openProgress?: (progressJson: string) => void,
-			componentDispatch?: ComponentDispatch,
-			durability?: import("./types.js").Durability,
-		): SnapshotRestoreBinding<NativeLixBinding>;
-		openFilesystemStorage(
-			path: string,
-			syncAllFiles: boolean,
-			telemetry?: (request: Uint8Array) => void,
-			telemetryParentJson?: string,
-			serverUrl?: string,
-			serverHeaders?: [string, string][],
-			openProgress?: (progressJson: string) => void,
-			componentDispatch?: ComponentDispatch,
-			durability?: import("./types.js").Durability,
-		): Promise<NativeLixBinding>;
-		openFilesystemStorageFromSnapshot(
-			path: string,
-			syncAllFiles: boolean,
-			telemetry?: (request: Uint8Array) => void,
-			telemetryParentJson?: string,
-			openProgress?: (progressJson: string) => void,
-			componentDispatch?: ComponentDispatch,
-			durability?: import("./types.js").Durability,
-		): SnapshotRestoreBinding<NativeLixBinding>;
-	};
-};
-
-type NativeObserveEventsBinding = Omit<
-	ObserveEventsBinding,
-	"setTelemetryParent"
-> & {
-	setTelemetryParent(parentJson?: string): void;
-};
-
-type NativeLixBinding = Omit<LixBinding, "observe" | "setTelemetryParent" | "recoverReplicaWithServer"> & {
- recoverReplicaWithServer(id:string,url:string,headers:[string,string][]):Promise<import("./types.js").ReplicaRecoveryReceipt>;
-	setTelemetryParent(parentJson?: string): void;
-	observe(
-		sql: Parameters<LixBinding["observe"]>[0],
-		params: Parameters<LixBinding["observe"]>[1],
-	): Promise<NativeObserveEventsBinding>;
-};
-
-function normalizeNativeObserveEvents(
-	events: NativeObserveEventsBinding,
-): ObserveEventsBinding {
-	return new Proxy(events, {
-		get(target, property, receiver) {
-			if (property === "setTelemetryParent") {
-				return (parent?: TelemetryParentContext) =>
-					target.setTelemetryParent(
-						parent === undefined ? undefined : JSON.stringify(parent),
-					);
-			}
-			const value = Reflect.get(target, property, receiver) as unknown;
-			return typeof value === "function" ? value.bind(target) : value;
-		},
-	}) as ObserveEventsBinding;
-}
-
-function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
-	return new Proxy(binding, {
-		get(target, property, receiver) {
-			if (property === "setTelemetryParent") {
-				return (parent?: TelemetryParentContext) =>
-					target.setTelemetryParent(
-						parent === undefined ? undefined : JSON.stringify(parent),
-					);
-			}
-			if (property === "recoverReplicaWithServer") {
-                return async (id: string, server: import("./binding-types.js").SyncServerBindingOptions) => {
-                    if(server.transport) throw new Error("Custom fetch is unsupported for native recovery");
-                    const headers = server.headerProvider ? await server.headerProvider() : server.headers;
-                    return target.recoverReplicaWithServer(id, server.url, headers);
-                };
-            }
-            if (property === "observe") {
-				return async (
-					sql: Parameters<LixBinding["observe"]>[0],
-					params: Parameters<LixBinding["observe"]>[1],
-				) => normalizeNativeObserveEvents(await target.observe(sql, params));
-			}
-			const value = Reflect.get(target, property, receiver) as unknown;
-			return typeof value === "function" ? value.bind(target) : value;
-		},
-	}) as unknown as LixBinding;
-}
-
-const require = createRequire(import.meta.url);
-const localNativePath = fileURLToPath(
-	new URL("../lix_js_sdk.node", import.meta.url),
-);
-
-const nativePackages = {
-	"linux-x64": "@lix-js/sdk-linux-x64",
-	"linux-arm64": "@lix-js/sdk-linux-arm64",
-	"darwin-arm64": "@lix-js/sdk-darwin-arm64",
-	"win32-x64": "@lix-js/sdk-win32-x64",
-} as const;
-
-function resolveNativePath() {
-	if (existsSync(localNativePath)) return localNativePath;
-	const key =
-		`${process.platform}-${process.arch}` as keyof typeof nativePackages;
-	const packageName = nativePackages[key];
-	let packageResolutionError: unknown;
-	if (packageName) {
-		try {
-			return require.resolve(packageName);
-		} catch (error) {
-			packageResolutionError = error;
-		}
-	}
-	if (!packageName) {
-		throw new Error(`Unsupported platform ${process.platform}-${process.arch}`);
-	}
-	throw packageResolutionError;
-}
-
-let addon: NativeAddon | undefined;
-let addonLoadError: NativeAddonUnavailableError | undefined;
-
-class NativeAddonUnavailableError extends Error {
-	constructor(message: string, options: ErrorOptions) {
-		super(message, options);
-		this.name = "NativeAddonUnavailableError";
-	}
-}
-
-function loadAddon(): NativeAddon {
-	if (addon) return addon;
-	if (addonLoadError) throw addonLoadError;
-	try {
-		addon = require(resolveNativePath()) as NativeAddon;
-		return addon;
-	} catch (cause) {
-		const error = new NativeAddonUnavailableError(
-			`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
-				"This package requires the matching optional native binary package. " +
-				"Run `npm run build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
-			{ cause },
+type FilesystemRuntime = typeof import("./binding.browser.js");
+async function filesystemRuntime(
+	storage: LixStorageConfig,
+): Promise<FilesystemRuntime> {
+	if (storage.kind !== "filesystem" || !storage.runtimeModuleUrl)
+		throw new Error(
+			"FilesystemStorage must provide its native runtime module; update @lix-js/storage-filesystem to match the SDK",
 		);
-		addonLoadError = error;
-		throw error;
-	}
+	return import(/* @vite-ignore */ storage.runtimeModuleUrl);
 }
-
 export async function openLixBinding(
 	storage: LixStorageConfig,
 	telemetry?: TelemetryDispatch,
-	telemetryParent?: TelemetryParentContext,
+	parent?: TelemetryParentContext,
 	server?: SyncServerBindingOptions,
-	openProgress?: OpenProgressDispatch,
+	progress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
-	try {
-		return await openNativeLixBinding(
+	if (storage.kind === "filesystem")
+		return (await filesystemRuntime(storage)).openLixBinding(
 			storage,
 			telemetry,
-			telemetryParent,
+			parent,
 			server,
-			openProgress,
+			progress,
 			snapshot,
 		);
-	} catch (nativeError) {
-		if (
-			!(nativeError instanceof NativeAddonUnavailableError) ||
-			storage.kind !== "memory" ||
-			server !== undefined
-		) {
-			throw nativeError;
-		}
-		try {
-			const { openMemoryWasmBinding } = await import("./binding.node-wasm.js");
-			return await openMemoryWasmBinding(
-				telemetry,
-				telemetryParent,
-				openProgress,
-				snapshot,
-				storage.durability,
-			);
-		} catch (wasmError) {
-			throw new AggregateError(
-				[nativeError, wasmError],
-				"Failed to open in-memory Lix with either the native or WebAssembly binding.",
-			);
-		}
-	}
-}
-
-export async function openNativeLixBinding(
-	storage: LixStorageConfig,
-	telemetry?: TelemetryDispatch,
-	telemetryParent?: TelemetryParentContext,
-	server?: SyncServerBindingOptions,
-	openProgress?: OpenProgressDispatch,
-	snapshot?: ReadableStream<Uint8Array>,
-): Promise<LixBinding> {
-	if (server?.transport) {
-		throw new TypeError(
-			"Custom sync fetch is only supported by the browser worker",
-		);
-	}
-	const nativeOpenProgress = openProgress
-		? (progressJson: string) => {
-				try {
-					openProgress(JSON.parse(progressJson));
-				} catch {
-					// Open progress is observational and cannot fail repository opening.
-				}
-			}
-		: undefined;
-	const componentDispatch = createComponentDispatch();
-	switch (storage.kind) {
-		case "memory": {
-			const nativeAddon = loadAddon();
-			const nativeTelemetry = telemetry
-				? (request: Uint8Array) => {
-						if (request.byteLength > 0) telemetry(request);
-					}
-				: undefined;
-			if (snapshot) {
-				const restore = nativeAddon.Lix.openMemoryFromSnapshot(
-					nativeTelemetry,
-					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
-					nativeOpenProgress,
-					componentDispatch,
-					storage.durability,
-				);
-				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
-			}
-			if (nativeTelemetry) {
-				return normalizeNativeBinding(
-					await nativeAddon.Lix.openMemory(
-						nativeTelemetry,
-						telemetryParent ? JSON.stringify(telemetryParent) : undefined,
-						server?.url,
-						server?.headers,
-						nativeOpenProgress,
-						componentDispatch,
-						storage.durability,
-					),
-				);
-			}
-			return normalizeNativeBinding(
-				await nativeAddon.Lix.openMemory(
-					undefined,
-					undefined,
-					server?.url,
-					server?.headers,
-					nativeOpenProgress,
-					componentDispatch,
-					storage.durability,
-				),
-			);
-		}
-		case "jsStorage":
-			throw new Error(
-				"JavaScript storage providers are only available in browsers",
-			);
-		case "filesystem": {
-			const nativeAddon = loadAddon();
-			const nativeTelemetry = telemetry
-				? (request: Uint8Array) => {
-						if (request.byteLength > 0) telemetry(request);
-					}
-				: undefined;
-			if (snapshot) {
-				const restore = nativeAddon.Lix.openFilesystemStorageFromSnapshot(
-					storage.path,
-					storage.syncAllFiles,
-					nativeTelemetry,
-					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
-					nativeOpenProgress,
-					componentDispatch,
-					storage.durability,
-				);
-				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
-			}
-			if (nativeTelemetry) {
-				return normalizeNativeBinding(
-					await nativeAddon.Lix.openFilesystemStorage(
-						storage.path,
-						storage.syncAllFiles,
-						nativeTelemetry,
-						telemetryParent ? JSON.stringify(telemetryParent) : undefined,
-						server?.url,
-						server?.headers,
-						nativeOpenProgress,
-						componentDispatch,
-						storage.durability,
-					),
-				);
-			}
-			return normalizeNativeBinding(
-				await nativeAddon.Lix.openFilesystemStorage(
-					storage.path,
-					storage.syncAllFiles,
-					undefined,
-					undefined,
-					server?.url,
-					server?.headers,
-					nativeOpenProgress,
-					componentDispatch,
-					storage.durability,
-				),
-			);
-		}
-	}
-}
-
-export async function createHostedBinding(
-	server: import("./binding-types.js").HostedServerBindingOptions,
-) {
-	return loadAddon().createHosted(
-		server.url,
-		server.headers,
-		server.idempotencyKey,
+	return (await import("./binding.node-wasm.js")).openNodeWasmBinding(
+		storage,
+		telemetry,
+		parent,
+		server,
+		progress,
+		snapshot,
 	);
 }
-export async function deleteHostedBinding(
-	server: import("./binding-types.js").HostedServerBindingOptions,
+export async function createHostedBinding(
+	...args: Parameters<FilesystemRuntime["createHostedBinding"]>
 ) {
-	await loadAddon().deleteHosted(server.url, server.headers);
+	return (await import("./binding.browser.js")).createHostedBinding(...args);
 }
-
-export async function convertReplicaBinding(storage:LixStorageConfig,server:SyncServerBindingOptions,branchId?:string):Promise<void> {
- if(storage.kind!=="filesystem")throw new TypeError("Node conversion requires FilesystemStorage");
- if(server.transport)throw new TypeError("Custom sync fetch is only supported in browsers");
- const headers=server.headerProvider ? await server.headerProvider() : server.headers;
- await (await import("./migration-binding.node.js")).loadMigrationAddon().convertFilesystemReplicaToPartial(storage.path,storage.syncAllFiles,server.url,headers,branchId);
+export async function deleteHostedBinding(
+	...args: Parameters<FilesystemRuntime["deleteHostedBinding"]>
+) {
+	return (await import("./binding.browser.js")).deleteHostedBinding(...args);
 }
-
-export async function retryReplicaMigrationCleanupBinding(storage:LixStorageConfig,server:SyncServerBindingOptions):Promise<number> {
- if(storage.kind!=="filesystem")throw new TypeError("Node migration cleanup requires FilesystemStorage");
- if(server.transport)throw new TypeError("Custom sync fetch is only supported in browsers");
- const headers=server.headerProvider ? await server.headerProvider() : server.headers;
- return (await import("./migration-binding.node.js")).loadMigrationAddon().retryFilesystemReplicaMigrationCleanup(storage.path,storage.syncAllFiles,server.url,headers);
+export async function convertReplicaBinding(
+	storage: LixStorageConfig,
+	...args: Parameters<FilesystemRuntime["convertReplicaBinding"]> extends [
+		LixStorageConfig,
+		...infer R,
+	]
+		? R
+		: never
+) {
+	const runtime =
+		storage.kind === "filesystem"
+			? await filesystemRuntime(storage)
+			: await import("./binding.browser.js");
+	return runtime.convertReplicaBinding(storage, ...args);
+}
+export async function retryReplicaMigrationCleanupBinding(
+	storage: LixStorageConfig,
+	...args: Parameters<
+		FilesystemRuntime["retryReplicaMigrationCleanupBinding"]
+	> extends [LixStorageConfig, ...infer R]
+		? R
+		: never
+) {
+	const runtime =
+		storage.kind === "filesystem"
+			? await filesystemRuntime(storage)
+			: await import("./binding.browser.js");
+	return runtime.retryReplicaMigrationCleanupBinding(storage, ...args);
 }

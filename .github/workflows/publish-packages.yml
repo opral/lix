@@ -334,8 +334,8 @@ jobs:
     with:
       ref: ${{ needs.release-version.outputs.release_sha }}
 
-  build-js-sdk-native-packages:
-    name: Build @lix-js/sdk native package (${{ matrix.suffix }})
+  build-filesystem-native-packages:
+    name: Build @lix-js/storage-filesystem native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     needs: release-version
@@ -389,40 +389,33 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: packages/storage-filesystem/package-lock.json
 
-      - name: Install JS SDK dependencies
-        working-directory: packages/js-sdk
-        run: npm install
+      - name: Install filesystem storage dependencies
+        working-directory: packages/storage-filesystem
+        run: npm ci --legacy-peer-deps
 
-      - name: Build JS SDK native binary
-        working-directory: packages/js-sdk
+      - name: Build filesystem storage native binary
+        working-directory: packages/storage-filesystem
         run: npm run build:native
-
-      - name: Build Linux migration binary for SDK integration tests
-        if: matrix.suffix == 'linux-x64'
-        working-directory: packages/js-sdk
-        run: npm run build:migration:native
 
       - name: Upload Linux native binaries for SDK integration tests
         if: matrix.suffix == 'linux-x64'
         uses: actions/upload-artifact@v4
         with:
-          name: js-sdk-linux-test-binaries
-          path: |
-            packages/js-sdk/lix_js_sdk.node
-            packages/js-sdk/lix_js_sdk_migration.node
+          name: filesystem-linux-test-binary
+          path: packages/storage-filesystem/lix_storage_filesystem.node
           if-no-files-found: error
 
-      - name: Prepare JS SDK native package
-        working-directory: packages/js-sdk
+      - name: Prepare filesystem storage native package
+        working-directory: packages/storage-filesystem
         run: npm run prepare:native-package -- --suffix=${{ matrix.suffix }}
 
-      - name: Upload JS SDK native package
+      - name: Upload filesystem storage native package
         uses: actions/upload-artifact@v4
         with:
-          name: js-sdk-native-${{ matrix.suffix }}
-          path: packages/js-sdk/native-packages/${{ matrix.suffix }}
+          name: filesystem-native-${{ matrix.suffix }}
+          path: packages/storage-filesystem/native-packages/${{ matrix.suffix }}
           if-no-files-found: error
 
       - name: Upload native build timings
@@ -579,7 +572,9 @@ jobs:
 
       - name: Build filesystem storage package
         working-directory: packages/storage-filesystem
-        run: npm run build
+        run: |
+          node scripts/link-sdk.js
+          npm run build:ts
 
       - name: Build OPFS storage package
         working-directory: packages/storage-opfs
@@ -612,7 +607,7 @@ jobs:
     needs:
       - release-version
       - build-js-sdk
-      - build-js-sdk-native-packages
+      - build-filesystem-native-packages
 
     steps:
       - name: Checkout repository
@@ -651,8 +646,8 @@ jobs:
       - name: Download Linux native binaries
         uses: actions/download-artifact@v4
         with:
-          name: js-sdk-linux-test-binaries
-          path: packages/js-sdk
+          name: filesystem-linux-test-binary
+          path: packages/storage-filesystem
 
       - name: Download filesystem storage package build
         uses: actions/download-artifact@v4
@@ -669,6 +664,10 @@ jobs:
       - name: Restore generated WASM source link
         run: |
           ln -s ../dist/wasm packages/js-sdk/src/wasm
+
+      - name: Link local SDK for filesystem runtime
+        working-directory: packages/storage-filesystem
+        run: node scripts/link-sdk.js
 
       - name: Test JS SDK package
         working-directory: packages/js-sdk
@@ -698,7 +697,7 @@ jobs:
     # crates.io -> npm -> GitHub release.
     needs:
       - release-version
-      - build-js-sdk-native-packages
+      - build-filesystem-native-packages
       - build-js-sdk-arm64
       - test-js-sdk
     if: needs.release-version.outputs.has_release == 'true'
@@ -759,7 +758,7 @@ jobs:
     environment: production
     needs:
       - release-version
-      - build-js-sdk-native-packages
+      - build-filesystem-native-packages
       - build-js-sdk-arm64
       - test-js-sdk
       - publish-rust-crates
@@ -782,10 +781,10 @@ jobs:
           cache-dependency-path: packages/js-sdk/package-lock.json
           registry-url: https://registry.npmjs.org
 
-      - name: Download JS SDK native packages
+      - name: Download filesystem storage native packages
         uses: actions/download-artifact@v4
         with:
-          pattern: js-sdk-native-*
+          pattern: filesystem-native-*
           path: native-packages
 
       - name: Download JS SDK package build
@@ -868,7 +867,7 @@ jobs:
           }
 
           for suffix in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
-            package_dir="$GITHUB_WORKSPACE/native-packages/js-sdk-native-$suffix"
+            package_dir="$GITHUB_WORKSPACE/native-packages/filesystem-native-$suffix"
             if [ ! -f "$package_dir/package.json" ]; then
               echo "Missing native package artifact for $suffix." >&2
               exit 1
@@ -957,7 +956,7 @@ jobs:
       - release-version
       - publish-lix-server
       - create-github-release
-      - build-js-sdk-native-packages
+      - build-filesystem-native-packages
       - build-js-sdk-arm64
       - build-js-sdk
       - build-js-sdk-browser
@@ -973,7 +972,7 @@ jobs:
           echo "publish-lix-server: ${{ needs.publish-lix-server.result }}"
           echo "create-github-release: ${{ needs.create-github-release.result }}"
           echo "build-js-sdk-arm64: ${{ needs.build-js-sdk-arm64.result }}"
-          echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
+          echo "build-filesystem-native-packages: ${{ needs.build-filesystem-native-packages.result }}"
           echo "build-js-sdk: ${{ needs.build-js-sdk.result }}"
           echo "build-js-sdk-browser: ${{ needs.build-js-sdk-browser.result }}"
           echo "test-js-sdk: ${{ needs.test-js-sdk.result }}"

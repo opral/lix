@@ -148,6 +148,7 @@ export type LixStorageConfig = {
 	  }
 	| {
 			kind: "filesystem";
+			runtimeModuleUrl?: string;
 			path: string;
 			syncAllFiles: boolean;
 	  }

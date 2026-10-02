@@ -1,6 +1,11 @@
 #![recursion_limit = "256"]
+// Host SDK builds only exercise shared Rust tests; its runtime is WASM.
+#![cfg_attr(
+    not(any(target_family = "wasm", lix_filesystem_native)),
+    allow(dead_code)
+)]
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), lix_filesystem_native))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -8,16 +13,17 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod browser_storage;
 #[cfg(target_family = "wasm")]
 mod js_storage;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), lix_filesystem_native))]
 mod napi;
 mod session;
 mod telemetry;
 #[cfg(target_family = "wasm")]
 mod wasm;
 
+#[cfg(any(target_family = "wasm", lix_filesystem_native))]
 mod component_runtime;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), lix_filesystem_native))]
 pub(crate) mod component_runtime_napi;
 #[cfg(target_family = "wasm")]
 pub(crate) mod component_runtime_wasm;

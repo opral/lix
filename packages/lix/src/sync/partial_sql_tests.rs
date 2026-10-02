@@ -21,6 +21,8 @@ pub(super) struct Fetches {
     object_requests: usize,
     metadata_requests: usize,
     payload_bytes: usize,
+    blob_manifest_ids: BTreeSet<String>,
+    chunk_ids: BTreeSet<String>,
 }
 
 async fn admitted_controls<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
@@ -216,6 +218,110 @@ pub(super) async fn execute_hydrating<
             }
             eprintln!("partial SQL hydrate metadata {address:?}");
             hydrate_metadata(storage, state, authority, address, fetches).await?;
+            continue;
+        }
+        if error.code == "LIX_PARTIAL_BLOB_MANIFEST_REQUIRED" {
+            let demand = crate::binary_cas::BlobManifestRequired::from_error(&error)?
+                .expect("manifest demand code carries a blob ID");
+            let blob_id = demand.0.to_hex();
+            if !seen.insert(format!("manifest:{blob_id}")) {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_SQL_NO_PROGRESS",
+                    format!("manifest hydration did not resolve {blob_id}: {error}"),
+                ));
+            }
+            let wire = authority
+                .get_sync_blob_manifest(&blob_id)
+                .await?
+                .expect("authority has the demanded blob manifest");
+            let manifest = super::blob::decode_manifest(&wire)?;
+            let read = storage.begin_read(Default::default()).await?;
+            let mut writes = storage.new_write_set();
+            crate::binary_cas::stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                .await?;
+            let mut preconditions = Vec::new();
+            crate::binary_cas::stage_transfer_publication_fence(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
+            drop(read);
+            storage
+                .commit_partial_replica_write_set(
+                    super::partial_replica_write_capability(),
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            fetches.blob_manifest_ids.insert(blob_id);
+            continue;
+        }
+        if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+            let chunk_ids = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("chunkIds"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_PARTIAL_SQL_INVALID_DEMAND",
+                        "chunk demand did not include chunkIds",
+                    )
+                })?;
+            let mut normalized_chunk_ids = Vec::with_capacity(chunk_ids.len());
+            for value in chunk_ids {
+                let chunk_id = value.as_str().ok_or_else(|| {
+                    LixError::new(
+                        "LIX_PARTIAL_SQL_INVALID_DEMAND",
+                        "chunk demand contained a non-text ID",
+                    )
+                })?;
+                if !seen.insert(format!("chunk:{chunk_id}")) {
+                    return Err(LixError::new(
+                        "LIX_PARTIAL_SQL_NO_PROGRESS",
+                        format!("chunk hydration did not resolve {chunk_id}: {error}"),
+                    ));
+                }
+                normalized_chunk_ids.push(chunk_id.to_owned());
+            }
+            let read = storage.begin_read(Default::default()).await?;
+            let mut writes = storage.new_write_set();
+            for chunk_id in &normalized_chunk_ids {
+                let bytes = authority
+                    .get_sync_chunk(chunk_id)
+                    .await?
+                    .expect("authority has the demanded content chunk");
+                crate::binary_cas::stage_verified_raw_chunk(
+                    &mut writes,
+                    crate::binary_cas::ChunkHash::from_hex(chunk_id)?,
+                    &bytes,
+                )?;
+            }
+            let mut preconditions = Vec::new();
+            crate::binary_cas::stage_transfer_publication_fence(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
+            drop(read);
+            storage
+                .commit_partial_replica_write_set(
+                    super::partial_replica_write_capability(),
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            fetches.chunk_ids.extend(normalized_chunk_ids);
             continue;
         }
         eprintln!(

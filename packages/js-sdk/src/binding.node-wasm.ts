@@ -1,6 +1,8 @@
 import { createComponentDispatch } from "./component-host/dispatch.js";
 import type {
 	LixBinding,
+	LixStorageConfig,
+	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
 	OpenProgressDispatch,
@@ -19,6 +21,7 @@ export async function openMemoryWasmBinding(
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 	durability?: import("./types.js").Durability,
+	server?: SyncServerBindingOptions,
 ): Promise<LixBinding> {
 	await initializeWasm();
 	const componentDispatch = createComponentDispatch();
@@ -37,9 +40,38 @@ export async function openMemoryWasmBinding(
 	return openMemory(
 		telemetry,
 		telemetryParent,
-		undefined,
+		server,
 		openProgress,
 		componentDispatch,
 		durability,
 	) as Promise<LixBinding>;
+}
+
+export async function openNodeWasmBinding(
+	storage: LixStorageConfig,
+	telemetry?: TelemetryDispatch,
+	parent?: TelemetryParentContext,
+	server?: SyncServerBindingOptions,
+	progress?: OpenProgressDispatch,
+	snapshot?: ReadableStream<Uint8Array>,
+): Promise<LixBinding> {
+	if (storage.kind === "memory")
+		return openMemoryWasmBinding(
+			telemetry,
+			parent,
+			progress,
+			snapshot,
+			storage.durability,
+			server,
+		);
+	if (storage.kind === "filesystem")
+		throw new Error("Filesystem storage requires its native runtime");
+	return (await import("./binding.browser.js")).openLixBinding(
+		storage,
+		telemetry,
+		parent,
+		server,
+		progress,
+		snapshot,
+	);
 }

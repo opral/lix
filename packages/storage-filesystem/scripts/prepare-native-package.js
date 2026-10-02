@@ -11,7 +11,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDir = join(__dirname, "..");
-const binaryPath = join(packageDir, "lix_js_sdk.node");
+const binaryPath = join(packageDir, "lix_storage_filesystem.node");
 const args = process.argv.slice(2);
 const suffixArg = args.find((arg) => arg.startsWith("--suffix="))?.slice("--suffix=".length);
 const outArg = args.find((arg) => arg.startsWith("--out="))?.slice("--out=".length);
@@ -32,19 +32,19 @@ const sdkPackage = JSON.parse(await readFile(join(packageDir, "package.json"), "
 const outDir = outArg ? resolve(process.cwd(), outArg) : join(packageDir, "native-packages", platform.suffix);
 
 await mkdir(outDir, { recursive: true });
-await cp(binaryPath, join(outDir, "lix_js_sdk.node"));
+await cp(binaryPath, join(outDir, "lix_storage_filesystem.node"));
 await writeFile(
 	join(outDir, "package.json"),
 	`${JSON.stringify(
 		{
 			name: nativePackageName(platform.suffix),
 			version: sdkPackage.version,
-			description: `Native binary for @lix-js/sdk on ${platform.os}-${platform.cpu}.`,
-			main: "./lix_js_sdk.node",
+			description: `Native binary for @lix-js/storage-filesystem on ${platform.os}-${platform.cpu}.`,
+			main: "./lix_storage_filesystem.node",
 			repository: sdkPackage.repository,
 			os: [platform.os],
 			cpu: [platform.cpu],
-			files: ["lix_js_sdk.node"],
+			files: ["lix_storage_filesystem.node"],
 			publishConfig: {
 				access: "public",
 			},

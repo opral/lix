@@ -203,7 +203,7 @@ async function openLixWorkerBindingInner(
 	onProgress?: (progress: LixOpenProgress) => void,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
-	if (openDirectLixBinding) {
+	if (openDirectLixBinding && storage.kind === "filesystem") {
 		const telemetryDispatch = telemetry
 			? (request: Uint8Array) => {
 					if (request.byteLength === 0) return;

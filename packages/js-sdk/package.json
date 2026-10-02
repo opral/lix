@@ -19,6 +19,10 @@
 		".": {
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
+		},
+		"./storage-runtime": {
+			"types": "./dist/storage-runtime.d.ts",
+			"default": "./dist/storage-runtime.js"
 		}
 	},
 	"imports": {
@@ -35,16 +39,13 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "npm run clean && npm run build:native && npm run build:migration:native && npm run build:wasm && npm run build:ts",
+		"build": "npm run clean && npm run build:wasm && npm run build:ts",
 		"build:browser": "npm run clean && npm run build:wasm && npm run build:ts",
-		"build:native": "node ./scripts/build-native.js",
 		"build:wasm": "node ./scripts/build-wasm.js",
-		"build:migration:native": "LIX_OFFLINE_MIGRATION=1 node ./scripts/build-native.js",
 		"build:wasm:dev": "LIX_WASM_PROFILE=dev node ./scripts/build-wasm.js",
 		"benchmark:plugin-reopen": "node ./scripts/benchmark-plugin-reopen.mjs",
 		"benchmark:storage-boundary": "LIX_WASM_STORAGE_BENCH=1 npm run build:browser && LIX_WASM_STORAGE_BENCH=1 vitest run --config vitest.browser.config.ts src/storage-bridge.bench.browser.test.ts",
 		"clean": "node ./scripts/clean.js",
-		"prepare:native-package": "node ./scripts/prepare-native-package.js",
 		"build:ts": "tsc -p tsconfig.json && node ./scripts/build-compatibility.js",
 		"test": "npm run build && vitest run",
 		"test:browser": "npm run build:browser && vitest run --config vitest.browser.config.ts",
@@ -52,12 +53,6 @@
 		"test:native:production": "node ./scripts/test-packed-native-open.js",
 		"test:browser:production": "node ./scripts/test-packed-vite.js",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
-	},
-	"optionalDependencies": {
-		"@lix-js/sdk-darwin-arm64": "0.18.1",
-		"@lix-js/sdk-linux-arm64": "0.18.1",
-		"@lix-js/sdk-linux-x64": "0.18.1",
-		"@lix-js/sdk-win32-x64": "0.18.1"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",

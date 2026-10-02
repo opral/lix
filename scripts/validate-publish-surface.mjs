@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	JS_SDK_NATIVE_PACKAGES,
+	FILESYSTEM_NATIVE_PACKAGES,
 	PUBLIC_NPM_PACKAGE_PATHS,
 } from "./release.mjs";
 
@@ -86,9 +86,15 @@ for (const packagePath of PUBLIC_NPM_PACKAGE_PATHS) {
 			`${npmPackage.name}@${npmPackage.version} must match workspace version ${workspaceVersion}`,
 		);
 	}
+	if (npmPackage.name === "@lix-js/sdk" &&
+		Object.keys({ ...npmPackage.dependencies, ...npmPackage.optionalDependencies }).some(
+			(name) => FILESYSTEM_NATIVE_PACKAGES.includes(name) || /^@lix-js\/sdk-(darwin|linux|win32)-/.test(name),
+		)) {
+		failures.push("@lix-js/sdk must not install native platform packages");
+	}
 	if (
-		npmPackage.name === "@lix-js/sdk" &&
-		JS_SDK_NATIVE_PACKAGES.some(
+		npmPackage.name === "@lix-js/storage-filesystem" &&
+		FILESYSTEM_NATIVE_PACKAGES.some(
 			(name) => npmPackage.optionalDependencies?.[name] !== workspaceVersion,
 		)
 	) {
@@ -114,10 +120,7 @@ for (const packagePath of PUBLIC_NPM_PACKAGE_PATHS) {
 	const linkedSdk = packageLock.packages?.["../js-sdk"];
 	if (
 		linkedSdk &&
-		(linkedSdk.version !== workspaceVersion ||
-			JS_SDK_NATIVE_PACKAGES.some(
-				(name) => linkedSdk.optionalDependencies?.[name] !== workspaceVersion,
-			))
+		(linkedSdk.version !== workspaceVersion)
 	) {
 		failures.push(
 			`${npmPackage.name} package lock must pin its linked SDK to ${workspaceVersion}`,

@@ -31,7 +31,7 @@ const EXPLICIT_COMMIT_BRANCH_ID = "01920000-0000-7000-8000-000000000402";
 const CONFLICT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000403";
 
 registerMemoryStorageContract({
-	name: "Node native",
+	name: "Node WASM",
 	loadSdk: async () => await import("./index.js"),
 	loadPluginArchives: loadTestPluginArchives,
 });
@@ -297,7 +297,9 @@ test("a paused snapshot export does not block queries and close cancels it", asy
 });
 
 test("native snapshot exports use bounded concurrency and overload cancellation completes", async () => {
-	const lix = await openLix();
+	const lix = await openLix({
+		storage: new FilesystemStorage({ path: tempFsDir(), syncAllFiles: false }),
+	});
 	let state = 0x6d2b_79f5;
 	let payload = "";
 	for (let index = 0; index < 192 * 1024; index++) {
@@ -352,8 +354,14 @@ test("native snapshot exports use bounded concurrency and overload cancellation 
 
 test("native snapshot overload and close progress with one Node worker thread", async () => {
 	const sdkUrl = pathToFileURL(join(process.cwd(), "dist/index.js")).href;
+	const filesystemUrl = new URL(
+		"../../storage-filesystem/dist/index.js",
+		import.meta.url,
+	).href;
+	const path = tempFsDir();
 	const script = `
 		import { openLix } from ${JSON.stringify(sdkUrl)};
+		import { FilesystemStorage } from ${JSON.stringify(filesystemUrl)};
 		const timeout = async (promise, label) => {
 			let timer;
 			try {
@@ -367,7 +375,7 @@ test("native snapshot overload and close progress with one Node worker thread", 
 				clearTimeout(timer);
 			}
 		};
-		const lix = await openLix();
+		const lix = await openLix({storage: new FilesystemStorage({path: ${JSON.stringify(path)}, syncAllFiles: false})});
 		let state = 0x243f6a88;
 		let payload = "";
 		for (let index = 0; index < 192 * 1024; index++) {

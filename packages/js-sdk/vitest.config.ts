@@ -6,7 +6,7 @@ export default defineConfig({
 		alias: {
 			"#binding": fileURLToPath(new URL("./src/binding.node.ts", import.meta.url)),
 			"#worker-factory": fileURLToPath(
-				new URL("./src/worker/factory.node.ts", import.meta.url),
+				new URL("./dist/worker/factory.node.js", import.meta.url),
 			),
 		},
 	},

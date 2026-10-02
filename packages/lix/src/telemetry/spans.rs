@@ -26,6 +26,11 @@ macro_rules! define_production_spans {
                         otel.name = tracing::field::Empty,
                         $($attr = tracing::field::Empty,)*
                         "error.type" = tracing::field::Empty,
+                        "rust_origin.kind" = tracing::field::Empty,
+                        "code.filepath" = tracing::field::Empty,
+                        "code.lineno" = tracing::field::Empty,
+                        "code.column" = tracing::field::Empty,
+                        "rust_stacktrace_status" = tracing::field::Empty,
                         "lix.receipt.version" = tracing::field::Empty,
                         "lix.receipt.expected_version" = tracing::field::Empty,
                         "lix.migration.from_version" = tracing::field::Empty,
@@ -63,6 +68,11 @@ macro_rules! define_production_spans {
                         $($attr,)*
                         "otel.name",
                         "error.type",
+                        "rust_origin.kind",
+                        "code.filepath",
+                        "code.lineno",
+                        "code.column",
+                        "rust_stacktrace_status",
                         "lix.receipt.version",
                         "lix.receipt.expected_version",
                         "lix.migration.from_version",

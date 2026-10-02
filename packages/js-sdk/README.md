@@ -94,6 +94,23 @@ show “Upgrading repository” with an indeterminate indicator instead of inven
 a percentage. Progress callbacks are observational and cannot change the result
 of opening.
 
+### Opening profiles
+
+`lix.openReport.initialized` distinguishes initialization during this open from
+existing native state. A browser open that creates the engine also exposes an
+immutable `lix.openReport.hostProfile` with wall-clock waits for WASM loading,
+component-compiler import/initialization, storage-provider startup and the
+native binding open. OPFS providers report lock, SQLite, pool and schema waits.
+These timings observe existing operations and perform no additional I/O.
+
+WASM cache/source fields record the actual loading branch. Reusing a realm
+reports only this caller's initialization wait, never a previous caller's
+fetch/compile costs. A handle attached to an existing shared engine omits the
+historical host profile. Initialization and migration facts remain separate.
+Imports can overlap, and provider opening can be nested inside creation; do not
+sum these wall-clock waits as exclusive CPU costs. Profiles are available on
+successful completed opens; progress and owner spans diagnose earlier failures.
+
 ### Compatibility metadata
 
 Raw HTTP integrations can obtain this SDK's protocol versions without loading
@@ -455,9 +472,9 @@ try {
 - `FilesystemStorage` is Node.js-only. Constructing it is safe in
   shared code, but passing one to `openLix()` in a browser throws an error.
 - The package is ESM-only.
-- The package uses conditional ESM imports internally: Node.js resolves the
-  native N-API binding, while browsers and other runtimes resolve the portable
-  WebAssembly binding. Vite resolves these conditional imports automatically.
+- The SDK uses WebAssembly in Node.js and browsers. Filesystem sessions load the
+  native N-API backend supplied by `@lix-js/storage-filesystem`; the SDK itself
+  has no native platform dependencies.
   Configure Vite to emit ES module workers because the Component compiler uses
   top-level await:
 
@@ -465,19 +482,21 @@ try {
   // vite.config.js
   export default { worker: { format: "es" } };
   ```
-- If the native addon cannot load in Node.js, in-memory Lix instances fall back
-  to the bundled WebAssembly engine. Filesystem storage still requires the native addon.
+- Filesystem storage requires its platform addon. Install optional dependencies
+  when installing `@lix-js/storage-filesystem`. Memory sessions require only the SDK.
 - Browser database work runs off the page's main thread. OPFS handles share one
   elected dedicated worker per physical repository; it owns both engine and
   storage. On owner loss, surviving tabs restore sessions and observations within
   a bounded recovery window. Interrupted transactions and snapshot streams must
   be restarted. In-flight writes may reject with `LIX_WRITE_OUTCOME_UNKNOWN`; do
-  not blindly replay them. Node.js uses the native binding's actor.
+  not blindly replay them. Node.js filesystem sessions use the native binding's actor. Node.js memory and
+  JavaScript storage sessions use reusable worker threads that are unreferenced
+  while idle.
 - Node.js and browsers execute installed Component API v2 plugins through the
   same JavaScript Component host. The host adapts Component interfaces to the
   platform's built-in WebAssembly runtime and connects them to Lix's shared Rust
-  host resources. Node.js retains its native engine and filesystem adapter;
-  the browser engine runs inside its dedicated worker.
+  host resources. Filesystem sessions in Node.js retain their native engine and Rust adapter;
+  Node.js memory sessions and the browser engine run WASM in dedicated workers.
 - Components are compiled on first use. Each file actor gets an isolated guest
   instance. Guest functions and loops check execution deadlines, and core memory
   declarations are capped before instantiation. Unsupported memory forms are

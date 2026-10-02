@@ -164,8 +164,21 @@ export type LixStorageCommitResult = {
 	stats: LixStorageWriteStats;
 };
 
+/** Optional host timings exposed by providers that own physical-store startup. */
+export type LixStorageProviderOpenProfile = {
+	openMs: number;
+	opfs?: {
+		lockWaitMs: number;
+		sqliteInitMs: number;
+		poolOpenMs: number;
+		schemaInitMs: number;
+	};
+};
+
 /** Mirrors `lix::storage::Storage`. */
 export interface LixStorageProvider {
+	/** Optional JS-only diagnostics; values contain timings, never store identity. */
+	openingProfile?(): LixStorageProviderOpenProfile;
 	/** Joins the active generation and returns its canonical unsigned 64-bit base-10 token. */
 	acquireSession(): Promise<string>;
 	/** Optional exclusive physical-store owner for partial replicas. The handle

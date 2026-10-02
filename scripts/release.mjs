@@ -40,11 +40,11 @@ export function releaseBranch(target, version) {
 	return `release/${releaseTag(target, version)}`;
 }
 
-export const JS_SDK_NATIVE_PACKAGES = [
-	"@lix-js/sdk-darwin-arm64",
-	"@lix-js/sdk-linux-arm64",
-	"@lix-js/sdk-linux-x64",
-	"@lix-js/sdk-win32-x64",
+export const FILESYSTEM_NATIVE_PACKAGES = [
+	"@lix-js/storage-filesystem-darwin-arm64",
+	"@lix-js/storage-filesystem-linux-arm64",
+	"@lix-js/storage-filesystem-linux-x64",
+	"@lix-js/storage-filesystem-win32-x64",
 ];
 export const PUBLIC_NPM_PACKAGE_PATHS = [
 	"packages/js-sdk",
@@ -505,9 +505,9 @@ export function updatePackageVersion(root, version) {
 		const packageJson = readJson(root, packageJsonPath);
 		packageJson.version = version;
 
-		if (packageJson.name === "@lix-js/sdk") {
+		if (packageJson.name === "@lix-js/storage-filesystem") {
 			packageJson.optionalDependencies = Object.fromEntries(
-				JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
+				FILESYSTEM_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
 			);
 		}
 		if (packageJson.peerDependencies?.["@lix-js/sdk"] !== undefined) {
@@ -522,8 +522,8 @@ export function updatePackageVersion(root, version) {
 			lock.packages[""].optionalDependencies = packageJson.optionalDependencies;
 			lock.packages[""].peerDependencies = packageJson.peerDependencies;
 		}
-		if (packageJson.name === "@lix-js/sdk") {
-			for (const packageName of JS_SDK_NATIVE_PACKAGES) {
+		if (packageJson.name === "@lix-js/storage-filesystem") {
+			for (const packageName of FILESYSTEM_NATIVE_PACKAGES) {
 				const lockedPackage = lock.packages?.[`node_modules/${packageName}`];
 				if (!lockedPackage) continue;
 				const unscopedName = packageName.split("/").at(-1);
@@ -535,9 +535,7 @@ export function updatePackageVersion(root, version) {
 		const linkedSdk = lock.packages?.["../js-sdk"];
 		if (linkedSdk) {
 			linkedSdk.version = version;
-			linkedSdk.optionalDependencies = Object.fromEntries(
-				JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
-			);
+			delete linkedSdk.optionalDependencies;
 		}
 		writeJson(root, lockPath, lock);
 	}

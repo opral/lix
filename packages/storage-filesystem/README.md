@@ -1,7 +1,7 @@
 # `lix-storage-filesystem`
 
 Filesystem-backed storage for Lix. The Rust crate and JavaScript package expose
-the same adapter with independently versioned releases.
+the same Rust adapter. The JavaScript package pins the matching SDK version.
 
 ## Exclusive repository lock
 
@@ -24,6 +24,15 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const storage = new FilesystemStorage({ path: "./repository" });
 const lix = await openLix({ storage });
 ```
+
+The JavaScript package supplies the native engine and RocksDB filesystem adapter.
+Its optional platform packages install the matching N-API binary for Linux x64/ARM64,
+macOS ARM64, or Windows x64. Install optional dependencies for filesystem support.
+The SDK alone uses WASM and does not install native binaries.
+
+Filesystem SQL and synchronization keep their existing native execution path.
+The native addon still contains the Lix engine because synchronization owns native
+engine sessions; this packaging split does not make filesystem builds smaller.
 
 The whole repository is synchronized by default. Pass `syncAllFiles: false`
 and use `storage.importPaths(paths)` for selective synchronization.

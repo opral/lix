@@ -41,8 +41,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Cross-compile ARM64 native SDK
-        working-directory: packages/js-sdk
+      - name: Cross-compile ARM64 native filesystem backend
+        working-directory: packages/storage-filesystem
         env:
           LIX_NATIVE_TARGET: aarch64-unknown-linux-gnu
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -52,18 +52,18 @@ jobs:
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu
         run: npm run build:native
       - name: Verify ARM64 ELF and package
-        working-directory: packages/js-sdk
+        working-directory: packages/storage-filesystem
         env:
           LIX_NATIVE_PACKAGE_ALLOW_CROSS: '1'
         run: |
-          file lix_js_sdk.node
-          readelf -h lix_js_sdk.node | grep -q 'Machine:.*AArch64'
-          readelf --version-info lix_js_sdk.node
+          file lix_storage_filesystem.node
+          readelf -h lix_storage_filesystem.node | grep -q 'Machine:.*AArch64'
+          readelf --version-info lix_storage_filesystem.node
           npm run prepare:native-package -- --suffix=linux-arm64
       - uses: actions/upload-artifact@v4
         with:
-          name: js-sdk-native-linux-arm64
-          path: packages/js-sdk/native-packages/linux-arm64
+          name: filesystem-native-linux-arm64
+          path: packages/storage-filesystem/native-packages/linux-arm64
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
@@ -82,15 +82,14 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/js-sdk/package-lock.json
+          cache-dependency-path: packages/storage-filesystem/package-lock.json
       - uses: actions/download-artifact@v4
         with:
-          name: js-sdk-native-linux-arm64
-          path: packages/js-sdk/native-packages/linux-arm64
+          name: filesystem-native-linux-arm64
+          path: packages/storage-filesystem/native-packages/linux-arm64
       - name: Test cross-compiled binary on ARM64
-        working-directory: packages/js-sdk
+        working-directory: packages/storage-filesystem
         run: |
           test "$(uname -m)" = aarch64
-          cp native-packages/linux-arm64/lix_js_sdk.node lix_js_sdk.node
-          npm ci
-          npx vitest run src/binding.node.test.ts
+          cp native-packages/linux-arm64/lix_storage_filesystem.node lix_storage_filesystem.node
+          node scripts/test-native-binary.cjs
