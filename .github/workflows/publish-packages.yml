@@ -105,5 +105,3 @@ jobs:
           name: release-native-timings-${{ matrix.suffix }}
           path: target/cargo-timings/*.html
           if-no-files-found: ignore
-
-
