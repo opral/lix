@@ -5,9 +5,7 @@ use crate::LixError;
 #[cfg(test)]
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
-use crate::changelog::{
-    ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitId,
-};
+use crate::changelog::{ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitId};
 use crate::commit_graph::CommitGraphContext;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -35,8 +33,11 @@ use std::sync::Mutex as StdMutex;
 use super::derived::{
     is_derived_only_request, is_derived_schema, request_may_include_derived, scan_derived_rows,
 };
+use super::visibility::{OrderedVisibilityRun, resolve_visible_ordered_runs};
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
+const DOMINANT_BRANCH_MIN_ROWS: usize = 512;
+const SMALL_GLOBAL_OVERLAY_MAX_ROWS: usize = 256;
 const ROW_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const ROW_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES: usize = 16;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
@@ -1066,6 +1067,36 @@ where
                 request.limit,
             ));
         }
+        if filter_global_scope.is_none()
+            && derived_rows.is_empty()
+            && let Some(rows) = try_merge_dominant_branch_with_global(
+                &mut hot_branch_rows,
+                &scope.projection_branch_ids,
+                request,
+            )
+        {
+            return Ok(rows);
+        }
+        if filter_global_scope.is_none() && derived_rows.is_empty() {
+            let visibility_request = VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            };
+            let ordered_runs = hot_branch_rows
+                .iter()
+                .map(|branch_rows| OrderedVisibilityRun {
+                    branch_id: &branch_rows.branch_id,
+                    rows: &branch_rows.rows,
+                    ordered_unique: branch_rows.ordered_unique,
+                })
+                .collect::<Vec<_>>();
+            if let Some(rows) = resolve_visible_ordered_runs(&ordered_runs, &visibility_request) {
+                return Ok(rows);
+            }
+        }
         let rows = concat_hot_state_batches(
             std::iter::once(derived_rows).chain(
                 hot_branch_rows
@@ -2025,6 +2056,36 @@ where
                 request.limit,
             ));
         }
+        if request.filter.global.is_none()
+            && derived_rows.is_empty()
+            && let Some(rows) = try_merge_dominant_branch_with_global(
+                &mut hot_branch_rows,
+                &scope.projection_branch_ids,
+                request,
+            )
+        {
+            return Ok(rows);
+        }
+        if request.filter.global.is_none() && derived_rows.is_empty() {
+            let visibility_request = VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            };
+            let ordered_runs = hot_branch_rows
+                .iter()
+                .map(|branch_rows| OrderedVisibilityRun {
+                    branch_id: &branch_rows.branch_id,
+                    rows: &branch_rows.rows,
+                    ordered_unique: branch_rows.ordered_unique,
+                })
+                .collect::<Vec<_>>();
+            if let Some(rows) = resolve_visible_ordered_runs(&ordered_runs, &visibility_request) {
+                return Ok(rows);
+            }
+        }
         let rows = concat_hot_state_batches(
             std::iter::once(derived_rows).chain(
                 hot_branch_rows
@@ -2152,6 +2213,9 @@ where
 {
     fn is_partial_replica(&self) -> bool {
         self.partial_scope_policy.is_some() || self.partial_scope_source.is_some()
+    }
+    fn scan_batch_resolves_visibility(&self) -> bool {
+        true
     }
     fn read_interest_registry(&self) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
         self.read_interest_registry.clone()
@@ -2392,6 +2456,165 @@ fn ordered_unique_branch_row_index(
         return None;
     }
     Some(index)
+}
+
+/// Merges a bounded global run into a much larger ordered branch run without
+/// rebuilding the branch's row columns. These predicates intentionally match
+/// only the shape whose visibility proof is explicit: one requested local
+/// branch, no derived rows or global-only predicate, and two authenticated
+/// ordered unique source runs. Every uncertain shape stays on the general
+/// resolver.
+fn try_merge_dominant_branch_with_global(
+    branch_rows: &mut [HotBranchRows],
+    projection_branch_ids: &[String],
+    request: &HotStateScanRequest,
+) -> Option<MaterializedHotStateBatch> {
+    if request.limit.is_some()
+        || !matches!(request.filter.rows, HotStateRowFilter::All)
+        || request.filter.global.is_some()
+    {
+        return None;
+    }
+    let [branch_id] = projection_branch_ids else {
+        return None;
+    };
+    if branch_id == GLOBAL_BRANCH_ID {
+        return None;
+    }
+
+    let mut local = None;
+    let mut global = None;
+    for (index, run) in branch_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, run)| !run.rows.is_empty())
+    {
+        if !run.ordered_unique {
+            return None;
+        }
+        if run.branch_id == *branch_id {
+            if local.replace(index).is_some()
+                || run
+                    .rows
+                    .iter()
+                    .any(|row| row.global() || row.branch_id() != run.branch_id)
+            {
+                return None;
+            }
+        } else if run.branch_id == GLOBAL_BRANCH_ID {
+            if global.replace(index).is_some()
+                || run
+                    .rows
+                    .iter()
+                    .any(|row| !row.global() || row.branch_id() != run.branch_id)
+            {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    let (local_index, global_index) = (local?, global?);
+    let local_rows = &branch_rows[local_index].rows;
+    let global_rows = &branch_rows[global_index].rows;
+    if local_rows.len() < DOMINANT_BRANCH_MIN_ROWS
+        || global_rows.len() > SMALL_GLOBAL_OVERLAY_MAX_ROWS
+        || local_rows.len().saturating_add(global_rows.len()) > u32::MAX as usize
+    {
+        return None;
+    }
+
+    // Branch-tier candidates suppress global candidates by the complete
+    // visible identity, including file scope. Tombstones participate in this
+    // shadow check and are filtered only after the merge.
+    let selected_globals = global_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(global_index, global_row)| {
+            (!batch_contains_visible_identity(local_rows, global_row)).then_some(global_index)
+        })
+        .collect::<Vec<_>>();
+
+    if selected_globals.is_empty() {
+        let local_rows = std::mem::take(&mut branch_rows[local_index].rows);
+        return Some(finalize_dominant_local_batch(
+            local_rows,
+            request.filter.include_tombstones,
+        ));
+    }
+
+    let mut additions = MaterializedHotStateBatchBuilder::with_capacity(selected_globals.len());
+    for global_index in selected_globals {
+        additions.push_ref(global_rows.row(global_index), Some(branch_id));
+    }
+    let additions = additions.finish();
+    let mut local_rows = std::mem::take(&mut branch_rows[local_index].rows);
+    let local_len = local_rows.len();
+    let merged_len = local_len + additions.len();
+    debug_assert!(merged_len <= u32::MAX as usize);
+    let mut permutation = Vec::with_capacity(merged_len);
+    let (mut local_index, mut global_index) = (0, 0);
+    while local_index < local_len && global_index < additions.len() {
+        if compare_visible_identity(local_rows.row(local_index), additions.row(global_index))
+            != std::cmp::Ordering::Greater
+        {
+            permutation.push(local_index as u32);
+            local_index += 1;
+        } else {
+            permutation.push((local_len + global_index) as u32);
+            global_index += 1;
+        }
+    }
+    while local_index < local_len {
+        permutation.push(local_index as u32);
+        local_index += 1;
+    }
+    while global_index < additions.len() {
+        permutation.push((local_len + global_index) as u32);
+        global_index += 1;
+    }
+    local_rows.append_batch(additions);
+    local_rows.permute_rows(&permutation);
+    Some(finalize_dominant_local_batch(
+        local_rows,
+        request.filter.include_tombstones,
+    ))
+}
+
+fn finalize_dominant_local_batch(
+    mut rows: MaterializedHotStateBatch,
+    include_tombstones: bool,
+) -> MaterializedHotStateBatch {
+    if !include_tombstones {
+        rows.retain_rows_in_place(|row| !row.deleted());
+    }
+    rows
+}
+
+fn compare_visible_identity(
+    left: MaterializedHotStateRowRef<'_>,
+    right: MaterializedHotStateRowRef<'_>,
+) -> std::cmp::Ordering {
+    left.schema_key()
+        .cmp(right.schema_key())
+        .then_with(|| left.row_pk().cmp(right.row_pk()))
+        .then_with(|| left.file_id().cmp(&right.file_id()))
+}
+
+fn batch_contains_visible_identity(
+    batch: &MaterializedHotStateBatch,
+    candidate: MaterializedHotStateRowRef<'_>,
+) -> bool {
+    let (mut low, mut high) = (0, batch.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match compare_visible_identity(batch.row(middle), candidate) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
 }
 
 /// Finalizes a table scan whose rows are already ordered and unique for the
@@ -3179,6 +3402,219 @@ mod tests {
             ordered_unique_branch_row_index(&[unordered_candidate], &requested_branch_ids),
             None,
             "an unordered candidate does not make the table ordering promise"
+        );
+    }
+
+    fn dominant_merge_test_row(
+        branch_id: &str,
+        row_pk: &str,
+        file_id: Option<&str>,
+        deleted: bool,
+    ) -> MaterializedHotStateRow {
+        MaterializedHotStateRow {
+            row_pk: RowPk::single(row_pk),
+            schema_key: "dominant_merge_test".to_string(),
+            file_id: file_id.map(str::to_owned),
+            snapshot_content: (!deleted).then(|| "{\"value\":true}".into()),
+            metadata: None,
+            deleted,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            global: branch_id == GLOBAL_BRANCH_ID,
+            change_id: None,
+            commit_id: Some(CommitId::for_test_label("dominant-merge")),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            untracked: false,
+            branch_id: branch_id.into(),
+        }
+    }
+
+    #[test]
+    fn dominant_local_merge_matches_visibility_for_global_collisions_files_and_tombstones() {
+        let branch_id = "dominant-merge-branch";
+        let local_rows = MaterializedHotStateBatch::from_rows(
+            (0..DOMINANT_BRANCH_MIN_ROWS)
+                .map(|index| {
+                    dominant_merge_test_row(
+                        branch_id,
+                        &format!("row-{index:04}"),
+                        Some("local-file"),
+                        index == 256,
+                    )
+                })
+                .collect(),
+        );
+        let mut global_rows = vec![
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0000", Some("local-file"), false),
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0000a", Some("local-file"), false),
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0002a", Some("local-file"), true),
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0256", Some("local-file"), false),
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0256", Some("other-file"), false),
+            dominant_merge_test_row(GLOBAL_BRANCH_ID, "row-0511z", Some("local-file"), false),
+        ];
+        global_rows.sort_by(|left, right| {
+            left.schema_key
+                .cmp(&right.schema_key)
+                .then_with(|| left.row_pk.cmp(&right.row_pk))
+                .then_with(|| left.file_id.cmp(&right.file_id))
+        });
+        let global_rows = MaterializedHotStateBatch::from_rows(global_rows);
+        let projection_branch_ids = vec![branch_id.to_string()];
+
+        for include_tombstones in [false, true] {
+            let request = HotStateScanRequest {
+                filter: super::super::HotStateFilter {
+                    include_tombstones,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let expected = resolve_visible_ordered_runs(
+                &[
+                    OrderedVisibilityRun {
+                        branch_id,
+                        rows: &local_rows,
+                        ordered_unique: true,
+                    },
+                    OrderedVisibilityRun {
+                        branch_id: GLOBAL_BRANCH_ID,
+                        rows: &global_rows,
+                        ordered_unique: true,
+                    },
+                ],
+                &VisibilityRequest {
+                    branch_scope: VisibilityBranchScope::BranchIds {
+                        branch_ids: projection_branch_ids.clone(),
+                    },
+                    include_tombstones,
+                    limit: None,
+                },
+            )
+            .expect("both source runs are ordered and unique");
+            let mut candidates = vec![
+                HotBranchRows {
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    rows: global_rows.clone(),
+                    ordered_unique: true,
+                },
+                HotBranchRows {
+                    branch_id: branch_id.to_string(),
+                    rows: local_rows.clone(),
+                    ordered_unique: true,
+                },
+            ];
+            let actual = try_merge_dominant_branch_with_global(
+                &mut candidates,
+                &projection_branch_ids,
+                &request,
+            )
+            .expect("the dominant local plus small global shape is eligible");
+            let actual = actual.into_rows();
+            assert_eq!(actual, expected.into_rows());
+            assert!(actual.windows(2).all(|rows| {
+                rows[0]
+                    .schema_key
+                    .cmp(&rows[1].schema_key)
+                    .then_with(|| rows[0].row_pk.cmp(&rows[1].row_pk))
+                    .then_with(|| rows[0].file_id.cmp(&rows[1].file_id))
+                    .is_le()
+            }));
+            assert!(actual.iter().all(|row| row.branch_id.as_ref() == branch_id));
+            assert_eq!(
+                actual.iter().filter(|row| row.deleted).count(),
+                if include_tombstones { 2 } else { 0 },
+                "both local and global tombstones obey the request"
+            );
+            assert!(actual.iter().any(|row| {
+                row.row_pk == RowPk::single("row-0256")
+                    && row.file_id.as_deref() == Some("other-file")
+                    && row.global
+            }));
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|row| row.row_pk == RowPk::single("row-0256")
+                        && row.file_id.as_deref() == Some("local-file"))
+                    .count(),
+                if include_tombstones { 1 } else { 0 },
+                "the local tombstone shadows a live global row of the same identity"
+            );
+        }
+    }
+
+    #[test]
+    fn dominant_local_merge_declines_limits_small_tables_and_unordered_runs() {
+        let branch_id = "dominant-merge-branch";
+        let projection_branch_ids = vec![branch_id.to_string()];
+        let local = MaterializedHotStateBatch::from_rows(
+            (0..DOMINANT_BRANCH_MIN_ROWS)
+                .map(|index| {
+                    dominant_merge_test_row(branch_id, &format!("row-{index:04}"), None, false)
+                })
+                .collect(),
+        );
+        let global = MaterializedHotStateBatch::from_rows(vec![dominant_merge_test_row(
+            GLOBAL_BRANCH_ID,
+            "row-between",
+            None,
+            false,
+        )]);
+        let mut candidates = vec![
+            HotBranchRows {
+                branch_id: branch_id.to_string(),
+                rows: local.clone(),
+                ordered_unique: true,
+            },
+            HotBranchRows {
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                rows: global.clone(),
+                ordered_unique: true,
+            },
+        ];
+        assert!(
+            try_merge_dominant_branch_with_global(
+                &mut candidates,
+                &projection_branch_ids,
+                &HotStateScanRequest {
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            )
+            .is_none()
+        );
+
+        let mut small_candidates = candidates
+            .iter()
+            .map(|run| HotBranchRows {
+                branch_id: run.branch_id.clone(),
+                rows: run.rows.clone(),
+                ordered_unique: run.ordered_unique,
+            })
+            .collect::<Vec<_>>();
+        small_candidates[0].rows =
+            MaterializedHotStateBatch::from_rows(vec![dominant_merge_test_row(
+                branch_id,
+                "only-local",
+                None,
+                false,
+            )]);
+        assert!(
+            try_merge_dominant_branch_with_global(
+                &mut small_candidates,
+                &projection_branch_ids,
+                &HotStateScanRequest::default(),
+            )
+            .is_none()
+        );
+
+        candidates[0].ordered_unique = false;
+        assert!(
+            try_merge_dominant_branch_with_global(
+                &mut candidates,
+                &projection_branch_ids,
+                &HotStateScanRequest::default(),
+            )
+            .is_none()
         );
     }
 
