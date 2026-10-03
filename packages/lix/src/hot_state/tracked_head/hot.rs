@@ -3218,7 +3218,8 @@ async fn scan_packed_current_base_rows(
     if base_refs.is_empty() {
         return Ok(MaterializedHotStateBatch::default());
     }
-    if request.read_columns.columns.as_slice() == ["commit_id"] {
+    let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
+    if !projection.requires_payload() && request.filter.row_pks.is_empty() {
         return scan_packed_current_base_provenance_rows(
             store, branch_id, base_refs, request, limit,
         )
@@ -14429,6 +14430,7 @@ mod tests {
     struct PackedSegmentCountingRead<R> {
         inner: R,
         segments: Arc<AtomicUsize>,
+        change_records: Option<Arc<AtomicUsize>>,
     }
 
     impl<R: StorageAdapterRead> StorageAdapterRead for PackedSegmentCountingRead<R> {
@@ -14440,6 +14442,11 @@ mod tests {
                 if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE {
                     self.segments
                         .fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+                if request.space == crate::changelog::CHANGE_SPACE
+                    && let Some(change_records) = &self.change_records
+                {
+                    change_records.fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
             }
             self.inner.get_many(requests).await
@@ -14541,12 +14548,14 @@ mod tests {
                 .unwrap();
 
             let segments = Arc::new(AtomicUsize::new(0));
+            let change_records = Arc::new(AtomicUsize::new(0));
             let counted = PackedSegmentCountingRead {
                 inner: storage
                     .begin_read(StorageReadOptions::default())
                     .await
                     .unwrap(),
                 segments: Arc::clone(&segments),
+                change_records: Some(Arc::clone(&change_records)),
             };
             let request = TrackedStateScanRequest {
                 filter: TrackedStateFilter {
@@ -14599,6 +14608,36 @@ mod tests {
                 limited.iter().next().unwrap().row_pk(),
                 &RowPk::single(selected)
             );
+
+            // Broad identity-only scans need the compact authenticated value
+            // plane for row count and provenance, but must not point-read one
+            // payload-bearing changelog record per live row.
+            change_records.store(0, Ordering::Relaxed);
+            let count_only = TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec!["lix_key_value".to_owned()],
+                    ..Default::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["change_id".to_owned()],
+                },
+                ..Default::default()
+            };
+            let counted_rows = scan_packed_current_base_rows(&counted, BRANCH, generation, &count_only, None)
+                .await
+                .unwrap();
+            assert_eq!(counted_rows.len(), row_count + 2);
+            assert_eq!(
+                change_records.load(Ordering::Relaxed),
+                0,
+                "identity-only packed count should not hydrate changelog payload records"
+            );
+            assert!(counted_rows.iter().all(|row| {
+                row.change_id().is_some()
+                    && row.commit_id() == Some(generation)
+                    && row.snapshot_content().is_none()
+                    && row.metadata().is_none()
+            }));
         }
     }
 

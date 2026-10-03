@@ -805,6 +805,9 @@ where
                 },
             ))?;
         }
+        if request.filter.global.is_some() {
+            return Ok(None);
+        }
         // The hot index carries tracked and untracked rows in one serving
         // plane, so this route never probes a separate retention index.
         if request.filter.untracked.is_some() || request_may_include_derived(request) {

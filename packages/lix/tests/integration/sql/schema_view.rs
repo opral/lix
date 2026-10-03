@@ -62,6 +62,192 @@ simulation_test!(
 );
 
 simulation_test!(
+    count_only_projection_tracks_staged_updates_deletes_and_filters,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        register_pushdown_note_schema(&session).await;
+
+        let explain = session
+            .execute("EXPLAIN VERBOSE SELECT COUNT(*) AS n FROM pushdown_note", &[])
+            .await
+            .expect("count-only plan should explain");
+        let plan = explain_plan_text(&explain);
+        assert!(
+            plan.contains("projection=[]"),
+            "COUNT(*) should keep an empty SQL projection:\n{plan}"
+        );
+
+        let mut tx = session.begin_transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO pushdown_note (id,kind,title,score,optional) VALUES \
+             ('a','todo','First',1.0,NULL), ('b','done','Second',2.0,NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_rows_eq(
+            tx.execute("SELECT COUNT(*) AS n FROM pushdown_note", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(2)]],
+        );
+
+        tx.execute(
+            "UPDATE pushdown_note SET kind='todo' WHERE id='b'",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_rows_eq(
+            tx.execute(
+                "SELECT COUNT(*) AS n FROM pushdown_note WHERE kind='todo'",
+                &[],
+            )
+            .await
+            .unwrap(),
+            vec![vec![Value::Integer(2)]],
+        );
+
+        tx.execute("DELETE FROM pushdown_note WHERE id='a'", &[])
+            .await
+            .unwrap();
+        assert_rows_eq(
+            tx.execute("SELECT COUNT(*) AS n FROM pushdown_note", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(1)]],
+        );
+        assert_rows_eq(
+            tx.execute(
+                "SELECT COUNT(*) AS n FROM pushdown_note WHERE kind='todo'",
+                &[],
+            )
+            .await
+            .unwrap(),
+            vec![vec![Value::Integer(1)]],
+        );
+
+        tx.execute(
+            "INSERT INTO pushdown_note (id,kind,title,score,optional) \
+             VALUES ('c','done','Third',3.0,NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_rows_eq(
+            tx.execute(
+                "SELECT COUNT(*) AS n FROM pushdown_note WHERE kind='done'",
+                &[],
+            )
+            .await
+            .unwrap(),
+            vec![vec![Value::Integer(1)]],
+        );
+        tx.commit().await.unwrap();
+
+        assert_rows_eq(
+            session
+                .execute("SELECT COUNT(*) AS n FROM pushdown_note", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(2)]],
+        );
+    }
+);
+
+simulation_test!(
+    count_global_scope_predicates_apply_after_local_shadowing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        register_pushdown_note_schema(&session).await;
+        let schema = session
+            .execute("SELECT value FROM lix_registered_schema WHERE schema_key='pushdown_note'", &[])
+            .await
+            .expect("registered schema should be visible")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value,lixcol_global,lixcol_untracked) VALUES ($1,true,false)",
+                &[schema],
+            )
+            .await
+            .expect("schema should also register in global scope");
+        session
+            .execute(
+                "INSERT INTO pushdown_note \
+                 (id,kind,title,score,optional,lixcol_global) VALUES \
+                 ('shared','global','Global',1.0,NULL,true), \
+                 ('global-only','global','Global only',2.0,NULL,true)",
+                &[],
+            )
+            .await
+            .expect("global rows should insert");
+        session
+            .execute(
+                "INSERT INTO pushdown_note (id,kind,title,score,optional) VALUES \
+                 ('shared','local','Local',3.0,NULL), \
+                 ('local-only','local','Local only',4.0,NULL)",
+                &[],
+            )
+            .await
+            .expect("local rows should insert");
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT COUNT(*) AS n FROM pushdown_note WHERE lixcol_global = true",
+                    &[],
+                )
+                .await
+                .expect("global count should preserve local shadowing"),
+            vec![vec![Value::Integer(1)]],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT COUNT(*) AS n FROM pushdown_note WHERE lixcol_global = false",
+                    &[],
+                )
+                .await
+                .expect("local count should preserve local shadowing"),
+            vec![vec![Value::Integer(2)]],
+        );
+        session
+            .execute("DELETE FROM pushdown_note WHERE id='shared'", &[])
+            .await
+            .expect("local shadow should delete");
+        for (predicate, expected) in [("true", 1), ("false", 1)] {
+            assert_rows_eq(
+                session
+                    .execute(
+                        &format!("SELECT COUNT(*) AS n FROM pushdown_note WHERE lixcol_global = {predicate}"),
+                        &[],
+                    )
+                    .await
+                    .expect("local tombstone should keep the global row shadowed"),
+                vec![vec![Value::Integer(expected)]],
+            );
+        }
+    }
+);
+
+simulation_test!(
     row_filter_pushdown_applies_limit_after_payload_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;

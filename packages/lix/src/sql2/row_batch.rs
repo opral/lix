@@ -439,6 +439,7 @@ fn direct_row_snapshot_request(request: &HotStateScanRequest) -> bool {
     matches!(request.filter.rows, HotStateRowFilter::All)
         && !request.filter.include_tombstones
         && request.filter.untracked.is_none()
+        && request.filter.global.is_none()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
 }
@@ -491,6 +492,14 @@ mod tests {
     fn exact_primary_key_and_limit_bypass_columnar_scan() {
         let mut request = HotStateScanRequest::default();
         assert!(direct_row_columnar_request(&request));
+        assert!(direct_row_snapshot_request(&request));
+
+        for global in [Some(false), Some(true)] {
+            request.filter.global = global;
+            assert!(!direct_row_columnar_request(&request));
+            assert!(!direct_row_snapshot_request(&request));
+        }
+        request.filter.global = None;
 
         request.filter.row_pks.push(RowPk::single("point-read"));
         assert!(!direct_row_columnar_request(&request));

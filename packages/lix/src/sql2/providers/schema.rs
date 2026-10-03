@@ -994,11 +994,10 @@ impl TableSpec for SchemaSpec {
 }
 
 fn row_columnar_projection_eligible(schema: &Schema) -> bool {
-    !schema.fields().is_empty()
-        && schema
-            .fields()
-            .iter()
-            .all(|field| !field.name().starts_with("lixcol_"))
+    schema
+        .fields()
+        .iter()
+        .all(|field| !field.name().starts_with("lixcol_"))
 }
 
 fn row_columnar_projection(
@@ -1299,7 +1298,7 @@ async fn row_columnar_scan_source(
                                 )
                                 .await
                                 .map_err(lix_error_to_datafusion_error)?;
-                            Arc::new(filter_record_batch(&batch, keep.as_ref())?)
+                            Arc::new(filter_row_columnar_batch(&batch, keep.as_ref())?)
                         };
                         Ok(batch)
                     },
@@ -1318,8 +1317,14 @@ async fn row_columnar_scan_source(
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
                 }
-                RecordBatch::try_new(batch_schema, batch.columns().to_vec())
-                    .map_err(DataFusionError::from)
+                let options =
+                    RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                RecordBatch::try_new_with_options(
+                    batch_schema,
+                    batch.columns().to_vec(),
+                    &options,
+                )
+                .map_err(DataFusionError::from)
             });
             // Rows of one row group that survived manifest pruning: group
             // pruning is the columnar route's access path, so a pruned group
@@ -1367,6 +1372,24 @@ async fn cached_or_load_row_columnar_batch(
         )
         .await
         .map_err(lix_error_to_datafusion_error)
+}
+
+fn filter_row_columnar_batch(batch: &RecordBatch, keep: &BooleanArray) -> Result<RecordBatch> {
+    if batch.num_columns() != 0 {
+        return filter_record_batch(batch, keep).map_err(DataFusionError::from);
+    }
+    if keep.len() != batch.num_rows() {
+        return exec_err!(
+            "row columnar zero-column shadow mask length does not match the batch row count"
+        );
+    }
+    let row_count = keep
+        .iter()
+        .filter(|value| *value == Some(true))
+        .count();
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    RecordBatch::try_new_with_options(Arc::clone(&batch.schema()), Vec::new(), &options)
+        .map_err(DataFusionError::from)
 }
 
 fn row_columnar_coordinate_shadow_masks(
@@ -1460,6 +1483,20 @@ fn row_columnar_overlay_batches(
     rows: &[crate::hot_state::RowColumnarOverlayRow],
     row_filters: &[RowFilter],
 ) -> Result<Vec<RecordBatch>> {
+    // COUNT(*) has no payload dependency. Overlay identities still shadow the
+    // immutable base (including tombstones), but only live overlays contribute
+    // output rows. Preserve that count in a zero-column batch without decoding
+    // or binding every overlay payload.
+    if schema.fields().is_empty() && row_filters.is_empty() {
+        let live_rows = rows.iter().filter(|row| !row.deleted).count();
+        if live_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(live_rows));
+        return RecordBatch::try_new_with_options(schema, Vec::new(), &options)
+            .map(|batch| vec![batch])
+            .map_err(DataFusionError::from);
+    }
     let decoder = RowProjectionDecoder::with_schema_amendments(
         spec,
         schema.fields().iter().map(|field| field.name().as_str()),
@@ -1564,7 +1601,9 @@ fn row_columnar_overlay_batches(
                 )
             }
             .map_err(row_projection_error_to_datafusion_error)?;
-            RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
+            let options = RecordBatchOptions::new().with_row_count(Some(snapshots.len()));
+            RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
+                .map_err(DataFusionError::from)
         })
         .collect()
 }
@@ -3698,6 +3737,11 @@ fn row_hot_state_projection(
         .any(|field| !field.name().starts_with("lixcol_"))
     {
         columns.push("raw_snapshot".to_string());
+    } else if schema.fields().is_empty() {
+        // An empty SQL projection is a count-only scan. `from_columns([])`
+        // intentionally means a full materialization for older callers, so
+        // request a real identity column to keep row counting payload-free.
+        columns.push("change_id".to_string());
     }
     HotStateProjection { columns }
 }
@@ -4534,11 +4578,12 @@ mod tests {
     use bytes::Bytes;
     use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use datafusion::catalog::TableProvider;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use futures_util::TryStreamExt;
     use serde_json::json;
 
     use super::super::spec::SpecTableProvider;
@@ -4564,6 +4609,43 @@ mod tests {
     #[derive(Default)]
     struct TestCachingRowSnapshotReader {
         batch: Mutex<Option<Arc<RecordBatch>>>,
+    }
+
+    struct CountOnlyColumnarRowSnapshotReader {
+        identities: Vec<String>,
+    }
+
+    #[async_trait]
+    impl crate::sql2::RowSnapshotReader for CountOnlyColumnarRowSnapshotReader {
+        async fn load_row_columnar_group(
+            &self,
+            layout: Arc<crate::sql2::row_batch::RowColumnarScanLayout>,
+            group_index: usize,
+            projection: Vec<usize>,
+        ) -> Result<RecordBatch, LixError> {
+            let schema = crate::columnar_row_group::row_group_projected_schema(
+                &layout.manifest,
+                &projection,
+            )?;
+            if projection.is_empty() {
+                let row_count = layout.manifest.groups[group_index].row_count as usize;
+                return RecordBatch::try_new_with_options(
+                    schema,
+                    Vec::new(),
+                    &RecordBatchOptions::new().with_row_count(Some(row_count)),
+                )
+                .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()));
+            }
+            let [identity_index] = projection.as_slice() else {
+                panic!("count-only fixture may request only the shadow identity")
+            };
+            assert_eq!(
+                layout.manifest.fields[*identity_index].name,
+                crate::sql2::ROW_COLUMNAR_IDENTITY_FIELD
+            );
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(self.identities.clone()))])
+                .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
+        }
     }
 
     #[async_trait]
@@ -4936,6 +5018,20 @@ mod tests {
         .expect("generic zero-column row batch should build");
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), rows.len());
+    }
+
+    #[test]
+    fn count_projection_requests_identity_without_payload() {
+        let projected = super::row_hot_state_projection(Some(&Schema::empty()), false);
+        assert_eq!(projected.columns, vec!["change_id"]);
+
+        let materialization =
+            crate::changelog::ChangeRecordProjection::from_columns(&projected.columns);
+        assert!(
+            !materialization.requires_payload(),
+            "COUNT(*) should not request snapshot or metadata materialization"
+        );
+        assert!(super::row_columnar_projection_eligible(&Schema::empty()));
     }
 
     #[test]
@@ -6907,6 +7003,11 @@ mod tests {
             Some(vec![1]),
             "schema-bound canonical JSON text is safe to scan directly"
         );
+        assert_eq!(
+            super::row_columnar_projection(&encoded.manifest, &Schema::empty(), &spec),
+            Some(Vec::new()),
+            "a count-only scan has a valid zero-column projection"
+        );
 
         let mut drifted = encoded.manifest.clone();
         drifted.metadata.insert(
@@ -7017,6 +7118,209 @@ mod tests {
             "insert-c",
             "the updated row moved out of the predicate and its stale base was already shadowed"
         );
+    }
+
+    #[test]
+    fn count_columnar_overlay_preserves_live_row_count_without_payloads() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "count_overlay_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        }))
+        .expect("schema");
+        let overlays = vec![
+            crate::hot_state::RowColumnarOverlayRow {
+                row_pk: TestRowPk::single("live-a"),
+                snapshot_content: None,
+                decoded_snapshot: None,
+                raw_snapshot: None,
+                deleted: false,
+                columnar_base_coordinate: None,
+            },
+            crate::hot_state::RowColumnarOverlayRow {
+                row_pk: TestRowPk::single("deleted"),
+                snapshot_content: None,
+                decoded_snapshot: None,
+                raw_snapshot: None,
+                deleted: true,
+                columnar_base_coordinate: None,
+            },
+            crate::hot_state::RowColumnarOverlayRow {
+                row_pk: TestRowPk::single("live-b"),
+                snapshot_content: None,
+                decoded_snapshot: None,
+                raw_snapshot: None,
+                deleted: false,
+                columnar_base_coordinate: None,
+            },
+        ];
+
+        let batches =
+            super::row_columnar_overlay_batches(&spec, Arc::new(Schema::empty()), &overlays, &[])
+                .expect("count-only overlay should need no snapshot payload");
+        let [batch] = batches.as_slice() else {
+            panic!("expected one count-only overlay batch")
+        };
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 2);
+
+        let filtered_overlays = vec![
+            crate::hot_state::RowColumnarOverlayRow {
+                row_pk: TestRowPk::single("live-a"),
+                snapshot_content: Some(Bytes::from_static(br#"{"id":"live-a"}"#)),
+                decoded_snapshot: None,
+                raw_snapshot: None,
+                deleted: false,
+                columnar_base_coordinate: None,
+            },
+            crate::hot_state::RowColumnarOverlayRow {
+                row_pk: TestRowPk::single("live-b"),
+                snapshot_content: Some(Bytes::from_static(br#"{"id":"live-b"}"#)),
+                decoded_snapshot: None,
+                raw_snapshot: None,
+                deleted: false,
+                columnar_base_coordinate: None,
+            },
+        ];
+        let filter = [super::RowFilter::ColumnEq {
+            column: "id".to_owned(),
+            column_type: SchemaColumnType::String,
+            value: super::RowFilterValue::String("live-b".to_owned()),
+        }];
+        let filtered = super::row_columnar_overlay_batches(
+            &spec,
+            Arc::new(Schema::empty()),
+            &filtered_overlays,
+            &filter,
+        )
+        .expect("filtered count-only overlay should preserve the matching row count");
+        let [batch] = filtered.as_slice() else {
+            panic!("expected one filtered count-only overlay batch")
+        };
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn columnar_count_stream_preserves_shadowed_overlay_cardinality() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "count_columnar_stream_fixture",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        }))
+        .expect("schema");
+        let snapshots = [json!({"id":"a"}), json!({"id":"b"}), json!({"id":"c"})];
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let identities = ["a", "b", "c"].map(TestRowPk::single);
+        let encoded = crate::sql2::encode_registered_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((row_pk, snapshot), canonical)| crate::sql2::RowColumnarRowRef {
+                    row_pk,
+                    snapshot_bytes: Some(canonical.as_bytes()),
+                    snapshot_value: Some(snapshot),
+                    typed_row: None,
+                },
+            ),
+        )
+        .expect("encode")
+        .expect("registered sidecar");
+        let head = CommitId::for_test_label("count-columnar-stream-head");
+        let mut manifest = encoded.manifest.clone();
+        manifest
+            .metadata
+            .remove(crate::sql2::ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY);
+        let manifest_digest = manifest.content_digest().expect("manifest digest");
+        let identity_texts = identities
+            .iter()
+            .map(|row_pk| row_pk.as_json_array_text().expect("row identity"))
+            .collect::<Vec<_>>();
+        let layout = Arc::new(crate::sql2::row_batch::RowColumnarScanLayout {
+            id: crate::hot_state::row_group_set_id(head, &spec.schema_key),
+            manifest: Arc::new(manifest),
+            manifest_digest,
+            overlay: Arc::new(vec![
+                crate::hot_state::RowColumnarOverlayRow {
+                    row_pk: TestRowPk::single("a"),
+                    snapshot_content: None,
+                    decoded_snapshot: None,
+                    raw_snapshot: None,
+                    deleted: false,
+                    columnar_base_coordinate: None,
+                },
+                crate::hot_state::RowColumnarOverlayRow {
+                    row_pk: TestRowPk::single("b"),
+                    snapshot_content: None,
+                    decoded_snapshot: None,
+                    raw_snapshot: None,
+                    deleted: true,
+                    columnar_base_coordinate: None,
+                },
+                crate::hot_state::RowColumnarOverlayRow {
+                    row_pk: TestRowPk::single("d"),
+                    snapshot_content: None,
+                    decoded_snapshot: None,
+                    raw_snapshot: None,
+                    deleted: false,
+                    columnar_base_coordinate: None,
+                },
+            ]),
+            branch_id: Arc::from("main"),
+            head_commit_id: head,
+            current_state_revision: 0,
+            live_count: 3,
+        });
+        let schema = Arc::new(Schema::empty());
+        let projection = super::row_columnar_projection(&layout.manifest, &schema, &spec)
+            .expect("count projection should be supported by the sidecar");
+        let group_indices = super::row_columnar_group_indices(&layout.manifest, &[]);
+        let source = super::row_columnar_scan_source(
+            Arc::new(CountOnlyColumnarRowSnapshotReader {
+                identities: identity_texts,
+            }),
+            layout,
+            projection,
+            group_indices,
+            schema,
+            Arc::new(spec),
+            Vec::new(),
+        )
+        .await
+        .expect("columnar count source");
+
+        let base_batches = source
+            .open(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .expect("open base partition")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("zero-column base partition should remain a valid stream");
+        let [base] = base_batches.as_slice() else {
+            panic!("expected one base row-group batch")
+        };
+        assert_eq!(base.num_columns(), 0);
+        assert_eq!(base.num_rows(), 1, "update and tombstone shadow stale base rows");
+
+        let overlay_batches = source
+            .open(1, Arc::new(datafusion::execution::TaskContext::default()))
+            .expect("open overlay partition")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("zero-column overlay partition should remain a valid stream");
+        let [overlay] = overlay_batches.as_slice() else {
+            panic!("expected one overlay count batch")
+        };
+        assert_eq!(overlay.num_columns(), 0);
+        assert_eq!(overlay.num_rows(), 2, "updated and inserted rows remain visible");
+        assert_eq!(base.num_rows() + overlay.num_rows(), 3);
     }
 
     #[test]
