@@ -7,6 +7,8 @@ use crate::hot_state::{
     HotStateRowIdentityRef, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
 };
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 // Scanned-vs-returned accounting for the single-row `lix_binary_blob_ref`
 // probe that every `lix_file` content update issues. `calls` exists so a zero
@@ -59,7 +61,26 @@ pub(crate) enum VisibilityBranchScope {
     BranchIds { branch_ids: Vec<String> },
 }
 
+/// One proven ordered and unique branch-local candidate run.
+///
+/// The source is ordered by `(schema_key, row_pk, file_id)` and carries rows
+/// for exactly `branch_id`. Branch and global runs can then be projected into
+/// effective branch identities and merged without concatenating or sorting
+/// every row ordinal.
+pub(crate) struct OrderedVisibilityRun<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) rows: &'a MaterializedHotStateBatch,
+    pub(crate) ordered_unique: bool,
+}
+
 pub(crate) trait StagedHotStateRows {
+    /// Proves that this overlay has no staged row mutations, tombstones, or
+    /// collection replacements. Implementations that cannot prove all three
+    /// must keep the default `false` and let the normal visibility merge run.
+    fn row_overlay_is_empty(&self) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
     /// Returns staged candidates in one shared columnar owner.
     fn staged_batch(
         &self,
@@ -149,6 +170,202 @@ pub(crate) fn resolve_visible_batch(
     )
 }
 
+/// Resolves already ordered branch-local runs with a bounded-size k-way heap.
+///
+/// This path is only for committed source runs: callers must prove every run
+/// is ordered and unique, and staged/derived rows must be absent. It returns
+/// `None` when the ordering proof is missing so callers can use the general
+/// resolver. The heap contains one borrowed row per run, independent of the
+/// number of rows in those runs.
+pub(crate) fn resolve_visible_ordered_runs(
+    runs: &[OrderedVisibilityRun<'_>],
+    request: &VisibilityRequest,
+) -> Option<MaterializedHotStateBatch> {
+    if runs.iter().any(|run| !run.ordered_unique) {
+        return None;
+    }
+    if request.limit == Some(0) {
+        return Some(MaterializedHotStateBatch::default());
+    }
+
+    let requested_branch_ids = requested_branch_ids(&request.branch_scope);
+    let mut candidate_runs = Vec::new();
+    if requested_branch_ids.is_empty() {
+        candidate_runs.extend(runs.iter().filter(|run| !run.rows.is_empty()).map(|run| {
+            OrderedCandidateRun {
+                rows: run.rows,
+                projected_branch_id: None,
+                tier: None,
+            }
+        }));
+    } else {
+        // Candidate identity ordering has branch ID as its first component,
+        // so run creation order is immaterial to output order. Preserve the
+        // old resolver's requested-branch order for equal-identity tie breaks.
+        for requested_branch_id in &requested_branch_ids {
+            for run in runs.iter().filter(|run| {
+                run.branch_id == GLOBAL_BRANCH_ID || run.branch_id == requested_branch_id.as_str()
+            }) {
+                if !run.rows.is_empty() {
+                    candidate_runs.push(OrderedCandidateRun {
+                        rows: run.rows,
+                        projected_branch_id: Some(requested_branch_id.as_str()),
+                        tier: Some((OverlayTier::BaseGlobal, OverlayTier::BaseBranch)),
+                    });
+                }
+            }
+        }
+    }
+
+    let candidate_capacity = candidate_runs.iter().fold(0usize, |capacity, run| {
+        capacity.saturating_add(run.rows.len())
+    });
+    let output_capacity = request
+        .limit
+        .map_or(candidate_capacity, |limit| limit.min(candidate_capacity));
+    let mut output = MaterializedHotStateBatchBuilder::with_capacity(output_capacity);
+    let mut heap = BinaryHeap::with_capacity(candidate_runs.len());
+    for run_index in 0..candidate_runs.len() {
+        if let Some(head) = ordered_run_head(&candidate_runs, run_index, 0) {
+            heap.push(head);
+        }
+    }
+
+    while let Some(first) = heap.pop() {
+        let identity = first.candidate.identity();
+        let mut winner = first.candidate;
+        advance_ordered_run_head(&candidate_runs, first, &mut heap);
+
+        while heap
+            .peek()
+            .is_some_and(|candidate| candidate.candidate.identity() == identity)
+        {
+            let candidate = heap.pop().expect("peeked ordered candidate exists");
+            if winner.tier <= candidate.candidate.tier {
+                winner = candidate.candidate;
+            }
+            advance_ordered_run_head(&candidate_runs, candidate, &mut heap);
+        }
+
+        if request.include_tombstones || !winner.row.deleted() {
+            let branch_override =
+                (winner.branch_id != winner.row.branch_id()).then_some(winner.branch_id);
+            output.push_ref(winner.row, branch_override);
+            if request.limit.is_some_and(|limit| output.len() >= limit) {
+                break;
+            }
+        }
+    }
+    Some(output.finish())
+}
+
+#[derive(Clone, Copy)]
+struct OrderedCandidateRun<'a> {
+    rows: &'a MaterializedHotStateBatch,
+    projected_branch_id: Option<&'a str>,
+    tier: Option<(OverlayTier, OverlayTier)>,
+}
+
+#[derive(Clone, Copy)]
+struct OrderedRunHead<'a> {
+    candidate: OverlayCandidate<'a>,
+    run_index: usize,
+    row_index: usize,
+}
+
+impl PartialEq for OrderedRunHead<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.candidate.identity() == other.candidate.identity()
+            && self.run_index == other.run_index
+            && self.row_index == other.row_index
+    }
+}
+
+impl Eq for OrderedRunHead<'_> {}
+
+impl PartialOrd for OrderedRunHead<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedRunHead<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap; reverse identity and source order so the
+        // smallest effective identity (and earliest equal-tier source) wins.
+        other
+            .candidate
+            .identity()
+            .cmp(&self.candidate.identity())
+            .then_with(|| other.run_index.cmp(&self.run_index))
+            .then_with(|| other.row_index.cmp(&self.row_index))
+    }
+}
+
+fn ordered_run_head<'a>(
+    runs: &[OrderedCandidateRun<'a>],
+    run_index: usize,
+    mut row_index: usize,
+) -> Option<OrderedRunHead<'a>> {
+    let run = runs[run_index];
+    while row_index < run.rows.len() {
+        let row = run.rows.row(row_index);
+        let candidate = if let Some(projected_branch_id) = run.projected_branch_id {
+            if row.branch_id() == GLOBAL_BRANCH_ID {
+                OverlayCandidate {
+                    row,
+                    branch_id: projected_branch_id,
+                    tier: run.tier.expect("projected run carries overlay tiers").0,
+                    sequence: run_index,
+                }
+            } else if row.branch_id() == projected_branch_id {
+                let (global_tier, branch_tier) =
+                    run.tier.expect("projected run carries overlay tiers");
+                OverlayCandidate {
+                    row,
+                    branch_id: row.branch_id(),
+                    tier: if row.global() {
+                        global_tier
+                    } else {
+                        branch_tier
+                    },
+                    sequence: run_index,
+                }
+            } else {
+                row_index += 1;
+                continue;
+            }
+        } else {
+            OverlayCandidate {
+                row,
+                branch_id: row.branch_id(),
+                tier: if row.global() {
+                    OverlayTier::BaseGlobal
+                } else {
+                    OverlayTier::BaseBranch
+                },
+                sequence: run_index,
+            }
+        };
+        return Some(OrderedRunHead {
+            candidate,
+            run_index,
+            row_index,
+        });
+    }
+    None
+}
+
+fn advance_ordered_run_head<'a>(
+    runs: &[OrderedCandidateRun<'a>],
+    head: OrderedRunHead<'a>,
+    heap: &mut BinaryHeap<OrderedRunHead<'a>>,
+) {
+    if let Some(next) = ordered_run_head(runs, head.run_index, head.row_index + 1) {
+        heap.push(next);
+    }
+}
+
 fn materialized_row_identity(row: MaterializedHotStateRowRef<'_>) -> HotStateRowIdentityRef<'_> {
     HotStateRowIdentityRef {
         branch_id: row.branch_id(),
@@ -166,6 +383,22 @@ pub(crate) async fn overlay_scan_batch<S>(
 where
     S: StagedHotStateRows + ?Sized,
 {
+    if base.scan_batch_resolves_visibility() && staged.row_overlay_is_empty()? {
+        // The committed reader already owns full branch/global visibility.
+        // Forward the original request so its ordered scan can apply LIMIT;
+        // there is no need to widen candidates, strip the bound, or rebuild a
+        // second materialized visibility set when the transaction overlay is
+        // provably empty.
+        let rows = base.scan_batch(request).await?;
+        #[cfg(test)]
+        if is_single_row_blob_ref_probe(request) {
+            BLOB_REF_PROBE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+            BLOB_REF_PROBE_ROWS_SCANNED.with(|count| count.set(count.get().saturating_add(rows.len())));
+            BLOB_REF_PROBE_ROWS_RETURNED.with(|count| count.set(count.get().saturating_add(rows.len())));
+        }
+        return Ok(rows);
+    }
+
     let mut visible_branch_ids = request.filter.branch_ids.clone();
     if let [schema_key] = request.filter.schema_keys.as_slice() {
         let mut retained = Vec::with_capacity(visible_branch_ids.len());
@@ -690,6 +923,176 @@ mod tests {
     }
 
     #[test]
+    fn ordered_branch_runs_match_general_visibility_resolution() {
+        let branch_a = "01920000-0000-7000-8000-0000000000a1";
+        let branch_b = "01920000-0000-7000-8000-0000000000a2";
+
+        let global_rows = MaterializedHotStateBatch::from_rows(vec![
+            row_at(
+                GLOBAL_BRANCH_ID,
+                "a",
+                "global-a-null",
+                true,
+                Some("global-a-null"),
+            ),
+            with_file(
+                row_at(
+                    GLOBAL_BRANCH_ID,
+                    "a",
+                    "global-a-file",
+                    true,
+                    Some("global-a-file"),
+                ),
+                "file-1",
+            ),
+            row_at(GLOBAL_BRANCH_ID, "b", "global-b", true, Some("global-b")),
+            row_at(GLOBAL_BRANCH_ID, "c", "global-c", true, Some("global-c")),
+            with_file(
+                row_at(
+                    GLOBAL_BRANCH_ID,
+                    "d",
+                    "global-d-file",
+                    true,
+                    Some("global-d-file"),
+                ),
+                "file-2",
+            ),
+            row_at(GLOBAL_BRANCH_ID, "e", "global-e", true, Some("global-e")),
+        ]);
+        let branch_a_rows = MaterializedHotStateBatch::from_rows(vec![
+            row_at(branch_a, "a", "branch-a-null", false, Some("branch-a-null")),
+            tombstone_at(branch_a, "b", false, Some("branch-a-delete-b")),
+            with_file(
+                tombstone_at(branch_a, "d", false, Some("branch-a-delete-d")),
+                "file-2",
+            ),
+            row_at(branch_a, "f", "branch-a-f", false, Some("branch-a-f")),
+        ]);
+        let branch_b_rows = MaterializedHotStateBatch::from_rows(vec![
+            with_file(
+                row_at(branch_b, "a", "branch-b-file", false, Some("branch-b-file")),
+                "file-1",
+            ),
+            row_at(branch_b, "c", "branch-b-c", false, Some("branch-b-c")),
+            tombstone_at(branch_b, "e", false, Some("branch-b-delete-e")),
+            with_file(
+                row_at(
+                    branch_b,
+                    "g",
+                    "branch-b-g-file",
+                    false,
+                    Some("branch-b-g-file"),
+                ),
+                "file-2",
+            ),
+        ]);
+
+        // Deliberately pass the runs in a different order from the requested
+        // branches. The merge must sort by effective identity, not run order.
+        let runs = [
+            OrderedVisibilityRun {
+                branch_id: branch_b,
+                rows: &branch_b_rows,
+                ordered_unique: true,
+            },
+            OrderedVisibilityRun {
+                branch_id: GLOBAL_BRANCH_ID,
+                rows: &global_rows,
+                ordered_unique: true,
+            },
+            OrderedVisibilityRun {
+                branch_id: branch_a,
+                rows: &branch_a_rows,
+                ordered_unique: true,
+            },
+        ];
+        let base_rows = MaterializedHotStateBatch::from_rows(
+            runs.iter()
+                .flat_map(|run| run.rows.iter().map(|row| row.to_owned()))
+                .collect(),
+        );
+
+        for branch_ids in [
+            vec![],
+            vec![GLOBAL_BRANCH_ID.to_owned()],
+            vec![branch_a.to_owned()],
+            vec![branch_a.to_owned(), branch_b.to_owned()],
+            vec![branch_b.to_owned(), branch_a.to_owned()],
+        ] {
+        for (include_tombstones, limit) in [(false, None), (false, Some(0)), (false, Some(3)), (true, Some(5))] {
+            let request = VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: branch_ids.clone(),
+                },
+                include_tombstones,
+                limit,
+            };
+            let expected = resolve_visible_batch(
+                base_rows.clone(),
+                MaterializedHotStateBatch::default(),
+                &request,
+            )
+            .into_rows();
+            let actual = resolve_visible_ordered_runs(&runs, &request)
+                .expect("all test runs have an ordering proof")
+                .into_rows();
+            assert_eq!(actual, expected);
+        }
+        }
+    }
+
+    #[test]
+    fn ordered_branch_merge_equal_tier_keeps_later_source() {
+        let branch = "01920000-0000-7000-8000-0000000000a1";
+        let left = MaterializedHotStateBatch::from_rows(vec![row_at(branch, "a", "left", false, Some("left"))]);
+        let right = MaterializedHotStateBatch::from_rows(vec![row_at(branch, "a", "right", false, Some("right"))]);
+        let runs = [
+            OrderedVisibilityRun { branch_id: branch, rows: &left, ordered_unique: true },
+            OrderedVisibilityRun { branch_id: branch, rows: &right, ordered_unique: true },
+        ];
+        let request = VisibilityRequest {
+            branch_scope: VisibilityBranchScope::BranchIds { branch_ids: vec![branch.to_owned()] },
+            include_tombstones: false,
+            limit: None,
+        };
+        let base = MaterializedHotStateBatch::from_rows(runs.iter().flat_map(|run| run.rows.iter().map(|row| row.to_owned())).collect());
+        let expected = resolve_visible_batch(base, MaterializedHotStateBatch::default(), &request).into_rows();
+        let actual = resolve_visible_ordered_runs(&runs, &request).unwrap().into_rows();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, right.into_rows());
+    }
+
+    #[test]
+    fn ordered_branch_merge_declines_unproven_runs() {
+        let branch = "01920000-0000-7000-8000-0000000000a1";
+        let rows = MaterializedHotStateBatch::from_rows(vec![row_at(
+            branch,
+            "row",
+            "value",
+            false,
+            Some("value"),
+        )]);
+        let runs = [OrderedVisibilityRun {
+            branch_id: branch,
+            rows: &rows,
+            ordered_unique: false,
+        }];
+        assert!(
+            resolve_visible_ordered_runs(
+                &runs,
+                &VisibilityRequest {
+                    branch_scope: VisibilityBranchScope::BranchIds {
+                        branch_ids: vec![branch.to_owned()],
+                    },
+                    include_tombstones: false,
+                    limit: None,
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn committed_scan_projects_global_row_into_requested_branch() {
         let rows = resolve_hot_state_batch(
             &MaterializedHotStateBatch::from_rows(vec![row_at(
@@ -1164,6 +1567,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_overlay_forwards_original_request_to_complete_visibility_reader() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let request = HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec!["schema".to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                file_ids: vec![NullableKeyFilter::Value("file-1".to_owned())],
+                untracked: Some(false),
+                global: Some(true),
+                include_tombstones: true,
+                ..Default::default()
+            },
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["row_pk".to_owned()],
+            },
+            limit: Some(1),
+        };
+        let base = CompleteVisibilityReader {
+            expected_request: request.clone(),
+            rows: MaterializedHotStateBatch::from_rows(vec![with_file(
+                tombstone_at(branch_id, "global-deleted", true, Some("global-delete")),
+                "file-1",
+            )]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        let rows = overlay_scan_batch(&base, &EmptyStagedRows, &request)
+            .await
+            .expect("complete base visibility should serve the request");
+        assert_eq!(rows.len(), 1);
+        assert!(rows.row(0).global());
+        assert!(rows.row(0).deleted());
+        assert_eq!(
+            base.requests
+                .lock()
+                .expect("scan request lock should not be poisoned")
+                .as_slice(),
+            &[request],
+            "the fast path must preserve the complete original request"
+        );
+    }
+
+    #[tokio::test]
     async fn overlay_scan_replacement_hides_only_its_branch() {
         let replaced_branch = "01920000-0000-7000-8000-0000000000a1";
         let unaffected_branch = "01920000-0000-7000-8000-0000000000a2";
@@ -1392,6 +1837,11 @@ mod tests {
         }
     }
 
+    fn with_file(mut row: MaterializedHotStateRow, file_id: &str) -> MaterializedHotStateRow {
+        row.file_id = Some(file_id.to_owned());
+        row
+    }
+
     fn tombstone_at(
         branch_id: &str,
         row_pk: &str,
@@ -1428,6 +1878,10 @@ mod tests {
     struct EmptyStagedRows;
 
     impl StagedHotStateRows for EmptyStagedRows {
+        fn row_overlay_is_empty(&self) -> Result<bool, LixError> {
+            Ok(true)
+        }
+
         fn staged_batch(
             &self,
             _request: &HotStateScanRequest,
@@ -1436,6 +1890,41 @@ mod tests {
         }
 
         fn load_exact_batch(
+            &self,
+            request: &HotStateExactBatchRequest,
+        ) -> Result<MaterializedHotStateExactBatch, LixError> {
+            MaterializedHotStateExactBatch::new(
+                MaterializedHotStateBatch::default(),
+                vec![None; request.rows.len()],
+            )
+        }
+    }
+
+    struct CompleteVisibilityReader {
+        expected_request: HotStateScanRequest,
+        rows: MaterializedHotStateBatch,
+        requests: std::sync::Mutex<Vec<HotStateScanRequest>>,
+    }
+
+    #[async_trait]
+    impl HotStateReader for CompleteVisibilityReader {
+        fn scan_batch_resolves_visibility(&self) -> bool {
+            true
+        }
+
+        async fn scan_batch(
+            &self,
+            request: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            self.requests
+                .lock()
+                .expect("scan request lock should not be poisoned")
+                .push(request.clone());
+            assert_eq!(request, &self.expected_request);
+            Ok(self.rows.clone())
+        }
+
+        async fn load_exact_batch(
             &self,
             request: &HotStateExactBatchRequest,
         ) -> Result<MaterializedHotStateExactBatch, LixError> {

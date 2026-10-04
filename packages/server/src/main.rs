@@ -2,6 +2,11 @@ use anyhow::Context;
 use lix_server::{Config, LixRuntimeManager, router, telemetry};
 use tokio::net::TcpListener;
 
+// Match the native CLI allocator: repeated scans should release and reuse
+// allocation pages across worker threads instead of retaining fragmented arenas.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

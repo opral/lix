@@ -8,9 +8,7 @@ use crate::LixError;
 use crate::filesystem::{
     FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathIndexScope,
 };
-use crate::hot_state::{
-    HotStateContext, HotStateReader, LogicalReadInterest, ReadInterestSnapshot,
-};
+use crate::hot_state::{HotStateContext, LogicalReadInterest, ReadInterestSnapshot};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::sync::partial_replica::PartialReplicaDescriptor;
 use crate::tracked_state::NativeMetadataRef;
@@ -158,7 +156,7 @@ where
             } => {
                 super::partial_candidate_prepare::selected_branch(descriptor, branch_id)?;
                 hot.reader(read.clone())
-                    .collection_generation(
+                    .collection_generation_active_token(
                         branch_id,
                         crate::collection_generation::CollectionScopeRef {
                             schema_key,

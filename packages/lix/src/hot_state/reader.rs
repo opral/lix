@@ -23,6 +23,14 @@ pub(crate) trait HotStateReader: Send + Sync {
     fn is_partial_replica(&self) -> bool {
         false
     }
+    /// Whether `scan_batch` already applies the complete current-state
+    /// visibility contract for the supplied request, including global
+    /// fallback, local precedence, tombstones, filters, and LIMIT. Overlay
+    /// wrappers use this capability only when they can also prove there are
+    /// no staged row changes to compose.
+    fn scan_batch_resolves_visibility(&self) -> bool {
+        false
+    }
     fn read_interest_registry(&self) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
         None
     }

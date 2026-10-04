@@ -1813,6 +1813,125 @@ pub(crate) async fn load_mutation_part_read_plan(
     })
 }
 
+/// Loads only the first `max_runs` authenticated parts intersecting one key
+/// range. This is a candidate-page primitive: a caller still has to resolve
+/// every candidate against current visibility. A depth-first, key-ordered
+/// walk keeps descriptor reads proportional to tree height plus the returned
+/// leaves, instead of expanding every descriptor in a broad schema range.
+pub(crate) async fn load_first_mutation_part_runs_for_range(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &MutationDirectoryRoot,
+    range: &MutationDirectoryKeyRange,
+    max_runs: usize,
+) -> Result<Option<Vec<MutationDirectoryPartRun>>, LixError> {
+    if max_runs == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if !is_bounded(root.layout) {
+        return Ok(None);
+    }
+    validate_root(root)?;
+    let ranges = [range.clone()];
+    let selection = MutationDirectoryReadSelection::SortedRanges(&ranges);
+    validate_selection(root, selection)?;
+
+    struct PendingNode {
+        node_id: [u8; 32],
+        base_index: u32,
+        expected: Option<NodeSummary>,
+    }
+
+    let overlaps = |first: &[u8], last: &[u8]| {
+        last >= range.start.as_ref()
+            && range
+                .end
+                .as_ref()
+                .is_none_or(|end| first < end.as_ref())
+    };
+    let mut pending = vec![PendingNode {
+        node_id: root.root_id,
+        base_index: 0,
+        expected: None,
+    }];
+    let mut runs = Vec::with_capacity(max_runs);
+    while let Some(current) = pending.pop() {
+        let mut node = load_nodes(store, &[current.node_id], true)
+            .await?
+            .pop()
+            .expect("one requested mutation directory node is returned");
+        validate_loaded_node(
+            &node,
+            current.node_id,
+            current.expected.as_ref(),
+            root,
+            "bounded candidate range",
+        )?;
+        match &mut node {
+            StoredNode::Leaf { entries, .. } => {
+                for (offset, entry) in std::mem::take(entries).into_iter().enumerate() {
+                    if !overlaps(
+                        stored_entry_first_key(&entry),
+                        stored_entry_last_key(&entry),
+                    ) {
+                        continue;
+                    }
+                    let entry_index = current
+                        .base_index
+                        .checked_add(u32::try_from(offset).map_err(|_| {
+                            directory_error("candidate part index exceeds u32")
+                        })?)
+                        .ok_or_else(|| directory_error("candidate part index overflows"))?;
+                    let entry = runtime_entry(entry)?;
+                    if !matches!(&entry, MutationDirectoryEntry::Bounded { .. }) {
+                        return Ok(None);
+                    }
+                    runs.push(MutationDirectoryPartRun {
+                        entry_index,
+                        selector_span: 0..1,
+                        entry,
+                    });
+                    if runs.len() == max_runs {
+                        return Ok(Some(runs));
+                    }
+                }
+            }
+            StoredNode::Internal { children, .. } => {
+                let mut starts = Vec::with_capacity(children.len());
+                let mut preceding = 0u32;
+                for child in children.iter() {
+                    starts.push(preceding);
+                    preceding = preceding
+                        .checked_add(child.entry_count)
+                        .ok_or_else(|| directory_error("candidate entry offset overflows"))?;
+                }
+                for (child, offset) in children.iter().zip(starts).rev() {
+                    if !overlaps(&child.first_key, &child.last_key) {
+                        continue;
+                    }
+                    let base_index = current
+                        .base_index
+                        .checked_add(offset)
+                        .ok_or_else(|| directory_error("candidate child offset overflows"))?;
+                    pending.push(PendingNode {
+                        node_id: child.node_id,
+                        base_index,
+                        expected: Some(NodeSummary {
+                            first_key: child.first_key.clone(),
+                            last_key: child.last_key.clone(),
+                            node_id: child.node_id,
+                            entry_count: child.entry_count,
+                            direct_row_count: child.direct_row_count,
+                            level: child.level,
+                            layout: child.layout,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+    Ok(Some(runs))
+}
+
 impl MutationDirectoryReadSelection<'_> {
     fn len(self) -> usize {
         match self {

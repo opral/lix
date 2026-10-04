@@ -21,6 +21,11 @@ pub(crate) use tracked_head::{hot_index_key_is_witness, hot_index_key_is_entry};
 mod types;
 pub(crate) mod visibility;
 
+/// Minimum authoritative collection cardinality before attempting the
+/// unordered bounded-candidate LIMIT route. Tiny or heavily-pruned
+/// collections are cheaper through the established scan path.
+pub(crate) const MIN_UNORDERED_LIMIT_CANDIDATES: usize = 512;
+
 /// Re-exported for the consumers that already spell these `crate::hot_state::…`.
 /// The definitions live in the top-level `row_columnar` module, which sits
 /// below both state planes; this facade only exists so the move did not have to
@@ -30,6 +35,9 @@ pub(crate) use crate::row_columnar::{RowColumnarWriteSets, row_group_set_id};
 pub(crate) use context::{
     BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
 };
+pub(crate) fn is_derived_schema(schema_key: &str) -> bool {
+    derived::is_derived_schema(schema_key)
+}
 #[cfg(test)]
 pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[allow(unused_imports)]
@@ -42,6 +50,10 @@ pub(crate) use row_decoded_column_cache::RowDecodedColumnCache;
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[cfg(test)]
 pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
+#[cfg(test)]
+pub(crate) use tracked_head::stage_hot_collection_live_count_for_test;
+#[cfg(test)]
+pub(crate) use tracked_head::stage_hot_collection_control_for_test;
 #[cfg(test)]
 pub(crate) use tracked_head::encode_hot_row_key_for_test;
 pub(crate) use tracked_head::hot_generation_scope_prefix;

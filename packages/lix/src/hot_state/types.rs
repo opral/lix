@@ -80,9 +80,10 @@ struct BranchIdId(u32);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaterializedHotStateBatch {
     singleton: Option<Box<MaterializedHotStateSingleton>>,
-    /// Schema keys, file ids, branch ids, and author ids share one contiguous UTF-8 arena,
-    /// so repeated batch-wide metadata costs a four-byte ordinal per row rather
-    /// than another owned allocation.
+    /// Schema keys, file ids, branch ids, and author ids share UTF-8 arena
+    /// slices, so repeated batch-wide metadata costs a four-byte ordinal per
+    /// row rather than another owned allocation. Appending a small overlay can
+    /// retain its arena alongside the dominant batch without recopying rows.
     strings: StringDictionary,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
@@ -146,6 +147,218 @@ impl MaterializedHotStateBatch {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.singleton.is_none() && self.row_pks.is_empty()
+    }
+
+    /// Appends another batch without copying the dominant batch's row
+    /// columns. The immutable string dictionaries are joined as arena slices;
+    /// only the appended batch's compact ordinals need rebasing.
+    pub(crate) fn append_batch(&mut self, mut other: Self) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        if self.singleton.is_some() {
+            *self = std::mem::take(self).into_columnar();
+        }
+        if other.singleton.is_some() {
+            other = other.into_columnar();
+        }
+        let additional = other.len();
+        let base_len = self.len();
+        let ordinal_offset = self.strings.append(other.strings);
+        for ordinal in &mut other.schema_keys {
+            ordinal.0 = ordinal
+                .0
+                .checked_add(ordinal_offset)
+                .expect("live-state schema dictionary ordinal exceeds u32");
+        }
+        for ordinal in other.file_ids.iter_mut().flatten() {
+            *ordinal = FileIdId::from_ordinal(
+                ordinal
+                    .ordinal()
+                    .checked_add(ordinal_offset)
+                    .expect("live-state file dictionary ordinal exceeds u32"),
+            );
+        }
+        for ordinal in &mut other.branch_ids {
+            ordinal.0 = ordinal
+                .0
+                .checked_add(ordinal_offset)
+                .expect("live-state branch dictionary ordinal exceeds u32");
+        }
+        for ordinal in &mut other.author_ids {
+            ordinal.0 = ordinal
+                .0
+                .checked_add(ordinal_offset)
+                .expect("live-state author dictionary ordinal exceeds u32");
+        }
+
+        self.schema_keys.reserve_exact(additional);
+        self.file_ids.reserve_exact(additional);
+        self.branch_ids.reserve_exact(additional);
+        self.row_pks.reserve_exact(additional);
+        self.snapshot_content.reserve_exact(additional);
+        self.decoded_snapshots.reserve_exact(additional);
+        self.raw_snapshots.reserve_exact(additional);
+        self.metadata.reserve_exact(additional);
+        self.deleted.reserve_exact(additional);
+        self.created_at.reserve_exact(additional);
+        self.updated_at.reserve_exact(additional);
+        self.global.reserve_exact(additional);
+        self.change_id.reserve_exact(additional);
+        self.commit_id.reserve_exact(additional);
+        self.author_ids.reserve_exact(additional);
+        self.untracked.reserve_exact(additional);
+        self.durable_predecessor.reserve_exact(additional);
+        match (
+            &mut self.columnar_base_coordinate,
+            other.columnar_base_coordinate.take(),
+        ) {
+            (Some(target), Some(source)) => {
+                target.reserve_exact(additional);
+                target.extend(source);
+            }
+            (Some(target), None) => {
+                target.reserve_exact(additional);
+                target.extend(
+                    std::iter::repeat_with(ColumnarBaseCoordinate::default).take(additional),
+                );
+            }
+            (None, Some(source)) => {
+                let mut target = Vec::with_capacity(base_len.saturating_add(additional));
+                target.resize(base_len, ColumnarBaseCoordinate::default());
+                target.extend(source);
+                self.columnar_base_coordinate = Some(target);
+            }
+            (None, None) => {}
+        }
+        self.schema_keys.append(&mut other.schema_keys);
+        self.file_ids.append(&mut other.file_ids);
+        self.branch_ids.append(&mut other.branch_ids);
+        self.row_pks.append(&mut other.row_pks);
+        self.snapshot_content.append(&mut other.snapshot_content);
+        self.decoded_snapshots.append(&mut other.decoded_snapshots);
+        self.raw_snapshots.append(&mut other.raw_snapshots);
+        self.metadata.append(&mut other.metadata);
+        self.deleted.append(&mut other.deleted);
+        self.created_at.append(&mut other.created_at);
+        self.updated_at.append(&mut other.updated_at);
+        self.global.append(&mut other.global);
+        self.change_id.append(&mut other.change_id);
+        self.commit_id.append(&mut other.commit_id);
+        self.author_ids.append(&mut other.author_ids);
+        self.untracked.append(&mut other.untracked);
+        self.durable_predecessor
+            .append(&mut other.durable_predecessor);
+        debug_assert_eq!(self.len(), base_len.saturating_add(additional));
+    }
+
+    fn into_columnar(self) -> Self {
+        if self.singleton.is_none() {
+            return self;
+        }
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(2);
+        builder.push_ref(self.row(0), None);
+        builder.finish()
+    }
+
+    /// Applies a destination-to-source permutation to every row column in
+    /// place. This is used after merging a small sorted overlay into a large
+    /// sorted batch, avoiding a second row-sized column owner.
+    pub(crate) fn permute_rows(&mut self, permutation: &[u32]) {
+        assert_eq!(permutation.len(), self.len());
+        if permutation.len() <= 1 {
+            return;
+        }
+        assert!(self.singleton.is_none());
+        let mut visited = vec![false; permutation.len()];
+        for start in 0..permutation.len() {
+            if visited[start] {
+                continue;
+            }
+            let mut current = start;
+            loop {
+                visited[current] = true;
+                let source = permutation[current] as usize;
+                if source == start {
+                    break;
+                }
+                assert!(source < permutation.len());
+                self.swap_rows(current, source);
+                current = source;
+            }
+        }
+    }
+
+    fn swap_rows(&mut self, left: usize, right: usize) {
+        self.schema_keys.swap(left, right);
+        self.file_ids.swap(left, right);
+        self.branch_ids.swap(left, right);
+        self.row_pks.swap(left, right);
+        self.snapshot_content.swap(left, right);
+        self.decoded_snapshots.swap(left, right);
+        self.raw_snapshots.swap(left, right);
+        self.metadata.swap(left, right);
+        self.deleted.swap(left, right);
+        self.created_at.swap(left, right);
+        self.updated_at.swap(left, right);
+        self.global.swap(left, right);
+        self.change_id.swap(left, right);
+        self.commit_id.swap(left, right);
+        self.author_ids.swap(left, right);
+        self.untracked.swap(left, right);
+        self.durable_predecessor.swap(left, right);
+        if let Some(coordinates) = &mut self.columnar_base_coordinate {
+            coordinates.swap(left, right);
+        }
+    }
+
+    pub(crate) fn retain_rows_in_place(
+        &mut self,
+        mut keep: impl FnMut(MaterializedHotStateRowRef<'_>) -> bool,
+    ) {
+        if self.singleton.is_some() {
+            if !keep(self.row(0)) {
+                *self = Self::default();
+            }
+            return;
+        }
+        let mut retained = 0;
+        for read in 0..self.len() {
+            if keep(self.row(read)) {
+                if retained != read {
+                    self.swap_rows(retained, read);
+                }
+                retained += 1;
+            }
+        }
+        if retained == 0 {
+            *self = Self::default();
+            return;
+        }
+        self.schema_keys.truncate(retained);
+        self.file_ids.truncate(retained);
+        self.branch_ids.truncate(retained);
+        self.row_pks.truncate(retained);
+        self.snapshot_content.truncate(retained);
+        self.decoded_snapshots.truncate(retained);
+        self.raw_snapshots.truncate(retained);
+        self.metadata.truncate(retained);
+        self.deleted.truncate(retained);
+        self.created_at.truncate(retained);
+        self.updated_at.truncate(retained);
+        self.global.truncate(retained);
+        self.change_id.truncate(retained);
+        self.commit_id.truncate(retained);
+        self.author_ids.truncate(retained);
+        self.untracked.truncate(retained);
+        self.durable_predecessor.truncate(retained);
+        if let Some(coordinates) = &mut self.columnar_base_coordinate {
+            coordinates.truncate(retained);
+        }
     }
 
     pub(crate) fn row(&self, index: usize) -> MaterializedHotStateRowRef<'_> {
@@ -1842,7 +2055,9 @@ mod batch_tests {
         assert_eq!(batch.dictionary_entry_count(), 4);
         assert_eq!(
             batch.dictionary_bytes_len(),
-            "shared_schema".len() + "shared_file".len() + "shared_branch".len()
+            "shared_schema".len()
+                + "shared_file".len()
+                + "shared_branch".len()
                 + crate::ANONYMOUS_ACCOUNT_ID.len()
         );
         let first = batch.row(0);
@@ -2006,7 +2221,9 @@ mod batch_tests {
         );
         assert_eq!(
             batch.dictionary_bytes_len(),
-            "shared_schema".len() + expected_file_bytes + "shared_branch".len()
+            "shared_schema".len()
+                + expected_file_bytes
+                + "shared_branch".len()
                 + crate::ANONYMOUS_ACCOUNT_ID.len()
         );
         assert_eq!(batch.dictionary_arena_buffer_count(), 1);
@@ -2273,6 +2490,60 @@ mod batch_tests {
                 .expect("single key"),
             "second"
         );
+    }
+
+    #[test]
+    fn batch_append_and_permutation_keep_rows_and_dictionary_ordinals_aligned() {
+        let mut local_first = row(RowPk::single("b"));
+        local_first.schema_key = "range_schema".to_owned();
+        local_first.file_id = Some("local-file".to_owned());
+        local_first.branch_id = Arc::from("local-branch");
+        let mut local_second = row(RowPk::single("d"));
+        local_second.schema_key = "range_schema".to_owned();
+        local_second.file_id = Some("local-file".to_owned());
+        local_second.branch_id = Arc::from("local-branch");
+        let mut local = MaterializedHotStateBatch::from_rows(vec![local_first, local_second]);
+
+        let mut global_first = row(RowPk::single("a"));
+        global_first.schema_key = "range_schema".to_owned();
+        global_first.file_id = Some("global-file".to_owned());
+        global_first.global = true;
+        global_first.branch_id = Arc::from("global-branch");
+        global_first.author_id = "global-author".to_owned();
+        let mut global_second = row(RowPk::single("c"));
+        global_second.schema_key = "range_schema".to_owned();
+        global_second.file_id = Some("global-file".to_owned());
+        global_second.global = true;
+        global_second.branch_id = Arc::from("global-branch");
+        global_second.author_id = "global-author".to_owned();
+        let global_source = MaterializedHotStateBatch::from_rows(vec![global_first, global_second]);
+        let mut additions = MaterializedHotStateBatchBuilder::with_capacity(2);
+        for row in global_source.iter() {
+            additions.push_ref(row, Some("local-branch"));
+        }
+        local.append_batch(additions.finish());
+
+        // The combined input is [b, d, a, c]; this bounded permutation is
+        // the ordered merge [a, b, c, d].
+        local.permute_rows(&[2, 0, 3, 1]);
+        let keys = local
+            .iter()
+            .map(|row| {
+                row.row_pk()
+                    .as_single_string()
+                    .expect("string PK")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["a", "b", "c", "d"]);
+        assert_eq!(local.row(0).file_id(), Some("global-file"));
+        assert_eq!(local.row(0).branch_id(), "local-branch");
+        assert_eq!(local.row(0).author_id(), "global-author");
+        assert_eq!(local.row(1).file_id(), Some("local-file"));
+        assert_eq!(local.row(1).branch_id(), "local-branch");
+        assert_eq!(local.row(2).file_id(), Some("global-file"));
+        assert_eq!(local.row(2).branch_id(), "local-branch");
+        assert_eq!(local.row(2).author_id(), "global-author");
     }
 }
 

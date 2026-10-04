@@ -1,7 +1,7 @@
 //! Arena-first string interner for the materialized batch owners.
 //!
 //! Both state planes dictionary-encode the identity columns of a materialized
-//! batch — schema keys, file ids, branch ids — into one contiguous UTF-8 arena
+//! batch — schema keys, file ids, branch ids — into UTF-8 arenas
 //! addressed by `u32` ordinals. Small dictionaries use a linear range scan;
 //! larger ones promote to a hash table whose buckets hold compact arena
 //! ordinals, with same-hash entries chained through a flat ordinal column.
@@ -53,13 +53,17 @@ const LARGE_DICTIONARY_ALLOCATION_BYTES: usize = 32 * 1024;
 
 /// Immutable dictionary storage shared by every identity column in one batch.
 ///
-/// Distinct values occupy one contiguous UTF-8 arena, so repeated batch-wide
+/// Distinct values occupy immutable UTF-8 arena slices, so repeated batch-wide
 /// metadata costs a four-byte ordinal per row instead of another owned
-/// allocation.
+/// allocation. Most dictionaries have one arena; appending batches can retain
+/// additional arenas without recopying their values.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StringDictionary {
-    bytes: Bytes,
+    arenas: Vec<Bytes>,
     ranges: Vec<Range<u32>>,
+    /// Allocated only after dictionaries from separate batches are joined.
+    /// Most dictionaries keep one arena and therefore no per-entry arena ID.
+    arena_ordinals: Option<Vec<u32>>,
     #[cfg(test)]
     arena_allocation_count: usize,
     #[cfg(test)]
@@ -73,20 +77,76 @@ impl StringDictionary {
             .ranges
             .get(ordinal as usize)
             .expect("string ordinal belongs to this dictionary");
+        let arena = self
+            .arena_ordinals
+            .as_ref()
+            .map_or(0, |arenas| arenas[ordinal as usize]);
         let range = range.start as usize..range.end as usize;
         // SAFETY: the builder appends complete `str` values and records their
         // exact boundaries. `Bytes` preserves that immutable allocation.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[range]) }
+        unsafe { std::str::from_utf8_unchecked(&self.arenas[arena as usize][range]) }
     }
 
     /// Shares the value at `ordinal` without copying it out of the arena.
     pub(crate) fn shared(&self, ordinal: u32) -> SharedStr {
-        let value = self.get(ordinal);
-        SharedStr::from_utf8_slice(self.bytes.clone(), value)
+        let range = self
+            .ranges
+            .get(ordinal as usize)
+            .expect("string ordinal belongs to this dictionary");
+        let arena = self
+            .arena_ordinals
+            .as_ref()
+            .map_or(0, |arenas| arenas[ordinal as usize]);
+        let bytes = self.arenas[arena as usize].clone();
+        let range = range.start as usize..range.end as usize;
+        let value = unsafe { std::str::from_utf8_unchecked(&bytes[range.clone()]) };
+        SharedStr::from_utf8_slice(bytes.clone(), value)
             .expect("dictionary value points into its own byte arena")
     }
 
-    /// Number of distinct interned values.
+    /// Appends another immutable dictionary without copying either arena.
+    /// Existing ordinals stay fixed; the returned offset must be added to
+    /// ordinals stored in rows from `other`.
+    pub(crate) fn append(&mut self, mut other: Self) -> u32 {
+        let ordinal_offset =
+            u32::try_from(self.ranges.len()).expect("string dictionary exceeds u32 ordinals");
+        let arena_offset =
+            u32::try_from(self.arenas.len()).expect("string dictionary has too many arenas");
+        let combined_ranges = self.ranges.len().saturating_add(other.ranges.len());
+        let has_multiple_arenas = self.arena_ordinals.is_some()
+            || other.arena_ordinals.is_some()
+            || (self.ranges.len() != 0 && other.ranges.len() != 0);
+        if has_multiple_arenas {
+            let mut ordinals = self
+                .arena_ordinals
+                .take()
+                .unwrap_or_else(|| vec![0; self.ranges.len()]);
+            ordinals.reserve_exact(other.ranges.len());
+            match other.arena_ordinals.take() {
+                Some(other_ordinals) => {
+                    ordinals.extend(other_ordinals.into_iter().map(|ordinal| {
+                        ordinal
+                            .checked_add(arena_offset)
+                            .expect("string dictionary arena ordinal exceeds u32")
+                    }))
+                }
+            None => ordinals.extend(std::iter::repeat(arena_offset).take(other.ranges.len())),
+            }
+            debug_assert_eq!(ordinals.len(), combined_ranges);
+            self.arena_ordinals = Some(ordinals);
+        }
+        self.arenas.append(&mut other.arenas);
+        self.ranges.reserve_exact(other.ranges.len());
+        self.ranges.append(&mut other.ranges);
+        #[cfg(test)]
+        {
+            self.arena_allocation_count += other.arena_allocation_count;
+            self.arena_large_allocation_count += other.arena_large_allocation_count;
+        }
+        ordinal_offset
+    }
+
+    /// Number of dictionary entries.
     pub(crate) fn len(&self) -> usize {
         self.ranges.len()
     }
@@ -94,13 +154,13 @@ impl StringDictionary {
     /// Size of the UTF-8 arena in bytes.
     #[cfg(test)]
     pub(crate) fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.arenas.iter().map(Bytes::len).sum()
     }
 
     /// Whether the arena holds any bytes at all.
     #[cfg(test)]
     pub(crate) fn is_arena_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.arenas.iter().all(Bytes::is_empty)
     }
 
     /// Reserved, not occupied, range slots — the allocation the range column
@@ -339,9 +399,11 @@ impl StringDictionaryBuilder {
                 .iter()
                 .all(|range| range.start <= range.end && range.end as usize <= self.bytes.len())
         );
+        let bytes = Bytes::from(self.bytes);
         StringDictionary {
-            bytes: Bytes::from(self.bytes),
+            arenas: vec![bytes],
             ranges: self.ranges,
+            arena_ordinals: None,
             #[cfg(test)]
             arena_allocation_count: self.arena_allocation_count,
             #[cfg(test)]

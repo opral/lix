@@ -3895,6 +3895,25 @@ impl PreparedStateRowOverlay {
 }
 
 impl crate::hot_state::StagedHotStateRows for PreparedStateRowOverlay {
+    fn row_overlay_is_empty(&self) -> Result<bool, LixError> {
+        if self.staged_writes.has_staged_state_rows()? {
+            return Ok(false);
+        }
+        let ordered = self
+            .staged_writes
+            .ordered_mutations
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire immutable transaction mutation journal",
+                )
+            })?;
+        Ok(!ordered
+            .as_ref()
+            .is_some_and(|journal| journal.row_count() != 0))
+    }
+
     fn staged_batch(
         &self,
         request: &HotStateScanRequest,
@@ -5217,6 +5236,10 @@ mod tests {
             .staging_overlay()
             .expect("ordinary overlay should build");
         assert!(
+            !StagedHotStateRows::row_overlay_is_empty(&ordinary_overlay)
+                .expect("ordered mutation journal should prevent empty-overlay proof")
+        );
+        assert!(
             !StagedHotStateRows::collection_replaced(
                 &ordinary_overlay,
                 branch_id,
@@ -5246,6 +5269,10 @@ mod tests {
         let marker_overlay = marker_writes
             .staging_overlay()
             .expect("marker overlay should build");
+        assert!(
+            !StagedHotStateRows::row_overlay_is_empty(&marker_overlay)
+                .expect("collection marker should prevent empty-overlay proof")
+        );
         assert!(
             StagedHotStateRows::collection_replaced(
                 &marker_overlay,
@@ -5400,6 +5427,10 @@ mod tests {
             .staging_overlay()
             .expect("empty overlay should build");
         assert!(
+            StagedHotStateRows::row_overlay_is_empty(&overlay)
+                .expect("empty overlay proof should succeed")
+        );
+        assert!(
             overlay
                 .scan_parts(&scan_request_for_key("schema-probe", false))
                 .expect("empty overlay scan should succeed")
@@ -5420,6 +5451,10 @@ mod tests {
                 ],
             })
             .expect("first tracked batch should still use the journal");
+        assert!(
+            !StagedHotStateRows::row_overlay_is_empty(&overlay)
+                .expect("staged journal should prevent empty-overlay proof")
+        );
         assert!(!staged_writes.uses_identity_index_for_tests());
     }
 

@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::Statistics;
+use futures_util::stream::BoxStream;
 
 use crate::LixError;
 use crate::hot_state::{
@@ -46,6 +47,31 @@ pub(crate) struct RowColumnarScanLayout {
 /// stronger tie order must retain the general SQL path.
 #[async_trait]
 pub(crate) trait RowSnapshotReader: Send + Sync {
+    /// Returns the exact current row count for a narrowly supported,
+    /// unfiltered scan without materializing every row identity. `None` keeps
+    /// callers on the ordinary scan path when the reader cannot prove the
+    /// complete visible scope from committed controls.
+    async fn exact_count(
+        &self,
+        _request: HotStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        Ok(None)
+    }
+
+    /// Returns at most `candidate_limit` primary keys from a durable
+    /// current-base page or a bounded authenticated packed-leaf prefix. This
+    /// is a candidate source for unordered LIMIT only; providers re-read every
+    /// candidate through the current hot-state visibility path before exposing
+    /// it. `None` means no bounded candidate proof applies and the ordinary
+    /// scan must run.
+    async fn scan_row_limit_candidates(
+        &self,
+        _request: HotStateScanRequest,
+        _candidate_limit: usize,
+    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        Ok(None)
+    }
+
     /// Returns primary keys from the same committed direct-scan proof as raw
     /// snapshots. Providers use this only when every projected SQL field is
     /// an exact primary-key component, avoiding a redundant JSON decode while
@@ -65,6 +91,23 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         &self,
         _request: HotStateScanRequest,
     ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
+        Ok(None)
+    }
+
+    /// Returns bounded raw-snapshot pages for a committed full scan. Readers
+    /// return `None` when the current generation cannot be proven as a stream
+    /// of disjoint immutable bases plus a bounded exact HOT overlay. Unlike
+    /// `scan_row_snapshots`, page batches do not promise a global primary-key
+    /// order; SQL providers using this capability must advertise no ordering.
+    async fn scan_row_snapshot_pages(
+        &self,
+        _request: HotStateScanRequest,
+    ) -> Result<
+        Option<
+            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
+        >,
+        LixError,
+    > {
         Ok(None)
     }
 
@@ -180,6 +223,27 @@ impl<S> RowSnapshotReader for CurrentRowSnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    async fn exact_count(
+        &self,
+        request: HotStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        self.hot_state
+            .reader(self.store.clone())
+            .exact_count_with_bounded_global_overlay(&request)
+            .await
+    }
+
+    async fn scan_row_limit_candidates(
+        &self,
+        request: HotStateScanRequest,
+        candidate_limit: usize,
+    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        self.hot_state
+            .reader(self.store.clone())
+            .scan_direct_row_limit_candidates(&request, candidate_limit)
+            .await
+    }
+
     async fn scan_row_primary_keys(
         &self,
         request: HotStateScanRequest,
@@ -203,6 +267,24 @@ where
         self.hot_state
             .reader(self.store.clone())
             .scan_direct_row_snapshots(&request)
+            .await
+    }
+
+    async fn scan_row_snapshot_pages(
+        &self,
+        request: HotStateScanRequest,
+    ) -> Result<
+        Option<
+            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
+        >,
+        LixError,
+    > {
+        if !direct_row_snapshot_request(&request) {
+            return Ok(None);
+        }
+        self.hot_state
+            .reader(self.store.clone())
+            .scan_direct_row_snapshot_pages(&request)
             .await
     }
 
@@ -439,6 +521,7 @@ fn direct_row_snapshot_request(request: &HotStateScanRequest) -> bool {
     matches!(request.filter.rows, HotStateRowFilter::All)
         && !request.filter.include_tombstones
         && request.filter.untracked.is_none()
+        && request.filter.global.is_none()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
 }
@@ -491,6 +574,14 @@ mod tests {
     fn exact_primary_key_and_limit_bypass_columnar_scan() {
         let mut request = HotStateScanRequest::default();
         assert!(direct_row_columnar_request(&request));
+        assert!(direct_row_snapshot_request(&request));
+
+        for global in [Some(false), Some(true)] {
+            request.filter.global = global;
+            assert!(!direct_row_columnar_request(&request));
+            assert!(!direct_row_snapshot_request(&request));
+        }
+        request.filter.global = None;
 
         request.filter.row_pks.push(RowPk::single("point-read"));
         assert!(!direct_row_columnar_request(&request));

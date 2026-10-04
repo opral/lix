@@ -15,6 +15,10 @@ pub(crate) use crate::row_state::{
 #[cfg(test)]
 pub(crate) use hot::hot_decode_row_pk_probe;
 #[cfg(test)]
+pub(crate) use hot::stage_hot_collection_live_count_for_test;
+#[cfg(test)]
+pub(crate) use hot::stage_hot_collection_control_for_test;
+#[cfg(test)]
 pub(crate) use hot::root_exact_profile;
 #[cfg(test)]
 pub(crate) use hot::{hot_index_key_is_witness, hot_index_key_is_entry};
@@ -78,6 +82,15 @@ use crate::tracked_state::{
     TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStateFilter,
     TrackedStateKey, TrackedStateKeyRef, TrackedStateScanRequest,
 };
+
+/// Small result of a bounded HOT scan that retains row identities only.
+#[derive(Default)]
+pub(crate) struct BoundedLiveIdentityScan {
+    pub(crate) identities: Vec<(RowPk, Option<String>)>,
+    pub(crate) physical_entries: usize,
+    pub(crate) physical_bytes: usize,
+    pub(crate) identity_bytes: usize,
+}
 
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "hot_state.diff_marker.v16";
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::declare(
