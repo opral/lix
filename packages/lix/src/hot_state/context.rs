@@ -2780,10 +2780,15 @@ where
                             .then_some(control.head_commit_id),
                         )
                         .await?;
+                    // Tracked roots are physically ordered by file before row
+                    // identity, while visibility merges require row identity
+                    // before file. Prove the materialized order here with a
+                    // borrowed O(N) scan and no row-sized scratch allocation.
+                    let ordered_unique = materialized_batch_is_strictly_ordered_unique(&rows);
                     Ok::<_, LixError>(HotBranchRows {
                         branch_id: branch_id.clone(),
                         rows,
-                        ordered_unique: true,
+                        ordered_unique,
                     })
                 }
             })
@@ -3013,8 +3018,8 @@ fn borrowed_scan_scope_is_send_for_storage_session_open() {
 
 /// Rows read from one durable hot-state branch source.
 ///
-/// A matching hot-state projection is storage-key ordered by visible identity
-/// and has one row per identity.
+/// Ordered fast paths require strict visible-identity ordering (which also
+/// proves uniqueness) in the actual materialized rows.
 struct HotBranchRows {
     branch_id: String,
     rows: MaterializedHotStateBatch,
@@ -3187,6 +3192,12 @@ fn compare_visible_identity(
         .cmp(right.schema_key())
         .then_with(|| left.row_pk().cmp(right.row_pk()))
         .then_with(|| left.file_id().cmp(&right.file_id()))
+}
+
+fn materialized_batch_is_strictly_ordered_unique(rows: &MaterializedHotStateBatch) -> bool {
+    rows.iter()
+        .zip(rows.iter().skip(1))
+        .all(|(left, right)| compare_visible_identity(left, right).is_lt())
 }
 
 fn batch_contains_visible_identity(
@@ -3789,6 +3800,55 @@ mod tests {
             .await
             .expect("commit direct hot state");
         generation
+    }
+
+    async fn stage_root_tracked_head_rows(
+        storage: &StorageAdapter,
+        branch_id: &str,
+        head: CommitId,
+        rows: &[MaterializedTrackedStateRow],
+    ) {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open tracked-root write read");
+        let mut writes = StorageWriteSet::new();
+        crate::init::stage_repository_protocol(&mut writes);
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &TrackedStateContext::new(),
+            &head.to_string(),
+            None,
+            rows,
+        )
+        .await
+        .expect("stage authenticated tracked root");
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_root_current_base(branch_id, head, head);
+        crate::branch::stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id: head,
+                tracked_generation: head,
+                current_state_revision: 0,
+                schema_presence_bloom: [u64::MAX; 4],
+                working_diff_checkpoint_commit_id: None,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                ref_change_id: ChangeId::for_test_label(&format!("{branch_id}-root-ref")),
+                author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
+                    .expect("anonymous account ID is canonical"),
+            },
+        )
+        .expect("stage tracked-root branch control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish tracked-root branch");
     }
 
     fn finite_pk_scan_request(
@@ -4925,6 +4985,31 @@ mod tests {
         }
     }
 
+    fn mixed_file_root_row(
+        schema_key: &str,
+        row_pk: RowPk,
+        file_id: Option<&str>,
+        snapshot: Option<&str>,
+        deleted: bool,
+        change_label: &str,
+        commit_id: CommitId,
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
+            row_pk,
+            schema_key: schema_key.to_owned(),
+            file_id: file_id.map(str::to_owned),
+            snapshot_content: snapshot.map(Into::into),
+            decoded_snapshot: None,
+            metadata: None,
+            deleted,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            change_id: ChangeId::for_test_label(change_label),
+            commit_id,
+        }
+    }
+
     #[test]
     fn dominant_local_merge_matches_visibility_for_global_collisions_files_and_tombstones() {
         let branch_id = "dominant-merge-branch";
@@ -4959,7 +5044,7 @@ mod tests {
 
         for include_tombstones in [false, true] {
             let request = HotStateScanRequest {
-                filter: super::super::HotStateFilter {
+                filter: HotStateFilter {
                     include_tombstones,
                     ..Default::default()
                 },
@@ -5036,6 +5121,256 @@ mod tests {
                 "the local tombstone shadows a live global row of the same identity"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_file_memory_scan_proves_order_before_dominant_visibility_merge() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hot_state = hot_state_context();
+        let branch_id = "mixed-file-order-branch";
+        let schema_key = "mixed_file_order_rows";
+
+        // The tracked tree orders file scope before row PK. These 400 `z`
+        // rows in the first file therefore precede 200 `a` rows in the second
+        // file, although visibility identity order puts every `a` before every
+        // `z`. The tombstone is deliberately inside the second file's range,
+        // where binary search over the physical order can miss it.
+        let local_pks = (0..400)
+            .map(|index| RowPk::single(format!("z-row-{index:04}")))
+            .chain((0..200).map(|index| RowPk::single(format!("a-row-{index:04}"))))
+            .collect::<Vec<_>>();
+        let local_head = CommitId::for_test_label("mixed-file-local-root");
+        let local_rows = local_pks
+            .iter()
+            .enumerate()
+            .map(|(index, row_pk)| {
+                let deleted = index == 450;
+                mixed_file_root_row(
+                    schema_key,
+                    row_pk.clone(),
+                    Some(if index < 400 { "a-file" } else { "b-file" }),
+                    (!deleted).then_some(r#"{"value":"local"}"#),
+                    deleted,
+                    &format!("mixed-file-local-change-{index}"),
+                    local_head,
+                )
+            })
+            .collect::<Vec<_>>();
+        stage_root_tracked_head_rows(&storage, branch_id, local_head, &local_rows).await;
+
+        let global_head = CommitId::for_test_label("mixed-file-global-root");
+        let shadowed_pk = RowPk::single("a-row-0050");
+        let file_scoped_pk = RowPk::single("a-row-0050");
+        let live_collision_pk = RowPk::single("a-row-0051");
+        let global_only_pk = RowPk::single("a-global-only");
+        let global_rows = vec![
+            mixed_file_root_row(
+                schema_key,
+                shadowed_pk.clone(),
+                Some("b-file"),
+                Some(r#"{"value":"must-be-hidden"}"#),
+                false,
+                "mixed-file-global-shadowed-change",
+                global_head,
+            ),
+            mixed_file_root_row(
+                schema_key,
+                file_scoped_pk.clone(),
+                Some("c-file"),
+                Some(r#"{"value":"different-file"}"#),
+                false,
+                "mixed-file-global-other-file-change",
+                global_head,
+            ),
+            mixed_file_root_row(
+                schema_key,
+                live_collision_pk.clone(),
+                Some("b-file"),
+                Some(r#"{"value":"must-lose-to-local"}"#),
+                false,
+                "mixed-file-global-live-collision-change",
+                global_head,
+            ),
+            mixed_file_root_row(
+                schema_key,
+                global_only_pk.clone(),
+                Some("b-file"),
+                Some(r#"{"value":"global-only"}"#),
+                false,
+                "mixed-file-global-only-change",
+                global_head,
+            ),
+        ];
+        stage_root_tracked_head_rows(&storage, GLOBAL_BRANCH_ID, global_head, &global_rows).await;
+
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                ..HotStateFilter::default()
+            },
+            ..HotStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open mixed-file ordering read");
+        let tracked_head_reader = TrackedHeadContext::new().reader(&read);
+        assert_eq!(
+            tracked_head_reader
+                .root_current_base_commit(branch_id, local_head)
+                .await
+                .expect("read local root-current-base selector"),
+            Some(local_head),
+            "fixture must exercise the local ROOT_CURRENT_BASE reader"
+        );
+        assert_eq!(
+            tracked_head_reader
+                .root_current_base_commit(GLOBAL_BRANCH_ID, global_head)
+                .await
+                .expect("read global root-current-base selector"),
+            Some(global_head),
+            "global fallback must also come from ROOT_CURRENT_BASE"
+        );
+        let scope = scan_scope(&read, &request, true, None)
+            .await
+            .expect("resolve mixed-file branch scope");
+        let reader = hot_state.reader(&read);
+        let mut source_runs = reader
+            .scan_hot_branch_rows(&request, &scope)
+            .await
+            .expect("read mixed-file materialized source runs");
+        let local_run = source_runs
+            .iter()
+            .find(|run| run.branch_id == branch_id)
+            .expect("local source run exists");
+        assert_eq!(local_run.rows.len(), 600);
+        assert!(
+            !materialized_batch_is_strictly_ordered_unique(&local_run.rows),
+            "the producer must not claim row-PK order for file-first storage order"
+        );
+        assert!(!local_run.ordered_unique);
+        assert!(
+            try_merge_dominant_branch_with_global(
+                &mut source_runs,
+                &scope.projection_branch_ids,
+                &request,
+            )
+            .is_none(),
+            "the >=512-row dominant path must decline an unproven source order"
+        );
+
+        let visible = reader
+            .scan_batch(&request)
+            .await
+            .expect("general visibility fallback resolves mixed-file rows")
+            .into_rows();
+        assert_eq!(visible.len(), 601);
+        assert!(
+            !visible.iter().any(|row| {
+                row.row_pk == shadowed_pk && row.file_id.as_deref() == Some("b-file")
+            }),
+            "the local tombstone must hide the same global identity"
+        );
+        assert!(
+            visible.iter().any(|row| {
+                row.row_pk == file_scoped_pk
+                    && row.file_id.as_deref() == Some("c-file")
+                    && row.global
+            }),
+            "a global row with the same PK in another file remains visible"
+        );
+        let live_collision = visible
+            .iter()
+            .filter(|row| {
+                row.row_pk == live_collision_pk && row.file_id.as_deref() == Some("b-file")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live_collision.len(), 1);
+        assert!(!live_collision[0].global);
+        assert_eq!(
+            live_collision[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"local"}"#),
+            "a local live row must win over its same-file global collision"
+        );
+        assert!(visible.iter().any(|row| {
+            row.row_pk == global_only_pk && row.file_id.as_deref() == Some("b-file") && row.global
+        }));
+
+        let mut including_tombstones = request;
+        including_tombstones.filter.include_tombstones = true;
+        let visible_with_tombstones = reader
+            .scan_batch(&including_tombstones)
+            .await
+            .expect("tombstone-inclusive visibility fallback resolves mixed-file rows")
+            .into_rows();
+        assert_eq!(visible_with_tombstones.len(), 602);
+        assert!(
+            visible_with_tombstones.iter().any(|row| {
+                row.row_pk == shadowed_pk
+                    && row.file_id.as_deref() == Some("b-file")
+                    && row.deleted
+                    && !row.global
+            }),
+            "including tombstones retains the local shadowing row"
+        );
+        assert!(!visible_with_tombstones.iter().any(|row| {
+            row.row_pk == shadowed_pk && row.file_id.as_deref() == Some("b-file") && row.global
+        }));
+
+        let mut tracked_request = including_tombstones.clone();
+        tracked_request.filter.include_tombstones = false;
+        let tracked_visible = reader
+            .scan_tracked_batch(&tracked_request)
+            .await
+            .expect("tracked-domain fallback resolves mixed-file rows")
+            .into_rows();
+        assert_eq!(tracked_visible.len(), 601);
+        assert!(
+            !tracked_visible.iter().any(|row| {
+                row.row_pk == shadowed_pk && row.file_id.as_deref() == Some("b-file")
+            })
+        );
+        let tracked_live_collision = tracked_visible
+            .iter()
+            .filter(|row| {
+                row.row_pk == live_collision_pk && row.file_id.as_deref() == Some("b-file")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tracked_live_collision.len(), 1);
+        assert!(!tracked_live_collision[0].global);
+        assert_eq!(
+            tracked_live_collision[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"local"}"#)
+        );
+        assert!(tracked_visible.iter().any(|row| {
+            row.row_pk == file_scoped_pk
+                && row.file_id.as_deref() == Some("c-file")
+                && row.global
+                && row.snapshot_content.as_deref() == Some(r#"{"value":"different-file"}"#)
+        }));
+        assert!(tracked_visible.iter().any(|row| {
+            row.row_pk == global_only_pk
+                && row.file_id.as_deref() == Some("b-file")
+                && row.global
+                && row.snapshot_content.as_deref() == Some(r#"{"value":"global-only"}"#)
+        }));
+
+        let tracked_with_tombstones = reader
+            .scan_tracked_batch(&including_tombstones)
+            .await
+            .expect("tombstone-inclusive tracked fallback resolves mixed-file rows")
+            .into_rows();
+        assert_eq!(tracked_with_tombstones.len(), 602);
+        assert!(tracked_with_tombstones.iter().any(|row| {
+            row.row_pk == shadowed_pk
+                && row.file_id.as_deref() == Some("b-file")
+                && row.deleted
+                && !row.global
+        }));
+        assert!(!tracked_with_tombstones.iter().any(|row| {
+            row.row_pk == shadowed_pk && row.file_id.as_deref() == Some("b-file") && row.global
+        }));
     }
 
     #[test]

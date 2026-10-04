@@ -6329,18 +6329,18 @@ where
                 let candidates = tracked
                     .scan_batch_at_commit_page(
                         &base_commit,
-                        &crate::tracked_state::TrackedStateScanRequest {
-                            filter: crate::tracked_state::TrackedStateFilter {
+                        &TrackedStateScanRequest {
+                            filter: TrackedStateFilter {
                                 schema_keys: vec![schema_key.to_owned()],
                                 file_ids: vec![NullableKeyFilter::Null],
                                 // Candidate budget counts physical tombstones
                                 // too; skip them only after the bounded page.
                                 include_tombstones: true,
-                                ..crate::tracked_state::TrackedStateFilter::default()
+                                ..TrackedStateFilter::default()
                             },
                             // Candidate roots need only identity and winner
                             // metadata; payload fields remain unread.
-                            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                            read_columns: TrackedStateReadColumns {
                                 columns: vec!["change_id".to_owned()],
                             },
                             limit: Some(candidate_limit),
@@ -16680,6 +16680,271 @@ mod tests {
                 .expect("filed identity outside range should preserve fallback")
                 .is_none(),
             "a filed HOT identity outside the requested PK interval must still decline the unfiled fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn packed_snapshot_stream_drop_does_not_read_the_next_part_window() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000d2";
+        const SCHEMA_KEY: &str = "lix_key_value";
+        const BRANCH_LABEL: &str = "packed-stream-cancel-branch";
+        const BASE_LABEL: &str = "packed-stream-cancel-base";
+        const ROW_COUNT: usize = 8 * 512 + 1;
+
+        fn jsonb_payload(row_pk: &RowPk) -> Vec<u8> {
+            WasmTypedRow::from_builtin_json(
+                SCHEMA_KEY,
+                row_pk,
+                &serde_json::json!({
+                    "key": row_pk
+                        .as_single_string_owned()
+                        .expect("JSONB fixture identity should be a string"),
+                    "value": "base",
+                }),
+            )
+            .expect("JSONB fixture row should type")
+            .durable_payload()
+            .expect("JSONB fixture payload should encode")
+            .to_vec()
+        }
+
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label(BRANCH_LABEL);
+        let base_commit = CommitId::for_test_label(BASE_LABEL);
+        let now = timestamp();
+        let base_rows = (0..ROW_COUNT)
+            .map(|index| {
+                let key = format!("row{index:04}");
+                MaterializedTrackedStateRow {
+                    row_pk: RowPk::single(&key),
+                    schema_key: SCHEMA_KEY.to_owned(),
+                    file_id: None,
+                    snapshot_content: Some(
+                        serde_json::json!({"key": key, "value": "base"})
+                            .to_string()
+                            .into(),
+                    ),
+                    decoded_snapshot: None,
+                    metadata: None,
+                    deleted: false,
+                    created_at: now.to_string(),
+                    updated_at: now.to_string(),
+                    author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                    change_id: ChangeId::for_test_label(&format!("cancel-base-{index}")),
+                    commit_id: generation,
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            BRANCH_ID,
+            BRANCH_LABEL,
+            &base_rows,
+        )
+        .await;
+
+        let payloads = base_rows
+            .iter()
+            .map(|row| jsonb_payload(&row.row_pk))
+            .collect::<Vec<_>>();
+        let authored_commit_deltas = base_rows
+            .iter()
+            .zip(&payloads)
+            .map(
+                |(row, snapshot)| crate::tracked_state::TrackedStateCommitDeltaRef {
+                    delta: crate::tracked_state::TrackedStateDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        row_pk: &row.row_pk,
+                        change_id: ChangeId::for_test_label(&format!(
+                            "cancel-base-{}",
+                            row.row_pk
+                                .as_single_string()
+                                .expect("JSONB base row identity should be a string"),
+                        )),
+                        commit_id: base_commit,
+                        author_id: &row.author_id,
+                        deleted: false,
+                        created_at: now,
+                        updated_at: now,
+                        semantic_fingerprint: None,
+                    },
+                    metadata: None,
+                    snapshot: Some(snapshot.as_slice()),
+                    origin_key: None,
+                    base_coordinate: None,
+                    authored: true,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut ordered_writes = StorageWriteSet::new();
+        let ordered = crate::tracked_state::stage_ordered_addressable_commit_deltas(
+            &mut ordered_writes,
+            authored_commit_deltas
+                .iter()
+                .copied()
+                .map(Ok::<_, LixError>),
+            true,
+            true,
+        )
+        .expect("ordered native staging should succeed")
+        .expect("ordered native rows should be directly addressable");
+        let base_manifest = crate::tracked_state::CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
+            commit_id: base_commit,
+            change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            replay_debt: crate::tracked_state::CommitStateReplayDebt {
+                depth: 1,
+                rows: ROW_COUNT as u64,
+                bytes: 0,
+            },
+            mutations: ordered.mutation_inventory().clone(),
+            touched_scope_filter: Default::default(),
+            global_scope: false,
+            current_state_scoped_ranges: None,
+            row_pk_index_root_id: None,
+            snapshot_root: None,
+        };
+        crate::tracked_state::stage_commit_state_manifest(&mut ordered_writes, &base_manifest)
+            .expect("ordered native mutation authority should stage");
+        storage
+            .commit_write_set(ordered_writes, StorageWriteOptions::default())
+            .await
+            .expect("ordered native base mutation authority should commit");
+
+        let manifest_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("packed stream manifest read should open");
+        let published_manifest =
+            crate::tracked_state::load_commit_state_manifest(&manifest_read, base_commit)
+                .await
+                .expect("packed stream manifest should load")
+                .expect("packed stream manifest should exist");
+        assert!(
+            published_manifest.mutations.parts.len()
+                > crate::tracked_state::COMMIT_DELTA_PART_READ_BATCH_MAX,
+            "the fixture must span more than one physical read window"
+        );
+        drop(manifest_read);
+
+        crate::test_support::seed_branch_head(
+            storage.clone(),
+            crate::GLOBAL_BRANCH_ID,
+            "packed-stream-cancel-global",
+        )
+        .await;
+        let mut writes = StorageWriteSet::new();
+        for row in &base_rows {
+            writes.delete(
+                ROW_SPACE,
+                StorageKey(Bytes::from(encode_hot_row_key_for_test(
+                    BRANCH_ID,
+                    generation,
+                    SCHEMA_KEY,
+                    &row.row_pk,
+                    None,
+                ))),
+            );
+        }
+        let mut packed_key = hot_scope_prefix(BRANCH_ID, generation);
+        packed_key.extend_from_slice(base_commit.as_uuid().as_bytes());
+        writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH_ID, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(packed_key)),
+            StorageValue {
+                bytes: Bytes::from_static(&[0; 16]),
+            },
+        );
+        writes.delete(
+            ROOT_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH_ID, generation))),
+        );
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: ROW_COUNT as u64,
+                ordered_identity_digest: None,
+            },
+        )
+        .expect("packed stream collection control should encode");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("packed stream current base should publish");
+
+        let hot_state = crate::hot_state::HotStateContext::new(
+            crate::tracked_state::TrackedStateContext::new(),
+            crate::commit_graph::CommitGraphContext::new(),
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("packed stream read should open");
+        let batch_sizes = Arc::new(StdMutex::new(Vec::new()));
+        let read = PackedSegmentBatchRead {
+            inner: read,
+            batch_sizes: Arc::clone(&batch_sizes),
+        };
+        let reader = hot_state.reader(Arc::new(read));
+        let request = crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec![SCHEMA_KEY.to_owned()],
+                branch_ids: vec![BRANCH_ID.to_owned()],
+                ..crate::hot_state::HotStateFilter::default()
+            },
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["raw_snapshot".to_owned()],
+            },
+            limit: None,
+        };
+        let mut pages = reader
+            .scan_direct_row_snapshot_pages_with_minimum_count(&request, 0)
+            .await
+            .expect("packed stream should plan")
+            .expect("multi-window packed base should stream");
+
+        // Admission has completed. Count only physical payload reads made as
+        // the consumer polls the lazy stream.
+        batch_sizes
+            .lock()
+            .expect("packed segment probe should lock")
+            .clear();
+        let first_page = pages
+            .try_next()
+            .await
+            .expect("first packed page should load")
+            .expect("packed stream should yield a first page");
+        let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) = first_page else {
+            panic!("packed stream should preserve raw durable payloads");
+        };
+        assert!(
+            !rows.is_empty(),
+            "the first polled page should contain rows"
+        );
+        drop(pages);
+
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("packed segment probe should lock")
+                .as_slice(),
+            &[crate::tracked_state::COMMIT_DELTA_PART_READ_BATCH_MAX],
+            "dropping after the first page must leave later packed parts unread"
         );
     }
 

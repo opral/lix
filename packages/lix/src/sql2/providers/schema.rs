@@ -5436,7 +5436,7 @@ mod tests {
     // short-circuit into a silent 0-row success.
     #[tokio::test]
     async fn insert_into_rejects_raw_datafusion_inserts_at_plan_time() {
-        let session = datafusion::prelude::SessionContext::new();
+        let session = SessionContext::new();
         let mut write_context = DummyWriteContext;
         let write_ctx = crate::sql2::SqlWriteContext::new(&mut write_context);
         let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active_with_write(
@@ -5569,7 +5569,7 @@ mod tests {
 
     #[tokio::test]
     async fn unordered_limit_projects_primary_keys_without_snapshot_payloads() {
-        let session = datafusion::prelude::SessionContext::new();
+        let session = SessionContext::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut row = live_row();
         row.row_pk = TestRowPk::single("candidate-0");
@@ -5608,7 +5608,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_limit_does_not_use_unordered_candidate_reader() {
-        let session = datafusion::prelude::SessionContext::new();
+        let session = SessionContext::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
             row_insert_spec_with_primary_key(),
@@ -5733,6 +5733,7 @@ mod tests {
                 .as_str(),
             r#"{"body":"staged winner"}"#
         );
+        {
         let requests = reader.requests.lock().expect("request lock");
         assert!(
             requests.len() > 2,
@@ -5764,7 +5765,7 @@ mod tests {
                 .iter()
                 .all(|request| { request.filter.file_ids == vec![crate::NullableKeyFilter::Null] })
         );
-        drop(requests);
+        }
 
         let insufficient = recheck_unordered_limit_candidates(
             &reader,
@@ -6012,7 +6013,8 @@ mod tests {
             .await
             .expect("plan the zero-column count scan");
         assert_eq!(
-            scan.partition_statistics(None)
+            datafusion::physical_plan::statistics::StatisticsContext::new()
+                .compute(scan.as_ref(), &datafusion::physical_plan::statistics::StatisticsArgs::new())
                 .expect("count scan statistics should be available")
                 .num_rows,
             Precision::Exact(7)
