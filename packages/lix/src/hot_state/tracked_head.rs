@@ -17,6 +17,8 @@ pub(crate) use hot::hot_decode_row_pk_probe;
 #[cfg(test)]
 pub(crate) use hot::stage_hot_collection_live_count_for_test;
 #[cfg(test)]
+pub(crate) use hot::stage_hot_collection_control_for_test;
+#[cfg(test)]
 pub(crate) use hot::root_exact_profile;
 #[cfg(test)]
 pub(crate) use hot::{hot_index_key_is_witness, hot_index_key_is_entry};

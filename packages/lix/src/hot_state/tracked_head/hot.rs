@@ -22,6 +22,7 @@ use std::sync::Mutex as StdMutex;
 
 use crate::storage_adapter::ValueSemantics;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use smallvec::SmallVec;
@@ -848,6 +849,7 @@ struct HotCollectionCacheKey {
 #[derive(Default)]
 pub(crate) struct HotStateTransactionCache {
     collection_controls: StdMutex<BTreeMap<HotCollectionCacheKey, HotCollectionControl>>,
+    collection_generation_unproven_fences: StdMutex<BTreeMap<HotCollectionCacheKey, bool>>,
     packed_point_generation_observations: StdMutex<SmallVec<[(CommitId, u8); 4]>>,
     packed_current_base_refs: StdMutex<BTreeMap<(String, CommitId), Vec<PackedCurrentBaseRef>>>,
     commit_delta_points: crate::tracked_state::CommitDeltaPointReadCache,
@@ -929,6 +931,33 @@ impl HotStateTransactionCache {
         }
         Ok(())
     }
+
+    fn collection_generation_unproven_fence(
+        &self,
+        key: &HotCollectionCacheKey,
+    ) -> Result<Option<bool>, LixError> {
+        Ok(self
+            .collection_generation_unproven_fences
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?
+            .get(key)
+            .copied())
+    }
+
+    fn remember_collection_generation_unproven_fence(
+        &self,
+        key: HotCollectionCacheKey,
+        unproven: bool,
+    ) -> Result<(), LixError> {
+        let mut entries = self
+            .collection_generation_unproven_fences
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?;
+        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            entries.entry(key).or_insert(unproven);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PackedIdentityMembership {
@@ -988,6 +1017,22 @@ fn hot_collection_control_key(
     write_key_string(&mut key, scope.schema_key, KEY_PART_FINAL);
     write_file_id(&mut key, scope.file_id);
     key
+}
+
+fn normalize_count_across_collection_fence(
+    mut control: HotCollectionControl,
+    branch_generation: CommitId,
+) -> HotCollectionControl {
+    if control.active_generation != branch_generation && control.ordered_identity_digest.is_none() {
+        // A generation fence changes collection membership. Legacy finite
+        // counts can omit surviving untracked rows or count retired tracked
+        // rows, so only a complete generation rebuild can restore an exact
+        // cardinality. A retained ordered digest is that complete proof:
+        // incremental fence writers clear it, while complete replacement
+        // writers recompute the count and digest over the post-fence members.
+        control.live_count = DEFERRED_ROOT_LIVE_COUNT;
+    }
+    control
 }
 
 async fn load_root_current_base_commit(
@@ -1052,6 +1097,19 @@ async fn load_stored_hot_collection_control(
     branch_generation: CommitId,
     scope: crate::collection_generation::CollectionScopeRef<'_>,
 ) -> Result<Option<HotCollectionControl>, LixError> {
+    Ok(
+        load_raw_stored_hot_collection_control(store, branch_id, branch_generation, scope)
+            .await?
+            .map(|control| normalize_count_across_collection_fence(control, branch_generation)),
+    )
+}
+
+async fn load_raw_stored_hot_collection_control(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+) -> Result<Option<HotCollectionControl>, LixError> {
     let key = StorageKey(Bytes::from(hot_collection_control_key(
         branch_id,
         branch_generation,
@@ -1075,40 +1133,6 @@ async fn load_stored_hot_collection_control(
         }
         None => Ok(None),
     }
-}
-
-async fn load_hot_collection_visibility_control(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    branch_generation: CommitId,
-    scope: crate::collection_generation::CollectionScopeRef<'_>,
-) -> Result<HotCollectionControl, LixError> {
-    let key = StorageKey(Bytes::from(hot_collection_control_key(
-        branch_id,
-        branch_generation,
-        scope,
-    )));
-    let value = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &[key])
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-    let Some(value) = value else {
-        // Visibility does not need the immutable root's exact count.
-        return Ok(HotCollectionControl {
-            active_generation: branch_generation,
-            live_count: 1,
-            ordered_identity_digest: None,
-        });
-    };
-    let StorageProjectedValue::FullValue(bytes) = value else {
-        return Err(head_value_error(
-            "hot collection-control visibility read unexpectedly omitted its value",
-        ));
-    };
-    storage_codec::decode("hot collection control", &bytes)
 }
 
 async fn load_root_collection_control_from_base(
@@ -1190,6 +1214,84 @@ async fn load_hot_collection_controls(
     Ok(controls)
 }
 
+fn load_hot_collection_controls_boxed<'a, S>(
+    store: &'a S,
+    branch_id: &'a str,
+    branch_generation: CommitId,
+    scopes: &'a [crate::collection_generation::CollectionScopeRef<'a>],
+) -> BoxFuture<'a, Result<Vec<HotCollectionControl>, LixError>>
+where
+    S: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(load_hot_collection_controls(
+        store,
+        branch_id,
+        branch_generation,
+        scopes,
+    ))
+}
+
+type BorrowedHotCollectionControls<'a> = BTreeMap<(&'a str, Option<&'a str>), HotCollectionControl>;
+
+type OwnedHotCollectionScopes = Vec<(String, Option<String>)>;
+
+fn hot_collection_scope_refs(
+    scopes: &[(String, Option<String>)],
+) -> Vec<crate::collection_generation::CollectionScopeRef<'_>> {
+    scopes
+        .iter()
+        .map(
+            |(schema_key, file_id)| crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: file_id.as_deref(),
+            },
+        )
+        .collect()
+}
+
+fn borrowed_hot_collection_controls<'a>(
+    scopes: &[crate::collection_generation::CollectionScopeRef<'a>],
+    controls: Vec<HotCollectionControl>,
+) -> BorrowedHotCollectionControls<'a> {
+    scopes
+        .iter()
+        .zip(controls)
+        .map(|(scope, control)| ((scope.schema_key, scope.file_id), control))
+        .collect()
+}
+
+fn hot_collection_row_is_active(
+    controls: &BorrowedHotCollectionControls<'_>,
+    branch_generation: CommitId,
+    schema_key: &str,
+    file_id: Option<&str>,
+    untracked: bool,
+    commit_id: Option<CommitId>,
+    inclusive: bool,
+) -> bool {
+    if untracked || schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+        return true;
+    }
+    [
+        Some((schema_key, None)),
+        file_id.map(|file_id| (schema_key, Some(file_id))),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|scope| {
+        let control = controls
+            .get(&scope)
+            .expect("row collection scope was loaded above");
+        control.active_generation == branch_generation
+            || survives_collection_generation_fence(
+                untracked,
+                commit_id,
+                control.active_generation,
+                inclusive,
+            )
+    })
+}
+
 async fn load_stored_hot_collection_controls(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -1220,11 +1322,183 @@ async fn load_stored_hot_collection_controls(
                         "hot collection-control batch read unexpectedly omitted its value",
                     ));
                 };
-                storage_codec::decode("hot collection control", &bytes).map(Some)
+                storage_codec::decode("hot collection control", &bytes).map(|control| {
+                    Some(normalize_count_across_collection_fence(
+                        control,
+                        branch_generation,
+                    ))
+                })
             }
             None => Ok(None),
         })
         .collect()
+}
+
+async fn hot_schema_has_collection_fence(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    schema_key: &str,
+) -> Result<bool, LixError> {
+    let mut prefix = hot_scope_prefix(branch_id, branch_generation);
+    write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
+    let range = StoragePrefix {
+        bytes: Bytes::from(prefix),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            COLLECTION_CONTROL_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    loop {
+        let (page, more) = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
+            let value = full_value_bytes(entry.value)?;
+            let control: HotCollectionControl =
+                storage_codec::decode("hot collection control", &value)?;
+            if control.active_generation != branch_generation {
+                return Ok(true);
+            }
+        }
+        if !more {
+            return Ok(false);
+        }
+    }
+}
+
+fn collection_generation_has_unproven_sibling_fence<'a, S>(
+    store: &'a S,
+    branch_id: &'a str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'a>,
+) -> BoxFuture<'a, Result<bool, LixError>>
+where
+    S: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
+        let root_key = StorageKey(Bytes::from(hot_scope_prefix(branch_id, branch_generation)));
+        let mut root_cursor = store
+            .begin_scan(
+                ROOT_CURRENT_BASE_SPACE,
+                crate::storage_adapter::StorageKeyRange {
+                    lower: std::ops::Bound::Included(root_key.clone()),
+                    upper: std::ops::Bound::Included(root_key),
+                },
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..StorageBeginScanOptions::default()
+                },
+            )
+            .await?;
+        let (root_rows, _) = root_cursor.next_page(1).await?.into_parts();
+        if !root_rows.is_empty() {
+            // Root markers live in the tracked tree rather than this HOT
+            // control prefix. Do not certify a finite HOT membership proof
+            // without enumerating that potentially large marker catalog.
+            return Ok(true);
+        }
+
+        let mut schema_prefix = hot_scope_prefix(branch_id, branch_generation);
+        write_key_string(&mut schema_prefix, scope.schema_key, KEY_PART_FINAL);
+        let range = if scope.file_id.is_none() {
+            // The schema control itself is the aggregate under inspection.
+            // Start at FILE_ID_SOME so this proof scans only sibling file
+            // scopes and never re-reads the aggregate as a scan row.
+            let mut file_scope_prefix = schema_prefix.clone();
+            file_scope_prefix.push(FILE_ID_SOME);
+            let upper = packed_key_prefix_successor(&schema_prefix)
+                .ok_or_else(|| head_value_error("schema control prefix has no successor"))?;
+            crate::storage_adapter::StorageKeyRange {
+                lower: std::ops::Bound::Included(StorageKey(Bytes::from(file_scope_prefix))),
+                upper: std::ops::Bound::Excluded(StorageKey(Bytes::from(upper))),
+            }
+        } else {
+            // A schema-wide fence is the only ancestor that can invalidate a
+            // file-scope witness. Probe that one key without walking siblings.
+            let schema_scope_key = StorageKey(Bytes::from(hot_collection_control_key(
+                branch_id,
+                branch_generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: scope.schema_key,
+                    file_id: None,
+                },
+            )));
+            crate::storage_adapter::StorageKeyRange {
+                lower: std::ops::Bound::Included(schema_scope_key.clone()),
+                upper: std::ops::Bound::Included(schema_scope_key),
+            }
+        };
+        let mut cursor = store
+            .begin_scan(
+                COLLECTION_CONTROL_SPACE,
+                range,
+                StorageBeginScanOptions::default(),
+            )
+            .await?;
+        loop {
+            let (page, more) = cursor
+                .next_page(if scope.file_id.is_none() {
+                    crate::storage_adapter::MAX_SCAN_PAGE_ROWS
+                } else {
+                    1
+                })
+                .await?
+                .into_parts();
+            for entry in page {
+                let control: HotCollectionControl = storage_codec::decode(
+                    "hot collection control",
+                    &full_value_bytes(entry.value)?,
+                )?;
+                if control.active_generation != branch_generation {
+                    return Ok(true);
+                }
+            }
+            if !more {
+                return Ok(false);
+            }
+        }
+    })
+}
+
+async fn hot_branch_has_collection_fence(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+) -> Result<bool, LixError> {
+    let range = StoragePrefix {
+        bytes: Bytes::from(hot_scope_prefix(branch_id, branch_generation)),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            COLLECTION_CONTROL_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    loop {
+        let (page, more) = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
+            let value = full_value_bytes(entry.value)?;
+            let control: HotCollectionControl =
+                storage_codec::decode("hot collection control", &value)?;
+            if control.active_generation != branch_generation {
+                return Ok(true);
+            }
+        }
+        if !more {
+            return Ok(false);
+        }
+    }
 }
 
 fn stage_hot_collection_control(
@@ -1272,6 +1546,32 @@ pub(crate) fn stage_hot_collection_live_count_for_test(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn stage_hot_collection_control_for_test(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    schema_key: &str,
+    file_id: Option<&str>,
+    active_generation: CommitId,
+    live_count: u64,
+) -> Result<(), LixError> {
+    stage_hot_collection_control(
+        writes,
+        branch_id,
+        branch_generation,
+        crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id,
+        },
+        HotCollectionControl {
+            active_generation,
+            live_count,
+            ordered_identity_digest: None,
+        },
+    )
+}
+
 async fn load_incremental_collection_controls(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -1285,7 +1585,14 @@ async fn load_incremental_collection_controls(
     let mut owned_scopes = BTreeSet::<(String, Option<String>)>::new();
     for delta in deltas {
         if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
-            owned_scopes.insert(collection_scope_from_row_pk(delta.row_pk)?);
+            let scope = collection_scope_from_row_pk(delta.row_pk)?;
+            if scope.1.is_some() {
+                // A file-scoped replacement changes membership in the
+                // schema-wide collection too. Load that aggregate so the
+                // marker can invalidate its exact cardinality.
+                owned_scopes.insert((scope.0.clone(), None));
+            }
+            owned_scopes.insert(scope);
             continue;
         }
         owned_scopes.insert((delta.schema_key.to_string(), None));
@@ -1337,6 +1644,9 @@ fn stage_incremental_collection_controls(
     for (delta, previous) in deltas.iter().zip(previous_values) {
         if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             let scope = collection_scope_from_row_pk(delta.row_pk)?;
+            if scope.1.is_some() {
+                dirty_scopes.insert((scope.0.clone(), None));
+            }
             dirty_scopes.insert(scope);
             continue;
         }
@@ -1483,8 +1793,21 @@ fn apply_incremental_collection_generation_deltas(
         control.active_generation = delta
             .commit_id
             .ok_or_else(|| head_value_error("tracked collection-generation row lacks commit_id"))?;
-        control.live_count = 0;
+        // A replacement retires tracked members lazily, while untracked rows
+        // survive every collection fence. Keep this scope's count deferred
+        // until a matching-generation control can certify its membership.
+        control.live_count = DEFERRED_ROOT_LIVE_COUNT;
         control.ordered_identity_digest = None;
+        if scope.1.is_some() {
+            let schema_scope = (scope.0.clone(), None);
+            let schema_control = controls
+                .get_mut(&schema_scope)
+                .expect("file marker schema aggregate was loaded above");
+            // The schema-wide count cannot be adjusted without enumerating
+            // the retired file, so preserve its deferred state as well.
+            schema_control.live_count = DEFERRED_ROOT_LIVE_COUNT;
+            schema_control.ordered_identity_digest = None;
+        }
     }
     Ok(())
 }
@@ -2391,9 +2714,10 @@ async fn packed_snapshot_stream_plan(
             continue;
         }
         if inventory.selected_source_commit_id().is_some()
-            || inventory.single_partition.as_ref().is_some_and(|scope| {
-                scope.schema_key != schema_key || scope.file_id.is_some()
-            })
+            || inventory
+                .single_partition
+                .as_ref()
+                .is_some_and(|scope| scope.schema_key != schema_key || scope.file_id.is_some())
             || inventory.columnar_parts.is_some()
             || inventory.lifecycle_summary.as_ref().is_none_or(|summary| {
                 summary.scope.schema_key != schema_key || summary.scope.file_id.is_some()
@@ -2611,9 +2935,7 @@ async fn packed_snapshot_stream_plan(
         // cannot compare a partial identity hash with the commit-wide digest.
         // Keep that cross-part proof for commits whose every part survived.
         for plan in &mut plans {
-            if retained_part_counts.get(&plan.commit_id)
-                != full_part_counts.get(&plan.commit_id)
-            {
+            if retained_part_counts.get(&plan.commit_id) != full_part_counts.get(&plan.commit_id) {
                 plan.lifecycle_identity_digest = None;
             }
         }
@@ -2627,8 +2949,7 @@ fn packed_snapshot_part_intersects_row_pk_range(
     lower: Option<&(Vec<u8>, bool)>,
     upper: Option<&(Vec<u8>, bool)>,
 ) -> bool {
-    if let (Some((lower_key, lower_inclusive)), Some((upper_key, upper_inclusive))) =
-        (lower, upper)
+    if let (Some((lower_key, lower_inclusive)), Some((upper_key, upper_inclusive))) = (lower, upper)
         && (lower_key > upper_key
             || (lower_key == upper_key && (!*lower_inclusive || !*upper_inclusive)))
     {
@@ -4922,6 +5243,12 @@ where
         let Some(cache) = self.transaction_cache.as_ref() else {
             return Ok(None);
         };
+        if load_root_current_base_commit(&self.store, branch_id, generation)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
         let base_refs =
             packed_exclusive_schema_base_refs(&self.store, branch_id, generation, schema_key)
                 .await?;
@@ -4943,6 +5270,8 @@ where
         };
         if collection.active_generation != generation
             || collection.live_count == DEFERRED_ROOT_LIVE_COUNT
+            || hot_schema_has_collection_fence(&self.store, branch_id, generation, schema_key)
+                .await?
         {
             return Ok(None);
         }
@@ -5010,14 +5339,62 @@ where
         branch_generation: CommitId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<crate::collection_generation::CollectionGeneration, LixError> {
-        let control = self
+        let mut control = self
             .collection_control(branch_id, branch_generation, scope)
             .await?;
+        let key = HotCollectionCacheKey {
+            branch_id: branch_id.to_owned(),
+            generation: branch_generation,
+            schema_key: scope.schema_key.to_owned(),
+            file_id: scope.file_id.map(str::to_owned),
+        };
+        let unproven_fence = if let Some(cache) = self.transaction_cache.as_deref() {
+            if let Some(unproven) = cache.collection_generation_unproven_fence(&key)? {
+                unproven
+            } else {
+                let unproven = collection_generation_has_unproven_sibling_fence(
+                    &self.store,
+                    branch_id,
+                    branch_generation,
+                    scope,
+                )
+                .await?;
+                cache.remember_collection_generation_unproven_fence(key, unproven)?;
+                unproven
+            }
+        } else {
+            collection_generation_has_unproven_sibling_fence(
+                &self.store,
+                branch_id,
+                branch_generation,
+                scope,
+            )
+            .await?
+        };
+        if unproven_fence {
+            control.live_count = DEFERRED_ROOT_LIVE_COUNT;
+            control.ordered_identity_digest = None;
+        }
         Ok(crate::collection_generation::CollectionGeneration {
             active_generation: control.active_generation,
             live_count: control.live_count,
             ordered_identity_digest: control.ordered_identity_digest,
         })
+    }
+
+    /// Reads only the generation token for an exact scope. Retained-read
+    /// preparation uses this to replay the point dependency without treating
+    /// the token as count or identity authority.
+    pub(crate) async fn collection_generation_active_token(
+        &self,
+        branch_id: &str,
+        branch_generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<CommitId, LixError> {
+        Ok(self
+            .collection_control(branch_id, branch_generation, scope)
+            .await?
+            .active_generation)
     }
 
     pub(crate) async fn stored_collection_generation(
@@ -5026,18 +5403,74 @@ where
         branch_generation: CommitId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        Ok(load_stored_hot_collection_control(
-            &self.store,
-            branch_id,
-            branch_generation,
-            scope,
+        Ok(
+            load_stored_hot_collection_control(&self.store, branch_id, branch_generation, scope)
+                .await?
+                .map(
+                    |control| crate::collection_generation::CollectionGeneration {
+                        active_generation: control.active_generation,
+                        live_count: control.live_count,
+                        ordered_identity_digest: control.ordered_identity_digest,
+                    },
+                ),
         )
-        .await?
-        .map(|control| crate::collection_generation::CollectionGeneration {
-            active_generation: control.active_generation,
-            live_count: control.live_count,
-            ordered_identity_digest: control.ordered_identity_digest,
-        }))
+    }
+
+    /// Reports collection metadata whose exact schema-wide count cannot be
+    /// proven for this serving generation. A newer collection fence can
+    /// retire tracked rows while leaving untracked rows visible, and legacy
+    /// finite counts may predate this distinction.
+    ///
+    /// HOT scope controls are scanned by their `(branch, generation,
+    /// schema)` prefix, so the work is proportional to collection scopes and
+    /// never visits row payloads. Root-backed branches conservatively decline
+    /// because old repositories can pair a finite HOT schema count with a
+    /// root file fence, and enumerating the root marker catalog would create
+    /// unbounded metadata memory on this path.
+    pub(crate) async fn schema_collection_count_may_be_stale(
+        &self,
+        branch_id: &str,
+        branch_generation: CommitId,
+        schema_key: &str,
+    ) -> Result<bool, LixError> {
+        let mut schema_prefix = hot_scope_prefix(branch_id, branch_generation);
+        write_key_string(&mut schema_prefix, schema_key, KEY_PART_FINAL);
+        if load_root_current_base_commit(&self.store, branch_id, branch_generation)
+            .await?
+            .is_some()
+        {
+            // Root-backed branches can carry file-scope fences outside HOT
+            // controls. Avoid materializing an unbounded root marker catalog
+            // to certify a single aggregate count.
+            return Ok(true);
+        }
+        let mut cursor = self
+            .store
+            .begin_scan(
+                COLLECTION_CONTROL_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::from(schema_prefix),
+                }
+                .to_range()?,
+                StorageBeginScanOptions::default(),
+            )
+            .await?;
+        loop {
+            let Some(page) = cursor.next_chunk().await? else {
+                break;
+            };
+            for entry in page {
+                let control: HotCollectionControl = storage_codec::decode(
+                    "hot collection control",
+                    &full_value_bytes(entry.value)?,
+                )?;
+                if control.active_generation != branch_generation {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     pub(crate) async fn exact_collection_live_count(
@@ -5839,6 +6272,13 @@ where
         .await?;
         if collection.active_generation != control.tracked_generation
             || collection.live_count == DEFERRED_ROOT_LIVE_COUNT
+            || hot_schema_has_collection_fence(
+                &self.store,
+                branch_id,
+                control.tracked_generation,
+                schema_key,
+            )
+            .await?
         {
             return Ok(None);
         }
@@ -5994,15 +6434,17 @@ where
             for (row_pk, row) in &overlay {
                 match base_commits.get(row_pk) {
                     Some(base_commit) if row.commit_id >= *base_commit && row.deleted => {
-                        *expected_live_count = expected_live_count.checked_sub(1).ok_or_else(|| {
-                            head_value_error("packed snapshot overlay count underflow")
-                        })?;
+                        *expected_live_count =
+                            expected_live_count.checked_sub(1).ok_or_else(|| {
+                                head_value_error("packed snapshot overlay count underflow")
+                            })?;
                     }
                     Some(_) => {}
                     None if !row.deleted => {
-                        *expected_live_count = expected_live_count.checked_add(1).ok_or_else(|| {
-                            head_value_error("packed snapshot overlay count overflow")
-                        })?;
+                        *expected_live_count =
+                            expected_live_count.checked_add(1).ok_or_else(|| {
+                                head_value_error("packed snapshot overlay count overflow")
+                            })?;
                     }
                     None => {}
                 }
@@ -6290,11 +6732,11 @@ where
             return Ok(None);
         }
         // Candidate keys can be stale after deletes or shadowed by a newer
-        // overlay. An exact finite collection count avoids doing bounded but
-        // fruitless payload rechecks for small/high-staleness collections.
-        // Deferred root counts cannot establish that the candidate prefix is
-        // likely to satisfy LIMIT, so those safely use the general scan.
-        let Some(collection) = load_stored_hot_collection_control(
+        // overlay. The stored count is only a cost hint here: every candidate
+        // is rechecked, and an undersized page falls back to the full scan.
+        // Deferred counts cannot establish that the bounded prefix is likely
+        // to satisfy LIMIT, so those safely use the general scan.
+        let Some(collection) = load_raw_stored_hot_collection_control(
             &self.store,
             branch_id,
             control.tracked_generation,
@@ -6307,21 +6749,22 @@ where
         else {
             return Ok(None);
         };
+        let candidate_threshold = minimum_collection_count.max(minimum_candidate_count);
         if collection.live_count == DEFERRED_ROOT_LIVE_COUNT
-            || collection.live_count
-                < u64::try_from(minimum_collection_count.max(minimum_candidate_count))
-                    .unwrap_or(u64::MAX)
+            || collection.live_count < u64::try_from(candidate_threshold).unwrap_or(u64::MAX)
         {
             return Ok(None);
         }
+        // This count is only a cost hint for a bounded candidate query. The
+        // candidate keys are rechecked through the authoritative reader and
+        // undersized pages fall back to the complete scan, so preserve root
+        // candidate admission even when the serving loader must defer a
+        // legacy fenced aggregate.
         let mut row_pks = Vec::with_capacity(candidate_limit);
         let mut seen = HashSet::with_capacity(candidate_limit);
-        if let Some(base_commit_id) = load_root_current_base_commit(
-            &self.store,
-            branch_id,
-            control.tracked_generation,
-        )
-        .await?
+        if let Some(base_commit_id) =
+            load_root_current_base_commit(&self.store, branch_id, control.tracked_generation)
+                .await?
         {
             let base_commit = base_commit_id.to_string();
             let mut tracked = crate::tracked_state::TrackedStateContext::new().reader(&self.store);
@@ -6573,6 +7016,12 @@ where
         control: BranchHeadControl,
         schema_key: &str,
     ) -> Result<Option<(CommitId, u64)>, LixError> {
+        if load_root_current_base_commit(&self.store, branch_id, control.tracked_generation)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
         let collection = load_hot_collection_control(
             &self.store,
             branch_id,
@@ -6583,7 +7032,16 @@ where
             },
         )
         .await?;
-        if collection.active_generation != control.tracked_generation {
+        if collection.active_generation != control.tracked_generation
+            || collection.live_count == DEFERRED_ROOT_LIVE_COUNT
+            || hot_schema_has_collection_fence(
+                &self.store,
+                branch_id,
+                control.tracked_generation,
+                schema_key,
+            )
+            .await?
+        {
             return Ok(None);
         }
         let base_refs = packed_exclusive_schema_base_refs(
@@ -6735,35 +7193,6 @@ where
         apply_collection_visibility: bool,
         fallback_base_commit_id: Option<CommitId>,
     ) -> Result<MaterializedHotStateBatch, LixError> {
-        let collection_control = if apply_collection_visibility {
-            match request.filter.schema_keys.as_slice() {
-                [schema_key]
-                    if schema_key
-                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY =>
-                {
-                    Some(
-                        load_hot_collection_visibility_control(
-                            &self.store,
-                            branch_id,
-                            generation,
-                            crate::collection_generation::CollectionScopeRef {
-                                schema_key,
-                                file_id: None,
-                            },
-                        )
-                        .await?,
-                    )
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let replaced_generation =
-            collection_control.filter(|control| control.active_generation != generation);
-        if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return Ok(MaterializedHotStateBatch::default());
-        }
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
         // would therefore let one tombstone hide a later live row.
@@ -6777,8 +7206,61 @@ where
         )
         .await?
         .expect("unbounded HOT scan cannot exhaust a byte budget");
-        if let Some(control) = replaced_generation {
-            filter_hot_scan_entries_by_collection_generation(&mut entries, control)?;
+        let collection_scope_keys = if apply_collection_visibility {
+            hot_scan_collection_scopes(&entries)
+        } else {
+            Vec::new()
+        };
+        let collection_scopes = hot_collection_scope_refs(&collection_scope_keys);
+        let collection_controls = if collection_scopes.is_empty() {
+            Vec::new()
+        } else {
+            load_hot_collection_controls_boxed(
+                &self.store,
+                branch_id,
+                generation,
+                &collection_scopes,
+            )
+            .await?
+        };
+        let collection_controls =
+            borrowed_hot_collection_controls(&collection_scopes, collection_controls);
+        if !collection_controls.is_empty() {
+            filter_hot_scan_entries_by_collection_controls(
+                &mut entries,
+                generation,
+                &collection_controls,
+            )?;
+        }
+        let mut has_collection_fence = collection_controls
+            .values()
+            .any(|control| control.active_generation != generation);
+        if apply_collection_visibility && request.limit.is_some() && !has_collection_fence {
+            has_collection_fence =
+                load_root_current_base_commit(&self.store, branch_id, generation)
+                    .await?
+                    .is_some();
+        }
+        if apply_collection_visibility && request.limit.is_some() && !has_collection_fence {
+            if request.filter.schema_keys.is_empty() {
+                has_collection_fence =
+                    hot_branch_has_collection_fence(&self.store, branch_id, generation).await?;
+            } else {
+                for schema_key in &request.filter.schema_keys {
+                    if schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                        && hot_schema_has_collection_fence(
+                            &self.store,
+                            branch_id,
+                            generation,
+                            schema_key,
+                        )
+                        .await?
+                    {
+                        has_collection_fence = true;
+                        break;
+                    }
+                }
+            }
         }
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let rows = materialize_hot_scan_entries(
@@ -6789,21 +7271,8 @@ where
             active_checkpoint_commit_id,
         )
         .await?;
-        let rows = rows.filter(
-            |row| {
-                replaced_generation.is_none_or(|control| {
-                    survives_collection_generation_fence(
-                        row.untracked(),
-                        row.commit_id(),
-                        control.active_generation,
-                        false,
-                    )
-                })
-            },
-            None,
-        );
         let has_overlay_rows = !rows.is_empty();
-        let packed_limit = if !has_overlay_rows && replaced_generation.is_none() {
+        let packed_limit = if !has_overlay_rows && !has_collection_fence {
             request.limit.map(|limit| limit.saturating_sub(rows.len()))
         } else {
             None
@@ -6835,6 +7304,17 @@ where
             scan_packed_current_base_rows(&self.store, branch_id, generation, request, packed_limit)
                 .await?
         };
+        let packed_rows = if apply_collection_visibility {
+            filter_materialized_hot_batch_by_collection_controls(
+                &self.store,
+                branch_id,
+                generation,
+                packed_rows,
+            )
+            .await?
+        } else {
+            packed_rows
+        };
         // A pristine root-backed generation has no possible shadowing winner,
         // so preserve bounded-read behavior by pushing LIMIT into the tracked
         // tree. Once any collection control or overlay/base exists, select all
@@ -6852,10 +7332,7 @@ where
         .await?;
         let combined = merge_ordered_live_batches(rows, packed_rows);
         let rows = merge_ordered_live_batches(combined, root_rows);
-        if request.filter.include_tombstones
-            && request.limit.is_none()
-            && replaced_generation.is_none()
-        {
+        if request.filter.include_tombstones && request.limit.is_none() && !has_collection_fence {
             return Ok(rows);
         }
         Ok(rows.filter(
@@ -7033,58 +7510,60 @@ where
         if keys.is_empty() {
             return Ok(MaterializedHotStateExactBatch::default());
         }
-        let replaced_generation = apply_collection_visibility
-            .then(|| {
-                keys.first()
-                    .filter(|first| keys.iter().all(|key| key.schema_key == first.schema_key))
-                    .filter(|first| {
-                        first.schema_key
-                            != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    })
-                    .map(|first| async {
-                        load_hot_collection_visibility_control(
-                            &self.store,
-                            branch_id,
-                            generation,
-                            crate::collection_generation::CollectionScopeRef {
-                                schema_key: first.schema_key,
-                                file_id: None,
-                            },
-                        )
-                        .await
-                    })
-            })
-            .flatten();
-        let replaced_generation = match replaced_generation {
-            Some(control) => {
-                let control = control.await?;
-                (control.active_generation != generation).then_some(control)
+        let collection_scopes = if apply_collection_visibility {
+            let mut scopes = BTreeSet::new();
+            for key in keys {
+                if key.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                {
+                    continue;
+                }
+                scopes.insert((key.schema_key, None));
+                if let Some(file_id) = key.file_id {
+                    scopes.insert((key.schema_key, Some(file_id)));
+                }
             }
-            None => None,
+            scopes
+                .into_iter()
+                .map(
+                    |(schema_key, file_id)| crate::collection_generation::CollectionScopeRef {
+                        schema_key,
+                        file_id,
+                    },
+                )
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
-        if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return MaterializedHotStateExactBatch::new(
-                MaterializedHotStateBatch::default(),
-                vec![None; keys.len()],
-            );
-        }
+        let collection_control_values = if collection_scopes.is_empty() {
+            Vec::new()
+        } else {
+            load_hot_collection_controls_boxed(
+                &self.store,
+                branch_id,
+                generation,
+                &collection_scopes,
+            )
+            .await?
+        };
+        let collection_controls =
+            borrowed_hot_collection_controls(&collection_scopes, collection_control_values);
         let mut values =
             hot_load_identity_ref_bytes(&self.store, branch_id, generation, keys).await?;
-        if let Some(control) = replaced_generation {
-            for value in &mut values {
-                let visible = value
-                    .as_deref()
-                    .map(decode_head_value)
-                    .transpose()?
-                    .is_some_and(|value| {
-                        survives_collection_generation_fence(
-                            value.untracked,
-                            value.commit_id,
-                            control.active_generation,
-                            false,
-                        )
-                    });
-                if !visible {
+        if !collection_controls.is_empty() {
+            for (key, value) in keys.iter().zip(&mut values) {
+                let Some(bytes) = value.as_ref() else {
+                    continue;
+                };
+                let head = decode_head_value(bytes)?;
+                if !hot_collection_row_is_active(
+                    &collection_controls,
+                    generation,
+                    key.schema_key,
+                    key.file_id,
+                    head.untracked,
+                    head.commit_id,
+                    false,
+                ) {
                     *value = None;
                 }
             }
@@ -7156,7 +7635,19 @@ where
         let mut resolved = Vec::with_capacity(keys.len());
         for (index, slot) in slots.into_iter().enumerate() {
             let mut row = slot.and_then(|slot| rows.get(slot as usize));
-            for candidate in [packed.row(index), root.row(index)].into_iter().flatten() {
+            let packed_candidate = packed.row(index).filter(|candidate| {
+                collection_controls.is_empty()
+                    || hot_collection_row_is_active(
+                        &collection_controls,
+                        generation,
+                        candidate.schema_key(),
+                        candidate.file_id(),
+                        candidate.untracked(),
+                        candidate.commit_id(),
+                        false,
+                    )
+            });
+            for candidate in [packed_candidate, root.row(index)].into_iter().flatten() {
                 if row.is_none_or(
                     |current| match (current.commit_id(), candidate.commit_id()) {
                         (Some(current), Some(candidate)) => candidate > current,
@@ -7168,30 +7659,11 @@ where
                     row = Some(candidate);
                 }
             }
-            resolved.push(row.filter(|row| {
-                replaced_generation.is_none_or(|control| {
-                    survives_collection_generation_fence(
-                        row.untracked(),
-                        row.commit_id(),
-                        control.active_generation,
-                        true,
-                    )
-                })
-            }));
+            resolved.push(row);
         }
         let mut builder = MaterializedHotStateBatchBuilder::with_capacity(keys.len());
         let mut combined_slots = Vec::with_capacity(keys.len());
         for row in resolved {
-            let row = row.filter(|row| {
-                replaced_generation.is_none_or(|control| {
-                    survives_collection_generation_fence(
-                        row.untracked(),
-                        row.commit_id(),
-                        control.active_generation,
-                        true,
-                    )
-                })
-            });
             combined_slots.push(
                 row.map(|row| {
                     u32::try_from(builder.push_ref(row, None)).map_err(|_| {
@@ -12144,24 +12616,71 @@ enum HotScanEntries<'a> {
     Decoded(Vec<(HotScanIdentity, Bytes)>),
 }
 
-fn filter_hot_scan_entries_by_collection_generation(
+fn insert_hot_collection_scope<'a>(
+    scopes: &mut BTreeSet<(&'a str, Option<&'a str>)>,
+    schema_key: &'a str,
+    file_id: Option<&'a str>,
+) {
+    if schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+        return;
+    }
+    scopes.insert((schema_key, None));
+    if let Some(file_id) = file_id {
+        scopes.insert((schema_key, Some(file_id)));
+    }
+}
+
+fn hot_scan_collection_scopes(entries: &HotScanEntries<'_>) -> OwnedHotCollectionScopes {
+    let mut scopes = BTreeSet::new();
+    match entries {
+        HotScanEntries::Decoded(rows) => {
+            for (identity, _) in rows {
+                insert_hot_collection_scope(&mut scopes, identity.schema_key(), identity.file_id());
+            }
+        }
+        HotScanEntries::Finite(batches) => {
+            for batch in batches {
+                for (identity, value) in batch.identities.identities.iter().zip(&batch.values) {
+                    if value.is_some() {
+                        insert_hot_collection_scope(
+                            &mut scopes,
+                            batch.identities.schema_key,
+                            identity.file_id,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    scopes
+        .into_iter()
+        .map(|(schema_key, file_id)| (schema_key.to_owned(), file_id.map(str::to_owned)))
+        .collect()
+}
+
+fn filter_hot_scan_entries_by_collection_controls(
     entries: &mut HotScanEntries<'_>,
-    control: HotCollectionControl,
+    branch_generation: CommitId,
+    controls: &BorrowedHotCollectionControls<'_>,
 ) -> Result<(), LixError> {
-    let visible = |bytes: &Bytes| -> Result<bool, LixError> {
-        let value = decode_head_value(bytes)?;
-        Ok(survives_collection_generation_fence(
-            value.untracked,
-            value.commit_id,
-            control.active_generation,
-            false,
-        ))
-    };
+    let visible =
+        |schema_key: &str, file_id: Option<&str>, bytes: &Bytes| -> Result<bool, LixError> {
+            let value = decode_head_value(bytes)?;
+            Ok(hot_collection_row_is_active(
+                controls,
+                branch_generation,
+                schema_key,
+                file_id,
+                value.untracked,
+                value.commit_id,
+                false,
+            ))
+        };
     match entries {
         HotScanEntries::Decoded(rows) => {
             let mut retained = Vec::with_capacity(rows.len());
             for (identity, bytes) in rows.drain(..) {
-                if visible(&bytes)? {
+                if visible(identity.schema_key(), identity.file_id(), &bytes)? {
                     retained.push((identity, bytes));
                 }
             }
@@ -12169,10 +12688,10 @@ fn filter_hot_scan_entries_by_collection_generation(
         }
         HotScanEntries::Finite(batches) => {
             for batch in batches {
-                for value in &mut batch.values {
+                for (identity, value) in batch.identities.identities.iter().zip(&mut batch.values) {
                     if value
                         .as_ref()
-                        .map(&visible)
+                        .map(|bytes| visible(batch.identities.schema_key, identity.file_id, bytes))
                         .transpose()?
                         .is_some_and(|visible| !visible)
                     {
@@ -12183,6 +12702,49 @@ fn filter_hot_scan_entries_by_collection_generation(
         }
     }
     Ok(())
+}
+
+fn filter_materialized_hot_batch_by_collection_controls<'a, S>(
+    store: &'a S,
+    branch_id: &'a str,
+    branch_generation: CommitId,
+    rows: MaterializedHotStateBatch,
+) -> BoxFuture<'a, Result<MaterializedHotStateBatch, LixError>>
+where
+    S: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
+        let mut borrowed_scopes = BTreeSet::new();
+        for row in rows.iter() {
+            insert_hot_collection_scope(&mut borrowed_scopes, row.schema_key(), row.file_id());
+        }
+        let scopes = borrowed_scopes
+            .into_iter()
+            .map(|(schema_key, file_id)| (schema_key.to_owned(), file_id.map(str::to_owned)))
+            .collect::<Vec<_>>();
+        if scopes.is_empty() {
+            return Ok(rows);
+        }
+        let scope_refs = hot_collection_scope_refs(&scopes);
+        let control_values =
+            load_hot_collection_controls_boxed(store, branch_id, branch_generation, &scope_refs)
+                .await?;
+        let controls = borrowed_hot_collection_controls(&scope_refs, control_values);
+        Ok(rows.filter(
+            |row| {
+                hot_collection_row_is_active(
+                    &controls,
+                    branch_generation,
+                    row.schema_key(),
+                    row.file_id(),
+                    row.untracked(),
+                    row.commit_id(),
+                    false,
+                )
+            },
+            None,
+        ))
+    })
 }
 
 fn hot_exact_identity_batches<'a>(
@@ -15466,10 +16028,12 @@ mod tests {
             .await
             .expect("read root candidate fixture");
         let tracked = crate::tracked_state::TrackedStateContext::new().reader(&read);
-        assert!(tracked
-            .has_durable_commit_root(&base_commit_id.to_string())
-            .await
-            .expect("probe published root"));
+        assert!(
+            tracked
+                .has_durable_commit_root(&base_commit_id.to_string())
+                .await
+                .expect("probe published root")
+        );
         let reader = HotStateStoreReader {
             store: &read,
             transaction_cache: None,
@@ -15487,16 +16051,20 @@ mod tests {
             author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
                 .expect("anonymous account ID is canonical"),
         };
-        assert!(reader
-            .scan_row_limit_candidates(branch_id, control, "lix_key_value", 512, 512, 512)
-            .await
-            .expect("physical candidate page should stop at tombstones")
-            .is_none());
-        assert!(reader
-            .scan_row_limit_candidates(branch_id, control, "lix_key_value", 4096, 512, 4096)
-            .await
-            .expect("small live collection should decline before candidate traversal")
-            .is_none());
+        assert!(
+            reader
+                .scan_row_limit_candidates(branch_id, control, "lix_key_value", 512, 512, 512)
+                .await
+                .expect("physical candidate page should stop at tombstones")
+                .is_none()
+        );
+        assert!(
+            reader
+                .scan_row_limit_candidates(branch_id, control, "lix_key_value", 4096, 512, 4096)
+                .await
+                .expect("small live collection should decline before candidate traversal")
+                .is_none()
+        );
         let candidates = reader
             .scan_row_limit_candidates(branch_id, control, "lix_key_value", 1024, 512, 512)
             .await
@@ -15590,11 +16158,13 @@ mod tests {
             author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
                 .expect("anonymous account ID is canonical"),
         };
-        assert!(reader
-            .scan_row_limit_candidates(branch_id, control, "lix_key_value", 4096, 512, 512)
-            .await
-            .expect("small collection should safely decline candidate scan")
-            .is_none());
+        assert!(
+            reader
+                .scan_row_limit_candidates(branch_id, control, "lix_key_value", 4096, 512, 512)
+                .await
+                .expect("small collection should safely decline candidate scan")
+                .is_none()
+        );
     }
 
     /// `HotCollectionControl` is `#[musli(packed)]`: its fields are positional
@@ -16094,24 +16664,24 @@ mod tests {
         let base_rows = base_specs
             .iter()
             .map(|(key, value)| MaterializedTrackedStateRow {
-            row_pk: RowPk::single(key),
-            schema_key: SCHEMA_KEY.to_owned(),
-            file_id: None,
-            snapshot_content: Some(
-                serde_json::json!({"key": key, "value": value})
-                    .to_string()
-                    .into(),
-            ),
-            decoded_snapshot: None,
-            metadata: None,
-            deleted: false,
-            created_at: now.to_string(),
-            updated_at: now.to_string(),
-            author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
-            change_id: ChangeId::for_test_label(&format!("{key}-base")),
-            commit_id: generation,
-        })
-        .collect::<Vec<_>>();
+                row_pk: RowPk::single(key),
+                schema_key: SCHEMA_KEY.to_owned(),
+                file_id: None,
+                snapshot_content: Some(
+                    serde_json::json!({"key": key, "value": value})
+                        .to_string()
+                        .into(),
+                ),
+                decoded_snapshot: None,
+                metadata: None,
+                deleted: false,
+                created_at: now.to_string(),
+                updated_at: now.to_string(),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_id: ChangeId::for_test_label(&format!("{key}-base")),
+                commit_id: generation,
+            })
+            .collect::<Vec<_>>();
         crate::test_support::seed_branch_head_with_rows(
             storage.clone(),
             BRANCH_ID,
@@ -16127,35 +16697,40 @@ mod tests {
         let authored_commit_deltas = base_rows
             .iter()
             .zip(&authored_payloads)
-            .map(|(row, snapshot)| crate::tracked_state::TrackedStateCommitDeltaRef {
-                delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    row_pk: &row.row_pk,
-                    change_id: ChangeId::for_test_label(&format!(
-                        "{}-ordered-base",
-                        row.row_pk
-                            .as_single_string()
-                            .expect("JSONB base row identity should be a string"),
-                    )),
-                    commit_id: base_commit,
-                    author_id: &row.author_id,
-                    deleted: false,
-                    created_at: now,
-                    updated_at: now,
-                    semantic_fingerprint: None,
+            .map(
+                |(row, snapshot)| crate::tracked_state::TrackedStateCommitDeltaRef {
+                    delta: crate::tracked_state::TrackedStateDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        row_pk: &row.row_pk,
+                        change_id: ChangeId::for_test_label(&format!(
+                            "{}-ordered-base",
+                            row.row_pk
+                                .as_single_string()
+                                .expect("JSONB base row identity should be a string"),
+                        )),
+                        commit_id: base_commit,
+                        author_id: &row.author_id,
+                        deleted: false,
+                        created_at: now,
+                        updated_at: now,
+                        semantic_fingerprint: None,
+                    },
+                    metadata: None,
+                    snapshot: Some(snapshot.as_slice()),
+                    origin_key: None,
+                    base_coordinate: None,
+                    authored: true,
                 },
-                metadata: None,
-                snapshot: Some(snapshot.as_slice()),
-                origin_key: None,
-                base_coordinate: None,
-                authored: true,
-            })
+            )
             .collect::<Vec<_>>();
         let mut ordered_writes = StorageWriteSet::new();
         let ordered = crate::tracked_state::stage_ordered_addressable_commit_deltas(
             &mut ordered_writes,
-            authored_commit_deltas.iter().copied().map(Ok::<_, LixError>),
+            authored_commit_deltas
+                .iter()
+                .copied()
+                .map(Ok::<_, LixError>),
             true,
             true,
         )
@@ -16178,7 +16753,11 @@ mod tests {
             snapshot_root: None,
         };
         assert!(base_manifest.mutations.direct_addresses_are_fully_owned());
-        assert!(!base_manifest.mutations.may_contain_finite_selected_members());
+        assert!(
+            !base_manifest
+                .mutations
+                .may_contain_finite_selected_members()
+        );
         assert!(base_manifest.mutations.lifecycle_summary.is_some());
         crate::tracked_state::stage_commit_state_manifest(&mut ordered_writes, &base_manifest)
             .expect("ordered native mutation authority should stage");
@@ -16190,13 +16769,11 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("packed stream base manifest read should open");
-        let base_manifest = crate::tracked_state::load_commit_state_manifest(
-            &seeded_read,
-            base_commit,
-        )
-        .await
-        .expect("packed stream base manifest should load")
-        .expect("packed stream base manifest should exist");
+        let base_manifest =
+            crate::tracked_state::load_commit_state_manifest(&seeded_read, base_commit)
+                .await
+                .expect("packed stream base manifest should load")
+                .expect("packed stream base manifest should exist");
         assert!(base_manifest.mutations.inline_part.is_empty());
         assert!(base_manifest.mutations.parts.len() > 1);
         drop(seeded_read);
@@ -16352,15 +16929,25 @@ mod tests {
                 label,
             );
         }
-        let extra_globals = (0..38).map(|index| {
-            let row_pk = RowPk::single(format!("global-extra-{index:02}"));
-            let payload = jsonb_payload(&row_pk, "extra-global-value");
-            (row_pk, payload)
-        }).collect::<Vec<_>>();
+        let extra_globals = (0..38)
+            .map(|index| {
+                let row_pk = RowPk::single(format!("global-extra-{index:02}"));
+                let payload = jsonb_payload(&row_pk, "extra-global-value");
+                (row_pk, payload)
+            })
+            .collect::<Vec<_>>();
         for (row_pk, payload) in &extra_globals {
-            stage_row(&mut writes, crate::GLOBAL_BRANCH_ID, global_generation,
-                row_pk, None, true, false, Some(payload),
-                &format!("packed-stream-{row_pk:?}"));
+            stage_row(
+                &mut writes,
+                crate::GLOBAL_BRANCH_ID,
+                global_generation,
+                row_pk,
+                None,
+                true,
+                false,
+                Some(payload),
+                &format!("packed-stream-{row_pk:?}"),
+            );
         }
         stage_hot_collection_control(
             &mut writes,
@@ -16395,7 +16982,8 @@ mod tests {
         let hot_state = crate::hot_state::HotStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
-        ).with_read_interest_registry(registry.clone());
+        )
+        .with_read_interest_registry(registry.clone());
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -16405,28 +16993,57 @@ mod tests {
             inner: read,
             batch_sizes: Arc::clone(&segment_batch_sizes),
         };
-        let (part_plans, _) = packed_snapshot_stream_plan(&read, BRANCH_ID, generation, SCHEMA_KEY, None, None)
-            .await.expect("batch guard fixture should plan")
-            .expect("batch guard fixture should have packed parts");
+        let (part_plans, _) =
+            packed_snapshot_stream_plan(&read, BRANCH_ID, generation, SCHEMA_KEY, None, None)
+                .await
+                .expect("batch guard fixture should plan")
+                .expect("batch guard fixture should have packed parts");
         assert_eq!(part_plans.len(), 2);
-        let oversized = vec![(part_plans[0].manifest.as_ref(), part_plans[0].part_index);
-            crate::tracked_state::COMMIT_DELTA_PART_READ_BATCH_MAX + 1];
-        assert!(crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
-            &read, &oversized, SCHEMA_KEY).await.expect("oversized batch should decline").is_none());
-        assert!(crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
-            &read, &[(part_plans[0].manifest.as_ref(), usize::MAX)], SCHEMA_KEY)
-            .await.is_err(), "missing part must fail before a physical read");
-        assert!(segment_batch_sizes.lock().expect("guard probe should lock").is_empty());
+        let oversized = vec![
+            (part_plans[0].manifest.as_ref(), part_plans[0].part_index);
+            crate::tracked_state::COMMIT_DELTA_PART_READ_BATCH_MAX + 1
+        ];
+        assert!(
+            crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
+                &read, &oversized, SCHEMA_KEY
+            )
+            .await
+            .expect("oversized batch should decline")
+            .is_none()
+        );
+        assert!(
+            crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
+                &read,
+                &[(part_plans[0].manifest.as_ref(), usize::MAX)],
+                SCHEMA_KEY
+            )
+            .await
+            .is_err(),
+            "missing part must fail before a physical read"
+        );
+        assert!(
+            segment_batch_sizes
+                .lock()
+                .expect("guard probe should lock")
+                .is_empty()
+        );
         let reversed = [
             (part_plans[1].manifest.as_ref(), part_plans[1].part_index),
             (part_plans[0].manifest.as_ref(), part_plans[0].part_index),
         ];
-        let reversed_parts = crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
-            &read, &reversed, SCHEMA_KEY).await.expect("reversed batch should execute")
+        let reversed_parts =
+            crate::tracked_state::load_commit_delta_parts_members_with_payloads_for_schema(
+                &read, &reversed, SCHEMA_KEY,
+            )
+            .await
+            .expect("reversed batch should execute")
             .expect("reversed batch should retain authenticated parts");
         assert_eq!(reversed_parts[0][0].key.row_pk, RowPk::single("row512"));
         assert_eq!(reversed_parts[1][0].key.row_pk, RowPk::single("row000"));
-        segment_batch_sizes.lock().expect("batch probe should reset").clear();
+        segment_batch_sizes
+            .lock()
+            .expect("batch probe should reset")
+            .clear();
         let reader = hot_state.reader(Arc::new(read));
         let request = crate::hot_state::HotStateScanRequest {
             filter: crate::hot_state::HotStateFilter {
@@ -16440,8 +17057,13 @@ mod tests {
             limit: None,
         };
         crate::row_payload::reset_typed_row_json_conversions_for_test();
-        assert!(reader.scan_direct_row_snapshot_pages(&request).await
-            .expect("small collection benefit gate should execute").is_none());
+        assert!(
+            reader
+                .scan_direct_row_snapshot_pages(&request)
+                .await
+                .expect("small collection benefit gate should execute")
+                .is_none()
+        );
         let pages = reader
             .scan_direct_row_snapshot_pages_with_minimum_count(&request, 0)
             .await
@@ -16454,7 +17076,10 @@ mod tests {
         );
         // Admission also performs exact visibility probes. Measure the part
         // producer's reads separately after the complete admission proof.
-        segment_batch_sizes.lock().expect("producer probe should reset").clear();
+        segment_batch_sizes
+            .lock()
+            .expect("producer probe should reset")
+            .clear();
         let batches = pages
             .try_collect::<Vec<_>>()
             .await
@@ -16493,9 +17118,14 @@ mod tests {
         expected.insert(global_b, global_b_payload);
         expected.extend(extra_globals);
         assert_eq!(actual, expected);
-        let interests = registry.snapshot().expect("stream read interests should snapshot");
-        assert_eq!(interests.interests.len(), 2,
-            "the main/global scan interests must cover all 40 payload and winner probes");
+        let interests = registry
+            .snapshot()
+            .expect("stream read interests should snapshot");
+        assert_eq!(
+            interests.interests.len(),
+            2,
+            "the main/global scan interests must cover all 40 payload and winner probes"
+        );
         assert!(!actual.contains_key(&deleted_pk));
         assert_eq!(
             crate::row_payload::typed_row_json_conversions_for_test(),
@@ -16536,11 +17166,7 @@ mod tests {
         let expected_range = expected
             .iter()
             .filter(|(row_pk, _)| {
-                crate::tracked_state::row_pk_satisfies_bounds(
-                    row_pk,
-                    Some(&lower),
-                    Some(&upper),
-                )
+                crate::tracked_state::row_pk_satisfies_bounds(row_pk, Some(&lower), Some(&upper))
             })
             .map(|(row_pk, payload)| (row_pk.clone(), payload.clone()))
             .collect::<BTreeMap<_, _>>();
@@ -16625,7 +17251,9 @@ mod tests {
         let out_of_range_file_pk = RowPk::single("z-filed-outside-range");
         let out_of_range_file_payload = jsonb_payload(&out_of_range_file_pk, "filed-outside-range");
         let out_of_range_file_value = encode_head_value(&HeadValueRef {
-            change_id: Some(ChangeId::for_test_label("packed-stream-filed-outside-range")),
+            change_id: Some(ChangeId::for_test_label(
+                "packed-stream-filed-outside-range",
+            )),
             commit_id: Some(overlay_commit),
             author_id: crate::ANONYMOUS_ACCOUNT_ID,
             untracked: false,
@@ -16976,6 +17604,7 @@ mod tests {
             .expect("publish collection control fixture");
 
         let get_many_calls = Arc::new(AtomicUsize::new(0));
+        let scan_calls = Arc::new(AtomicUsize::new(0));
         let reader = HotStateStoreReader {
             store: CountingRead {
                 inner: storage
@@ -16983,7 +17612,7 @@ mod tests {
                     .await
                     .expect("open collection control fixture read"),
                 get_many_calls: Arc::clone(&get_many_calls),
-                scan_calls: None,
+                scan_calls: Some(Arc::clone(&scan_calls)),
             },
             transaction_cache: Some(Arc::new(HotStateTransactionCache::default())),
             root_base_cache: None,
@@ -17008,6 +17637,138 @@ mod tests {
             1,
             "the immutable transaction snapshot should point-read a control once"
         );
+        assert_eq!(
+            scan_calls.load(Ordering::Relaxed),
+            2,
+            "the immutable transaction snapshot should cache the two scope proof probes"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_generation_declines_schema_digest_after_sibling_file_fence() {
+        const BRANCH_ID: &str = "collection-generation-file-fence-branch";
+        const SCHEMA_KEY: &str = "collection_generation_file_fence_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("collection-generation-file-fence-serving");
+        let fence = CommitId::for_test_label("collection-generation-file-fence-marker");
+        assert_ne!(generation, fence);
+        let mut writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: 2,
+                ordered_identity_digest: Some([9; 32]),
+            },
+        )
+        .expect("stage legacy schema aggregate");
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: Some("replaced-file"),
+            },
+            HotCollectionControl {
+                active_generation: fence,
+                live_count: DEFERRED_ROOT_LIVE_COUNT,
+                ordered_identity_digest: None,
+            },
+        )
+        .expect("stage legacy sibling file fence");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish collection controls");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open collection control read");
+        let control = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+            root_base_cache: None,
+        }
+        .collection_generation(
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+        )
+        .await
+        .expect("load schema collection generation");
+        assert_eq!(control.active_generation, generation);
+        assert_eq!(
+            control.live_count, DEFERRED_ROOT_LIVE_COUNT,
+            "a legacy finite schema aggregate is not authoritative after a file fence"
+        );
+        assert_eq!(
+            control.ordered_identity_digest, None,
+            "the sibling file fence invalidates the legacy schema digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_generation_preserves_complete_own_scope_fence_digest() {
+        const BRANCH_ID: &str = "collection-generation-own-fence-branch";
+        const SCHEMA_KEY: &str = "collection_generation_own_fence_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("collection-generation-own-fence-serving");
+        let fence = CommitId::for_test_label("collection-generation-own-fence-marker");
+        assert_ne!(generation, fence);
+        let mut writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: fence,
+                live_count: 2,
+                ordered_identity_digest: Some([7; 32]),
+            },
+        )
+        .expect("stage complete own-scope replacement witness");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish complete own-scope control");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open collection control read");
+        let control = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+            root_base_cache: None,
+        }
+        .collection_generation(
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+        )
+        .await
+        .expect("load own-scope collection generation");
+        assert_eq!(control.active_generation, fence);
+        assert_eq!(control.live_count, 2);
+        assert_eq!(control.ordered_identity_digest, Some([7; 32]));
     }
 
     struct CountingRead<R> {
@@ -17097,8 +17858,7 @@ mod tests {
             requests: &[StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
             for request in requests {
-                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE
-                {
+                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE {
                     self.batch_sizes
                         .lock()
                         .expect("packed segment batch probe should lock")
@@ -17296,6 +18056,209 @@ mod tests {
                     && row.metadata().is_none()
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn packed_file_fence_filters_before_limited_scan_selects_rows() {
+        const BRANCH: &str = "packed-file-fence-limit-branch";
+        const SCHEMA: &str = "packed_file_fence_limit_rows";
+        const RETIRED_FILE: &str = "retired-file";
+        const LIVE_FILE: &str = "live-file";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::new(uuid::Uuid::from_u128(1 << 32));
+        let retired_base_commit = CommitId::new(uuid::Uuid::from_u128(1 << 32));
+        let file_fence_commit = CommitId::new(uuid::Uuid::from_u128(2 << 32));
+        let live_base_commit = CommitId::new(uuid::Uuid::from_u128(3 << 32));
+        let make_row =
+            |row_pk: &str, file_id: &str, commit_id: CommitId| MaterializedTrackedStateRow {
+                row_pk: RowPk::single(row_pk),
+                schema_key: SCHEMA.to_owned(),
+                file_id: Some(file_id.to_owned()),
+                snapshot_content: Some(format!(r#"{{"value":"{row_pk}"}}"#).into()),
+                decoded_snapshot: None,
+                metadata: None,
+                deleted: false,
+                created_at: timestamp().to_string(),
+                updated_at: timestamp().to_string(),
+                author_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+                change_id: ChangeId::for_test_label(&format!("packed-file-fence-{row_pk}")),
+                commit_id,
+            };
+        let retired_rows = vec![make_row("retired", RETIRED_FILE, retired_base_commit)];
+        let live_rows = vec![make_row("live-after-fence", LIVE_FILE, live_base_commit)];
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed file-fence fixture read");
+        let mut writes = StorageWriteSet::new();
+        for (base_commit_id, rows, file_id) in [
+            (retired_base_commit, &retired_rows, RETIRED_FILE),
+            (live_base_commit, &live_rows, LIVE_FILE),
+        ] {
+            crate::test_support::stage_tracked_root_from_materialized(
+                &mut read,
+                &mut writes,
+                &crate::tracked_state::TrackedStateContext::new(),
+                &base_commit_id.to_string(),
+                None,
+                rows,
+            )
+            .await
+            .expect("stage packed file-fence snapshot");
+            let mut base_key = hot_scope_prefix(BRANCH, generation);
+            base_key.extend_from_slice(base_commit_id.as_uuid().as_bytes());
+            writes.put(
+                PACKED_CURRENT_BASE_SPACE,
+                StorageKey(Bytes::from(base_key)),
+                StorageValue {
+                    bytes: Bytes::from(
+                        packed_current_base_value(None, Some(file_id))
+                            .expect("file-scoped base ref"),
+                    ),
+                },
+            );
+        }
+        writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        for (file_id, active_generation) in [
+            (None, generation),
+            (Some(RETIRED_FILE), file_fence_commit),
+            (Some(LIVE_FILE), generation),
+        ] {
+            stage_hot_collection_control(
+                &mut writes,
+                BRANCH,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: SCHEMA,
+                    file_id,
+                },
+                HotCollectionControl {
+                    active_generation,
+                    live_count: DEFERRED_ROOT_LIVE_COUNT,
+                    ordered_identity_digest: None,
+                },
+            )
+            .expect("stage packed file-scope control");
+        }
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish packed file-fence fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed file-fence scan");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: None,
+            root_base_cache: None,
+        };
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![SCHEMA.to_owned()],
+                file_ids: vec![
+                    NullableKeyFilter::Value(RETIRED_FILE.to_owned()),
+                    NullableKeyFilter::Value(LIVE_FILE.to_owned()),
+                ],
+                ..Default::default()
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["change_id".to_owned()],
+            },
+            limit: Some(1),
+        };
+        let visible = reader
+            .scan_live_batch_for_generation(BRANCH, generation, None, &request)
+            .await
+            .expect("limited packed scan should apply file fence before limit");
+        assert_eq!(visible.len(), 1);
+        let row = visible.iter().next().expect("one live packed row");
+        assert_eq!(row.file_id(), Some(LIVE_FILE));
+        assert_eq!(row.row_pk(), &RowPk::single("live-after-fence"));
+    }
+
+    #[tokio::test]
+    async fn packed_identity_membership_declines_root_backed_generation() {
+        const BRANCH: &str = "packed-membership-root-backed-branch";
+        const SCHEMA: &str = "packed_membership_root_backed_rows";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("packed-membership-root-generation");
+        let root_commit = CommitId::for_test_label("packed-membership-root-base");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            ROOT_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH, generation))),
+            StorageValue {
+                bytes: Bytes::copy_from_slice(root_commit.as_uuid().as_bytes()),
+            },
+        );
+        let mut base_key = hot_scope_prefix(BRANCH, generation);
+        base_key.extend_from_slice(root_commit.as_uuid().as_bytes());
+        writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(base_key)),
+            StorageValue {
+                bytes: Bytes::from(packed_current_base_value(None, None).expect("base ref")),
+            },
+        );
+        writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        stage_packed_exclusive_schema_base_ref(
+            &mut writes,
+            BRANCH,
+            generation,
+            SCHEMA,
+            root_commit,
+        );
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: 1,
+                ordered_identity_digest: Some([7; 32]),
+            },
+        )
+        .expect("stage exact packed collection control");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish root-backed packed membership fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open root-backed membership read");
+        let reader = HotStateStoreReader {
+            store: &read,
+            transaction_cache: Some(Arc::new(HotStateTransactionCache::default())),
+            root_base_cache: None,
+        };
+        assert!(
+            reader
+                .prepare_packed_identity_membership(BRANCH, generation, SCHEMA)
+                .await
+                .expect("root-backed membership should decline")
+                .is_none()
+        );
     }
 
     #[tokio::test]

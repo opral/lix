@@ -59,7 +59,10 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
             }
             filter.file_ids = vec![NullableKeyFilter::Null];
         }
-        let collection = load_hot_collection_visibility_control(
+        if hot_schema_has_collection_fence(&self.store, branch_id, generation, schema_key).await? {
+            return Ok(None);
+        }
+        let collection = load_hot_collection_control(
             &self.store,
             branch_id,
             generation,
@@ -190,7 +193,10 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
             }
             filter.file_ids = vec![NullableKeyFilter::Null];
         }
-        let collection = load_hot_collection_visibility_control(
+        if hot_schema_has_collection_fence(&self.store, branch_id, generation, schema_key).await? {
+            return Ok(None);
+        }
+        let collection = load_hot_collection_control(
             &self.store,
             branch_id,
             generation,
@@ -221,10 +227,7 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
                 // One physical value is admitted at a time. Decode only its
                 // identity and fixed header; never construct a row batch that
                 // can retain payload-bearing durable predecessors.
-                let (page, more) = cursor
-                    .next_page(1)
-                    .await?
-                    .into_parts();
+                let (page, more) = cursor.next_page(1).await?.into_parts();
                 let Some(entry) = page.into_iter().next() else {
                     if !more {
                         break;
@@ -236,9 +239,7 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
                     .0
                     .len()
                     .checked_add(match &entry.value {
-                        StorageProjectedValue::FullValue(value) => {
-                            value.len()
-                        }
+                        StorageProjectedValue::FullValue(value) => value.len(),
                         StorageProjectedValue::KeyOnly => 0,
                     })
                     .ok_or_else(|| head_value_error("bounded scan byte count overflow"))?;
@@ -275,10 +276,10 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
                         // RowPk string/byte parts are slices of this key's
                         // Bytes allocation. This total is therefore a
                         // conservative measure of retained identity storage.
-                        scan.identity_bytes = scan
-                            .identity_bytes
-                            .checked_add(identity.key.len())
-                            .ok_or_else(|| head_value_error("identity byte count overflow"))?;
+                        scan.identity_bytes =
+                            scan.identity_bytes
+                                .checked_add(identity.key.len())
+                                .ok_or_else(|| head_value_error("identity byte count overflow"))?;
                         let HotScanIdentity {
                             key,
                             row_pk,
@@ -307,13 +308,8 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
     ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
-        self.try_scan_limited_live_batch_inner(
-            branch_id,
-            control,
-            request,
-            requested_untracked,
-        )
-        .await
+        self.try_scan_limited_live_batch_inner(branch_id, control, request, requested_untracked)
+            .await
     }
 
     async fn try_scan_limited_live_batch_inner(
@@ -364,7 +360,10 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
             }
             filter.file_ids = vec![NullableKeyFilter::Null];
         }
-        let collection = load_hot_collection_visibility_control(
+        if hot_schema_has_collection_fence(&self.store, branch_id, generation, schema_key).await? {
+            return Ok(None);
+        }
+        let collection = load_hot_collection_control(
             &self.store,
             branch_id,
             generation,
@@ -374,9 +373,8 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
             },
         )
         .await?;
-        let replaced = (collection.active_generation != generation).then_some(collection);
-        if replaced.is_some_and(|control| control.live_count == 0) {
-            return Ok(Some(MaterializedHotStateBatch::default()));
+        if collection.active_generation != generation {
+            return Ok(None);
         }
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut result = MaterializedHotStateBatchBuilder::with_capacity(
@@ -396,10 +394,7 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
             while result.len() < limit {
                 let page_limit =
                     (limit - result.len()).min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS);
-                let (page, more) = cursor
-                    .next_page(page_limit)
-                    .await?
-                    .into_parts();
+                let (page, more) = cursor.next_page(page_limit).await?.into_parts();
                 let mut entries = Vec::with_capacity(page.len());
                 for entry in page {
                     let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
@@ -407,13 +402,9 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
                         entries.push((identity, full_value_bytes(entry.value)?));
                     }
                 }
-                let mut entries = HotScanEntries::Decoded(entries);
-                if let Some(control) = replaced {
-                    filter_hot_scan_entries_by_collection_generation(&mut entries, control)?;
-                }
                 let rows = materialize_hot_scan_entries(
                     &self.store,
-                    entries,
+                    HotScanEntries::Decoded(entries),
                     projection,
                     branch_id,
                     control.working_diff_checkpoint_commit_id,

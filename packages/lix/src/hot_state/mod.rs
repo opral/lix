@@ -53,6 +53,8 @@ pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use tracked_head::stage_hot_collection_live_count_for_test;
 #[cfg(test)]
+pub(crate) use tracked_head::stage_hot_collection_control_for_test;
+#[cfg(test)]
 pub(crate) use tracked_head::encode_hot_row_key_for_test;
 pub(crate) use tracked_head::hot_generation_scope_prefix;
 pub(crate) use tracked_head::stage_retire_hot_generation;

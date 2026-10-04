@@ -602,6 +602,31 @@ impl<S> HotStateContextReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Replays the exact collection-control dependency without requesting
+    /// count or ordered-identity authority. Partial candidate readers use
+    /// this point-only path because their control-plane adapter does not
+    /// support sibling-scope scans.
+    pub(crate) async fn collection_generation_active_token(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<CommitId>, LixError> {
+        let controls = load_branch_head_controls(
+            &self.store,
+            &[branch_id.to_owned()],
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
+        let Some(control) = controls.get(branch_id).copied() else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .reader(&self.store)
+            .collection_generation_active_token(branch_id, control.tracked_generation, scope)
+            .await
+            .map(Some)
+    }
+
     pub(crate) async fn exact_count_with_bounded_global_overlay(
         &self,
         request: &HotStateScanRequest,
@@ -694,11 +719,31 @@ where
         else {
             return Ok(None);
         };
-        if local_collection.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
+        if local_collection.active_generation != local_branch_control.tracked_generation
+            || global_collection.active_generation != global_branch_control.tracked_generation
+            || local_collection.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
             || global_collection.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
             || global_collection.live_count > EXACT_COUNT_GLOBAL_MAX_ENTRIES as u64
         {
             return Ok(None);
+        }
+        for (candidate_branch_id, candidate_generation) in [
+            (branch_id.as_str(), local_branch_control.tracked_generation),
+            (GLOBAL_BRANCH_ID, global_branch_control.tracked_generation),
+        ] {
+            if tracked
+                .schema_collection_count_may_be_stale(
+                    candidate_branch_id,
+                    candidate_generation,
+                    schema_key,
+                )
+                .await?
+            {
+                // Legacy finite controls can predate newer collection fences,
+                // and root-backed counts do not certify all inherited scope
+                // members. Fall back to the ordinary visibility scan.
+                return Ok(None);
+            }
         }
 
         let mut visible_global_rows = 0_u64;
@@ -4351,7 +4396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_count_rechecks_nonzero_global_overlay_across_collection_fence() {
+    async fn exact_count_declines_deferred_global_count_after_collection_fence() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
         let branch_id = "exact-count-global-fence-branch";
@@ -4462,15 +4507,18 @@ mod tests {
             .expect("global collection control should load")
             .expect("global collection control should exist");
         assert_eq!(collection.active_generation, marker_head);
-        assert_eq!(collection.live_count, 1);
+        assert_eq!(
+            collection.live_count,
+            crate::collection_generation::DEFERRED_LIVE_COUNT
+        );
         let reader = hot_state.reader(&read);
         assert_eq!(
             reader
                 .exact_count_with_bounded_global_overlay(&request)
                 .await
-                .expect("finite post-fence controls should count"),
-            Some(2),
-            "the one local row and one post-fence global row should remain visible"
+                .expect("post-fence counts should use the regular scan"),
+            None,
+            "a collection fence cannot prove an exact count while untracked survivors are possible"
         );
         assert_eq!(
             reader
@@ -4757,7 +4805,678 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_count_trusts_finite_control_across_collection_generation_fence() {
+    async fn exact_count_declines_legacy_finite_schema_count_after_file_replacement() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hot_state = hot_state_context();
+        let branch_id = "exact-count-file-fence-branch";
+        let schema_key = "exact_count_file_fence_rows";
+        let local_keep = RowPk::single("local-keep");
+        let shared_pk = RowPk::single("shared-row");
+        let retired_file_pk = RowPk::single("retired-file-row");
+        let global_only = RowPk::single("global-only");
+        let local_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0001_0000_7000_8000_0000_0000_0000,
+        ));
+        let marker_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0002_0000_7000_8000_0000_0000_0000,
+        ));
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("exact-count-file-fence-global-head"),
+            &[
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &shared_pk,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"shadowed-global"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &global_only,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"global"}"#),
+                    deleted: false,
+                },
+            ],
+        )
+        .await;
+        let local_generation = stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            branch_id,
+            None,
+            local_head,
+            &[
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &local_keep,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"local"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &shared_pk,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"shadowing-local"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &retired_file_pk,
+                    file_id: Some("replaced-file"),
+                    snapshot: Some(r#"{"value":"retired"}"#),
+                    deleted: false,
+                },
+            ],
+        )
+        .await;
+
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: Some("replaced-file"),
+        };
+        let marker_pk = RowPk::single(crate::collection_generation::collection_scope_key(scope));
+        stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            branch_id,
+            Some(local_generation),
+            marker_head,
+            &[DirectTrackedHeadRow {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
+                row_pk: &marker_pk,
+                file_id: None,
+                snapshot: Some("{}"),
+                deleted: false,
+            }],
+        )
+        .await;
+
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                ..HotStateFilter::default()
+            },
+            projection: HotStateProjection {
+                columns: vec!["change_id".to_owned()],
+            },
+            ..HotStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open exact-count read");
+        let branch_control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .expect("local branch control should load")
+            .expect("local branch control should exist");
+        let collection_scope = crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: None,
+        };
+        let aggregate = TrackedHeadContext::new()
+            .reader(&read)
+            .stored_collection_generation(
+                branch_id,
+                branch_control.tracked_generation,
+                collection_scope,
+            )
+            .await
+            .expect("schema aggregate should load")
+            .expect("schema aggregate should exist");
+        assert_eq!(
+            aggregate.live_count,
+            crate::collection_generation::DEFERRED_LIVE_COUNT,
+            "a new file marker must invalidate the schema-wide aggregate"
+        );
+        assert_eq!(
+            hot_state
+                .reader(&read)
+                .exact_count_with_bounded_global_overlay(&request)
+                .await
+                .expect("new file fences should use the regular scan"),
+            None
+        );
+        drop(read);
+
+        // Reproduce a repository written before file-marker publication began
+        // invalidating the schema aggregate: the old finite count (3) remains
+        // beside the newer file-scope fence.
+        let mut legacy_writes = storage.new_write_set();
+        crate::hot_state::stage_hot_collection_live_count_for_test(
+            &mut legacy_writes,
+            branch_id,
+            branch_control.tracked_generation,
+            schema_key,
+            3,
+        )
+        .expect("legacy finite schema control should stage");
+        storage
+            .commit_write_set(legacy_writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy finite schema control should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reopen exact-count read");
+        let reader = hot_state.reader(&read);
+        assert_eq!(
+            reader
+                .exact_count_with_bounded_global_overlay(&request)
+                .await
+                .expect("legacy file fences should fall back"),
+            None,
+            "a finite schema count cannot cover a newer file-scope replacement"
+        );
+        assert_eq!(
+            reader
+                .scan_batch(&request)
+                .await
+                .expect("regular scan should apply file fence and global shadowing")
+                .len(),
+            3,
+            "the file row is retired, the local collision wins, and the other global row remains"
+        );
+
+        let mut payload_request = request;
+        payload_request.projection.columns = vec!["snapshot_content".to_owned()];
+        let rows = reader
+            .scan_batch(&payload_request)
+            .await
+            .expect("payload scan should use regular visibility")
+            .into_rows();
+        let shared_rows = rows
+            .iter()
+            .filter(|row| row.row_pk == shared_pk)
+            .collect::<Vec<_>>();
+        assert_eq!(shared_rows.len(), 1);
+        assert!(!shared_rows[0].global);
+        assert_eq!(
+            shared_rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"shadowing-local"}"#)
+        );
+
+        let mut exact_request = payload_request;
+        exact_request.filter.row_pks = vec![shared_pk.clone()];
+        let exact_rows = reader
+            .scan_batch(&exact_request)
+            .await
+            .expect("exact point scan should apply file and schema fences")
+            .into_rows();
+        assert_eq!(exact_rows.len(), 1);
+        assert!(!exact_rows[0].global);
+        assert_eq!(
+            exact_rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"shadowing-local"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_count_declines_legacy_global_file_fence_count() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hot_state = hot_state_context();
+        let branch_id = "exact-count-global-file-fence-branch";
+        let schema_key = "exact_count_global_file_fence_rows";
+        let local_pk = RowPk::single("local-row");
+        let global_shared = RowPk::single("shared-row");
+        let global_only = RowPk::single("global-only");
+        let retired_file_pk = RowPk::single("retired-global-file-row");
+        stage_direct_tracked_head_rows(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("exact-count-global-file-fence-local-head"),
+            &[
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &local_pk,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"local"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &global_shared,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"local"}"#),
+                    deleted: false,
+                },
+            ],
+        )
+        .await;
+        let global_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0001_0000_7000_8000_0000_0000_0000,
+        ));
+        let marker_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0002_0000_7000_8000_0000_0000_0000,
+        ));
+        let global_generation = stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            None,
+            global_head,
+            &[
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &global_shared,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"shadowed-global"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &global_only,
+                    file_id: None,
+                    snapshot: Some(r#"{"value":"global"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key,
+                    row_pk: &retired_file_pk,
+                    file_id: Some("global-replaced-file"),
+                    snapshot: Some(r#"{"value":"retired"}"#),
+                    deleted: false,
+                },
+            ],
+        )
+        .await;
+        let marker_scope = crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: Some("global-replaced-file"),
+        };
+        let marker_pk = RowPk::single(crate::collection_generation::collection_scope_key(
+            marker_scope,
+        ));
+        stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            Some(global_generation),
+            marker_head,
+            &[DirectTrackedHeadRow {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
+                row_pk: &marker_pk,
+                file_id: None,
+                snapshot: Some("{}"),
+                deleted: false,
+            }],
+        )
+        .await;
+
+        // Restore the old finite aggregate beside the producer-created file
+        // marker; this is the metadata shape persisted by affected versions.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open global generation read");
+        let global_head = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(GLOBAL_BRANCH_ID)
+            .await
+            .expect("global branch control should load")
+            .expect("global branch control should exist");
+        drop(read);
+        assert_eq!(global_head.tracked_generation, global_generation);
+        let mut legacy_writes = storage.new_write_set();
+        crate::hot_state::stage_hot_collection_live_count_for_test(
+            &mut legacy_writes,
+            GLOBAL_BRANCH_ID,
+            global_generation,
+            schema_key,
+            3,
+        )
+        .expect("legacy finite global control should stage");
+        storage
+            .commit_write_set(legacy_writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy finite global control should commit");
+
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                ..HotStateFilter::default()
+            },
+            projection: HotStateProjection {
+                columns: vec!["change_id".to_owned()],
+            },
+            ..HotStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open exact-count read");
+        let reader = hot_state.reader(&read);
+        assert_eq!(
+            reader
+                .exact_count_with_bounded_global_overlay(&request)
+                .await
+                .expect("legacy global file fences should fall back"),
+            None,
+            "the global aggregate must also be checked for file-scope fences"
+        );
+        assert_eq!(
+            reader
+                .scan_batch(&request)
+                .await
+                .expect("regular scan should apply the global file fence")
+                .len(),
+            3,
+            "the retired global file row is hidden, local row shadows its collision, and another global row remains"
+        );
+        let mut payload_request = request;
+        payload_request.projection.columns = vec!["snapshot_content".to_owned()];
+        let rows = reader
+            .scan_batch(&payload_request)
+            .await
+            .expect("payload scan should use regular visibility")
+            .into_rows();
+        let shared_rows = rows
+            .iter()
+            .filter(|row| row.row_pk == global_shared)
+            .collect::<Vec<_>>();
+        assert_eq!(shared_rows.len(), 1);
+        assert!(!shared_rows[0].global);
+        assert_eq!(
+            shared_rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"local"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_count_declines_legacy_finite_count_for_root_backed_branch() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hot_state = hot_state_context();
+        let branch_id = "exact-count-root-file-fence-branch";
+        let schema_key = "exact_count_root_file_fence_rows";
+        let old_file_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0001_0000_7000_8000_0000_0000_0000,
+        ));
+        let marker_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0002_0000_7000_8000_0000_0000_0000,
+        ));
+        let root_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0003_0000_7000_8000_0000_0000_0000,
+        ));
+        let file_pk = RowPk::single("root-retired-row");
+        let keep_pk = RowPk::single("root-kept-row");
+        let marker_scope = crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: Some("root-replaced-file"),
+        };
+        let marker_pk = RowPk::single(crate::collection_generation::collection_scope_key(
+            marker_scope,
+        ));
+        let mut root_rows = vec![
+            mixed_file_root_row(
+                schema_key,
+                file_pk,
+                Some("root-replaced-file"),
+                Some(r#"{"value":"retired"}"#),
+                false,
+                "exact-count-root-file-row",
+                old_file_commit,
+            ),
+            mixed_file_root_row(
+                schema_key,
+                keep_pk,
+                None,
+                Some(r#"{"value":"kept"}"#),
+                false,
+                "exact-count-root-unfiled-row",
+                marker_commit,
+            ),
+            mixed_file_root_row(
+                crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
+                marker_pk,
+                None,
+                Some("{}"),
+                false,
+                "exact-count-root-file-marker",
+                marker_commit,
+            ),
+        ];
+        root_rows[2].created_at = "2026-01-01T00:00:01Z".to_owned();
+        root_rows[2].updated_at = "2026-01-01T00:00:01Z".to_owned();
+        stage_root_tracked_head_rows(&storage, branch_id, root_head, &root_rows).await;
+        let global_tombstone = RowPk::single("global-tombstone");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("exact-count-root-file-global-control"),
+            &[DirectTrackedHeadRow {
+                schema_key,
+                row_pk: &global_tombstone,
+                file_id: None,
+                snapshot: None,
+                deleted: true,
+            }],
+        )
+        .await;
+        let mut legacy_writes = storage.new_write_set();
+        crate::hot_state::stage_hot_collection_live_count_for_test(
+            &mut legacy_writes,
+            branch_id,
+            root_head,
+            schema_key,
+            2,
+        )
+        .expect("legacy finite root-backed control should stage");
+        storage
+            .commit_write_set(legacy_writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy finite root-backed control should commit");
+
+        let request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                ..HotStateFilter::default()
+            },
+            projection: HotStateProjection {
+                columns: vec!["change_id".to_owned()],
+            },
+            ..HotStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open root-backed exact-count read");
+        let collection = TrackedHeadContext::new()
+            .reader(&read)
+            .collection_generation(
+                branch_id,
+                root_head,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: None,
+                },
+            )
+            .await
+            .expect("root-backed collection metadata should load");
+        assert_eq!(
+            collection.live_count,
+            crate::collection_generation::DEFERRED_LIVE_COUNT,
+            "root marker catalogs must invalidate finite HOT schema aggregates"
+        );
+        assert_eq!(collection.ordered_identity_digest, None);
+        let reader = hot_state.reader(&read);
+        assert_eq!(
+            reader
+                .exact_count_with_bounded_global_overlay(&request)
+                .await
+                .expect("root-backed aggregates should fall back"),
+            None,
+            "a root marker catalog is not bounded by the finite HOT count"
+        );
+        assert_eq!(
+            reader
+                .scan_batch(&request)
+                .await
+                .expect("regular root scan should apply its file fence")
+                .len(),
+            1,
+            "the old file row is hidden while the unfiled root row remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_count_fence_preserves_untracked_survivor_visibility() {
+        let storage = StorageAdapter::new(Memory::new());
+        let hot_state = hot_state_context();
+        let branch_id = "exact-count-untracked-fence-branch";
+        let schema_key = "exact_count_untracked_fence_rows";
+        let local_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0001_0000_7000_8000_0000_0000_0000,
+        ));
+        let marker_head = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0000_0002_0000_7000_8000_0000_0000_0000,
+        ));
+        let tracked_pk = RowPk::single("tracked-retired");
+        let untracked_pk = RowPk::single("untracked-survivor");
+        let local_generation = stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            branch_id,
+            None,
+            local_head,
+            &[DirectTrackedHeadRow {
+                schema_key,
+                row_pk: &tracked_pk,
+                file_id: None,
+                snapshot: Some(r#"{"value":"tracked"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
+        let untracked_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open untracked write read");
+        write_untracked_rows_to_store(
+            &storage,
+            &untracked_read,
+            &[MaterializedUntrackedStateRow {
+                row_pk: untracked_pk.clone(),
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+                snapshot_content: Some(r#"{"value":"untracked"}"#.to_owned()),
+                metadata: None,
+                deleted: false,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                branch_id: branch_id.to_owned(),
+            }],
+        )
+        .await;
+        drop(untracked_read);
+
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: None,
+        };
+        let marker_pk = RowPk::single(crate::collection_generation::collection_scope_key(scope));
+        stage_direct_tracked_head_rows_in_generation(
+            &storage,
+            branch_id,
+            Some(local_generation),
+            marker_head,
+            &[DirectTrackedHeadRow {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY,
+                row_pk: &marker_pk,
+                file_id: None,
+                snapshot: Some("{}"),
+                deleted: false,
+            }],
+        )
+        .await;
+        let global_tombstone = RowPk::single("global-control");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("exact-count-untracked-global-control"),
+            &[DirectTrackedHeadRow {
+                schema_key,
+                row_pk: &global_tombstone,
+                file_id: None,
+                snapshot: None,
+                deleted: true,
+            }],
+        )
+        .await;
+
+        // Recreate a legacy marker control that stored finite zero even though
+        // the row-level fence deliberately leaves untracked members visible.
+        let mut legacy_writes = storage.new_write_set();
+        crate::hot_state::stage_hot_collection_control_for_test(
+            &mut legacy_writes,
+            branch_id,
+            local_generation,
+            schema_key,
+            None,
+            marker_head,
+            0,
+        )
+        .expect("legacy zero schema control should stage");
+        storage
+            .commit_write_set(legacy_writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy zero schema control should commit");
+
+        let count_request = HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                branch_ids: vec![branch_id.to_owned()],
+                ..HotStateFilter::default()
+            },
+            projection: HotStateProjection {
+                columns: vec!["change_id".to_owned()],
+            },
+            ..HotStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open legacy fenced read");
+        let reader = hot_state.reader(&read);
+        let collection = TrackedHeadContext::new()
+            .reader(&read)
+            .stored_collection_generation(branch_id, local_generation, scope)
+            .await
+            .expect("legacy schema control should load")
+            .expect("legacy schema control should exist");
+        assert_eq!(
+            collection.live_count,
+            crate::collection_generation::DEFERRED_LIVE_COUNT,
+            "a finite count from an older scope generation must be normalized"
+        );
+        assert_eq!(
+            reader
+                .exact_count_with_bounded_global_overlay(&count_request)
+                .await
+                .expect("legacy fence should use normal count scan"),
+            None
+        );
+        let mut payload_request = count_request;
+        payload_request.projection.columns = vec!["snapshot_content".to_owned()];
+        let rows = reader
+            .scan_batch(&payload_request)
+            .await
+            .expect("ordinary scan should keep untracked survivor")
+            .into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row_pk, untracked_pk);
+        assert!(rows[0].untracked);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"untracked"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_count_declines_control_across_collection_generation_fence() {
         let storage = StorageAdapter::new(Memory::new());
         let hot_state = hot_state_context();
         let branch_id = "exact-count-fenced-branch";
@@ -4866,20 +5585,32 @@ mod tests {
             .await
             .expect("stored collection control should load")
             .expect("stored collection control should exist");
-        assert_eq!(collection.live_count, 0);
+        assert_eq!(
+            collection.live_count,
+            crate::collection_generation::DEFERRED_LIVE_COUNT
+        );
         assert_ne!(
             collection.active_generation, branch_control.tracked_generation,
             "a collection marker fence is distinct from the serving branch generation"
         );
         assert_eq!(collection.active_generation, marker_head);
+        let reader = hot_state.reader(&read);
         assert_eq!(
             hot_state
                 .reader(&read)
                 .exact_count_with_bounded_global_overlay(&request)
                 .await
-                .expect("finite post-fence counts should remain usable"),
-            Some(0),
-            "the retired local row and tombstoned global row should not count"
+                .expect("post-fence counts should use the regular scan"),
+            None,
+            "fenced controls cannot certify an aggregate while untracked survivors are possible"
+        );
+        assert_eq!(
+            reader
+                .scan_batch(&request)
+                .await
+                .expect("regular scan should apply the schema fence")
+                .len(),
+            0
         );
     }
 
