@@ -11393,6 +11393,10 @@ pub(crate) async fn load_commit_delta_parts_members_with_payloads_for_schema(
         selected.push((manifest, *part_index, part));
     }
 
+    #[cfg(test)]
+    COMMIT_DELTA_PART_LOAD_PROBE.with(|probe| {
+        probe.set(probe.get().saturating_add(selected_parts.len()))
+    });
     let values = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
@@ -11438,6 +11442,21 @@ pub(crate) async fn load_commit_delta_parts_members_with_payloads_for_schema(
         decoded_parts.push(members);
     }
     Ok(Some(decoded_parts))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMMIT_DELTA_PART_LOAD_PROBE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_commit_delta_part_loads_for_test() {
+    COMMIT_DELTA_PART_LOAD_PROBE.with(|probe| probe.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_commit_delta_part_loads_for_test() -> usize {
+    COMMIT_DELTA_PART_LOAD_PROBE.with(|probe| probe.replace(0))
 }
 
 /// Loads logical history members, including every selected row in a

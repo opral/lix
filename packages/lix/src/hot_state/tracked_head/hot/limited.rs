@@ -80,10 +80,9 @@ impl<S: StorageAdapterRead> HotStateStoreReader<S> {
         let mut physical_entries = 0_usize;
         let mut physical_bytes = 0_usize;
         for prefix in prefixes {
-            let range = StoragePrefix {
-                bytes: Bytes::from(prefix),
-            }
-            .to_range()?;
+            let Some(range) = hot_file_row_pk_range(prefix, &filter)? else {
+                continue;
+            };
             let mut cursor = self
                 .store
                 .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())

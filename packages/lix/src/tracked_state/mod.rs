@@ -76,6 +76,10 @@ pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
 pub(crate) use storage::load_commit_state_authority_ids;
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
+pub(crate) use storage::{
+    reset_commit_delta_part_loads_for_test, take_commit_delta_part_loads_for_test,
+};
+#[cfg(test)]
 pub(crate) use storage::stage_sweep_unreachable_content_nodes;
 pub(crate) use storage::{
     AuthoritativeLiveChangeRequest, CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator,

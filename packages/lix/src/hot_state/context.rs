@@ -1028,11 +1028,7 @@ where
     where
         S: Clone + Send + Sync + 'static,
     {
-        if request.limit.is_some()
-            || !request.filter.row_pks.is_empty()
-            || request.filter.row_pk_lower.is_some()
-            || request.filter.row_pk_upper.is_some()
-        {
+        if request.limit.is_some() || !request.filter.row_pks.is_empty() {
             return Ok(None);
         }
         let Some((branch_id, control, schema_key)) =
@@ -1065,7 +1061,13 @@ where
         let Some(local_pages) = self
             .tracked_head
             .reader(self.store.clone())
-            .scan_packed_row_snapshot_pages(&branch_id, control, &schema_key)
+            .scan_packed_row_snapshot_pages(
+                &branch_id,
+                control,
+                &schema_key,
+                request.filter.row_pk_lower.clone(),
+                request.filter.row_pk_upper.clone(),
+            )
             .await?
         else {
             return Ok(None);
@@ -1102,6 +1104,8 @@ where
             let global_scan = TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![schema_key.clone()],
+                    row_pk_lower: request.filter.row_pk_lower.clone(),
+                    row_pk_upper: request.filter.row_pk_upper.clone(),
                     include_tombstones: true,
                     ..TrackedStateFilter::default()
                 },

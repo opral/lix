@@ -5501,7 +5501,8 @@ mod tests {
             None,
         );
         let segment_len = decode_immutable_locator(&markers[0])
-            .expect("extent fixture locator should decode").segment_len;
+            .expect("extent fixture locator should decode")
+            .segment_len;
         let before_random = counters.snapshot();
         for index in [1_usize, 9, 17, 25] {
             let value = random_store

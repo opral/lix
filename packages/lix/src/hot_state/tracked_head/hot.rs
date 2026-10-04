@@ -2206,6 +2206,8 @@ async fn packed_snapshot_stream_plan(
     branch_id: &str,
     generation: CommitId,
     schema_key: &str,
+    row_pk_lower: Option<&crate::tracked_state::RowPkRangeBound>,
+    row_pk_upper: Option<&crate::tracked_state::RowPkRangeBound>,
 ) -> Result<Option<(Vec<PackedSnapshotStreamPlan>, u64)>, LixError> {
     let prefix = crate::tracked_state::encode_schema_file_prefix(schema_key, None);
     let Some(upper) = packed_key_prefix_successor(&prefix) else {
@@ -2215,6 +2217,26 @@ async fn packed_snapshot_stream_plan(
     let Some(schema_upper) = packed_key_prefix_successor(&schema_prefix) else {
         return Ok(None);
     };
+    let encoded_lower = row_pk_lower.map(|bound| {
+        (
+            crate::tracked_state::encode_key_ref(TrackedStateKeyRef {
+                schema_key,
+                file_id: None,
+                row_pk: &bound.row_pk,
+            }),
+            bound.inclusive,
+        )
+    });
+    let encoded_upper = row_pk_upper.map(|bound| {
+        (
+            crate::tracked_state::encode_key_ref(TrackedStateKeyRef {
+                schema_key,
+                file_id: None,
+                row_pk: &bound.row_pk,
+            }),
+            bound.inclusive,
+        )
+    });
     let Some(active) = packed_current_base_refs_for_stream(
         store,
         branch_id,
@@ -2567,7 +2589,58 @@ async fn packed_snapshot_stream_plan(
     {
         return Ok(None);
     }
+    if encoded_lower.is_some() || encoded_upper.is_some() {
+        let mut full_part_counts = BTreeMap::<CommitId, usize>::new();
+        for plan in &plans {
+            *full_part_counts.entry(plan.commit_id).or_default() += 1;
+        }
+        plans.retain(|plan| {
+            packed_snapshot_part_intersects_row_pk_range(
+                &plan.first_key,
+                &plan.last_key,
+                encoded_lower.as_ref(),
+                encoded_upper.as_ref(),
+            )
+        });
+        let mut retained_part_counts = BTreeMap::<CommitId, usize>::new();
+        for plan in &plans {
+            *retained_part_counts.entry(plan.commit_id).or_default() += 1;
+        }
+        // A lifecycle identity digest authenticates the whole commit. A
+        // bounded PK range deliberately reads only intersecting parts, so it
+        // cannot compare a partial identity hash with the commit-wide digest.
+        // Keep that cross-part proof for commits whose every part survived.
+        for plan in &mut plans {
+            if retained_part_counts.get(&plan.commit_id)
+                != full_part_counts.get(&plan.commit_id)
+            {
+                plan.lifecycle_identity_digest = None;
+            }
+        }
+    }
     Ok(Some((plans, base_live_count)))
+}
+
+fn packed_snapshot_part_intersects_row_pk_range(
+    first_key: &[u8],
+    last_key: &[u8],
+    lower: Option<&(Vec<u8>, bool)>,
+    upper: Option<&(Vec<u8>, bool)>,
+) -> bool {
+    if let (Some((lower_key, lower_inclusive)), Some((upper_key, upper_inclusive))) =
+        (lower, upper)
+        && (lower_key > upper_key
+            || (lower_key == upper_key && (!*lower_inclusive || !*upper_inclusive)))
+    {
+        return false;
+    }
+    let ends_before_lower = lower.is_some_and(|(key, inclusive)| {
+        last_key < key.as_slice() || (!*inclusive && last_key == key.as_slice())
+    });
+    let starts_after_upper = upper.is_some_and(|(key, inclusive)| {
+        first_key > key.as_slice() || (!*inclusive && first_key == key.as_slice())
+    });
+    !ends_before_lower && !starts_after_upper
 }
 
 fn packed_snapshot_part_escapes_unfiled_schema_range(
@@ -5737,6 +5810,8 @@ where
         branch_id: &str,
         control: BranchHeadControl,
         schema_key: &str,
+        row_pk_lower: Option<crate::tracked_state::RowPkRangeBound>,
+        row_pk_upper: Option<crate::tracked_state::RowPkRangeBound>,
     ) -> Result<
         Option<
             BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
@@ -5773,32 +5848,54 @@ where
             branch_id,
             control.tracked_generation,
             schema_key,
+            row_pk_lower.as_ref(),
+            row_pk_upper.as_ref(),
         )
         .await?
         else {
             return Ok(None);
         };
-        if plans.is_empty() {
+        let has_pk_bounds = row_pk_lower.is_some() || row_pk_upper.is_some();
+        if plans.is_empty() && !has_pk_bounds {
             return Ok(None);
         }
 
         let filter = TrackedStateFilter {
             schema_keys: vec![schema_key.to_owned()],
+            row_pk_lower: row_pk_lower.clone(),
+            row_pk_upper: row_pk_upper.clone(),
             include_tombstones: true,
             ..TrackedStateFilter::default()
         };
-        let Some(entries) = hot_scan_entries_with_physical_entry_limit(
-            &self.store,
-            branch_id,
-            control.tracked_generation,
-            &filter,
-            None,
-            Some(ROW_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
-            Some(PACKED_SNAPSHOT_STREAM_MAX_OVERLAY_ROWS),
-        )
-        .await?
-        else {
-            return Ok(None);
+        let entries = if has_pk_bounds {
+            let Some(entries) = hot_scan_unfiled_row_pk_range_with_physical_entry_limit(
+                &self.store,
+                branch_id,
+                control.tracked_generation,
+                &filter,
+                ROW_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES,
+                PACKED_SNAPSHOT_STREAM_MAX_OVERLAY_ROWS,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            entries
+        } else {
+            let Some(entries) = hot_scan_entries_with_physical_entry_limit(
+                &self.store,
+                branch_id,
+                control.tracked_generation,
+                &filter,
+                None,
+                Some(ROW_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
+                Some(PACKED_SNAPSHOT_STREAM_MAX_OVERLAY_ROWS),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            entries
         };
         let rows = materialize_hot_scan_entries(
             &self.store,
@@ -5892,24 +5989,26 @@ where
                 }
             }
         }
-        let mut expected_live_count = base_live_count;
-        for (row_pk, row) in &overlay {
-            match base_commits.get(row_pk) {
-                Some(base_commit) if row.commit_id >= *base_commit && row.deleted => {
-                    expected_live_count = expected_live_count.checked_sub(1).ok_or_else(|| {
-                        head_value_error("packed snapshot overlay count underflow")
-                    })?;
+        let mut expected_live_count = (!has_pk_bounds).then_some(base_live_count);
+        if let Some(expected_live_count) = &mut expected_live_count {
+            for (row_pk, row) in &overlay {
+                match base_commits.get(row_pk) {
+                    Some(base_commit) if row.commit_id >= *base_commit && row.deleted => {
+                        *expected_live_count = expected_live_count.checked_sub(1).ok_or_else(|| {
+                            head_value_error("packed snapshot overlay count underflow")
+                        })?;
+                    }
+                    Some(_) => {}
+                    None if !row.deleted => {
+                        *expected_live_count = expected_live_count.checked_add(1).ok_or_else(|| {
+                            head_value_error("packed snapshot overlay count overflow")
+                        })?;
+                    }
+                    None => {}
                 }
-                Some(_) => {}
-                None if !row.deleted => {
-                    expected_live_count = expected_live_count.checked_add(1).ok_or_else(|| {
-                        head_value_error("packed snapshot overlay count overflow")
-                    })?;
-                }
-                None => {}
             }
         }
-        if expected_live_count != collection.live_count {
+        if expected_live_count.is_some_and(|count| count != collection.live_count) {
             return Ok(None);
         }
         overlay.retain(|row_pk, row| {
@@ -5929,9 +6028,11 @@ where
                 plans,
                 0_usize,
                 overlay,
-                collection.live_count,
+                expected_live_count,
                 0_u64,
                 blake3::Hasher::new(),
+                row_pk_lower,
+                row_pk_upper,
             ),
             |(
                 store,
@@ -5943,6 +6044,8 @@ where
                 expected_live_count,
                 emitted_live_count,
                 mut lifecycle_hash,
+                row_pk_lower,
+                row_pk_upper,
             )| async move {
                 if index >= plans.len() {
                     let rows = overlay
@@ -5957,7 +6060,7 @@ where
                         })
                         .collect::<Vec<_>>();
                     if rows.is_empty() {
-                        if emitted_live_count != expected_live_count {
+                        if expected_live_count.is_some_and(|expected| emitted_live_count != expected) {
                             return Err(head_value_error(
                                 "packed snapshot stream output disagrees with collection live count",
                             ));
@@ -5967,7 +6070,7 @@ where
                     let emitted_live_count = emitted_live_count
                         .checked_add(rows.len() as u64)
                         .ok_or_else(|| head_value_error("packed stream row count overflow"))?;
-                    if emitted_live_count != expected_live_count {
+                    if expected_live_count.is_some_and(|expected| emitted_live_count != expected) {
                         return Err(head_value_error(
                             "packed snapshot stream output disagrees with collection live count",
                         ));
@@ -5984,6 +6087,8 @@ where
                             expected_live_count,
                             emitted_live_count,
                             lifecycle_hash,
+                            row_pk_lower,
+                            row_pk_upper,
                         ),
                     )));
                 }
@@ -6062,6 +6167,13 @@ where
                         let payload = member.change.snapshot.ok_or_else(|| {
                             head_value_error("live packed snapshot member lost its payload")
                         })?;
+                        if !crate::tracked_state::row_pk_satisfies_bounds(
+                            &member.key.row_pk,
+                            row_pk_lower.as_ref(),
+                            row_pk_upper.as_ref(),
+                        ) {
+                            continue;
+                        }
                         if let Some(overlay_row) = overlay.remove(&member.key.row_pk) {
                             if overlay_row.commit_id >= member.value.commit_id {
                                 if !overlay_row.deleted {
@@ -6107,6 +6219,8 @@ where
                         expected_live_count,
                         emitted_live_count,
                         lifecycle_hash,
+                        row_pk_lower,
+                        row_pk_upper,
                     ),
                 )))
             },
@@ -13449,6 +13563,77 @@ async fn hot_scan_entries_with_physical_entry_limit<'a>(
     Ok(Some(HotScanEntries::Decoded(rows)))
 }
 
+/// Reads a bounded typed-PK interval from one unfiled HOT schema. The file
+/// membership marker is checked for the whole schema before narrowing the
+/// physical row-key range, so a filed identity cannot hide outside the query
+/// interval and invalidate the packed stream's scope proof.
+async fn hot_scan_unfiled_row_pk_range_with_physical_entry_limit(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    filter: &TrackedStateFilter,
+    retained_byte_budget: usize,
+    physical_entry_limit: usize,
+) -> Result<Option<HotScanEntries<'static>>, LixError> {
+    if filter.schema_keys.len() != 1
+        || !filter.row_pks.is_empty()
+        || !filter.file_ids.is_empty()
+        || (filter.row_pk_lower.is_none() && filter.row_pk_upper.is_none())
+        || hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys).await?
+    {
+        return Ok(None);
+    }
+    let mut range_filter = filter.clone();
+    range_filter.file_ids = vec![NullableKeyFilter::Null];
+    let Some(prefixes) = hot_file_scan_prefixes(branch_id, generation, &range_filter) else {
+        return Ok(None);
+    };
+    let scope = hot_scope_prefix(branch_id, generation);
+    let mut rows = Vec::new();
+    let mut physical_entries = 0_usize;
+    let mut retained_bytes = 0_usize;
+    for prefix in prefixes {
+        let Some(range) = hot_file_row_pk_range(prefix, &range_filter)? else {
+            continue;
+        };
+        let mut cursor = store
+            .begin_scan(ROW_SPACE, range, StorageBeginScanOptions::default())
+            .await?;
+        loop {
+            let (page, page_has_more) = cursor.next_page(1).await?.into_parts();
+            for entry in page {
+                physical_entries = physical_entries
+                    .checked_add(1)
+                    .ok_or_else(|| head_value_error("HOT range entry count overflow"))?;
+                if physical_entries > physical_entry_limit {
+                    return Ok(None);
+                }
+                let encoded_key_bytes = entry.key.0.len();
+                let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                #[cfg(any(test, feature = "storage-benches"))]
+                HOT_SCAN_DECODED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !identity.matches_filter(&range_filter) {
+                    continue;
+                }
+                let value = full_value_bytes(entry.value)?;
+                retained_bytes = retained_bytes
+                    .checked_add(encoded_key_bytes)
+                    .and_then(|bytes| bytes.checked_add(value.len()))
+                    .and_then(|bytes| bytes.checked_add(size_of::<(HotScanIdentity, Bytes)>()))
+                    .ok_or_else(|| head_value_error("HOT range retained byte size overflow"))?;
+                if retained_bytes > retained_byte_budget {
+                    return Ok(None);
+                }
+                rows.push((identity, value));
+            }
+            if !page_has_more {
+                break;
+            }
+        }
+    }
+    Ok(Some(HotScanEntries::Decoded(rows)))
+}
+
 fn hot_filter_has_one_fixed_file_bucket(filter: &TrackedStateFilter) -> bool {
     let Some(first) = filter.file_ids.first() else {
         return false;
@@ -16139,8 +16324,8 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let global_generation = global_control.tracked_generation;
-        let global_a = RowPk::single("global-a");
-        let global_b = RowPk::single("global-b");
+        let global_a = RowPk::single("row421.5");
+        let global_b = RowPk::single("row512.5");
         let global_a_payload = jsonb_payload(&global_a, "global-a-value");
         let global_b_payload = jsonb_payload(&global_b, "global-b-value");
         for (row_pk, snapshot, label) in [
@@ -16220,7 +16405,7 @@ mod tests {
             inner: read,
             batch_sizes: Arc::clone(&segment_batch_sizes),
         };
-        let (part_plans, _) = packed_snapshot_stream_plan(&read, BRANCH_ID, generation, SCHEMA_KEY)
+        let (part_plans, _) = packed_snapshot_stream_plan(&read, BRANCH_ID, generation, SCHEMA_KEY, None, None)
             .await.expect("batch guard fixture should plan")
             .expect("batch guard fixture should have packed parts");
         assert_eq!(part_plans.len(), 2);
@@ -16316,6 +16501,185 @@ mod tests {
             crate::row_payload::typed_row_json_conversions_for_test(),
             0,
             "raw page streaming should not convert durable JSONB to/from JSON"
+        );
+
+        let lower = crate::tracked_state::RowPkRangeBound {
+            row_pk: RowPk::single("row419"),
+            inclusive: false,
+        };
+        let upper = crate::tracked_state::RowPkRangeBound {
+            row_pk: RowPk::single("row512"),
+            inclusive: false,
+        };
+        let mut range_request = request.clone();
+        range_request.filter.row_pk_lower = Some(lower.clone());
+        range_request.filter.row_pk_upper = Some(upper.clone());
+        crate::tracked_state::reset_commit_delta_part_loads_for_test();
+        let range_pages = reader
+            .scan_direct_row_snapshot_pages_with_minimum_count(&range_request, 0)
+            .await
+            .expect("bounded packed stream should plan")
+            .expect("bounded PK interval should use the packed stream");
+        let range_batches = range_pages
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("each selected packed part should authenticate");
+        let mut range_actual = BTreeMap::new();
+        for batch in range_batches {
+            let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) = batch else {
+                panic!("bounded packed stream should preserve raw durable payloads");
+            };
+            for (row_pk, payload) in rows {
+                assert!(range_actual.insert(row_pk, payload.to_vec()).is_none());
+            }
+        }
+        let expected_range = expected
+            .iter()
+            .filter(|(row_pk, _)| {
+                crate::tracked_state::row_pk_satisfies_bounds(
+                    row_pk,
+                    Some(&lower),
+                    Some(&upper),
+                )
+            })
+            .map(|(row_pk, payload)| (row_pk.clone(), payload.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(range_actual, expected_range);
+        assert!(range_actual.contains_key(&RowPk::single("row421.5")));
+        assert!(!range_actual.contains_key(&RowPk::single("row512.5")));
+        assert_eq!(
+            crate::tracked_state::take_commit_delta_part_loads_for_test(),
+            1,
+            "the exclusive upper bound at the second part's first key should skip that part"
+        );
+        assert_eq!(
+            crate::row_payload::typed_row_json_conversions_for_test(),
+            0,
+            "bounded raw pages should not convert durable JSONB through JSON"
+        );
+
+        let full_lower = crate::tracked_state::RowPkRangeBound {
+            row_pk: RowPk::single("row000"),
+            inclusive: true,
+        };
+        let full_upper = crate::tracked_state::RowPkRangeBound {
+            row_pk: RowPk::single("row512"),
+            inclusive: true,
+        };
+        let mut inclusive_request = request.clone();
+        inclusive_request.filter.row_pk_lower = Some(full_lower.clone());
+        inclusive_request.filter.row_pk_upper = Some(full_upper.clone());
+        crate::tracked_state::reset_commit_delta_part_loads_for_test();
+        let inclusive_pages = reader
+            .scan_direct_row_snapshot_pages_with_minimum_count(&inclusive_request, 0)
+            .await
+            .expect("inclusive boundary range should plan")
+            .expect("inclusive PK bounds should use the packed stream");
+        let inclusive_batches = inclusive_pages
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("inclusive boundary parts should authenticate");
+        let mut inclusive_actual = BTreeMap::new();
+        for batch in inclusive_batches {
+            let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) = batch else {
+                panic!("inclusive boundary pages should preserve raw durable payloads");
+            };
+            for (row_pk, payload) in rows {
+                assert!(inclusive_actual.insert(row_pk, payload.to_vec()).is_none());
+            }
+        }
+        let expected_inclusive = expected
+            .iter()
+            .filter(|(row_pk, _)| {
+                crate::tracked_state::row_pk_satisfies_bounds(
+                    row_pk,
+                    Some(&full_lower),
+                    Some(&full_upper),
+                )
+            })
+            .map(|(row_pk, payload)| (row_pk.clone(), payload.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(inclusive_actual, expected_inclusive);
+        assert!(inclusive_actual.contains_key(&RowPk::single("row512")));
+        assert!(!inclusive_actual.contains_key(&RowPk::single("row512.5")));
+        assert_eq!(
+            crate::tracked_state::take_commit_delta_part_loads_for_test(),
+            2,
+            "inclusive bounds across all part fences should retain both parts"
+        );
+
+        let guard_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("file-guard branch read should open");
+        let guard_control = BranchHeadControlContext::new()
+            .reader(&guard_read)
+            .load(BRANCH_ID)
+            .await
+            .expect("file-guard branch control should load")
+            .expect("file-guard branch control should exist");
+        let next_control = guard_control
+            .next_current_state_revision()
+            .expect("file-guard branch revision should advance");
+        drop(guard_read);
+        let out_of_range_file_pk = RowPk::single("z-filed-outside-range");
+        let out_of_range_file_payload = jsonb_payload(&out_of_range_file_pk, "filed-outside-range");
+        let out_of_range_file_value = encode_head_value(&HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("packed-stream-filed-outside-range")),
+            commit_id: Some(overlay_commit),
+            author_id: crate::ANONYMOUS_ACCOUNT_ID,
+            untracked: false,
+            deleted: false,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            snapshot: Some(&out_of_range_file_payload),
+            metadata: None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        })
+        .expect("file-guard HOT row should encode");
+        let mut file_guard_writes = StorageWriteSet::new();
+        file_guard_writes.put(
+            ROW_SPACE,
+            StorageKey(Bytes::from(encode_hot_row_key_parts(
+                BRANCH_ID,
+                generation,
+                SCHEMA_KEY,
+                &out_of_range_file_pk,
+                Some("file-outside-range"),
+            ))),
+            StorageValue {
+                bytes: Bytes::from(out_of_range_file_value),
+            },
+        );
+        file_guard_writes.put(
+            FILE_SPACE,
+            StorageKey(Bytes::from(encode_hot_file_schema_key(
+                &hot_scope_prefix(BRANCH_ID, generation),
+                SCHEMA_KEY,
+            ))),
+            StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
+        stage_branch_head_control(&mut file_guard_writes, BRANCH_ID, next_control)
+            .expect("file-guard branch control should stage");
+        storage
+            .commit_write_set(file_guard_writes, StorageWriteOptions::default())
+            .await
+            .expect("file-guard HOT row should publish");
+        let file_guard_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("file-guard scan read should open");
+        let file_guard_reader = hot_state.reader(Arc::new(file_guard_read));
+        assert!(
+            file_guard_reader
+                .scan_direct_row_snapshot_pages_with_minimum_count(&range_request, 0)
+                .await
+                .expect("filed identity outside range should preserve fallback")
+                .is_none(),
+            "a filed HOT identity outside the requested PK interval must still decline the unfiled fast path"
         );
     }
 
