@@ -359,9 +359,13 @@ impl SchemaSpec {
         .map_err(lix_error_to_datafusion_error)?;
         apply_exact_row_pk_filters(&mut request, &self.spec, filters)?;
         apply_exact_file_id_filter(&mut request, exact_file_ids_from_filters(filters)?);
+        // A primary-key range is a valid logical predicate in every file
+        // scope. A single exact file owner can make it one contiguous storage
+        // interval; broad or multiple file scopes keep the same typed bounds
+        // as per-row predicates while the storage reader applies them within
+        // each scope it visits.
         if request.filter.row_pks.is_empty()
-            && request.filter.file_ids.len() == 1
-            && !matches!(request.filter.file_ids[0], crate::NullableKeyFilter::Any)
+            && !row_filters.is_empty()
             && let Some((lower, upper)) = primary_key_range(&self.spec, &row_filters)
         {
             request.filter.row_pk_lower = lower;
@@ -4569,6 +4573,134 @@ mod tests {
         lix.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn primary_key_range_sql_keeps_file_global_and_tombstone_visibility() {
+        let lix = crate::open_lix()
+            .with_storage(crate::Memory::new())
+            .await
+            .unwrap();
+        let file_a = "01920000-0000-7000-8000-0000000000a1";
+        let file_b = "01920000-0000-7000-8000-0000000000a2";
+        lix.execute(
+            &format!(
+                "INSERT INTO lix_file(id,path) VALUES ('{file_a}','/range-a'), ('{file_b}','/range-b')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            &format!(
+                "INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES \
+                 ('range-2','local-null-r2',NULL), \
+                 ('range-2','local-a-r2','{file_a}'), \
+                 ('range-3','local-a-r3','{file_a}'), \
+                 ('range-2','local-b-r2','{file_b}'), \
+                 ('range-3','local-b-r3','{file_b}')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        // A global file-backed row needs its owner in the global branch.
+        lix.execute(
+            &format!(
+                "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{file_b}','/global-range-b',TRUE)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            &format!(
+                "INSERT INTO lix_key_value(key,value,lixcol_file_id,lixcol_global) VALUES \
+                 ('range-2','global-null-r2',NULL,TRUE), \
+                 ('range-3','global-null-r3',NULL,TRUE), \
+                 ('range-3','global-b-r3','{file_b}',TRUE)",
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            &format!("DELETE FROM lix_key_value WHERE key='range-3' AND lixcol_file_id='{file_b}'"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let result = lix
+            .execute(
+                "SELECT key, value, lixcol_file_id, lixcol_global \
+                 FROM lix_key_value WHERE key >= 'range-2' AND key < 'range-4'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = result
+            .rows()
+            .iter()
+            .map(|row| {
+                let key = match row.get::<crate::Value>("key").unwrap() {
+                    crate::Value::Text(value) => value,
+                    value => panic!("unexpected key value: {value:?}"),
+                };
+                let value = match row.get::<crate::Value>("value").unwrap() {
+                    crate::Value::Jsonb(value) => value.as_json_string().unwrap(),
+                    crate::Value::Text(value) => value,
+                    value => panic!("unexpected payload value: {value:?}"),
+                };
+                let file_id = match row.get::<crate::Value>("lixcol_file_id").unwrap() {
+                    crate::Value::Null => None,
+                    crate::Value::Text(file_id) => Some(file_id),
+                    value => panic!("unexpected file ID: {value:?}"),
+                };
+                let global = match row.get::<crate::Value>("lixcol_global").unwrap() {
+                    crate::Value::Boolean(global) => global,
+                    value => panic!("unexpected global flag: {value:?}"),
+                };
+                (key, value, file_id, global)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            rows,
+            std::collections::BTreeSet::from([
+                (
+                    "range-2".to_owned(),
+                    "local-null-r2".to_owned(),
+                    None,
+                    false,
+                ),
+                (
+                    "range-3".to_owned(),
+                    "global-null-r3".to_owned(),
+                    None,
+                    true,
+                ),
+                (
+                    "range-2".to_owned(),
+                    "local-a-r2".to_owned(),
+                    Some(file_a.to_owned()),
+                    false,
+                ),
+                (
+                    "range-3".to_owned(),
+                    "local-a-r3".to_owned(),
+                    Some(file_a.to_owned()),
+                    false,
+                ),
+                (
+                    "range-2".to_owned(),
+                    "local-b-r2".to_owned(),
+                    Some(file_b.to_owned()),
+                    false,
+                ),
+            ])
+        );
+        lix.close().await.unwrap();
+    }
+
     use crate::sql2::SchemaSurfaceSpec;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6369,6 +6501,115 @@ mod tests {
         assert!(!lower.inclusive);
         assert_eq!(upper.row_pk.clone().into_parts(), vec!["45"]);
         assert!(upper.inclusive);
+    }
+
+    #[tokio::test]
+    async fn primary_key_range_pushdown_is_valid_across_all_file_scopes() {
+        let spec = row_insert_spec_with_primary_key();
+        let provider = super::SchemaSpec::active(
+            Arc::clone(&spec),
+            Arc::new(EmptyHotStateReader) as Arc<dyn HotStateReader>,
+            active_branch_ref(),
+            "branch-a".to_string(),
+            None,
+        );
+        let range = vec![
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("id")),
+                Operator::GtEq,
+                Box::new(string_literal("row-10")),
+            )),
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("id")),
+                Operator::Lt,
+                Box::new(string_literal("row-20")),
+            )),
+        ];
+
+        let (_schema, request, _row_filters) = provider
+            .plan_scan_parts(None, &range, None)
+            .await
+            .expect("unfiled and all-file range should plan");
+        assert!(request.filter.file_ids.is_empty());
+        assert_eq!(
+            request
+                .filter
+                .row_pk_lower
+                .as_ref()
+                .expect("inclusive lower key bound")
+                .row_pk
+                .clone()
+                .into_parts(),
+            vec!["row-10"]
+        );
+        assert!(
+            request
+                .filter
+                .row_pk_lower
+                .as_ref()
+                .expect("inclusive lower key bound")
+                .inclusive
+        );
+        assert_eq!(
+            request
+                .filter
+                .row_pk_upper
+                .as_ref()
+                .expect("exclusive upper key bound")
+                .row_pk
+                .clone()
+                .into_parts(),
+            vec!["row-20"]
+        );
+        assert!(
+            !request
+                .filter
+                .row_pk_upper
+                .as_ref()
+                .expect("exclusive upper key bound")
+                .inclusive
+        );
+
+        let multiple_files = Expr::InList(InList::new(
+            Box::new(column("lixcol_file_id")),
+            vec![string_literal("file-a"), string_literal("file-b")],
+            false,
+        ));
+        let mut filters = range;
+        filters.push(multiple_files);
+        let (_schema, request, _row_filters) = provider
+            .plan_scan_parts(None, &filters, None)
+            .await
+            .expect("multi-file range should plan");
+        assert_eq!(
+            request.filter.file_ids,
+            vec![
+                crate::NullableKeyFilter::Value("file-a".to_owned()),
+                crate::NullableKeyFilter::Value("file-b".to_owned()),
+            ]
+        );
+        assert_eq!(
+            request
+                .filter
+                .row_pk_lower
+                .as_ref()
+                .expect("multi-file lower bound")
+                .row_pk
+                .clone()
+                .into_parts(),
+            vec!["row-10"]
+        );
+        assert_eq!(
+            request
+                .filter
+                .row_pk_upper
+                .as_ref()
+                .expect("multi-file upper bound")
+                .row_pk
+                .clone()
+                .into_parts(),
+            vec!["row-20"]
+        );
     }
 
     #[test]
