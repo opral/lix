@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::Statistics;
+use futures_util::stream::BoxStream;
 
 use crate::LixError;
 use crate::hot_state::{
@@ -90,6 +91,23 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         &self,
         _request: HotStateScanRequest,
     ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
+        Ok(None)
+    }
+
+    /// Returns bounded raw-snapshot pages for a committed full scan. Readers
+    /// return `None` when the current generation cannot be proven as a stream
+    /// of disjoint immutable bases plus a bounded exact HOT overlay. Unlike
+    /// `scan_row_snapshots`, page batches do not promise a global primary-key
+    /// order; SQL providers using this capability must advertise no ordering.
+    async fn scan_row_snapshot_pages(
+        &self,
+        _request: HotStateScanRequest,
+    ) -> Result<
+        Option<
+            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
+        >,
+        LixError,
+    > {
         Ok(None)
     }
 
@@ -249,6 +267,24 @@ where
         self.hot_state
             .reader(self.store.clone())
             .scan_direct_row_snapshots(&request)
+            .await
+    }
+
+    async fn scan_row_snapshot_pages(
+        &self,
+        request: HotStateScanRequest,
+    ) -> Result<
+        Option<
+            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
+        >,
+        LixError,
+    > {
+        if !direct_row_snapshot_request(&request) {
+            return Ok(None);
+        }
+        self.hot_state
+            .reader(self.store.clone())
+            .scan_direct_row_snapshot_pages(&request)
             .await
     }
 

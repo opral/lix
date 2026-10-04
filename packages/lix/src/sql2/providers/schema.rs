@@ -20,6 +20,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 
@@ -59,7 +60,7 @@ use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use futures_util::stream;
 
 use super::spec::{
-    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec,
+    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec, batch_stream_source,
     batch_stream_source_with_statistics_and_source, projected_schema, register_spec_table,
     row_source, scan_row_source, take_record_batch_rows,
 };
@@ -756,8 +757,8 @@ impl TableSpec for SchemaSpec {
         .flatten();
         let direct_snapshot_reader = (!private_registry
             && direct_row_batch_eligible(&schema, &request, &row_filters))
-            .then(|| self.row_snapshot_reader.clone())
-            .flatten();
+        .then(|| self.row_snapshot_reader.clone())
+        .flatten();
         let direct_snapshot_decoder = direct_snapshot_reader
             .as_ref()
             .map(|_| {
@@ -815,6 +816,29 @@ impl TableSpec for SchemaSpec {
                     row_filters,
                 ))
                 .await?,
+            });
+        }
+        if request.limit.is_none()
+            && let (Some(reader), Some(decoder)) = (
+                direct_snapshot_reader.as_ref(),
+                direct_snapshot_decoder.as_ref(),
+            )
+        {
+            return Ok(PlannedScan {
+                schema: Arc::clone(&schema),
+                ordering: None,
+                source: row_snapshot_pages_scan_source(
+                    Arc::clone(reader),
+                    Arc::clone(&self.hot_state),
+                    Arc::clone(&self.spec),
+                    Arc::clone(&schema),
+                    request,
+                    row_filters,
+                    batch_projection,
+                    staged_read_context,
+                    Arc::clone(decoder),
+                    direct_primary_key_projection,
+                ),
             });
         }
         Ok(PlannedScan {
@@ -1070,12 +1094,9 @@ impl TableSpec for SchemaSpec {
     }
 }
 
-fn exact_count_scan_source(
-    schema: SchemaRef,
-    count: usize,
-) -> Result<super::spec::ScanSource> {
-    let statistics = Statistics::new_unknown(schema.as_ref())
-        .with_num_rows(Precision::Exact(count));
+fn exact_count_scan_source(schema: SchemaRef, count: usize) -> Result<super::spec::ScanSource> {
+    let statistics =
+        Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(count));
     let batch = RecordBatch::try_new_with_options(
         Arc::clone(&schema),
         Vec::new(),
@@ -1419,14 +1440,9 @@ async fn row_columnar_scan_source(
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
                 }
-                let options =
-                    RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                RecordBatch::try_new_with_options(
-                    batch_schema,
-                    batch.columns().to_vec(),
-                    &options,
-                )
-                .map_err(DataFusionError::from)
+                let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                RecordBatch::try_new_with_options(batch_schema, batch.columns().to_vec(), &options)
+                    .map_err(DataFusionError::from)
             });
             // Rows of one row group that survived manifest pruning: group
             // pruning is the columnar route's access path, so a pruned group
@@ -1437,7 +1453,7 @@ async fn row_columnar_scan_source(
             // OLAP plans have very little stack headroom: before #1334 sized
             // these test threads, adding one `u64` to `SqlReadProfile` was
             // enough to overflow them. Keep additions off this future.
-            let batches = futures_util::StreamExt::map(batches, |batch| {
+            let batches = batches.map(|batch| {
                 if let Ok(batch) = &batch {
                     record_rows_examined(batch.num_rows());
                 }
@@ -1485,10 +1501,7 @@ fn filter_row_columnar_batch(batch: &RecordBatch, keep: &BooleanArray) -> Result
             "row columnar zero-column shadow mask length does not match the batch row count"
         );
     }
-    let row_count = keep
-        .iter()
-        .filter(|value| *value == Some(true))
-        .count();
+    let row_count = keep.iter().filter(|value| *value == Some(true)).count();
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
     RecordBatch::try_new_with_options(Arc::clone(&batch.schema()), Vec::new(), &options)
         .map_err(DataFusionError::from)
@@ -3701,9 +3714,7 @@ fn apply_row_batch_filters(
     // a deletion slot so later layers can reconcile it; compact those slots
     // before Arrow projection even when the SQL query has no predicate.
     let rows = rows.filter(
-        |row| {
-            !row.deleted() && !hidden_registered_schema_row(&spec.schema_key, row.row_pk())
-        },
+        |row| !row.deleted() && !hidden_registered_schema_row(&spec.schema_key, row.row_pk()),
         None,
     );
     let rows = revalidate_schema_amended_rows(spec, &rows)?.unwrap_or(rows);
@@ -3903,6 +3914,166 @@ fn direct_row_batch_eligible(
             .all(|field| !field.name().starts_with("lixcol_"))
 }
 
+fn row_snapshot_pages_scan_source(
+    reader: Arc<dyn RowSnapshotReader>,
+    hot_state: Arc<dyn HotStateReader>,
+    spec: Arc<SchemaSurfaceSpec>,
+    schema: SchemaRef,
+    request: HotStateScanRequest,
+    row_filters: Vec<RowFilter>,
+    batch_projection: RowBatchProjection,
+    write_ctx: Option<SqlWriteContext>,
+    decoder: Arc<RowProjectionDecoder>,
+    direct_primary_key_projection: bool,
+) -> super::spec::ScanSource {
+    let stream_schema = Arc::clone(&schema);
+    batch_stream_source(schema, 1, move |_partition, _context| {
+        let reader = Arc::clone(&reader);
+        let hot_state = Arc::clone(&hot_state);
+        let spec = Arc::clone(&spec);
+        let schema = Arc::clone(&stream_schema);
+        let request = request.clone();
+        let row_filters = row_filters.clone();
+        let write_ctx = write_ctx.clone();
+        let decoder = Arc::clone(&decoder);
+        let direct_primary_key_projection = direct_primary_key_projection;
+        let pages = stream::once(async move {
+            if let Some(pages) = reader
+                .scan_row_snapshot_pages(request.clone())
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            {
+                let page_spec = Arc::clone(&spec);
+                let page_decoder = Arc::clone(&decoder);
+                let page_schema = Arc::clone(&schema);
+                let pages = pages.map(move |page| {
+                    page.map_err(lix_error_to_datafusion_error)
+                        .and_then(|rows| {
+                            if !row_snapshot_batch_matches_opening_schema(&page_spec, &rows) {
+                                return Err(DataFusionError::Execution(
+                                    "streamed row snapshot page does not match the opening schema"
+                                        .to_owned(),
+                                ));
+                            }
+                            record_rows_examined(rows.len());
+                            if direct_primary_key_projection {
+                                row_snapshot_page_primary_key_record_batch(
+                                    &page_spec,
+                                    Arc::clone(&page_schema),
+                                    rows,
+                                )
+                            } else {
+                                row_snapshot_record_batch(
+                                    &page_spec,
+                                    &page_decoder,
+                                    Arc::clone(&page_schema),
+                                    rows,
+                                )
+                            }
+                        })
+                });
+                return Ok::<_, DataFusionError>(pages.boxed());
+            }
+            if direct_primary_key_projection
+                && let Some(row_pks) = reader
+                    .scan_row_primary_keys(request.clone())
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?
+            {
+                record_rows_examined(row_pks.len());
+                let batch = row_primary_key_record_batch(&spec, Arc::clone(&schema), row_pks)?;
+                return Ok(stream::once(async move { Ok(batch) }).boxed());
+            }
+            if let Some(rows) = reader
+                .scan_row_snapshots(request.clone())
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+                .filter(|rows| row_snapshot_batch_matches_opening_schema(&spec, rows))
+            {
+                record_rows_examined(rows.len());
+                let batch = row_snapshot_record_batch(&spec, &decoder, Arc::clone(&schema), rows)?;
+                return Ok(stream::once(async move { Ok(batch) }).boxed());
+            }
+            let rows = hot_state
+                .scan_batch(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            record_rows_examined(rows.len());
+            let batch = row_record_batch_with_staged_schemas(
+                write_ctx.as_ref(),
+                &spec,
+                Arc::clone(&schema),
+                rows,
+                &row_filters,
+                batch_projection,
+            )
+            .await?;
+            Ok(stream::once(async move { Ok(batch) }).boxed())
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&stream_schema),
+            pages,
+        )))
+    })
+}
+
+fn row_snapshot_batch_matches_opening_schema(
+    spec: &SchemaSurfaceSpec,
+    rows: &crate::tracked_state::ExclusiveRowSnapshotBatch,
+) -> bool {
+    match rows {
+        crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(rows) => rows
+            .segments()
+            .all(|segment| segment.projection().schema_fingerprint() == spec.schema_fingerprint),
+        _ => true,
+    }
+}
+
+fn row_snapshot_record_batch(
+    _spec: &SchemaSurfaceSpec,
+    decoder: &RowProjectionDecoder,
+    schema: SchemaRef,
+    rows: crate::tracked_state::ExclusiveRowSnapshotBatch,
+) -> Result<RecordBatch> {
+    let columns = match rows {
+        crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(rows) => {
+            decoder.decode_certified_native_projection_batch(&rows)
+        }
+        crate::tracked_state::ExclusiveRowSnapshotBatch::DescribedNative(rows) => {
+            decoder.decode_owned_validated_native_payload_arrow_columns(rows.into_rows())
+        }
+        crate::tracked_state::ExclusiveRowSnapshotBatch::ValidatedNative(rows) => decoder
+            .decode_validated_native_payload_arrow_columns(
+                rows.iter().map(|(row_pk, payload)| (payload, row_pk)),
+            ),
+        crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) => decoder
+            .decode_durable_payload_arrow_columns(
+                rows.iter()
+                    .map(|(row_pk, payload)| (payload.as_ref(), row_pk)),
+            ),
+    }
+    .map_err(row_projection_error_to_datafusion_error)?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+fn row_snapshot_page_primary_key_record_batch(
+    spec: &SchemaSurfaceSpec,
+    schema: SchemaRef,
+    rows: crate::tracked_state::ExclusiveRowSnapshotBatch,
+) -> Result<RecordBatch> {
+    let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) = rows else {
+        return Err(DataFusionError::Internal(
+            "packed primary-key stream returned a non-raw snapshot page".to_owned(),
+        ));
+    };
+    row_primary_key_record_batch(
+        spec,
+        schema,
+        rows.into_iter().map(|(row_pk, _)| row_pk).collect(),
+    )
+}
+
 /// A provider-level physical projection: all requested columns are simple
 /// string primary-key components stored verbatim in the current-state key.
 /// DataFusion still plans and executes every relational operator above this
@@ -4006,9 +4177,7 @@ async fn recheck_unordered_limit_candidates(
             }
         }
         if verified.len() - verified_before_chunk < candidate_chunk.len() {
-            chunk_size = chunk_size
-                .saturating_mul(2)
-                .min(LIMIT_RECHECK_CHUNK_SIZE);
+            chunk_size = chunk_size.saturating_mul(2).min(LIMIT_RECHECK_CHUNK_SIZE);
         }
         offset = end;
     }
@@ -4914,8 +5083,8 @@ mod tests {
     use super::super::spec::SpecTableProvider;
     use super::row_record_batch;
     use super::{
-        LIMIT_CANDIDATE_MINIMUM_PAGE, LIMIT_RECHECK_CHUNK_SIZE,
-        recheck_unordered_limit_candidates, unordered_limit_candidates_eligible,
+        LIMIT_CANDIDATE_MINIMUM_PAGE, LIMIT_RECHECK_CHUNK_SIZE, recheck_unordered_limit_candidates,
+        unordered_limit_candidates_eligible,
     };
     use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
@@ -4942,6 +5111,51 @@ mod tests {
 
     struct LimitCandidateCallCounter(Arc<AtomicUsize>);
 
+    struct UnorderedSnapshotPages(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl crate::sql2::RowSnapshotReader for UnorderedSnapshotPages {
+        async fn scan_row_snapshot_pages(
+            &self,
+            request: HotStateScanRequest,
+        ) -> Result<
+            Option<
+                futures_util::stream::BoxStream<
+                    'static,
+                    Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>,
+                >,
+            >,
+            LixError,
+        > {
+            assert!(
+                request.limit.is_none(),
+                "ORDER BY must retain its fetch above the scan"
+            );
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let pages = [[3, 2].as_slice(), [0, 1, 4].as_slice()]
+                .into_iter()
+                .map(|indices| {
+                    Ok(crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(
+                        indices
+                            .iter()
+                            .map(|index| {
+                                (
+                                    TestRowPk::single(format!("candidate-{index}")),
+                                    Bytes::from_static(
+                                        b"key-only projection must not decode this payload",
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(futures_util::StreamExt::boxed(
+                futures_util::stream::iter(pages),
+            )))
+        }
+    }
+
     #[derive(Default)]
     struct TestCachingRowSnapshotReader {
         batch: Mutex<Option<Arc<RecordBatch>>>,
@@ -4958,10 +5172,7 @@ mod tests {
 
     #[async_trait]
     impl crate::sql2::RowSnapshotReader for ExactCountRowSnapshotReader {
-        async fn exact_count(
-            &self,
-            request: HotStateScanRequest,
-        ) -> Result<Option<u64>, LixError> {
+        async fn exact_count(&self, request: HotStateScanRequest) -> Result<Option<u64>, LixError> {
             self.requests
                 .lock()
                 .expect("exact-count requests lock")
@@ -4998,8 +5209,11 @@ mod tests {
                 layout.manifest.fields[*identity_index].name,
                 crate::sql2::ROW_COLUMNAR_IDENTITY_FIELD
             );
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(self.identities.clone()))])
-                .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(StringArray::from(self.identities.clone()))],
+            )
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
         }
     }
 
@@ -5062,8 +5276,14 @@ mod tests {
                 .lock()
                 .expect("limit recheck request lock")
                 .push(request.clone());
-            assert!(request.limit.is_none(), "candidate rechecks must be unbounded");
-            assert_eq!(request.filter.file_ids, vec![crate::NullableKeyFilter::Null]);
+            assert!(
+                request.limit.is_none(),
+                "candidate rechecks must be unbounded"
+            );
+            assert_eq!(
+                request.filter.file_ids,
+                vec![crate::NullableKeyFilter::Null]
+            );
             assert!(request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE);
             let rows = self
                 .rows
@@ -5313,7 +5533,10 @@ mod tests {
             false,
         ));
         let mut exact_identity = request.clone();
-        exact_identity.filter.row_pks.push(TestRowPk::single("point"));
+        exact_identity
+            .filter
+            .row_pks
+            .push(TestRowPk::single("point"));
         assert!(!unordered_limit_candidates_eligible(
             &spec,
             &schema,
@@ -5373,7 +5596,10 @@ mod tests {
             .collect()
             .await
             .expect("project identity without snapshot payload");
-        let values = batches[0].column(0).as_any().downcast_ref::<StringArray>()
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
             .expect("primary key should be utf8");
         assert_eq!(values.value(0), "candidate-0");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -5405,6 +5631,43 @@ mod tests {
             0,
             "DataFusion must retain the sort above the full scan"
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_sorts_across_unordered_snapshot_pages() {
+        let session = SessionContext::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
+            row_insert_spec_with_primary_key(),
+            Arc::new(EmptyHotStateReader),
+            active_branch_ref(),
+            "branch-a".to_owned(),
+            Some(Arc::new(UnorderedSnapshotPages(Arc::clone(&calls)))),
+        )));
+        session
+            .register_table("project_message", Arc::new(provider))
+            .expect("register schema provider");
+        let batches = session
+            .sql("SELECT id FROM project_message ORDER BY id LIMIT 3")
+            .await
+            .expect("plan ordered page")
+            .collect()
+            .await
+            .expect("sort globally across snapshot pages");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("primary key should be utf8")
+                    .iter()
+                    .map(|value| value.expect("primary key must be non-null").to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["candidate-0", "candidate-1", "candidate-2"]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5471,24 +5734,36 @@ mod tests {
             r#"{"body":"staged winner"}"#
         );
         let requests = reader.requests.lock().expect("request lock");
-        assert!(requests.len() > 2, "short pages should expand the next read");
+        assert!(
+            requests.len() > 2,
+            "short pages should expand the next read"
+        );
         assert_eq!(requests[0].filter.row_pks.len(), 3);
-        assert!(requests
-            .iter()
-            .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE)
+        );
         // The last chunk contains only the remaining keys and can be shorter
         // than the preceding chunk, even though the adaptive target grows.
-        assert!(requests[..requests.len() - 1].windows(2).all(|pair| {
-            pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len()
-        }));
+        assert!(
+            requests[..requests.len() - 1]
+                .windows(2)
+                .all(|pair| { pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len() })
+        );
         assert_eq!(
-            requests.iter().map(|request| request.filter.row_pks.len()).sum::<usize>(),
+            requests
+                .iter()
+                .map(|request| request.filter.row_pks.len())
+                .sum::<usize>(),
             candidates.len()
         );
         assert!(requests.iter().all(|request| request.limit.is_none()));
-        assert!(requests.iter().all(|request| {
-            request.filter.file_ids == vec![crate::NullableKeyFilter::Null]
-        }));
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.filter.file_ids == vec![crate::NullableKeyFilter::Null] })
+        );
         drop(requests);
 
         let insufficient = recheck_unordered_limit_candidates(
@@ -5511,17 +5786,19 @@ mod tests {
             rows: Vec::new(),
             requests: Mutex::new(Vec::new()),
         };
-        assert!(recheck_unordered_limit_candidates(
-            &small_reader,
-            &unordered_limit_request(Some(1)),
-            (0..LIMIT_CANDIDATE_MINIMUM_PAGE - 1)
-                .map(|index| TestRowPk::single(format!("small-{index}")))
-                .collect(),
-            1,
-        )
-        .await
-        .expect("small candidate page should decline")
-        .is_none());
+        assert!(
+            recheck_unordered_limit_candidates(
+                &small_reader,
+                &unordered_limit_request(Some(1)),
+                (0..LIMIT_CANDIDATE_MINIMUM_PAGE - 1)
+                    .map(|index| TestRowPk::single(format!("small-{index}")))
+                    .collect(),
+                1,
+            )
+            .await
+            .expect("small candidate page should decline")
+            .is_none()
+        );
         assert!(
             small_reader
                 .requests
@@ -5644,6 +5921,22 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("identity column should be utf8");
         assert_eq!(values.value(0), "identity-1");
+
+        let page = super::row_snapshot_page_primary_key_record_batch(
+            &spec,
+            Arc::clone(&schema),
+            crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(vec![(
+                crate::row_pk::RowPk::single("identity-2"),
+                Bytes::from_static(b"this is intentionally not a row payload"),
+            )]),
+        )
+        .expect("streamed identity projection should not decode the payload");
+        let values = page
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("identity column should be utf8");
+        assert_eq!(values.value(0), "identity-2");
 
         let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
         assert!(!super::direct_primary_key_projection_eligible(
@@ -8143,7 +8436,11 @@ mod tests {
             panic!("expected one base row-group batch")
         };
         assert_eq!(base.num_columns(), 0);
-        assert_eq!(base.num_rows(), 1, "update and tombstone shadow stale base rows");
+        assert_eq!(
+            base.num_rows(),
+            1,
+            "update and tombstone shadow stale base rows"
+        );
 
         let overlay_batches = source
             .open(1, Arc::new(datafusion::execution::TaskContext::default()))
@@ -8155,7 +8452,11 @@ mod tests {
             panic!("expected one overlay count batch")
         };
         assert_eq!(overlay.num_columns(), 0);
-        assert_eq!(overlay.num_rows(), 2, "updated and inserted rows remain visible");
+        assert_eq!(
+            overlay.num_rows(),
+            2,
+            "updated and inserted rows remain visible"
+        );
         assert_eq!(base.num_rows() + overlay.num_rows(), 3);
     }
 

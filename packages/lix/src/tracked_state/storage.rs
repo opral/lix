@@ -108,6 +108,7 @@ pub(crate) const TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE: StorageSpace = Sto
 // address stride. Physical ordered parts and their packed coordinates must
 // use the same width so a part boundary never needs a second geometry.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
+pub(crate) const COMMIT_DELTA_PART_READ_BATCH_MAX: usize = 8;
 // Scan pages are bounded by row count, not bytes. Keep authority hydration
 // bounded as well when a page contains large authenticated directories.
 const COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS: usize = 64;
@@ -11337,6 +11338,106 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         false,
     )
     .await
+}
+
+/// Loads a bounded window of authenticated mutation parts in one point-read
+/// batch. SlateDB's immutable-value reader groups locators by backing segment
+/// and coalesces adjacent ranges, avoiding repeated reads and hashes of the
+/// same cache extent when a stream loads neighboring packed parts.
+pub(crate) async fn load_commit_delta_parts_members_with_payloads_for_schema(
+    store: &(impl StorageAdapterRead + ?Sized),
+    selected_parts: &[(&PublishedCommitStateManifest, usize)],
+    schema_key: &str,
+) -> Result<Option<Vec<Vec<CommitDeltaMember>>>, LixError> {
+    if selected_parts.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    if selected_parts.len() > COMMIT_DELTA_PART_READ_BATCH_MAX {
+        return Ok(None);
+    }
+
+    let mut keys = Vec::with_capacity(selected_parts.len());
+    let mut selected = Vec::with_capacity(selected_parts.len());
+    for (published_manifest, part_index) in selected_parts {
+        let manifest = &published_manifest.manifest;
+        let inventory = &manifest.mutations;
+        if inventory.selected_source_commit_id().is_some()
+            || inventory.columnar_parts.is_some()
+            || !inventory.inline_part.is_empty()
+            || !inventory.direct_addresses_are_fully_owned()
+            || inventory.may_contain_finite_selected_members()
+            || inventory.single_partition.as_ref().is_some_and(|scope| {
+                scope.schema_key != schema_key || scope.file_id.is_some()
+            })
+            || inventory.lifecycle_summary.as_ref().is_none_or(|summary| {
+                summary.scope.schema_key != schema_key || summary.scope.file_id.is_some()
+            })
+            || inventory.replacement_generation.is_some()
+            || inventory.replacement_parts.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(part) = inventory.parts.get(*part_index) else {
+            return Err(replacement_payload_error(
+                "packed snapshot plan selected a missing mutation part",
+            ));
+        };
+        if part.replacement_part.is_some() {
+            return Ok(None);
+        }
+        keys.push(StorageKey(Bytes::from(commit_delta_segment_key_for_part(
+            manifest.commit_id,
+            *part_index,
+            part,
+        )?)));
+        selected.push((manifest, *part_index, part));
+    }
+
+    let values = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    if values.len() != selected_parts.len() {
+        return Err(replacement_payload_error(
+            "packed snapshot batch point read returned the wrong number of values",
+        ));
+    }
+    let mut decoded_parts = Vec::with_capacity(selected.len());
+    for ((manifest, part_index, part), value) in selected.into_iter().zip(values) {
+        let commit_id = manifest.commit_id;
+        let value = value.ok_or_else(|| {
+            replacement_payload_error("packed snapshot plan references a missing mutation part")
+        })?;
+        let value = full_value_bytes(value).ok_or_else(|| {
+            replacement_payload_error("packed snapshot mutation part omitted its physical value")
+        })?;
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: part.first_key.clone(),
+            last_key: part.last_key.clone(),
+            content_digest: part.content_digest,
+            replacement_part: None,
+        };
+        let mut members = Vec::new();
+        collect_strict_commit_delta_members(
+            &value,
+            Some(&bounds),
+            commit_id,
+            u32::try_from(part_index)
+                .map_err(|_| replacement_payload_error("mutation part index exceeds u32"))?,
+            &manifest.change_account_id,
+            &mut members,
+        )?;
+        if members.len() > COMMIT_DELTA_SEGMENT_MAX_ROWS
+            || members
+                .iter()
+                .any(|member| member.key.schema_key != schema_key || member.key.file_id.is_some())
+        {
+            return Ok(None);
+        }
+        validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+        decoded_parts.push(members);
+    }
+    Ok(Some(decoded_parts))
 }
 
 /// Loads logical history members, including every selected row in a

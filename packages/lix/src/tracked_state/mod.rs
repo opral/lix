@@ -28,6 +28,7 @@ mod types;
 
 pub(crate) use codec::TrackedStateMutationBatchBuilder;
 pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
+pub(crate) use codec::{encode_schema_file_prefix, encode_schema_key_prefix};
 pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
     try_stage_collapsed_rebuild_plans_with_writer,
@@ -80,6 +81,7 @@ pub(crate) use storage::{
     AuthoritativeLiveChangeRequest, CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator,
     CommitDeltaLiveMembershipCursor, CommitDeltaMember, CommitDeltaPointReadCache,
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
+    COMMIT_DELTA_PART_READ_BATCH_MAX,
     EnvelopeCertifiedNativeProjectionBatch, EnvelopeCertifiedNativeProjectionSegment,
     ExclusiveRowSnapshotBatch, OrderedAddressableCommitDeltaStage, PublishedCommitStateTopology,
     StagedCommitStateManifest, TrackedStateChunkOverlay, commit_delta_contains_schema,
@@ -89,14 +91,18 @@ pub(crate) use storage::{
     encode_commit_state_manifest_replacement_for_migration, has_deferred_commit_history,
     load_authoritative_live_change_records, load_authoritative_selected_change_records,
     load_change_record_by_id,
+    load_authenticated_commit_delta_index_values,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
+    load_commit_delta_parts_members_with_payloads_for_schema,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_exact_tracked_row_change_locators,
     load_commit_history_members_with_payloads_for_schemas, load_commit_mutation_directory_roots,
     load_commit_state_manifest, load_commit_state_manifests, load_exclusive_row_snapshots,
+    load_published_commit_state_manifest,
     load_local_commit_delta_members_with_payloads, load_local_selected_change_owner_commit_ids,
     load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
     load_published_commit_state_topology, load_retained_commit_snapshots_for_schemas,
+    PublishedCommitStateManifest,
     rewrite_commit_state_incorporation_for_migration, scan_change_records_from_commit_deltas,
     scan_commit_delta_inventory, scan_commit_delta_limit_candidate_row_pks,
     scan_commit_delta_values,
@@ -172,7 +178,8 @@ pub(crate) use types::TrackedStateTreeScanRequest;
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateIncorporation,
-    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
+    CommitStateReplayDebt,
     MaterializedTrackedStateRow, RowPkRangeBound, TrackedStateBaseCoordinate,
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateIndexValueRef,

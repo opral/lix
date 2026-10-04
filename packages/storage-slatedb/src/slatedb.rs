@@ -5388,7 +5388,9 @@ mod tests {
         let mut writer = ImmutableSegmentWriter::default();
         let mut expected = Vec::new();
         for index in 0_u8..32 {
-            let value = Bytes::from(vec![index; mib]);
+            // Keep the first eight encoded values inside one aligned 8 MiB
+            // cache extent, including their immutable-locator framing.
+            let value = Bytes::from(vec![index; mib - 1024]);
             writer
                 .insert(Key(Bytes::from(vec![index; 32])), value.clone())
                 .expect("stage extent-cache value");
@@ -5431,7 +5433,7 @@ mod tests {
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
             }),
-            None,
+            Some(counters.clone()),
         );
         sequential_store
             .put_segments(vec![segment])
@@ -5439,7 +5441,7 @@ mod tests {
             .expect("store extent-cache segment");
 
         let before_sequential = counters.snapshot();
-        for index in 0..6 {
+        for index in 0..8 {
             let value = sequential_store
                 .get_many(vec![markers[index].clone()])
                 .await
@@ -5455,6 +5457,36 @@ mod tests {
             sequential_io.read_bytes,
             IMMUTABLE_CACHE_EXTENT_BYTES as u64
         );
+        assert_eq!(
+            sequential_io.cache_filesystem_reads, 9,
+            "eight one-key reads verify the same aligned cache extent repeatedly"
+        );
+
+        let batch_cache = tempfile::tempdir().expect("create batched extent cache");
+        let batch_store = ImmutableValueStore::new(
+            "cross-request-extents",
+            Arc::clone(&object_store),
+            Some(&SlateDBCacheOptions {
+                root_folder: batch_cache.path().to_path_buf(),
+                max_disk_cache_bytes: 128 * 1024 * 1024,
+                block_cache_bytes: 0,
+                metadata_cache_bytes: 0,
+            }),
+            Some(counters.clone()),
+        );
+        let before_batch = counters.snapshot();
+        let batched = batch_store
+            .get_many(markers[..8].to_vec())
+            .await
+            .expect("read eight locators in one batched request");
+        assert_eq!(batched, expected[..8]);
+        let batch_io = counters.snapshot().saturating_sub(before_batch);
+        assert_eq!(batch_io.read_objects, 1);
+        assert_eq!(batch_io.read_bytes, IMMUTABLE_CACHE_EXTENT_BYTES as u64);
+        assert_eq!(
+            batch_io.cache_filesystem_reads, 2,
+            "one multi-key read should verify the shared aligned extent once, then recheck after acquiring its fetch lock"
+        );
 
         let random_cache = tempfile::tempdir().expect("create random-seek extent cache");
         let random_store = ImmutableValueStore::new(
@@ -5468,6 +5500,8 @@ mod tests {
             }),
             None,
         );
+        let segment_len = decode_immutable_locator(&markers[0])
+            .expect("extent fixture locator should decode").segment_len;
         let before_random = counters.snapshot();
         for index in [1_usize, 9, 17, 25] {
             let value = random_store
@@ -5480,7 +5514,7 @@ mod tests {
         assert_eq!(random_io.read_objects, 4);
         assert_eq!(
             random_io.read_bytes,
-            (4 * IMMUTABLE_CACHE_EXTENT_BYTES) as u64,
+            segment_len.min(4 * IMMUTABLE_CACHE_EXTENT_BYTES) as u64,
             "each cold random seek should fetch at most one fixed extent"
         );
     }
