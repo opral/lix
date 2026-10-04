@@ -46,6 +46,17 @@ pub(crate) struct RowColumnarScanLayout {
 /// stronger tie order must retain the general SQL path.
 #[async_trait]
 pub(crate) trait RowSnapshotReader: Send + Sync {
+    /// Returns the exact current row count for a narrowly supported,
+    /// unfiltered scan without materializing every row identity. `None` keeps
+    /// callers on the ordinary scan path when the reader cannot prove the
+    /// complete visible scope from committed controls.
+    async fn exact_count(
+        &self,
+        _request: HotStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        Ok(None)
+    }
+
     /// Returns primary keys from the same committed direct-scan proof as raw
     /// snapshots. Providers use this only when every projected SQL field is
     /// an exact primary-key component, avoiding a redundant JSON decode while
@@ -180,6 +191,16 @@ impl<S> RowSnapshotReader for CurrentRowSnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    async fn exact_count(
+        &self,
+        request: HotStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        self.hot_state
+            .reader(self.store.clone())
+            .exact_count_with_bounded_global_overlay(&request)
+            .await
+    }
+
     async fn scan_row_primary_keys(
         &self,
         request: HotStateScanRequest,

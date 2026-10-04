@@ -749,6 +749,24 @@ impl TableSpec for SchemaSpec {
                 .map_err(row_projection_error_to_datafusion_error)
             })
             .transpose()?;
+        if self.write_ctx.is_none()
+            && !private_registry
+            && schema.fields().is_empty()
+            && filters.is_empty()
+            && row_filters.is_empty()
+            && let Some(reader) = self.row_snapshot_reader.as_ref()
+            && let Some(count) = reader
+                .exact_count(request.clone())
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            && let Ok(count) = usize::try_from(count)
+        {
+            return Ok(PlannedScan {
+                schema: Arc::clone(&schema),
+                ordering: None,
+                source: exact_count_scan_source(schema, count)?,
+            });
+        }
         let mut columnar_request = request.clone();
         // LIMIT is a relational operator, not a storage-layout capability.
         // Ask the reader whether the same filtered/projection scan has a
@@ -995,6 +1013,31 @@ impl TableSpec for SchemaSpec {
         self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
             .await
     }
+}
+
+fn exact_count_scan_source(
+    schema: SchemaRef,
+    count: usize,
+) -> Result<super::spec::ScanSource> {
+    let statistics = Statistics::new_unknown(schema.as_ref())
+        .with_num_rows(Precision::Exact(count));
+    let batch = RecordBatch::try_new_with_options(
+        Arc::clone(&schema),
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(count)),
+    )?;
+    let stream_schema = Arc::clone(&schema);
+    Ok(batch_stream_source_with_statistics_and_source(
+        Arc::clone(&schema),
+        vec![statistics.clone()],
+        Some(statistics),
+        move |_partition, _context| {
+            let schema = Arc::clone(&stream_schema);
+            let batch = batch.clone();
+            let batches = stream::once(async move { Ok(batch) });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+        },
+    ))
 }
 
 fn row_columnar_projection_eligible(schema: &Schema) -> bool {
@@ -4712,9 +4755,11 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::stats::Precision;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use datafusion::prelude::SessionContext;
     use futures_util::TryStreamExt;
     use serde_json::json;
 
@@ -4745,6 +4790,25 @@ mod tests {
 
     struct CountOnlyColumnarRowSnapshotReader {
         identities: Vec<String>,
+    }
+
+    struct ExactCountRowSnapshotReader {
+        count: u64,
+        requests: Mutex<Vec<HotStateScanRequest>>,
+    }
+
+    #[async_trait]
+    impl crate::sql2::RowSnapshotReader for ExactCountRowSnapshotReader {
+        async fn exact_count(
+            &self,
+            request: HotStateScanRequest,
+        ) -> Result<Option<u64>, LixError> {
+            self.requests
+                .lock()
+                .expect("exact-count requests lock")
+                .push(request);
+            Ok(Some(self.count))
+        }
     }
 
     #[async_trait]
@@ -5164,6 +5228,72 @@ mod tests {
             "COUNT(*) should not request snapshot or metadata materialization"
         );
         assert!(super::row_columnar_projection_eligible(&Schema::empty()));
+    }
+
+    #[tokio::test]
+    async fn count_star_uses_exact_count_scan_with_exact_statistics() {
+        let snapshot_reader = Arc::new(ExactCountRowSnapshotReader {
+            count: 7,
+            requests: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
+            row_insert_spec_with_primary_key(),
+            Arc::new(EmptyHotStateReader),
+            active_branch_ref(),
+            "branch-a".to_string(),
+            Some(snapshot_reader.clone()),
+        ))));
+        let session = SessionContext::new();
+        session
+            .register_table("project_message", provider.clone())
+            .expect("register the schema surface");
+
+        let empty_projection = Vec::new();
+        let scan = provider
+            .scan(&session.state(), Some(&empty_projection), &[], None)
+            .await
+            .expect("plan the zero-column count scan");
+        assert_eq!(
+            scan.partition_statistics(None)
+                .expect("count scan statistics should be available")
+                .num_rows,
+            Precision::Exact(7)
+        );
+        let scan_batches = scan
+            .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .expect("count scan should open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("count scan should execute");
+        assert_eq!(scan_batches.len(), 1);
+        assert_eq!(scan_batches[0].num_columns(), 0);
+        assert_eq!(scan_batches[0].num_rows(), 7);
+
+        let count_batches = session
+            .sql("SELECT COUNT(*) AS count FROM project_message")
+            .await
+            .expect("plan COUNT(*)")
+            .collect()
+            .await
+            .expect("execute COUNT(*)");
+        let count = count_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) should return Int64")
+            .value(0);
+        assert_eq!(count, 7);
+
+        let requests = snapshot_reader
+            .requests
+            .lock()
+            .expect("exact-count requests lock");
+        assert_eq!(requests.len(), 2, "both plans should use the exact route");
+        assert!(requests.iter().all(|request| {
+            request.filter.schema_keys == ["project_message"]
+                && request.filter.branch_ids == ["branch-a"]
+                && request.projection.columns == ["change_id"]
+        }));
     }
 
     #[test]

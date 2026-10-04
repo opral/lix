@@ -1246,6 +1246,30 @@ fn stage_hot_collection_control(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn stage_hot_collection_live_count_for_test(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    schema_key: &str,
+    live_count: u64,
+) -> Result<(), LixError> {
+    stage_hot_collection_control(
+        writes,
+        branch_id,
+        branch_generation,
+        crate::collection_generation::CollectionScopeRef {
+            schema_key,
+            file_id: None,
+        },
+        HotCollectionControl {
+            active_generation: branch_generation,
+            live_count,
+            ordered_identity_digest: None,
+        },
+    )
+}
+
 async fn load_incremental_collection_controls(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -4338,6 +4362,26 @@ where
             live_count: control.live_count,
             ordered_identity_digest: control.ordered_identity_digest,
         })
+    }
+
+    pub(crate) async fn stored_collection_generation(
+        &self,
+        branch_id: &str,
+        branch_generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        Ok(load_stored_hot_collection_control(
+            &self.store,
+            branch_id,
+            branch_generation,
+            scope,
+        )
+        .await?
+        .map(|control| crate::collection_generation::CollectionGeneration {
+            active_generation: control.active_generation,
+            live_count: control.live_count,
+            ordered_identity_digest: control.ordered_identity_digest,
+        }))
     }
 
     pub(crate) async fn exact_collection_live_count(
