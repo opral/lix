@@ -1820,10 +1820,11 @@ where
             .await
     }
 
-    /// Probes root publication in tests and storage benchmarks. Every current
-    /// protocol commit must return true; false is valid only for explicit
-    /// legacy-rootless fixtures or damaged storage awaiting repair.
-    #[cfg(any(test, feature = "storage-benches"))]
+    /// Checks whether a durable tree root is published for this commit. A
+    /// bounded LIMIT candidate page must decline when it is absent because a
+    /// rootless page scan may replay the entire commit before applying its
+    /// limit. Current protocol commits should have a root; legacy rootless
+    /// fixtures remain readable through the compatibility scan.
     pub(crate) async fn has_durable_commit_root(&self, commit_id: &str) -> Result<bool, LixError> {
         Ok(self.tree.load_root(&self.store, commit_id).await?.is_some())
     }

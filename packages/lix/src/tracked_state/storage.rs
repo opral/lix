@@ -15138,6 +15138,190 @@ pub(crate) async fn scan_commit_delta_values(
     .await
 }
 
+/// Returns an ordered, bounded sample of identity candidates from one
+/// authenticated local packed commit. Candidates are not visibility claims;
+/// callers must re-resolve them through the current state overlay. Aliases,
+/// columnar deltas, compact replacement parts, and unsupported directory
+/// layouts decline so this helper never replays a full commit to satisfy a
+/// small LIMIT.
+pub(crate) async fn scan_commit_delta_limit_candidate_row_pks(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_key: &str,
+    candidate_limit: usize,
+    max_leaves: usize,
+) -> Result<Option<Vec<RowPk>>, LixError> {
+    const MAX_CANDIDATES: usize = 4096;
+    const MAX_LEAVES: usize = 8;
+    const MAX_INLINE_BYTES: usize = 8 * 1024 * 1024;
+
+    if candidate_limit == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if candidate_limit > MAX_CANDIDATES || max_leaves == 0 || max_leaves > MAX_LEAVES {
+        return Ok(None);
+    }
+    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+        return Ok(None);
+    };
+    let inventory = &state.mutations;
+    if inventory.selected_source_commit_id().is_some()
+        || inventory.columnar_parts.is_some()
+        || !inventory.replacement_part_digests.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let prefix = encode_schema_file_prefix(schema_key, None);
+    let range = super::mutation_directory::MutationDirectoryKeyRange {
+        start: Bytes::from(prefix.clone()),
+        end: prefix_successor(&prefix).map(Bytes::from),
+    };
+    let mut candidates = Vec::with_capacity(candidate_limit);
+
+    if let Some(root) = state.mutation_directory_root.as_ref() {
+        if root.layout != super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+            && root.layout != super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+        {
+            return Ok(None);
+        }
+        let Some(runs) = super::mutation_directory::load_first_mutation_part_runs_for_range(
+            store, root, &range, max_leaves,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        for run in runs {
+            let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } = run.entry
+            else {
+                return Ok(None);
+            };
+            if part.replacement_part.is_some() {
+                return Ok(None);
+            }
+            let segment_index = usize::try_from(run.entry_index)
+                .map_err(|_| replacement_payload_error("candidate part index exceeds usize"))?;
+            let segment_key = commit_delta_segment_key_for_part(commit_id, segment_index, &part)?;
+            let value = PointReadPlan::new(
+                TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                &[StorageKey(Bytes::from(segment_key))],
+            )
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| replacement_payload_error("candidate directory references a missing segment"))?;
+            let bytes = full_value_bytes(value).ok_or_else(|| {
+                replacement_payload_error("candidate segment read omitted its value")
+            })?;
+            let bounds = CommitDeltaSegmentBounds {
+                first_key: part.first_key,
+                last_key: part.last_key,
+                content_digest: part.content_digest,
+                replacement_part: part.replacement_part,
+            };
+            append_limit_candidate_row_pks(
+                &bytes,
+                Some(&bounds),
+                commit_id,
+                schema_key,
+                candidate_limit,
+                &mut candidates,
+            )?;
+            if candidates.len() == candidate_limit {
+                break;
+            }
+        }
+    } else {
+        let manifest = commit_delta_manifest_from_commit_state(&state);
+        if let Some(inline) = manifest.inline_segment() {
+            if inline.len() > MAX_INLINE_BYTES {
+                return Ok(None);
+            }
+            append_limit_candidate_row_pks(
+                inline,
+                None,
+                commit_id,
+                schema_key,
+                candidate_limit,
+                &mut candidates,
+            )?;
+        } else {
+            if manifest.segments.len() > max_leaves {
+                return Ok(None);
+            }
+            for (segment_index, bounds) in manifest.segments.iter().enumerate() {
+                if bounds.last_key.as_slice() < range.start.as_ref()
+                    || range
+                        .end
+                        .as_ref()
+                        .is_some_and(|end| bounds.first_key.as_slice() >= end.as_ref())
+                {
+                    continue;
+                }
+                if bounds.replacement_part.is_some() {
+                    return Ok(None);
+                }
+                let segment_key = commit_delta_segment_key_for_bounds(
+                    commit_id,
+                    segment_index,
+                    bounds,
+                )?;
+                let value = PointReadPlan::new(
+                    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                    &[StorageKey(Bytes::from(segment_key))],
+                )
+                .materialize(store, StorageGetOptions::default())
+                .await?
+                .value
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| replacement_payload_error("candidate manifest references a missing segment"))?;
+                let bytes = full_value_bytes(value).ok_or_else(|| {
+                    replacement_payload_error("candidate segment read omitted its value")
+                })?;
+                append_limit_candidate_row_pks(
+                    &bytes,
+                    Some(bounds),
+                    commit_id,
+                    schema_key,
+                    candidate_limit,
+                    &mut candidates,
+                )?;
+                if candidates.len() == candidate_limit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(Some(candidates))
+}
+
+fn append_limit_candidate_row_pks(
+    segment_bytes: &[u8],
+    bounds: Option<&CommitDeltaSegmentBounds>,
+    commit_id: CommitId,
+    schema_key: &str,
+    candidate_limit: usize,
+    candidates: &mut Vec<RowPk>,
+) -> Result<(), LixError> {
+    let leaf = decode_commit_delta_segment(segment_bytes, bounds, commit_id)?;
+    visit_commit_delta_leaf(&leaf, commit_id, |_, encoded_key, _| {
+        if candidates.len() == candidate_limit {
+            return Ok(());
+        }
+        let key = decode_key(encoded_key)?;
+        if key.schema_key == schema_key && key.file_id.is_none() {
+            candidates.push(key.row_pk);
+        }
+        Ok(())
+    })
+}
+
 /// Scans from immutable authority already authenticated in this reader
 /// snapshot. Directory nodes and parts remain content- and bound-checked by
 /// the local scan; this only avoids reloading the same header and inventory.
@@ -29177,6 +29361,41 @@ mod tests {
             directory_requests.load(Ordering::Relaxed) >= 2,
             "each warm lookup must authenticate the bounded directory"
         );
+    }
+
+    #[tokio::test]
+    async fn unordered_limit_candidates_read_only_a_bounded_authenticated_prefix() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("bounded-limit-candidate-prefix");
+        let fixtures = packed_commit_delta_fixtures();
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("bounded delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("bounded delta should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open bounded candidate read");
+        let candidates = crate::tracked_state::scan_commit_delta_limit_candidate_row_pks(
+            &read,
+            commit_id,
+            "alpha",
+            8,
+            1,
+        )
+        .await
+        .expect("bounded candidate scan should succeed")
+        .expect("bounded directory should support candidate scan");
+        assert_eq!(candidates.len(), 8);
+        assert!(candidates.iter().all(|candidate| {
+            fixtures.iter().any(|fixture| {
+                fixture.schema_key == "alpha" && fixture.row_pk == *candidate
+            })
+        }));
     }
 
     #[tokio::test]

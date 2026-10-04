@@ -859,6 +859,93 @@ where
             .map(Some)
     }
 
+    /// Returns a bounded set of row-key candidates from the durable root or
+    /// from a small authenticated packed-leaf prefix. This is only a candidate
+    /// source for an unordered SQL LIMIT; the provider re-reads every key
+    /// through `scan_batch` before returning it. Global rows remain eligible
+    /// because the authoritative re-read applies local/global collision and
+    /// tombstone rules. Rootless aliases, columnar data, and unsupported
+    /// mutation directories decline instead of replaying all identities.
+    pub(crate) async fn scan_direct_row_limit_candidates(
+        &self,
+        request: &HotStateScanRequest,
+        candidate_limit: usize,
+    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        if let Some(registry) = &self.read_interest_registry {
+            registry.register(super::LogicalReadInterest::scan(
+                request,
+                match request.filter.untracked {
+                    Some(true) => HotStateReadDomain::Untracked,
+                    Some(false) => HotStateReadDomain::Tracked,
+                    None => HotStateReadDomain::Combined,
+                },
+            ))?;
+        }
+        if !request
+            .limit
+            .is_some_and(|limit| (1..=1024).contains(&limit))
+            || candidate_limit == 0
+            || candidate_limit > 4096
+            || request.filter.global.is_some()
+            || request.filter.untracked.is_some()
+            || request.filter.include_tombstones
+            || !matches!(request.filter.rows, HotStateRowFilter::All)
+            || !request.filter.row_pks.is_empty()
+            || request.filter.row_pk_lower.is_some()
+            || request.filter.row_pk_upper.is_some()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.constraints.is_empty()
+            || request.filter.declared_column_eq.is_some()
+            || request.filter.declared_column_range.is_some()
+            || request_may_include_derived(request)
+            || self.partial_scope_policy.is_some()
+            || self.partial_scope_source.is_some()
+        {
+            return Ok(None);
+        }
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Ok(None);
+        };
+        let scope = scan_scope(
+            &self.store,
+            request,
+            true,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
+        let [requested_branch_id] = scope.projection_branch_ids.as_slice() else {
+            return Ok(None);
+        };
+        if scope
+            .storage_branch_ids
+            .iter()
+            .any(|branch_id| branch_id != requested_branch_id && branch_id != GLOBAL_BRANCH_ID)
+        {
+            return Ok(None);
+        }
+        let Some(control) = scope.branch_heads.get(requested_branch_id).copied() else {
+            return Ok(None);
+        };
+        let minimum_candidate_count = request
+            .limit
+            .expect("the candidate route requires a finite limit")
+            .max(super::MIN_UNORDERED_LIMIT_CANDIDATES);
+        self.tracked_head
+            .reader(&self.store)
+            .scan_row_limit_candidates(
+                requested_branch_id,
+                control,
+                schema_key,
+                candidate_limit,
+                minimum_candidate_count,
+                // A complete scan of a small live collection is cheaper than
+                // probing the full candidate budget and then falling back.
+                // Keep this cost gate independent of the minimum useful page.
+                candidate_limit,
+            )
+            .await
+    }
+
     pub(crate) async fn scan_direct_row_snapshots(
         &self,
         request: &HotStateScanRequest,
