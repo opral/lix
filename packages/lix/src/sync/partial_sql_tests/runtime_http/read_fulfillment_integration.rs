@@ -483,6 +483,429 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     authority.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
+    const CONVERSATION_IDS: [&str; 4] = [
+        "01950000-0000-7000-8000-000000001001",
+        "01950000-0000-7000-8000-000000001003",
+        "01950000-0000-7000-8000-000000001004",
+        "01950000-0000-7000-8000-000000001006",
+    ];
+    const OUTSIDE_CONVERSATION_ID: &str = "01950000-0000-7000-8000-000000001002";
+    const LOCAL_CONVERSATION_ID: &str = "01950000-0000-7000-8000-000000001005";
+
+    let print_profile = |case: &str, log: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>| {
+        let requests = fulfillment_requests(log);
+        let rpc_measurements = requests
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "inputs": request["inputs"],
+                    "response_bytes": request["response_bytes"],
+                    "discovery": request["discovery"],
+                    "server_ms": request["server_ms"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let scan_limits = requests
+            .iter()
+            .flat_map(|request| {
+                request["request_interests"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|interest| {
+                interest["kind"] == "scan"
+                    && interest["request"]["filter"]["schema_keys"]
+                        .as_array()
+                        .is_some_and(|keys| keys.iter().any(|key| key == "lix_conversation"))
+            })
+            .filter_map(|interest| interest["request"]["limit"].as_u64())
+            .filter(|limit| *limit > 0)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "CONVERSATION_READ_FULFILLMENT_PROFILE_JSON={}",
+            serde_json::json!({
+                "case": case,
+                "rpcs": rpc_measurements,
+                "scan_limits": scan_limits,
+            })
+        );
+    };
+
+    let backing = Memory::new();
+    let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+
+    let mut checkpoint_ids = Vec::new();
+    for index in 0..4 {
+        authority
+            .execute(
+                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(format!("/conversation-checkpoint-{index}.txt")),
+                    Value::Blob(format!("checkpoint {index}").into_bytes().into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let checkpoint_id = authority
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_conversation (id, target, title, lixcol_global) \
+                 VALUES ($1, lix_row_ref('lix_commit', NULL, $2), $3, true)",
+                &[
+                    Value::Text(CONVERSATION_IDS[index].to_owned()),
+                    Value::Text(checkpoint_id.clone()),
+                    Value::Text(format!("Qualification {index}")),
+                ],
+            )
+            .await
+            .unwrap();
+        checkpoint_ids.push(checkpoint_id);
+    }
+
+    // The target predicate should select only the first four rows. A fifth
+    // global conversation and a local file conversation are
+    // useful decoys: authority candidate scans may be broader, but SQL's
+    // residual predicates must still define the result.
+    authority
+        .execute(
+            "INSERT INTO lix_file(path, content) VALUES ('/conversation-outside-range.txt', CAST('outside' AS BYTEA))",
+            &[],
+        )
+        .await
+        .unwrap();
+    let outside_checkpoint = authority
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    let local_file_id = authority
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/conversation-checkpoint-0.txt'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_conversation (id, target, title, lixcol_global) \
+             VALUES ($1, lix_row_ref('lix_commit', NULL, $2), 'Outside qualification', true), \
+                    ($3, lix_row_ref('lix_file', NULL, $4), 'Local decoy', false)",
+            &[
+                Value::Text(OUTSIDE_CONVERSATION_ID.to_owned()),
+                Value::Text(outside_checkpoint),
+                Value::Text(LOCAL_CONVERSATION_ID.to_owned()),
+                Value::Text(local_file_id),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let query = "SELECT id, title, \
+                    CASE \
+                      WHEN target = lix_row_ref('lix_commit', NULL, $1) THEN $1 \
+                      WHEN target = lix_row_ref('lix_commit', NULL, $2) THEN $2 \
+                      WHEN target = lix_row_ref('lix_commit', NULL, $3) THEN $3 \
+                      WHEN target = lix_row_ref('lix_commit', NULL, $4) THEN $4 \
+                    END AS commit_id \
+                 FROM lix_conversation \
+                 WHERE lixcol_global = true \
+                   AND target IN ( \
+                     lix_row_ref('lix_commit', NULL, $1), \
+                     lix_row_ref('lix_commit', NULL, $2), \
+                     lix_row_ref('lix_commit', NULL, $3), \
+                     lix_row_ref('lix_commit', NULL, $4) \
+                   ) \
+                 ORDER BY lixcol_created_at ASC, id ASC";
+    let params = checkpoint_ids
+        .iter()
+        .cloned()
+        .map(Value::Text)
+        .collect::<Vec<_>>();
+    let authority_rows = authority.execute(query, &params).await.unwrap();
+    assert_eq!(authority_rows.rows().len(), 4);
+    let expected = checkpoint_ids
+        .iter()
+        .enumerate()
+        .map(|(index, commit_id)| (commit_id.clone(), format!("Qualification {index}")))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let authority_results = authority_rows
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("commit_id").unwrap(),
+                row.get::<String>("title").unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(authority_results, expected);
+
+    // An ordered declared column exercises range candidates without assigning
+    // ordering semantics to opaque ROW_REF values.
+    let range_schema = serde_json::json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": "candidate_range_probe",
+        "columns": [
+            {"name": "id", "type": "text", "nullable": false},
+            {"name": "ordinal", "type": "int8", "nullable": false}
+        ],
+        "primary_key": ["id"],
+        "unique": [["ordinal"]]
+    });
+    authority
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+            &[Value::Text(serde_json::to_string(&range_schema).unwrap())],
+        )
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO candidate_range_probe (id, ordinal) VALUES \
+             ('below', -1), ('first', 0), ('middle', 1), ('last', 2), ('above', 3)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
+    let open_cold_replica = |log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>| {
+        let server = server.clone();
+        let repository_id = authority.lix_id().to_owned();
+        let account_id = authority.active_account_id().to_owned();
+        async move {
+            let transport = HttpSyncTransport::connect_with(
+                TimedClient {
+                    inner: Client {
+                        server,
+                        lose_body: Arc::new(AtomicBool::new(false)),
+                    },
+                    log,
+                    delay: 0,
+                },
+                &format!("https://example.test/lix/{repository_id}"),
+            )
+            .await
+            .unwrap();
+            let leased = transport.partial_replica_descriptor(None).await.unwrap();
+            let state = Arc::new(
+                PartialReplicaState::from_leased(
+                    transport.protocol_url().into(),
+                    account_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    leased.wire,
+                )
+                .unwrap(),
+            );
+            transport
+                .bind_native_baseline_lease(state.baseline_lease())
+                .unwrap();
+
+            let storage = StorageAdapter::new(
+                crate::storage_adapter::StorageSession::acquire(Memory::new())
+                    .await
+                    .unwrap(),
+            );
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let mut writes = storage.new_write_set();
+            let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+            crate::init::stage_partial_repository_protocol(&mut writes);
+            drop(read);
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (engine, session) =
+                Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+                    .await
+                    .unwrap();
+            let engine = Arc::new(engine);
+            engine.sync_mode().admit_partial_replica(
+                state.clone(),
+                crate::sync::partial_replica_write_capability(),
+            );
+            storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let worker_storage = storage;
+            let worker_state = state;
+            let worker_transport = transport.clone();
+            let worker = tokio::spawn(async move {
+                while let Some(demand) = receiver.recv().await {
+                    let result = crate::sync::partial_runtime::hydrate_demand_with_receipt(
+                        &worker_storage,
+                        &worker_state,
+                        &worker_transport,
+                        demand.request,
+                    )
+                    .await;
+                    let _ = demand.response.send(result);
+                }
+            });
+            let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
+            (replica, worker)
+        }
+    };
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (replica, worker) = open_cold_replica(log.clone()).await;
+
+    let rows = replica
+        .execute(query, &params)
+        .await
+        .expect("cold sparse target-IN query should hydrate its global conversations");
+    let results = rows
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("commit_id").unwrap(),
+                row.get::<String>("title").unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(results, expected);
+    assert!(
+        !fulfillment_requests(&log).is_empty(),
+        "checkpoint conversation query must use read fulfillment"
+    );
+    let requests = fulfillment_requests(&log);
+    let conversation_scan = requests
+        .iter()
+        .flat_map(|request| {
+            request["request_interests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .find(|interest| {
+            interest["kind"] == "scan"
+                && interest["request"]["filter"]["schema_keys"]
+                    .as_array()
+                    .is_some_and(|keys| keys.iter().any(|key| key == "lix_conversation"))
+        })
+        .expect("cold query should select the conversation scan recipe");
+    let filter = &conversation_scan["request"]["filter"];
+    assert_eq!(filter["row_pks"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        filter["declared_column_eq"]["values"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "the cold scan should carry all four target-IN values"
+    );
+    print_profile("target_in", &log);
+
+    replica.close().await.unwrap();
+    worker.abort();
+
+    // Re-run the same bounded predicate on another empty replica with a
+    // positive SQL limit. It must remain a cold read and return the full
+    // target set before LIMIT is applied locally.
+    let limited_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (limited_replica, limited_worker) = open_cold_replica(limited_log.clone()).await;
+    let limited_query = format!("{query} LIMIT 4");
+    let limited_rows = limited_replica
+        .execute(&limited_query, &params)
+        .await
+        .expect("cold target-IN query with LIMIT should hydrate its candidates");
+    let limited_results = limited_rows
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("commit_id").unwrap(),
+                row.get::<String>("title").unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(limited_results, expected);
+    assert!(!fulfillment_requests(&limited_log).is_empty());
+    print_profile("limited", &limited_log);
+    limited_replica.close().await.unwrap();
+    limited_worker.abort();
+
+    // Exercise a genuine declared-column range on another empty replica.
+    let range_query = "SELECT id FROM candidate_range_probe \
+                       WHERE ordinal BETWEEN 0 AND 2 ORDER BY id";
+    let authority_range = authority.execute(range_query, &[]).await.unwrap();
+    let expected_range = authority_range
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(expected_range, ["first", "last", "middle"]);
+    let range_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (range_replica, range_worker) = open_cold_replica(range_log.clone()).await;
+    let range_rows = range_replica
+        .execute(range_query, &[])
+        .await
+        .expect("cold indexed integer range should hydrate its candidates");
+    let range_results = range_rows
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(range_results, expected_range);
+    assert!(!fulfillment_requests(&range_log).is_empty());
+    let requests = fulfillment_requests(&range_log);
+    assert!(requests.iter().any(|request| {
+        request["request_interests"]
+            .as_array()
+            .is_some_and(|interests| {
+                interests.iter().any(|interest| {
+                    interest["kind"] == "scan"
+                        && interest["request"]["filter"]["schema_keys"]
+                            .as_array()
+                            .is_some_and(|keys| {
+                                keys.iter().any(|key| key == "candidate_range_probe")
+                            })
+                        && interest["request"]["filter"]["declared_column_range"].is_object()
+                })
+            })
+    }));
+    print_profile("range", &range_log);
+    range_replica.close().await.unwrap();
+    range_worker.abort();
+
+    server.close().await.unwrap();
+    authority.close().await.unwrap();
+}
 /// Manual read-only probe for reproducing production-only partial-replica
 /// failures against an authority through the real HTTP transport. The local
 /// replica is always a fresh in-memory store. Set
