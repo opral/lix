@@ -1111,11 +1111,16 @@ where
         {
             return self.tree.distinct_schema_keys(&self.store, &root).await;
         }
-        let manifest = storage::load_published_commit_state_topology(&self.store, commit_id)
+        let manifest = match storage::load_published_commit_state_topology(&self.store, commit_id)
             .await?
-            .ok_or_else(|| {
-                LixError::unknown(format!("commit '{commit_id}' has no commit-state manifest"))
-            })?;
+        {
+            Some(manifest) => manifest,
+            None => {
+                return Err(
+                    storage::missing_commit_state_manifest_error(&self.store, commit_id).await,
+                );
+            }
+        };
         if let Some(root) = manifest.row_pk_index_root_id() {
             return self.tree.distinct_schema_keys(&self.store, root).await;
         }
@@ -1142,14 +1147,16 @@ where
         if row_pks.is_empty() {
             return Ok(Vec::new());
         }
-        let manifest = storage::load_published_commit_state_topology(&self.store, commit_id)
+        let manifest = match storage::load_published_commit_state_topology(&self.store, commit_id)
             .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("commit '{commit_id}' has no commit-state manifest"),
-                )
-            })?;
+        {
+            Some(manifest) => manifest,
+            None => {
+                return Err(
+                    storage::missing_commit_state_manifest_error(&self.store, commit_id).await,
+                );
+            }
+        };
         let Some(root) = manifest.row_pk_index_root_id() else {
             if storage::load_manifest_snapshot_commit_root(&self.store, commit_id)
                 .await?
@@ -6507,6 +6514,45 @@ mod tests {
     use crate::changelog::{ChangelogContext, ChangelogWriter, CommitRecord};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+
+    #[tokio::test]
+    async fn missing_row_pk_inventory_requests_deferred_commit_header() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("deferred-row-pk-inventory");
+        let mut writes = storage.new_write_set();
+        storage::stage_commit_history_deferred(&mut writes, commit_id);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("deferred marker should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut tracked = TrackedStateContext::new().reader(&read);
+        let error = tracked
+            .enumerate_schema_row_pk_keys_at_commit(
+                commit_id,
+                "lix_key_value",
+                &[RowPk::single("history-marker")],
+            )
+            .await
+            .expect_err("a deferred row-PK catalog requires its commit header");
+
+        assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");
+        assert_eq!(
+            error.details.as_ref().unwrap()["commitIds"],
+            serde_json::json!([commit_id.to_string()]),
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeMetadata"]["address"],
+            serde_json::json!({
+                "kind": "commit_state_header",
+                "commitId": commit_id.to_string(),
+            }),
+        );
+    }
 
     #[test]
     fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
