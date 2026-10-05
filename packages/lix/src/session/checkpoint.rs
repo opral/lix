@@ -87,11 +87,14 @@ where
                 // planning runs without the foreground session gate; its prepared
                 // commit relies on storage conflict detection.
                 let gc_session = self.clone();
-                let gc_coordinator = self.commit_coordinator.clone();
+                let gc_running = self.commit_coordinator.checkpoint_gc_completion_signal();
                 if let Err(error) =
                     crate::background_task::spawn("lix-checkpoint-gc", move || async move {
                         gc_session.collect_checkpoint_garbage_best_effort().await;
-                        gc_coordinator.finish_checkpoint_gc();
+                        // Do not publish completion while this task still owns
+                        // a session, storage adapter, or its coordinator clone.
+                        drop(gc_session);
+                        gc_running.store(false, std::sync::atomic::Ordering::Release);
                     })
                 {
                     self.commit_coordinator.finish_checkpoint_gc();

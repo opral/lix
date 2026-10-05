@@ -328,6 +328,9 @@ where
         if let Err(error) = claim_fresh_import(&storage, &claim).await {
             let cleaned = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
             let error = with_cleanup_error(error, cleaned);
+            // The completion message is a storage-release receipt.
+            drop(candidate);
+            drop(storage);
             let _ = report_done.send(Ok(()));
             let _ = report_claimed.send(Err(error));
             return;
@@ -336,6 +339,8 @@ where
             // The restore was cancelled before it observed ownership. The
             // claim is now settled and exact, so it is safe to remove it.
             let result = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
+            drop(candidate);
+            drop(storage);
             let _ = report_done.send(result);
             return;
         }
@@ -345,6 +350,10 @@ where
         } else {
             Ok(())
         };
+        // Do not let cleanup().await return while this detached worker still
+        // owns handles that can keep the underlying storage alive.
+        drop(candidate);
+        drop(storage);
         let _ = report_done.send(result);
     })?;
     Ok(FreshEpochCleanup {
@@ -3318,7 +3327,86 @@ pub(super) mod tests {
     use super::*;
     use crate::storage_adapter::StorageWriteOptions;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct StorageHandleProbe {
+        inner: crate::Memory,
+        live_handles: Arc<AtomicUsize>,
+    }
+
+    impl StorageHandleProbe {
+        fn new() -> Self {
+            Self {
+                inner: crate::Memory::new(),
+                live_handles: Arc::new(AtomicUsize::new(1)),
+            }
+        }
+    }
+
+    impl Clone for StorageHandleProbe {
+        fn clone(&self) -> Self {
+            self.live_handles.fetch_add(1, Ordering::AcqRel);
+            Self {
+                inner: self.inner.clone(),
+                live_handles: Arc::clone(&self.live_handles),
+            }
+        }
+    }
+
+    impl Drop for StorageHandleProbe {
+        fn drop(&mut self) {
+            self.live_handles.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Storage for StorageHandleProbe {
+        type Read<'a> = MemoryRead;
+        type Write<'a> = MemoryWrite;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_epoch_cleanup_receipt_follows_storage_handle_release() {
+        let storage = StorageHandleProbe::new();
+        let live_handles = Arc::clone(&storage.live_handles);
+        let claim = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(91),
+        });
+        let candidate =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, claim.clone());
+        let mut cleanup = start_fresh_epoch_cleanup(storage.clone(), candidate, claim)
+            .expect("start cleanup task");
+        cleanup
+            .wait_for_claim()
+            .await
+            .expect("cleanup task claims storage");
+
+        cleanup.cleanup().await.expect("cleanup completes");
+        assert_eq!(
+            live_handles.load(Ordering::Acquire),
+            1,
+            "completion receipt must follow release of worker-owned storage handles"
+        );
+    }
 
     #[test]
     fn candidate_epoch_writes_are_durable_and_cover_snapshot_wire_spaces() {

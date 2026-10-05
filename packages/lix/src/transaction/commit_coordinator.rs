@@ -55,7 +55,7 @@ where
     observe_invalidation: Arc<ObserveInvalidation>,
     capacity: Arc<Semaphore>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    checkpoint_gc_running: AtomicBool,
+    checkpoint_gc_running: Arc<AtomicBool>,
     checkpoint_gc_not_before_sequence: AtomicU64,
     state: Mutex<CommitCoordinatorState<StorageImpl>>,
     #[cfg(test)]
@@ -106,7 +106,7 @@ where
                 observe_invalidation,
                 capacity: Arc::new(Semaphore::new(COMMIT_QUEUE_CAPACITY)),
                 telemetry,
-                checkpoint_gc_running: AtomicBool::new(false),
+                checkpoint_gc_running: Arc::new(AtomicBool::new(false)),
                 checkpoint_gc_not_before_sequence: AtomicU64::new(0),
                 state: Mutex::new(CommitCoordinatorState::default()),
                 #[cfg(test)]
@@ -162,6 +162,13 @@ where
         self.inner
             .checkpoint_gc_running
             .store(false, Ordering::Release);
+    }
+
+    /// A detached GC worker keeps only this completion signal after releasing
+    /// its session/coordinator handles, so clearing it is a storage-release
+    /// barrier rather than a side effect of dropping the coordinator clone.
+    pub(crate) fn checkpoint_gc_completion_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.checkpoint_gc_running)
     }
 
     pub(crate) async fn commit(

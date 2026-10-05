@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
@@ -24,24 +24,37 @@ pub(crate) enum ObserveInvalidationEvent {
 
 #[derive(Debug)]
 pub(crate) struct ObserveInvalidation {
+    signals: Arc<ObserveSignals>,
+    watcher: Arc<ObserveWatcherLifecycle>,
+}
+
+#[derive(Debug)]
+struct ObserveSignals {
     generation: AtomicU64,
     sender: watch::Sender<ObserveInvalidationEvent>,
-    external_watcher_started: Mutex<bool>,
+}
+
+#[derive(Debug, Default)]
+struct ObserveWatcherLifecycle {
+    started: Mutex<bool>,
+    task: StdMutex<Option<crate::background_task::OwnedBackgroundTask>>,
 }
 
 impl ObserveInvalidation {
     pub(crate) fn new() -> Self {
         let (sender, _) = watch::channel(ObserveInvalidationEvent::Generation(0));
         Self {
-            generation: AtomicU64::new(0),
-            sender,
-            external_watcher_started: Mutex::new(false),
+            signals: Arc::new(ObserveSignals {
+                generation: AtomicU64::new(0),
+                sender,
+            }),
+            watcher: Arc::default(),
         }
     }
 
     pub(crate) fn bump(&self) -> u64 {
-        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.sender.send_modify(|event| {
+        let next = self.signals.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.signals.sender.send_modify(|event| {
             if matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
                 return;
             }
@@ -51,11 +64,11 @@ impl ObserveInvalidation {
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.signals.generation.load(Ordering::SeqCst)
     }
 
     pub(crate) fn fail_terminal(&self, error: LixError) {
-        self.sender.send_modify(|event| {
+        self.signals.sender.send_modify(|event| {
             if !matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
                 *event = ObserveInvalidationEvent::TerminalError(error);
             }
@@ -69,7 +82,7 @@ impl ObserveInvalidation {
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<ObserveInvalidationEvent> {
-        self.sender.subscribe()
+        self.signals.sender.subscribe()
     }
 
     pub(crate) async fn ensure_external_watcher<StorageImpl>(
@@ -83,8 +96,8 @@ impl ObserveInvalidation {
         // its baseline. Otherwise they can evaluate an older snapshot that
         // the watcher treats as already seen; cancellation also releases this
         // gate so a contender can retry startup.
-        let mut watcher_started = self.external_watcher_started.lock().await;
-        let event = self.sender.borrow().clone();
+        let mut watcher_started = self.watcher.started.lock().await;
+        let event = self.signals.sender.borrow().clone();
         if let ObserveInvalidationEvent::TerminalError(error) = event {
             return Err(error);
         }
@@ -92,33 +105,101 @@ impl ObserveInvalidation {
             return Ok(());
         }
 
+        // A previous watcher can have marked itself stopped immediately
+        // before returning. Reap it while holding the startup gate so a new
+        // watcher cannot race its final storage access.
+        if let Some(previous) = self
+            .watcher
+            .task
+            .lock()
+            .expect("observer watcher task lock should not poison")
+            .take()
+        {
+            previous.cancel_and_join()?;
+        }
+
         match storage.watch_for_changes().await {
             Ok(mut changes) => {
-                let invalidation = Arc::downgrade(self);
-                crate::background_task::spawn("lix-observe-change-watch", move || async move {
-                    loop {
-                        let Some(invalidation) = invalidation.upgrade() else {
-                            break;
-                        };
-                        match changes.changed().await {
-                            Ok(()) => {
-                                invalidation.bump();
-                            }
-                            Err(error) => {
-                                if matches!(error, StorageError::Fenced | StorageError::Closed(_)) {
-                                    invalidation.fail_terminal(error.into());
-                                } else {
-                                    // Wake observers so the stable-read loop can retry and
-                                    // reopen the adapter watch after a transient failure.
-                                    invalidation.bump();
-                                }
-                                *invalidation.external_watcher_started.lock().await = false;
+                let weak_signals = Arc::downgrade(&self.signals);
+                let lifecycle = Arc::clone(&self.watcher);
+                let no_receivers = self.signals.sender.clone();
+                let task = crate::background_task::spawn_owned(
+                    "lix-observe-change-watch",
+                    move || async move {
+                        loop {
+                            let Some(live_signals) = weak_signals.upgrade() else {
                                 break;
+                            };
+                            let has_receivers = live_signals.sender.receiver_count() > 0;
+                            drop(live_signals);
+                            if !has_receivers {
+                                let mut started = lifecycle.started.lock().await;
+                                let still_has_receivers = weak_signals
+                                    .upgrade()
+                                    .is_some_and(|signals| signals.sender.receiver_count() > 0);
+                                if !still_has_receivers {
+                                    *started = false;
+                                    break;
+                                }
+                                continue;
+                            }
+                            let changed = futures_lite::future::race(
+                                async { Some(changes.changed().await) },
+                                async {
+                                    no_receivers.closed().await;
+                                    None
+                                },
+                            )
+                            .await;
+                            match changed {
+                                Some(Ok(())) => {
+                                    if let Some(signals) = weak_signals.upgrade() {
+                                        bump_signals(&signals);
+                                    } else {
+                                        break;
+                                    }
+                                    // Storage adapters are permitted to report
+                                    // an already-ready invalidation repeatedly.
+                                    // Yield so cancellation remains pollable even
+                                    // when the source never becomes pending.
+                                    futures_lite::future::yield_now().await;
+                                }
+                                None => {
+                                    let mut started = lifecycle.started.lock().await;
+                                    let still_has_receivers = weak_signals
+                                        .upgrade()
+                                        .is_some_and(|signals| signals.sender.receiver_count() > 0);
+                                    if !still_has_receivers {
+                                        *started = false;
+                                        break;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    if let Some(signals) = weak_signals.upgrade() {
+                                        if matches!(
+                                            error,
+                                            StorageError::Fenced | StorageError::Closed(_)
+                                        ) {
+                                            fail_terminal_signals(&signals, error.into());
+                                        } else {
+                                            // Wake observers so the stable-read loop can retry and
+                                            // reopen the adapter watch after a transient failure.
+                                            bump_signals(&signals);
+                                        }
+                                    }
+                                    *lifecycle.started.lock().await = false;
+                                    break;
+                                }
                             }
                         }
-                    }
-                })?;
+                    },
+                )?;
                 *watcher_started = true;
+                *self
+                    .watcher
+                    .task
+                    .lock()
+                    .expect("observer watcher task lock should not poison") = Some(task);
                 return Ok(());
             }
             Err(StorageError::Unsupported(StorageCapability::ChangeWatch)) => {}
@@ -157,51 +238,115 @@ impl ObserveInvalidation {
                     return Err(error);
                 }
             };
-            let invalidation = Arc::downgrade(self);
-            crate::background_task::spawn("lix-observe-invalidation", move || async move {
-                loop {
-                    // This is a dedicated Lix-owned worker. Sleeping the worker
-                    // thread avoids requiring a Tokio timer driver from the host.
-                    std::thread::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
-                    let Some(invalidation) = invalidation.upgrade() else {
-                        break;
-                    };
-                    if invalidation.sender.receiver_count() == 0 {
-                        // Synchronize shutdown with startup. A new subscriber can race this
-                        // check; rechecking under the startup gate either keeps this watcher
-                        // alive or lets the contender start its replacement.
-                        let mut watcher_started =
-                            invalidation.external_watcher_started.lock().await;
-                        if invalidation.sender.receiver_count() == 0 {
-                            *watcher_started = false;
+            let weak_signals = Arc::downgrade(&self.signals);
+            let lifecycle = Arc::clone(&self.watcher);
+            let no_receivers = self.signals.sender.clone();
+            let task = crate::background_task::spawn_owned(
+                "lix-observe-invalidation",
+                move || async move {
+                    loop {
+                        let Some(live_signals) = weak_signals.upgrade() else {
                             break;
-                        }
-                        drop(watcher_started);
-                    }
-                    let current_revision = match storage.load_mutation_revision().await {
-                        Ok(revision) => revision,
-                        Err(error) => {
-                            let error: LixError = error.into();
-                            if matches!(
-                                error.code.as_str(),
-                                LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
-                            ) {
-                                invalidation.fail_terminal(error);
+                        };
+                        let has_receivers = live_signals.sender.receiver_count() > 0;
+                        drop(live_signals);
+                        if !has_receivers {
+                            let mut started = lifecycle.started.lock().await;
+                            let still_has_receivers = weak_signals
+                                .upgrade()
+                                .is_some_and(|signals| signals.sender.receiver_count() > 0);
+                            if !still_has_receivers {
+                                *started = false;
                                 break;
                             }
                             continue;
                         }
-                    };
-                    if current_revision != last_seen_revision {
-                        last_seen_revision = current_revision;
-                        invalidation.bump();
+                        let elapsed = tokio::time::sleep(EXTERNAL_MUTATION_REVISION_POLL_INTERVAL);
+                        tokio::pin!(elapsed);
+                        let no_receivers = no_receivers.closed();
+                        tokio::pin!(no_receivers);
+                        tokio::select! {
+                            _ = &mut elapsed => {}
+                            _ = &mut no_receivers => {
+                                let mut started = lifecycle.started.lock().await;
+                                let still_has_receivers = weak_signals
+                                    .upgrade()
+                                    .is_some_and(|signals| signals.sender.receiver_count() > 0);
+                                if !still_has_receivers {
+                                    *started = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let current_revision = match storage.load_mutation_revision().await {
+                            Ok(revision) => revision,
+                            Err(error) => {
+                                let error: LixError = error.into();
+                                if matches!(
+                                    error.code.as_str(),
+                                    LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
+                                ) {
+                                    if let Some(signals) = weak_signals.upgrade() {
+                                        fail_terminal_signals(&signals, error);
+                                    }
+                                    *lifecycle.started.lock().await = false;
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        if current_revision != last_seen_revision {
+                            last_seen_revision = current_revision;
+                            if let Some(signals) = weak_signals.upgrade() {
+                                bump_signals(&signals);
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                }
-            })?;
+                },
+            )?;
             *watcher_started = true;
+            *self
+                .watcher
+                .task
+                .lock()
+                .expect("observer watcher task lock should not poison") = Some(task);
             Ok(())
         }
     }
+}
+
+impl Drop for ObserveInvalidation {
+    fn drop(&mut self) {
+        let task = self
+            .watcher
+            .task
+            .lock()
+            .expect("observer watcher task lock should not poison")
+            .take();
+        if let Some(task) = task {
+            let _ = task.cancel_and_join();
+        }
+    }
+}
+
+fn bump_signals(signals: &ObserveSignals) {
+    let next = signals.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    signals.sender.send_modify(|event| {
+        if matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
+            return;
+        }
+        *event = ObserveInvalidationEvent::Generation(next);
+    });
+}
+
+fn fail_terminal_signals(signals: &ObserveSignals, error: LixError) {
+    signals.sender.send_modify(|event| {
+        if !matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
+            *event = ObserveInvalidationEvent::TerminalError(error);
+        }
+    });
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -235,7 +380,7 @@ mod tests {
     }
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
     #[derive(Clone)]
@@ -296,6 +441,174 @@ mod tests {
             options: WriteOptions,
         ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProbeStorage {
+        inner: Memory,
+        _lifetime: Arc<()>,
+        reads: Arc<AtomicUsize>,
+        poll_started: Arc<Notify>,
+    }
+
+    impl Storage for ProbeStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.reads.fetch_add(1, Ordering::AcqRel) > 0 {
+                self.poll_started.notify_one();
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    struct PendingChangeSource {
+        entered: Arc<Notify>,
+        dropped: Arc<AtomicUsize>,
+        _storage_lifetime: Arc<()>,
+    }
+
+    impl Drop for PendingChangeSource {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl StorageChangeSource for PendingChangeSource {
+        fn changed(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct PendingChangeWatchStorage {
+        inner: Memory,
+        entered: Arc<Notify>,
+        dropped: Arc<AtomicUsize>,
+        lifetime: Arc<()>,
+    }
+
+    impl Storage for PendingChangeWatchStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+
+        async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+            Ok(StorageChangeWatch::from_source(PendingChangeSource {
+                entered: Arc::clone(&self.entered),
+                dropped: Arc::clone(&self.dropped),
+                _storage_lifetime: Arc::clone(&self.lifetime),
+            }))
+        }
+    }
+
+    struct AlwaysReadyChangeSource {
+        dropped: Arc<AtomicUsize>,
+        _storage_lifetime: Arc<()>,
+    }
+
+    impl Drop for AlwaysReadyChangeSource {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl StorageChangeSource for AlwaysReadyChangeSource {
+        fn changed(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlwaysReadyChangeWatchStorage {
+        inner: Memory,
+        dropped: Arc<AtomicUsize>,
+        lifetime: Arc<()>,
+    }
+
+    impl Storage for AlwaysReadyChangeWatchStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+
+        async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+            Ok(StorageChangeWatch::from_source(AlwaysReadyChangeSource {
+                dropped: Arc::clone(&self.dropped),
+                _storage_lifetime: Arc::clone(&self.lifetime),
+            }))
         }
     }
 
@@ -434,6 +747,7 @@ mod tests {
     #[tokio::test]
     async fn contending_observer_waits_for_cancelled_watcher_start_and_retries() {
         let invalidation = Arc::new(ObserveInvalidation::new());
+        let _observer = invalidation.subscribe();
         let storage = BlockingFirstReadStorage::new();
         let cancelled_start = {
             let invalidation = Arc::clone(&invalidation);
@@ -474,7 +788,7 @@ mod tests {
             .expect("contending observer task should not panic")
             .expect("contending observer should establish the watcher");
         assert!(
-            *invalidation.external_watcher_started.lock().await,
+            *invalidation.watcher.started.lock().await,
             "contending retry should mark the watcher as started"
         );
     }
@@ -492,7 +806,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !*invalidation.external_watcher_started.lock().await {
+                if !*invalidation.watcher.started.lock().await {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -506,6 +820,171 @@ mod tests {
             .ensure_external_watcher(storage)
             .await
             .expect("watcher should restart");
-        assert!(*invalidation.external_watcher_started.lock().await);
+        assert!(*invalidation.watcher.started.lock().await);
+    }
+
+    #[tokio::test]
+    async fn pending_change_watch_stops_without_receivers_and_restarts() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let storage = PendingChangeWatchStorage {
+            inner: Memory::new(),
+            entered: Arc::clone(&entered),
+            dropped: Arc::clone(&dropped),
+            lifetime: Arc::new(()),
+        };
+        let adapter = StorageAdapter::new(storage);
+        let observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(adapter.clone())
+            .await
+            .expect("change watcher should start");
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("change watcher should enter its pending wait");
+
+        drop(observer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !*invalidation.watcher.started.lock().await
+                    && dropped.load(Ordering::Acquire) == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("change watcher should stop after its last observer closes");
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+
+        let replacement = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(adapter)
+            .await
+            .expect("change watcher should restart for a new observer");
+        assert!(*invalidation.watcher.started.lock().await);
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn dropping_owner_joins_pending_change_watcher_and_releases_storage() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let owner = Arc::downgrade(&invalidation);
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let storage_lifetime = Arc::new(());
+        let storage_weak = Arc::downgrade(&storage_lifetime);
+        let storage = PendingChangeWatchStorage {
+            inner: Memory::new(),
+            entered: Arc::clone(&entered),
+            dropped: Arc::clone(&dropped),
+            lifetime: Arc::clone(&storage_lifetime),
+        };
+        drop(storage_lifetime);
+        let adapter = StorageAdapter::new(storage);
+        let observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(adapter)
+            .await
+            .expect("change watcher should start");
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("change watcher should enter its pending wait");
+
+        drop(invalidation);
+        assert!(owner.upgrade().is_none(), "owner should be fully dropped");
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            1,
+            "joined watcher should release its pending change source"
+        );
+        assert!(
+            storage_weak.upgrade().is_none(),
+            "joined watcher should release its storage-owned change watch"
+        );
+        drop(observer);
+    }
+
+    #[tokio::test]
+    async fn dropping_owner_joins_always_ready_change_watcher() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let owner = Arc::downgrade(&invalidation);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let lifetime = Arc::new(());
+        let storage_lifetime = Arc::downgrade(&lifetime);
+        let storage = AlwaysReadyChangeWatchStorage {
+            inner: Memory::new(),
+            dropped: Arc::clone(&dropped),
+            lifetime: Arc::clone(&lifetime),
+        };
+        drop(lifetime);
+        let mut observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(StorageAdapter::new(storage))
+            .await
+            .expect("always-ready change watcher should start");
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("always-ready source should publish an invalidation")
+            .expect("observer channel should remain open");
+
+        drop(invalidation);
+        assert!(owner.upgrade().is_none(), "owner should be fully dropped");
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            1,
+            "joined watcher should release its always-ready source"
+        );
+        assert!(
+            storage_lifetime.upgrade().is_none(),
+            "joined watcher should release storage retained by its source"
+        );
+        drop(observer);
+    }
+
+    #[tokio::test]
+    async fn dropping_owner_joins_poll_watcher_and_releases_storage() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let owner = Arc::downgrade(&invalidation);
+        let lifetime = Arc::new(());
+        let storage_lifetime = Arc::downgrade(&lifetime);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let poll_started = Arc::new(Notify::new());
+        let storage = ProbeStorage {
+            inner: Memory::new(),
+            _lifetime: Arc::clone(&lifetime),
+            reads,
+            poll_started: Arc::clone(&poll_started),
+        };
+        let observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(StorageAdapter::new(storage.clone()))
+            .await
+            .expect("unsupported change watch should start revision polling");
+        tokio::time::timeout(Duration::from_secs(2), poll_started.notified())
+            .await
+            .expect("revision poller should perform a poll after its baseline read");
+        drop(storage);
+        drop(lifetime);
+
+        let shutdown_started = tokio::time::Instant::now();
+        drop(invalidation);
+        let shutdown_elapsed = shutdown_started.elapsed();
+        assert!(owner.upgrade().is_none(), "owner should be fully dropped");
+        assert!(
+            storage_lifetime.upgrade().is_none(),
+            "joined poller should release its storage clone"
+        );
+        println!(
+            "OBSERVER_WATCHER_SHUTDOWN_PROFILE_JSON={}",
+            serde_json::json!({
+                "watcher": "revision_poll",
+                "shutdown_us": shutdown_elapsed.as_micros(),
+                "poll_interval_us": EXTERNAL_MUTATION_REVISION_POLL_INTERVAL.as_micros(),
+            })
+        );
+        drop(observer);
     }
 }
