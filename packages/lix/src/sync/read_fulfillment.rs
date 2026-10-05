@@ -293,36 +293,61 @@ pub(crate) fn annotate_capture(
         .as_ref()
         .is_some_and(|d| d.get("nativeHistoryDemand").is_some())
         && !has_bounded_history
+        && selected_change_payload_locator(&error).is_none()
     {
         return error;
     }
-    if snapshot.interests.is_empty()
-        || snapshot
+    if snapshot.interests.is_empty() {
+        return error;
+    }
+    let has_diff = snapshot
+        .interests
+        .iter()
+        .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }));
+    let history_over_budget =
+        !history_recipes_within_budget(snapshot.interests.iter().map(|interest| interest.as_ref()));
+    let salvage_current_recipes = has_diff || history_over_budget;
+    if salvage_current_recipes && selected_change_payload_locator(&error).is_none() {
+        // Historical diffs may name local pending commits. Their specialized
+        // demand path owns those endpoints; over-budget History has the same
+        // native-demand behavior. Neither can be replayed as an admitted
+        // current-state recipe without a selected payload locator.
+        return error;
+    }
+    let interests: Vec<_> = if salvage_current_recipes {
+        // Historical recipes cannot authorize a current mutable payload.
+        // When the native miss identifies that payload exactly, retain only
+        // independent current recipes; the historical miss stays native.
+        snapshot
             .interests
             .iter()
-            .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }))
-    {
-        // Historical diffs may name local pending commits. Their specialized
-        // demand path owns those endpoints; the authority cannot replay the
-        // client's private history as an admitted current-state recipe.
+            .filter(|interest| {
+                !matches!(
+                    interest.as_ref(),
+                    LogicalReadInterest::History { .. } | LogicalReadInterest::Diff { .. }
+                )
+            })
+            .map(|interest| interest.as_ref())
+            .collect()
+    } else {
+        snapshot
+            .interests
+            .iter()
+            .map(|interest| interest.as_ref())
+            .collect()
+    };
+    if interests.is_empty() || interests.len() > 4096 {
         return error;
     }
-    if !history_recipes_within_budget(snapshot.interests.iter().map(|interest| interest.as_ref())) {
-        // A valid foreground query may capture more History scans than the
-        // bounded authority recipe supports. Preserve the established native
-        // demand path instead of sending an over-budget wire request.
-        return error;
-    }
-    if snapshot.serialized_bytes > MAX_RECIPE_BYTES {
+    let serialized_interests = match serde_json::to_vec(&interests) {
+        Ok(serialized) => serialized,
+        Err(_) => return invalid("invalid read operation recipes"),
+    };
+    if serialized_interests.len() > MAX_RECIPE_BYTES {
         return invalid("read operation recipe byte limit exceeded");
     }
     // Keep the native missing diagnostic intact for corruption handling and
     // pinned transaction admission. Failed captures are never published.
-    let interests: Vec<_> = snapshot
-        .interests
-        .iter()
-        .map(|value| value.as_ref())
-        .collect();
     let details = error
         .details
         .get_or_insert_with(|| Box::new(serde_json::json!({})));
@@ -4509,6 +4534,125 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(history_recipes_within_budget(&boundary));
+    }
+
+    #[test]
+    fn overbudget_history_keeps_current_recipe_for_selected_payload_recovery() {
+        let capture = ReadInterestRegistry::new(32, 64 * 1024);
+        for _ in 0..=crate::hot_state::MAX_HISTORY_RECIPE_COUNT {
+            capture
+                .register(LogicalReadInterest::History {
+                    branch_id: "branch".into(),
+                    anchor: uuid::Uuid::now_v7().to_string(),
+                    commit_ids: vec![uuid::Uuid::now_v7().to_string()],
+                    relation: "lix_file".into(),
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    retain_payloads: false,
+                    projected_columns: vec!["id".into()],
+                    limit: None,
+                })
+                .unwrap();
+        }
+        capture
+            .register(LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_key_value".into()],
+                        branch_ids: vec!["branch".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                domain: InterestDomain::Tracked,
+            })
+            .unwrap();
+
+        let change_id = uuid::Uuid::now_v7().to_string();
+        let error = LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected change payload is unavailable",
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "changeId": change_id,
+            "nativeHistoryDemand": {"version": 1}
+        }));
+        let annotated = annotate_capture(error, Some(&capture));
+        let interests = interests_for_error(&annotated)
+            .unwrap()
+            .expect("current recipe should be retained for payload recovery");
+
+        assert_eq!(interests.len(), 1);
+        assert!(matches!(interests[0], LogicalReadInterest::Scan { .. }));
+        let details = annotated.details.as_ref().unwrap();
+        assert!(details.get("nativeHistoryDemand").is_some());
+        assert_eq!(details["nativeReadRecipeCount"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn diff_capture_keeps_current_recipe_only_for_selected_payload_recovery() {
+        let scan = || LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec!["lix_key_value".into()],
+                    branch_ids: vec!["branch".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            domain: InterestDomain::Tracked,
+        };
+        let diff = || LogicalReadInterest::Diff {
+            branch_id: Some("branch".into()),
+            relation: "lix_key_value".into(),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(
+                uuid::Uuid::now_v7().to_string(),
+            ),
+            to: crate::hot_state::DiffInterestEndpoint::Fixed(
+                uuid::Uuid::now_v7().to_string(),
+            ),
+            filter: crate::tracked_state::TrackedStateFilter::default(),
+            retain_payloads: false,
+            projected_columns: vec!["key".into()],
+            limit: None,
+        };
+        let missing_payload = || {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected change payload is unavailable",
+            )
+            .with_details(serde_json::json!({
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "changeId": uuid::Uuid::now_v7().to_string(),
+                "nativeHistoryDemand": {"version": 1},
+            }))
+        };
+
+        let mixed = ReadInterestRegistry::new(8, 16 * 1024);
+        mixed.register(diff()).unwrap();
+        mixed.register(scan()).unwrap();
+        let annotated = annotate_capture(missing_payload(), Some(&mixed));
+        let interests = interests_for_error(&annotated)
+            .unwrap()
+            .expect("current recipe should survive a selected payload miss");
+        assert_eq!(interests.len(), 1);
+        assert!(matches!(interests[0], LogicalReadInterest::Scan { .. }));
+        assert!(annotated
+            .details
+            .as_ref()
+            .is_some_and(|details| details.get("nativeHistoryDemand").is_some()));
+
+        let diff_only = ReadInterestRegistry::new(8, 16 * 1024);
+        diff_only.register(diff()).unwrap();
+        let annotated = annotate_capture(missing_payload(), Some(&diff_only));
+        assert!(annotated
+            .details
+            .as_ref()
+            .is_none_or(|details| details.get(MARKER).is_none()));
+        assert!(interests_for_error(&annotated).unwrap().is_none());
     }
 
     #[test]

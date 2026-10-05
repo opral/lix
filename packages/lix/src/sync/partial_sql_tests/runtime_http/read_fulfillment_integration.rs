@@ -1825,7 +1825,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let recovered = mixed
         .execute(
             "SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false",
-            &[Value::Text(mixed_conversation_id)],
+            &[Value::Text(mixed_conversation_id.clone())],
         )
         .await
         .unwrap();
@@ -1840,4 +1840,164 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     mixed.close().await.unwrap();
     mixed_worker.abort();
+
+    // An oversized History selection must not suppress a separately scoped
+    // current-row payload demand from the same operation capture.
+    let overflow_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (overflow, overflow_worker, overflow_storage, overflow_state, overflow_transport) =
+        open_cold_replica(overflow_log.clone()).await;
+    let overflow_capture = crate::hot_state::ReadInterestRegistry::new(16, 65536);
+    let saved_interests = capture.snapshot().unwrap().interests;
+    let history_template = saved_interests
+        .iter()
+        .find(|interest| {
+            matches!(
+                interest.as_ref(),
+                crate::hot_state::LogicalReadInterest::History { .. }
+            )
+        })
+        .unwrap();
+    for mask in 1usize..=9 {
+        let mut history = history_template.as_ref().clone();
+        if let crate::hot_state::LogicalReadInterest::History { commit_ids, .. } = &mut history {
+            *commit_ids = selected
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, id)| id.clone())
+                .collect();
+        }
+        overflow_capture.register(history).unwrap();
+    }
+    overflow_capture
+        .register(
+            saved_interests
+                .iter()
+                .find(|interest| {
+                    matches!(
+                        interest.as_ref(),
+                        crate::hot_state::LogicalReadInterest::Scan { .. }
+                    )
+                })
+                .unwrap()
+                .as_ref()
+                .clone(),
+        )
+        .unwrap();
+    overflow_capture
+        .register(crate::hot_state::LogicalReadInterest::Diff {
+            branch_id: Some(
+                overflow_state
+                    .descriptor()
+                    .selected_branch
+                    .branch_id
+                    .clone(),
+            ),
+            relation: "lix_file".into(),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(match history_template.as_ref() {
+                crate::hot_state::LogicalReadInterest::History { anchor, .. } => anchor.clone(),
+                _ => unreachable!(),
+            }),
+            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+            filter: crate::tracked_state::TrackedStateFilter::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        })
+        .unwrap();
+    overflow_log.lock().unwrap().clear();
+    let history_error = crate::sync::read_fulfillment::annotate_capture(
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "oversized History missing dependency",
+        )
+        .with_details(
+            serde_json::json!({"nativeHistoryDemand": {"version": 1, "includeStateHeaders": true}}),
+        ),
+        Some(&overflow_capture),
+    );
+    assert!(
+        crate::sync::read_fulfillment::interests_for_error(&history_error)
+            .unwrap()
+            .is_none()
+    );
+    crate::sync::partial_runtime::hydrate_demand_with_receipt(
+        &overflow_storage,
+        &overflow_state,
+        &overflow_transport,
+        crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+            vec![NativeMetadataRef::CommitGraphRecord(
+                checkpoint_ids[0].clone(),
+            )],
+            history_error,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(fulfillment_requests(&overflow_log).is_empty());
+    overflow_log.lock().unwrap().clear();
+    let current_error = crate::sync::read_fulfillment::annotate_capture(
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected current change is missing",
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "changeId": mixed_conversation_change_id,
+        })),
+        Some(&overflow_capture),
+    );
+    crate::sync::partial_runtime::hydrate_demand_with_receipt(
+        &overflow_storage,
+        &overflow_state,
+        &overflow_transport,
+        crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+            vec![NativeMetadataRef::ChangeLocator(
+                mixed_conversation_change_id,
+            )],
+            current_error,
+        ),
+    )
+    .await
+    .unwrap();
+    let current_recipes = fulfillment_requests(&overflow_log);
+    assert_eq!(
+        current_recipes.len(),
+        1,
+        "oversized History preserves current payload fulfillment"
+    );
+    assert!(
+        current_recipes[0]["request_interests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|interest| interest["kind"] == "scan")
+    );
+    assert!(
+        overflow_log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["status"] == 200)
+    );
+    overflow_log.lock().unwrap().clear();
+    assert_eq!(
+        overflow
+            .execute(
+                "SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false",
+                &[Value::Text(mixed_conversation_id)],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("title")
+            .unwrap(),
+        "Mixed History recovery",
+    );
+    assert!(
+        overflow_log.lock().unwrap().is_empty(),
+        "overflow recovery installs the canonical current payload"
+    );
+    overflow.close().await.unwrap();
+    overflow_worker.abort();
 }
