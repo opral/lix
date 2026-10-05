@@ -378,6 +378,30 @@ pub(crate) async fn reconcile_global_conversion_authenticated<
     journal: &mut impl GlobalConversionJournalOwner,
     authenticated: &AuthenticatedPartialConversion,
 ) -> Result<ReconciledGlobalConversion, LixError> {
+    let mut recovery = pending_conversion::ConversionRecovery::default();
+    loop {
+        match reconcile_global_conversion_authenticated_once(
+            source,
+            manifest,
+            journal,
+            authenticated,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => recovery.retry(error).await?,
+        }
+    }
+}
+
+async fn reconcile_global_conversion_authenticated_once<
+    S: Storage + Clone + Send + Sync + 'static,
+>(
+    source: &StorageAdapter<S>,
+    manifest: &FullConversionManifest,
+    journal: &mut impl GlobalConversionJournalOwner,
+    authenticated: &AuthenticatedPartialConversion,
+) -> Result<ReconciledGlobalConversion, LixError> {
     use futures_util::FutureExt as _;
     let server = authenticated.server();
     let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;

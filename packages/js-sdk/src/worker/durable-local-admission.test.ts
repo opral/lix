@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import { DurableLocalAdmission, type DurableLocalAdmissionStore } from "./durable-local-admission.js";
 import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH, type AdmissionIdentity } from "./shared-admission.js";
+import { compatibility } from "@lix-js/sdk/compatibility";
 
 const id = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${id}`;
@@ -27,6 +28,21 @@ test("cold instance restores only exact scoped routing evidence and stores no cr
   expect([...values.keys()][0]).toMatch(/^[0-9a-f]{64}$/);
 });
 
+test("durable offline proof round-trips the engine-generated current epochs", async () => {
+  const currentIdentity: AdmissionIdentity = {
+    repositoryId: id,
+    principalId: "user-A",
+    protocolEpoch: compatibility.syncProtocolVersion,
+    storageEpoch: compatibility.storageFormatVersion,
+  };
+  expect(ADMISSION_PROTOCOL_EPOCH).toBe(compatibility.syncProtocolVersion);
+  expect(ADMISSION_STORAGE_EPOCH).toBe(compatibility.storageFormatVersion);
+  const { store } = memory();
+  const proof = new DurableLocalAdmission("physical-A", url, store);
+  await proof.record(headers, currentIdentity);
+  await expect(proof.read(headers)).resolves.toEqual(currentIdentity);
+});
+
 test("canonical header order matches while additional credentials remain bound", async () => {
   const { store } = memory();
   const proof = new DurableLocalAdmission("physical", url, store);
@@ -38,6 +54,8 @@ test("canonical header order matches while additional credentials remain bound",
 test.each([
   (v: any) => { v.schemaVersion = 2; },
   (v: any) => { v.key = "wrong"; },
+  (v: any) => { v.identity.storageEpoch = 85; },
+  (v: any) => { v.identity.protocolEpoch = 25; },
   (v: any) => { v.identity.storageEpoch = 80; },
   (v: any) => { v.identity.protocolEpoch = 20; },
   (v: any) => { v.identity.repositoryId = "other"; },

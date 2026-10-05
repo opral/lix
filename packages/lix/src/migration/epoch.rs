@@ -65,9 +65,18 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, 82, 83, 84, 85, crate::init::CURRENT_FORMAT_VERSION]
-        .into_iter()
-        .find(|format| partial_repository_protocol(*format) == Some(marker))
+    [
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        crate::init::CURRENT_FORMAT_VERSION,
+    ]
+    .into_iter()
+    .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
 
 fn durable_candidate_write_options() -> WriteOptions {
@@ -995,8 +1004,8 @@ where
         intent,
         AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
     )
-        .then(|| source_marker.as_deref().and_then(partial_repository_format))
-        .flatten();
+    .then(|| source_marker.as_deref().and_then(partial_repository_format))
+    .flatten();
     let legacy_status = match partial_source_format {
         Some(from_version) => super::MigrationStatus::Required {
             from_version,
@@ -1364,33 +1373,27 @@ where
         attempt: uuid::Uuid::now_v7(),
     };
     let migrating_bytes = encode_pointer(migrating);
-    let mut claim = match source
-        .begin_migration_write(WriteOptions {
-            await_durable: true,
-            preconditions: vec![StorageAdapter::<S>::mutation_revision_precondition(
-                source_revision,
-            )],
-            ..WriteOptions::default()
-        })
-        .await
-    {
-        Ok(claim) => claim,
-        Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_intent(
-                storage, progress, server, options, intent,
-            ))
-            .await;
-        }
-        Err(error) => return Err(storage_error(error)),
+    let legacy_source_marker = if source_bank == EpochBank::Legacy && from_format != 0 {
+        Some(
+            load_storage_value(
+                storage,
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+            )
+            .await?
+            .ok_or_else(|| epoch_error("legacy migration source protocol marker is missing"))?,
+        )
+    } else {
+        None
     };
-    put_pointer(&mut claim, migrating_bytes.clone())
-        .await
-        .map_err(storage_error)?;
-    put_lease(&mut claim, Bytes::from_static(b"0"))
-        .await
-        .map_err(storage_error)?;
-    if let Err(error) =
-        resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
+    if let Err(error) = claim_active_migration(
+        storage,
+        &source,
+        source_revision,
+        &migrating_bytes,
+        legacy_source_marker,
+    )
+    .await
     {
         if is_admission_race(&error) {
             return Box::pin(admit_repository_with_intent(
@@ -1928,10 +1931,8 @@ where
     }
     super::api::migrate_v86_marker(target).await?;
     crate::sync::upgrade_owned_partial_receipt(target).await?;
-    if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(
-        &target.begin_read(ReadOptions::default()).await?,
-    )
-    .await?
+    if let Some((key, bytes)) =
+        crate::sync::v2_journal_upgrade(&target.begin_read(ReadOptions::default()).await?).await?
     {
         write_candidate_page(
             target,
@@ -2002,14 +2003,14 @@ where
     {
         let mut write = storage
             .begin_write(WriteOptions {
-                    await_durable: true,
-                    preconditions: vec![Precondition::KeyValueEquals {
-                        space: REPOSITORY_EPOCH_SPACE,
-                        key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
-                        expected: active_pointer.clone(),
-                    }],
-                    ..WriteOptions::default()
-                })
+                await_durable: true,
+                preconditions: vec![Precondition::KeyValueEquals {
+                    space: REPOSITORY_EPOCH_SPACE,
+                    key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
+                    expected: active_pointer.clone(),
+                }],
+                ..WriteOptions::default()
+            })
             .await
             .map_err(storage_error)?;
         write
@@ -2922,6 +2923,42 @@ where
         .await?;
     crate::storage_adapter::stage_mutation_revision(&mut write).await?;
     resolve_exact_pointer_commit(storage, write.commit().await, migrating).await
+}
+
+/// Claim an already-active epoch for migration. When the source is the legacy
+/// bank, persist its exact protocol marker alongside the migrating pointer so
+/// another opener can restore the source if this owner disappears. Pointerless
+/// legacy claims use `claim_legacy`, which already stages the same witness.
+async fn claim_active_migration<S>(
+    storage: &S,
+    source: &StorageAdapter<S>,
+    source_revision: Option<Bytes>,
+    migrating: &Bytes,
+    legacy_source_marker: Option<Bytes>,
+) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let mut claim = source
+        .begin_migration_write(WriteOptions {
+            await_durable: true,
+            preconditions: vec![StorageAdapter::<S>::mutation_revision_precondition(
+                source_revision,
+            )],
+            ..WriteOptions::default()
+        })
+        .await?;
+    put_pointer(&mut claim, migrating.clone()).await?;
+    put_lease(&mut claim, Bytes::from_static(b"0")).await?;
+    if let Some(marker) = legacy_source_marker {
+        claim
+            .put_many(
+                REPOSITORY_EPOCH_SPACE,
+                single_put(REPOSITORY_EPOCH_SOURCE_MARKER_KEY, marker),
+            )
+            .await?;
+    }
+    resolve_exact_pointer_commit(storage, claim.commit().await, migrating).await
 }
 
 async fn activate_legacy<S>(
@@ -4541,6 +4578,9 @@ pub(super) mod tests {
 
 #[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
 mod replica_upgrade_tests;
+
+#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+mod test_host_admission;
 
 #[cfg(test)]
 mod retained_generation_tests;

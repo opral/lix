@@ -46,13 +46,13 @@
 		"benchmark:plugin-reopen": "node ./scripts/benchmark-plugin-reopen.mjs",
 		"benchmark:storage-boundary": "LIX_WASM_STORAGE_BENCH=1 npm run build:browser && LIX_WASM_STORAGE_BENCH=1 vitest run --config vitest.browser.config.ts src/storage-bridge.bench.browser.test.ts",
 		"clean": "node ./scripts/clean.js",
-		"build:ts": "tsc -p tsconfig.json && node ./scripts/build-compatibility.js",
+		"build:ts": "node ./scripts/build-compatibility.js && tsc -p tsconfig.json",
 		"test": "npm run build && vitest run",
 		"test:browser": "npm run build:browser && vitest run --config vitest.browser.config.ts",
 		"test:browser:built": "vitest run --config vitest.browser.config.ts",
 		"test:native:production": "node ./scripts/test-packed-native-open.js",
 		"test:browser:production": "node ./scripts/test-packed-vite.js",
-		"typecheck": "tsc -p tsconfig.test.json --noEmit"
+		"typecheck": "node ./scripts/build-compatibility.js && tsc -p tsconfig.test.json --noEmit"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",

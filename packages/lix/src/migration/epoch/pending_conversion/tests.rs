@@ -376,12 +376,20 @@ async fn run_pending_native_conversion_inner(
                             response.status()
                         );
                     }
-                    let response = server
-                        .handle(
-                            request.body(ServerProtocolBody::full(bytes)).unwrap(),
-                            ServerProtocolContext::anonymous(),
-                        )
-                        .await;
+                    let request = request.body(ServerProtocolBody::full(bytes)).unwrap();
+                    let response = if let Some(host_response) = test_host_admission::response(
+                        request.method(),
+                        request.uri(),
+                        request.headers(),
+                        server.lix_id(),
+                    ) {
+                        let (parts, body) = host_response.into_parts();
+                        http::Response::from_parts(parts, ServerProtocolBody::full(body))
+                    } else {
+                        server
+                            .handle(request, ServerProtocolContext::anonymous())
+                            .await
+                    };
                     let status = response.status();
                     let body = response.into_body().collect().await.unwrap().to_bytes();
                     if with_new_branch
@@ -540,23 +548,24 @@ async fn run_pending_native_conversion_inner(
         with_new_branch.then_some(requested_branch.as_str()),
     )
     .await;
-    assert!(first.is_err());
+    assert!(
+        first.is_ok(),
+        "normal conversion must recover its lost merge ACK: {first:?}"
+    );
     assert!(lost.load(Ordering::SeqCst));
     let owned = crate::storage_adapter::StorageSession::acquire(local_storage.clone())
         .await
         .unwrap();
-    assert_eq!(load_pointer(&owned).await.unwrap().unwrap().1, original);
-    assert!(
-        list_retained_replica_sources(&owned)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        list_retained_replica_sources(&owned).await.unwrap().len(),
+        1
     );
-    let (PointerState::Active { bank, .. }, _) = load_pointer(&owned).await.unwrap().unwrap()
-    else {
-        panic!("source must remain active after rollback")
+    let PointerState::Active { bank, .. } = decode_pointer(&original).unwrap() else {
+        panic!("original source must be an active epoch")
     };
-    let source = StorageAdapter::for_epoch(owned.clone(), bank, original.clone());
+    // Publication moves the active pointer but never rewrites the retained
+    // original full source, even when the authority's merge ACK was lost.
+    let source = StorageAdapter::for_epoch_unfenced(owned.clone(), bank);
     let read = source.begin_read(Default::default()).await.unwrap();
     let control = crate::branch::BranchHeadControlContext::new()
         .reader(&read)
@@ -568,27 +577,6 @@ async fn run_pending_native_conversion_inner(
     drop(read);
     drop(source);
     drop(owned);
-    let mut completed = false;
-    for _ in 0..3 {
-        let result = convert_fixture_replica(
-            local_storage.clone(),
-            options.clone(),
-            with_new_branch.then_some(requested_branch.as_str()),
-        )
-        .await;
-        if result.is_ok() {
-            completed = true;
-            break;
-        }
-        assert!(
-            with_branches || with_new_branch,
-            "single branch exact replay failed: {result:?}"
-        );
-    }
-    assert!(
-        completed,
-        "all branch exact outcomes must eventually resume"
-    );
     assert_eq!(
         lost_branches.lock().unwrap().len(),
         1 + usize::from(with_branches) + usize::from(with_new_branch)
