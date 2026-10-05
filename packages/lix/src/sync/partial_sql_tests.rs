@@ -336,6 +336,93 @@ pub(super) async fn execute_hydrating<
     ))
 }
 
+/// Test-only SQL retry loop backed by the real HTTP native-demand endpoints.
+/// It hydrates only typed native objects/metadata and never starts a background
+/// uploader, making it suitable for authoring a pending local row in fixtures.
+pub(crate) async fn execute_hydrating_over_http<
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+>(
+    session: &SessionContext<S>,
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    server: &crate::ServerOptions,
+    sql: &str,
+    params: &[Value],
+) -> Result<ExecuteResult, LixError> {
+    let transport =
+        super::platform::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    transport.bind_native_baseline_lease(state.baseline_lease())?;
+    let mut seen = BTreeSet::new();
+    for _ in 0..512 {
+        match session.execute(sql, params).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if let Some(address) = NativeObjectRef::from_missing_error(&error)? {
+                    if !seen.insert(format!("object:{address:?}")) {
+                        return Err(LixError::new(
+                            "LIX_PARTIAL_SQL_NO_PROGRESS",
+                            format!("object hydration did not resolve {address:?}: {error}"),
+                        ));
+                    }
+                    hydrate_native_object(
+                        storage,
+                        state,
+                        address,
+                        32 * 1024 * 1024,
+                        |request| {
+                            let transport = transport.clone();
+                            async move { transport.native_object_range(&request).await }
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                if let Some(address) = NativeMetadataRef::from_missing_error(&error)? {
+                    if !seen.insert(format!("metadata:{address:?}")) {
+                        return Err(LixError::new(
+                            "LIX_PARTIAL_SQL_NO_PROGRESS",
+                            format!("metadata hydration did not resolve {address:?}: {error}"),
+                        ));
+                    }
+                    let request = NativeMetadataRequest {
+                        epoch_id: state.epoch_id().to_owned(),
+                        objects: vec![address],
+                    };
+                    let response = transport.native_metadata(&request).await?;
+                    let read = storage.begin_read(Default::default()).await?;
+                    let mut writes = storage.new_write_set();
+                    let preconditions = stage_native_metadata(
+                        &read,
+                        &mut writes,
+                        state,
+                        &request,
+                        &response,
+                    )
+                    .await?;
+                    drop(read);
+                    storage
+                        .commit_partial_replica_write_set(
+                            super::partial_replica_write_capability(),
+                            writes,
+                            StorageWriteOptions {
+                                preconditions,
+                                await_durable: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(LixError::new(
+        "LIX_PARTIAL_SQL_DEMAND_LIMIT",
+        "SQL exceeded 512 explicit native dependency demands",
+    ))
+}
+
 fn value(result: ExecuteResult) -> String {
     assert_eq!(
         result.rows().len(),

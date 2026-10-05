@@ -348,6 +348,7 @@ impl NativeHistoryFrontier {
 pub(crate) enum NativeMetadataRef {
     CommitStateHeader(String),
     CommitGraphRecord(String),
+    CheckpointConversation(String),
     ChangeLocator(String),
 }
 
@@ -360,6 +361,10 @@ enum NativeMetadataWire {
         commit_id: String,
     },
     CommitGraphRecord {
+        #[serde(rename = "commitId")]
+        commit_id: String,
+    },
+    CheckpointConversation {
         #[serde(rename = "commitId")]
         commit_id: String,
     },
@@ -377,6 +382,9 @@ impl From<NativeMetadataWire> for NativeMetadataRef {
             NativeMetadataWire::CommitGraphRecord { commit_id } => {
                 Self::CommitGraphRecord(commit_id)
             }
+            NativeMetadataWire::CheckpointConversation { commit_id } => {
+                Self::CheckpointConversation(commit_id)
+            }
             NativeMetadataWire::ChangeLocator { change_id } => Self::ChangeLocator(change_id),
         }
     }
@@ -389,6 +397,9 @@ impl From<NativeMetadataRef> for NativeMetadataWire {
             }
             NativeMetadataRef::CommitGraphRecord(commit_id) => {
                 Self::CommitGraphRecord { commit_id }
+            }
+            NativeMetadataRef::CheckpointConversation(commit_id) => {
+                Self::CheckpointConversation { commit_id }
             }
             NativeMetadataRef::ChangeLocator(change_id) => Self::ChangeLocator { change_id },
         }
@@ -511,7 +522,10 @@ impl NativeMetadataRef {
 
     pub(crate) fn id(&self) -> &str {
         match self {
-            Self::CommitStateHeader(id) | Self::CommitGraphRecord(id) | Self::ChangeLocator(id) => {
+            Self::CommitStateHeader(id)
+            | Self::CommitGraphRecord(id)
+            | Self::CheckpointConversation(id)
+            | Self::ChangeLocator(id) => {
                 id
             }
         }

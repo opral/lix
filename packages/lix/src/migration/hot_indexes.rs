@@ -388,7 +388,7 @@ mod tests {
             .await
             .unwrap();
         assert!(report.semantic_preservation_verified);
-        assert_eq!(report.preservation_basis, "v85-migration-plan-v1");
+        assert_eq!(report.preservation_basis, "v86-migration-plan-v1");
         assert_ne!(report.before_content_digest, report.after_content_digest);
         assert_eq!(report.expected_content_digest, report.after_content_digest);
         let lix = crate::open_lix().with_storage(storage).await.unwrap();

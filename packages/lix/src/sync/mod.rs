@@ -83,7 +83,7 @@ pub(crate) use partial_merge_protocol::{
 pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
 pub(crate) use partial_interest_journal::{
-    PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
+    PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests, v2_journal_upgrade,
     validate_partial_read_interest_journal,
 };
 mod leased_descriptor;
@@ -98,6 +98,8 @@ pub(crate) use partial_open::{
 mod partial_scope_tests;
 #[cfg(test)]
 mod partial_sql_tests;
+#[cfg(test)]
+pub(crate) use partial_sql_tests::execute_hydrating_over_http;
 mod partial_upload;
 mod partial_upload_cycle;
 #[cfg(test)]
@@ -225,7 +227,7 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // older peers cannot reconstruct the resulting tracked-state root IDs.
 // v25 adds typed canonical CHANGE_SPACE payloads to descriptor-scoped exact
 // row closures; older peers cannot decode this new read-fulfillment input.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 25;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 26;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -540,6 +542,7 @@ pub(crate) use repository::{
 pub(crate) use partial_open::authenticate_partial_source_conversion;
 
 pub(crate) use partial_state::{
+    prepare_owned_partial_receipt_upgrade,
     prepare_owned_partial_metadata_upgrade, upgrade_owned_partial_receipt,
 };
 mod partial_branch_switch;

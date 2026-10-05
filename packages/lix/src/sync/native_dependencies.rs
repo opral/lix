@@ -83,6 +83,11 @@ pub(super) fn validate(response: &NativeMetadataResponse) -> Result<(), LixError
             return Err(invalid("unrelated or duplicate native metadata dependency"));
         }
         validate_bytes(&item.address, &item.bytes)?;
+        super::native_metadata::validate_checkpoint_conversation_envelope(
+            &item.address,
+            &item.bytes,
+            item.checkpoint_conversation.as_ref(),
+        )?;
     }
     let mut catalogs = BTreeSet::new();
     for item in response.objects.iter().chain(&deps.metadata) {
@@ -157,6 +162,7 @@ pub(super) async fn select(
             result.metadata.push(NativeMetadata {
                 address,
                 bytes: header.to_vec(),
+                checkpoint_conversation: None,
             });
             header
         };
@@ -233,6 +239,13 @@ mod tests {
         let mut bad = response.clone();
         bad.dependencies.metadata[0].address =
             NativeMetadataRef::CommitStateHeader("00000000-0000-7000-8000-000000000292".into());
+        assert!(validate(&bad).is_err());
+        let mut bad = response.clone();
+        bad.dependencies.metadata[0].checkpoint_conversation =
+            Some(super::super::native_metadata::CheckpointConversationEnvelope {
+                commit_id: "00000000-0000-7000-8000-000000000292".into(),
+                conversation_id: super::super::native_metadata::RequiredNullable(None),
+            });
         assert!(validate(&bad).is_err());
         let mut bad = response.clone();
         bad.dependencies.objects[0].bytes[0] ^= 1;

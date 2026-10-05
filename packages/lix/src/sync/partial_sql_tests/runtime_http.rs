@@ -1056,4 +1056,6 @@ mod lazy_publication;
 
 mod file_open_probe;
 
+mod checkpoint_log_profile;
+
 mod read_fulfillment_integration;

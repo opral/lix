@@ -8,6 +8,19 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use super::commit::SyncCommit;
 
+/// Deserialize an explicitly present nullable protocol member. `Option<T>`
+/// alone accepts an omitted field when serde defaults are applied, so this is
+/// intentionally paired with no `default` attribute.
+pub(crate) fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// Returns the exact JSON size of a one-event delta response without cloning
 /// commit payloads. Both HTTP admission and ordinary Authority transactions
 /// use this single wire projection so an accepted event is always pullable.
@@ -171,7 +184,7 @@ pub struct SyncPushResponse {
 pub struct SyncCommitHeader {
     /// Immutable commit membership; required by the current protocol.
     pub is_checkpoint: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub checkpoint_conversation_id: Option<String>,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
@@ -434,6 +447,32 @@ pub struct SyncBlobRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_conversation_nullable_member_is_required_and_explicit() {
+        let header = SyncCommitHeader {
+            is_checkpoint: true,
+            checkpoint_conversation_id: None,
+            commit_id: "commit".to_owned(),
+            parent_commit_ids: Vec::new(),
+            base_commit_id: None,
+            account_id: "account".to_owned(),
+            created_at: "2026-10-05T00:00:00Z".to_owned(),
+            global_scope: false,
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: false,
+            generation: 0,
+            first_parent_jump_commit_id: None,
+            first_parent_jump_span: None,
+            first_parent_checkpoint_summary: None,
+        };
+        let mut wire = serde_json::to_value(header).expect("serialize header");
+        assert!(wire.get("checkpointConversationId").unwrap().is_null());
+        wire.as_object_mut()
+            .unwrap()
+            .remove("checkpointConversationId");
+        assert!(serde_json::from_value::<SyncCommitHeader>(wire).is_err());
+    }
 
     #[test]
     fn pull_wire_is_explicitly_snapshot_or_delta() {

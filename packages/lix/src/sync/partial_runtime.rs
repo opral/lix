@@ -1,6 +1,7 @@
 //! Demand-only worker for an admitted partial replica. It never performs the
 //! full replica's snapshot, history inventory, upload or certified pull loop.
 
+use std::collections::BTreeSet;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -26,6 +27,50 @@ use super::{SyncPhase, SyncTransport};
 // local CAS contention, but cap it so a deterministic failed guard cannot
 // retain the worker forever.
 const MAX_METADATA_INSTALL_PRECONDITION_RETRIES: usize = 8;
+pub(super) const MAX_UPLOAD_NATIVE_DEMANDS: usize = 64;
+
+/// Resolve an exact, typed native input requested by upload preparation.
+/// Keep this bounded: background upload must not turn an impossible authority
+/// lookup into an unbounded worker stall.
+pub(super) async fn hydrate_upload_demand<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    error: LixError,
+    seen: &mut BTreeSet<String>,
+    deadline: Option<(&super::http::CandidateBaselineDeadline, &str)>,
+    max_demands: usize,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    let Some(demand) = super::runtime::native_sync_demand_request_for_error(&error)? else {
+        return Err(error);
+    };
+    let key = format!("{demand:?}");
+    if seen.len() >= max_demands || !seen.insert(key) {
+        return Err(error);
+    }
+    if let Some((deadline, lease_id)) = deadline {
+        let hydrate = hydrate_demand(storage, state, transport, demand).fuse();
+        futures_util::pin_mut!(hydrate);
+        let result = loop {
+            deadline.check(lease_id)?;
+            let remaining = deadline.remaining()?.max(Duration::from_millis(1));
+            let timeout = sleep(remaining).fuse();
+            futures_util::pin_mut!(timeout);
+            select_biased! {
+                result = hydrate => break result,
+                _ = timeout => deadline.check(lease_id)?,
+            }
+        };
+        result?;
+        deadline.check(lease_id)
+    } else {
+        hydrate_demand(storage, state, transport, demand).await
+    }
+}
 
 pub(crate) async fn start_partial_runtime_with_engine<S>(
     storage: StorageAdapter<S>,
@@ -753,7 +798,7 @@ async fn run_partial_worker<
 
 /// Observe only admitted branch controls and tiny push records before deciding
 /// to connect. Clean offline reopen performs no authority handshake.
-async fn upload_pending_once<S, C, Connect>(
+pub(super) async fn upload_pending_once<S, C, Connect>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     transport: &mut Option<HttpSyncTransport<C>>,
@@ -822,21 +867,41 @@ where
             *transport = Some(connected);
         }
         let connected = transport.as_ref().expect("connected above");
-        let upload = super::partial_upload_cycle::upload_partial_once(
-            storage,
-            state,
-            &branch.branch_id,
-            uuid::Uuid::now_v7().to_string(),
-            32,
-            1024 * 1024,
-            |request| async move {
-                super::partial_blob_upload::push_partial_with_blobs(
-                    storage, state, connected, &request,
+        let mut seen = BTreeSet::new();
+        let upload = loop {
+            match super::partial_upload_cycle::upload_partial_once(
+                storage,
+                state,
+                &branch.branch_id,
+                uuid::Uuid::now_v7().to_string(),
+                32,
+                1024 * 1024,
+                |request| async move {
+                    super::partial_blob_upload::push_partial_with_blobs(
+                        storage, state, connected, &request,
+                    )
+                    .await
+                },
+            )
+            .await
+            {
+                Err(error) => match hydrate_upload_demand(
+                    storage,
+                    state,
+                    connected,
+                    error,
+                    &mut seen,
+                    None,
+                    MAX_UPLOAD_NATIVE_DEMANDS,
                 )
                 .await
-            },
-        )
-        .await;
+                {
+                    Ok(()) => continue,
+                    Err(error) => break Err(error),
+                },
+                result => break result,
+            }
+        };
         match upload {
             Ok(changed) => progress |= changed,
             Err(error) if error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" => {}
@@ -1933,6 +1998,7 @@ mod tests {
                             response.objects.push(NativeMetadata {
                                 address: serde_json::from_value(objects[1].clone()).unwrap(),
                                 bytes: b"corrupt optional header".to_vec(),
+                                checkpoint_conversation: None,
                             });
                         }
                         serde_json::to_vec(&response).unwrap()
@@ -2077,6 +2143,119 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upload_preparation_missing_locator_is_hydrated_exactly_once() {
+        let (storage, state, transport, client, address) = fixture_metadata(false, false).await;
+        let error = NativeMetadataRef::annotate_missing_batch(
+            vec![address.clone()],
+            LixError::unknown("selected change locator is absent locally"),
+        );
+        let mut seen = BTreeSet::new();
+        hydrate_upload_demand(
+            &storage,
+            &state,
+            &transport,
+            error,
+            &mut seen,
+            None,
+            MAX_UPLOAD_NATIVE_DEMANDS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.len(), 1);
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert!(
+            native_metadata_is_resident(&read, &state, &address)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_demand_retry_rejects_repeated_and_exhausted_budgets_without_fetching() {
+        let (storage, state, transport, client, address) = fixture_metadata(false, false).await;
+        let mut seen = BTreeSet::new();
+        let missing = || {
+            NativeMetadataRef::annotate_missing_batch(
+                vec![address.clone()],
+                LixError::unknown("selected change locator is absent locally"),
+            )
+        };
+        hydrate_upload_demand(
+            &storage,
+            &state,
+            &transport,
+            missing(),
+            &mut seen,
+            None,
+            MAX_UPLOAD_NATIVE_DEMANDS,
+        )
+        .await
+        .unwrap();
+        let repeated = hydrate_upload_demand(
+            &storage,
+            &state,
+            &transport,
+            missing(),
+            &mut seen,
+            None,
+            MAX_UPLOAD_NATIVE_DEMANDS,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(repeated.code, "LIX_ERROR_UNKNOWN");
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+
+        let (storage, state, transport, client, address) = fixture_metadata(false, false).await;
+        let mut exhausted = (0..MAX_UPLOAD_NATIVE_DEMANDS)
+            .map(|index| format!("previous-demand-{index}"))
+            .collect::<BTreeSet<_>>();
+        let capped = hydrate_upload_demand(
+            &storage,
+            &state,
+            &transport,
+            NativeMetadataRef::annotate_missing_batch(
+                vec![address],
+                LixError::unknown("selected change locator is absent locally"),
+            ),
+            &mut exhausted,
+            None,
+            MAX_UPLOAD_NATIVE_DEMANDS,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(capped.code, "LIX_ERROR_UNKNOWN");
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_demand_hydration_is_cancelled_at_candidate_deadline() {
+        let (storage, state, transport, client, address) = fixture_metadata(true, false).await;
+        let deadline = super::super::http::CandidateBaselineDeadline::for_test(
+            &state.baseline_lease().lease_id,
+            Duration::from_millis(20),
+        );
+        let mut seen = BTreeSet::new();
+        let error = hydrate_upload_demand(
+            &storage,
+            &state,
+            &transport,
+            NativeMetadataRef::annotate_missing_batch(
+                vec![address],
+                LixError::unknown("selected change locator is absent locally"),
+            ),
+            &mut seen,
+            Some((&deadline, &state.baseline_lease().lease_id)),
+            MAX_UPLOAD_NATIVE_DEMANDS,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_PARTIAL_CANDIDATE_EXPIRED");
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(client.cancelled.load(Ordering::SeqCst), 1);
     }
 
     #[derive(Clone)]
@@ -2249,6 +2428,7 @@ mod tests {
                                 address,
                                 bytes: crate::changelog::encode_commit_record(&self.records[&id])
                                     .unwrap(),
+                                checkpoint_conversation: None,
                             }
                         })
                         .collect();

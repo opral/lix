@@ -124,7 +124,7 @@ pub(crate) fn stage_delete_sync_checkpoint_source(
 pub struct SyncCommit {
     /// Immutable commit membership; required by the current protocol.
     pub is_checkpoint: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "super::protocol::deserialize_required_nullable")]
     pub checkpoint_conversation_id: Option<String>,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
@@ -524,7 +524,9 @@ impl SyncCommit {
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         let commit_id = CommitId::parse_lix(&self.commit_id, "sync commit id")?;
         if let Some(id) = &self.checkpoint_conversation_id {
-            if !self.is_checkpoint || uuid::Uuid::parse_str(id).is_err() {
+            if !self.is_checkpoint
+                || !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == *id)
+            {
                 return invalid("sync checkpoint conversation id requires a checkpoint and UUID");
             }
         }
@@ -836,7 +838,11 @@ where
         };
     let exported = SyncCommit {
         is_checkpoint: record.is_checkpoint,
-        checkpoint_conversation_id: crate::checkpoint_conversation::load_checkpoint_conversation(store, commit_id).await?,
+        checkpoint_conversation_id: if record.is_checkpoint {
+            crate::checkpoint_conversation::load_checkpoint_conversation(store, commit_id).await?
+        } else {
+            None
+        },
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
             .parent_commit_ids
@@ -1398,10 +1404,17 @@ mod tests {
         };
         commit.validate().expect("legacy uncertainty is explicit");
         let wire = serde_json::to_value(&commit).expect("serialize unknown proof");
+        assert!(wire["checkpointConversationId"].is_null());
         assert_eq!(wire["incorporationUnknown"], true);
         assert!(wire.get("completeIncorporationSourceCommitId").is_none());
         let decoded: SyncCommit = serde_json::from_value(wire).expect("decode unknown proof");
         assert_eq!(decoded, commit);
+        let mut omitted = serde_json::to_value(&commit).expect("serialize required nullable");
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove("checkpointConversationId");
+        assert!(serde_json::from_value::<SyncCommit>(omitted).is_err());
         commit.complete_incorporation_source_commit_id =
             Some(CommitId::for_test_label("incorporation-source").to_string());
         commit

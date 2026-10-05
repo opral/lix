@@ -58,13 +58,14 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         82 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82),
         83 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83),
         84 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84),
+        85 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION]
+    [79, 80, 81, 82, 83, 84, 85, crate::init::CURRENT_FORMAT_VERSION]
         .into_iter()
         .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
@@ -1597,7 +1598,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | 82 | 83 | 84 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | 83 | 84 | 85 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1653,6 +1654,18 @@ where
                     }),
                 )
                 .await?;
+                if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+                    plan.get_or_insert_with(|| {
+                        super::publish::PublicationPlan::bounded(
+                            options.max_changes,
+                            options.max_preflight_bytes,
+                        )
+                    })
+                    .put_mutable(
+                        crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                        vec![(key.0.to_vec(), bytes.to_vec())],
+                    )?;
+                }
             }
             drop(read);
             if from_format <= 81 {
@@ -1913,7 +1926,26 @@ where
     if from_format <= 84 {
         super::semantic_fingerprint_format::migrate(target, true).await?;
     }
+    super::api::migrate_v86_marker(target).await?;
     crate::sync::upgrade_owned_partial_receipt(target).await?;
+    if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(
+        &target.begin_read(ReadOptions::default()).await?,
+    )
+    .await?
+    {
+        write_candidate_page(
+            target,
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: crate::storage_adapter::StorageValue { bytes },
+                }],
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    }
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
         Ok(crate::sync::load_partial_replica_state(&read)
@@ -4588,6 +4620,8 @@ where
                 (83, false) => crate::init::REPOSITORY_PROTOCOL_V83,
                 (84, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
                 (84, false) => crate::init::REPOSITORY_PROTOCOL_V84,
+                (85, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85,
+                (85, false) => crate::init::REPOSITORY_PROTOCOL_V85,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

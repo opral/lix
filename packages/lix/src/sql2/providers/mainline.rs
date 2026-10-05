@@ -36,6 +36,7 @@ pub(super) fn register_functions<S>(
     session: &datafusion::prelude::SessionContext,
     source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
+    read_interest_registry: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -48,6 +49,7 @@ pub(super) fn register_functions<S>(
                 catalog: catalog.clone(),
                 slots: execution_slots(session),
                 history,
+                read_interest_registry: read_interest_registry.clone(),
                 blob_reader: Arc::clone(&blob_reader),
             }),
         );
@@ -56,6 +58,7 @@ pub(super) fn register_functions<S>(
 
 struct MainlineFunction<S> {
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    read_interest_registry: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     store: S,
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
@@ -80,7 +83,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableFunctionImpl
     for MainlineFunction<S>
 {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let (relation, anchor) = if self.history {
+        let (relation, explicit_anchor) = if self.history {
             match args {
                 [relation] => (
                     Some(DiffRelation::from_catalog(
@@ -113,7 +116,8 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableFunctionImpl
                 }
             }
         };
-        let anchor = anchor
+        let retain_moving_checkpoint_state = explicit_anchor.is_none();
+        let anchor = explicit_anchor
             .or_else(|| self.slots.active_branch_commit_id())
             .ok_or_else(|| {
                 DataFusionError::Plan("mainline requires an active branch head".into())
@@ -122,6 +126,8 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableFunctionImpl
             .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(MainlineSpec {
             blob_reader: Arc::clone(&self.blob_reader),
+            read_interest_registry: self.read_interest_registry.clone(),
+            retain_moving_checkpoint_state,
             store: self.store.clone(),
             relation,
             anchor,
@@ -371,6 +377,8 @@ fn record_work(_diff: bool) {
 
 struct MainlineSpec<S> {
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    read_interest_registry: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
+    retain_moving_checkpoint_state: bool,
     store: S,
     relation: Option<DiffRelation>,
     anchor: CommitId,
@@ -483,6 +491,9 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
         let active_branch_id = self.active_branch_id.clone();
         let output_schema = schema.clone();
         let blob_reader = Arc::clone(&self.blob_reader);
+        let read_interest_registry = self.read_interest_registry.clone();
+        let retain_moving_checkpoint_state =
+            self.retain_moving_checkpoint_state && self.relation.is_none();
         let ordering = Some(
             if relation.is_some() {
                 "lixcol_position"
@@ -502,6 +513,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             let source_selected_ids = selected_ids.clone();
             let source_active_branch_id = active_branch_id.clone();
             let source_blob_reader = Arc::clone(&blob_reader);
+            let source_read_interest_registry = read_interest_registry.clone();
             let planned_limit = limit;
             Arc::new(move |fetch| {
                 let limit = match (planned_limit, fetch) {
@@ -509,11 +521,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     (Some(planned), None) => Some(planned),
                     (None, fetch) => fetch,
                 };
-                let window_size = if limit.is_some() || source_relation.is_some() {
-                    1
-                } else {
-                    64
-                };
+                let window_size = mainline_window_size(limit, source_relation.is_some());
                 let (
                     store,
                     relation,
@@ -531,8 +539,10 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                 );
                 let selected_ids = source_selected_ids.clone();
                 let blob_reader = Arc::clone(&source_blob_reader);
+                let read_interest_registry = source_read_interest_registry.clone();
                 let max_position = max_position;
                 let needs_checkpoint_active = needs_checkpoint_active;
+                let retain_moving_checkpoint_state = retain_moving_checkpoint_state;
                 let needs_checkpoint_conversation = needs_checkpoint_conversation;
                 let anchor = anchor;
                 let scan_schema = source_schema.clone();
@@ -549,6 +559,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     let blob_reader = Arc::clone(&blob_reader);
                     let stream_schema = schema.clone();
                     let include_state_headers = relation.is_some();
+                    let stream_read_interest_registry = read_interest_registry.clone();
             let stream = async_stream::try_stream! {
                 let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
                 let mut graph = CommitGraphContext::new().reader(store.clone());
@@ -656,6 +667,13 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                     keys.push(key);
                                 }
                                 if !keys.is_empty() {
+                                    if retain_moving_checkpoint_state {
+                                        register_checkpoint_retirement_interest(
+                                            stream_read_interest_registry.as_ref(),
+                                            active_branch_id.as_deref(),
+                                            &keys,
+                                        )?;
+                                    }
                                     record_checkpoint_retirement_work(keys.len());
                                     let mut tracked_state = crate::tracked_state::TrackedStateContext::new().reader(store.clone());
                                     let retirement_rows = tracked_state.load_projected_batch_at_commit(
@@ -671,24 +689,28 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             }
 
                             if relation.is_none() {
+                                let conversation_commit_ids = if needs_checkpoint_conversation {
+                                    window
+                                        .iter()
+                                        .filter(|(node, _, selected, _)| *selected && node.is_checkpoint)
+                                        .map(|(node, _, _, _)| node.commit_id)
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
+                                let conversation_ids = crate::checkpoint_conversation::load_checkpoint_conversations(
+                                    &store,
+                                    &conversation_commit_ids,
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?;
+                                let mut conversation_ids = conversation_ids.into_iter();
                                 let mut selected_rows = Vec::with_capacity(window.len());
-                                for ((node, current_position, selected, _), active) in
-                                    window.iter().zip(&checkpoint_active)
-                                {
-                                    if !*selected {
-                                        continue;
-                                    }
-                                    let conversation_id =
-                                        if needs_checkpoint_conversation && node.is_checkpoint {
-                                            crate::checkpoint_conversation::load_checkpoint_conversation(
-                                                &store,
-                                                node.commit_id,
-                                            )
-                                            .await
-                                            .map_err(lix_error_to_datafusion_error)?
-                                        } else {
-                                            None
-                                        };
+                                for ((node, current_position, selected, _), active) in window.iter().zip(&checkpoint_active) {
+                                    if !*selected { continue; }
+                                    let conversation_id = if needs_checkpoint_conversation && node.is_checkpoint {
+                                        conversation_ids.next().flatten()
+                                    } else { None };
                                     selected_rows.push((
                                         node,
                                         *current_position,
@@ -719,12 +741,15 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                         && needs_checkpoint_conversation
                                         && node.is_checkpoint
                                     {
-                                        crate::checkpoint_conversation::load_checkpoint_conversation(
+                                        crate::checkpoint_conversation::load_checkpoint_conversations(
                                             &store,
-                                            node.commit_id,
+                                            &[node.commit_id],
                                         )
                                         .await
                                         .map_err(lix_error_to_datafusion_error)?
+                                        .into_iter()
+                                        .next()
+                                        .flatten()
                                     } else {
                                         None
                                     };
@@ -856,6 +881,43 @@ fn checkpoint_retired_from_row(
     Ok(value.state.retired)
 }
 
+fn register_checkpoint_retirement_interest(
+    registry: Option<&Arc<crate::hot_state::ReadInterestRegistry>>,
+    branch_id: Option<&str>,
+    keys: &[crate::tracked_state::TrackedStateKey],
+) -> Result<()> {
+    let (Some(registry), Some(branch_id)) = (registry, branch_id) else {
+        return Ok(());
+    };
+    let rows = keys
+        .iter()
+        .map(|key| crate::hot_state::ExactReadIdentity {
+            schema_key: key.schema_key.clone(),
+            branch_id: branch_id.to_owned(),
+            file_id: key.file_id.clone(),
+            row_pk: key.row_pk.clone(),
+        })
+        .collect();
+    registry
+        .register(crate::hot_state::LogicalReadInterest::Exact {
+            rows,
+            projection: crate::hot_state::HotStateProjection {
+                columns: vec!["snapshot_content".to_owned()],
+            },
+            untracked: Some(false),
+            include_tombstones: false,
+        })
+        .map_err(lix_error_to_datafusion_error)
+}
+
+fn mainline_window_size(limit: Option<usize>, historical_relation: bool) -> usize {
+    if historical_relation {
+        1
+    } else {
+        limit.map_or(64, |limit| limit.clamp(1, 64))
+    }
+}
+
 #[inline]
 fn record_checkpoint_retirement_work(keys: usize) {
     #[cfg(test)]
@@ -876,4 +938,20 @@ fn record_log_metadata_batch(rows: usize) {
     });
     #[cfg(not(test))]
     let _ = rows;
+}
+
+#[cfg(test)]
+mod mainline_window_tests {
+    use super::mainline_window_size;
+
+    #[test]
+    fn bounded_log_windows_respect_limits_and_historical_frontiers() {
+        for limit in [1, 10, 20, 40, 64, 128] {
+            assert_eq!(mainline_window_size(Some(limit), false), limit.min(64));
+        }
+        assert_eq!(mainline_window_size(None, false), 64);
+        for limit in [1, 10, 20, 40, 64, 128] {
+            assert_eq!(mainline_window_size(Some(limit), true), 1);
+        }
+    }
 }

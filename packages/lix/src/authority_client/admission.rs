@@ -216,10 +216,16 @@ async fn admission_response<H: ProtocolHttp>(
         .request_stream(ProtocolHttpRequest {
             method: "GET".into(),
             url: format!("{normalized}admission"),
-            headers: vec![(
-                "lix-sync-protocol-version".into(),
-                crate::SYNC_PROTOCOL_VERSION.to_string(),
-            )],
+            headers: vec![
+                (
+                    "lix-server-protocol-version".into(),
+                    crate::SERVER_PROTOCOL_VERSION.to_string(),
+                ),
+                (
+                    "lix-sync-protocol-version".into(),
+                    crate::SYNC_PROTOCOL_VERSION.to_string(),
+                ),
+            ],
             body: None,
         })
         .await?;

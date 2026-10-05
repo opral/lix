@@ -173,6 +173,7 @@ async fn read_one(
             Ok(Some(NativeMetadata {
                 address,
                 bytes: bytes.to_vec(),
+                checkpoint_conversation: None,
             }))
         }
         Some(StorageProjectedValue::KeyOnly) => {
@@ -250,6 +251,35 @@ async fn read_walk(
                 Err(_) => break, // Optional headers must not invalidate the required graph read.
             }
         }
+    }
+    let mut checkpoint_indexes = Vec::new();
+    let mut checkpoint_ids = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        if let NativeMetadataRef::CommitGraphRecord(_) = object.address {
+            let record: CommitRecord =
+                crate::storage_codec::decode("commit record", &object.bytes)?;
+            if record.is_checkpoint {
+                checkpoint_indexes.push(index);
+                checkpoint_ids.push(record.commit_id);
+            }
+        }
+    }
+    let conversation_ids = crate::checkpoint_conversation::load_checkpoint_conversations(
+        read,
+        &checkpoint_ids,
+    )
+    .await?;
+    for ((index, id), conversation_id) in checkpoint_indexes
+        .into_iter()
+        .zip(checkpoint_ids)
+        .zip(conversation_ids)
+    {
+        objects[index].checkpoint_conversation = Some(
+            super::native_metadata::CheckpointConversationEnvelope {
+                commit_id: id.to_string(),
+                conversation_id: super::native_metadata::RequiredNullable(conversation_id),
+            },
+        );
     }
     let response = NativeMetadataResponse {
         dependencies: Default::default(),

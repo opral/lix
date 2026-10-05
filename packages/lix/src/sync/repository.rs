@@ -2161,7 +2161,9 @@ impl ParsedSyncHeader {
     fn parse(header: &SyncCommitHeader) -> Result<Self, LixError> {
         let commit_id = CommitId::parse_lix(&header.commit_id, "sync commit header")?;
         if let Some(id) = &header.checkpoint_conversation_id {
-            if !header.is_checkpoint || uuid::Uuid::parse_str(id).is_err() {
+            if !header.is_checkpoint
+                || !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == *id)
+            {
                 return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync checkpoint conversation id requires a checkpoint and UUID"));
             }
         }
@@ -5625,18 +5627,6 @@ where
                     existing.first_parent_checkpoint_summary = Some(derived);
                     summary_enrichments.push(existing.clone());
                 }
-                if crate::checkpoint_conversation::load_checkpoint_conversation(
-                    &read,
-                    header.commit_id,
-                )
-                .await?
-                    != header.checkpoint_conversation_id
-                {
-                    return Err(immutable_object_mismatch(
-                        "checkpoint conversation",
-                        header.commit_id,
-                    ));
-                }
                 let existing_scope =
                     match load_published_commit_state_topology(&read, header.commit_id).await? {
                         Some(topology) => Some(topology.global_scope()),
@@ -5881,12 +5871,23 @@ where
         }
 
         let mut writes = adapter.new_write_set();
-        for header in header_by_id.values() {
-            if let Some(conversation_id) = &header.checkpoint_conversation_id {
-                crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, header.commit_id, conversation_id)?;
-            }
-        }
         let mut preconditions = Vec::new();
+        let partial_admission = crate::sync::load_partial_replica_state(&read).await?;
+        for header in header_by_id.values().filter(|header| header.is_checkpoint) {
+            let admission = partial_admission.as_ref().map(|(state, receipt)| {
+                (state.epoch_id(), receipt)
+            });
+            crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                &read,
+                &mut writes,
+                &mut preconditions,
+                header.commit_id,
+                load_commit_record(&read, header.commit_id).await?.is_some(),
+                header.checkpoint_conversation_id.as_deref(),
+                admission,
+            )
+            .await?;
+        }
         let mut omitted_sources = BTreeMap::new();
         for row in &parsed_rows {
             let scope = if advertised_branches.contains(row.branch_id.as_str()) {
@@ -6364,9 +6365,12 @@ where
             let read = adapter.begin_read(StorageReadOptions::default()).await?;
             let expected_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(&read).await?;
+            let partial_admission = crate::sync::load_partial_replica_state(&read).await?;
             let mut new_records = Vec::new();
             let mut summary_enrichments = Vec::new();
             let mut writes = adapter.new_write_set();
+            let mut conversation_preconditions = Vec::new();
+            let mut conversation_changed = false;
             let mut resolved_omissions = false;
             let mut ordered_headers = parsed.values().collect::<Vec<_>>();
             ordered_headers.sort_by_key(|header| (header.generation, header.commit_id));
@@ -6438,17 +6442,20 @@ where
                         summary_enrichments.push(existing.clone());
                     }
                     trusted_records.insert(header.commit_id, existing.clone());
-                    if crate::checkpoint_conversation::load_checkpoint_conversation(
-                        &read,
-                        header.commit_id,
-                    )
-                    .await?
-                        != header.checkpoint_conversation_id
-                    {
-                        return Err(immutable_object_mismatch(
-                            "checkpoint conversation",
+                    if header.is_checkpoint {
+                        let admission = partial_admission.as_ref().map(|(state, receipt)| {
+                            (state.epoch_id(), receipt)
+                        });
+                        conversation_changed |= crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                            &read,
+                            &mut writes,
+                            &mut conversation_preconditions,
                             header.commit_id,
-                        ));
+                            true,
+                            header.checkpoint_conversation_id.as_deref(),
+                            admission,
+                        )
+                        .await?;
                     }
                     let existing_scope = match load_published_commit_state_topology(
                         &read,
@@ -6518,12 +6525,20 @@ where
                     }
                     trusted_records.insert(header.commit_id, record.clone());
                     new_records.push(record);
-                    if let Some(conversation_id) = &header.checkpoint_conversation_id {
-                        crate::checkpoint_conversation::stage_checkpoint_conversation(
+                    if header.is_checkpoint {
+                        let admission = partial_admission.as_ref().map(|(state, receipt)| {
+                            (state.epoch_id(), receipt)
+                        });
+                        conversation_changed |= crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                            &read,
                             &mut writes,
+                            &mut conversation_preconditions,
                             header.commit_id,
-                            conversation_id,
-                        )?;
+                            false,
+                            header.checkpoint_conversation_id.as_deref(),
+                            admission,
+                        )
+                        .await?;
                     }
                     stage_commit_history_deferred_with_scope(
                         &mut writes,
@@ -6532,13 +6547,18 @@ where
                     );
                 }
             }
-            if new_records.is_empty() && summary_enrichments.is_empty() && !resolved_omissions {
+            if new_records.is_empty()
+                && summary_enrichments.is_empty()
+                && !conversation_changed
+                && !resolved_omissions
+            {
                 return Ok(());
             }
             let mut preconditions = new_records
                 .iter()
                 .map(|record| commit_record_precondition(record.commit_id, None))
                 .collect::<Vec<_>>();
+            preconditions.extend(conversation_preconditions);
             {
                 let mut read_ref = &read;
                 let mut changelog_writer =
@@ -7352,6 +7372,7 @@ where
 
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
+        let partial_admission = crate::sync::load_partial_replica_state(&read).await?;
         for (commit_id, commit) in &parsed {
             if !existing.contains(commit_id)
                 && let Some(alias) = &commit.wire.state_alias
@@ -8050,8 +8071,20 @@ where
                 created_at: commit.created_at,
                 touched_scope_digest,
             };
-            if let Some(conversation_id) = &commit.wire.checkpoint_conversation_id {
-                crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, commit_id, conversation_id)?;
+            if record.is_checkpoint {
+                let admission = partial_admission
+                    .as_ref()
+                    .map(|(state, receipt)| (state.epoch_id(), receipt));
+                crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                    &read,
+                    &mut writes,
+                    &mut preconditions,
+                    commit_id,
+                    existing.contains(&commit_id) || deferred_existing.contains(&commit_id),
+                    commit.wire.checkpoint_conversation_id.as_deref(),
+                    admission,
+                )
+                .await?;
             }
             if deferred_existing.contains(&commit_id) {
                 let certified = records
@@ -8076,11 +8109,6 @@ where
                             "sync history body '{commit_id}' disagrees with its certified topology"
                         ),
                     ));
-                }
-                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, commit_id).await?
-                    != commit.wire.checkpoint_conversation_id
-                {
-                    return Err(immutable_object_mismatch("checkpoint conversation", commit_id));
                 }
             }
             if !deferred_existing.contains(&commit_id) {
@@ -8964,11 +8992,15 @@ where
                 };
             let mut header = sync_header_from_record(
                 &record,
-                crate::checkpoint_conversation::load_checkpoint_conversation(
-                    &read,
-                    record.commit_id,
-                )
-                .await?,
+                if record.is_checkpoint {
+                    crate::checkpoint_conversation::load_checkpoint_conversation(
+                        &read,
+                        record.commit_id,
+                    )
+                    .await?
+                } else {
+                    None
+                },
                 global_scope,
                 incorporation,
             );
@@ -9222,11 +9254,15 @@ where
                 .incorporation();
             let mut header = sync_header_from_record(
                 &record,
-                crate::checkpoint_conversation::load_checkpoint_conversation(
-                    &read,
-                    record.commit_id,
-                )
-                .await?,
+                if record.is_checkpoint {
+                    crate::checkpoint_conversation::load_checkpoint_conversation(
+                        &read,
+                        record.commit_id,
+                    )
+                    .await?
+                } else {
+                    None
+                },
                 record.base_commit_id.is_none(),
                 incorporation,
             );
