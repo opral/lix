@@ -222,6 +222,10 @@ enum DiffRelationKind {
 }
 
 impl DiffRelation {
+    pub(super) fn supports_bounded_history_recipe(&self) -> bool {
+        matches!(self.name.as_str(), "lix_file" | "lix_directory")
+    }
+
     pub(super) fn from_catalog(catalog: &PublicCatalog, name: &str) -> Result<Self> {
         let surface = catalog.surface(name).ok_or_else(|| {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
@@ -385,6 +389,173 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
         )
         .await
     }
+}
+
+/// Build a fixed history recipe from the exact native route selected by one
+/// history scan. Callers must establish that `commit_ids` came from a
+/// finite exact mainline predicate and that the scan has no pushed limit.
+pub(super) fn bounded_history_interest(
+    branch_id: &str,
+    anchor: &str,
+    commit_ids: Vec<String>,
+    relation: &DiffRelation,
+    projected_columns: &[String],
+    filters: &[Expr],
+) -> Result<Option<crate::hot_state::LogicalReadInterest>> {
+    let projection = projected_columns
+        .iter()
+        .filter_map(|name| relation.schema.index_of(name).ok())
+        .collect::<Vec<_>>();
+    let projected = projected_schema(&relation.schema, Some(&projection));
+    let metadata_filters = if relation.kind == DiffRelationKind::File {
+        filter_conjuncts(filters)
+            .into_iter()
+            .filter(|filter| file_metadata_filter(filter, &relation.schema))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let schema = diff_filter_schema(relation, &projected, &metadata_filters)?;
+    let route = DiffRoute::from_filters(filters, relation, &schema);
+    let mut filter = route.request.filter;
+    if route.contradictory
+        || filter.file_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_IDENTITIES
+        || filter.row_pks.len() > crate::hot_state::MAX_HISTORY_RECIPE_IDENTITIES
+        || schema.fields().len() > crate::hot_state::MAX_HISTORY_RECIPE_PROJECTED_COLUMNS
+    {
+        return Ok(None);
+    }
+    // File routes intentionally include null-file directory descriptors when
+    // probing specific files. Canonicalize duplicates before retaining the
+    // exact physical recipe.
+    let mut seen_file_ids = BTreeSet::new();
+    filter.file_ids.retain(|value| {
+        let identity = match value {
+            NullableKeyFilter::Any => (0, String::new()),
+            NullableKeyFilter::Null => (1, String::new()),
+            NullableKeyFilter::Value(id) => (2, id.clone()),
+        };
+        seen_file_ids.insert(identity)
+    });
+    let mut seen_row_pks = BTreeSet::new();
+    filter.row_pks.retain(|row_pk| seen_row_pks.insert(row_pk.clone()));
+    let retain_payloads = route.request.retain_payloads;
+    let projected_columns = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    if validate_bounded_history_recipe_shape(
+        relation.name.as_str(),
+        &filter,
+        &projected_columns,
+        retain_payloads,
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    let interest = crate::hot_state::LogicalReadInterest::History {
+        branch_id: branch_id.to_owned(),
+        anchor: anchor.to_owned(),
+        commit_ids,
+        relation: relation.name.clone(),
+        filter,
+        retain_payloads,
+        projected_columns,
+        limit: None,
+    };
+    Ok(Some(interest))
+}
+
+pub(crate) fn validate_bounded_history_recipe_shape(
+    relation_name: &str,
+    filter: &TrackedStateFilter,
+    projected_columns: &[String],
+    retain_payloads: bool,
+) -> Result<(), crate::LixError> {
+    let invalid = || {
+        crate::LixError::new(
+            "LIX_READ_FULFILLMENT_INVALID",
+            "history recipe does not match a public native diff route",
+        )
+    };
+    let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), relation_name)
+        .map_err(|_| invalid())?;
+    if !relation.supports_bounded_history_recipe() {
+        return Err(invalid());
+    }
+    let mut columns = BTreeSet::new();
+    if projected_columns.iter().any(|column| {
+        !columns.insert(column)
+            || relation
+                .schema
+                .fields()
+                .iter()
+                .all(|field| field.name() != column)
+    }) {
+        return Err(invalid());
+    }
+    if projected_columns.len() > crate::hot_state::MAX_HISTORY_RECIPE_PROJECTED_COLUMNS
+        || filter.file_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_IDENTITIES
+        || filter.row_pks.len() > crate::hot_state::MAX_HISTORY_RECIPE_IDENTITIES
+    {
+        return Err(invalid());
+    }
+    let uuid_row_pk = |row_pk: &RowPk| {
+        matches!(row_pk.components.as_slice(), [RowPkComponent::Uuid(_)])
+    };
+    if !filter.include_tombstones
+        || filter.row_pk_lower.is_some()
+        || filter.row_pk_upper.is_some()
+        || filter.row_pks.iter().any(|row_pk| !uuid_row_pk(row_pk))
+    {
+        return Err(invalid());
+    }
+    let expected_retain_payloads = projection_requires_tracked_payloads(
+        &relation.kind,
+        projected_columns.iter().map(String::as_str),
+    );
+    if retain_payloads != expected_retain_payloads {
+        return Err(invalid());
+    }
+    match relation_name {
+        "lix_file" => {
+            let mut file_ids = BTreeSet::new();
+            let mut has_file_id_value = false;
+            if !filter.schema_keys.is_empty()
+                || !filter.row_pks.is_empty()
+                || filter.file_ids.iter().any(|file_id| match file_id {
+                    NullableKeyFilter::Null => !file_ids.insert((1_u8, String::new())),
+                    NullableKeyFilter::Value(id) => {
+                        has_file_id_value = true;
+                        uuid::Uuid::parse_str(id).map_or(true, |parsed| {
+                            parsed.to_string() != *id || !file_ids.insert((2_u8, id.clone()))
+                        })
+                    }
+                    NullableKeyFilter::Any => true,
+                })
+                || (has_file_id_value
+                    && !filter
+                        .file_ids
+                        .iter()
+                        .any(|file_id| matches!(file_id, NullableKeyFilter::Null)))
+            {
+                return Err(invalid());
+            }
+        }
+        "lix_directory" => {
+            let unique_row_pks = filter.row_pks.iter().collect::<BTreeSet<_>>();
+            if filter.schema_keys.as_slice() != [DIRECTORY_DESCRIPTOR_SCHEMA_KEY]
+                || !filter.file_ids.is_empty()
+                || unique_row_pks.len() != filter.row_pks.len()
+            {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1039,24 +1210,10 @@ impl DiffRoute {
         // their potentially numerous changed content atoms. Keeping the tree
         // diff identity-only avoids hydrating every changed row merely to
         // render one file path or descriptor field.
-        let retain_payloads = relation.kind != DiffRelationKind::File
-            && projection
-                .fields()
-                .iter()
-                .filter_map(|field| side_column(field.name()))
-                .any(|(_, column)| {
-                    !matches!(
-                        column,
-                        "id" | "lixcol_file_id"
-                            | "lixcol_created_at"
-                            | "lixcol_updated_at"
-                            | "lixcol_change_id"
-                            | "lixcol_author_id"
-                            | "lixcol_commit_id"
-                            | "lixcol_global"
-                            | "lixcol_untracked"
-                    )
-                });
+        let retain_payloads = projection_requires_tracked_payloads(
+            &relation.kind,
+            projection.fields().iter().map(|field| field.name().as_str()),
+        );
         Self {
             row_refs,
             request: TrackedStateDiffRequest {
@@ -1073,6 +1230,26 @@ impl DiffRoute {
             contradictory,
         }
     }
+}
+
+fn projection_requires_tracked_payloads<'a>(
+    kind: &DiffRelationKind,
+    columns: impl Iterator<Item = &'a str>,
+) -> bool {
+    !matches!(kind, DiffRelationKind::File)
+        && columns.filter_map(side_column).any(|(_, column)| {
+            !matches!(
+                column,
+                "id" | "lixcol_file_id"
+                    | "lixcol_created_at"
+                    | "lixcol_updated_at"
+                    | "lixcol_change_id"
+                    | "lixcol_author_id"
+                    | "lixcol_commit_id"
+                    | "lixcol_global"
+                    | "lixcol_untracked"
+            )
+        })
 }
 
 fn optional_values(conjuncts: &[Expr], column: &'static str) -> Option<Vec<String>> {

@@ -227,7 +227,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // older peers cannot reconstruct the resulting tracked-state root IDs.
 // v25 adds typed canonical CHANGE_SPACE payloads to descriptor-scoped exact
 // row closures; older peers cannot decode this new read-fulfillment input.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 26;
+// v27 adds bounded leased first-parent history recipes to read fulfillment.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 27;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

@@ -6,8 +6,11 @@ mod reader;
 #[allow(unused_imports)]
 pub(crate) use read_interests::{
     DiffInterestEndpoint, ExactReadIdentity, FilePathInterest, FilePathInterestComparison,
-    InterestDomain, LogicalReadInterest, MovingReadInterestSnapshot, ReadInterestOperation,
-    ReadInterestPublication, ReadInterestRegistry, ReadInterestSnapshot,
+    InterestDomain, LogicalReadInterest, MAX_HISTORY_RECIPE_COMMIT_IDS, MAX_HISTORY_RECIPE_COUNT,
+    MAX_HISTORY_RECIPE_GRAPH_NODES, MAX_HISTORY_RECIPE_IDENTITIES,
+    MAX_HISTORY_RECIPE_PROJECTED_COLUMNS, MAX_HISTORY_RECIPE_SELECTED_IDS,
+    MovingReadInterestSnapshot, ReadInterestOperation, ReadInterestPublication,
+    ReadInterestRegistry, ReadInterestSnapshot,
 };
 mod row_columnar_cache;
 mod row_decoded_column_cache;

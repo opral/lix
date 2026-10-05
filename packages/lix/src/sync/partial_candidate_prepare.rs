@@ -240,6 +240,7 @@ pub(super) fn interest_belongs_to_candidate(
         }
         LogicalReadInterest::CollectionGeneration { branch_id, .. }
         | LogicalReadInterest::PackedIdentityMembership { branch_id, .. }
+        | LogicalReadInterest::History { branch_id, .. }
         | LogicalReadInterest::Diff {
             branch_id: Some(branch_id),
             ..

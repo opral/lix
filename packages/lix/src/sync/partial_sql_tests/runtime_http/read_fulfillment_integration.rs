@@ -1290,3 +1290,554 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
     worker.abort();
     authority.close().await.unwrap();
 }
+
+
+#[tokio::test]
+async fn bounded_checkpoint_file_history_discovers_native_closure() {
+    let backing = Memory::new();
+    let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let mut checkpoint_ids = Vec::new();
+    for checkpoint in 0..9 {
+        // Several commits between checkpoints expose multiple dependency layers.
+        for edit in 0..3 {
+            authority
+                .execute(
+                    "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+                    &[
+                        Value::Text(format!(
+                            "/bounded-history/checkpoint-{checkpoint}/{edit}.txt"
+                        )),
+                        Value::Blob(
+                            format!("checkpoint {checkpoint} edit {edit}")
+                                .into_bytes()
+                                .into(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        checkpoint_ids.push(authority.create_checkpoint().await.unwrap().commit_id);
+    }
+    let mixed_conversation_id = uuid::Uuid::now_v7().to_string();
+    authority
+        .execute(
+            "INSERT INTO lix_conversation(id, target, title, lixcol_global) VALUES ($1, lix_row_ref('lix_commit', NULL, $2), 'Mixed History recovery', true)",
+            &[
+                Value::Text(mixed_conversation_id.clone()),
+                Value::Text(checkpoint_ids.last().unwrap().clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    let mixed_conversation_change_id = authority
+        .execute(
+            "SELECT lixcol_change_id FROM lix_conversation WHERE id = $1",
+            &[Value::Text(mixed_conversation_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("lixcol_change_id")
+        .unwrap();
+    let selected = checkpoint_ids
+        .iter()
+        .rev()
+        .take(7)
+        .cloned()
+        .collect::<Vec<_>>();
+    let placeholders = (2..=8)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT lixcol_to_commit_id AS commit_id, id, coalesce(to_path, from_path) AS path \
+                       FROM lix_history('lix_file', $1) \
+                       WHERE lixcol_to_commit_id IN ({placeholders}) ORDER BY path ASC"
+    );
+    let params = std::iter::once(Value::Text(selected[0].clone()))
+        .chain(selected.iter().cloned().map(Value::Text))
+        .collect::<Vec<_>>();
+    let expected = authority.execute(&sql, &params).await.unwrap();
+    let values = |result: &ExecuteResult| {
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("commit_id").unwrap(),
+                    row.get::<String>("id").unwrap(),
+                    row.get::<String>("path").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        expected.rows().len(),
+        21,
+        "seven real checkpoint diffs each contain three file writes"
+    );
+    assert!(
+        expected
+            .rows()
+            .iter()
+            .all(|row| selected.contains(&row.get::<String>("commit_id").unwrap()))
+    );
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
+    let open_cold_replica = |log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>| {
+        let server = server.clone();
+        let repository_id = authority.lix_id().to_owned();
+        let account_id = authority.active_account_id().to_owned();
+        async move {
+            let transport = HttpSyncTransport::connect_with(
+                TimedClient {
+                    inner: Client {
+                        server,
+                        lose_body: Arc::new(AtomicBool::new(false)),
+                    },
+                    log,
+                    delay: 0,
+                },
+                &format!("https://example.test/lix/{repository_id}"),
+            )
+            .await
+            .unwrap();
+            let leased = transport.partial_replica_descriptor(None).await.unwrap();
+            let state = Arc::new(
+                PartialReplicaState::from_leased(
+                    transport.protocol_url().into(),
+                    account_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    leased.wire,
+                )
+                .unwrap(),
+            );
+            transport
+                .bind_native_baseline_lease(state.baseline_lease())
+                .unwrap();
+
+            let storage = StorageAdapter::new(
+                crate::storage_adapter::StorageSession::acquire(Memory::new())
+                    .await
+                    .unwrap(),
+            );
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let mut writes = storage.new_write_set();
+            let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+            crate::init::stage_partial_repository_protocol(&mut writes);
+            drop(read);
+            storage
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (engine, session) =
+                Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+                    .await
+                    .unwrap();
+            let engine = Arc::new(engine);
+            engine.sync_mode().admit_partial_replica(
+                state.clone(),
+                crate::sync::partial_replica_write_capability(),
+            );
+            storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let worker_storage = storage.clone();
+            let worker_state = state.clone();
+            let worker_transport = transport.clone();
+            let worker = tokio::spawn(async move {
+                while let Some(demand) = receiver.recv().await {
+                    let result = crate::sync::partial_runtime::hydrate_demand_with_receipt(
+                        &worker_storage,
+                        &worker_state,
+                        &worker_transport,
+                        demand.request,
+                    )
+                    .await;
+                    let _ = demand.response.send(result);
+                }
+            });
+            let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
+            (replica, worker, storage, state, transport)
+        }
+    };
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (replica, worker, ..) = open_cold_replica(log.clone()).await;
+    log.lock().unwrap().clear();
+    let started = Instant::now();
+    let cold = replica.execute(&sql, &params).await.unwrap();
+    assert_eq!(values(&cold), values(&expected));
+    let requests = log.lock().unwrap().clone();
+    let physical = requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r["operation"].as_str(),
+                Some("native-objects" | "native-object-range" | "native-metadata")
+            )
+        })
+        .count();
+    let recipes = fulfillment_requests(&log);
+    eprintln!(
+        "BOUNDED_HISTORY_CLOSURE_PROFILE_JSON={}",
+        serde_json::json!({
+            "selected_checkpoints": selected.len(), "rows": cold.rows().len(),
+            "cold_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "physical_fallback_calls": physical, "requests": requests,
+            "fulfillment_calls": recipes.len(), "fulfillment_response_bytes": response_bytes(&recipes),
+        })
+    );
+    log.lock().unwrap().clear();
+    let warm = replica.execute(&sql, &params).await.unwrap();
+    assert_eq!(values(&warm), values(&expected));
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "retained immutable history must execute offline"
+    );
+    replica.close().await.unwrap();
+    worker.abort();
+    assert_eq!(
+        recipes.len(),
+        1,
+        "one operation-sized closure must cover the selected page"
+    );
+    assert!(
+        response_bytes(&recipes) < 2 * 1024 * 1024,
+        "small history page must retain a bounded wire closure"
+    );
+    assert!(
+        physical <= 2,
+        "bounded public checkpoint history needs operation-sized closure; got {physical} pointer fetches"
+    );
+
+    // Directory history uses the same bounded operation contract, with typed
+    // directory identities rather than file IDs. Each checkpoint introduced
+    // one directory, so this exercises actual rows rather than an empty scan.
+    let directory_sql = sql.replace("'lix_file'", "'lix_directory'");
+    let directory_expected = authority.execute(&directory_sql, &params).await.unwrap();
+    assert_eq!(directory_expected.rows().len(), 7);
+    let directory_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (directory_replica, directory_worker, ..) = open_cold_replica(directory_log.clone()).await;
+    directory_log.lock().unwrap().clear();
+    let directory_rows = directory_replica
+        .execute(&directory_sql, &params)
+        .await
+        .unwrap();
+    assert_eq!(values(&directory_rows), values(&directory_expected));
+    assert_eq!(fulfillment_requests(&directory_log).len(), 1);
+    assert!(only_read_fulfillment(&directory_log));
+    eprintln!(
+        "DIRECTORY_HISTORY_CLOSURE_PROFILE_JSON={}",
+        serde_json::json!({
+            "rows": directory_rows.rows().len(), "requests": directory_log.lock().unwrap().clone(),
+        })
+    );
+    directory_log.lock().unwrap().clear();
+    assert_eq!(
+        values(
+            &directory_replica
+                .execute(&directory_sql, &params)
+                .await
+                .unwrap()
+        ),
+        values(&directory_expected)
+    );
+    assert!(directory_log.lock().unwrap().is_empty());
+    directory_replica.close().await.unwrap();
+    directory_worker.abort();
+
+    // Keep the leased roots fixed while the authority renames a selected file
+    // and publishes another checkpoint. History must retain the old paths and
+    // source owners rather than discover against the authority's live head.
+    let pinned_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (pinned, pinned_worker, ..) = open_cold_replica(pinned_log.clone()).await;
+    authority_execute(&server, authority.lix_id(),
+        "UPDATE lix_file SET path = '/after-history-lease.txt' WHERE path = '/bounded-history/checkpoint-8/0.txt'", &[]).await;
+    authority_execute(
+        &server,
+        authority.lix_id(),
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        &[],
+    )
+    .await;
+    pinned_log.lock().unwrap().clear();
+    let pinned_rows = pinned.execute(&sql, &params).await.unwrap();
+    assert_eq!(values(&pinned_rows), values(&expected));
+    assert!(
+        pinned_rows
+            .rows()
+            .iter()
+            .all(|row| row.get::<String>("path").unwrap() != "/after-history-lease.txt")
+    );
+    let pinned_requests = fulfillment_requests(&pinned_log);
+    assert_eq!(
+        pinned_requests.len(),
+        1,
+        "lease-pinned history should close in one operation"
+    );
+    assert!(
+        only_read_fulfillment(&pinned_log),
+        "advancing authority must not restore pointer discovery"
+    );
+    pinned_log.lock().unwrap().clear();
+    assert_eq!(
+        values(&pinned.execute(&sql, &params).await.unwrap()),
+        values(&expected)
+    );
+    assert!(pinned_log.lock().unwrap().is_empty());
+    pinned.close().await.unwrap();
+    pinned_worker.abort();
+
+    // A visible History page starts at the latest checkpoint even when the
+    // leased head has subsequently advanced. Scope must be proved from that
+    // leased head; requiring anchor == head would miss the actual UI path.
+    let historical_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (historical, historical_worker, ..) = open_cold_replica(historical_log.clone()).await;
+    historical_log.lock().unwrap().clear();
+    assert_eq!(
+        values(&historical.execute(&sql, &params).await.unwrap()),
+        values(&expected)
+    );
+    assert_eq!(
+        fulfillment_requests(&historical_log).len(),
+        1,
+        "an older public anchor needs the same bounded closure"
+    );
+    assert!(only_read_fulfillment(&historical_log));
+    historical.close().await.unwrap();
+    historical_worker.abort();
+
+    // A local checkpoint cannot be proved on the authority's leased lane.
+    // Declining the optimization is normal protocol behavior: retain native
+    // demand semantics without an HTTP error or repeated eligibility probes.
+    let private_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (private, private_worker, ..) = open_cold_replica(private_log.clone()).await;
+    private
+        .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+        .await
+        .unwrap();
+    private
+        .execute(
+            "INSERT INTO lix_file(path, content) VALUES ('/private-history.txt', $1)",
+            &[Value::Blob(b"local checkpoint".to_vec().into())],
+        )
+        .await
+        .unwrap();
+    let private_checkpoint = private.create_checkpoint().await.unwrap().commit_id;
+    let private_sql = sql.replace("$8)", "$8, $9)");
+    let private_params = std::iter::once(Value::Text(private_checkpoint.clone()))
+        .chain(selected.iter().cloned().map(Value::Text))
+        .chain(std::iter::once(Value::Text(private_checkpoint.clone())))
+        .collect::<Vec<_>>();
+    private_log.lock().unwrap().clear();
+    let private_rows = private
+        .execute(&private_sql, &private_params)
+        .await
+        .unwrap();
+    let private_values = values(&private_rows);
+    let public_values = private_values
+        .iter()
+        .filter(|(commit, _, _)| commit != &private_checkpoint)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(public_values, values(&expected));
+    let local_values = private_values
+        .iter()
+        .filter(|(commit, _, _)| commit == &private_checkpoint)
+        .collect::<Vec<_>>();
+    assert_eq!(local_values.len(), 1);
+    assert_eq!(local_values[0].2, "/private-history.txt");
+    let private_requests = private_log.lock().unwrap().clone();
+    assert!(
+        private_requests
+            .iter()
+            .all(|request| request["status"] == 200)
+    );
+    assert_eq!(
+        fulfillment_requests(&private_log).len(),
+        1,
+        "unprovable private history must probe eligibility only once per basis"
+    );
+    let fallback_position = private_requests
+        .iter()
+        .position(|request| request["operation"] == "read-fulfillment")
+        .unwrap();
+    assert!(
+        private_requests[fallback_position + 1..]
+            .iter()
+            .any(|request| {
+                matches!(
+                    request["operation"].as_str(),
+                    Some("native-objects" | "native-object-range" | "native-metadata")
+                )
+            }),
+        "private history must exercise native-demand hydration after declining the recipe"
+    );
+    eprintln!(
+        "PRIVATE_HISTORY_FALLBACK_PROFILE_JSON={}",
+        serde_json::json!({
+            "rows": private_rows.rows().len(), "requests": private_requests,
+        })
+    );
+    private_log.lock().unwrap().clear();
+    assert_eq!(
+        values(
+            &private
+                .execute(&private_sql, &private_params)
+                .await
+                .unwrap()
+        ),
+        private_values
+    );
+    assert!(private_log.lock().unwrap().is_empty());
+    private.close().await.unwrap();
+    private_worker.abort();
+
+    // Drive the real missing-input boundary deterministically. Query planning
+    // can choose either side of a mixed History/current-row join first; both
+    // orders must allow canonical current-row recovery after private History
+    // was found ineligible on the same leased basis.
+    let mixed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (mixed, mixed_worker, mixed_storage, mixed_state, mixed_transport) =
+        open_cold_replica(mixed_log.clone()).await;
+    let capture = crate::hot_state::ReadInterestRegistry::new(16, 65536);
+    capture
+        .register(crate::hot_state::LogicalReadInterest::History {
+            branch_id: mixed_state.descriptor().selected_branch.branch_id.clone(),
+            anchor: private_checkpoint,
+            commit_ids: selected.clone(),
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        })
+        .unwrap();
+    capture
+        .register(crate::hot_state::LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    branch_ids: vec![mixed_state.descriptor().selected_branch.branch_id.clone()],
+                    schema_keys: vec!["lix_conversation".into()],
+                    row_pks: vec![
+                        crate::row_pk::RowPk::uuid_from_canonical(&mixed_conversation_id).unwrap(),
+                    ],
+                    ..Default::default()
+                },
+                projection: crate::hot_state::HotStateProjection {
+                    columns: vec!["untracked".into(), "raw_snapshot".into()],
+                },
+                ..Default::default()
+            },
+            domain: crate::hot_state::InterestDomain::Combined,
+        })
+        .unwrap();
+    mixed_log.lock().unwrap().clear();
+    let history_error = crate::sync::read_fulfillment::annotate_capture(
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "missing private History dependency",
+        )
+        .with_details(
+            serde_json::json!({"nativeHistoryDemand": {"version": 1, "includeStateHeaders": true}}),
+        ),
+        Some(&capture),
+    );
+    crate::sync::partial_runtime::hydrate_demand_with_receipt(
+        &mixed_storage,
+        &mixed_state,
+        &mixed_transport,
+        crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+            vec![NativeMetadataRef::CommitGraphRecord(
+                checkpoint_ids[0].clone(),
+            )],
+            history_error,
+        ),
+    )
+    .await
+    .unwrap();
+    let locator = NativeMetadataRef::ChangeLocator(mixed_conversation_change_id.clone());
+    let current_error = crate::sync::read_fulfillment::annotate_capture(
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected current change is missing",
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "changeId": mixed_conversation_change_id,
+        })),
+        Some(&capture),
+    );
+    crate::sync::partial_runtime::hydrate_demand_with_receipt(
+        &mixed_storage,
+        &mixed_state,
+        &mixed_transport,
+        crate::sync::runtime::SyncDemandRequest::NativeMetadata(vec![locator], current_error),
+    )
+    .await
+    .unwrap();
+    let mixed_recipes = fulfillment_requests(&mixed_log);
+    assert_eq!(
+        mixed_recipes.len(),
+        2,
+        "one History fallback and one current-payload recovery"
+    );
+    assert!(
+        mixed_recipes[0]["request_interests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|interest| interest["kind"] == "history")
+    );
+    assert!(
+        mixed_recipes[1]["request_interests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|interest| interest["kind"] != "history")
+    );
+    assert!(
+        mixed_log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["status"] == 200)
+    );
+    mixed_log.lock().unwrap().clear();
+    let recovered = mixed
+        .execute(
+            "SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false",
+            &[Value::Text(mixed_conversation_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.rows()[0].get::<String>("title").unwrap(),
+        "Mixed History recovery"
+    );
+    assert!(
+        mixed_log.lock().unwrap().is_empty(),
+        "canonical current-row payload must already be installed: {:?}",
+        *mixed_log.lock().unwrap()
+    );
+    mixed.close().await.unwrap();
+    mixed_worker.abort();
+}

@@ -80,6 +80,7 @@ pub(crate) trait SqlExecutionContext: Sync {
     }
     async fn sql_planning_environment(
         &self,
+        _statements: &[datafusion::sql::parser::Statement],
     ) -> Result<
         Option<(
             Arc<super::SqlPlanningCache<crate::catalog::CatalogFingerprint>>,

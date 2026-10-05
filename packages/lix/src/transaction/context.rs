@@ -13467,6 +13467,7 @@ where
 
     async fn sql_planning_environment(
         &self,
+        _statements: &[datafusion::sql::parser::Statement],
     ) -> Result<
         Option<(
             Arc<SqlPlanningCache<CatalogFingerprint>>,
