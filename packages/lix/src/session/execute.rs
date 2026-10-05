@@ -14910,31 +14910,36 @@ mod assume_send_future_proofs_borrowing {
     }
 }
 
-/// Concrete native candidate evaluator; keeps the generic lifetime-erasure
-/// callback private and returns no owned read capability.
-pub(crate) async fn prepare_partial_candidate_read_scope<StorageImpl>(
-    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
-    state: &crate::sync::PartialReplicaState,
-    interests: Option<&crate::hot_state::MovingReadInterestSnapshot>,
+/// Candidate evaluator shared by reconciliation and branch publication.
+/// Erase its future at this boundary so consumer crates do not inherit the
+/// concrete candidate replay layout. The parent still polls and cancels the
+/// borrowed evaluation, and no owned read capability escapes.
+pub(crate) fn prepare_partial_candidate_read_scope<'a, 'read, StorageImpl>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'read>>,
+    state: &'a crate::sync::PartialReplicaState,
+    interests: Option<&'a crate::hot_state::MovingReadInterestSnapshot>,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: crate::hot_state::HotStateContext,
     allow_missing_selected_control: bool,
-) -> Result<crate::sync::PreparedCandidateState, LixError>
+) -> crate::sync::SyncTransportFuture<'a, crate::sync::PreparedCandidateState>
 where
+    'read: 'a,
     StorageImpl: Storage + 'static,
 {
-    with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
-        crate::sync::prepare_candidate_state(
-            read,
-            state,
-            interests,
-            plugin_host,
-            hot,
-            allow_missing_selected_control,
-        )
+    Box::pin(async move {
+        with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
+            crate::sync::prepare_candidate_state(
+                read,
+                state,
+                interests,
+                plugin_host,
+                hot,
+                allow_missing_selected_control,
+            )
+            .await
+        })
         .await
     })
-    .await
 }
 
 /// Keep lifetime erasure scoped to native dependency discovery; no read escapes.
