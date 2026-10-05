@@ -480,11 +480,24 @@ impl TrackedStateTree {
         right_root: Option<&TrackedStateRootId>,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
+        self.diff_with_identity_budget(store, left_root, right_root, request, None)
+            .await
+    }
+
+    pub(crate) async fn diff_with_identity_budget(
+        &self,
+        store: &impl StorageAdapterRead,
+        left_root: Option<&TrackedStateRootId>,
+        right_root: Option<&TrackedStateRootId>,
+        request: &TrackedStateTreeScanRequest,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+    ) -> Result<TrackedStateTreeDiffBatch, LixError> {
         match (left_root, right_root) {
             (None, None) => Ok(TrackedStateTreeDiffBatch::default()),
             (Some(left), Some(right)) if left == right => Ok(TrackedStateTreeDiffBatch::default()),
             (Some(left), Some(right)) => {
                 let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+                out.set_native_work_budget(native_work_budget.cloned());
                 self.diff_nodes(
                     store,
                     *left.as_bytes(),
@@ -498,6 +511,7 @@ impl TrackedStateTree {
             (Some(left), None) => {
                 let ranges = scan_ranges(request);
                 let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+                out.set_native_work_budget(native_work_budget.cloned());
                 self.collect_root_diff_shared(
                     store,
                     *left.as_bytes(),
@@ -512,6 +526,7 @@ impl TrackedStateTree {
             (None, Some(right)) => {
                 let ranges = scan_ranges(request);
                 let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+                out.set_native_work_budget(native_work_budget.cloned());
                 self.collect_root_diff_shared(
                     store,
                     *right.as_bytes(),
@@ -1218,7 +1233,9 @@ impl TrackedStateTree {
             return Ok(());
         }
 
+        out.charge_native_visit(0)?;
         let left = self.load_node(store, &left_hash).await?;
+        out.charge_native_visit(0)?;
         let right = self.load_node(store, &right_hash).await?;
         if let (DecodedNode::Leaf(left), DecodedNode::Leaf(right)) = (&left, &right) {
             return self.diff_decoded_leaves(left, right, request, out);
@@ -1265,11 +1282,17 @@ impl TrackedStateTree {
                 (Some(left_summary), Some(right_summary)) => {
                     let left_node = match left_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &left_summary.child_hash).await?,
+                        None => {
+                            out.charge_native_visit(0)?;
+                            self.load_node(store, &left_summary.child_hash).await?
+                        }
                     };
                     let right_node = match right_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &right_summary.child_hash).await?,
+                        None => {
+                            out.charge_native_visit(0)?;
+                            self.load_node(store, &right_summary.child_hash).await?
+                        }
                     };
                     match (left_node, right_node) {
                         (DecodedNode::Internal(left_node), DecodedNode::Internal(right_node)) => {
@@ -1287,13 +1310,21 @@ impl TrackedStateTree {
                         (DecodedNode::Leaf(left_node), DecodedNode::Leaf(right_node)) => {
                             match left_summary.last_key.cmp(&right_summary.last_key) {
                                 std::cmp::Ordering::Less => {
-                                    left_window.extend(decoded_leaf_entries_owned(&left_node)?);
+                                    append_native_bounded_diff_leaf(
+                                        &left_node,
+                                        out,
+                                        &mut left_window,
+                                    )?;
                                     left.pop_front();
                                     right_loaded = Some(DecodedNode::Leaf(right_node));
                                 }
                                 std::cmp::Ordering::Greater => {
                                     left_loaded = Some(DecodedNode::Leaf(left_node));
-                                    right_window.extend(decoded_leaf_entries_owned(&right_node)?);
+                                    append_native_bounded_diff_leaf(
+                                        &right_node,
+                                        out,
+                                        &mut right_window,
+                                    )?;
                                     right.pop_front();
                                 }
                                 std::cmp::Ordering::Equal => {
@@ -1307,8 +1338,16 @@ impl TrackedStateTree {
                                             out,
                                         )?;
                                     } else {
-                                        left_window.extend(decoded_leaf_entries_owned(&left_node)?);
-                                        right_window.extend(decoded_leaf_entries_owned(&right_node)?);
+                                        append_native_bounded_diff_leaf(
+                                            &left_node,
+                                            out,
+                                            &mut left_window,
+                                        )?;
+                                        append_native_bounded_diff_leaf(
+                                            &right_node,
+                                            out,
+                                            &mut right_window,
+                                        )?;
                                         self.diff_leaf_entries(
                                             &left_window,
                                             &right_window,
@@ -1326,14 +1365,17 @@ impl TrackedStateTree {
                 (Some(left_summary), None) => {
                     let left_node = match left_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &left_summary.child_hash).await?,
+                        None => {
+                            out.charge_native_visit(0)?;
+                            self.load_node(store, &left_summary.child_hash).await?
+                        }
                     };
                     match left_node {
                         DecodedNode::Internal(node) => {
                             replace_front_with_children(&mut left, node.into_children())?;
                         }
                         DecodedNode::Leaf(node) => {
-                            left_window.extend(decoded_leaf_entries_owned(&node)?);
+                            append_native_bounded_diff_leaf(&node, out, &mut left_window)?;
                             left.pop_front();
                         }
                     }
@@ -1341,14 +1383,17 @@ impl TrackedStateTree {
                 (None, Some(right_summary)) => {
                     let right_node = match right_loaded.take() {
                         Some(node) => node,
-                        None => self.load_node(store, &right_summary.child_hash).await?,
+                        None => {
+                            out.charge_native_visit(0)?;
+                            self.load_node(store, &right_summary.child_hash).await?
+                        }
                     };
                     match right_node {
                         DecodedNode::Internal(node) => {
                             replace_front_with_children(&mut right, node.into_children())?;
                         }
                         DecodedNode::Leaf(node) => {
-                            right_window.extend(decoded_leaf_entries_owned(&node)?);
+                            append_native_bounded_diff_leaf(&node, out, &mut right_window)?;
                             right.pop_front();
                         }
                     }
@@ -1371,7 +1416,11 @@ impl TrackedStateTree {
         let mut left_index = 0usize;
         let mut right_index = 0usize;
         while left_index < left.len() && right_index < right.len() {
-            match left[left_index].entry.key.cmp(&right[right_index].entry.key) {
+            match left[left_index]
+                .entry
+                .key
+                .cmp(&right[right_index].entry.key)
+            {
                 std::cmp::Ordering::Less => {
                     self.push_removed_diff(left[left_index].clone(), request, out)?;
                     left_index += 1;
@@ -1410,6 +1459,20 @@ impl TrackedStateTree {
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
+        if out.has_native_work_budget() {
+            for index in 0..left.len() {
+                let entry = left.entry_owned(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "left tree leaf entry disappeared")
+                })?;
+                out.charge_native_visit(entry.key.len())?;
+            }
+            for index in 0..right.len() {
+                let entry = right.entry_owned(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "right tree leaf entry disappeared")
+                })?;
+                out.charge_native_visit(entry.key.len())?;
+            }
+        }
         let mut left_index = 0usize;
         let mut right_index = 0usize;
         while left_index < left.len() && right_index < right.len() {
@@ -1451,9 +1514,12 @@ impl TrackedStateTree {
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
+        let encoded_key_bytes = entry.entry.key.len();
+        out.validate_native_identity_key_size(encoded_key_bytes)?;
         let key = decode_key_shared(entry.entry.key)?;
         let value = decode_value(&entry.entry.value)?;
         if request.matches_ref(key.as_ref(), &value) {
+            out.charge_native_identity(encoded_key_bytes)?;
             out.push_shared_with_author_presence(
                 key,
                 Some(value),
@@ -1472,9 +1538,12 @@ impl TrackedStateTree {
         request: &TrackedStateTreeScanRequest,
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
+        let encoded_key_bytes = entry.entry.key.len();
+        out.validate_native_identity_key_size(encoded_key_bytes)?;
         let key = decode_key_shared(entry.entry.key)?;
         let value = decode_value(&entry.entry.value)?;
         if request.matches_ref(key.as_ref(), &value) {
+            out.charge_native_identity(encoded_key_bytes)?;
             out.push_shared_with_author_presence(
                 key,
                 None,
@@ -1495,12 +1564,15 @@ impl TrackedStateTree {
         out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
         debug_assert_eq!(left.entry.key, right.entry.key);
+        let encoded_key_bytes = left.entry.key.len();
+        out.validate_native_identity_key_size(encoded_key_bytes)?;
         let key = decode_key_shared(left.entry.key)?;
         let left_value = decode_value(&left.entry.value)?;
         let right_value = decode_value(&right.entry.value)?;
         if request.matches_ref(key.as_ref(), &left_value)
             || request.matches_ref(key.as_ref(), &right_value)
         {
+            out.charge_native_identity(encoded_key_bytes)?;
             out.push_shared_with_author_presence(
                 key,
                 Some(left_value),
@@ -1740,8 +1812,9 @@ impl TrackedStateTree {
         S: StorageAdapterRead + ?Sized + 'a,
     {
         Box::pin(async move {
+            out.charge_native_visit(0)?;
             let node = self.load_node(store, &hash).await?;
-            out.reserve_exact_once(tree_diff_capacity_hint(&node, request).min(u32::MAX as usize));
+            out.reserve_exact_once(tree_diff_capacity_hint(&node, request).min(u32::MAX as usize))?;
             match node {
                 DecodedNode::Leaf(leaf) => {
                     for index in 0..leaf.len() {
@@ -1754,6 +1827,7 @@ impl TrackedStateTree {
                                 "tracked-state leaf entry disappeared during one-sided diff",
                             )
                         })?;
+                        out.charge_native_visit(entry.key.len())?;
                         if !encoded_key_in_scan_ranges(&entry.key, ranges) {
                             continue;
                         }
@@ -2961,12 +3035,31 @@ fn decoded_leaf_entry_owned(
     })
 }
 
-fn decoded_leaf_entries_owned(
-    leaf: &DecodedLeafNodeRef,
-) -> Result<Vec<DiffLeafEntry>, LixError> {
+fn decoded_leaf_entries_owned(leaf: &DecodedLeafNodeRef) -> Result<Vec<DiffLeafEntry>, LixError> {
     (0..leaf.len())
         .map(|index| decoded_leaf_entry_owned(leaf, index))
         .collect()
+}
+
+fn append_native_bounded_diff_leaf(
+    leaf: &DecodedLeafNodeRef,
+    out: &mut TrackedStateTreeDiffBatchBuilder,
+    target: &mut Vec<DiffLeafEntry>,
+) -> Result<(), LixError> {
+    if out.has_native_work_budget() {
+        for index in 0..leaf.len() {
+            let key = leaf.key(index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state diff leaf key disappeared before bounded retention",
+                )
+            })?;
+            out.validate_native_identity_key_size(key.len())?;
+            out.charge_native_visit(key.len())?;
+        }
+    }
+    target.extend(decoded_leaf_entries_owned(leaf)?);
+    Ok(())
 }
 
 fn decoded_node_row_count(node: &DecodedNode) -> usize {
@@ -6149,8 +6242,8 @@ mod tests {
                         canonical.root_id,
                         TrackedStateRootId::new([
                             186, 62, 74, 187, 132, 195, 146, 56, 49, 2, 162, 244, 22, 127, 244,
-                            180, 156, 194, 11, 237, 73, 148, 113, 94, 5, 6, 245, 244, 117, 129,
-                            74, 253,
+                            180, 156, 194, 11, 237, 73, 148, 113, 94, 5, 6, 245, 244, 117, 129, 74,
+                            253,
                         ])
                     );
                 }
@@ -6455,9 +6548,17 @@ mod tests {
         let encoded_key = encode_key(&present_key);
         let mut legacy_leaf = vec![5, 1, 0, 0, 0, encoded_key.len() as u8];
         legacy_leaf.extend_from_slice(&encoded_key);
-        legacy_leaf.extend_from_slice(ChangeId::for_test_label("legacy-change").as_uuid().as_bytes());
+        legacy_leaf.extend_from_slice(
+            ChangeId::for_test_label("legacy-change")
+                .as_uuid()
+                .as_bytes(),
+        );
         legacy_leaf.push(0); // inline commit id
-        legacy_leaf.extend_from_slice(CommitId::for_test_label("legacy-commit").as_uuid().as_bytes());
+        legacy_leaf.extend_from_slice(
+            CommitId::for_test_label("legacy-commit")
+                .as_uuid()
+                .as_bytes(),
+        );
         legacy_leaf.push(0); // inline state tail
         legacy_leaf.push(0); // unchanged zero timestamps, live
         let root = TrackedStateRootId::new(hash_bytes(&legacy_leaf));

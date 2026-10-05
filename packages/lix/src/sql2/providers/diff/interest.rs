@@ -7,6 +7,7 @@ pub(crate) async fn prepare_native_diff_interest<R>(
     to: &str,
     request: &TrackedStateDiffRequest,
     projected_columns: &[String],
+    native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
 ) -> Result<(), crate::LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -18,6 +19,9 @@ where
         let from_descriptor = commit_state_descriptor(&store, from).await?;
         let to_descriptor = commit_state_descriptor(&store, to).await?;
         let mut tracked = TrackedStateContext::new().reader(store);
+        if let Some(budget) = native_diff_budget {
+            tracked = tracked.with_native_diff_identity_budget(budget);
+        }
         // Native side preparation inspects projection names only. This schema
         // never reaches Arrow output, validation, or expression evaluation.
         let projection = Schema::new(

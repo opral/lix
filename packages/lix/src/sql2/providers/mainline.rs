@@ -594,7 +594,6 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             .collect::<Vec<_>>();
                         let interest = super::diff::bounded_history_interest(
                             branch_id,
-                            &anchor.to_string(),
                             commit_ids,
                             relation,
                             &projected_columns,

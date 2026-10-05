@@ -205,3 +205,143 @@ async fn v2_partial_browser_app_fixture_authority() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Synthetic current-format partial epoch with the prerelease v3 History
+/// journal for real OPFS migration/admission QA. The row remains pending so
+/// the browser path also proves journal migration preserves local edits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual local browser fixture; requires manifest and stop paths"]
+async fn v3_history_partial_browser_app_fixture_authority() {
+    let manifest_path = std::env::var("LIX_BROWSER_V3_PARTIAL_MANIFEST")
+        .expect("set a v3 History fixture output path");
+    let stop_path =
+        std::env::var("LIX_BROWSER_V3_PARTIAL_STOP").expect("set a v3 History fixture stop path");
+    assert!(!std::path::Path::new(&stop_path).exists());
+
+    let authority = Authority::new().await;
+    let authenticated = crate::sync::authenticate_partial_conversion(authority.options(), None)
+        .await
+        .unwrap();
+    let state = authenticated.state().clone();
+    let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+    let installed = install_fresh_partial_epoch(storage.clone(), &state)
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(installed.adapter.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    installed
+        .adapter
+        .admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    crate::sync::execute_hydrating_over_http(
+        &session,
+        &installed.adapter,
+        &state,
+        authenticated.server(),
+        "INSERT INTO lix_key_value (key,value) VALUES ('v3-browser-pending','local-pending')",
+        &[],
+    )
+    .await
+    .unwrap();
+    drop(session);
+    drop(engine);
+
+    let journal_key =
+        crate::storage_codec::id_string::uuid_bytes_from_canonical(state.epoch_id()).unwrap();
+    let mut history = serde_json::to_value(crate::hot_state::LogicalReadInterest::History {
+        branch_id: state.descriptor().selected_branch.branch_id.clone(),
+        commit_ids: vec![state.descriptor().selected_branch.head.commit_id.clone()],
+        relation: "lix_file".into(),
+        filter: crate::tracked_state::TrackedStateFilter {
+            include_tombstones: true,
+            ..Default::default()
+        },
+        retain_payloads: false,
+        projected_columns: vec!["id".into()],
+        limit: None,
+    })
+    .unwrap();
+    history["anchor"] = serde_json::json!(state.descriptor().selected_branch.head.commit_id);
+    let retained = serde_json::to_value(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+        scope: crate::filesystem::FilesystemPathIndexScope::All,
+        branch_ids: vec![state.descriptor().selected_branch.branch_id.clone()],
+        include_blob_refs: false,
+        cache_small_blob_data: false,
+    })
+    .unwrap();
+    let old_journal = serde_json::to_vec(&serde_json::json!({
+        "version": 3,
+        "epochId": state.epoch_id(),
+        "recipes": [history, retained]
+    }))
+    .unwrap();
+    let mut writes = installed.adapter.new_write_set();
+    writes.put(
+        crate::sync::PARTIAL_READ_INTEREST_SPACE,
+        journal_key.as_slice(),
+        old_journal.as_slice(),
+    );
+    let mut write = installed
+        .adapter
+        .begin_migration_write(WriteOptions::default())
+        .await
+        .unwrap();
+    writes.lower_into(&mut write).await.unwrap();
+    write.commit().await.unwrap();
+
+    let current = inspect_existing_epoch_adapter(&storage).await.unwrap();
+    let read = current.begin_read(Default::default()).await.unwrap();
+    let mut entries = Vec::new();
+    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
+        let mut cursor = read
+            .begin_scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        loop {
+            let (page, more) = cursor.next_page(256).await.unwrap().into_parts();
+            for entry in page {
+                let ProjectedValue::FullValue(value) = entry.value else {
+                    panic!("fixture requires complete values");
+                };
+                entries.push(serde_json::json!({
+                    "space": space.id.0,
+                    "key": entry.key.0.to_vec(),
+                    "value": value.to_vec(),
+                }));
+            }
+            if !more {
+                break;
+            }
+        }
+    }
+    drop(read);
+    drop(installed.adapter);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&serde_json::json!({
+            "url": authority.url,
+            "repositoryId": state.repository_id(),
+            "fixtureKind": "synthetic-current-v3-partial-replica",
+            "pendingRow": {"key": "v3-browser-pending", "value": "local-pending"},
+            "entries": entries,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("Synthetic current-format v3 History browser fixture ready: {manifest_path}");
+    while !std::path::Path::new(&stop_path).exists() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

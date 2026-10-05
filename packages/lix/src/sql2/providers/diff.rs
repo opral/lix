@@ -386,6 +386,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
+            None,
         )
         .await
     }
@@ -396,7 +397,6 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
 /// finite exact mainline predicate and that the scan has no pushed limit.
 pub(super) fn bounded_history_interest(
     branch_id: &str,
-    anchor: &str,
     commit_ids: Vec<String>,
     relation: &DiffRelation,
     projected_columns: &[String],
@@ -438,7 +438,9 @@ pub(super) fn bounded_history_interest(
         seen_file_ids.insert(identity)
     });
     let mut seen_row_pks = BTreeSet::new();
-    filter.row_pks.retain(|row_pk| seen_row_pks.insert(row_pk.clone()));
+    filter
+        .row_pks
+        .retain(|row_pk| seen_row_pks.insert(row_pk.clone()));
     let retain_payloads = route.request.retain_payloads;
     let projected_columns = schema
         .fields()
@@ -457,7 +459,6 @@ pub(super) fn bounded_history_interest(
     }
     let interest = crate::hot_state::LogicalReadInterest::History {
         branch_id: branch_id.to_owned(),
-        anchor: anchor.to_owned(),
         commit_ids,
         relation: relation.name.clone(),
         filter,
@@ -502,9 +503,8 @@ pub(crate) fn validate_bounded_history_recipe_shape(
     {
         return Err(invalid());
     }
-    let uuid_row_pk = |row_pk: &RowPk| {
-        matches!(row_pk.components.as_slice(), [RowPkComponent::Uuid(_)])
-    };
+    let uuid_row_pk =
+        |row_pk: &RowPk| matches!(row_pk.components.as_slice(), [RowPkComponent::Uuid(_)]);
     if !filter.include_tombstones
         || filter.row_pk_lower.is_some()
         || filter.row_pk_upper.is_some()
@@ -1212,7 +1212,10 @@ impl DiffRoute {
         // render one file path or descriptor field.
         let retain_payloads = projection_requires_tracked_payloads(
             &relation.kind,
-            projection.fields().iter().map(|field| field.name().as_str()),
+            projection
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
         );
         Self {
             row_refs,
@@ -2740,9 +2743,12 @@ mod tests {
         )
         .await
         .expect("insert base-backed file");
-        main.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
-            .await
-            .expect("seal branch base");
+        main.execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
+        .await
+        .expect("seal branch base");
         let branch = main
             .create_branch(CreateBranchOptions {
                 id: None,
@@ -2790,7 +2796,10 @@ mod tests {
             .await
             .expect("modify one live local winner");
         session
-            .execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(removed_id.into())])
+            .execute(
+                "DELETE FROM lix_file WHERE id = $1",
+                &[Value::Text(removed_id.into())],
+            )
             .await
             .expect("tombstone one base-backed file");
 
@@ -3019,7 +3028,10 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]
@@ -3243,7 +3255,10 @@ mod tests {
             .unwrap();
         let directory_id = nested.rows()[0].get::<String>("id").unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("baseline checkpoint");
         let baseline = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
@@ -3287,7 +3302,10 @@ mod tests {
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
         }
         let target = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("seal ancestor move");
         let target = target.rows()[0].get::<String>("commit_id").unwrap();
@@ -3369,7 +3387,10 @@ mod tests {
             .unwrap();
         }
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]
@@ -3391,7 +3412,10 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]
@@ -3460,7 +3484,10 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]
@@ -3473,7 +3500,10 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]

@@ -128,7 +128,32 @@ where
     let mut catalog_branches = std::collections::BTreeSet::<String>::new();
     // One authority request shares this traversal ceiling across every
     // History recipe; per-recipe bounds alone would multiply graph work.
+    let native_diff_budget = matches!(&purpose, NativeReadPreparationPurpose::Authority { .. })
+        .then(|| crate::tracked_state::NativeDiffIdentityBudget::new(16_384));
     let mut history_graph_nodes_remaining = crate::hot_state::MAX_HISTORY_RECIPE_GRAPH_NODES;
+    if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. })
+        && interests
+            .interests
+            .iter()
+            .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }))
+    {
+        let recipes = interests
+            .interests
+            .iter()
+            .map(|interest| interest.as_ref().clone())
+            .collect::<Vec<_>>();
+        super::working_diff_recipe::validate_working_diff_recipes(
+            &recipes,
+            &descriptor.selected_branch.branch_id,
+        )?;
+        super::working_diff_recipe::prove_selected_branch_checkpoint_ancestry(
+            read.clone(),
+            descriptor,
+            &mut history_graph_nodes_remaining,
+        )
+        .await?;
+    }
+
     for interest in &interests.interests {
         match interest.as_ref() {
             LogicalReadInterest::Scan { request, domain } => {
@@ -260,12 +285,12 @@ where
                         retain_payloads: *retain_payloads,
                     },
                     projected_columns,
+                    native_diff_budget.clone(),
                 )
                 .await?;
             }
             LogicalReadInterest::History {
                 branch_id,
-                anchor,
                 commit_ids,
                 relation,
                 filter,
@@ -298,14 +323,12 @@ where
                         ));
                     }
                 }
-                let anchor_id = crate::changelog::CommitId::parse_lix(anchor, "history anchor")?;
                 let mut graph = crate::commit_graph::CommitGraphContext::new().reader(read.clone());
                 let mut cursor = crate::changelog::CommitId::parse_lix(
                     &branch.head.commit_id,
                     "leased branch head",
                 )?;
                 let mut parents = std::collections::BTreeMap::new();
-                let mut anchor_seen = false;
                 let mut seen = std::collections::BTreeSet::new();
                 let mut previous_generation = None;
                 loop {
@@ -321,7 +344,16 @@ where
                             "history recipes exceed the shared bounded ancestry work budget",
                         ));
                     }
-                    let node = match graph.load_node(&cursor).await? {
+                    let loaded = match graph.load_node(&cursor).await {
+                        Err(error) if error.code == "LIX_SYNC_HISTORY_REQUIRED" => {
+                            return Err(LixError::new(
+                                "LIX_HISTORY_RECIPE_FALLBACK",
+                                "history recipe ancestry requires unavailable history",
+                            ));
+                        }
+                        result => result?,
+                    };
+                    let node = match loaded {
                         Some(node) => node,
                         None => {
                             return Err(LixError::new(
@@ -330,6 +362,12 @@ where
                             ));
                         }
                     };
+                    if node.commit_id != cursor {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "history recipe node ID disagrees with its requested address",
+                        ));
+                    }
                     if previous_generation.is_some_and(|generation| node.generation >= generation) {
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PARAM,
@@ -337,13 +375,10 @@ where
                         ));
                     }
                     previous_generation = Some(node.generation);
-                    if cursor == anchor_id {
-                        anchor_seen = true;
-                    }
-                    if anchor_seen && selected.contains(&cursor) {
+                    if selected.contains(&cursor) {
                         parents.insert(cursor, node.parent_commit_ids.first().copied());
                     }
-                    if anchor_seen && parents.len() == selected.len() {
+                    if parents.len() == selected.len() {
                         break;
                     }
                     let Some(parent) = node.parent_commit_ids.first().copied() else {
@@ -351,7 +386,7 @@ where
                     };
                     cursor = parent;
                 }
-                if !anchor_seen || parents.len() != selected.len() {
+                if parents.len() != selected.len() {
                     return Err(LixError::new(
                         "LIX_HISTORY_RECIPE_FALLBACK",
                         "history recipe is outside the bounded leased ancestry",
@@ -376,6 +411,7 @@ where
                             id,
                             &request,
                             projected_columns,
+                            native_diff_budget.clone(),
                         )
                         .await?;
                     }
@@ -553,7 +589,11 @@ where
     // operation-scoped context intentionally has no trusted live-epoch cache.
     let reader = hot.reader(read.clone());
     let executable_rows = reader
-        .prepare_captured_read_interests(interests, active_account_id)
+        .prepare_captured_read_interests_with_native_diff_budget(
+            interests,
+            active_account_id,
+            native_diff_budget,
+        )
         .await?;
     returned_identities.extend(executable_rows.iter().cloned());
     catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));

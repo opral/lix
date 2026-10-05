@@ -74,6 +74,7 @@ where
     let candidate = transport.fork_native_baseline_lease(next.baseline_lease())?;
     let storage = engine.storage();
     let mut demands = std::collections::BTreeSet::new();
+    let mut working_diff_attempted = false;
     loop {
         deadline.check(&next.baseline_lease().lease_id)?;
         engine.sync_mode().ensure_partial_admission_healthy()?;
@@ -106,6 +107,24 @@ where
         let Some(demand) = super::runtime::native_sync_demand_request_for_error(&error)? else {
             return Err(error);
         };
+        if !working_diff_attempted {
+            working_diff_attempted = true;
+            use futures_util::FutureExt;
+            let hydrate = super::working_diff_candidate::hydrate_working_diff_dependencies(
+                &engine, &previous, &next, &candidate,
+            )
+            .fuse();
+            let expires = super::platform::sleep(deadline.remaining()?).fuse();
+            futures_util::pin_mut!(hydrate, expires);
+            let installed = futures_util::select_biased! {
+                _ = expires => return Err(LixError::new("LIX_PARTIAL_CANDIDATE_EXPIRED", "candidate dependency replay exceeded its original baseline deadline")),
+                result = hydrate => result?,
+            };
+            deadline.check(&next.baseline_lease().lease_id)?;
+            if installed {
+                continue;
+            }
+        }
         // Same typed immutable input cannot be demanded twice by one candidate.
         // Native corruption and unsupported history remain terminal errors.
         let fingerprint = format!("{demand:?}");

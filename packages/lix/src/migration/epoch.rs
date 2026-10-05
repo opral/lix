@@ -666,7 +666,17 @@ where
     if !crate::init::is_partial_repository_protocol(&read).await? {
         return Ok(false);
     }
-    Ok(partial::historical_partial_receipt_version(&read)
+    if partial::historical_partial_receipt_version(&read)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    // Protocol 27 was prerelease but may have left a strict v3 interest
+    // journal in a current-format partial epoch. Route that repository through
+    // detached migration so its journal can be rewritten to v4 without a
+    // runtime decoder compatibility path.
+    Ok(crate::sync::legacy_read_interest_journal_upgrade(&read)
         .await?
         .is_some())
 }
@@ -1666,7 +1676,9 @@ where
                     }),
                 )
                 .await?;
-                if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+                if let Some((key, bytes)) =
+                    crate::sync::legacy_read_interest_journal_upgrade(&read).await?
+                {
                     plan.get_or_insert_with(|| {
                         super::publish::PublicationPlan::bounded(
                             options.max_changes,
@@ -1940,8 +1952,10 @@ where
     }
     super::api::migrate_v86_marker(target).await?;
     crate::sync::upgrade_owned_partial_receipt(target).await?;
-    if let Some((key, bytes)) =
-        crate::sync::v2_journal_upgrade(&target.begin_read(ReadOptions::default()).await?).await?
+    if let Some((key, bytes)) = crate::sync::legacy_read_interest_journal_upgrade(
+        &target.begin_read(ReadOptions::default()).await?,
+    )
+    .await?
     {
         write_candidate_page(
             target,

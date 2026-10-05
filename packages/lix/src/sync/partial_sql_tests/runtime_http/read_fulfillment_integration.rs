@@ -70,9 +70,7 @@ impl RawHttpClient for ReadOnlyProductionClient {
                 .strip_prefix(&self.repo_path)
                 .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'));
             let allowed = repo_route.is_some_and(|route| match request.method.as_str() {
-                "GET" => {
-                    route.is_empty() || route == "/" || route == "/sync/descriptor"
-                }
+                "GET" => route.is_empty() || route == "/" || route == "/sync/descriptor",
                 "POST" => [
                     "/sync/read-fulfillment",
                     "/sync/native-objects",
@@ -187,8 +185,18 @@ where
     let mut events = lix.observe(sql, params)?;
     let event = tokio::time::timeout(std::time::Duration::from_secs(20), events.next())
         .await
-        .map_err(|_| LixError::new("LIX_TEST_OBSERVE_TIMEOUT", "observe did not yield its first result"))??
-        .ok_or_else(|| LixError::new("LIX_TEST_OBSERVE_ENDED", "observe ended before its first result"))?;
+        .map_err(|_| {
+            LixError::new(
+                "LIX_TEST_OBSERVE_TIMEOUT",
+                "observe did not yield its first result",
+            )
+        })??
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_TEST_OBSERVE_ENDED",
+                "observe ended before its first result",
+            )
+        })?;
     events.close();
     Ok(event.rows)
 }
@@ -920,8 +928,8 @@ async fn production_cold_global_sql_uses_read_fulfillment() {
         .expect("set LIX_READ_FULFILLMENT_PROBE_URL to the normalized repo URL");
     let normalized = crate::sync::normalize_sync_locator(&url)
         .expect("probe URL should be a canonical loopback repository locator");
-    let normalized_url = url::Url::parse(&normalized.protocol_url)
-        .expect("normalized probe URL should parse");
+    let normalized_url =
+        url::Url::parse(&normalized.protocol_url).expect("normalized probe URL should parse");
     assert_eq!(normalized_url.scheme(), "http");
     assert_eq!(normalized_url.host_str(), Some("127.0.0.1"));
     assert_eq!(normalized_url.port(), Some(43019));
@@ -944,26 +952,26 @@ async fn production_cold_global_sql_uses_read_fulfillment() {
         report_production_probe_error("http_close", error);
     }
     assert!(probe_result.is_ok(), "cold production GLOBAL SQL failed");
-    assert!(close_result.is_ok(), "production HTTP session cleanup failed");
+    assert!(
+        close_result.is_ok(),
+        "production HTTP session cleanup failed"
+    );
 }
 
 async fn run_production_cold_global_probe(
     transport: &HttpSyncTransport<ReadOnlyProductionClient>,
 ) -> Result<(), LixError> {
     let leased = transport.partial_replica_descriptor(None).await?;
-    let state = Arc::new(
-        PartialReplicaState::from_leased(
-            transport.protocol_url().into(),
-            transport.active_account_id().into(),
-            uuid::Uuid::now_v7().to_string(),
-            leased.wire,
-        )?,
-    );
+    let state = Arc::new(PartialReplicaState::from_leased(
+        transport.protocol_url().into(),
+        transport.active_account_id().into(),
+        uuid::Uuid::now_v7().to_string(),
+        leased.wire,
+    )?);
     transport.bind_native_baseline_lease(state.baseline_lease())?;
 
-    let storage = StorageAdapter::new(
-        crate::storage_adapter::StorageSession::acquire(Memory::new()).await?,
-    );
+    let storage =
+        StorageAdapter::new(crate::storage_adapter::StorageSession::acquire(Memory::new()).await?);
     let read = storage.begin_read(Default::default()).await?;
     let mut writes = storage.new_write_set();
     let preconditions = stage_partial_bootstrap(&read, &mut writes, &state)?;
@@ -980,9 +988,7 @@ async fn run_production_cold_global_probe(
         )
         .await?;
     let (engine, session) =
-        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
-            .await
-            ?;
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state).await?;
     let engine = Arc::new(engine);
     engine.sync_mode().admit_partial_replica(
         state.clone(),
@@ -1217,45 +1223,45 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
 
     let registered_schemas = observe_first(
         &replica,
-            "SELECT schema_key, value, lixcol_file_id, lixcol_metadata, \
+        "SELECT schema_key, value, lixcol_file_id, lixcol_metadata, \
              lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
              lixcol_author_id, lixcol_commit_id, lixcol_untracked \
              FROM lix_registered_schema LIMIT $1 OFFSET $2",
         &[Value::Integer(10), Value::Integer(0)],
     )
-        .await
-        .expect("projected registered-schema read should hydrate over HTTP");
+    .await
+    .expect("projected registered-schema read should hydrate over HTTP");
     assert!(!registered_schemas.is_empty());
     let working_diff = observe_first(
         &replica,
         "SELECT count(*) AS file_count FROM lix_diff('lix_file')",
         &[],
     )
-        .await
-        .expect("working-diff count should resolve its native read dependencies");
+    .await
+    .expect("working-diff count should resolve its native read dependencies");
     assert_eq!(working_diff.len(), 1);
     let active_account = observe_first(
         &replica,
-            "SELECT id, name FROM lix_account WHERE id = lix_active_account_id()",
+        "SELECT id, name FROM lix_account WHERE id = lix_active_account_id()",
         &[],
     )
-        .await
-        .expect("active-account read should hydrate over HTTP");
+    .await
+    .expect("active-account read should hydrate over HTTP");
     assert_eq!(active_account.len(), 1);
 
     let preview = observe_first(
         &replica,
-            "SELECT id, path, CASE WHEN OCTET_LENGTH(content) <= $1 THEN content END AS content, \
+        "SELECT id, path, CASE WHEN OCTET_LENGTH(content) <= $1 THEN content END AS content, \
              OCTET_LENGTH(content) AS size_bytes FROM lix_file \
              WHERE id IN ($2, $3) ORDER BY path",
-            &[
-                Value::Integer(32 * 1024),
-                Value::Text(large_id.into()),
-                Value::Text(small_id.into()),
-            ],
+        &[
+            Value::Integer(32 * 1024),
+            Value::Text(large_id.into()),
+            Value::Text(small_id.into()),
+        ],
     )
-        .await
-        .expect("bounded preview should fetch only eligible content over HTTP");
+    .await
+    .expect("bounded preview should fetch only eligible content over HTTP");
     assert_eq!(preview.len(), 2);
     let large = preview
         .rows()
@@ -1291,7 +1297,6 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
     authority.close().await.unwrap();
 }
 
-
 #[tokio::test]
 async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let backing = Memory::new();
@@ -1300,7 +1305,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     let mut checkpoint_ids = Vec::new();
-    for checkpoint in 0..9 {
+    for checkpoint in 0..12 {
         // Several commits between checkpoints expose multiple dependency layers.
         for edit in 0..3 {
             authority
@@ -1346,10 +1351,10 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let selected = checkpoint_ids
         .iter()
         .rev()
-        .take(7)
+        .take(10)
         .cloned()
         .collect::<Vec<_>>();
-    let placeholders = (2..=8)
+    let placeholders = (2..=11)
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -1377,8 +1382,8 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     };
     assert_eq!(
         expected.rows().len(),
-        21,
-        "seven real checkpoint diffs each contain three file writes"
+        30,
+        "ten real checkpoint diffs each contain three file writes"
     );
     assert!(
         expected
@@ -1473,7 +1478,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
                 }
             });
             let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
-            (replica, worker, storage, state, transport)
+            (replica, worker, storage, state, transport, engine)
         }
     };
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1488,7 +1493,12 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .filter(|r| {
             matches!(
                 r["operation"].as_str(),
-                Some("native-objects" | "native-object-range" | "native-metadata")
+                Some(
+                    "native-objects"
+                        | "native-object-range"
+                        | "native-metadata"
+                        | "native-metadata-walk"
+                )
             )
         })
         .count();
@@ -1530,7 +1540,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // one directory, so this exercises actual rows rather than an empty scan.
     let directory_sql = sql.replace("'lix_file'", "'lix_directory'");
     let directory_expected = authority.execute(&directory_sql, &params).await.unwrap();
-    assert_eq!(directory_expected.rows().len(), 7);
+    assert_eq!(directory_expected.rows().len(), 10);
     let directory_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (directory_replica, directory_worker, ..) = open_cold_replica(directory_log.clone()).await;
     directory_log.lock().unwrap().clear();
@@ -1622,6 +1632,85 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     historical.close().await.unwrap();
     historical_worker.abort();
 
+    // A local replica can move past the leased public head before querying
+    // older public History. The selected commit IDs still prove against that
+    // lease, so a private local anchor must not disable the immutable closure.
+    let advancing_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (advancing, advancing_worker, _, advancing_state, _, _) =
+        open_cold_replica(advancing_log.clone()).await;
+    advancing
+        .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+        .await
+        .unwrap();
+    advancing
+        .execute(
+            "INSERT INTO lix_file(path, content) VALUES ('/unpublished-history-anchor.txt', $1)",
+            &[Value::Blob(b"unpublished anchor".to_vec().into())],
+        )
+        .await
+        .unwrap();
+    let unpublished_anchor = advancing.create_checkpoint().await.unwrap().commit_id;
+    assert_ne!(
+        unpublished_anchor,
+        advancing_state.descriptor().selected_branch.head.commit_id,
+        "fixture must query from a newer local checkpoint than its immutable lease"
+    );
+    let advancing_params = std::iter::once(Value::Text(unpublished_anchor))
+        .chain(selected.iter().cloned().map(Value::Text))
+        .collect::<Vec<_>>();
+    advancing_log.lock().unwrap().clear();
+    let advancing_rows = advancing.execute(&sql, &advancing_params).await.unwrap();
+    assert_eq!(values(&advancing_rows), values(&expected));
+    let advancing_requests = fulfillment_requests(&advancing_log);
+    assert_eq!(
+        advancing_requests.len(),
+        1,
+        "ten public IDs behind an unpublished local anchor should fit one closure"
+    );
+    assert!(only_read_fulfillment(&advancing_log));
+    let physical_after_local_advance = advancing_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            matches!(
+                request["operation"].as_str(),
+                Some(
+                    "native-objects"
+                        | "native-object-range"
+                        | "native-metadata"
+                        | "native-metadata-walk"
+                )
+            )
+        })
+        .count();
+    assert_eq!(
+        physical_after_local_advance, 0,
+        "public History closure must not fall back to pointer reads after a local advance"
+    );
+    let serialized_history = advancing_requests[0]["request_interests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|interest| interest["kind"] == "history")
+        .expect("the bounded History recipe must be sent");
+    assert_eq!(
+        serialized_history["commit_ids"].as_array().unwrap().len(),
+        10
+    );
+    assert!(
+        serialized_history.get("anchor").is_none(),
+        "an unpublished local anchor must remain local to SQL planning"
+    );
+    advancing_log.lock().unwrap().clear();
+    assert_eq!(
+        values(&advancing.execute(&sql, &advancing_params).await.unwrap()),
+        values(&expected)
+    );
+    assert!(advancing_log.lock().unwrap().is_empty());
+    advancing.close().await.unwrap();
+    advancing_worker.abort();
+
     // A local checkpoint cannot be proved on the authority's leased lane.
     // Declining the optimization is normal protocol behavior: retain native
     // demand semantics without an HTTP error or repeated eligibility probes.
@@ -1639,7 +1728,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .await
         .unwrap();
     let private_checkpoint = private.create_checkpoint().await.unwrap().commit_id;
-    let private_sql = sql.replace("$8)", "$8, $9)");
+    let private_sql = sql.replace("$11) ORDER BY", "$11, $12) ORDER BY");
     let private_params = std::iter::once(Value::Text(private_checkpoint.clone()))
         .chain(selected.iter().cloned().map(Value::Text))
         .chain(std::iter::once(Value::Text(private_checkpoint.clone())))
@@ -1713,14 +1802,13 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // orders must allow canonical current-row recovery after private History
     // was found ineligible on the same leased basis.
     let mixed_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (mixed, mixed_worker, mixed_storage, mixed_state, mixed_transport) =
+    let (mixed, mixed_worker, mixed_storage, mixed_state, mixed_transport, _) =
         open_cold_replica(mixed_log.clone()).await;
     let capture = crate::hot_state::ReadInterestRegistry::new(16, 65536);
     capture
         .register(crate::hot_state::LogicalReadInterest::History {
             branch_id: mixed_state.descriptor().selected_branch.branch_id.clone(),
-            anchor: private_checkpoint,
-            commit_ids: selected.clone(),
+            commit_ids: vec![private_checkpoint.clone()],
             relation: "lix_file".into(),
             filter: crate::tracked_state::TrackedStateFilter {
                 include_tombstones: true,
@@ -1844,7 +1932,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // An oversized History selection must not suppress a separately scoped
     // current-row payload demand from the same operation capture.
     let overflow_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (overflow, overflow_worker, overflow_storage, overflow_state, overflow_transport) =
+    let (overflow, overflow_worker, overflow_storage, overflow_state, overflow_transport, _) =
         open_cold_replica(overflow_log.clone()).await;
     let overflow_capture = crate::hot_state::ReadInterestRegistry::new(16, 65536);
     let saved_interests = capture.snapshot().unwrap().interests;
@@ -1894,10 +1982,14 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
                     .clone(),
             ),
             relation: "lix_file".into(),
-            from: crate::hot_state::DiffInterestEndpoint::Fixed(match history_template.as_ref() {
-                crate::hot_state::LogicalReadInterest::History { anchor, .. } => anchor.clone(),
-                _ => unreachable!(),
-            }),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(
+                overflow_state
+                    .descriptor()
+                    .selected_branch
+                    .head
+                    .commit_id
+                    .clone(),
+            ),
             to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
             filter: crate::tracked_state::TrackedStateFilter::default(),
             retain_payloads: false,
@@ -2000,4 +2092,229 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     overflow.close().await.unwrap();
     overflow_worker.abort();
+
+    // Keep the old checkpoint chain above as unrelated cold history input,
+    // then expose a small active working diff with no new checkpoint. Use the
+    // server-owned engine for all authority reads and writes because the
+    // original authority handle has stale revision caches after server edits.
+    // Compare against the preexisting count so fixture setup cannot hide a
+    // change already present in the working set.
+    let working_diff_sql = "SELECT count(*) AS file_count FROM lix_diff('lix_file')";
+    let authority_working_count =
+        |result: &ExecuteResult| result.rows()[0].get::<i64>("file_count").unwrap();
+    let before_working_edits =
+        authority_execute(&server, authority.lix_id(), working_diff_sql, &[]).await;
+    let before_count = authority_working_count(&before_working_edits);
+    let new_working_edits = 3i64;
+    for edit in 0..new_working_edits {
+        authority_execute(
+            &server,
+            authority.lix_id(),
+            "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+            &[
+                Value::Text(format!("/bounded-working-diff/new-{edit}.txt")),
+                Value::Blob(format!("new active edit {edit}").into_bytes().into()),
+            ],
+        )
+        .await;
+    }
+    let authority_working =
+        authority_execute(&server, authority.lix_id(), working_diff_sql, &[]).await;
+    let expected_working_count = authority_working_count(&authority_working);
+    assert_eq!(
+        expected_working_count - before_count,
+        new_working_edits,
+        "fixture contributes exactly its known working-file delta"
+    );
+
+    let working_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (
+        working_replica,
+        working_worker,
+        _working_storage,
+        working_state,
+        working_transport,
+        working_engine,
+    ) = open_cold_replica(working_log.clone()).await;
+    working_log.lock().unwrap().clear();
+    let working_started = Instant::now();
+    let cold_working = working_replica
+        .execute(working_diff_sql, &[])
+        .await
+        .unwrap();
+    let cold_working_count = authority_working_count(&cold_working);
+    assert_eq!(cold_working_count, expected_working_count);
+    let working_requests = working_log.lock().unwrap().clone();
+    let working_recipes = fulfillment_requests(&working_log);
+    let working_pointer_calls = working_requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request["operation"].as_str(),
+                Some(
+                    "native-objects"
+                        | "native-object-range"
+                        | "native-metadata"
+                        | "native-metadata-walk"
+                )
+            )
+        })
+        .count();
+    eprintln!(
+        "BOUNDED_WORKING_DIFF_CLOSURE_PROFILE_JSON={}",
+        serde_json::json!({
+            "decoy_checkpoint_count": checkpoint_ids.len(),
+            "preexisting_working_count": before_count,
+            "fixture_working_delta": new_working_edits,
+            "expected_count": expected_working_count,
+            "cold_count": cold_working_count,
+            "cold_ms": working_started.elapsed().as_secs_f64() * 1000.0,
+            "fulfillment_calls": working_recipes.len(),
+            "pointer_calls": working_pointer_calls,
+            "requests": working_requests,
+        })
+    );
+    assert_eq!(
+        working_recipes.len(),
+        1,
+        "cold moving working diff should be discovered in one closure"
+    );
+    assert!(
+        only_read_fulfillment(&working_log),
+        "cold moving working diff should not fetch native pointers"
+    );
+    assert_eq!(working_pointer_calls, 0);
+    working_log.lock().unwrap().clear();
+    assert_eq!(
+        authority_working_count(
+            &working_replica
+                .execute(working_diff_sql, &[])
+                .await
+                .unwrap()
+        ),
+        expected_working_count
+    );
+    assert!(
+        working_log.lock().unwrap().is_empty(),
+        "retained working-diff closure should serve warm count offline"
+    );
+
+    // Keep the moving Diff interest retained while the authority advances its
+    // checkpoint and then starts a new active working set. The candidate must
+    // use the retained recipe to batch its immutable dependencies before the
+    // ordinary publication gate adopts the new descriptor.
+    let prior_cursor = working_state.descriptor().cursor;
+    authority_execute(
+        &server,
+        authority.lix_id(),
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+        &[],
+    )
+    .await;
+    let next_working_edits = 2i64;
+    for edit in 0..next_working_edits {
+        authority_execute(
+            &server,
+            authority.lix_id(),
+            "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+            &[
+                Value::Text(format!("/bounded-working-diff/next-{edit}.txt")),
+                Value::Blob(format!("next active edit {edit}").into_bytes().into()),
+            ],
+        )
+        .await;
+    }
+    let next_authority_working =
+        authority_execute(&server, authority.lix_id(), working_diff_sql, &[]).await;
+    let next_expected_count = authority_working_count(&next_authority_working);
+    assert_eq!(next_expected_count, next_working_edits);
+
+    working_log.lock().unwrap().clear();
+    let next_wrapper = working_transport
+        .partial_replica_descriptor(Some(&working_state.descriptor().selected_branch.branch_id))
+        .await
+        .unwrap();
+    assert!(next_wrapper.wire.descriptor.cursor > prior_cursor);
+    let next_cursor = next_wrapper.wire.descriptor.cursor;
+    let candidate_started = Instant::now();
+    let prepared = crate::sync::partial_reconcile::prepare_clean_descriptor(
+        working_engine.clone(),
+        working_state.clone(),
+        &working_transport,
+        next_wrapper,
+        crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
+    )
+    .await
+    .unwrap();
+    let crate::sync::partial_reconcile::PreparedDescriptor::Ready(prepared) = prepared else {
+        panic!("advanced authority head should produce a publishable candidate");
+    };
+    crate::sync::partial_publication::publish_prepared_partial(working_engine.clone(), prepared)
+        .await
+        .unwrap();
+    let adopted = working_engine
+        .sync_mode()
+        .partial_admission()
+        .expect("normal candidate publication keeps replica admission");
+    assert_eq!(adopted.descriptor().cursor, next_cursor);
+    let candidate_rows = working_replica
+        .execute(working_diff_sql, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        authority_working_count(&candidate_rows),
+        next_expected_count,
+        "retained moving candidate must expose the exact later working count"
+    );
+    let candidate_requests = working_log.lock().unwrap().clone();
+    let candidate_recipes = fulfillment_requests(&working_log);
+    let candidate_pointer_calls = candidate_requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request["operation"].as_str(),
+                Some(
+                    "native-objects"
+                        | "native-object-range"
+                        | "native-metadata"
+                        | "native-metadata-walk"
+                )
+            )
+        })
+        .count();
+    eprintln!(
+        "RETAINED_WORKING_DIFF_CANDIDATE_PROFILE_JSON={}",
+        serde_json::json!({
+            "candidate_ms": candidate_started.elapsed().as_secs_f64() * 1000.0,
+            "previous_cursor": prior_cursor,
+            "adopted_cursor": adopted.descriptor().cursor,
+            "decoy_checkpoint_count": checkpoint_ids.len(),
+            "expected_count": next_expected_count,
+            "fulfillment_calls": candidate_recipes.len(),
+            "pointer_calls": candidate_pointer_calls,
+            "requests": candidate_requests,
+        })
+    );
+    assert_eq!(
+        candidate_recipes.len(),
+        1,
+        "candidate moving working diff should batch into one closure"
+    );
+    assert_eq!(
+        candidate_pointer_calls, 0,
+        "candidate should not hydrate serial checkpoint deltas"
+    );
+    working_log.lock().unwrap().clear();
+    assert_eq!(
+        authority_working_count(
+            &working_replica
+                .execute(working_diff_sql, &[])
+                .await
+                .unwrap()
+        ),
+        next_expected_count
+    );
+    assert!(working_log.lock().unwrap().is_empty());
+    working_replica.close().await.unwrap();
+    working_worker.abort();
 }
