@@ -12,8 +12,8 @@ use crate::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = MAX_INPUT_BYTES.div_ceil(3) * 4 + 2 * 1024 * 1024;
@@ -30,6 +30,31 @@ const MARKER: &str = "readFulfillment";
 
 fn invalid(message: &str) -> LixError {
     LixError::new("LIX_READ_FULFILLMENT_INVALID", message)
+}
+
+pub(crate) fn history_recipes_within_budget<'a>(
+    interests: impl IntoIterator<Item = &'a LogicalReadInterest>,
+) -> bool {
+    let mut recipes = 0usize;
+    let mut selected_ids = 0usize;
+    for interest in interests {
+        if let LogicalReadInterest::History { commit_ids, .. } = interest {
+            let Some(next_recipes) = recipes.checked_add(1) else {
+                return false;
+            };
+            let Some(next_selected_ids) = selected_ids.checked_add(commit_ids.len()) else {
+                return false;
+            };
+            recipes = next_recipes;
+            selected_ids = next_selected_ids;
+            if recipes > crate::hot_state::MAX_HISTORY_RECIPE_COUNT
+                || selected_ids > crate::hot_state::MAX_HISTORY_RECIPE_SELECTED_IDS
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -249,12 +274,7 @@ pub(crate) fn annotate_capture(
     mut error: LixError,
     capture: Option<&ReadInterestRegistry>,
 ) -> LixError {
-    if error.automatic_retry_is_forbidden()
-        || error
-            .details
-            .as_ref()
-            .is_some_and(|d| d.get("nativeHistoryDemand").is_some())
-    {
+    if error.automatic_retry_is_forbidden() {
         return error;
     }
     let Some(capture) = capture else {
@@ -264,27 +284,70 @@ pub(crate) fn annotate_capture(
         Ok(snapshot) => snapshot,
         Err(error) => return error,
     };
-    if snapshot.interests.is_empty()
-        || snapshot
-            .interests
-            .iter()
-            .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }))
+    let has_bounded_history = snapshot
+        .interests
+        .iter()
+        .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::History { .. }));
+    if error
+        .details
+        .as_ref()
+        .is_some_and(|d| d.get("nativeHistoryDemand").is_some())
+        && !has_bounded_history
+        && selected_change_payload_locator(&error).is_none()
     {
-        // Historical diffs may name local pending commits. Their specialized
-        // demand path owns those endpoints; the authority cannot replay the
-        // client's private history as an admitted current-state recipe.
         return error;
     }
-    if snapshot.serialized_bytes > MAX_RECIPE_BYTES {
+    if snapshot.interests.is_empty() {
+        return error;
+    }
+    let has_diff = snapshot
+        .interests
+        .iter()
+        .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }));
+    let history_over_budget =
+        !history_recipes_within_budget(snapshot.interests.iter().map(|interest| interest.as_ref()));
+    let salvage_current_recipes = has_diff || history_over_budget;
+    if salvage_current_recipes && selected_change_payload_locator(&error).is_none() {
+        // Historical diffs may name local pending commits. Their specialized
+        // demand path owns those endpoints; over-budget History has the same
+        // native-demand behavior. Neither can be replayed as an admitted
+        // current-state recipe without a selected payload locator.
+        return error;
+    }
+    let interests: Vec<_> = if salvage_current_recipes {
+        // Historical recipes cannot authorize a current mutable payload.
+        // When the native miss identifies that payload exactly, retain only
+        // independent current recipes; the historical miss stays native.
+        snapshot
+            .interests
+            .iter()
+            .filter(|interest| {
+                !matches!(
+                    interest.as_ref(),
+                    LogicalReadInterest::History { .. } | LogicalReadInterest::Diff { .. }
+                )
+            })
+            .map(|interest| interest.as_ref())
+            .collect()
+    } else {
+        snapshot
+            .interests
+            .iter()
+            .map(|interest| interest.as_ref())
+            .collect()
+    };
+    if interests.is_empty() || interests.len() > 4096 {
+        return error;
+    }
+    let serialized_interests = match serde_json::to_vec(&interests) {
+        Ok(serialized) => serialized,
+        Err(_) => return invalid("invalid read operation recipes"),
+    };
+    if serialized_interests.len() > MAX_RECIPE_BYTES {
         return invalid("read operation recipe byte limit exceeded");
     }
     // Keep the native missing diagnostic intact for corruption handling and
     // pinned transaction admission. Failed captures are never published.
-    let interests: Vec<_> = snapshot
-        .interests
-        .iter()
-        .map(|value| value.as_ref())
-        .collect();
     let details = error
         .details
         .get_or_insert_with(|| Box::new(serde_json::json!({})));
@@ -411,6 +474,100 @@ pub(crate) struct ReadFulfillmentResponse {
     pub(crate) profile: DiscoveryProfile,
     pub(crate) closure_digest: String,
     pub(crate) continuation: Option<ReadContinuation>,
+    pub(crate) outcome: ReadFulfillmentOutcome,
+}
+
+/// A successful, authenticated indication that this exact leased basis is
+/// outside the bounded public-history closure. The client still performs its
+/// original native-demand read; this outcome carries no coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReadFulfillmentOutcome {
+    Complete,
+    HistoryFallback,
+}
+
+const MAX_HISTORY_FALLBACK_BASIS_MEMO: usize = 128;
+static HISTORY_FALLBACK_BASIS_MEMO: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn history_fallback_basis(request: &ReadFulfillmentRequest) -> Result<Option<String>, LixError> {
+    let history = request
+        .interests
+        .iter()
+        .filter(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+        .collect::<Vec<_>>();
+    if history.is_empty() {
+        return Ok(None);
+    }
+    let basis = serde_json::json!({
+        "epochId": &request.epoch_id,
+        "descriptor": &request.descriptor,
+        "history": history,
+    });
+    Ok(Some(
+        blake3::hash(&serde_json::to_vec(&basis).map_err(|_| invalid("invalid history basis"))?)
+            .to_hex()
+            .to_string(),
+    ))
+}
+
+pub(crate) fn history_recipe_is_ineligible(
+    request: &ReadFulfillmentRequest,
+) -> Result<bool, LixError> {
+    let Some(basis) = history_fallback_basis(request)? else {
+        return Ok(false);
+    };
+    let memo = HISTORY_FALLBACK_BASIS_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
+    Ok(memo
+        .lock()
+        .map_err(|_| invalid("history eligibility memo poisoned"))?
+        .contains(&basis))
+}
+
+/// Build the narrow current-row recovery request after a History recipe has
+/// been proven ineligible for this leased basis. Only operation-local current
+/// recipes remain, and the selected canonical locator is the sole required
+/// input; private historical frontiers are never forwarded to authority.
+pub(crate) fn current_payload_request_after_history_fallback(
+    request: &ReadFulfillmentRequest,
+    locator: &NativeMetadataRef,
+) -> Option<ReadFulfillmentRequest> {
+    if !matches!(locator, NativeMetadataRef::ChangeLocator(_))
+        || !request
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+    {
+        return None;
+    }
+    let mut current = request.clone();
+    current
+        .interests
+        .retain(|interest| !matches!(interest, LogicalReadInterest::History { .. }));
+    if current.interests.is_empty() {
+        return None;
+    }
+    current.required = vec![ReadInputAddress::Metadata(locator.clone())];
+    current.continuation = None;
+    Some(current)
+}
+
+pub(crate) fn remember_history_recipe_ineligible(
+    request: &ReadFulfillmentRequest,
+) -> Result<(), LixError> {
+    let Some(basis) = history_fallback_basis(request)? else {
+        return Ok(());
+    };
+    let memo = HISTORY_FALLBACK_BASIS_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut memo = memo
+        .lock()
+        .map_err(|_| invalid("history eligibility memo poisoned"))?;
+    memo.retain(|existing| existing != &basis);
+    memo.push_back(basis);
+    while memo.len() > MAX_HISTORY_FALLBACK_BASIS_MEMO {
+        memo.pop_front();
+    }
+    Ok(())
 }
 mod payload {
     use super::*;
@@ -485,7 +642,7 @@ impl ReadFulfillmentRequest {
         {
             return Err(invalid("invalid read fulfillment request"));
         }
-        // Historical endpoints may name private or unleased commits. Their
+        // Arbitrary diff endpoints may name private or unleased commits. Their
         // specialized discovery protocol owns that scope; do not accept them
         // merely because the foreground capture normally filters them out.
         if self
@@ -494,6 +651,46 @@ impl ReadFulfillmentRequest {
             .any(|interest| matches!(interest, LogicalReadInterest::Diff { .. }))
         {
             return Err(invalid("historical diff recipes require history discovery"));
+        }
+        if !history_recipes_within_budget(&self.interests) {
+            return Err(invalid("aggregate bounded-history recipe limit exceeded"));
+        }
+        for interest in &self.interests {
+            if let LogicalReadInterest::History {
+                branch_id,
+                anchor,
+                commit_ids,
+                relation,
+                filter,
+                retain_payloads,
+                projected_columns,
+                limit,
+                ..
+            } = interest
+            {
+                if branch_id != &self.descriptor.selected_branch.branch_id
+                    || limit.is_some()
+                    || commit_ids.is_empty()
+                    || commit_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS
+                    || !matches!(relation.as_str(), "lix_file" | "lix_directory")
+                    || !canonical_commit_id(anchor)?.has_canonical_text(anchor)
+                {
+                    return Err(invalid("invalid bounded history recipe scope"));
+                }
+                let mut seen = BTreeSet::new();
+                for commit_id in commit_ids {
+                    let parsed = canonical_commit_id(commit_id)?;
+                    if !parsed.has_canonical_text(commit_id) || !seen.insert(parsed) {
+                        return Err(invalid("invalid bounded history commit selection"));
+                    }
+                }
+                crate::sql2::validate_bounded_history_recipe_shape(
+                    relation,
+                    filter,
+                    projected_columns,
+                    *retain_payloads,
+                )?;
+            }
         }
         for interest in &self.interests {
             let selected_branch_id = self.descriptor.selected_branch.branch_id.as_str();
@@ -521,6 +718,7 @@ impl ReadFulfillmentRequest {
                 LogicalReadInterest::Diff { branch_id, .. } => {
                     branch_id.as_deref().is_none_or(branch_is_in_descriptor)
                 }
+                LogicalReadInterest::History { branch_id, .. } => branch_id == selected_branch_id,
             };
             if !branch_scope_is_in_descriptor {
                 return Err(invalid(
@@ -1179,15 +1377,38 @@ async fn discover_with_read(
         serialized_bytes: 0,
         interests: request.interests.iter().cloned().map(Arc::new).collect(),
     };
-    let logical_inputs = super::read_interest_prepare::prepare_native_read_interests_authority(
-        scoped,
-        &request.descriptor,
-        &interests,
-        account,
-        hot,
-        blobs.clone(),
-    )
-    .await?;
+    let logical_inputs =
+        match super::read_interest_prepare::prepare_native_read_interests_authority(
+            scoped,
+            &request.descriptor,
+            &interests,
+            account,
+            hot,
+            blobs.clone(),
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(error)
+                if error.code == "LIX_HISTORY_RECIPE_FALLBACK"
+                    && request.interests.iter().any(|interest| {
+                        matches!(interest, LogicalReadInterest::History { .. })
+                    }) =>
+            {
+                let inputs = Vec::new();
+                return Ok(ReadFulfillmentResponse {
+                    lix_id: repository.into(),
+                    epoch_id: request.epoch_id.clone(),
+                    request_digest: request.digest()?,
+                    closure_digest: input_digest(request, &inputs)?,
+                    inputs,
+                    profile: DiscoveryProfile::default(),
+                    continuation: None,
+                    outcome: ReadFulfillmentOutcome::HistoryFallback,
+                });
+            }
+            Err(error) => return Err(error),
+        };
     // Some immutable metadata addresses are canonical derivations rather than
     // physical rows (notably direct ChangeLocator values). Merge those typed
     // inputs into the same observation map as physical reads so one operation
@@ -1279,6 +1500,7 @@ async fn discover_with_read(
         profile,
         closure_digest: closure_digest.clone(),
         continuation: None,
+        outcome: ReadFulfillmentOutcome::Complete,
     };
     validate_complete(request, &response)?;
     let start = if let Some(cursor) = &request.continuation {
@@ -1345,6 +1567,20 @@ pub(crate) fn validate_response(
         return Err(invalid(
             "read fulfillment belongs to another request or exceeds its bound",
         ));
+    }
+    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
+        if !request
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+            || request.continuation.is_some()
+            || !response.inputs.is_empty()
+            || response.continuation.is_some()
+            || input_digest(request, &response.inputs)? != response.closure_digest
+        {
+            return Err(invalid("invalid bounded-history fallback page"));
+        }
+        return Ok(());
     }
     let mut bytes = 0usize;
     let mut seen = BTreeSet::new();
@@ -1545,6 +1781,9 @@ fn scan_recipe_selects_change_candidate_identity(
                 _ => true,
             }
         }
+        // Historical recipes currently authorize immutable native inputs
+        // only. They do not mint mutable CHANGE_SPACE row-selection proofs.
+        LogicalReadInterest::History { .. } => false,
         _ => false,
     }
 }
@@ -2112,6 +2351,7 @@ fn payload_recipe_mask(interests: &[LogicalReadInterest]) -> u16 {
             LogicalReadInterest::CollectionGeneration { .. } => 32,
             LogicalReadInterest::PackedIdentityMembership { .. } => 64,
             LogicalReadInterest::Diff { .. } => 128,
+            LogicalReadInterest::History { .. } => 256,
         }
     })
 }
@@ -2130,6 +2370,18 @@ fn validate_complete(
         return Err(invalid(
             "read fulfillment closure is incomplete or mismatched",
         ));
+    }
+    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
+        if request.continuation.is_none()
+            && response.inputs.is_empty()
+            && request
+                .interests
+                .iter()
+                .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+        {
+            return Ok(());
+        }
+        return Err(invalid("invalid bounded-history fallback response"));
     }
     let mut bytes = 0usize;
     let mut seen = BTreeSet::new();
@@ -2253,6 +2505,10 @@ pub(super) async fn fetch<C: super::http::RawHttpClient>(
 ) -> Result<ReadFulfillmentResponse, LixError> {
     let mut page_request = request.clone();
     let mut response = transport.fulfill_read(&page_request).await?;
+    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
+        validate_complete(request, &response)?;
+        return Ok(response);
+    }
     let mut payload_bytes = response
         .inputs
         .iter()
@@ -2265,6 +2521,9 @@ pub(super) async fn fetch<C: super::http::RawHttpClient>(
         };
         page_request.continuation = Some(next);
         let page = transport.fulfill_read(&page_request).await?;
+        if page.outcome != ReadFulfillmentOutcome::Complete {
+            return Err(invalid("read fulfillment page changed its outcome"));
+        }
         payload_bytes = payload_bytes.saturating_add(
             page.inputs
                 .iter()
@@ -2288,6 +2547,11 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
     request: &ReadFulfillmentRequest,
     response: &ReadFulfillmentResponse,
 ) -> Result<super::runtime::HydratedInputs, LixError> {
+    if response.outcome != ReadFulfillmentOutcome::Complete {
+        return Err(invalid(
+            "bounded-history fallback cannot be installed as read coverage",
+        ));
+    }
     validate_complete(request, response)?;
     if request.epoch_id != state.epoch_id() || request.descriptor != *state.descriptor() {
         return Err(invalid("read fulfillment basis changed"));
@@ -2905,9 +3169,130 @@ mod tests {
             inputs,
             profile: Default::default(),
             continuation: None,
+            outcome: ReadFulfillmentOutcome::Complete,
         };
         authority.close().await.unwrap();
         (request, response)
+    }
+
+    #[tokio::test]
+    async fn bounded_history_fallback_is_typed_and_memoized_only_for_its_basis() {
+        let (mut request, _) = fixture().await;
+        let branch = &request.descriptor.selected_branch;
+        request.interests = vec![LogicalReadInterest::History {
+            branch_id: branch.branch_id.clone(),
+            anchor: branch.head.commit_id.clone(),
+            commit_ids: vec![branch.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: Vec::new(),
+            limit: None,
+        }];
+        request.validate(&request.descriptor.lix_id).unwrap();
+
+        let empty = Vec::new();
+        let mut response = ReadFulfillmentResponse {
+            lix_id: request.descriptor.lix_id.clone(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest().unwrap(),
+            closure_digest: input_digest(&request, &empty).unwrap(),
+            inputs: empty,
+            profile: Default::default(),
+            continuation: None,
+            outcome: ReadFulfillmentOutcome::HistoryFallback,
+        };
+        validate_complete(&request, &response).unwrap();
+        validate_response(&request, &response).unwrap();
+        assert!(!history_recipe_is_ineligible(&request).unwrap());
+        remember_history_recipe_ineligible(&request).unwrap();
+        assert!(history_recipe_is_ineligible(&request).unwrap());
+
+        let mut same_recipe_different_frontier = request.clone();
+        same_recipe_different_frontier
+            .required
+            .push(ReadInputAddress::Metadata(
+                NativeMetadataRef::CommitGraphRecord(
+                    request.descriptor.selected_branch.head.commit_id.clone(),
+                ),
+            ));
+        assert!(history_recipe_is_ineligible(&same_recipe_different_frontier).unwrap());
+
+        let mut changed_basis = request.clone();
+        changed_basis.descriptor.cursor += 1;
+        assert!(!history_recipe_is_ineligible(&changed_basis).unwrap());
+
+        let current_interest = LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![request.descriptor.selected_branch.branch_id.clone()],
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        };
+        let locator = NativeMetadataRef::ChangeLocator(uuid::Uuid::now_v7().to_string());
+        let mut mixed = request.clone();
+        mixed.interests.push(current_interest.clone());
+        let current_only = current_payload_request_after_history_fallback(&mixed, &locator)
+            .expect("current recipe remains eligible after private History fallback");
+        assert_eq!(current_only.descriptor, mixed.descriptor);
+        assert_eq!(current_only.epoch_id, mixed.epoch_id);
+        assert_eq!(current_only.interests, vec![current_interest]);
+        assert_eq!(
+            current_only.required,
+            vec![ReadInputAddress::Metadata(locator.clone())]
+        );
+        assert!(current_only.continuation.is_none());
+        assert!(current_payload_request_after_history_fallback(&request, &locator).is_none());
+
+        response.inputs.push(ReadInput {
+            address: ReadInputAddress::BlobChunk([7; 32]),
+            bytes: b"not coverage".to_vec(),
+        });
+        response.closure_digest = input_digest(&request, &response.inputs).unwrap();
+        assert!(validate_complete(&request, &response).is_err());
+        assert!(validate_response(&request, &response).is_err());
+        response.inputs.clear();
+        response.closure_digest = input_digest(&request, &response.inputs).unwrap();
+        response.continuation = Some(ReadContinuation {
+            next_input: 1,
+            closure_digest: response.closure_digest.clone(),
+        });
+        assert!(validate_complete(&request, &response).is_err());
+        assert!(validate_response(&request, &response).is_err());
+        response.continuation = None;
+        let mut paged_request = request.clone();
+        paged_request.continuation = Some(ReadContinuation {
+            next_input: 1,
+            closure_digest: response.closure_digest.clone(),
+        });
+        response.request_digest = paged_request.digest().unwrap();
+        assert!(validate_response(&paged_request, &response).is_err());
+
+        let mut non_history_request = request.clone();
+        non_history_request.interests = vec![LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![request.descriptor.selected_branch.branch_id.clone()],
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        }];
+        let non_history_fallback = ReadFulfillmentResponse {
+            lix_id: non_history_request.descriptor.lix_id.clone(),
+            epoch_id: non_history_request.epoch_id.clone(),
+            request_digest: non_history_request.digest().unwrap(),
+            closure_digest: input_digest(&non_history_request, &[]).unwrap(),
+            inputs: Vec::new(),
+            profile: Default::default(),
+            continuation: None,
+            outcome: ReadFulfillmentOutcome::HistoryFallback,
+        };
+        assert!(validate_response(&non_history_request, &non_history_fallback).is_err());
     }
 
     #[test]
@@ -3751,13 +4136,200 @@ mod tests {
             relation: "lix_state_diff".into(),
             from: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
             to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
-            filter: Default::default(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
             retain_payloads: true,
             projected_columns: vec![],
             limit: None,
         }];
         let error = request.validate(&request.descriptor.lix_id).unwrap_err();
         assert!(error.to_string().contains("historical diff recipes"));
+    }
+
+    #[tokio::test]
+    async fn fulfillment_accepts_only_bounded_leased_history_recipes() {
+        let (mut request, _) = fixture().await;
+        let selected_branch = request.descriptor.selected_branch.branch_id.clone();
+        let anchor = request.descriptor.selected_branch.head.commit_id.clone();
+        let recipe = || LogicalReadInterest::History {
+            branch_id: selected_branch.clone(),
+            anchor: anchor.clone(),
+            commit_ids: vec![uuid::Uuid::now_v7().to_string()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+
+        request.interests = vec![recipe()];
+        request.validate(&request.descriptor.lix_id).unwrap();
+
+        let mut too_many_recipes = request.clone();
+        too_many_recipes.interests = (0..=crate::hot_state::MAX_HISTORY_RECIPE_COUNT)
+            .map(|_| recipe())
+            .collect();
+        assert!(
+            too_many_recipes
+                .validate(&too_many_recipes.descriptor.lix_id)
+                .is_err()
+        );
+
+        let mut too_many_selected_ids = request.clone();
+        too_many_selected_ids.interests = (0..5)
+            .map(|_| {
+                let mut interest = recipe();
+                let LogicalReadInterest::History { commit_ids, .. } = &mut interest else {
+                    unreachable!();
+                };
+                *commit_ids = (0..13).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+                interest
+            })
+            .collect();
+        assert!(
+            too_many_selected_ids
+                .validate(&too_many_selected_ids.descriptor.lix_id)
+                .is_err()
+        );
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { commit_ids, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        commit_ids.clear();
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { commit_ids, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        *commit_ids = (0..17).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { commit_ids, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        let selected_id = commit_ids[0].clone();
+        commit_ids.push(selected_id);
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { commit_ids, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        commit_ids[0] = "not-a-commit".into();
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { branch_id, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        *branch_id = request.descriptor.global_branch.branch_id.clone();
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { limit, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        *limit = Some(1);
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History {
+            projected_columns, ..
+        } = &mut invalid.interests[0]
+        else {
+            unreachable!();
+        };
+        projected_columns.push("private_unknown_column".into());
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter.file_ids.push(crate::NullableKeyFilter::Any);
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History {
+            projected_columns, ..
+        } = &mut invalid.interests[0]
+        else {
+            unreachable!();
+        };
+        let column = projected_columns[0].clone();
+        projected_columns.push(column);
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History {
+            retain_payloads, ..
+        } = &mut invalid.interests[0]
+        else {
+            unreachable!();
+        };
+        *retain_payloads = true;
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter.include_tombstones = false;
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter.row_pk_lower = Some(crate::tracked_state::RowPkRangeBound {
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(&uuid::Uuid::now_v7().to_string())
+                .unwrap(),
+            inclusive: true,
+        });
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter
+            .row_pks
+            .push(crate::row_pk::RowPk::single("not-a-uuid"));
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter
+            .file_ids
+            .push(crate::NullableKeyFilter::Value("not-a-uuid".into()));
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { filter, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        filter.file_ids = (0..=crate::hot_state::MAX_HISTORY_RECIPE_IDENTITIES)
+            .map(|_| crate::NullableKeyFilter::Value(uuid::Uuid::now_v7().to_string()))
+            .collect();
+        filter.file_ids.push(crate::NullableKeyFilter::Null);
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
+
+        let mut invalid = request.clone();
+        let LogicalReadInterest::History { relation, .. } = &mut invalid.interests[0] else {
+            unreachable!();
+        };
+        *relation = "lix_key_value".into();
+        assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
     }
 
     #[tokio::test]
@@ -3913,6 +4485,174 @@ mod tests {
         assert_eq!(details["nativeReadRecipeCount"], serde_json::json!(1));
         assert_eq!(details["nativeReadRecipeMask"], serde_json::json!(16));
         assert!(details.get("readFulfillment").is_some());
+    }
+
+    #[test]
+    fn overbudget_history_capture_keeps_the_original_native_demand() {
+        let make_history = || LogicalReadInterest::History {
+            branch_id: "branch".into(),
+            anchor: uuid::Uuid::now_v7().to_string(),
+            commit_ids: vec![uuid::Uuid::now_v7().to_string()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+
+        let capture = ReadInterestRegistry::new(16, 4096);
+        for _ in 0..=crate::hot_state::MAX_HISTORY_RECIPE_COUNT {
+            capture.register(make_history()).unwrap();
+        }
+        let error = LixError::new(LixError::CODE_INTERNAL_ERROR, "native history is missing")
+            .with_details(serde_json::json!({
+                "nativeHistoryDemand": {"kind": "history"},
+                "kept": "original diagnostic"
+            }));
+        let annotated = annotate_capture(error, Some(&capture));
+        assert_eq!(annotated.code, LixError::CODE_INTERNAL_ERROR);
+        let details = annotated.details.as_ref().unwrap();
+        assert_eq!(details["kept"], "original diagnostic");
+        assert!(details.get("nativeHistoryDemand").is_some());
+        assert!(details.get(MARKER).is_none());
+        assert!(interests_for_error(&annotated).unwrap().is_none());
+
+        let boundary = (0..crate::hot_state::MAX_HISTORY_RECIPE_COUNT)
+            .map(|_| {
+                let mut interest = make_history();
+                let LogicalReadInterest::History { commit_ids, .. } = &mut interest else {
+                    unreachable!();
+                };
+                *commit_ids = (0..crate::hot_state::MAX_HISTORY_RECIPE_SELECTED_IDS
+                    / crate::hot_state::MAX_HISTORY_RECIPE_COUNT)
+                    .map(|_| uuid::Uuid::now_v7().to_string())
+                    .collect();
+                interest
+            })
+            .collect::<Vec<_>>();
+        assert!(history_recipes_within_budget(&boundary));
+    }
+
+    #[test]
+    fn overbudget_history_keeps_current_recipe_for_selected_payload_recovery() {
+        let capture = ReadInterestRegistry::new(32, 64 * 1024);
+        for _ in 0..=crate::hot_state::MAX_HISTORY_RECIPE_COUNT {
+            capture
+                .register(LogicalReadInterest::History {
+                    branch_id: "branch".into(),
+                    anchor: uuid::Uuid::now_v7().to_string(),
+                    commit_ids: vec![uuid::Uuid::now_v7().to_string()],
+                    relation: "lix_file".into(),
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    retain_payloads: false,
+                    projected_columns: vec!["id".into()],
+                    limit: None,
+                })
+                .unwrap();
+        }
+        capture
+            .register(LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_key_value".into()],
+                        branch_ids: vec!["branch".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                domain: InterestDomain::Tracked,
+            })
+            .unwrap();
+
+        let change_id = uuid::Uuid::now_v7().to_string();
+        let error = LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected change payload is unavailable",
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "changeId": change_id,
+            "nativeHistoryDemand": {"version": 1}
+        }));
+        let annotated = annotate_capture(error, Some(&capture));
+        let interests = interests_for_error(&annotated)
+            .unwrap()
+            .expect("current recipe should be retained for payload recovery");
+
+        assert_eq!(interests.len(), 1);
+        assert!(matches!(interests[0], LogicalReadInterest::Scan { .. }));
+        let details = annotated.details.as_ref().unwrap();
+        assert!(details.get("nativeHistoryDemand").is_some());
+        assert_eq!(details["nativeReadRecipeCount"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn diff_capture_keeps_current_recipe_only_for_selected_payload_recovery() {
+        let scan = || LogicalReadInterest::Scan {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec!["lix_key_value".into()],
+                    branch_ids: vec!["branch".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            domain: InterestDomain::Tracked,
+        };
+        let diff = || LogicalReadInterest::Diff {
+            branch_id: Some("branch".into()),
+            relation: "lix_key_value".into(),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(
+                uuid::Uuid::now_v7().to_string(),
+            ),
+            to: crate::hot_state::DiffInterestEndpoint::Fixed(
+                uuid::Uuid::now_v7().to_string(),
+            ),
+            filter: crate::tracked_state::TrackedStateFilter::default(),
+            retain_payloads: false,
+            projected_columns: vec!["key".into()],
+            limit: None,
+        };
+        let missing_payload = || {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected change payload is unavailable",
+            )
+            .with_details(serde_json::json!({
+                "payloadFailureReason": "selected_change_payload_unavailable",
+                "changeId": uuid::Uuid::now_v7().to_string(),
+                "nativeHistoryDemand": {"version": 1},
+            }))
+        };
+
+        let mixed = ReadInterestRegistry::new(8, 16 * 1024);
+        mixed.register(diff()).unwrap();
+        mixed.register(scan()).unwrap();
+        let annotated = annotate_capture(missing_payload(), Some(&mixed));
+        let interests = interests_for_error(&annotated)
+            .unwrap()
+            .expect("current recipe should survive a selected payload miss");
+        assert_eq!(interests.len(), 1);
+        assert!(matches!(interests[0], LogicalReadInterest::Scan { .. }));
+        assert!(annotated
+            .details
+            .as_ref()
+            .is_some_and(|details| details.get("nativeHistoryDemand").is_some()));
+
+        let diff_only = ReadInterestRegistry::new(8, 16 * 1024);
+        diff_only.register(diff()).unwrap();
+        let annotated = annotate_capture(missing_payload(), Some(&diff_only));
+        assert!(annotated
+            .details
+            .as_ref()
+            .is_none_or(|details| details.get(MARKER).is_none()));
+        assert!(interests_for_error(&annotated).unwrap().is_none());
     }
 
     #[test]
@@ -4394,6 +5134,39 @@ mod tests {
         let error = validate_complete(&wrong_recipe, &wrong_response)
             .expect_err("a payload for a different row must not be authorized by the scan");
         assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("payloadFailureReason")),
+            Some(&serde_json::json!(
+                "selected_change_payload_recipe_mismatch"
+            )),
+        );
+
+        // A valid History recipe authenticates only its immutable native
+        // dependency closure. It cannot be used as a wildcard authority for
+        // otherwise valid mutable ChangeRecord payloads.
+        let mut history_only = request.clone();
+        history_only.interests = vec![LogicalReadInterest::History {
+            branch_id: leased.descriptor.selected_branch.branch_id.clone(),
+            anchor: leased.descriptor.selected_branch.head.commit_id.clone(),
+            commit_ids: vec![leased.descriptor.selected_branch.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        }];
+        let mut history_response = response.clone();
+        history_response.request_digest = history_only.digest().unwrap();
+        history_response.closure_digest =
+            input_digest(&history_only, &history_response.inputs).unwrap();
+        let error = validate_complete(&history_only, &history_response)
+            .expect_err("History must not authorize mutable row payloads");
         assert_eq!(
             error
                 .details
@@ -4905,6 +5678,7 @@ mod tests {
             inputs,
             profile: Default::default(),
             continuation: None,
+            outcome: ReadFulfillmentOutcome::Complete,
         };
 
         install(&storage, &state, &request, &response)

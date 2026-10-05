@@ -417,7 +417,7 @@ paths:
       - $ref: "#/components/parameters/ReplicaId"
     post:
       operationId: syncReadFulfillment
-      description: Executes the submitted typed read interests once against the admitted descriptor roots and returns verified immutable native inputs. The request is limited to 528 KiB (512 KiB recipes plus a bounded descriptor). Responses page at 4 MiB, except that one native input may be up to 64 MiB; a closure is limited to 256 MiB, 16384 inputs, 65536 storage calls, and 1 GiB of authority reads. The closure digest binds every page. Returned inputs warm local state and do not certify absence or result membership.
+      description: Executes the submitted typed read interests once against the admitted descriptor roots and returns verified native dependencies. The request is limited to 528 KiB (512 KiB recipes plus a bounded descriptor). Responses page at 4 MiB, except that one native input may be up to 64 MiB; a closure is limited to 256 MiB, 16384 inputs, 65536 storage calls, and 1 GiB of authority reads. The closure digest binds every page. Returned inputs warm local state and do not certify absence or result membership. Bounded file and directory History recipes share limits of 8 recipes, 64 selected commit IDs, and 4096 ancestry-node loads. Unprovable or excessive ancestry work returns an empty history_fallback outcome; clients continue native hydration without installing read coverage.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -427,7 +427,7 @@ paths:
         content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentRequest" } } }
       responses:
         "200":
-          description: Immutable typed inputs observed while evaluating all submitted interests at the admitted roots.
+          description: Verified typed dependencies observed at the admitted roots, or an empty history_fallback response with no coverage.
           content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentResponse" } } }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/native-metadata-walk:
@@ -1003,7 +1003,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 26 }
+      schema: { type: integer, const: 27 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1061,7 +1061,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 26 }
+        syncProtocolVersion: { type: integer, const: 27 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1630,8 +1630,11 @@ components:
           minItems: 1
           maxItems: 32
           uniqueItems: true
-          description: Typed immutable inputs required by the first missing native frontier. The authority verifies and returns every item before evaluating recipes.
-          items: { $ref: "#/components/schemas/ReadInputAddress" }
+          description: Typed immutable inputs required by the first missing native frontier. A complete response returns every item; history_fallback grants no coverage and leaves this frontier for native hydration.
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/ReadInputAddress" }
+              - not: { properties: { kind: { const: change_record } } }
         continuation:
           oneOf:
             - { $ref: "#/components/schemas/ReadContinuation" }
@@ -1650,8 +1653,8 @@ components:
       properties:
         kind:
           type: string
-          enum: [filesystem_metadata, file_content, collection_generation, packed_identity_membership, filesystem_paths, scan, exact]
-      description: Tagged native read recipe. Variant fields are the canonical serialized LogicalReadInterest fields; unknown fields are rejected by the implementation.
+          enum: [filesystem_metadata, file_content, collection_generation, packed_identity_membership, filesystem_paths, scan, exact, history]
+      description: Tagged native read recipe. Variant fields are the canonical serialized LogicalReadInterest fields; unknown fields are rejected by the implementation. History supports only lix_file and lix_directory on the leased selected branch, a canonical fixed anchor and at most 16 distinct canonical commit_ids per recipe. Filters, projections and payload retention must match the supported native route. Historical dependencies grant no mutable change-record authority.
     ReadInputAddress:
       oneOf:
         - type: object
@@ -1670,6 +1673,25 @@ components:
           additionalProperties: false
           required: [kind, address]
           properties:
+            kind: { type: string, const: change_record }
+            address:
+              type: object
+              additionalProperties: false
+              required: [change_id, source_commit_id, branch_id, schema_key, file_id, row_pk, updated_at, payload_digest]
+              description: Canonical mutable changelog dependency paired with its selected source locator and authorized physical candidate identity. History recipes cannot authorize this variant, and it is forbidden in the required immutable frontier.
+              properties:
+                change_id: { type: string, format: uuid }
+                source_commit_id: { type: string, format: uuid }
+                branch_id: { type: string, format: uuid }
+                schema_key: { type: string }
+                file_id: { type: [string, "null"], format: uuid }
+                row_pk: { $ref: "#/components/schemas/SyncRowPk" }
+                updated_at: { type: string, format: date-time }
+                payload_digest: { $ref: "#/components/schemas/NativeDigest" }
+        - type: object
+          additionalProperties: false
+          required: [kind, address]
+          properties:
             kind: { type: string, const: blob_manifest }
             address: { $ref: "#/components/schemas/NativeDigest" }
         - type: object
@@ -1684,7 +1706,7 @@ components:
       required: [address, bytes]
       properties:
         address: { $ref: "#/components/schemas/ReadInputAddress" }
-        bytes: { type: string, format: byte, maxLength: 89478488, description: One immutable native input, at most 64 MiB decoded. }
+        bytes: { type: string, format: byte, maxLength: 89478488, description: One typed native dependency, at most 64 MiB decoded. }
     DiscoveryProfile:
       type: object
       additionalProperties: false
@@ -1696,15 +1718,25 @@ components:
     ReadFulfillmentResponse:
       type: object
       additionalProperties: false
-      required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation]
+      required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation, outcome]
+      allOf:
+        - if: { properties: { outcome: { const: history_fallback } } }
+          then:
+            properties:
+              inputs: { type: array, maxItems: 0 }
+              continuation: { type: "null" }
       properties:
         lixId: { type: string, format: uuid }
         epochId: { type: string, format: uuid }
         requestDigest: { type: string, minLength: 64, maxLength: 64 }
+        outcome:
+          type: string
+          enum: [complete, history_fallback]
+          description: history_fallback is valid only for a History request without continuation, with empty inputs, null continuation and the request-bound empty closure digest. It provides no coverage and cannot be installed.
         inputs:
           type: array
           maxItems: 16384
-          description: One page of the immutable closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB unless it contains one 64 MiB input.
+          description: One page of the typed dependency closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB unless it contains one 64 MiB input.
           items: { $ref: "#/components/schemas/ReadInput" }
         profile: { $ref: "#/components/schemas/DiscoveryProfile" }
         closureDigest: { type: string, minLength: 64, maxLength: 64 }

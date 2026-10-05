@@ -197,6 +197,16 @@ mod tests {
                 projected_columns: vec![],
                 limit: None,
             },
+            LogicalReadInterest::History {
+                branch_id: "branch".into(),
+                anchor: "00000000-0000-7000-8000-000000000001".into(),
+                commit_ids: vec!["00000000-0000-7000-8000-000000000002".into()],
+                relation: "lix_file".into(),
+                filter: TrackedStateFilter::default(),
+                retain_payloads: false,
+                projected_columns: vec!["id".into()],
+                limit: None,
+            },
             LogicalReadInterest::Exact {
                 rows: keys
                     .iter()

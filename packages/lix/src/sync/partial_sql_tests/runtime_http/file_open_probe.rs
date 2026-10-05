@@ -102,7 +102,7 @@ impl RawHttpClient for TimedClient {
                     )
                 })
                 .unwrap_or_default();
-            self.log.lock().unwrap().push(serde_json::json!({"operation":operation,"request_bytes":request_bytes,"request_interests":request_interests,"response_bytes":response_bytes,"inputs":inputs,"blob_chunks":blob_chunks,"discovery":discovery,"server_ms":server_ms,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
+            self.log.lock().unwrap().push(serde_json::json!({"operation":operation,"status":result.as_ref().map(|response| response.status).ok(),"request_bytes":request_bytes,"request_interests":request_interests,"response_bytes":response_bytes,"inputs":inputs,"blob_chunks":blob_chunks,"discovery":discovery,"server_ms":server_ms,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
             result
         })
     }

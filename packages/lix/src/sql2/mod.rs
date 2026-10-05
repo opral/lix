@@ -104,7 +104,7 @@ pub(crate) use planning_cache::{
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
-    ProviderSelection, register_read_table_functions,
+    ProviderSelection, read_provider_selection, register_read_table_functions,
     register_write_read_relations,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
@@ -136,7 +136,8 @@ pub(crate) use plan::read::statement::{
 };
 
 pub(crate) use providers::{
-    prepare_native_diff_interest, prepare_native_file_content_inputs,
+    prepare_native_diff_interest, validate_bounded_history_recipe_shape,
+    prepare_native_file_content_inputs,
     prepare_native_file_content_interest,
     prepare_native_file_metadata_interest,
 };

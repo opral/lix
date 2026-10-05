@@ -2092,6 +2092,7 @@ where
                     // independently register Exact/Scan above.
                     super::LogicalReadInterest::CollectionGeneration { .. }
                     | super::LogicalReadInterest::PackedIdentityMembership { .. }
+                    | super::LogicalReadInterest::History { .. }
                     | super::LogicalReadInterest::Diff { .. }
                     | super::LogicalReadInterest::FileContent { .. }
                     | super::LogicalReadInterest::FilesystemMetadata { .. } => continue,

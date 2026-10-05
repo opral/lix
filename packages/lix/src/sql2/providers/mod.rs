@@ -232,7 +232,7 @@ impl ProviderSelection {
     /// `All`, `OnlyWithVisibleSchemas`, and every unknown name load the full
     /// visible catalog so information-schema, custom rows, and normal
     /// unknown-table errors keep their current semantics.
-    fn requires_visible_schemas(&self) -> bool {
+    pub(crate) fn requires_visible_schemas(&self) -> bool {
         match self {
             Self::All | Self::AllWithHistory(_) | Self::OnlyWithVisibleSchemas { .. } => true,
             Self::Only {
@@ -1367,7 +1367,7 @@ mod tests {
     }
 }
 
-pub(crate) use diff::prepare_native_diff_interest;
+pub(crate) use diff::{prepare_native_diff_interest, validate_bounded_history_recipe_shape};
 pub(crate) use file::{
     prepare_native_file_content_inputs, prepare_native_file_content_interest,
     prepare_native_file_metadata_interest,

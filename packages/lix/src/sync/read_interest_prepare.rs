@@ -23,6 +23,14 @@ enum NativeReadPreparationPurpose {
     },
 }
 
+fn consume_history_graph_node_budget(remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
 fn path_index_request_for_interest(
     scope: &FilesystemPathIndexScope,
     branch_ids: &[String],
@@ -118,6 +126,9 @@ where
     let mut returned_identities =
         std::collections::BTreeSet::<(String, crate::tracked_state::TrackedStateKey)>::new();
     let mut catalog_branches = std::collections::BTreeSet::<String>::new();
+    // One authority request shares this traversal ceiling across every
+    // History recipe; per-recipe bounds alone would multiply graph work.
+    let mut history_graph_nodes_remaining = crate::hot_state::MAX_HISTORY_RECIPE_GRAPH_NODES;
     for interest in &interests.interests {
         match interest.as_ref() {
             LogicalReadInterest::Scan { request, domain } => {
@@ -251,6 +262,124 @@ where
                     projected_columns,
                 )
                 .await?;
+            }
+            LogicalReadInterest::History {
+                branch_id,
+                anchor,
+                commit_ids,
+                relation,
+                filter,
+                retain_payloads,
+                projected_columns,
+                limit,
+            } => {
+                let branch =
+                    super::partial_candidate_prepare::selected_branch(descriptor, branch_id)?;
+                if !matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
+                    // Fixed history inputs are retained across refreshes; they
+                    // are never rebound to the moving candidate head.
+                    continue;
+                }
+                if branch_id != &descriptor.selected_branch.branch_id
+                    || limit.is_some()
+                    || commit_ids.is_empty()
+                    || commit_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS
+                {
+                    return Err(super::partial_candidate_prepare::unsupported(
+                        "history recipe is outside its bounded leased branch scope",
+                    ));
+                }
+                let mut selected = std::collections::BTreeSet::new();
+                for id in commit_ids {
+                    let parsed = crate::changelog::CommitId::parse_lix(id, "history commit")?;
+                    if !parsed.has_canonical_text(id) || !selected.insert(parsed) {
+                        return Err(super::partial_candidate_prepare::unsupported(
+                            "history recipe contains a noncanonical or duplicate commit",
+                        ));
+                    }
+                }
+                let anchor_id = crate::changelog::CommitId::parse_lix(anchor, "history anchor")?;
+                let mut graph = crate::commit_graph::CommitGraphContext::new().reader(read.clone());
+                let mut cursor = crate::changelog::CommitId::parse_lix(
+                    &branch.head.commit_id,
+                    "leased branch head",
+                )?;
+                let mut parents = std::collections::BTreeMap::new();
+                let mut anchor_seen = false;
+                let mut seen = std::collections::BTreeSet::new();
+                let mut previous_generation = None;
+                loop {
+                    if !seen.insert(cursor) {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "history recipe encountered a first-parent cycle",
+                        ));
+                    }
+                    if !consume_history_graph_node_budget(&mut history_graph_nodes_remaining) {
+                        return Err(LixError::new(
+                            "LIX_HISTORY_RECIPE_FALLBACK",
+                            "history recipes exceed the shared bounded ancestry work budget",
+                        ));
+                    }
+                    let node = match graph.load_node(&cursor).await? {
+                        Some(node) => node,
+                        None => {
+                            return Err(LixError::new(
+                                "LIX_HISTORY_RECIPE_FALLBACK",
+                                "history recipe ancestry is not available on the leased branch",
+                            ));
+                        }
+                    };
+                    if previous_generation.is_some_and(|generation| node.generation >= generation) {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "history recipe first-parent generation is not decreasing",
+                        ));
+                    }
+                    previous_generation = Some(node.generation);
+                    if cursor == anchor_id {
+                        anchor_seen = true;
+                    }
+                    if anchor_seen && selected.contains(&cursor) {
+                        parents.insert(cursor, node.parent_commit_ids.first().copied());
+                    }
+                    if anchor_seen && parents.len() == selected.len() {
+                        break;
+                    }
+                    let Some(parent) = node.parent_commit_ids.first().copied() else {
+                        break;
+                    };
+                    cursor = parent;
+                }
+                if !anchor_seen || parents.len() != selected.len() {
+                    return Err(LixError::new(
+                        "LIX_HISTORY_RECIPE_FALLBACK",
+                        "history recipe is outside the bounded leased ancestry",
+                    ));
+                }
+                let request = crate::tracked_state::TrackedStateDiffRequest {
+                    filter: filter.clone(),
+                    retain_payloads: *retain_payloads,
+                };
+                for id in commit_ids {
+                    let to = crate::changelog::CommitId::parse_lix(id, "history commit")?;
+                    let Some(from) = parents.get(&to) else {
+                        return Err(super::partial_candidate_prepare::unsupported(
+                            "selected history commit is outside its proved ancestry",
+                        ));
+                    };
+                    if let Some(from) = from {
+                        crate::sql2::prepare_native_diff_interest(
+                            read.clone(),
+                            relation,
+                            &from.to_string(),
+                            id,
+                            &request,
+                            projected_columns,
+                        )
+                        .await?;
+                    }
+                }
             }
             LogicalReadInterest::FilesystemMetadata {
                 directory,
@@ -642,10 +771,7 @@ where
     )
     .await?;
     let mut fallback_owner_commits = std::collections::BTreeSet::new();
-    for ((_, change_id, _, _), locator) in locator_fallback_requests
-        .iter()
-        .zip(fallback_locators)
-    {
+    for ((_, change_id, _, _), locator) in locator_fallback_requests.iter().zip(fallback_locators) {
         fallback_owner_commits.insert(locator.commit_id);
         locators.insert(*change_id, locator);
     }
@@ -671,12 +797,14 @@ where
         read,
         &payload_requests
             .iter()
-            .map(|(_, request)| crate::tracked_state::AuthoritativeLiveChangeRequest {
-                change_id: request.change_id,
-                source_commit_id: request.source_commit_id,
-                key: request.key.clone(),
-                updated_at: request.updated_at,
-            })
+            .map(
+                |(_, request)| crate::tracked_state::AuthoritativeLiveChangeRequest {
+                    change_id: request.change_id,
+                    source_commit_id: request.source_commit_id,
+                    key: request.key.clone(),
+                    updated_at: request.updated_at,
+                },
+            )
             .collect::<Vec<_>>(),
     )
     .await?;
@@ -770,6 +898,17 @@ async fn prepare_path_index_small_blob_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_graph_budget_is_shared_and_fail_closed() {
+        let mut remaining = crate::hot_state::MAX_HISTORY_RECIPE_GRAPH_NODES;
+        for _ in 0..crate::hot_state::MAX_HISTORY_RECIPE_GRAPH_NODES {
+            assert!(consume_history_graph_node_budget(&mut remaining));
+        }
+        assert_eq!(remaining, 0);
+        assert!(!consume_history_graph_node_budget(&mut remaining));
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn filesystem_path_interest_preparation_preserves_directory_scope() {

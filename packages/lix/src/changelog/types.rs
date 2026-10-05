@@ -47,6 +47,11 @@ impl CommitId {
         &self.uuid
     }
 
+    /// Compare the canonical wire spelling without allocation or test aliases.
+    pub(crate) fn has_canonical_text(&self, value: &str) -> bool {
+        uuid_text_str(&uuid_text(self.uuid)) == value
+    }
+
     /// Creates a commit id whose low 32 bits are reserved for directly
     /// addressable packed change ordinals.
     ///

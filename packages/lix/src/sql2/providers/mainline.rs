@@ -560,7 +560,53 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     let stream_schema = schema.clone();
                     let include_state_headers = relation.is_some();
                     let stream_read_interest_registry = read_interest_registry.clone();
+            let history_selected_ids = selected_ids.clone();
             let stream = async_stream::try_stream! {
+                // History diffs normally start only after mainline has read
+                // graph/header inputs. Capture the immutable bounded recipe
+                // first so read fulfillment can close those initial misses as
+                // well as the later diff dependencies in one authority pass.
+                if limit.is_none()
+                    && let (Some(relation), Some(branch_id), Some(ids), Some(registry)) = (
+                        relation.as_ref(),
+                        active_branch_id.as_deref(),
+                        history_selected_ids.as_ref(),
+                        stream_read_interest_registry.as_ref(),
+                    )
+                    && !ids.is_empty()
+                    && ids.len() <= crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS
+                    && relation.supports_bounded_history_recipe()
+                {
+                    let commit_ids = ids.iter().cloned().collect::<Vec<_>>();
+                    let canonical = commit_ids.iter().all(|id| {
+                        CommitId::parse_lix(id, "history commit")
+                            .is_ok_and(|parsed| parsed.has_canonical_text(id))
+                    });
+                    if canonical {
+                        let projected_columns = schema
+                            .fields()
+                            .iter()
+                            .filter_map(|field| {
+                                relation.schema.index_of(field.name()).ok().map(|_| {
+                                    field.name().clone()
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let interest = super::diff::bounded_history_interest(
+                            branch_id,
+                            &anchor.to_string(),
+                            commit_ids,
+                            relation,
+                            &projected_columns,
+                            &row_filters,
+                        )?;
+                        if let Some(interest) = interest {
+                            registry
+                                .register(interest)
+                                .map_err(lix_error_to_datafusion_error)?;
+                        }
+                    }
+                }
                 let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
                 let mut graph = CommitGraphContext::new().reader(store.clone());
                 let mut next = Some(anchor);

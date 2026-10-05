@@ -853,6 +853,21 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) file_views: Option<SessionFileViews>,
 }
 
+async fn sql_planning_catalog_fingerprint<F, Fut>(
+    selection: &crate::sql2::ProviderSelection,
+    visible_catalog: F,
+) -> Result<CatalogFingerprint, LixError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Arc<CatalogSnapshot>, LixError>>,
+{
+    if selection.requires_visible_schemas() {
+        Ok(visible_catalog().await?.fingerprint().clone())
+    } else {
+        Ok(CatalogSnapshot::builtin().fingerprint().clone())
+    }
+}
+
 impl<R> SessionSqlExecutionContext<'_, R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
@@ -899,6 +914,7 @@ where
 
     async fn sql_planning_environment(
         &self,
+        statements: &[datafusion::sql::parser::Statement],
     ) -> Result<
         Option<(
             Arc<SqlPlanningCache<CatalogFingerprint>>,
@@ -906,10 +922,15 @@ where
         )>,
         LixError,
     > {
-        let catalog = self.compiled_sql_catalog().await?;
+        let selection = crate::sql2::read_provider_selection(
+            &self.sql_planning_cache.datafusion_session().state(),
+            statements,
+        );
+        let fingerprint =
+            sql_planning_catalog_fingerprint(&selection, || self.compiled_sql_catalog()).await?;
         Ok(Some((
             Arc::clone(&self.sql_planning_cache),
-            catalog.fingerprint().clone(),
+            fingerprint,
         )))
     }
 
@@ -1019,6 +1040,7 @@ pub(super) fn non_retryable_after_execution(mut error: LixError) -> LixError {
 
 #[cfg(test)]
 mod tests {
+    use super::sql_planning_catalog_fingerprint;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Condvar;
@@ -1026,6 +1048,7 @@ mod tests {
     use std::task::{Context, Poll};
     use std::thread;
     use std::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::engine::Engine;
     use crate::storage::{
@@ -1035,6 +1058,78 @@ mod tests {
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn fixed_system_read_planning_uses_builtin_fingerprint_without_loading_catalog() {
+        let statement = crate::sql2::parse_statement(
+            "SELECT id FROM lix_history('lix_file', $1)",
+        )
+        .unwrap();
+        let state = datafusion::prelude::SessionContext::new().state();
+        let selection =
+            crate::sql2::read_provider_selection(&state, &[statement]);
+        assert!(!selection.requires_visible_schemas());
+
+        let visible_catalog_calls = AtomicUsize::new(0);
+        let fingerprint = sql_planning_catalog_fingerprint(&selection, || async {
+            visible_catalog_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::catalog::CatalogSnapshot::builtin_shared())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(visible_catalog_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fingerprint,
+            crate::catalog::CatalogSnapshot::builtin()
+                .fingerprint()
+                .clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_history_relation_still_loads_visible_catalog_for_planning() {
+        let statement = crate::sql2::parse_statement(
+            "SELECT * FROM lix_history('runtime_note', $1)",
+        )
+        .unwrap();
+        let state = datafusion::prelude::SessionContext::new().state();
+        let selection =
+            crate::sql2::read_provider_selection(&state, &[statement]);
+        assert!(selection.requires_visible_schemas());
+
+        let visible_schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "runtime_note",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        });
+        let expected_catalog =
+            crate::catalog::CatalogSnapshot::from_visible_schemas(&[visible_schema.clone()])
+                .unwrap();
+        let visible_catalog_calls = AtomicUsize::new(0);
+        let fingerprint = sql_planning_catalog_fingerprint(&selection, || async {
+            visible_catalog_calls.fetch_add(1, Ordering::Relaxed);
+            crate::catalog::CatalogSnapshot::from_visible_schemas(&[visible_schema])
+                .map(std::sync::Arc::new)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(visible_catalog_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fingerprint,
+            expected_catalog.fingerprint().clone()
+        );
+        assert_ne!(
+            fingerprint,
+            crate::catalog::CatalogSnapshot::builtin()
+                .fingerprint()
+                .clone()
+        );
+    }
 
     fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + TEST_WAIT_TIMEOUT;

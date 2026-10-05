@@ -312,7 +312,7 @@ pub(crate) async fn prepare_read_session<'ctx, C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let planning_environment = ctx.sql_planning_environment().await?;
+    let planning_environment = ctx.sql_planning_environment(statements).await?;
     Ok(ReadSqlSession {
         session: Some(build_read_session(ctx, statements).await?),
         planning_environment,
@@ -328,7 +328,7 @@ pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let planning_environment = ctx.sql_planning_environment().await?;
+    let planning_environment = ctx.sql_planning_environment(statements).await?;
     Ok(ReadSqlSession {
         session: Some(build_read_session_at_head(ctx, active_head, statements).await?),
         planning_environment,
@@ -643,7 +643,9 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     write_ctx.ensure_statement_allowed_after_restore()?;
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
-    let planning_environment = read_ctx.sql_planning_environment().await?;
+    let planning_environment = read_ctx
+        .sql_planning_environment(std::slice::from_ref(&statement))
+        .await?;
     let (plan, session, resolved_statement) = create_transaction_read_logical_plan_from_parsed(
         read_ctx, write_ctx, sql, statement, params,
     )

@@ -15,6 +15,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+pub(crate) const MAX_HISTORY_RECIPE_COMMIT_IDS: usize = 16;
+pub(crate) const MAX_HISTORY_RECIPE_COUNT: usize = 8;
+pub(crate) const MAX_HISTORY_RECIPE_SELECTED_IDS: usize = 64;
+pub(crate) const MAX_HISTORY_RECIPE_GRAPH_NODES: usize = 4096;
+pub(crate) const MAX_HISTORY_RECIPE_IDENTITIES: usize = 256;
+pub(crate) const MAX_HISTORY_RECIPE_PROJECTED_COLUMNS: usize = 128;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InterestDomain {
@@ -127,6 +134,23 @@ pub(crate) enum LogicalReadInterest {
         projected_columns: Vec<String>,
         limit: Option<usize>,
     },
+    /// A fixed, bounded set of historical commit diffs selected by a
+    /// mainline history scan. This recipe is distinct from arbitrary `Diff`
+    /// endpoints: authority replay proves every selected commit lies on the
+    /// leased selected-branch first-parent lane from `anchor`.
+    History {
+        branch_id: String,
+        anchor: String,
+        commit_ids: Vec<String>,
+        relation: String,
+        #[serde(with = "super::read_interests_codec::NativeTrackedFilter")]
+        filter: crate::tracked_state::TrackedStateFilter,
+        retain_payloads: bool,
+        projected_columns: Vec<String>,
+        /// Limits remain SQL residuals. Captures with a limit are excluded
+        /// until authority replay can preserve the selected prefix exactly.
+        limit: Option<usize>,
+    },
     Scan {
         #[serde(with = "super::read_interests_codec::NativeScan")]
         request: HotStateScanRequest,
@@ -150,7 +174,7 @@ impl LogicalReadInterest {
                 from: DiffInterestEndpoint::Fixed(_),
                 to: DiffInterestEndpoint::Fixed(_),
                 ..
-            }
+            } | Self::History { .. }
         )
     }
 
@@ -604,6 +628,39 @@ mod tests {
                 .unwrap()
                 .code,
             "LIX_PARTIAL_READ_INTEREST_CHANGED"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_history_recipe_is_immutable_across_candidate_refreshes() {
+        let registry = ReadInterestRegistry::new_durable(16, 16384);
+        let history = LogicalReadInterest::History {
+            branch_id: "branch".into(),
+            anchor: "anchor".into(),
+            commit_ids: vec!["selected".into()],
+            relation: "lix_file".into(),
+            filter: Default::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+        registry.register(history.clone()).unwrap();
+        assert_eq!(registry.snapshot().unwrap().interests.len(), 1);
+        assert!(
+            registry
+                .moving_snapshot()
+                .unwrap()
+                .as_read_snapshot()
+                .interests
+                .is_empty()
+        );
+        assert!(
+            registry
+                .moving_current_snapshot()
+                .unwrap()
+                .as_read_snapshot()
+                .interests
+                .is_empty()
         );
     }
 

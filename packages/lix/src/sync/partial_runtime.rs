@@ -478,6 +478,46 @@ pub(super) fn hydrate_demand_with_receipt<
     })
 }
 
+async fn hydrate_current_payload_after_history_fallback<
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient,
+>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    request: &super::read_fulfillment::ReadFulfillmentRequest,
+    locator: &NativeMetadataRef,
+) -> Result<Option<HydratedInputs>, LixError> {
+    let Some(current_request) =
+        super::read_fulfillment::current_payload_request_after_history_fallback(request, locator)
+    else {
+        return Ok(None);
+    };
+    let response = super::read_fulfillment::fetch(transport, &current_request)
+        .await
+        .map_err(|error| {
+            super::read_fulfillment::annotate_client_failure(
+                error,
+                super::read_fulfillment::ClientFailurePhase::Validation,
+            )
+        })?;
+    if response.outcome != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
+        return Err(LixError::new(
+            "LIX_READ_FULFILLMENT_INVALID",
+            "current payload recovery returned a History fallback",
+        ));
+    }
+    super::read_fulfillment::install(storage, state, &current_request, &response)
+        .await
+        .map(Some)
+        .map_err(|error| {
+            super::read_fulfillment::annotate_client_failure(
+                error,
+                super::read_fulfillment::ClientFailurePhase::Installation,
+            )
+        })
+}
+
 // Erase this child operation before composing the worker select loop.
 fn hydrate_exact_demand_with_receipt<
     'a,
@@ -507,6 +547,12 @@ fn hydrate_exact_demand_with_receipt<
                         super::read_fulfillment::ClientFailurePhase::Validation,
                     )
                 })?
+            && interests.iter().all(|interest| match interest {
+                crate::hot_state::LogicalReadInterest::History { branch_id, .. } => {
+                    branch_id == &state.descriptor().selected_branch.branch_id
+                }
+                _ => true,
+            })
         {
             use super::read_fulfillment::ReadInputAddress;
             let selected_payload_locator =
@@ -604,22 +650,68 @@ fn hydrate_exact_demand_with_receipt<
                 required,
                 continuation: None,
             };
-            let response = super::read_fulfillment::fetch(transport, &fulfillment)
-                .await
-                .map_err(|error| {
-                    super::read_fulfillment::annotate_client_failure(
-                        error,
-                        super::read_fulfillment::ClientFailurePhase::Validation,
+            if super::read_fulfillment::history_recipe_is_ineligible(&fulfillment)? {
+                // This memo records only bounded-recipe ineligibility for the
+                // exact leased history basis. It grants no read coverage, so
+                // the original native-demand path below still runs.
+                if let Some(locator) = selected_payload_locator.as_ref()
+                    && let Some(hydrated) = hydrate_current_payload_after_history_fallback(
+                        storage,
+                        state,
+                        transport,
+                        &fulfillment,
+                        locator,
                     )
-                })?;
-            return super::read_fulfillment::install(storage, state, &fulfillment, &response)
-                .await
-                .map_err(|error| {
-                    super::read_fulfillment::annotate_client_failure(
-                        error,
-                        super::read_fulfillment::ClientFailurePhase::Installation,
-                    )
-                });
+                    .await?
+                {
+                    return Ok(hydrated);
+                }
+            } else {
+                match super::read_fulfillment::fetch(transport, &fulfillment).await {
+                    Ok(response) => {
+                        if response.outcome
+                            == super::read_fulfillment::ReadFulfillmentOutcome::HistoryFallback
+                        {
+                            super::read_fulfillment::remember_history_recipe_ineligible(
+                                &fulfillment,
+                            )?;
+                            if let Some(locator) = selected_payload_locator.as_ref()
+                                && let Some(hydrated) =
+                                    hydrate_current_payload_after_history_fallback(
+                                        storage,
+                                        state,
+                                        transport,
+                                        &fulfillment,
+                                        locator,
+                                    )
+                                    .await?
+                            {
+                                return Ok(hydrated);
+                            }
+                        } else {
+                            return super::read_fulfillment::install(
+                                storage,
+                                state,
+                                &fulfillment,
+                                &response,
+                            )
+                            .await
+                            .map_err(|error| {
+                                super::read_fulfillment::annotate_client_failure(
+                                    error,
+                                    super::read_fulfillment::ClientFailurePhase::Installation,
+                                )
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        return Err(super::read_fulfillment::annotate_client_failure(
+                            error,
+                            super::read_fulfillment::ClientFailurePhase::Validation,
+                        ));
+                    }
+                }
+            }
         }
         let history_inputs = match &request {
             SyncDemandRequest::NativeMetadata(addresses, error) if allow_metadata_walk => {
