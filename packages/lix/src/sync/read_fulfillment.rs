@@ -369,9 +369,10 @@ pub(crate) struct ReadContinuation {
 pub(crate) enum ReadInputAddress {
     Metadata(NativeMetadataRef),
     Object(NativeObjectRef),
-    /// A canonical changelog payload selected by one descriptor-scoped row
-    /// identity. The payload itself is mutable in CHANGE_SPACE, so its exact
-    /// row lifetime and source owner travel with the typed input.
+    /// A canonical changelog dependency selected by a descriptor-scoped
+    /// candidate identity, before local result filtering. Its CHANGE_SPACE
+    /// value is mutable, so its exact row lifetime and source owner travel
+    /// with the typed input.
     ChangeRecord {
         change_id: String,
         source_commit_id: String,
@@ -1386,13 +1387,19 @@ pub(crate) fn validate_response(
     }
     Ok(())
 }
-/// A scan can select a canonical row payload when its identity satisfies the
-/// recipe's exact filters. An empty `row_pks` list is the native wildcard
-/// used by ordinary SQL scans; it still constrains the identity through the
-/// schema, branch, file, and row-bound filters below. The server may return a
-/// typed payload only for an identity actually selected while replaying that
-/// scan, not for arbitrary mutable CHANGE_SPACE values.
-fn scan_selects_change_identity(
+/// Authorize canonical dependencies within a scan's physical candidate scope.
+/// A read recipe prepares native inputs, not SQL result rows: indexed equality
+/// and range probes may return stale candidates, or fall back to a schema scan
+/// when their index is incomplete. Visibility also reads global rows and
+/// tombstones before applying its output filters and limit. Local evaluation
+/// must retain those predicates; applying them here would reject the inputs it
+/// needs to decide the result.
+///
+/// An empty `row_pks` list is a wildcard, but schema, branch/global overlay,
+/// file, and primary-key bounds still fence every canonical candidate. The
+/// descriptor and closure byte/count bounds are validated separately. A
+/// matching identity never proves membership in a limited or filtered result.
+fn scan_selects_change_candidate_identity(
     scan: &crate::hot_state::HotStateScanRequest,
     domain: InterestDomain,
     branch_id: &str,
@@ -1401,8 +1408,7 @@ fn scan_selects_change_identity(
     row_pk: &crate::row_pk::RowPk,
 ) -> bool {
     let filter = &scan.filter;
-    if scan.limit.is_some()
-        || domain == InterestDomain::Untracked
+    if domain == InterestDomain::Untracked
         || filter.untracked == Some(true)
         || filter.rows != crate::hot_state::HotStateRowFilter::All
         || !filter
@@ -1427,14 +1433,10 @@ fn scan_selects_change_identity(
         return false;
     }
 
-    // These predicates need row contents, indexed values, or tombstone state
-    // that the wire identity alone cannot prove. Reject them here instead of
-    // trying to approximate their selection semantics.
-    filter.global.is_none()
-        && filter.constraints.is_empty()
-        && filter.declared_column_eq.is_none()
-        && filter.declared_column_range.is_none()
-        && !filter.include_tombstones
+    // These inputs can be needed before residual predicates, branch/global
+    // visibility, tombstone removal, or an output limit are evaluated. Their
+    // predicates do not narrow the physical candidate dependency scope.
+    true
 }
 
 /// Branch-scoped scans physically read global rows as candidates for the
@@ -1449,7 +1451,7 @@ fn branch_is_selected_by_scan(branch_ids: &[String], branch_id: &str) -> bool {
                 .any(|candidate| candidate != crate::GLOBAL_BRANCH_ID))
 }
 
-fn scan_recipe_selects_change_identity(
+fn scan_recipe_selects_change_candidate_identity(
     interest: &LogicalReadInterest,
     branch_id: &str,
     schema_key: &str,
@@ -1468,9 +1470,9 @@ fn scan_recipe_selects_change_identity(
                         && row.row_pk == *row_pk
                 })
         }
-        LogicalReadInterest::Scan { request, domain } => {
-            scan_selects_change_identity(request, *domain, branch_id, schema_key, file_id, row_pk)
-        }
+        LogicalReadInterest::Scan { request, domain } => scan_selects_change_candidate_identity(
+            request, *domain, branch_id, schema_key, file_id, row_pk,
+        ),
         LogicalReadInterest::FilesystemMetadata {
             directory,
             branch_ids,
@@ -1494,7 +1496,7 @@ fn scan_recipe_selects_change_identity(
                     crate::filesystem::FilesystemPathIndexScope::FileIds,
                 )
             };
-            scan_recipe_selects_change_identity(
+            scan_recipe_selects_change_candidate_identity(
                 &LogicalReadInterest::FilesystemPaths {
                     scope,
                     branch_ids: branch_ids.clone(),
@@ -1520,7 +1522,7 @@ fn scan_recipe_selects_change_identity(
                 .with_scope(scope.clone())
                 .with_blob_refs(*include_blob_refs || *cache_small_blob_data)
                 .hot_state_request();
-            if !scan_selects_change_identity(
+            if !scan_selects_change_candidate_identity(
                 &scan,
                 InterestDomain::Combined,
                 branch_id,
@@ -1599,7 +1601,7 @@ fn plugin_registry_dependency_matches(
         {
             return false;
         }
-        scan_recipe_selects_change_identity(
+        scan_recipe_selects_change_candidate_identity(
             interest,
             selected_branch_id,
             selected_schema_key,
@@ -1675,7 +1677,7 @@ fn plugin_owner_dependency_matches(
             _ => selected_file.as_deref() == Some(file_id.as_str()),
         };
         same_file
-            && scan_recipe_selects_change_identity(
+            && scan_recipe_selects_change_candidate_identity(
                 interest,
                 selected_branch,
                 selected_schema,
@@ -1840,7 +1842,7 @@ impl ReadFulfillmentPayloadContext {
                         continue;
                     }
                     let row = entry.live_row();
-                    if scan_selects_change_identity(
+                    if scan_selects_change_candidate_identity(
                         request,
                         InterestDomain::Combined,
                         &row.branch_id,
@@ -2057,7 +2059,7 @@ fn file_content_recipe_selects_change_identity_with_context(
         .schema_keys
         .iter()
         .any(|schema| schema == schema_key)
-        && scan_selects_change_identity(
+        && scan_selects_change_candidate_identity(
             request,
             InterestDomain::Combined,
             branch_id,
@@ -2191,7 +2193,7 @@ fn validate_complete(
             .iter()
             .enumerate()
             .any(|(index, interest)| {
-                scan_recipe_selects_change_identity(
+                scan_recipe_selects_change_candidate_identity(
                     interest,
                     branch_id,
                     schema_key,
@@ -2909,7 +2911,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_change_payload_recipe_requires_a_safe_identity_match() {
+    fn scan_change_payload_recipe_preserves_candidate_identity_scope() {
         let row_pk = crate::row_pk::RowPk::single("row");
         let make_scan = || crate::hot_state::HotStateScanRequest {
             filter: crate::hot_state::HotStateFilter {
@@ -2922,7 +2924,7 @@ mod tests {
             ..Default::default()
         };
         let selects = |scan: &crate::hot_state::HotStateScanRequest, domain| {
-            scan_selects_change_identity(scan, domain, "branch", "schema", None, &row_pk)
+            scan_selects_change_candidate_identity(scan, domain, "branch", "schema", None, &row_pk)
         };
 
         assert!(selects(&make_scan(), InterestDomain::Combined));
@@ -2930,7 +2932,7 @@ mod tests {
         assert!(!selects(&make_scan(), InterestDomain::Untracked));
 
         assert!(
-            scan_selects_change_identity(
+            scan_selects_change_candidate_identity(
                 &make_scan(),
                 InterestDomain::Combined,
                 crate::GLOBAL_BRANCH_ID,
@@ -2980,6 +2982,35 @@ mod tests {
         wrong_file.filter.file_ids[0] = crate::NullableKeyFilter::Value("file".to_owned());
         assert!(!selects(&wrong_file, InterestDomain::Combined));
 
+        let mut no_rows = make_scan();
+        no_rows.filter.rows = crate::hot_state::HotStateRowFilter::None;
+        assert!(!selects(&no_rows, InterestDomain::Combined));
+
+        for inclusive in [false, true] {
+            let bound = crate::tracked_state::RowPkRangeBound {
+                row_pk: row_pk.clone(),
+                inclusive,
+            };
+            let mut lower = make_scan();
+            lower.filter.row_pk_lower = Some(bound.clone());
+            assert_eq!(selects(&lower, InterestDomain::Combined), inclusive);
+            let mut upper = make_scan();
+            upper.filter.row_pk_upper = Some(bound);
+            assert_eq!(selects(&upper, InterestDomain::Combined), inclusive);
+        }
+        let mut below_lower = make_scan();
+        below_lower.filter.row_pk_lower = Some(crate::tracked_state::RowPkRangeBound {
+            row_pk: crate::row_pk::RowPk::single("zzz"),
+            inclusive: true,
+        });
+        assert!(!selects(&below_lower, InterestDomain::Combined));
+        let mut above_upper = make_scan();
+        above_upper.filter.row_pk_upper = Some(crate::tracked_state::RowPkRangeBound {
+            row_pk: crate::row_pk::RowPk::single("aaa"),
+            inclusive: true,
+        });
+        assert!(!selects(&above_upper, InterestDomain::Combined));
+
         let mut untracked_only = make_scan();
         untracked_only.filter.untracked = Some(true);
         assert!(!selects(&untracked_only, InterestDomain::Combined));
@@ -2992,19 +3023,47 @@ mod tests {
                 field: crate::hot_state::ScanField::RowPk,
                 operator: crate::hot_state::ScanOperator::Eq(crate::Value::Text("row".to_owned())),
             });
-        assert!(!selects(&content_predicate, InterestDomain::Combined));
+        assert!(selects(&content_predicate, InterestDomain::Combined));
 
         let mut global_scope = make_scan();
         global_scope.filter.global = Some(false);
-        assert!(!selects(&global_scope, InterestDomain::Combined));
+        assert!(selects(&global_scope, InterestDomain::Combined));
 
         let mut tombstones = make_scan();
         tombstones.filter.include_tombstones = true;
-        assert!(!selects(&tombstones, InterestDomain::Combined));
+        assert!(selects(&tombstones, InterestDomain::Combined));
 
         let mut limited = make_scan();
         limited.limit = Some(1);
-        assert!(!selects(&limited, InterestDomain::Combined));
+        assert!(selects(&limited, InterestDomain::Combined));
+
+        let mut indexed_candidates = make_scan();
+        indexed_candidates.filter.declared_column_eq = Some(crate::hot_state::DeclaredColumnEq {
+            schema_key: "schema".to_owned(),
+            ordinal: 0,
+            values: vec![crate::hot_state::HotIndexValue::String("target".to_owned())],
+        });
+        assert!(selects(&indexed_candidates, InterestDomain::Combined));
+        indexed_candidates.filter.declared_column_eq = None;
+        indexed_candidates.filter.declared_column_range =
+            Some(Box::new(crate::hot_state::DeclaredColumnRange {
+                schema_key: "schema".to_owned(),
+                ordinal: 0,
+                lower: Some((
+                    crate::hot_state::HotIndexValue::String("a".to_owned()),
+                    true,
+                )),
+                upper: Some((
+                    crate::hot_state::HotIndexValue::String("z".to_owned()),
+                    false,
+                )),
+            }));
+        assert!(selects(&indexed_candidates, InterestDomain::Combined));
+        indexed_candidates.filter.row_pks = vec![crate::row_pk::RowPk::single("other_row")];
+        assert!(
+            !selects(&indexed_candidates, InterestDomain::Combined),
+            "an index predicate cannot widen the explicit primary-key scope"
+        );
     }
 
     #[test]
@@ -3902,42 +3961,42 @@ mod tests {
             cache_small_blob_data: false,
         };
         assert_eq!(payload_recipe_mask(std::slice::from_ref(&interest)), 16);
-        assert!(scan_recipe_selects_change_identity(
+        assert!(scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_file_descriptor",
             Some(id),
             &key
         ));
-        assert!(scan_recipe_selects_change_identity(
+        assert!(scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_binary_blob_ref",
             Some(id),
             &key
         ));
-        assert!(scan_recipe_selects_change_identity(
+        assert!(scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_directory_descriptor",
             None,
             &other_key
         ));
-        assert!(!scan_recipe_selects_change_identity(
+        assert!(!scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_file_descriptor",
             Some(other),
             &other_key
         ));
-        assert!(!scan_recipe_selects_change_identity(
+        assert!(!scan_recipe_selects_change_candidate_identity(
             &interest,
             "other-branch",
             "lix_file_descriptor",
             Some(id),
             &key
         ));
-        assert!(!scan_recipe_selects_change_identity(
+        assert!(!scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_account",
@@ -3950,7 +4009,7 @@ mod tests {
         {
             *include_blob_refs = false;
         }
-        assert!(!scan_recipe_selects_change_identity(
+        assert!(!scan_recipe_selects_change_candidate_identity(
             &interest,
             "branch",
             "lix_binary_blob_ref",
@@ -3986,7 +4045,7 @@ mod tests {
             ("branch", "lix_account", None, &key, false),
         ] {
             assert_eq!(
-                scan_recipe_selects_change_identity(&metadata, branch, schema, file, row),
+                scan_recipe_selects_change_candidate_identity(&metadata, branch, schema, file, row),
                 expected,
             );
         }
@@ -4106,7 +4165,7 @@ mod tests {
             {
                 if schema_key != "lix_directory_descriptor" {
                     assert!(!request.interests.iter().any(|interest| {
-                        scan_recipe_selects_change_identity(
+                        scan_recipe_selects_change_candidate_identity(
                             interest,
                             branch_id,
                             schema_key,
