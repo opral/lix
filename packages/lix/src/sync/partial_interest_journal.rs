@@ -176,7 +176,7 @@ pub(crate) async fn v2_journal_upgrade(
         return Ok(None);
     };
     let journal_key = key(&state)?;
-    let value = PointReadPlan::new(PARTIAL_READ_INTEREST_SPACE, &[journal_key.clone()])
+    let value = PointReadPlan::new(PARTIAL_READ_INTEREST_SPACE, std::slice::from_ref(&journal_key))
         .materialize(read, Default::default())
         .await?
         .value
