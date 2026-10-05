@@ -12,7 +12,11 @@ export default defineConfig({
 		},
 	},
 	optimizeDeps: {
-		include: ["@bytecodealliance/jco-transpile/wasm-tools"],
+		include: [
+			"@bytecodealliance/jco-transpile/wasm-tools",
+			"@bytecodealliance/jco-transpile/component",
+			"binaryen",
+		],
 	},
 	define: {
 		"import.meta.env.LIX_WASM_STORAGE_BENCH": JSON.stringify(
@@ -21,6 +25,9 @@ export default defineConfig({
 	},
 	test: {
 		include: ["src/**/*.browser.test.ts"],
+		// Each file boots real WASM workers. Isolate their startup budgets;
+		// concurrency and cross-worker races remain exercised within each test.
+		fileParallelism: false,
 		browser: {
 			enabled: true,
 			headless: true,
