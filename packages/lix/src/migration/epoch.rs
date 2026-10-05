@@ -58,15 +58,25 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         82 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V82),
         83 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83),
         84 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84),
+        85 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
 }
 
 fn partial_repository_format(marker: &[u8]) -> Option<u32> {
-    [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION]
-        .into_iter()
-        .find(|format| partial_repository_protocol(*format) == Some(marker))
+    [
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        crate::init::CURRENT_FORMAT_VERSION,
+    ]
+    .into_iter()
+    .find(|format| partial_repository_protocol(*format) == Some(marker))
 }
 
 fn durable_candidate_write_options() -> WriteOptions {
@@ -318,6 +328,9 @@ where
         if let Err(error) = claim_fresh_import(&storage, &claim).await {
             let cleaned = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
             let error = with_cleanup_error(error, cleaned);
+            // The completion message is a storage-release receipt.
+            drop(candidate);
+            drop(storage);
             let _ = report_done.send(Ok(()));
             let _ = report_claimed.send(Err(error));
             return;
@@ -326,6 +339,8 @@ where
             // The restore was cancelled before it observed ownership. The
             // claim is now settled and exact, so it is safe to remove it.
             let result = cleanup_fresh_epoch_claim(&storage, &candidate, &claim).await;
+            drop(candidate);
+            drop(storage);
             let _ = report_done.send(result);
             return;
         }
@@ -335,6 +350,10 @@ where
         } else {
             Ok(())
         };
+        // Do not let cleanup().await return while this detached worker still
+        // owns handles that can keep the underlying storage alive.
+        drop(candidate);
+        drop(storage);
         let _ = report_done.send(result);
     })?;
     Ok(FreshEpochCleanup {
@@ -994,8 +1013,8 @@ where
         intent,
         AdmissionIntent::PartialReplica | AdmissionIntent::OwnedMigration
     )
-        .then(|| source_marker.as_deref().and_then(partial_repository_format))
-        .flatten();
+    .then(|| source_marker.as_deref().and_then(partial_repository_format))
+    .flatten();
     let legacy_status = match partial_source_format {
         Some(from_version) => super::MigrationStatus::Required {
             from_version,
@@ -1363,33 +1382,27 @@ where
         attempt: uuid::Uuid::now_v7(),
     };
     let migrating_bytes = encode_pointer(migrating);
-    let mut claim = match source
-        .begin_migration_write(WriteOptions {
-            await_durable: true,
-            preconditions: vec![StorageAdapter::<S>::mutation_revision_precondition(
-                source_revision,
-            )],
-            ..WriteOptions::default()
-        })
-        .await
-    {
-        Ok(claim) => claim,
-        Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_intent(
-                storage, progress, server, options, intent,
-            ))
-            .await;
-        }
-        Err(error) => return Err(storage_error(error)),
+    let legacy_source_marker = if source_bank == EpochBank::Legacy && from_format != 0 {
+        Some(
+            load_storage_value(
+                storage,
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+            )
+            .await?
+            .ok_or_else(|| epoch_error("legacy migration source protocol marker is missing"))?,
+        )
+    } else {
+        None
     };
-    put_pointer(&mut claim, migrating_bytes.clone())
-        .await
-        .map_err(storage_error)?;
-    put_lease(&mut claim, Bytes::from_static(b"0"))
-        .await
-        .map_err(storage_error)?;
-    if let Err(error) =
-        resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
+    if let Err(error) = claim_active_migration(
+        storage,
+        &source,
+        source_revision,
+        &migrating_bytes,
+        legacy_source_marker,
+    )
+    .await
     {
         if is_admission_race(&error) {
             return Box::pin(admit_repository_with_intent(
@@ -1597,7 +1610,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | 82 | 83 | 84 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | 83 | 84 | 85 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1653,6 +1666,18 @@ where
                     }),
                 )
                 .await?;
+                if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+                    plan.get_or_insert_with(|| {
+                        super::publish::PublicationPlan::bounded(
+                            options.max_changes,
+                            options.max_preflight_bytes,
+                        )
+                    })
+                    .put_mutable(
+                        crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                        vec![(key.0.to_vec(), bytes.to_vec())],
+                    )?;
+                }
             }
             drop(read);
             if from_format <= 81 {
@@ -1913,7 +1938,24 @@ where
     if from_format <= 84 {
         super::semantic_fingerprint_format::migrate(target, true).await?;
     }
+    super::api::migrate_v86_marker(target).await?;
     crate::sync::upgrade_owned_partial_receipt(target).await?;
+    if let Some((key, bytes)) =
+        crate::sync::v2_journal_upgrade(&target.begin_read(ReadOptions::default()).await?).await?
+    {
+        write_candidate_page(
+            target,
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: crate::storage_adapter::StorageValue { bytes },
+                }],
+            },
+        )
+        .await
+        .map_err(storage_error)?;
+    }
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
         Ok(crate::sync::load_partial_replica_state(&read)
@@ -1970,14 +2012,14 @@ where
     {
         let mut write = storage
             .begin_write(WriteOptions {
-                    await_durable: true,
-                    preconditions: vec![Precondition::KeyValueEquals {
-                        space: REPOSITORY_EPOCH_SPACE,
-                        key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
-                        expected: active_pointer.clone(),
-                    }],
-                    ..WriteOptions::default()
-                })
+                await_durable: true,
+                preconditions: vec![Precondition::KeyValueEquals {
+                    space: REPOSITORY_EPOCH_SPACE,
+                    key: Key(Bytes::from_static(REPOSITORY_EPOCH_KEY)),
+                    expected: active_pointer.clone(),
+                }],
+                ..WriteOptions::default()
+            })
             .await
             .map_err(storage_error)?;
         write
@@ -2892,6 +2934,42 @@ where
     resolve_exact_pointer_commit(storage, write.commit().await, migrating).await
 }
 
+/// Claim an already-active epoch for migration. When the source is the legacy
+/// bank, persist its exact protocol marker alongside the migrating pointer so
+/// another opener can restore the source if this owner disappears. Pointerless
+/// legacy claims use `claim_legacy`, which already stages the same witness.
+async fn claim_active_migration<S>(
+    storage: &S,
+    source: &StorageAdapter<S>,
+    source_revision: Option<Bytes>,
+    migrating: &Bytes,
+    legacy_source_marker: Option<Bytes>,
+) -> Result<(), StorageError>
+where
+    S: Storage,
+{
+    let mut claim = source
+        .begin_migration_write(WriteOptions {
+            await_durable: true,
+            preconditions: vec![StorageAdapter::<S>::mutation_revision_precondition(
+                source_revision,
+            )],
+            ..WriteOptions::default()
+        })
+        .await?;
+    put_pointer(&mut claim, migrating.clone()).await?;
+    put_lease(&mut claim, Bytes::from_static(b"0")).await?;
+    if let Some(marker) = legacy_source_marker {
+        claim
+            .put_many(
+                REPOSITORY_EPOCH_SPACE,
+                single_put(REPOSITORY_EPOCH_SOURCE_MARKER_KEY, marker),
+            )
+            .await?;
+    }
+    resolve_exact_pointer_commit(storage, claim.commit().await, migrating).await
+}
+
 async fn activate_legacy<S>(
     storage: &S,
     migrating: &Bytes,
@@ -3249,7 +3327,86 @@ pub(super) mod tests {
     use super::*;
     use crate::storage_adapter::StorageWriteOptions;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct StorageHandleProbe {
+        inner: crate::Memory,
+        live_handles: Arc<AtomicUsize>,
+    }
+
+    impl StorageHandleProbe {
+        fn new() -> Self {
+            Self {
+                inner: crate::Memory::new(),
+                live_handles: Arc::new(AtomicUsize::new(1)),
+            }
+        }
+    }
+
+    impl Clone for StorageHandleProbe {
+        fn clone(&self) -> Self {
+            self.live_handles.fetch_add(1, Ordering::AcqRel);
+            Self {
+                inner: self.inner.clone(),
+                live_handles: Arc::clone(&self.live_handles),
+            }
+        }
+    }
+
+    impl Drop for StorageHandleProbe {
+        fn drop(&mut self) {
+            self.live_handles.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Storage for StorageHandleProbe {
+        type Read<'a> = MemoryRead;
+        type Write<'a> = MemoryWrite;
+
+        async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_epoch_cleanup_receipt_follows_storage_handle_release() {
+        let storage = StorageHandleProbe::new();
+        let live_handles = Arc::clone(&storage.live_handles);
+        let claim = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(91),
+        });
+        let candidate =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, claim.clone());
+        let mut cleanup = start_fresh_epoch_cleanup(storage.clone(), candidate, claim)
+            .expect("start cleanup task");
+        cleanup
+            .wait_for_claim()
+            .await
+            .expect("cleanup task claims storage");
+
+        cleanup.cleanup().await.expect("cleanup completes");
+        assert_eq!(
+            live_handles.load(Ordering::Acquire),
+            1,
+            "completion receipt must follow release of worker-owned storage handles"
+        );
+    }
 
     #[test]
     fn candidate_epoch_writes_are_durable_and_cover_snapshot_wire_spaces() {
@@ -4510,6 +4667,9 @@ pub(super) mod tests {
 #[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
 mod replica_upgrade_tests;
 
+#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+mod test_host_admission;
+
 #[cfg(test)]
 mod retained_generation_tests;
 
@@ -4588,6 +4748,8 @@ where
                 (83, false) => crate::init::REPOSITORY_PROTOCOL_V83,
                 (84, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84,
                 (84, false) => crate::init::REPOSITORY_PROTOCOL_V84,
+                (85, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85,
+                (85, false) => crate::init::REPOSITORY_PROTOCOL_V85,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

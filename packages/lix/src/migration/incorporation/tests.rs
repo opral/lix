@@ -186,6 +186,7 @@ async fn full_and_sparse_migrations_produce_identical_headers_and_accept_native_
                     uuid::Uuid::from_slice(key).unwrap().to_string(),
                 ),
                 bytes: bytes.clone(),
+                checkpoint_conversation: None,
             })
             .collect::<Vec<_>>();
         let request = NativeMetadataRequest {
@@ -256,6 +257,9 @@ async fn legacy_sql_checkpoints_preserve_members_without_inferred_provenance() {
         .await
         .unwrap();
         super::super::semantic_fingerprint_format::migrate(&adapter, false)
+            .await
+            .unwrap();
+        super::super::api::migrate_v86_marker(&adapter)
             .await
             .unwrap();
         let engine = crate::engine::Engine::new_with_adapter(
@@ -373,6 +377,9 @@ async fn legacy_headers_upgrade_without_rewriting_rows_history_or_membership() {
         .await
         .unwrap();
     super::super::semantic_fingerprint_format::migrate(&adapter, false)
+        .await
+        .unwrap();
+    super::super::api::migrate_v86_marker(&adapter)
         .await
         .unwrap();
     let engine =

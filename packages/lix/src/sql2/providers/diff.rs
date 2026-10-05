@@ -2910,6 +2910,7 @@ mod tests {
             &context,
             SqlChangelogQuerySource { store },
             Arc::new(PublicCatalog::fixed_system().clone()),
+            None,
             blob_reader,
         );
         let allowed = [b"before".as_slice(), b"after".as_slice()].map(|bytes| {

@@ -394,20 +394,47 @@ where
     Ok(true)
 }
 
-async fn ensure_global_upload<S: Storage + Clone + Send + Sync + 'static>(
+async fn ensure_global_upload<S, C>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
-) -> Result<(), LixError> {
-    let read = storage.begin_read(Default::default()).await?;
-    let prepared = partial_upload::prepare_partial_ordinary_upload(
-        &read,
-        state,
-        crate::GLOBAL_BRANCH_ID,
-        uuid::Uuid::now_v7().to_string(),
-        32,
-        1024 * 1024,
-    )
-    .await?;
+    transport: &HttpSyncTransport<C>,
+    wrapper: &TimedLeasedPartialDescriptor,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    let leased = transport.fork_native_baseline_lease(&wrapper.wire.lease)?;
+    let mut seen = BTreeSet::new();
+    let (read, prepared) = loop {
+        wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
+        let read = storage.begin_read(Default::default()).await?;
+        match partial_upload::prepare_partial_ordinary_upload(
+            &read,
+            state,
+            crate::GLOBAL_BRANCH_ID,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        {
+            Ok(prepared) => break (read, prepared),
+            Err(error) => {
+                drop(read);
+                partial_runtime::hydrate_upload_demand(
+                    storage,
+                    state,
+                    &leased,
+                    error,
+                    &mut seen,
+                    Some((&wrapper.deadline, &wrapper.wire.lease.lease_id)),
+                    partial_runtime::MAX_UPLOAD_NATIVE_DEMANDS,
+                )
+                .await?;
+            }
+        }
+    };
     let Some(prepared) = prepared else {
         return Ok(());
     };
@@ -475,7 +502,7 @@ where
             .await;
         }
         if existing.is_none() {
-            ensure_global_upload(&storage, &previous).await.map_err(|error| {
+            ensure_global_upload(&storage, &previous, transport, &wrapper).await.map_err(|error| {
                 if error.code=="LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" {
                     LixError::new("LIX_PARTIAL_GLOBAL_SELECTED_RECONCILIATION_REQUIRED",
                         "created branch source requires selected publication before GLOBAL reconciliation; pending data remains retained")
@@ -627,7 +654,15 @@ where
                 match result {
                     Ok(()) => break,
                     Err(error) => {
-                        hydrate_error(&storage, &previous, &leased, error, &mut seen).await?
+                        hydrate_error(
+                            &storage,
+                            &previous,
+                            &leased,
+                            error,
+                            &mut seen,
+                            Some((&basis.deadline, &basis.wire.lease.lease_id)),
+                        )
+                        .await?
                     }
                 }
             }
@@ -641,7 +676,12 @@ where
         // conflicting selected history as a GLOBAL success.
         let selected = &previous.descriptor().selected_branch.branch_id;
         if selected != crate::GLOBAL_BRANCH_ID {
-            for _ in 0..68 {
+            let basis = transport.partial_replica_descriptor(Some(selected)).await?;
+            let leased = transport.fork_native_baseline_lease(&basis.wire.lease)?;
+            let mut seen = BTreeSet::new();
+            let mut successful_uploads = 0;
+            loop {
+                basis.deadline.check(&basis.wire.lease.lease_id)?;
                 let storage_ref = &storage;
                 let state_ref = previous.as_ref();
                 let result = partial_upload_cycle::upload_partial_once(
@@ -664,14 +704,54 @@ where
                 .await;
                 match result {
                     Ok(false) => break,
-                    Ok(true) => {}
+                    Ok(true) => {
+                        successful_uploads += 1;
+                        seen.clear();
+                        if successful_uploads >= 68 {
+                            let read = storage.begin_read(Default::default()).await?;
+                            let (push, _, _) = partial_push_state::load_partial_push_state(
+                                &read, &previous, selected,
+                            )
+                            .await?;
+                            let control = crate::branch::BranchHeadControlContext::new()
+                                .reader(&read)
+                                .load(selected)
+                                .await?
+                                .ok_or_else(|| unresolved("selected upload branch disappeared"))?;
+                            let clean = push.prepared.is_none()
+                                && control.head_commit_id == push.confirmed.head
+                                && control
+                                    .working_diff_checkpoint_commit_id
+                                    .map(|id| id.to_string())
+                                    .as_ref()
+                                    == Some(&push.confirmed.checkpoint);
+                            drop(read);
+                            if clean {
+                                break;
+                            }
+                            return Err(unresolved(
+                                "selected upload drain exceeded its bounded wave count with pending work",
+                            ));
+                        }
+                    }
                     Err(error) if error.code == LixError::CODE_TRANSACTION_CONFLICT => {
                         return Err(LixError::new(
                             "LIX_PARTIAL_GLOBAL_SELECTED_RECONCILIATION_REQUIRED",
                             "selected divergence requires reconciliation; GLOBAL outcome and all pending edits remain retained",
                         ));
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        partial_runtime::hydrate_upload_demand(
+                            &storage,
+                            &previous,
+                            &leased,
+                            error,
+                            &mut seen,
+                            Some((&basis.deadline, &basis.wire.lease.lease_id)),
+                            partial_runtime::MAX_UPLOAD_NATIVE_DEMANDS,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -693,18 +773,14 @@ async fn hydrate_error<S, C>(
     transport: &HttpSyncTransport<C>,
     error: LixError,
     seen: &mut BTreeSet<String>,
+    deadline: Option<(&http::CandidateBaselineDeadline, &str)>,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
     C: RawHttpClient + Clone + 'static,
 {
-    let Some(demand) = runtime::native_sync_demand_request_for_error(&error)? else {
-        return Err(error);
-    };
-    if seen.len() >= 4096 || !seen.insert(format!("{demand:?}")) {
-        return Err(unresolved("GLOBAL proof repeated a hydrated native input"));
-    }
-    partial_runtime::hydrate_demand(storage, state, transport, demand).await
+    partial_runtime::hydrate_upload_demand(storage, state, transport, error, seen, deadline, 4096)
+        .await
 }
 
 /// Recover a published ordinary creation group even if its ACK was lost and a
@@ -752,7 +828,17 @@ where
         match result {
             Ok(false) => return Ok(false),
             Ok(true) => break,
-            Err(error) => hydrate_error(storage, state, &leased, error, &mut seen).await?,
+            Err(error) => {
+                hydrate_error(
+                    storage,
+                    state,
+                    &leased,
+                    error,
+                    &mut seen,
+                    Some((&wrapper.deadline, &wrapper.wire.lease.lease_id)),
+                )
+                .await?
+            }
         }
     }
     for child in &upload.created_refs {
@@ -801,7 +887,15 @@ where
                     ));
                 }
                 Err(error) => {
-                    hydrate_error(storage, state, &child_transport, error, &mut seen).await?
+                    hydrate_error(
+                        storage,
+                        state,
+                        &child_transport,
+                        error,
+                        &mut seen,
+                        Some((&child_wrapper.deadline, &child_wrapper.wire.lease.lease_id)),
+                    )
+                    .await?
                 }
             }
         }

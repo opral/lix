@@ -214,6 +214,12 @@ where
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         if before.role == RepositoryRole::PartialReplica {
             super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
+            if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+                plan.put_mutable(
+                    crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                    vec![(key.0.to_vec(), bytes.to_vec())],
+                )?;
+            }
         }
         read.finish()?;
         Box::pin(super::hot_indexes::append_plan(
@@ -263,7 +269,7 @@ where
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84))
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84 | 85))
         || (before.role == RepositoryRole::PartialReplica && before.current)
     {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
@@ -275,6 +281,12 @@ where
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         if before.role == RepositoryRole::PartialReplica {
             super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
+            if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+                plan.put_mutable(
+                    crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                    vec![(key.0.to_vec(), bytes.to_vec())],
+                )?;
+            }
         }
         read.finish()?;
         if before.format.is_some_and(|format| format <= 81) {
@@ -294,7 +306,7 @@ where
             read.finish()?;
         }
         (
-            "v85-migration-plan-v1",
+            "v86-migration-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -473,7 +485,7 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
 
-    async fn expected_v85_digest<S>(storage: &S) -> String
+    async fn expected_v86_digest<S>(storage: &S) -> String
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
@@ -519,7 +531,7 @@ mod tests {
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
-        let before = expected_v85_digest(&storage).await;
+        let before = expected_v86_digest(&storage).await;
         let inspection = inspect_repository(storage.clone()).await.unwrap();
         assert_eq!(inspection.format, Some(80));
         assert!(!inspection.current);
@@ -616,7 +628,7 @@ mod tests {
         );
         lix.close().await.unwrap();
 
-        let before = expected_v85_digest(&storage).await;
+        let before = expected_v86_digest(&storage).await;
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
@@ -711,8 +723,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_legacy_formats_to_v85_preserve_admission_and_resident_records_offline() {
-        for (format, receipt_version) in [79, 80, 81, 82, 83, 84, crate::init::CURRENT_FORMAT_VERSION]
+    async fn partial_legacy_formats_to_v86_preserve_admission_and_resident_records_offline() {
+        for (format, receipt_version) in [79, 80, 81, 82, 83, 84, 85, crate::init::CURRENT_FORMAT_VERSION]
             .into_iter()
             .flat_map(|format| [1, 2, 3].map(|version| (format, version)))
         {
@@ -757,7 +769,7 @@ mod tests {
             if format <= 81 {
                 // A sparse cache cannot certify whole-collection completeness.
                 // The v79-v81 upgrade retires old index records without
-                // requesting hydration; v82 through v85 preserve it.
+                // requesting hydration; v82 through v86 preserve it.
                 writes.put(
                     crate::hot_state::INDEX_SPACE,
                     b"old-untrusted-index".as_slice(),
@@ -854,7 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v82_journal_v2_requires_rebootstrap_without_publishing_candidate() {
+    async fn partial_v82_journal_v2_is_losslessly_upgraded_before_publication() {
         let authority = crate::open_lix().await.unwrap();
         let state = crate::sync::PartialReplicaState::new(
             format!("https://example.test/lix/{}", authority.lix_id()),
@@ -880,7 +892,7 @@ mod tests {
             journal_key.as_slice(),
             serde_json::to_vec(&serde_json::json!({
                 "version": 2,
-                "epochId": state.epoch_id(),
+                "epochId": "00000000-0000-7000-8000-000000000598",
                 "recipes": [{
                     "kind": "filesystem_paths",
                     "file_ids": ["selected-file"],
@@ -902,14 +914,58 @@ mod tests {
         super::super::epoch::stage_repository_format_for_test(&storage, true, 82)
             .await
             .unwrap();
-        let before = content_digest(&storage).await.unwrap();
-        let error = migrate_repository(storage.clone()).await.unwrap_err();
-        assert!(
-            error.to_string().contains("fresh partial-replica bootstrap"),
-            "the hard cut must explain recovery: {error}"
-        );
+        let rejected_source_digest = content_digest(&storage).await.unwrap();
+        assert!(migrate_repository(storage.clone()).await.is_err());
         assert_eq!(inspect_repository(storage.clone()).await.unwrap().format, Some(82));
-        assert_eq!(content_digest(&storage).await.unwrap(), before);
+        assert_eq!(content_digest(&storage).await.unwrap(), rejected_source_digest);
+        // The failed migration attempt fences its source adapter. Repair the
+        // deliberately invalid source journal through a newly inspected view.
+        let retry_adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        let mut retry_writes = retry_adapter.new_write_set();
+        retry_writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            journal_key.as_slice(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "epochId": state.epoch_id(),
+                "recipes": [{
+                    "kind": "filesystem_paths",
+                    "file_ids": ["selected-file"],
+                    "branch_ids": [state.descriptor().selected_branch.branch_id],
+                    "include_blob_refs": false,
+                    "cache_small_blob_data": false
+                }],
+            })).unwrap(),
+        );
+        let mut retry_write = retry_adapter.begin_migration_write(Default::default()).await.unwrap();
+        retry_writes.lower_into(&mut retry_write).await.unwrap();
+        retry_write.commit().await.unwrap();
+        let report = migrate_repository(storage.clone()).await.unwrap();
+        assert_eq!(report.before.format, Some(82));
+        assert!(report.semantic_preservation_verified);
+        assert_eq!(report.expected_content_digest, report.after_content_digest);
+        let current = super::super::epoch::inspect_existing_epoch_adapter(&storage).await.unwrap();
+        let read = current.begin_read(Default::default()).await.unwrap();
+        let (migrated_state, _) = crate::sync::load_partial_replica_state(&read)
+            .await.unwrap().unwrap();
+        crate::sync::validate_partial_read_interest_journal(&read, &migrated_state)
+            .await.unwrap();
+        let value = PointReadPlan::new(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            &[StorageKey(Bytes::copy_from_slice(&journal_key))],
+        ).materialize(&read, Default::default()).await.unwrap().value.pop().flatten();
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            panic!("upgraded interest journal is missing");
+        };
+        let journal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(journal["version"], 3);
+        assert_eq!(
+            journal["recipes"][0]["scope"],
+            serde_json::json!({"file_ids":["selected-file"]})
+        );
+        drop(read);
     }
 
     #[tokio::test]

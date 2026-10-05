@@ -302,6 +302,7 @@ where
             session,
             ctx.changelog_query_source(),
             Arc::clone(&catalog),
+            ctx.read_interest_registry(),
             ctx.blob_reader(),
         );
     }

@@ -1045,6 +1045,27 @@ async fn admission_recovers_from_gateway_and_network_failures_without_mutations(
 }
 
 #[tokio::test]
+async fn admission_sends_server_and_sync_protocol_versions() {
+    let http = ScriptHttp::default();
+    http.push_json(200, admission_identity());
+    super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap();
+
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0].headers;
+    assert!(headers.iter().any(|(name, value)| {
+        name == "lix-server-protocol-version"
+            && value == &crate::SERVER_PROTOCOL_VERSION.to_string()
+    }));
+    assert!(headers.iter().any(|(name, value)| {
+        name == "lix-sync-protocol-version"
+            && value == &crate::SYNC_PROTOCOL_VERSION.to_string()
+    }));
+}
+
+#[tokio::test]
 async fn admission_retry_budget_exhausts_and_terminal_responses_are_not_retried() {
     let http = ScriptHttp::default();
     for _ in 0..5 {

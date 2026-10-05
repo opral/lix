@@ -68,6 +68,126 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
         expected.rows()
     );
 }
+
+#[tokio::test]
+async fn active_checkpoint_retirement_interest_rebases_authority_state() {
+    let authority = open_lix().await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_file(path, content) VALUES ('/retirement-rebase.md', $1)",
+            &[Value::Blob(b"before".to_vec().into())],
+        )
+        .await
+        .unwrap();
+    let checkpoint_id = authority.create_checkpoint().await.unwrap().commit_id;
+
+    let (authority, engine, session, old) = fixture_from_authority(authority, None).await;
+    let storage = engine.storage();
+    let query = "SELECT commit_id FROM lix_log() WHERE is_checkpoint AND commit_id = $1";
+    let before = execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        query,
+        &[Value::Text(checkpoint_id.clone())],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before.rows().len(), 1);
+    assert_eq!(
+        before.rows()[0].get::<String>("commit_id").unwrap(),
+        checkpoint_id
+    );
+
+    let key = crate::tracked_state::TrackedStateKey {
+        schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
+        file_id: None,
+        row_pk: crate::row_pk::RowPk::uuid_from_canonical(&checkpoint_id).unwrap(),
+    };
+    let registry = engine.sync_mode().read_interests().unwrap();
+    let contains_retirement_interest = |snapshot: &crate::hot_state::ReadInterestSnapshot| {
+        snapshot.interests.iter().any(|interest| match interest.as_ref() {
+            crate::hot_state::LogicalReadInterest::Exact { rows, .. } => rows.iter().any(|row| {
+                row.schema_key == key.schema_key
+                    && row.branch_id == old.descriptor().selected_branch.branch_id
+                    && row.row_pk == key.row_pk
+            }),
+            _ => false,
+        })
+    };
+    assert!(contains_retirement_interest(&registry.snapshot().unwrap()));
+    crate::sync::partial_interest_journal::flush_partial_read_interests(
+        &storage, &old, &registry,
+    )
+    .await
+    .unwrap();
+
+    authority
+        .execute(
+            "SELECT commit_id FROM lix_undo($1)",
+            &[Value::Text(checkpoint_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert!(
+        authority
+            .execute(query, &[Value::Text(checkpoint_id.clone())])
+            .await
+            .unwrap()
+            .is_empty(),
+        "authority must retire the checkpoint before rebase"
+    );
+
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+
+    // Deliberately use the raw local session after candidate publication: an
+    // absent demanded state must fail here rather than being hidden by a
+    // post-rebase authority hydration helper.
+    assert!(
+        session
+            .execute(query, &[Value::Text(checkpoint_id.clone())])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut tracked = crate::tracked_state::TrackedStateContext::new().reader(&read);
+    let rows = tracked
+        .load_projected_batch_at_commit(
+            &next.descriptor().selected_branch.head.commit_id,
+            std::slice::from_ref(&key),
+            &crate::changelog::ChangeRecordProjection::from_columns(&[
+                "snapshot_content".into(),
+            ]),
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .row(0)
+        .expect("rebase must install the exact retirement row");
+    let state: serde_json::Value = serde_json::from_str(
+        row.snapshot_content()
+            .expect("retirement row must carry its state snapshot")
+            .as_str(),
+    )
+    .unwrap();
+    assert_eq!(state["state"]["retired"], true);
+}
+
 #[tokio::test]
 async fn joined_checkpoint_history_hydrates_active_selection_and_replays_offline() {
     let authority = open_lix().await.unwrap();

@@ -266,8 +266,8 @@ async fn mainline_checkpoint_retirement_batches_count_windows_and_keeps_pages_la
             checkpoint_ids[checkpoint_ids.len() - 1 - index]
         );
     }
-    assert_eq!(crate::sql2::take_checkpoint_retirement_work(), (5, 5));
-    assert_eq!(crate::sql2::take_mainline_metadata_work(), (5, 5));
+    assert_eq!(crate::sql2::take_checkpoint_retirement_work(), (1, 5));
+    assert_eq!(crate::sql2::take_mainline_metadata_work(), (1, 5));
 
     // A plain COUNT(*) asks DataFusion for no log columns. The zero-column
     // projection still needs to preserve the source's row count while using

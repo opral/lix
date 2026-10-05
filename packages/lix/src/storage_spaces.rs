@@ -135,6 +135,14 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
         "checkpoint.conversation.v1",
         ValueSemantics::Mutable,
     ),
+    // The constant is declared in checkpoint_conversation.rs, but reference
+    // its raw descriptor here to avoid making the checked constructor recurse
+    // through this registry while it is being evaluated.
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000e),
+        "sync.partial_checkpoint_conversation_coverage.v1",
+        ValueSemantics::Mutable,
+    ),
     crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
 ];
 
@@ -240,6 +248,11 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_000d),
         "checkpoint.conversation.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000e),
+        "sync.partial_checkpoint_conversation_coverage.v1",
         ValueSemantics::Mutable,
     ),
 ];

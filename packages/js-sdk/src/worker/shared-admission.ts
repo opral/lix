@@ -2,9 +2,10 @@ import { HttpTransportError, type HttpTransport } from "../http-transport.js";
 import { initializeWasm } from "../wasm-init.js";
 import { emitOpenProgress } from "../open-progress.js";
 import type { LixOpenProgress, LixOpenReport } from "../types.js";
+import { compatibility } from "@lix-js/sdk/compatibility";
 
-export const ADMISSION_PROTOCOL_EPOCH = 25;
-export const ADMISSION_STORAGE_EPOCH = 85;
+export const ADMISSION_PROTOCOL_EPOCH = compatibility.syncProtocolVersion;
+export const ADMISSION_STORAGE_EPOCH = compatibility.storageFormatVersion;
 export type AdmissionIdentity = {
   repositoryId: string;
   principalId: string;

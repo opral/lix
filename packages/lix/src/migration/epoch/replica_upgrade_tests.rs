@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Authority {
     url: String,
+    storage: crate::Memory,
     stop: Arc<AtomicBool>,
     fail_snapshot: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -62,7 +63,7 @@ impl Authority {
         }
         lix.close().await.unwrap();
         let protocol = crate::open_lix()
-            .with_storage(storage)
+            .with_storage(storage.clone())
             .serve()
             .with_embedded_lix_id()
             .await
@@ -121,6 +122,7 @@ impl Authority {
         });
         Self {
             url,
+            storage,
             stop,
             fail_snapshot,
             worker: Some(worker),
@@ -175,7 +177,16 @@ fn serve_request(
     }
     let mut body = vec![0; length];
     stream.read_exact(&mut body)?;
-    let response = if fail.load(Ordering::Acquire) && path.contains("/sync/pull") {
+    let request = request.body(ServerProtocolBody::full(body)).unwrap();
+    let response = if let Some(host_response) = test_host_admission::response(
+        request.method(),
+        request.uri(),
+        request.headers(),
+        protocol.lix_id(),
+    ) {
+        let (parts, body) = host_response.into_parts();
+        http::Response::from_parts(parts, ServerProtocolBody::full(body))
+    } else if fail.load(Ordering::Acquire) && path.contains("/sync/pull") {
         http::Response::builder()
             .status(503)
             .body(ServerProtocolBody::full(
@@ -183,10 +194,7 @@ fn serve_request(
             ))
             .unwrap()
     } else {
-        runtime.block_on(protocol.handle(
-            request.body(ServerProtocolBody::full(body)).unwrap(),
-            ServerProtocolContext::anonymous(),
-        ))
+        runtime.block_on(protocol.handle(request, ServerProtocolContext::anonymous()))
     };
     let (parts, body) = response.into_parts();
     let bytes = runtime.block_on(body.collect()).unwrap().to_bytes();
@@ -615,14 +623,9 @@ async fn pending_conversion_journal_blocks_format_upgrade_without_changing_sourc
     let authority = Authority::new().await;
     for format in [81, 82] {
         let memory = crate::Memory::new();
-        let source = old_replica_with_recovery_data(
-            &authority,
-            EpochBank::A,
-            false,
-            true,
-            memory.clone(),
-        )
-        .await;
+        let source =
+            old_replica_with_recovery_data(&authority, EpochBank::A, false, true, memory.clone())
+                .await;
         drop(source);
         let storage = crate::storage_adapter::StorageSession::acquire(
             crate::sync::durable_memory_for_test(memory),
@@ -1196,7 +1199,7 @@ async fn legacy_dirty_archive_survives_partial_conversion_and_remains_exportable
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn normal_open_retains_dirty_legacy_replica_without_archiving_pending_work() {
+async fn normal_open_preserves_dirty_legacy_replica_for_recovery_without_uploading_it() {
     let authority = Authority::new().await;
     let memory = crate::Memory::new();
     let source =
@@ -1204,38 +1207,224 @@ async fn normal_open_retains_dirty_legacy_replica_without_archiving_pending_work
             .await;
     drop(source);
     let storage = crate::sync::durable_memory_for_test(memory);
-    let owned = crate::storage_adapter::StorageSession::acquire(storage.clone())
+    let partial = crate::open_lix()
+        .with_storage(storage.clone())
+        .with_server(authority.options())
+        .await
+        .expect("authenticated legacy open preserves dirty source as recovery data");
+    let rows = partial
+        .execute(
+            "SELECT key, value FROM lix_key_value WHERE key = 'upgrade-test'",
+            &[],
+        )
         .await
         .unwrap();
-    let before = crate::migration::public_api::content_digest(&owned)
+    assert_eq!(rows.rows().len(), 1);
+    let sources = partial.replica_recovery_sources().await.unwrap();
+    assert_eq!(sources.len(), 2);
+    let recovery_source = sources
+        .iter()
+        .find(|source| source.recovery_required)
+        .expect("dirty v77 source is retained for explicit recovery");
+    let archive = partial
+        .export_replica_recovery(&recovery_source.id)
         .await
         .unwrap();
-    let pointer = load_pointer(&owned).await.unwrap();
-    drop(owned);
+    let archived_rows = archive
+        .branches
+        .iter()
+        .flat_map(|branch| &branch.rows)
+        .collect::<Vec<_>>();
+    assert!(archived_rows.iter().any(|row| {
+        row.untracked
+            && row.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.get("key").and_then(serde_json::Value::as_str)
+                    == Some("local-only-upgrade-test")
+            })
+    }));
+    assert!(archived_rows.iter().any(|row| {
+        row.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.get("key").and_then(serde_json::Value::as_str) == Some("offline-recovery")
+        })
+    }));
+    partial.close().await.unwrap();
+
+    let remote = crate::open_lix()
+        .with_storage(authority.storage.clone())
+        .await
+        .unwrap();
+    let remote_rows = remote
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key IN ('offline-recovery', 'local-only-upgrade-test')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        remote_rows.rows().is_empty(),
+        "legacy pending edits must never be published during recovery admission"
+    );
+    remote.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_legacy_open_rejects_wrong_authority_without_changing_source() {
+    let authority = Authority::new().await;
+    let wrong_authority = Authority::new().await;
+    let memory = crate::Memory::new();
+    let source =
+        old_replica_with_recovery_data(&authority, EpochBank::Legacy, true, true, memory.clone())
+            .await;
+    drop(source);
+    let storage = crate::sync::durable_memory_for_test(memory);
+    let before = crate::storage_adapter::StorageSession::acquire(storage.clone())
+        .await
+        .unwrap();
+    let digest_before = crate::migration::public_api::content_digest(&before)
+        .await
+        .unwrap();
+    let pointer_before = load_pointer(&before).await.unwrap();
+    drop(before);
+
+    let error = crate::open_lix()
+        .with_storage(storage.clone())
+        .with_server(wrong_authority.options())
+        .await
+        .err()
+        .expect("wrong authority must not claim a dirty source");
+    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+
+    let after = crate::storage_adapter::StorageSession::acquire(storage.clone())
+        .await
+        .unwrap();
+    assert_eq!(load_pointer(&after).await.unwrap(), pointer_before);
+    assert_eq!(
+        crate::migration::public_api::content_digest(&after)
+            .await
+            .unwrap(),
+        digest_before
+    );
+    assert!(
+        list_retained_replica_sources(&after)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(after);
+
+    // Authentication alone is not enough to publish: a failed source rebuild
+    // must leave the original dirty bank and pointer available for retry.
+    authority.fail_snapshot.store(true, Ordering::Release);
     let error = crate::open_lix()
         .with_storage(storage.clone())
         .with_server(authority.options())
         .await
         .err()
-        .expect("pending legacy work requires recovery");
-    assert_eq!(
-        error.code,
-        "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED"
-    );
-    let owned = crate::storage_adapter::StorageSession::acquire(storage)
+        .expect("failed authenticated rebuild must not publish a replacement");
+    assert_eq!(error.code, "TEST_UNAVAILABLE");
+    let after_failure = crate::storage_adapter::StorageSession::acquire(storage)
         .await
         .unwrap();
-    assert_eq!(load_pointer(&owned).await.unwrap(), pointer);
+    assert_eq!(load_pointer(&after_failure).await.unwrap(), pointer_before);
     assert_eq!(
-        crate::migration::public_api::content_digest(&owned)
+        crate::migration::public_api::content_digest(&after_failure)
             .await
             .unwrap(),
-        before
+        digest_before
     );
     assert!(
-        list_retained_replica_sources(&owned)
+        list_retained_replica_sources(&after_failure)
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_legacy_migration_claim_retains_exact_source_marker_for_recovery() {
+    let authority = Authority::new().await;
+    let authenticated = crate::sync::authenticate_partial_conversion(authority.options(), None)
+        .await
+        .unwrap();
+    let state = authenticated.state().clone();
+    let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+    let installed = install_fresh_partial_epoch(storage.clone(), &state)
+        .await
+        .unwrap();
+    let source = installed.adapter;
+    let (
+        PointerState::Active {
+            bank: EpochBank::Legacy,
+            format,
+            generation,
+            ..
+        },
+        _source_pointer,
+    ) = load_pointer(&storage).await.unwrap().unwrap()
+    else {
+        panic!("fixture must begin in an active legacy bank");
+    };
+    let source_marker = load_storage_value(
+        &storage,
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        crate::init::REPOSITORY_PROTOCOL_KEY,
+    )
+    .await
+    .unwrap()
+    .expect("active legacy source has an exact protocol marker");
+    let source_revision = source.load_mutation_revision().await.unwrap();
+    let migrating = encode_pointer(PointerState::Migrating {
+        source: EpochBank::Legacy,
+        source_format: format,
+        target: EpochBank::A,
+        generation: generation + 1,
+        attempt: uuid::Uuid::now_v7(),
+    });
+    claim_active_migration(
+        &storage,
+        &source,
+        source_revision,
+        &migrating,
+        Some(source_marker.clone()),
+    )
+    .await
+    .unwrap();
+    let stored_marker = load_source_marker(&storage)
+        .await
+        .unwrap()
+        .expect("active legacy claim atomically stores its recovery witness");
+    assert_eq!(stored_marker, source_marker);
+    let lease = load_lease(&storage).await.unwrap().unwrap();
+    recover_interrupted_migration(
+        &storage,
+        decode_pointer(&migrating).unwrap(),
+        &migrating,
+        Some(&lease),
+        Some(&stored_marker),
+    )
+    .await
+    .unwrap();
+    assert!(load_pointer(&storage).await.unwrap().is_none());
+    assert_eq!(
+        load_storage_value(
+            &storage,
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+        )
+        .await
+        .unwrap(),
+        Some(source_marker)
+    );
+    assert!(load_source_marker(&storage).await.unwrap().is_none());
+    // Recovery only unwinds control metadata; all source admission records stay.
+    let restored = StorageAdapter::new(storage.clone());
+    let read = restored.begin_read(ReadOptions::default()).await.unwrap();
+    assert_eq!(
+        crate::sync::load_partial_replica_state(&read)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        state
     );
 }

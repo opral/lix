@@ -4058,6 +4058,18 @@ mod tests {
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
                 (crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0, 10,), // unconditional canonical sync-state alias cleanup descriptors
                 (crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE.id.0, 10), // private checkpoint provenance cleanup
+                (
+                    crate::checkpoint_conversation::CHECKPOINT_CONVERSATION_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // commit-owned conversation pointer cleanup
+                (
+                    crate::checkpoint_conversation::PARTIAL_CHECKPOINT_CONVERSATION_COVERAGE_SPACE
+                        .id
+                        .0,
+                    10,
+                ), // paired epoch-bound absence-proof cleanup
             ]
         );
         assert_eq!(

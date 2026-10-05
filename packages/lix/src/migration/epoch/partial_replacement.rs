@@ -41,7 +41,11 @@ impl PartialReplacementSource {
         self.format
     }
 
-    pub(crate) async fn require_preserving_upgrade<S>(&self, storage: &S) -> Result<(), LixError>
+    pub(crate) async fn require_preserving_upgrade<S>(
+        &self,
+        storage: &S,
+        authenticated_state: Option<&crate::sync::PartialReplicaState>,
+    ) -> Result<(), LixError>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
@@ -51,11 +55,27 @@ impl PartialReplacementSource {
         let adapter = StorageAdapter::for_epoch_unfenced(storage.clone(), self.bank);
         let read = adapter.begin_read(ReadOptions::default()).await?;
         let proof = crate::sync::inspect_replica_rebuild_source(&read, self.format).await?;
-        if proof.is_none_or(|proof| proof.recovery_required) {
+        let Some(proof) = proof else {
             return Err(LixError::new(
                 "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
-                "older full replica has pending work requiring recovery before upgrade; source retained unchanged",
+                "older full replica lacks authenticated rebuild coordinates; source retained unchanged",
             ));
+        };
+        if proof.recovery_required {
+            let Some(state) = authenticated_state else {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
+                    "older full replica has pending work requiring recovery before upgrade; source retained unchanged",
+                ));
+            };
+            if proof.repository_id != state.repository_id()
+                || proof.account_id != state.active_account_id()
+            {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                    "authenticated authority differs from the pending legacy replica identity; source retained unchanged",
+                ));
+            }
         }
         Ok(())
     }

@@ -83,7 +83,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     loop {
-        match Box::pin(prepare_partial_open_once(storage.clone(), server.clone(), progress)).await {
+        match Box::pin(prepare_partial_open_once(
+            storage.clone(),
+            server.clone(),
+            progress,
+        ))
+        .await
+        {
             Err(error)
                 if error.code == "LIX_PARTIAL_OPEN_RETRY"
                     || error.code == LixError::CODE_STORAGE_FENCED =>
@@ -121,7 +127,8 @@ where
                     "configured authority differs from durable partial admission",
                 ));
             }
-            let transport = connect_existing_authority(&admitted.state, server.as_ref(), progress).await?;
+            let transport =
+                connect_existing_authority(&admitted.state, server.as_ref(), progress).await?;
             return Ok(PreparedPartialOpen {
                 adapter: admitted.adapter,
                 state: Arc::new(admitted.state),
@@ -151,8 +158,35 @@ where
                 ));
             }
         }
-        source.require_preserving_upgrade(&storage).await?;
         let from_format = source.format();
+        // A dirty pre-v80 full replica cannot be migrated as an ordinary
+        // background open: its acknowledged remote image must first be
+        // authenticated, and the old bank must become a recovery archive.
+        // The full-repository migrator below performs that fenced rebuild
+        // without uploading local pending rows; bind the proof before it may
+        // claim or publish any candidate epoch.
+        let authenticated_source = if !source.is_partial() && from_format < 80 {
+            if let Some(configured) = server.clone() {
+                Some(
+                    authenticate_partial_source_conversion_with_progress(
+                        configured, None, progress,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        source
+            .require_preserving_upgrade(
+                &storage,
+                authenticated_source
+                    .as_ref()
+                    .map(|authenticated| authenticated.state()),
+            )
+            .await?;
         let admitted = if source.is_partial() {
             // Sparse upgrades retain both the authenticated admission and every
             // resident record, including pending work, without contacting a server.
@@ -165,9 +199,13 @@ where
                     "full replica conversion requires its authenticated authority; source retained",
                 )
             })?;
-            let authenticated =
-                authenticate_partial_source_conversion_with_progress(configured, None, progress)
-                    .await?;
+            let authenticated = match authenticated_source {
+                Some(authenticated) => authenticated,
+                None => {
+                    authenticate_partial_source_conversion_with_progress(configured, None, progress)
+                        .await?
+                }
+            };
             crate::migration::convert_clean_replica_to_partial(&storage, &authenticated, progress)
                 .await?
         };

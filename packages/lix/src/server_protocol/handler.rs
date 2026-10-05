@@ -11692,6 +11692,7 @@ mod tests {
         let foreign_commit = json!({
             "commitId": crate::changelog::CommitId::for_test_label("foreign-sync-author").to_string(),
             "isCheckpoint": false,
+            "checkpointConversationId": null,
             "parentCommitIds": [],
             "globalScope": true,
             "baseCommitId": null,

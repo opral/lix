@@ -92,7 +92,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83 | 84),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83 | 84 | 85),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -246,6 +246,9 @@ where
     if from_version <= 84 {
         migration_step(|| super::semantic_fingerprint_format::migrate(&adapter, false)).await?;
     }
+    if from_version <= 85 {
+        migration_step(|| migrate_v86_marker(&adapter)).await?;
+    }
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
     }
@@ -257,6 +260,57 @@ where
             + legacy_commit_records_rewritten,
         commit_members_rewritten,
     })
+}
+
+/// v86 registers the epoch-scoped partial metadata coverage cache. The cache
+/// starts empty; this marker-only publication gives old repositories an
+/// explicit format boundary without rewriting packed history or guessing
+/// negative coverage from sparse local rows.
+pub(super) async fn migrate_v86_marker<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let marker = load_repository_protocol_marker(adapter)
+        .await?
+        .ok_or_else(|| migration_error("v86 format migration has no repository marker"))?;
+    if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_VALUE
+        || marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE
+    {
+        return Ok(());
+    }
+    let (expected, next) = if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V85 {
+        (
+            crate::init::REPOSITORY_PROTOCOL_V85,
+            crate::init::REPOSITORY_PROTOCOL_VALUE,
+        )
+    } else if marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85 {
+        (
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+        )
+    } else {
+        return Err(migration_error(
+            "v86 format migration observed an unexpected repository marker",
+        ));
+    };
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
+    let revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    read.finish().map_err(storage_error)?;
+    crate::migration::publish::publish(
+        adapter,
+        revision,
+        expected,
+        next,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Persists the additive `lix_account.profile_uri` amendment in every live

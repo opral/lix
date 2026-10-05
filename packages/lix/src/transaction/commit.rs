@@ -271,6 +271,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .map(|_| prepared_writes.file_content_writes[0].file_id.clone());
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
+    let partial_admission = crate::sync::load_partial_replica_state(read).await?;
+    let partial_epoch = partial_admission
+        .as_ref()
+        .map(|(state, _)| state.epoch_id().to_owned());
+    let mut needs_partial_admission_guard = false;
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
@@ -280,7 +285,25 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 publication.recovery_ref.checkpoint_commit_id,
                 conversation_id,
             )?;
+        } else if let Some(epoch_id) = partial_epoch.as_deref() {
+            let (space, key, _) = crate::checkpoint_conversation::stage_partial_null_coverage(
+                &mut writes,
+                epoch_id,
+                publication.recovery_ref.checkpoint_commit_id,
+            )?;
+            preconditions.push(StoragePrecondition::KeyAbsent { space, key });
+            needs_partial_admission_guard = true;
         }
+    }
+    if needs_partial_admission_guard {
+        let (_, receipt) = partial_admission
+            .as_ref()
+            .expect("partial epoch came from admission receipt");
+        preconditions.push(StoragePrecondition::KeyValueEquals {
+            space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            key: crate::sync::partial_replica_state_key(),
+            expected: receipt.clone(),
+        });
     }
     let ordered_replacements = prepared_writes
         .commit_change_refs_by_branch

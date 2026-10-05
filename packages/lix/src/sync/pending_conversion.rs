@@ -505,7 +505,69 @@ where
     })
 }
 
+/// Retry only the durable conversion journal, never arbitrary executions.
+/// Each replay authenticates the same repository/account and resumes its frozen
+/// attempt IDs and prepared frontier. A lost acknowledgement cannot create a
+/// second merge. Exhaustion leaves the source and journal available for reopen.
 pub(crate) async fn reconcile_pending_conversion_authenticated<
+    S: Storage + Clone + Send + Sync + 'static,
+>(
+    source: &StorageAdapter<S>,
+    journal: &mut impl ConversionJournalOwner,
+    authenticated: &AuthenticatedPartialConversion,
+) -> Result<ReconciledPendingConversion, LixError> {
+    let mut recovery = ConversionRecovery::default();
+    loop {
+        match reconcile_pending_conversion_authenticated_once(source, journal, authenticated).await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => recovery.retry(error).await?,
+        }
+    }
+}
+
+/// Shared by selected and global journal recovery. Replay only after known
+/// transport failures; authentication, validation and storage failures stop.
+#[derive(Default)]
+pub(super) struct ConversionRecovery {
+    first_failure: Option<LixError>,
+    started: Option<web_time::Instant>,
+    replays: u32,
+}
+impl ConversionRecovery {
+    pub(super) async fn retry(&mut self, error: LixError) -> Result<(), LixError> {
+        if !recoverable_conversion_transport(&error) {
+            return Err(error);
+        }
+        let original = self.first_failure.get_or_insert_with(|| error.clone());
+        let started = self.started.get_or_insert_with(web_time::Instant::now);
+        // Recovery budget is checked between operations, preserving transport
+        // timeouts and durable commit semantics of each journal replay.
+        if self.replays == 3 || started.elapsed() >= Duration::from_secs(10) {
+            return Err(original.clone());
+        }
+        sleep(Duration::from_millis(100 * (1 << self.replays))).await;
+        self.replays += 1;
+        if started.elapsed() >= Duration::from_secs(10) {
+            return Err(original.clone());
+        }
+        Ok(())
+    }
+}
+
+fn recoverable_conversion_transport(error: &LixError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "LIX_TRANSPORT_NETWORK" | "LIX_ERROR_SYNC_TRANSPORT"
+    ) || (error.code == LixError::CODE_INTERNAL_ERROR
+        && error
+            .details()
+            .and_then(|details| details.get("httpStatus"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|status| matches!(status, 502 | 503 | 504)))
+}
+
+async fn reconcile_pending_conversion_authenticated_once<
     S: Storage + Clone + Send + Sync + 'static,
 >(
     source: &StorageAdapter<S>,
@@ -583,4 +645,37 @@ pub(crate) async fn finish_conversion_cleanup_bounded<F: Future<Output = Result<
     let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(cleanup, timeout);
     futures_util::select_biased! {_=cleanup=>{},_=timeout=>{}};
+}
+
+#[cfg(test)]
+mod recovery_policy_tests {
+    use super::*;
+
+    #[test]
+    fn conversion_recovery_is_limited_to_transport_and_gateway_failures() {
+        for code in ["LIX_TRANSPORT_NETWORK", "LIX_ERROR_SYNC_TRANSPORT"] {
+            assert!(recoverable_conversion_transport(&LixError::new(
+                code,
+                "connection lost"
+            )));
+        }
+        for status in [502, 503, 504] {
+            assert!(recoverable_conversion_transport(
+                &LixError::new(LixError::CODE_INTERNAL_ERROR, "gateway unavailable")
+                    .with_details(serde_json::json!({"httpStatus": status})),
+            ));
+        }
+        for (code, status) in [
+            (LixError::CODE_INTERNAL_ERROR, 500),
+            (LixError::CODE_INTERNAL_ERROR, 401),
+            ("LIX_ADMISSION_AUTH_REJECTED", 503),
+            (LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN, 503),
+            ("LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH", 502),
+        ] {
+            assert!(!recoverable_conversion_transport(
+                &LixError::new(code, "terminal failure")
+                    .with_details(serde_json::json!({"httpStatus": status})),
+            ));
+        }
+    }
 }
