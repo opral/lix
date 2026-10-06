@@ -1,46 +1,25 @@
 # Changelog
 
-## 0.19.0 - 2026-10-06
+## 0.19.0 — 2026-10-06
 
-### Minor
+### Improvements
 
-- Move Node.js native binaries from `@lix-js/sdk` to `@lix-js/storage-filesystem`. The SDK uses WASM for memory and JavaScript storage sessions and no longer installs native platform packages. Filesystem sessions retain the existing Rust engine, RocksDB adapter, synchronization, exclusive locking, and migration support. Install matching SDK/filesystem versions with optional dependencies enabled.
+- Faster queries and lower memory use in large repositories, including row counts, range queries, and queries with `LIMIT`.
+- Smaller JavaScript SDK downloads. The SDK no longer installs native platform binaries and shares one WebAssembly engine between normal operation and migration.
 
-### Patch
+### Fixes
 
-- Unordered small LIMIT scans can read a bounded set of authenticated current-base keys and recheck their current visibility, avoiding full row materialization when enough live candidates are available. Unsupported layouts and insufficient candidate pages retain the regular scan.
-- Reduced memory use for SQL row counts.
+- Fixed offline file editing and file/directory reads in partial replicas with installed plugins.
+- Fixed checkpoint uploads and reopening history on fresh partial replicas, including preservation of conversation details.
+- Improved recovery when upgrading older repositories or resuming interrupted migrations, preserving local data and offline access.
+- Fixed filesystem repositories failing to open on Windows.
+- Fixed background observers retaining storage handles after subscriptions or repositories close.
+- File and directory metadata now stays on the row it was supplied for. Automatically created parent directories no longer inherit that metadata.
 
-  Count-only scans avoid loading row values and use exact collection counts when the current columnar layout can serve the query. Filtered counts retain the values needed to evaluate their predicates.
-- Keep metadata supplied on a file or directory path write on that row. Automatically created parent directories now have no metadata instead of inheriting the written row's metadata.
-- Reduced redundant allocation and scan time across local and global state.
+### Upgrade notes
 
-  Proven ordered runs now merge directly while resolving shadowed rows and tombstones, avoiding a full concatenation and sort of every candidate row.
-
-  Read-only transactions forward their original scan request when the committed reader already resolves visibility and the transaction proves it has no staged rows, tombstones, or collection replacements. This avoids a second full visibility pass and preserves bounded scan requests.
-
-  Large local batches with a bounded global overlay reuse their row storage, append only global winners, and merge in place while preserving row payload and provenance sidecars.
-- Fix native partial directory metadata reads after creating a plugin-managed file. Read fulfillment now accepts the reserved executable-owner dependency only alongside a directly selected canonical row for the same file and physical branch. Malformed owners and unrelated keys, files, directories or branches remain rejected.
-
-  Directory metadata preparation now uses the same directory-only path index as query execution, avoiding unrelated file descriptors and executable owners during cold folder listing.
-- Fix first offline file edits in prepared native partial replicas and cold file/directory reads in repositories with installed plugins.
-
-  Partial reads now retain the selected file and its required native dependencies. Incoming synchronization prepares retained moving scopes before exposing the new serving generation, so an already prepared document can continue reading and editing locally. Format upgrades preserve pending conversion journals and stop with recoverable diagnostics when local work cannot be safely converted.
-- Use the workspace mimalloc allocator in the native server, matching the native CLI, to reduce allocation overhead and retained memory during repeated large scans.
-- Observer watchers now stop when their last subscriber closes and release their storage handles when the owning engine is dropped. Native shutdown cancels and joins the watcher instead of leaving a detached polling thread running. Snapshot cleanup and checkpoint garbage collection release their task-owned storage handles before reporting completion.
-- Bind partial replica serving coordinates to durable witnesses, preserve them while migrating older repositories, and reject writes that would invalidate their commit ancestry.
-- Supported packed row scans now prune immutable mutation parts using primary-key bounds before loading payloads. Snapshot admission still checks the full collection and file scope, and range scans recheck typed bounds on current rows and overlays. Unsupported layouts retain the existing scan path.
-- Primary-key range predicates now reach storage scans across all file scopes, allowing readers to discard out-of-range rows before payload materialization while preserving local/global visibility and tombstones. Exact file scopes can still use physical range seeks; broader scopes keep the typed range as a per-row predicate.
-- The JavaScript SDK now ships one WebAssembly engine for ordinary opening and maintenance operations, removing the duplicate migration WASM download. The `@lix-js/sdk/migration` API remains available and shares engine initialization with normal bindings. Source builds and artifact consumers should use `build:wasm` and `dist/wasm` instead of the removed `build:migration:wasm` script and `dist/migration-wasm` directory.
-- Fixed sparse-replica checkpoint upload, history reopening, and recovery of older local repositories.
-
-  Checkpoint preparation now fetches missing authoritative changes and preserves conversation details when history is opened on a fresh replica. Migration retains original local data and resumes interrupted conversion or lost server acknowledgements. Browser repositories keep verified offline access after migration and owner teardown.
-- Full scans of supported packed collections now project bounded batches of eight authenticated mutation parts, with bounded HOT and global overlays. This avoids retaining every row and payload in memory before SQL execution and shares reads of physical storage extents. Small collections and unsupported layouts keep the existing scan path, and SQL ordering remains explicit.
-- Reduced the install size of the `@lix-js/sdk` native binary packages.
-
-  Release builds of the native addon now strip the local symbol table, which shrinks the linux-x64 binary from 471 MB to 358 MB without changing its behavior.
-- Unfiltered row counts can use persisted exact collection cardinality with bounded global visibility checks. Missing, deferred, or unsupported metadata continues through the regular scan, preserving older repository layouts and transaction read tracking.
-- Fix opening filesystem repositories on Windows by passing compatible paths to RocksDB, and test native binaries on each release platform before publishing.
+- Native filesystem binaries now ship with `@lix-js/storage-filesystem`. Install matching SDK and filesystem package versions with optional dependencies enabled. Memory sessions use WebAssembly.
+- Browser apps using Vite must configure ES module workers: `worker: { format: "es" }`.
 
 ## 0.18.1 - 2026-09-25
 
