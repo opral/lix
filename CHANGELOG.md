@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.19.0 — 2026-10-06
+
+### Improvements
+
+- Faster queries and lower memory use in large repositories, including row counts, range queries, and queries with `LIMIT`.
+- Smaller JavaScript SDK downloads. The SDK no longer installs native platform binaries and shares one WebAssembly engine between normal operation and migration.
+
+### Fixes
+
+- Fixed offline file editing and file/directory reads in partial replicas with installed plugins.
+- Fixed checkpoint uploads and reopening history on fresh partial replicas, including preservation of conversation details.
+- Improved recovery when upgrading older repositories or resuming interrupted migrations, preserving local data and offline access.
+- Fixed filesystem repositories failing to open on Windows.
+- Fixed background observers retaining storage handles after subscriptions or repositories close.
+- File and directory metadata now stays on the row it was supplied for. Automatically created parent directories no longer inherit that metadata.
+
+### Upgrade notes
+
+- Native filesystem binaries now ship with `@lix-js/storage-filesystem`. Install matching SDK and filesystem package versions with optional dependencies enabled. Memory sessions use WebAssembly.
+- Browser apps using Vite must configure ES module workers: `worker: { format: "es" }`.
+
 ## 0.18.1 - 2026-09-25
 
 ### Minor
