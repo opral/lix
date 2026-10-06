@@ -5280,6 +5280,21 @@ pub(crate) async fn load_published_commit_state_manifest(
         .map(|manifest| PublishedCommitStateManifest { manifest }))
 }
 
+/// Decode header-only topology without rereading a record already transferred.
+pub(crate) fn decode_published_commit_state_topology(
+    commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<PublishedCommitStateTopology, LixError> {
+    let header = decode_stored_commit_state_manifest(bytes)?;
+    if header.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "topology header does not match its commit address",
+        ));
+    }
+    Ok(PublishedCommitStateTopology { header })
+}
+
 /// Loads only the authenticated immutable authority header needed by commit
 /// topology, branch lifecycle, and scoped-root inheritance.
 pub(crate) async fn load_published_commit_state_topology(

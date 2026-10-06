@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use futures_util::{FutureExt, select_biased};
 
-use crate::storage_adapter::{Storage, StorageAdapter, StorageWriteOptions};
+use crate::storage_adapter::{Storage, StorageAdapter, StorageAdapterRead, StorageWriteOptions};
 use crate::{LixError, tracked_state::NativeMetadataRef};
 
 use super::http::{HttpSyncTransport, RawHttpClient};
@@ -214,6 +214,26 @@ async fn validate_admission<S: Storage + Clone + Send + Sync + 'static, C: RawHt
     Ok(())
 }
 
+async fn hydrate_write_frontier<S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    address: NativeMetadataRef,
+) -> Result<(), LixError> {
+    let NativeMetadataRef::CommitGraphRecord(anchor) = address else {
+        return Err(LixError::unknown("write frontier requires graph metadata"));
+    };
+    hydrate_metadata_selection(storage, state, transport,
+        &super::native_metadata_walk::NativeMetadataWalkRequest {
+            epoch_id: state.epoch_id().to_owned(), anchor,
+            max_commits: super::native_metadata_walk::MAX_METADATA_WALK_COMMITS,
+            include_state_headers: false,
+            selection: super::native_metadata_walk::MetadataSelection::JumpSpine,
+            stops: Vec::new(), minimum_generation: None, require_state_header: false,
+        }).await
+}
+
+#[cfg(test)]
 async fn hydrate_metadata<S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
@@ -258,11 +278,41 @@ pub(super) async fn hydrate_metadata_batch<
     install_metadata_response(storage, state, &request, &response).await
 }
 
-async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
+/// Shared selection transfer: no local read spans I/O; all policies use the
+/// same addressed-byte validation and epoch-fenced durable installer.
+pub(super) async fn hydrate_metadata_selection<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    request: &super::native_metadata_walk::NativeMetadataWalkRequest,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient,
+{
+    if request.epoch_id != state.epoch_id() {
+        return Err(LixError::new("LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH", "metadata selection epoch differs"));
+    }
+    let response = transport.native_metadata_walk(request).await?;
+    let exact = super::native_metadata_walk::validate_response(state.repository_id(), request, &response)?;
+    install_metadata_response_inner(storage, state, &exact, &response, true).await
+}
+
+pub(super) async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     request: &NativeMetadataRequest,
     response: &super::native_metadata::NativeMetadataResponse,
+) -> Result<(), LixError> {
+    install_metadata_response_inner(storage, state, request, response, false).await
+}
+
+async fn install_metadata_response_inner<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &NativeMetadataRequest,
+    response: &super::native_metadata::NativeMetadataResponse,
+    selection: bool,
 ) -> Result<(), LixError> {
     let mut precondition_retries = 0;
     loop {
@@ -281,6 +331,39 @@ async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
                 "native metadata hydration admission changed",
             ));
         }
+        // Selection is speculative acquisition, not authority to replace resident
+        // metadata. In particular, local graph rows can contain locally refined
+        // facts. The retained client proof reads and validates those rows itself.
+        // Filter in this snapshot on every CAS retry; absent inputs still install
+        // through the exact epoch-fenced admission path.
+        let selected;
+        let selected_request;
+        let (request, response) = if selection {
+            let keys = request.objects.iter().map(super::native_metadata::key)
+                .collect::<Result<Vec<_>, _>>()?;
+            let requests = request.objects.iter().zip(&keys).map(|(address, key)| {
+                crate::storage_adapter::StorageGetManyRequest {
+                    space: super::native_metadata::space(address),
+                    keys: std::slice::from_ref(key),
+                    opts: Default::default(),
+                }
+            }).collect::<Vec<_>>();
+            let values = read.get_many(&requests).await?.values;
+            if values.len() != response.objects.len() {
+                return Err(LixError::unknown("metadata selection residency cardinality mismatch"));
+            }
+            selected = super::native_metadata::NativeMetadataResponse {
+                objects: response.objects.iter().zip(values)
+                    .filter_map(|(object, value)| value.is_none().then(|| object.clone())).collect(),
+                ..response.clone()
+            };
+            if selected.objects.is_empty() { return Ok(()); }
+            selected_request = NativeMetadataRequest {
+                objects: selected.objects.iter().map(|object| object.address.clone()).collect(),
+                ..request.clone()
+            };
+            (&selected_request, &selected)
+        } else { (request, response) };
         let mut writes = storage.new_write_set();
         let preconditions =
             stage_native_metadata(&read, &mut writes, state, request, response).await?;
@@ -737,13 +820,7 @@ fn hydrate_exact_demand_with_receipt<
             )? {
                 // Drop all local reads before network I/O. Install through the
                 // same immutable, epoch-fenced path used for exact metadata.
-                let response = transport.native_metadata_walk(&walk).await?;
-                let exact = super::native_metadata_walk::validate_response(
-                    state.repository_id(),
-                    &walk,
-                    &response,
-                )?;
-                install_metadata_response(storage, state, &exact, &response).await?;
+                hydrate_metadata_selection(storage, state, transport, &walk).await?;
             }
         }
         match request {
@@ -763,35 +840,18 @@ fn hydrate_exact_demand_with_receipt<
                     .await?;
                 Ok(HydratedInputs::default())
             }
-            SyncDemandRequest::Chunks(ids) => {
-                for id in ids {
-                    let hash = crate::binary_cas::ChunkHash::from_hex(&id)?;
-                    if super::partial_blob::chunk_is_resident(storage, state, hash).await? {
-                        continue;
+            SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
+                for page in ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
+                    let mut missing = Vec::new();
+                    for id in page {
+                        let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
+                        if !super::partial_blob::chunk_is_resident(storage, state, hash).await? { missing.push(id.clone()); }
                     }
-                    let bytes = transport.get_chunk(&id).await?.ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_STORAGE_ERROR,
-                            "authority lacks demanded blob chunk",
-                        )
-                    })?;
-                    super::partial_blob::install_chunk(storage, state, hash, &bytes).await?;
-                }
-                Ok(HydratedInputs::default())
-            }
-            SyncDemandRequest::ChunksWithRead(ids, _) => {
-                for id in ids {
-                    let hash = crate::binary_cas::ChunkHash::from_hex(&id)?;
-                    if super::partial_blob::chunk_is_resident(storage, state, hash).await? {
-                        continue;
+                    let chunks = super::transfer::fetch_chunk_page(transport, &missing).await?;
+                    for (id, bytes) in missing.into_iter().zip(chunks) {
+                        let bytes = bytes.ok_or_else(|| LixError::new(LixError::CODE_STORAGE_ERROR, "authority lacks demanded blob chunk"))?;
+                        super::partial_blob::install_chunk(storage, state, crate::binary_cas::ChunkHash::from_hex(&id)?, &bytes).await?;
                     }
-                    let bytes = transport.get_chunk(&id).await?.ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_STORAGE_ERROR,
-                            "authority lacks demanded blob chunk",
-                        )
-                    })?;
-                    super::partial_blob::install_chunk(storage, state, hash, &bytes).await?;
                 }
                 Ok(HydratedInputs::default())
             }
@@ -836,7 +896,7 @@ fn hydrate_exact_demand_with_receipt<
                     super::partial_write_frontier::prepare_baseline_write_frontier(
                         storage,
                         state,
-                        |address| hydrate_metadata(storage, state, transport, address),
+                        |address| hydrate_write_frontier(storage, state, transport, address),
                     )
                     .await?;
                 }
@@ -849,7 +909,7 @@ fn hydrate_exact_demand_with_receipt<
                 super::partial_write_frontier::prepare_baseline_write_frontier(
                     storage,
                     state,
-                    |address| hydrate_metadata(storage, state, transport, address),
+                    |address| hydrate_write_frontier(storage, state, transport, address),
                 )
                 .await?;
                 Ok(HydratedInputs::default())
@@ -2515,12 +2575,32 @@ mod tests {
         impl RawHttpClient for GraphClient {
             fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
                 Box::pin(async move {
-                    if !request.url.ends_with("/sync/native-metadata") {
+                    if !request.url.ends_with("/sync/native-metadata")
+                        && !request.url.ends_with("/sync/native-metadata-walk") {
                         return self.handshake.send(request).await;
                     }
                     self.handshake.fetches.fetch_add(1, Ordering::SeqCst);
-                    let request: NativeMetadataRequest =
-                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    let request: NativeMetadataRequest = if request.url.ends_with("/sync/native-metadata-walk") {
+                        let walk: super::super::native_metadata_walk::NativeMetadataWalkRequest =
+                            serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                        assert_eq!(walk.selection, super::super::native_metadata_walk::MetadataSelection::Causal);
+                        let mut pending = vec![CommitId::parse_lix(&walk.anchor, "test walk").unwrap()];
+                        let mut seen = std::collections::BTreeSet::new();
+                        let mut objects = Vec::new();
+                        while let Some(id) = pending.pop() {
+                            if objects.len() == usize::from(walk.max_commits) { break; }
+                            if !seen.insert(id) { continue; }
+                            objects.push(NativeMetadataRef::CommitGraphRecord(id.to_string()));
+                            let record = &self.records[&id];
+                            if !walk.stops.contains(&id.to_string())
+                                && walk.minimum_generation.is_none_or(|minimum| record.generation > minimum) {
+                                pending.extend(record.parent_commit_ids.iter().copied());
+                            }
+                        }
+                        NativeMetadataRequest { epoch_id: walk.epoch_id, objects }
+                    } else {
+                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap()
+                    };
                     let objects = request
                         .objects
                         .into_iter()
@@ -2632,7 +2712,8 @@ mod tests {
             .await
             .unwrap()
         );
-        assert_eq!(client.fetches.load(Ordering::SeqCst), 17);
+        assert!(client.fetches.load(Ordering::SeqCst) <= 3,
+            "proof requests must grow with bounded pages rather than commits");
     }
 
     #[tokio::test]

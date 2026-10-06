@@ -5,8 +5,10 @@ use crate::changelog::{CommitId, CommitRecord};
 use crate::storage_adapter::{Storage, StorageAdapter, StorageAdapterRead};
 use crate::tracked_state::NativeMetadataRef;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 const MARKER: &str = "partialAncestryProof";
+const MAX_PROOF_WORK: usize = 65_536;
 
 pub(super) struct Walk {
     ancestor: CommitRecord,
@@ -18,6 +20,7 @@ pub(super) struct Walk {
     source_proof: Option<Box<Walk>>,
     source_probe_complete: bool,
     legacy_unknown: bool,
+    work_done: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(super) steps: usize,
 }
@@ -34,6 +37,7 @@ impl Walk {
             source_proof: None,
             source_probe_complete: false,
             legacy_unknown: false,
+            work_done: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             steps: 0,
         }
@@ -49,10 +53,14 @@ impl Walk {
             let details = error
                 .details
                 .get_or_insert_with(|| Box::new(serde_json::json!({})));
+            let selection_incorporated = details.get(MARKER)
+                .and_then(|marker| marker.get("selectionIncorporated"))
+                .and_then(serde_json::Value::as_bool).unwrap_or(self.incorporated);
             details[MARKER] = serde_json::json!({
                 "ancestor": self.ancestor.commit_id.to_string(),
                 "descendant": self.descendant.to_string(),
                 "incorporated": self.incorporated,
+                "selectionIncorporated": selection_incorporated,
                 "excludedBase": self.excluded_base.map(|id| id.to_string()),
             });
         }
@@ -73,6 +81,9 @@ impl Walk {
             #[cfg(test)]
             {
                 self.steps += 1;
+            }
+            if self.work_done.fetch_add(1, Ordering::Relaxed) >= MAX_PROOF_WORK {
+                return Err(limited("incorporation proof exceeded its aggregate work budget"));
             }
             work += 1;
             if work == work_slice {
@@ -189,9 +200,12 @@ impl Walk {
                 // linear suffix. Try its native causal jumps before loading a
                 // header for every commit, retaining this subproof across misses.
                 // One probe per walk avoids rewalking overlapping source histories.
-                let proof = self
-                    .source_proof
-                    .get_or_insert_with(|| Box::new(Walk::new(self.ancestor.clone(), source)));
+                let budget = Arc::clone(&self.work_done);
+                let proof = self.source_proof.get_or_insert_with(|| {
+                    let mut proof = Walk::new(self.ancestor.clone(), source);
+                    proof.work_done = budget;
+                    Box::new(proof)
+                });
                 match Box::pin(proof.run(read, cache, work_slice)).await {
                     Ok(true) => return Ok(true),
                     Ok(false) => {
@@ -254,13 +268,12 @@ pub(crate) async fn incorporated(
     cache: &mut BTreeMap<CommitId, CommitRecord>,
     work_slice: usize,
 ) -> Result<bool, LixError> {
-    if Walk::new(ancestor.clone(), descendant)
-        .run(read, cache, work_slice)
-        .await?
-    {
+    let mut causal = Walk::new(ancestor.clone(), descendant);
+    if causal.run(read, cache, work_slice).await? {
         return Ok(true);
     }
     let mut walk = Walk::new(ancestor.clone(), descendant);
+    walk.work_done = causal.work_done;
     walk.incorporated = true;
     walk.run(read, cache, work_slice).await
 }
@@ -342,13 +355,29 @@ where
                 else {
                     return Err(error);
                 };
-                crate::sync::partial_runtime::hydrate_metadata_batch(
-                    storage,
-                    state,
-                    transport,
-                    vec![address],
-                )
-                .await?;
+                let selection_incorporated = error.details.as_ref()
+                    .and_then(|details| details.get(MARKER))
+                    .and_then(|marker| marker.get("selectionIncorporated"))
+                    .and_then(serde_json::Value::as_bool).unwrap_or(walk.incorporated);
+                let mut stops = vec![walk.ancestor.commit_id.to_string()];
+                stops.extend(walk.excluded_base.map(|id| id.to_string()));
+                let request = crate::sync::native_metadata_walk::NativeMetadataWalkRequest {
+                    epoch_id: state.epoch_id().to_owned(),
+                    anchor: address.id().to_owned(),
+                    max_commits: crate::sync::native_metadata_walk::MAX_METADATA_WALK_COMMITS,
+                    include_state_headers: selection_incorporated,
+                    selection: if selection_incorporated {
+                        crate::sync::native_metadata_walk::MetadataSelection::Incorporation
+                    } else {
+                        crate::sync::native_metadata_walk::MetadataSelection::Causal
+                    },
+                    stops,
+                    minimum_generation: (!selection_incorporated).then_some(walk.ancestor.generation),
+                    require_state_header: matches!(address, NativeMetadataRef::CommitStateHeader(_)),
+                };
+                crate::sync::partial_runtime::hydrate_metadata_selection(
+                    storage, state, transport, &request,
+                ).await?;
             }
         }
     }

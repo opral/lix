@@ -121,15 +121,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
-    // Existing canonical flattening can allocate the complete requested file.
-    // Bound one file independently of native commit/request output budgets.
-    const MAX_PREPARED_BLOB: u64 = 64 * 1024 * 1024;
     if transport.active_account_id() != expected_account {
         return Err(LixError::new(
             "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
             "blob upload authority account differs",
         ));
     }
+    let mut inline_group = super::transfer::TransferBatch::new();
     for blob in super::repository::sync_commit_blob_ids(&request.commits)? {
         let id = BlobId::from_hex(&blob)?;
         let read = crate::migration::MigrationPlanningRead::new(storage).await?;
@@ -140,47 +138,35 @@ where
             .next()
             .flatten()
             .ok_or_else(|| LixError::unknown("captured local blob metadata is missing"))?;
-        if metadata.size_bytes > MAX_PREPARED_BLOB {
-            return Err(LixError::new(
-                "LIX_PARTIAL_UPLOAD_PREPARATION_REQUIRED",
-                "large file upload requires streaming canonical preparation",
-            ));
+        if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+            let canonical =
+                crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
+            drop(read);
+            super::transfer::upload_canonical_blob(transport, &metadata, &canonical, || async {
+                crate::migration::MigrationPlanningRead::new(storage).await.map_err(LixError::from)
+            })
+            .await?;
+            continue;
         }
         let chunks = load_canonical_blob_chunks(&read, id)
             .await?
             .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
         let manifest = super::blob::encode_manifest(id, &chunks)?;
         drop(read);
-        let registration = transport.register_blob(&manifest).await?;
-        let mut missing = BTreeSet::new();
-        for id in &registration.missing_chunk_ids {
-            if !missing.insert(id.as_str())
-                || !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "authority requested a duplicate or unrelated upload chunk",
+        let encoded = serde_json::to_vec(&manifest)
+            .map_err(|error| LixError::unknown(error.to_string()))?
+            .len();
+        let decoded = manifest.size_bytes as usize;
+        if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+            super::transfer::register_inline_group(transport, &inline_group).await?;
+            inline_group = super::transfer::TransferBatch::new();
+            if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                return Err(LixError::unknown(
+                    "single migration content member did not fit",
                 ));
             }
         }
-        for chunk in &chunks {
-            let id = chunk.receipt.hash.to_hex();
-            if missing.contains(id.as_str()) {
-                transport.put_chunk(&id, &chunk.bytes).await?;
-            }
-        }
-        if !missing.is_empty()
-            && !transport
-                .register_blob(&manifest)
-                .await?
-                .missing_chunk_ids
-                .is_empty()
-        {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "authority blob remains incomplete after upload",
-            ));
-        }
     }
+    super::transfer::register_inline_group(transport, &inline_group).await?;
     Ok(())
 }

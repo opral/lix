@@ -30,7 +30,7 @@ where
     match transport.push(&combined).await {
         Err(error)
             if combined.inline_blobs.len() > request.inline_blobs.len()
-                && is_explicit_body_limit(&error) =>
+                && super::transfer::explicit_body_limit(&error) =>
         {
             // A 413 rejects the request before publication. Retry only the
             // transfer representation, retaining the exact frozen native tuple.
@@ -79,13 +79,6 @@ enum TransferMode {
     Chunks,
 }
 
-fn is_explicit_body_limit(error: &LixError) -> bool {
-    error.details.as_ref().and_then(|details| details.get("httpStatus"))
-        .and_then(serde_json::Value::as_u64) == Some(413)
-        // HttpSyncTransport maps an unstructured intermediary HTTP 413 here.
-        || (error.code == "LIX_ERROR_REQUEST_BODY_TOO_LARGE" && error.details.is_none())
-}
-
 async fn prepare_partial_upload_blobs_inner<S, T>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
@@ -109,6 +102,8 @@ where
             "blob upload authority account differs",
         ));
     }
+    let mut inline_group = super::transfer::TransferBatch::new();
+    let mut authority_group = Vec::new();
     for blob in super::repository::sync_commit_blob_ids(&request.commits)? {
         let id = BlobId::from_hex(&blob)?;
         let read = storage.begin_read(Default::default()).await?;
@@ -134,7 +129,11 @@ where
             // was never demanded locally. Confirm its exact immutable identity
             // at the authority instead of hydrating and uploading it again.
             drop(read);
-            confirm_authority_blob(transport, &blob).await?;
+            authority_group.push(blob);
+            if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
+                super::transfer::confirm_authority_group(transport, &authority_group).await?;
+                authority_group.clear();
+            }
             continue;
         };
         if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
@@ -146,7 +145,12 @@ where
                 Ok(manifest) => manifest,
                 Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
                     drop(read);
-                    confirm_authority_blob(transport, &blob).await?;
+                    authority_group.push(blob);
+                    if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
+                        super::transfer::confirm_authority_group(transport, &authority_group)
+                            .await?;
+                        authority_group.clear();
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -161,7 +165,11 @@ where
                 // A resident deferred manifest is also a valid sparse state.
                 // Other storage errors, including corruption, remain errors.
                 drop(read);
-                confirm_authority_blob(transport, &blob).await?;
+                authority_group.push(blob);
+                if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
+                    super::transfer::confirm_authority_group(transport, &authority_group).await?;
+                    authority_group.clear();
+                }
                 continue;
             }
             Ok(None) => return Err(LixError::unknown("captured local blob content is missing")),
@@ -180,10 +188,27 @@ where
                 continue;
             }
         }
+        if mode == TransferMode::Prepare && manifest.inline_bytes_base64.is_some() {
+            let encoded = serde_json::to_vec(&manifest)
+                .map_err(|error| LixError::unknown(error.to_string()))?
+                .len();
+            let decoded = manifest.size_bytes as usize;
+            if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+                super::transfer::register_inline_group(transport, &inline_group).await?;
+                inline_group = super::transfer::TransferBatch::new();
+                if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                    return Err(LixError::unknown("single inline group member did not fit"));
+                }
+            }
+            continue;
+        }
         if mode == TransferMode::Chunks {
             manifest.inline_bytes_base64 = None;
         }
-        let registration = transport.register_blob(&manifest).await?;
+        let registration =
+            super::transfer::register_manifest_page(transport, std::slice::from_ref(&manifest))
+                .await?
+                .remove(0);
         let mut missing = std::collections::BTreeSet::new();
         for id in &registration.missing_chunk_ids {
             if !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id) {
@@ -195,17 +220,22 @@ where
             missing.insert(id.as_str());
         }
         let uploaded = !missing.is_empty();
-        for chunk in &chunks {
-            let id = chunk.receipt.hash.to_hex();
-            if missing.contains(id.as_str()) {
-                transport.put_chunk(&id, &chunk.bytes).await?;
-                missing.remove(id.as_str());
-            }
+        let uploads = chunks
+            .iter()
+            .filter_map(|chunk| {
+                let id = chunk.receipt.hash.to_hex();
+                missing
+                    .remove(id.as_str())
+                    .then_some((id, chunk.bytes.as_slice()))
+            })
+            .collect::<Vec<_>>();
+        for page in uploads.chunks(super::transfer::CHUNK_CONCURRENCY) {
+            super::transfer::upload_chunk_page(transport, page).await?;
         }
         if uploaded
-            && !transport
-                .register_blob(&manifest)
+            && !super::transfer::register_manifest_page(transport, std::slice::from_ref(&manifest))
                 .await?
+                .remove(0)
                 .missing_chunk_ids
                 .is_empty()
         {
@@ -215,22 +245,9 @@ where
             ));
         }
     }
+    super::transfer::register_inline_group(transport, &inline_group).await?;
+    super::transfer::confirm_authority_group(transport, &authority_group).await?;
     Ok(())
-}
-
-async fn confirm_authority_blob<T: SyncTransport>(
-    transport: &T,
-    blob: &str,
-) -> Result<(), LixError> {
-    let ids = [blob.to_owned()];
-    let manifests = transport.get_blobs(&ids).await?;
-    if manifests.len() != 1 || manifests[0].blob_id != blob {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "authority must confirm exactly the referenced checkpoint blob",
-        ));
-    }
-    super::blob::validate_sync_blob_manifest(&manifests[0])
 }
 
 /// Transfer large flat or delta-backed blobs with at most one forced anchor's
@@ -246,101 +263,20 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
-    let manifest = super::SyncBlobManifest {
-        blob_id: canonical.blob_id.to_hex(),
-        size_bytes: canonical.size_bytes,
-        chunks: canonical
-            .chunks
-            .iter()
-            .map(|chunk| super::SyncBlobChunk {
-                chunk_id: chunk.hash.to_hex(),
-                size_bytes: chunk.size_bytes,
-            })
-            .collect(),
-        inline_bytes_base64: None,
-    };
-    super::blob::validate_sync_blob_manifest(&manifest)?;
-    let registration = transport.register_blob(&manifest).await?;
-    let declared = manifest
-        .chunks
-        .iter()
-        .map(|chunk| chunk.chunk_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut missing = std::collections::BTreeSet::new();
-    for id in registration.missing_chunk_ids {
-        if !declared.contains(id.as_str()) {
+    super::transfer::upload_canonical_blob(transport, metadata, canonical, || async {
+        let read = storage.begin_read(Default::default()).await?;
+        if load_partial_replica_state(&read)
+            .await?
+            .as_ref()
+            .map(|(actual, _)| actual)
+            != Some(state)
+        {
             return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "authority requested an unrelated upload chunk",
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "blob upload epoch changed",
             ));
         }
-        // A flat manifest can reference the same chunk at many offsets. The
-        // authority may report each occurrence; transfer the immutable bytes once.
-        missing.insert(id);
-    }
-    let uploaded = !missing.is_empty();
-    let mut offset = 0u64;
-    let mut first = 0;
-    while first < manifest.chunks.len() && !missing.is_empty() {
-        let mut end = first;
-        let mut size = 0u64;
-        while end < manifest.chunks.len() && size < crate::binary_cas::CHUNK_ANCHOR_BYTES as u64 {
-            size += manifest.chunks[end].size_bytes;
-            end += 1;
-        }
-        let expected = &manifest.chunks[first..end];
-        if expected
-            .iter()
-            .any(|chunk| missing.contains(&chunk.chunk_id))
-        {
-            let read = storage.begin_read(Default::default()).await?;
-            if load_partial_replica_state(&read)
-                .await?
-                .as_ref()
-                .map(|(actual, _)| actual)
-                != Some(state)
-            {
-                return Err(LixError::new(
-                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                    "blob upload epoch changed",
-                ));
-            }
-            let chunks =
-                crate::binary_cas::load_canonical_blob_anchor(&read, metadata, offset).await?;
-            drop(read);
-            if chunks.len() != expected.len()
-                || chunks.iter().zip(expected).any(|(chunk, receipt)| {
-                    chunk.receipt.hash.to_hex() != receipt.chunk_id
-                        || chunk.receipt.size_bytes != receipt.size_bytes
-                })
-            {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "canonical upload anchor changed after manifest preparation",
-                ));
-            }
-            for chunk in chunks {
-                let id = chunk.receipt.hash.to_hex();
-                if missing.contains(&id) {
-                    transport.put_chunk(&id, &chunk.bytes).await?;
-                    missing.remove(&id);
-                }
-            }
-        }
-        offset += size;
-        first = end;
-    }
-    if uploaded
-        && !transport
-            .register_blob(&manifest)
-            .await?
-            .missing_chunk_ids
-            .is_empty()
-    {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "authority blob remains incomplete after upload",
-        ));
-    }
-    Ok(())
+        Ok(read)
+    })
+    .await
 }

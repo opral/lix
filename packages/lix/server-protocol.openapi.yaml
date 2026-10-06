@@ -641,6 +641,37 @@ paths:
           description: Missing chunks to upload, or confirmation that the blob is complete.
           content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobRegistration" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/blobs:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ReplicaId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
+    post:
+      operationId: syncRegisterBlobs
+      description: Registers a bounded group with at most 32 manifests and 1 MiB encoded or decoded inline payload. All members validate before durable admission.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 32
+              items: { $ref: "#/components/schemas/SyncBlobManifest" }
+      responses:
+        "200":
+          description: Ordered missing-chunk registrations; complete verified members are committed together.
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                maxItems: 32
+                items: { $ref: "#/components/schemas/SyncBlobRegistration" }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/chunk:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -1003,7 +1034,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 28 }
+      schema: { type: integer, const: 29 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1061,7 +1092,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 28 }
+        syncProtocolVersion: { type: integer, const: 29 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1567,12 +1598,19 @@ components:
     NativeMetadataWalkRequest:
       type: object
       additionalProperties: false
-      required: [epochId, anchor, maxCommits, includeStateHeaders]
+      required: [epochId, anchor, maxCommits, includeStateHeaders, selection, stops, minimumGeneration, requireStateHeader]
       properties:
         epochId: { type: string, format: uuid }
         anchor: { type: string, format: uuid }
         maxCommits: { type: integer, minimum: 1, maximum: 16 }
         includeStateHeaders: { type: boolean }
+        selection: { type: string, enum: [history, causal, incorporation, jumpSpine] }
+        stops:
+          type: array
+          maxItems: 2
+          items: { type: string, format: uuid }
+        minimumGeneration: { type: [integer, "null"], minimum: 0 }
+        requireStateHeader: { type: boolean }
     NativeMetadataResponse:
       type: object
       required: [lixId, epochId, objects]

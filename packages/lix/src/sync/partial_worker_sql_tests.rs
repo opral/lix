@@ -157,6 +157,9 @@ impl RawHttpClient for AuthorityClient {
                     futures_util::future::pending::<()>().await;
                 }
                 serde_json::to_value(receipt).unwrap()
+            } else if request.method == http::Method::POST && url.path().ends_with("/sync/blobs") {
+                let manifests: Vec<crate::sync::SyncBlobManifest> = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                serde_json::to_value(self.authority.register_sync_blob_manifests(&manifests).await?).unwrap()
             } else if request.method == http::Method::POST && url.path().ends_with("/sync/blob") {
                 let manifest = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 serde_json::to_value(

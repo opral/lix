@@ -1201,9 +1201,39 @@ where
         Box::pin(async move {
             let mut request =
                 self.request(Method::POST, "/sync/blob", "register sync blob manifest");
+            super::blob::validate_sync_blob_manifest(manifest)?;
+            request.response_limit = 2 * super::transfer::CONTENT_GROUP_BYTES;
             request.headers.push(json_content_type());
-            request.body = Some(json_body(manifest, "encode sync blob manifest")?);
+            let body = json_body(manifest, "encode sync blob manifest")?;
+            if body.len() > 2 * super::transfer::CONTENT_GROUP_BYTES {
+                return Err(LixError::new("LIX_TRANSFER_MEMBER_TOO_LARGE",
+                    "manifest inventory exceeds its bounded transfer lane"));
+            }
+            request.body = Some(body);
             self.send_json(request).await
+        })
+    }
+
+    fn register_blobs<'a>(
+        &'a self,
+        manifests: &'a [SyncBlobManifest],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobRegistration>> {
+        Box::pin(async move {
+            super::blob::validate_manifest_group(manifests)?;
+            let mut request = self.request(Method::POST, "/sync/blobs", "register sync blob group");
+            request.response_limit = super::transfer::CONTENT_GROUP_BYTES;
+            request.headers.push(json_content_type());
+            request.body = Some(json_body(&manifests, "encode sync blob group")?);
+            let registrations: Vec<SyncBlobRegistration> = self.send_json(request).await?;
+            if registrations.len() != manifests.len() {
+                return Err(LixError::new(LixError::CODE_INVALID_PARAM, "blob group response cardinality differs"));
+            }
+            for (manifest, registration) in manifests.iter().zip(&registrations) {
+                if registration.missing_chunk_ids.iter().any(|id| !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id)) {
+                    return Err(LixError::new(LixError::CODE_INVALID_PARAM, "authority requested an unrelated grouped upload chunk"));
+                }
+            }
+            Ok(registrations)
         })
     }
 

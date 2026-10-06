@@ -243,3 +243,97 @@ async fn run(lose_ack: bool) {
     drop(engine);
     authority.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn content_groups_split_explicit_proxy_limits_and_preserve_all_identities() {
+    let backing = Memory::new();
+    let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_options(crate::server_protocol::ServerProtocolOptions {
+            max_request_body_bytes: BODY_CAP,
+            ..Default::default()
+        })
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let transport = HttpSyncTransport::connect_with(
+        Probe {
+            inner: Client {
+                server,
+                lose_body: Arc::new(AtomicBool::new(false)),
+            },
+            requests: requests.clone(),
+            lose_ack: Arc::new(AtomicBool::new(false)),
+            pushes: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+        &format!("https://example.test/lix/{}", authority.lix_id()),
+    )
+    .await
+    .unwrap();
+    let mut group = crate::sync::transfer::TransferBatch::new();
+    let mut ids = Vec::new();
+    for marker in 0..8u8 {
+        let bytes = vec![marker; 32 * 1024];
+        let hash = crate::binary_cas::ChunkHash::from_content(&bytes);
+        let blob = crate::binary_cas::BlobId::from_content(&bytes);
+        ids.push(blob.to_hex());
+        let manifest = crate::sync::blob::encode_manifest(
+            blob,
+            &[crate::binary_cas::CanonicalBlobChunk {
+                receipt: crate::binary_cas::BlobChunkReceipt {
+                    hash,
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes,
+            }],
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&manifest).unwrap().len();
+        assert!(group.push(manifest, encoded, 32 * 1024).unwrap().is_none());
+    }
+    crate::sync::transfer::register_inline_group(&transport, &group)
+        .await
+        .unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        7,
+        "8 members split into four bounded groups of two"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, _, status)| *status == 413)
+            .count(),
+        3
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, bytes, status)| *status == 200 && *bytes <= BODY_CAP)
+            .count(),
+        4
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(url, _, _)| url.ends_with("/sync/blobs"))
+    );
+    drop(requests);
+    for id in ids {
+        assert!(
+            authority
+                .get_sync_blob_manifest(&id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    authority.close().await.unwrap();
+}

@@ -17,6 +17,25 @@ use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
 const MAX_SYNC_BLOB_CHUNKS: usize = 16_384;
 pub(super) const MAX_INLINE_SYNC_BLOB_BYTES: usize = 256 * 1024;
 
+pub(crate) fn validate_manifest_group(wires: &[SyncBlobManifest]) -> Result<(), LixError> {
+    if wires.is_empty() || wires.len() > super::transfer::CONTENT_GROUP_ITEMS
+        || serde_json::to_vec(wires).map_err(|e| LixError::unknown(e.to_string()))?.len() > super::transfer::CONTENT_GROUP_BYTES
+    {
+        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "blob group exceeds transfer budget"));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut decoded = 0usize;
+    for wire in wires {
+        if !ids.insert(&wire.blob_id) { return Err(LixError::new(LixError::CODE_INVALID_PARAM, "blob group repeats an identity")); }
+        validate_sync_blob_manifest(wire)?;
+        decoded = decoded.saturating_add(decode_inline_bytes(wire)?.map_or(0, |bytes| bytes.len()));
+        if decoded > super::transfer::CONTENT_GROUP_BYTES {
+            return Err(LixError::new(LixError::CODE_INVALID_PARAM, "blob group decoded content exceeds transfer budget"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result<(), LixError> {
     decode_manifest(manifest).map(|_| ())
 }
@@ -379,6 +398,63 @@ where
         Ok(())
     }
 
+    /// Register one bounded group in a coherent read and one durable commit.
+    /// Validate all members first; coalesce shared chunk/demand keys before
+    /// writing so overlapping manifests cannot create duplicate mutations.
+    pub(crate) async fn register_sync_blob_manifests(
+        &self,
+        wires: &[SyncBlobManifest],
+    ) -> Result<Vec<SyncBlobRegistration>, LixError> {
+        validate_manifest_group(wires)?;
+        let decoded = wires.iter().map(|wire| Ok((decode_manifest(wire)?, decode_inline_bytes(wire)?)))
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let _guard = self.lock_collaboration_writes().await;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        let hashes = decoded.iter().filter(|(_, bytes)| bytes.is_none())
+            .flat_map(|(manifest, _)| manifest.chunks.iter().map(|chunk| chunk.hash))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let presence = hashes.iter().copied().zip(chunk_presence_many(&read, &hashes).await?)
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut complete = Vec::new();
+        let mut provided = Vec::new();
+        let mut registrations = Vec::new();
+        for (manifest, inline) in decoded {
+            let missing_chunk_ids = if inline.is_some() { Vec::new() } else {
+                manifest.chunks.iter().filter(|chunk| !presence[&chunk.hash]).map(|chunk| chunk.hash.to_hex()).collect::<Vec<_>>()
+            };
+            if missing_chunk_ids.is_empty() {
+                let mut validation = adapter.new_write_set();
+                if let Some(bytes) = inline {
+                    stage_verified_inline_canonical_blob(&mut validation, &manifest, &bytes)?;
+                    let mut offset = 0;
+                    for receipt in &manifest.chunks {
+                        let end = offset + receipt.size_bytes as usize;
+                        provided.push(CanonicalBlobChunk { receipt: *receipt, bytes: bytes[offset..end].to_vec() });
+                        offset = end;
+                    }
+                } else {
+                    stage_verified_canonical_manifest(&read, &mut validation, &manifest).await?;
+                }
+                complete.push(manifest);
+            }
+            registrations.push(SyncBlobRegistration { missing_chunk_ids });
+        }
+        if !complete.is_empty() {
+            let mut writes = adapter.new_write_set();
+            let missing = crate::binary_cas::stage_deferred_canonical_manifests_with_chunks(&read, &mut writes, &complete, &provided).await?;
+            if !missing.is_empty() { return Err(LixError::unknown("verified group became incomplete")); }
+            let mut preconditions = Vec::new();
+            stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
+            drop(read);
+            let options = StorageWriteOptions { preconditions, await_durable: true, ..Default::default() };
+            if self.sync_mode_state().role() == super::SyncRole::Replica {
+                adapter.commit_certified_replica_write_set(super::certified_replica_write_capability(), writes, options).await?;
+            } else { adapter.commit_write_set(writes, options).await?; }
+        }
+        Ok(registrations)
+    }
+
     /// Authority-side manifest registration. The manifest becomes readable
     /// only after every referenced chunk is already present.
     pub(crate) async fn register_sync_blob_manifest(
@@ -634,6 +710,27 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(manifest.inline_bytes_base64.is_none());
+    }
+
+    #[tokio::test]
+    async fn grouped_registration_is_atomic_and_replayable() {
+        let lix = crate::open_lix().await.unwrap();
+        let bytes = [b"grouped payload one".to_vec(), b"grouped payload two".to_vec()];
+        let manifests = bytes.iter().map(|bytes| wire_manifest(CanonicalBlobManifest::from_bytes(bytes), Some(bytes))).collect::<Vec<_>>();
+        let mut damaged = manifests.clone();
+        damaged[1].inline_bytes_base64 = Some(base64::engine::general_purpose::STANDARD.encode(b"wrong"));
+        assert!(lix.register_sync_blob_manifests(&damaged).await.is_err());
+        assert!(lix.get_sync_blob_manifest(&manifests[0].blob_id).await.unwrap().is_none());
+        for _ in 0..2 {
+            let registrations = lix.register_sync_blob_manifests(&manifests).await.unwrap();
+            assert_eq!(registrations.len(), 2);
+            assert!(registrations.iter().all(|registration| registration.missing_chunk_ids.is_empty()));
+        }
+        for (manifest, bytes) in manifests.iter().zip(bytes) {
+            let chunk = &manifest.chunks[0].chunk_id;
+            assert_eq!(lix.get_sync_chunk(chunk).await.unwrap().unwrap(), bytes);
+        }
+        lix.close().await.unwrap();
     }
 
     #[tokio::test]
