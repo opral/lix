@@ -169,10 +169,10 @@ export class OpfsBackend implements LixStorageProvider {
 		const lockStartedAt = profileNow();
 		const releaseLock = await acquireOpfsLock(name);
 		const lockWaitMs = profileElapsed(lockStartedAt);
-		onOwnershipAcquired?.();
 		let pool: SAHPoolUtil | undefined;
 		let database: OpfsSAHPoolDatabase | undefined;
 		try {
+			onOwnershipAcquired?.();
 			const navigatorValue = getBrowserNavigator();
 			if (!navigatorValue.storage?.getDirectory) {
 				throw new Error(
