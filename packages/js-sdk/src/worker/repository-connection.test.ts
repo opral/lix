@@ -8,7 +8,7 @@ afterEach(async () => {
 	vi.unstubAllGlobals();
 	vi.useRealTimers();
 });
-function connection() {
+function connection(key = crypto.randomUUID()) {
 	const sent: any[] = [];
 	let channel: any;
 	const worker = {
@@ -45,10 +45,10 @@ function connection() {
 	worker.postMessage.mockImplementation((message: any) => {
 		if (message.kind === "start") {
 			const listener = worker.addEventListener.mock.calls.find(([kind]) => kind === "message")?.[1];
-			listener?.({ data: { kind: "build", buildId: currentBuild } });
+			listener?.({ data: { kind: "build", buildId: currentBuild, token: message.token } });
 		}
 	});
-	const result = createRepositoryConnection(crypto.randomUUID());
+	const result = createRepositoryConnection(key);
 	connections.push(result);
 	const listener = vi.fn(),
 		fatal = vi.fn();
@@ -217,3 +217,61 @@ for (const buildId of [undefined, "https://example.test/assets/old-worker.js"]) 
 		},
 	);
 }
+
+test("owner acquisition failure is reported promptly and stale run failures are ignored", async () => {
+	const c = connection();
+	const token = c.worker.postMessage.mock.calls.find(([message]) => message.kind === "start")![0].token;
+	const receive = c.worker.addEventListener.mock.calls.find(([kind]) => kind === "message")![1];
+	receive({ data: { kind: "failure", token: "old-run", message: "stale" } });
+	expect(c.fatal).not.toHaveBeenCalled();
+	receive({ data: { kind: "failure", token, message: "ownership unavailable" } });
+	expect(c.fatal).toHaveBeenCalledWith(expect.objectContaining({ code: "LIX_WORKER_FAILED", message: "ownership unavailable" }));
+	expect(c.worker.terminate).toHaveBeenCalledOnce();
+	await c.result.terminate();
+});
+
+test("an idle worker that errors is evicted before the next open", async () => {
+	const c = connection();
+	const client = c.elect();
+	const token = c.worker.postMessage.mock.calls.find(([message]) => message.kind === "start")![0].token;
+	const receive = c.worker.addEventListener.mock.calls.find(([kind]) => kind === "message")![1];
+	const closing = c.result.terminate();
+	c.receive({ kind: "disconnected", client, generation: "owner-1" });
+	await closing;
+	receive({ data: { kind: "retired", token, reusable: true, runtimeWarm: true } });
+	const idleError = c.worker.addEventListener.mock.calls.findLast(([kind]) => kind === "error")![1];
+	idleError(new Error("idle worker failed"));
+	expect(c.worker.terminate).toHaveBeenCalledOnce();
+	const replacement = connection();
+	expect(replacement.worker.postMessage).toHaveBeenCalledWith(expect.objectContaining({ kind: "start" }));
+	await replacement.result.terminate();
+});
+
+
+test("same-key reopen racing retirement restarts the retained realm after cleanup", async () => {
+	const key = crypto.randomUUID();
+	const c = connection(key);
+	const client = c.elect();
+	const receive = c.worker.addEventListener.mock.calls.find(([kind]) => kind === "message")![1];
+	const firstStart = c.worker.postMessage.mock.calls.find(([message]) => message.kind === "start")![0];
+	const closing = c.result.terminate();
+	c.receive({ kind: "disconnected", client, generation: "owner-1" });
+	await closing;
+	const reopened = createRepositoryConnection(key);
+	connections.push(reopened);
+	const fatal = vi.fn();
+	reopened.onFatal(fatal);
+	expect(c.worker.postMessage.mock.calls.filter(([message]) => message.kind === "start")).toHaveLength(1);
+	receive({ data: { kind: "retired", token: firstStart.token, reusable: true, runtimeWarm: true } });
+	const starts = c.worker.postMessage.mock.calls.filter(([message]) => message.kind === "start");
+	expect(starts).toHaveLength(2);
+	expect(starts[1][0].token).not.toBe(firstStart.token);
+	expect(c.worker.terminate).not.toHaveBeenCalled();
+	receive({ data: { kind: "failure", token: firstStart.token, message: "old retirement" } });
+	expect(fatal).not.toHaveBeenCalled();
+	const reopenedClient = c.elect("owner-2");
+	const secondClose = reopened.terminate();
+	c.receive({ kind: "disconnected", client: reopenedClient, generation: "owner-2" });
+	await secondClose;
+	receive({ data: { kind: "retired", token: starts[1][0].token, reusable: false } });
+});
