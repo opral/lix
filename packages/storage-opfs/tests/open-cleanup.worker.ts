@@ -2,8 +2,47 @@
 import { OpfsBackend } from "../dist/direct.js";
 
 self.onmessage = async (event) => {
-	const name = `open-cleanup:${crypto.randomUUID()}`;
+	const name = event.data.name ?? `open-cleanup:${crypto.randomUUID()}`;
 	try {
+		if (event.data.scenario === "pool-failure") {
+			const original = FileSystemFileHandle.prototype.createSyncAccessHandle;
+			const failure = new Error("interrupted OPFS handle acquisition");
+			const existing = new Set<string>(event.data.files);
+			FileSystemFileHandle.prototype.createSyncAccessHandle = async function (...args) {
+				if (existing.has(this.name)) throw failure;
+				return original.apply(this, args);
+			};
+			let error;
+			try {
+				await OpfsBackend.open(name);
+			} catch (caught) {
+				error = caught;
+			} finally {
+				FileSystemFileHandle.prototype.createSyncAccessHandle = original;
+			}
+			if (error !== failure) throw new Error("opening did not preserve access-handle failure");
+			self.postMessage({ ok: true });
+			return;
+		}
+		if (event.data.scenario === "seed" || event.data.scenario === "read") {
+			const db = await OpfsBackend.open(name);
+			const space = { id: 987, name: "open-cleanup", valueSemantics: "mutable", valueIntegrity: "backendVerified" };
+			let result;
+			try {
+				if (event.data.scenario === "seed") {
+					const write = await db.beginWrite({ awaitDurable: true, preconditions: [], batchCapacityHintBytes: 256 });
+					await write.putMany(space, [{ key: new Uint8Array([1]), value: new Uint8Array([42]) }]);
+					await write.commit();
+					result = { ok: true };
+				} else {
+					const read = await db.beginRead({ durability: "durable", consistency: "snapshot" });
+					const values = await read.getMany([{ space, keys: [new Uint8Array([1])], options: { projection: "fullValue" } }]);
+					result = { value: values[0]?.value?.[0] };
+				}
+			} finally { await db.close(); }
+			self.postMessage(result);
+			return;
+		}
 		if (event.data.scenario === "sqlite-retry") {
 			const compile = WebAssembly.compile;
 			const failure = new Error("interrupted SQLite compilation");
