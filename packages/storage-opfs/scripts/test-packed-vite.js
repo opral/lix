@@ -184,14 +184,9 @@ try {
 			);
 		}
 		progress("checking observation across owner failover");
-		await pages[1].evaluate(() => globalThis.__storageOpfsStartObservation());
-		await pages[0].close();
-		const failover = await pages[1].evaluate(() => {
-			return globalThis.__storageOpfsRecoverObservation("owner-failover-production");
-		});
-		assert.equal(failover.value, "owner-failover-production");
+		const failover = await measureOwnerFailover(context, server.port, "owner-failover-production");
 		progress("owner failover observation passed");
-		const failoverSamples = [failover.elapsedMs];
+		const failoverSamples = [failover];
 		if (benchmarkEnabled) {
 			for (let index = 1; index < 10; index += 1) {
 				failoverSamples.push(
@@ -233,21 +228,45 @@ async function measureOwnerFailover(browserContext, port, storageName) {
 	}
 	const url = `http://127.0.0.1:${port}${base}?storage=${encodeURIComponent(storageName)}`;
 	try {
+		const repositoryLock = `lix:repository-owner:lix:opfs:${Buffer.from(storageName).toString("hex")}`;
+		const dataLock = `lix:opfs-sqlite:${storageName}`;
+		let originalOwner;
 		for (const page of [owner, follower]) {
 			await page.goto(url, { waitUntil: "load" });
 			await page.waitForFunction(() => "__storageOpfsProductionSmoke" in globalThis);
 			assert.deepEqual(await page.evaluate(() => globalThis.__storageOpfsProductionSmoke), {
 				message: "persistent-production",
 			});
+			if (page === owner) {
+				// Retain a live session before the follower can elect a worker.
+				await owner.evaluate(() => globalThis.__storageOpfsPrepareBenchmarkWriter());
+				const locks = await owner.evaluate(() => navigator.locks.query());
+				const repository = locks.held.find(lock => lock.name === repositoryLock);
+				const data = locks.held.find(lock => lock.name === dataLock);
+				assert.ok(repository, "designated host must own the repository");
+				assert.ok(data, "designated host must own physical storage");
+				assert.equal(repository.clientId, data.clientId);
+				originalOwner = repository.clientId;
+			}
 		}
 		await follower.evaluate(() => globalThis.__storageOpfsStartObservation());
+		const before = await follower.evaluate(() => navigator.locks.query());
+		assert.equal(before.held.find(lock => lock.name === repositoryLock)?.clientId, originalOwner);
+		assert.equal(before.held.find(lock => lock.name === dataLock)?.clientId, originalOwner);
+		const startedAt = performance.now();
 		await owner.close();
 		const recovered = await follower.evaluate(() =>
 			globalThis.__storageOpfsRecoverObservation("owner-failover-benchmark"),
 		);
+		const elapsedMs = performance.now() - startedAt;
 		assert.equal(recovered.value, "owner-failover-benchmark");
+		const after = await follower.evaluate(() => navigator.locks.query());
+		const replacement = after.held.find(lock => lock.name === repositoryLock);
+		assert.ok(replacement, "follower must elect a replacement owner");
+		assert.notEqual(replacement.clientId, originalOwner);
+		assert.equal(after.held.find(lock => lock.name === dataLock)?.clientId, replacement.clientId);
 		assert.deepEqual(errors, []);
-		return recovered.elapsedMs;
+		return elapsedMs;
 	} finally {
 		await Promise.all([owner.close(), follower.close()]);
 	}
