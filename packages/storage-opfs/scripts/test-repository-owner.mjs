@@ -143,7 +143,7 @@ try {
 			await a.evaluate(() => api.close());
 			assert.equal(await b.evaluate(() => api.read("shared")), "durable");
 			await b.evaluate(() => api.close());
-			await a.waitForFunction(() => window.retiredOwners > 0);
+			await Promise.all([a, b].map(page => page.waitForFunction(() => window.retiredOwners > 0)));
 			const workerCount = await a.evaluate(() => window.ownerWorkers);
 			// Reuse the compiler realm across physical repositories, without keeping
 			// either ownership locks or previous repository state alive while idle.
