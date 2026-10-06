@@ -1049,12 +1049,20 @@ async function getPool(
 	const vfsName = `${SQLITE_VFS_NAME_PREFIX}${await hashName(storageName)}`;
 	let pool = pools.get(vfsName);
 	if (!pool) {
-		pool = sqlite3.installOpfsSAHPoolVfs({
+		const options = {
 			name: vfsName,
 			directory: `${SQLITE_VFS_DIRECTORY}/${fileName(storageName)}`,
 			initialCapacity: 16,
-		});
+			// Our shared SQLite bundle preserves files on failed initialization.
+			// Permit a later opening attempt to replace SQLite's cached rejection.
+			forceReinitIfPreviouslyFailed: true,
+		};
+		pool = sqlite3.installOpfsSAHPoolVfs(options);
 		pools.set(vfsName, pool);
+		const installing = pool;
+		void installing.catch(() => {
+			if (pools.get(vfsName) === installing) pools.delete(vfsName);
+		});
 	}
 	const resolved = await pool;
 	if (resolved.isPaused()) await resolved.unpauseVfs();

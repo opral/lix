@@ -58,3 +58,12 @@ test("failed pool opening preserves every existing repository file", async () =>
 	expect(await storedFiles(name)).toEqual(before);
 	expect(await runScenario("read", name)).toEqual({ value: 42 });
 }, 30_000);
+
+test("failed pool opening can retry without losing data in the same worker", async () => {
+	const name = `pool-retry-${crypto.randomUUID()}`;
+	expect(await runScenario("seed", name)).toEqual({ ok: true });
+	const before = await storedFiles(name);
+	expect(before.length).toBeGreaterThan(0);
+	expect(await runScenario("pool-failure-retry", name, before.map(file => file.path.split("/").at(-1)!))).toEqual({ value: 42 });
+	expect(await storedFiles(name)).toEqual(before);
+}, 30_000);

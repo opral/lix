@@ -4,7 +4,7 @@ import { OpfsBackend } from "../dist/direct.js";
 self.onmessage = async (event) => {
 	const name = event.data.name ?? `open-cleanup:${crypto.randomUUID()}`;
 	try {
-		if (event.data.scenario === "pool-failure") {
+		if (event.data.scenario === "pool-failure" || event.data.scenario === "pool-failure-retry") {
 			const original = FileSystemFileHandle.prototype.createSyncAccessHandle;
 			const failure = new Error("interrupted OPFS handle acquisition");
 			const existing = new Set<string>(event.data.files);
@@ -21,6 +21,17 @@ self.onmessage = async (event) => {
 				FileSystemFileHandle.prototype.createSyncAccessHandle = original;
 			}
 			if (error !== failure) throw new Error("opening did not preserve access-handle failure");
+			if (event.data.scenario === "pool-failure-retry") {
+				const db = await OpfsBackend.open(name);
+				let value;
+				try {
+					const read = await db.beginRead({ durability: "durable", consistency: "snapshot" });
+					const values = await read.getMany([{ space: { id: 987, name: "open-cleanup", valueSemantics: "mutable", valueIntegrity: "backendVerified" }, keys: [new Uint8Array([1])], options: { projection: "fullValue" } }]);
+					value = values[0]?.value?.[0];
+				} finally { await db.close(); }
+				self.postMessage({ value });
+				return;
+			}
 			self.postMessage({ ok: true });
 			return;
 		}
