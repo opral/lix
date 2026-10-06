@@ -67,3 +67,14 @@ test("failed pool opening can retry without losing data in the same worker", asy
 	expect(await runScenario("pool-failure-retry", name, before.map(file => file.path.split("/").at(-1)!))).toEqual({ value: 42 });
 	expect(await storedFiles(name)).toEqual(before);
 }, 30_000);
+
+
+test("disposing pools preserves files and isolated data across same-worker reopens", async () => {
+	const name = `pool-disposal-${crypto.randomUUID()}`;
+	expect(await runScenario("seed", name)).toEqual({ ok: true });
+	const before = await storedFiles(name);
+	expect(before.length).toBeGreaterThan(0);
+	expect(await runScenario("pool-disposal", name)).toEqual({ first: 42, reopened: 42, other: 84 });
+	expect(await storedFiles(name)).toEqual(before);
+	expect((await storedFiles(name + "-other")).length).toBeGreaterThan(0);
+}, 30_000);

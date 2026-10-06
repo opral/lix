@@ -36,8 +36,14 @@ export function sqliteBundlePlugin() {
 						"await this.#dhVfsParent.removeEntry(this.#dhVfsRoot.name, { recursive: true });",
 						"if (removeFiles && this.#dhVfsParent) await this.#dhVfsParent.removeEntry(this.#dhVfsRoot.name, { recursive: true });");
 					source = replaceOnce(source,
+						'sqlite3.config.error(this.vfsName, "removeVfs() failed with no recovery strategy:", e);',
+						'if (!removeFiles) throw e; sqlite3.config.error(this.vfsName, "removeVfs() failed with no recovery strategy:", e);');
+					source = replaceOnce(source,
 						"await thePool.removeVfs().catch(() => {});",
 						"await thePool.removeVfs(false).catch(() => {});");
+					source = replaceOnce(source,
+						"async removeVfs() {\n\t\t\t\t\treturn this.#p.removeVfs();",
+						"async disposePreservingFiles() { return this.#p.removeVfs(false); }\n\t\t\t\tasync removeVfs() {\n\t\t\t\t\treturn this.#p.removeVfs();");
 					return { contents: source, loader: "js" };
 				},
 			);

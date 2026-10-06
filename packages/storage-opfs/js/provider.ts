@@ -202,7 +202,7 @@ export class OpfsBackend implements LixStorageProvider {
 		} catch (error) {
 			try {
 				database?.close();
-				if (pool && !pool.isPaused()) pool.pauseVfs();
+				if (pool) await disposePool(pool);
 			} catch {
 				// Preserve the original open/schema error.
 			}
@@ -268,7 +268,7 @@ export class OpfsBackend implements LixStorageProvider {
 		);
 		try {
 			this.#database.close();
-			if (!this.#pool.isPaused()) this.#pool.pauseVfs();
+			await disposePool(this.#pool);
 		} finally {
 			await this.#releaseLock();
 		}
@@ -1040,6 +1040,16 @@ function decodeDataUrl(dataUrl: string): Uint8Array<ArrayBuffer> {
 		bytes[index] = binary.charCodeAt(index);
 	}
 	return bytes;
+}
+
+async function disposePool(pool: SAHPoolUtil): Promise<void> {
+	// The shared SQLite bundle exposes disposal separately from file deletion.
+	// A warm SDK realm must not accumulate one paused VFS per repository name.
+	if (!pool.isPaused()) pool.pauseVfs();
+	const dispose = Reflect.get(pool, "disposePreservingFiles");
+	if (typeof dispose !== "function") throw new Error("Missing non-destructive SQLite VFS disposal");
+	await dispose.call(pool);
+	pools.delete(pool.vfsName);
 }
 
 async function getPool(

@@ -4,6 +4,26 @@ import { OpfsBackend } from "../dist/direct.js";
 self.onmessage = async (event) => {
 	const name = event.data.name ?? `open-cleanup:${crypto.randomUUID()}`;
 	try {
+		if (event.data.scenario === "pool-disposal") {
+			const space = { id: 987, name: "open-cleanup", valueSemantics: "mutable", valueIntegrity: "backendVerified" };
+			const read = async (key: string) => {
+				const db = await OpfsBackend.open(key);
+				try {
+					const snapshot = await db.beginRead({ durability: "durable", consistency: "snapshot" });
+					const values = await snapshot.getMany([{ space, keys: [new Uint8Array([1])], options: { projection: "fullValue" } }]);
+					return values[0]?.value?.[0];
+				} finally { await db.close(); }
+			};
+			const first = await read(name);
+			const other = await OpfsBackend.open(name + "-other");
+			try {
+				const write = await other.beginWrite({ awaitDurable: true, preconditions: [], batchCapacityHintBytes: 256 });
+				await write.putMany(space, [{ key: new Uint8Array([1]), value: new Uint8Array([84]) }]);
+				await write.commit();
+			} finally { await other.close(); }
+			self.postMessage({ first, reopened: await read(name), other: await read(name + "-other") });
+			return;
+		}
 		if (event.data.scenario === "pool-failure" || event.data.scenario === "pool-failure-retry") {
 			const original = FileSystemFileHandle.prototype.createSyncAccessHandle;
 			const failure = new Error("interrupted OPFS handle acquisition");
