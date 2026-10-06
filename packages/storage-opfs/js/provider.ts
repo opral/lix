@@ -1056,6 +1056,12 @@ async function getPool(
 }
 
 async function acquireOpfsLock(name: string): Promise<() => Promise<void>> {
+	// SQLite filenames use UTF-8 bytes. Lone surrogates therefore alias the
+	// replacement character and must share the same ownership fence. Keep
+	// well-formed names unchanged so existing physical lock names still match.
+	name = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+		new TextEncoder().encode(name),
+	);
 	const locks = getBrowserNavigator().locks;
 	if (!locks) {
 		throw new Error("OPFS storage requires Web Locks for safe ownership");

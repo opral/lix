@@ -1,9 +1,24 @@
 // @ts-expect-error packed provider entry has no declaration file.
 import { OpfsBackend } from "../dist/direct.js";
 
-self.onmessage = async () => {
+self.onmessage = async (event) => {
 	const name = `open-cleanup:${crypto.randomUUID()}`;
 	try {
+		if (event.data.scenario === "aliases") {
+			const first = await OpfsBackend.open(name + "\ud800");
+			let alias;
+			let code;
+			try {
+				alias = await OpfsBackend.open(name + "\ud801");
+			} catch (error) {
+				code = (error as { code?: string }).code;
+			} finally {
+				await alias?.close();
+				await first.close();
+			}
+			self.postMessage({ code });
+			return;
+		}
 		let original: unknown;
 		try {
 			await OpfsBackend.open(name, () => {
