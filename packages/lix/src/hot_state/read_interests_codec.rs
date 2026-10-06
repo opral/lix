@@ -199,7 +199,6 @@ mod tests {
             },
             LogicalReadInterest::History {
                 branch_id: "branch".into(),
-                anchor: "00000000-0000-7000-8000-000000000001".into(),
                 commit_ids: vec!["00000000-0000-7000-8000-000000000002".into()],
                 relation: "lix_file".into(),
                 filter: TrackedStateFilter::default(),
@@ -258,7 +257,10 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&interest).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["request"]["filter"]["schema_keys"][0], "lix_registered_schema");
+        assert_eq!(
+            value["request"]["filter"]["schema_keys"][0],
+            "lix_registered_schema"
+        );
         assert_eq!(
             serde_json::from_slice::<LogicalReadInterest>(&encoded).unwrap(),
             interest
@@ -283,7 +285,6 @@ mod tests {
         assert_eq!(restored.snapshot().unwrap().interests.len(), 1);
         restored.register(interest.clone()).unwrap();
         assert_eq!(restored.snapshot().unwrap().interests.len(), 1);
-
     }
     #[test]
     fn registry_restore_preserves_distinct_uuid_and_text_recipes() {

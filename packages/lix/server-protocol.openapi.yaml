@@ -417,7 +417,7 @@ paths:
       - $ref: "#/components/parameters/ReplicaId"
     post:
       operationId: syncReadFulfillment
-      description: Executes the submitted typed read interests once against the admitted descriptor roots and returns verified native dependencies. The request is limited to 528 KiB (512 KiB recipes plus a bounded descriptor). Responses page at 4 MiB, except that one native input may be up to 64 MiB; a closure is limited to 256 MiB, 16384 inputs, 65536 storage calls, and 1 GiB of authority reads. The closure digest binds every page. Returned inputs warm local state and do not certify absence or result membership. Bounded file and directory History recipes share limits of 8 recipes, 64 selected commit IDs, and 4096 ancestry-node loads. Unprovable or excessive ancestry work returns an empty history_fallback outcome; clients continue native hydration without installing read coverage.
+      description: Executes the submitted typed read interests once against the admitted descriptor roots and returns verified native dependencies. The request is limited to 528 KiB (512 KiB recipes plus a bounded descriptor). Responses page at 4 MiB, except that one native input may be up to 64 MiB; a closure is limited to 256 MiB, 16384 inputs, 65536 storage calls, and 1 GiB of authority reads. The closure digest binds every page. Returned inputs warm local state and do not certify absence or result membership. Bounded file and directory History recipes share limits of 8 recipes, 64 selected commit IDs, 4096 ancestry-node loads, and a shared 16384 changed-identity, 65536 node/key-visit and 4 MiB encoded-key work budgets across native diff replay passes. Unprovable ancestry or deterministic native-only replay work exhaustion returns an empty native_fallback outcome reusable only for the same leased descriptor and native recipes. Global discovery, payload, blob or allocation work exhaustion returns an empty operation_fallback outcome reusable only for the exact request. Clients continue native hydration without installing read coverage.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -427,7 +427,7 @@ paths:
         content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentRequest" } } }
       responses:
         "200":
-          description: Verified typed dependencies observed at the admitted roots, or an empty history_fallback response with no coverage.
+          description: Verified typed dependencies observed at the admitted roots, or an empty-input native_fallback or operation_fallback response with measured work and no coverage.
           content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentResponse" } } }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/native-metadata-walk:
@@ -1003,7 +1003,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 27 }
+      schema: { type: integer, const: 28 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1061,7 +1061,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 27 }
+        syncProtocolVersion: { type: integer, const: 28 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1630,7 +1630,7 @@ components:
           minItems: 1
           maxItems: 32
           uniqueItems: true
-          description: Typed immutable inputs required by the first missing native frontier. A complete response returns every item; history_fallback grants no coverage and leaves this frontier for native hydration.
+          description: Typed immutable inputs required by the first missing native frontier. A complete response returns every item; Either fallback outcome grants no coverage and leaves this frontier for native hydration.
           items:
             allOf:
               - { $ref: "#/components/schemas/ReadInputAddress" }
@@ -1653,8 +1653,8 @@ components:
       properties:
         kind:
           type: string
-          enum: [filesystem_metadata, file_content, collection_generation, packed_identity_membership, filesystem_paths, scan, exact, history]
-      description: Tagged native read recipe. Variant fields are the canonical serialized LogicalReadInterest fields; unknown fields are rejected by the implementation. History supports only lix_file and lix_directory on the leased selected branch, a canonical fixed anchor and at most 16 distinct canonical commit_ids per recipe. Filters, projections and payload retention must match the supported native route. Historical dependencies grant no mutable change-record authority.
+          enum: [filesystem_metadata, file_content, collection_generation, packed_identity_membership, filesystem_paths, scan, exact, diff, history]
+      description: Tagged native read recipe. Variant fields are the canonical serialized LogicalReadInterest fields; unknown fields are rejected by the implementation. History supports only lix_file and lix_directory on the leased selected branch, at most 20 distinct canonical commit_ids per recipe, each independently proved on the first-parent ancestry of the leased branch head. Filters, projections and payload retention must match the supported native route. Working Diff supports only the leased selected branch, WorkingCheckpoint to ActiveHead endpoints, lix_file or lix_directory, no payload retention or payload columns, no limit, and at most 8 recipes. The leased checkpoint must be proved on the leased head first-parent ancestry using the same 4096-node budget as History. Historical and working-diff dependencies grant no mutable change-record authority.
     ReadInputAddress:
       oneOf:
         - type: object
@@ -1712,15 +1712,15 @@ components:
       additionalProperties: false
       required: [storageCalls, storageBytes, payloadBytes]
       properties:
-        storageCalls: { type: integer, minimum: 0 }
-        storageBytes: { type: integer, minimum: 0 }
+        storageCalls: { type: integer, minimum: 0, description: Storage calls admitted by the work limit; a rejected next call is excluded. }
+        storageBytes: { type: integer, minimum: 0, description: Observed storage bytes including a final input that crosses the work limit. }
         payloadBytes: { type: integer, minimum: 0 }
     ReadFulfillmentResponse:
       type: object
       additionalProperties: false
       required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation, outcome]
       allOf:
-        - if: { properties: { outcome: { const: history_fallback } } }
+        - if: { properties: { outcome: { enum: [native_fallback, operation_fallback] } } }
           then:
             properties:
               inputs: { type: array, maxItems: 0 }
@@ -1731,8 +1731,8 @@ components:
         requestDigest: { type: string, minLength: 64, maxLength: 64 }
         outcome:
           type: string
-          enum: [complete, history_fallback]
-          description: history_fallback is valid only for a History request without continuation, with empty inputs, null continuation and the request-bound empty closure digest. It provides no coverage and cannot be installed.
+          enum: [complete, native_fallback, operation_fallback]
+          description: Both fallback outcomes are valid only for a bounded History or working-diff request without continuation, with empty inputs, null continuation and the request-bound empty closure digest. native_fallback declines ancestry proof or deterministic native-only replay work for the leased descriptor and native recipes; operation_fallback declines only this exact request due to global discovery, payload, blob or allocation work bounds. Neither provides coverage or can be installed. The profile reports observed work, including the final input that crosses a byte limit. Storage calls rejected before execution are excluded.
         inputs:
           type: array
           maxItems: 16384

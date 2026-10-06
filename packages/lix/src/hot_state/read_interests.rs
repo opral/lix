@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-pub(crate) const MAX_HISTORY_RECIPE_COMMIT_IDS: usize = 16;
+pub(crate) const MAX_HISTORY_RECIPE_COMMIT_IDS: usize = 20;
 pub(crate) const MAX_HISTORY_RECIPE_COUNT: usize = 8;
 pub(crate) const MAX_HISTORY_RECIPE_SELECTED_IDS: usize = 64;
 pub(crate) const MAX_HISTORY_RECIPE_GRAPH_NODES: usize = 4096;
@@ -137,10 +137,10 @@ pub(crate) enum LogicalReadInterest {
     /// A fixed, bounded set of historical commit diffs selected by a
     /// mainline history scan. This recipe is distinct from arbitrary `Diff`
     /// endpoints: authority replay proves every selected commit lies on the
-    /// leased selected-branch first-parent lane from `anchor`.
+    /// leased selected-branch first-parent lane. Local head movement does not
+    /// change the authority of these immutable selected commits.
     History {
         branch_id: String,
-        anchor: String,
         commit_ids: Vec<String>,
         relation: String,
         #[serde(with = "super::read_interests_codec::NativeTrackedFilter")]
@@ -636,7 +636,6 @@ mod tests {
         let registry = ReadInterestRegistry::new_durable(16, 16384);
         let history = LogicalReadInterest::History {
             branch_id: "branch".into(),
-            anchor: "anchor".into(),
             commit_ids: vec!["selected".into()],
             relation: "lix_file".into(),
             filter: Default::default(),

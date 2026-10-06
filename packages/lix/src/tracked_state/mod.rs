@@ -10,6 +10,7 @@ mod context;
 mod current_state_data_part;
 pub(crate) mod current_state_envelope;
 mod diff;
+mod diff_budget;
 #[cfg(test)]
 pub(crate) use diff::{arm_diff_commits_test_probe, take_diff_commits_test_probe};
 mod diff_id;
@@ -46,6 +47,7 @@ pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
 };
+pub(crate) use diff_budget::{NATIVE_DIFF_RECIPE_WORK_BOUND_CODE, NativeDiffIdentityBudget};
 pub(crate) use diff_id::{decode_diff_id, encode_diff_id};
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,

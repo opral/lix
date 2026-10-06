@@ -35,6 +35,8 @@ pub(crate) mod native_metadata;
 mod native_metadata_walk;
 mod read_fulfillment;
 mod read_interest_prepare;
+mod working_diff_candidate;
+mod working_diff_recipe;
 #[cfg(feature = "server-protocol")]
 pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
 pub(crate) use native_metadata::NativeMetadataRequest;
@@ -83,8 +85,8 @@ pub(crate) use partial_merge_protocol::{
 pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
 pub(crate) use partial_interest_journal::{
-    PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests, v2_journal_upgrade,
-    validate_partial_read_interest_journal,
+    PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
+    legacy_read_interest_journal_upgrade, validate_partial_read_interest_journal,
 };
 mod leased_descriptor;
 mod partial_replica;
@@ -105,14 +107,14 @@ mod partial_upload_cycle;
 #[cfg(test)]
 mod partial_working_diff_tests;
 pub(crate) use partial_push_state::PARTIAL_BRANCH_PUSH_SPACE;
-mod partial_state;
 pub(crate) mod partial_serving;
+mod partial_state;
+#[cfg(test)]
+pub(crate) use partial_state::tests::released_v2_receipt_bytes_for_test;
 pub(crate) use partial_state::{
     PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
     partial_replica_state_key,
 };
-#[cfg(test)]
-pub(crate) use partial_state::tests::released_v2_receipt_bytes_for_test;
 mod platform;
 #[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
@@ -172,18 +174,16 @@ pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
 pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead,
-    SyncCheckpointInventoryPage, SyncCommitHeader, SyncEvent, SyncHistoryBoundary,
-    SyncFirstParentCheckpointSummary,
-    SyncHistoryResponse, SyncPushRequest, SyncPushResponse, SyncRepositoryPullResponse,
-    SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
-};
-pub(crate) use read_fulfillment::{
-    ReadFulfillmentRequest, ReadFulfillmentResponse,
-    annotate_capture as annotate_read_fulfillment_capture,
-    discover as discover_read_fulfillment,
+    SyncCheckpointInventoryPage, SyncCommitHeader, SyncEvent, SyncFirstParentCheckpointSummary,
+    SyncHistoryBoundary, SyncHistoryResponse, SyncPushRequest, SyncPushResponse,
+    SyncRepositoryPullResponse, SyncSnapshotRow, SyncSnapshotRowPage, encoded_delta_event_len,
 };
 #[cfg(feature = "server-protocol")]
 pub(crate) use read_fulfillment::MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES;
+pub(crate) use read_fulfillment::{
+    ReadFulfillmentRequest, ReadFulfillmentResponse,
+    annotate_capture as annotate_read_fulfillment_capture, discover as discover_read_fulfillment,
+};
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
@@ -228,7 +228,9 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v25 adds typed canonical CHANGE_SPACE payloads to descriptor-scoped exact
 // row closures; older peers cannot decode this new read-fulfillment input.
 // v27 adds bounded leased first-parent history recipes to read fulfillment.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 27;
+// v28 removes the History anchor and adds bounded moving-diff dependency replay
+// with separate ancestry-proof and operation-work fallback outcomes.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 28;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -543,8 +545,8 @@ pub(crate) use repository::{
 pub(crate) use partial_open::authenticate_partial_source_conversion;
 
 pub(crate) use partial_state::{
-    prepare_owned_partial_receipt_upgrade,
-    prepare_owned_partial_metadata_upgrade, upgrade_owned_partial_receipt,
+    prepare_owned_partial_metadata_upgrade, prepare_owned_partial_receipt_upgrade,
+    upgrade_owned_partial_receipt,
 };
 mod partial_branch_switch;
 pub(crate) use partial_branch_switch::{PartialBranchSwitchCompletion, switch_existing_branch};

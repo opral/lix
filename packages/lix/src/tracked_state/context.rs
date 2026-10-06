@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
-    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
-    CommitLoadRequest,
+    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
 };
 use crate::common::SharedStr;
 use crate::row_pk::{RowPk, RowPkComponent};
@@ -29,9 +28,8 @@ use crate::tracked_state::codec::{
 };
 use crate::tracked_state::diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRequest,
-    TrackedStateDiffRow,
-    TrackedStatePayloadBatch, TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder,
-    TrackedStateTreeDiffRowRef, diff_commits,
+    TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStateTreeDiffBatch,
+    TrackedStateTreeDiffBatchBuilder, TrackedStateTreeDiffRowRef, diff_commits,
 };
 #[cfg(test)]
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
@@ -923,6 +921,7 @@ impl TrackedStateContext {
             commit_delta_value_cache: HashMap::new(),
             point_replay_commits: HashMap::new(),
             commit_delta_point_cache: storage::CommitDeltaPointReadCache::default(),
+            native_diff_identity_budget: None,
         }
     }
 
@@ -1002,6 +1001,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// Shares decoded immutable manifests between rootless layout discovery
     /// and the later delta scan in this storage snapshot.
     commit_delta_point_cache: storage::CommitDeltaPointReadCache,
+    native_diff_identity_budget: Option<super::NativeDiffIdentityBudget>,
 }
 
 struct DiffCommitRootValidationCache {
@@ -1097,6 +1097,16 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Installs the shared authority-side work limit used while preparing
+    /// native diff recipes. Readers without this builder remain unlimited.
+    pub(crate) fn with_native_diff_identity_budget(
+        mut self,
+        budget: super::NativeDiffIdentityBudget,
+    ) -> Self {
+        self.native_diff_identity_budget = Some(budget);
+        self
+    }
+
     /// Enumerates authenticated schema runs, without scanning row payloads.
     /// The rootless row-PK catalog preserves the ordinary schema prefix and
     /// is a monotonic superset; callers still resolve exact current scopes.
@@ -1275,8 +1285,11 @@ where
             if let Some(limit) = request.limit {
                 entries.truncate(limit);
             }
-            if let Some(root_id) = durable_root.as_ref() && !catalog_identity_scan {
-                self.restore_legacy_root_authors(root_id, &mut entries).await?;
+            if let Some(root_id) = durable_root.as_ref()
+                && !catalog_identity_scan
+            {
+                self.restore_legacy_root_authors(root_id, &mut entries)
+                    .await?;
             }
             return materialize_batch_from_index_entries(&self.store, entries, &materialization)
                 .await;
@@ -1378,9 +1391,10 @@ where
                 })
             })
             .collect::<Vec<_>>();
-        let mut canonical_live = storage::load_authoritative_live_change_records(&self.store, &live)
-            .await?
-            .into_iter();
+        let mut canonical_live =
+            storage::load_authoritative_live_change_records(&self.store, &live)
+                .await?
+                .into_iter();
         let deleted = legacy
             .iter()
             .filter_map(|&index| {
@@ -1419,7 +1433,9 @@ where
                 }
                 author_id
             } else {
-                let canonical = canonical_live.next().expect("one record per legacy live row");
+                let canonical = canonical_live
+                    .next()
+                    .expect("one record per legacy live row");
                 if canonical.change_id != value.change_id
                     || canonical.schema_key != key.schema_key
                     || canonical.file_id != key.file_id
@@ -1506,7 +1522,8 @@ where
             .iter()
             .map(|(_, key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        self.restore_legacy_root_authors(root_id, &mut entries).await?;
+        self.restore_legacy_root_authors(root_id, &mut entries)
+            .await?;
         for ((index, _, _), (_, resolved)) in candidates.drain(..).zip(entries) {
             values[index] = Some(resolved);
         }
@@ -1521,9 +1538,10 @@ where
     ) -> Result<(), LixError> {
         let mut candidates = Vec::new();
         for (index, (key, value)) in keys.iter().zip(values.iter()).enumerate() {
-            let Some(value) = value.as_ref().filter(|value| {
-                value.author_id == crate::ANONYMOUS_ACCOUNT_ID
-            }) else {
+            let Some(value) = value
+                .as_ref()
+                .filter(|value| value.author_id == crate::ANONYMOUS_ACCOUNT_ID)
+            else {
                 continue;
             };
             candidates.push((
@@ -1536,7 +1554,8 @@ where
             .iter()
             .map(|(_, key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        self.restore_legacy_root_authors(root_id, &mut entries).await?;
+        self.restore_legacy_root_authors(root_id, &mut entries)
+            .await?;
         for ((index, _, _), (_, resolved)) in candidates.into_iter().zip(entries) {
             values[index] = Some(resolved);
         }
@@ -1696,7 +1715,8 @@ where
                 .iter()
                 .map(|(_, key, value)| (key.clone(), value.clone()))
                 .collect::<Vec<_>>();
-            self.restore_legacy_root_authors(&root_id, &mut owned).await?;
+            self.restore_legacy_root_authors(&root_id, &mut owned)
+                .await?;
             for ((index, _, _), (_, value)) in candidates.drain(..).zip(owned) {
                 entries[index].1.author_id = value.author_id;
             }
@@ -1726,7 +1746,16 @@ where
         right_commit_id: &str,
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
-        diff_commits(self, left_commit_id, right_commit_id, request, false).await
+        let work_budget = self.native_diff_identity_budget.clone();
+        diff_commits(
+            self,
+            left_commit_id,
+            right_commit_id,
+            request,
+            false,
+            work_budget,
+        )
+        .await
     }
 
     /// Compares authored members for merge publication. Collection-generation
@@ -1737,7 +1766,16 @@ where
         right_commit_id: &str,
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
-        diff_commits(self, left_commit_id, right_commit_id, request, true).await
+        let work_budget = self.native_diff_identity_budget.clone();
+        diff_commits(
+            self,
+            left_commit_id,
+            right_commit_id,
+            request,
+            true,
+            work_budget,
+        )
+        .await
     }
 
     pub(crate) async fn restore_legacy_diff_authors(
@@ -1780,8 +1818,8 @@ where
                 }
             }
         }
-        let live = storage::load_authoritative_live_change_records(&self.store, &live_requests)
-            .await?;
+        let live =
+            storage::load_authoritative_live_change_records(&self.store, &live_requests).await?;
         let deleted_authors = self
             .resolve_legacy_tombstone_authors(&deleted_requests)
             .await?;
@@ -1912,13 +1950,7 @@ where
             (CommitId, String, Option<String>),
             (
                 TrackedStateKey,
-                Vec<(
-                    usize,
-                    ChangeId,
-                    crate::common::LixTimestamp,
-                    String,
-                    bool,
-                )>,
+                Vec<(usize, ChangeId, crate::common::LixTimestamp, String, bool)>,
             ),
         >::new();
         for (ordinal, key, after, author_present) in batch.rows_with_after_author_presence() {
@@ -1953,20 +1985,13 @@ where
             return Ok(());
         }
 
-        let mut by_commit =
-            BTreeMap::<
-                CommitId,
-                Vec<(
-                    TrackedStateKey,
-                    Vec<(
-                        usize,
-                        ChangeId,
-                        crate::common::LixTimestamp,
-                        String,
-                        bool,
-                    )>,
-                )>,
-            >::new();
+        let mut by_commit = BTreeMap::<
+            CommitId,
+            Vec<(
+                TrackedStateKey,
+                Vec<(usize, ChangeId, crate::common::LixTimestamp, String, bool)>,
+            )>,
+        >::new();
         for ((commit_id, _, _), request) in scopes {
             by_commit.entry(commit_id).or_default().push(request);
         }
@@ -2045,12 +2070,7 @@ where
         let mut validated_payload_keys = HashSet::with_capacity(comparison_rows.len());
         let mut changes = HashMap::<ChangeId, ChangeRecord>::new();
         let mut fallback_rows = Vec::new();
-        for ((row, key), entry) in comparison_rows
-            .iter()
-            .copied()
-            .zip(keys.iter())
-            .zip(loaded)
-        {
+        for ((row, key), entry) in comparison_rows.iter().copied().zip(keys.iter()).zip(loaded) {
             let Some(entry) = entry else {
                 // Sparse complete-state boundaries may route the immutable
                 // payload through a selected changelog source even when their
@@ -2157,7 +2177,9 @@ where
             validated_payload_keys.insert((row.commit_id(), key.clone()));
             fingerprints.insert(
                 row.change_id(),
-                value.semantic_fingerprint.expect("all loaded proofs were checked"),
+                value
+                    .semantic_fingerprint
+                    .expect("all loaded proofs were checked"),
             );
         }
         self.validate_tree_diff_batch_against_delta_index(batch, Some(&validated_payload_keys))
@@ -3743,9 +3765,15 @@ where
         left_commit_id: &str,
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
-        self.diff_semantic_tree_entries_at_commits_inner(left_commit_id, right_commit_id, request)
-            .await
+        self.diff_semantic_tree_entries_at_commits_inner(
+            left_commit_id,
+            right_commit_id,
+            request,
+            native_work_budget,
+        )
+        .await
     }
 
     async fn diff_semantic_tree_entries_at_commits_inner(
@@ -3753,6 +3781,7 @@ where
         left_commit_id: &str,
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
         let left_root = self.tree.load_root(&self.store, left_commit_id).await?;
         let right_root = if left_commit_id == right_commit_id {
@@ -3775,31 +3804,65 @@ where
             .await?;
         }
         if let (Some(_), Some(_)) = (&left_root, &right_root) {
+            let mut bounded_request;
+            let request = if let Some(budget) = native_work_budget {
+                bounded_request = request.clone();
+                let max_plus_one = budget.remaining_identities()?.saturating_add(1);
+                bounded_request.limit = Some(
+                    bounded_request
+                        .limit
+                        .map_or(max_plus_one, |limit| limit.min(max_plus_one)),
+                );
+                &bounded_request
+            } else {
+                request
+            };
             return self
-                .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
+                .diff_tree_entries_from_roots(
+                    left_commit_id,
+                    right_commit_id,
+                    request,
+                    native_work_budget,
+                )
                 .await;
         }
         if let Some(entries) = self
-            .diff_tree_entries_from_first_parent_interval(left_commit_id, right_commit_id, request)
+            .diff_tree_entries_from_first_parent_interval(
+                left_commit_id,
+                right_commit_id,
+                request,
+                native_work_budget,
+            )
             .await?
         {
             return Ok(entries);
         }
         if let Some(mut entries) = self
-            .diff_tree_entries_from_first_parent_interval(right_commit_id, left_commit_id, request)
+            .diff_tree_entries_from_first_parent_interval(
+                right_commit_id,
+                left_commit_id,
+                request,
+                native_work_budget,
+            )
             .await?
         {
             entries.swap_sides();
             return Ok(entries);
+        }
+        if left_commit_id == right_commit_id {
+            return Ok(TrackedStateTreeDiffBatch::default());
+        }
+        if native_work_budget.is_some() {
+            return Err(LixError::new(
+                super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE,
+                "native diff recipe cannot use an unbounded full-root replay",
+            ));
         }
         if self
             .exact_current_state_scope_has_equal_hot_state(left_commit_id, right_commit_id, request)
             .await?
             == Some(true)
         {
-            return Ok(TrackedStateTreeDiffBatch::default());
-        }
-        if left_commit_id == right_commit_id {
             return Ok(TrackedStateTreeDiffBatch::default());
         }
         let all_rows = TrackedStateTreeScanRequest {
@@ -3939,10 +4002,11 @@ where
         };
         let mut batches = Vec::with_capacity(interval.len());
         for commit_id in interval {
-            batches.push(
-                self.scan_replayed_commit_delta_values(commit_id, &[])
-                    .await?,
-            );
+            let work_budget = self.native_diff_identity_budget.clone();
+            let batch = self
+                .scan_replayed_commit_delta_values_with_budget(commit_id, &[], work_budget)
+                .await?;
+            batches.push(batch);
         }
         let row_count = batches
             .iter()
@@ -3981,6 +4045,7 @@ where
         ancestor_commit_id: &str,
         descendant_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
     ) -> Result<Option<TrackedStateTreeDiffBatch>, LixError> {
         let Some(interval) = self
             .first_parent_interval_between(ancestor_commit_id, descendant_commit_id)
@@ -3996,10 +4061,17 @@ where
         let scanned_schema_keys = schema_keys_with_file_descriptors(&request.schema_keys);
         let mut decoded_batches = Vec::with_capacity(interval.len());
         for commit_id in interval {
-            decoded_batches.push(
-                self.scan_replayed_commit_delta_values(commit_id, &scanned_schema_keys)
-                    .await?,
-            );
+            let batch = self
+                .scan_replayed_commit_delta_values_with_budget(
+                    commit_id,
+                    &scanned_schema_keys,
+                    native_work_budget.cloned(),
+                )
+                .await?;
+            // The scanner charges each matching identity before placing it in
+            // this decoded batch; this check keeps cumulative retained batches
+            // bounded before flattening them into the interval arena.
+            decoded_batches.push(batch);
         }
         let mut row_count = 0usize;
         let mut encoded_bytes = 0usize;
@@ -4207,6 +4279,7 @@ where
         left_commit_id: &str,
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
     ) -> Result<TrackedStateTreeDiffBatch, LixError> {
         let mut cache = DiffCommitRootValidationCache::new();
         let left_root = self
@@ -4219,7 +4292,13 @@ where
                 .await?
         };
         self.tree
-            .diff(&self.store, Some(&left_root), Some(&right_root), request)
+            .diff_with_identity_budget(
+                &self.store,
+                Some(&left_root),
+                Some(&right_root),
+                request,
+                native_work_budget,
+            )
             .await
     }
 
@@ -4324,7 +4403,8 @@ where
             Vec::new()
         };
         if let Some(root_id) = interval.baseline_root.as_ref() {
-            self.restore_legacy_root_authors(root_id, &mut baseline).await?;
+            self.restore_legacy_root_authors(root_id, &mut baseline)
+                .await?;
         }
         let row_capacity = baseline.len().checked_add(delta_rows).ok_or_else(|| {
             LixError::new(
@@ -4832,6 +4912,16 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
     ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
+        self.scan_replayed_commit_delta_values_with_budget(commit_id, schema_keys, None)
+            .await
+    }
+
+    async fn scan_replayed_commit_delta_values_with_budget(
+        &mut self,
+        commit_id: CommitId,
+        schema_keys: &[String],
+        native_work_budget: Option<super::NativeDiffIdentityBudget>,
+    ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
         let replay_commit = self.load_point_replay_commit(commit_id).await?;
         let source_manifest = match replay_commit
             .state_manifest
@@ -4845,11 +4935,12 @@ where
             ),
             None => None,
         };
-        storage::scan_commit_delta_values_from_authenticated_states(
+        storage::scan_commit_delta_values_from_authenticated_states_with_budget(
             &self.store,
             &replay_commit.state_manifest,
             source_manifest.as_deref(),
             schema_keys,
+            native_work_budget.as_ref(),
         )
         .await
     }
@@ -5230,6 +5321,7 @@ where
                             &anchor.to_string(),
                             &id.to_string(),
                             &TrackedStateTreeScanRequest::default(),
+                            None,
                         )
                         .await?,
                 )
@@ -7065,8 +7157,8 @@ mod tests {
                 "cascade updated_at",
                 "2026-01-02T00:00:01Z",
             ),
-                    semantic_fingerprint: None,
-};
+            semantic_fingerprint: None,
+        };
         let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
         builder.push_shared(
             crate::tracked_state::codec::DecodedTrackedStateKeyShared {
@@ -7090,7 +7182,11 @@ mod tests {
             .await
             .expect_err("matching marker with a different timestamp is corrupt");
         assert!(error.message.contains("marker time"));
-        assert_eq!(batch.len(), 1, "mismatched tombstone must not be suppressed");
+        assert_eq!(
+            batch.len(),
+            1,
+            "mismatched tombstone must not be suppressed"
+        );
     }
 
     #[tokio::test]
@@ -7100,7 +7196,11 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked = TrackedStateContext::new();
         let marker_key = collection_cascade_payload_key("test_schema", Some(FILE_ID));
-        let mut marker = row("unused", "collection-marker-author", "collection-marker-author");
+        let mut marker = row(
+            "unused",
+            "collection-marker-author",
+            "collection-marker-author",
+        );
         marker.schema_key = marker_key.schema_key.clone();
         marker.file_id = marker_key.file_id.clone();
         marker.row_pk = marker_key.row_pk.clone();
@@ -7137,8 +7237,8 @@ mod tests {
             created_at: timestamp,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             is_checkpoint: false,
-                    first_parent_checkpoint_summary: None,
-};
+            first_parent_checkpoint_summary: None,
+        };
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
             .stage_append(crate::changelog::ChangelogAppend {
@@ -7155,12 +7255,9 @@ mod tests {
             base_coordinate: None,
             authored: true,
         };
-        let staged = storage::stage_addressable_commit_deltas(
-            &mut writes,
-            &[commit_delta],
-            &[false],
-        )
-        .expect("SYSTEM marker delta should stage");
+        let staged =
+            storage::stage_addressable_commit_deltas(&mut writes, &[commit_delta], &[false])
+                .expect("SYSTEM marker delta should stage");
         storage::stage_change_locators(&mut writes, &staged.locators);
         let mut root_writer = tracked.writer(&read, &mut writes);
         root_writer
@@ -7207,8 +7304,8 @@ mod tests {
                 deleted: true,
                 created_at: timestamp,
                 updated_at: timestamp,
-                            semantic_fingerprint: None,
-};
+                semantic_fingerprint: None,
+            };
             let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(1);
             builder.push_shared_with_author_presence(
                 crate::tracked_state::codec::DecodedTrackedStateKeyShared {
@@ -7250,7 +7347,11 @@ mod tests {
             .suppress_collection_generation_cascade_tombstones(&mut authorless_v82)
             .await
             .expect("an omitted v82 author must not conflict with its marker");
-        assert_eq!(authorless_v82.len(), 0, "valid cascade should be suppressed");
+        assert_eq!(
+            authorless_v82.len(),
+            0,
+            "valid cascade should be suppressed"
+        );
     }
 
     #[tokio::test]
@@ -10213,7 +10314,11 @@ mod tests {
         assert_eq!(details["commit_id"], commit_id.to_string());
         assert_eq!(
             details["row_ref"],
-            crate::row_ref::schema_identity_detail(&row.schema_key, row.file_id.as_deref(), &row.row_pk)
+            crate::row_ref::schema_identity_detail(
+                &row.schema_key,
+                row.file_id.as_deref(),
+                &row.row_pk
+            )
         );
     }
 
@@ -11287,6 +11392,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["row-a", "row-b", "row-c"]
         );
+
+        let diff_request = TrackedStateDiffRequest {
+            retain_payloads: false,
+            ..Default::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("unlimited rootless diff read should open");
+        let unlimited = tracked_state
+            .reader(read)
+            .diff_commits("base", "generation-2", &diff_request)
+            .await
+            .expect("ordinary rootless SQL diff remains unlimited");
+        assert_eq!(unlimited.entries.len(), 2);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("bounded rootless diff read should open");
+        let error = tracked_state
+            .reader(read)
+            .with_native_diff_identity_budget(super::super::NativeDiffIdentityBudget::new(1))
+            .diff_commits("base", "generation-2", &diff_request)
+            .await
+            .expect_err("over-budget rootless replay must fail before retaining its next batch");
+        assert_eq!(error.code, super::super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE);
     }
 
     #[tokio::test]
@@ -12162,8 +12294,8 @@ mod tests {
             created_at: timestamp,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             is_checkpoint: false,
-                    first_parent_checkpoint_summary: None,
-};
+            first_parent_checkpoint_summary: None,
+        };
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
             .stage_append(crate::changelog::ChangelogAppend {
@@ -12182,37 +12314,29 @@ mod tests {
             base_coordinate: None,
             authored: true,
         };
-        let staged = storage::stage_addressable_commit_deltas(
-            &mut writes,
-            &[commit_delta],
-            &[true],
-        )
-        .expect("authored mutation should stage");
+        let staged =
+            storage::stage_addressable_commit_deltas(&mut writes, &[commit_delta], &[true])
+                .expect("authored mutation should stage");
         assert_eq!(staged.assigned_change_ids.as_slice(), &[change_id]);
 
         // Build the exact authorless generic-leaf encoding used by v82. The
         // retained packed owner above remains the canonical SYSTEM authority.
         let key = encoded_key_from_materialized_row(&row);
-        let value = encode_value_ref(
-            TrackedStateIndexValueRef {
-                change_id,
-                commit_id,
-                author_id: &row.author_id,
-                deleted: false,
-                created_at: timestamp,
-                updated_at: timestamp,
-                            semantic_fingerprint: None,
-},
-        );
+        let value = encode_value_ref(TrackedStateIndexValueRef {
+            change_id,
+            commit_id,
+            author_id: &row.author_id,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            semantic_fingerprint: None,
+        });
         let author_suffix_len = 2 + row.author_id.len();
         let tail_end = value
             .len()
             .checked_sub(author_suffix_len)
             .expect("encoded value should contain its author");
-        assert_eq!(
-            &value[tail_end + 2..],
-            crate::SYSTEM_ACCOUNT_ID.as_bytes()
-        );
+        assert_eq!(&value[tail_end + 2..], crate::SYSTEM_ACCOUNT_ID.as_bytes());
         let mut legacy_leaf = vec![5, 1, 0, 0];
         {
             let mut write_varint = |mut value: u64| {
@@ -12255,13 +12379,12 @@ mod tests {
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
         );
-        let (_, catalog_mutations) = crate::tracked_state::with_row_pk_index_mutations(
-            catalog_primary.finish(),
-        )
-        .expect("legacy root catalog mutation should encode");
+        let (_, catalog_mutations) =
+            crate::tracked_state::with_row_pk_index_mutations(catalog_primary.finish())
+                .expect("legacy root catalog mutation should encode");
         let mut catalog_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
         let catalog_root = TrackedStateTree::new()
             .apply_mutations_with_overlay(
@@ -12315,8 +12438,8 @@ mod tests {
         let rows = rows.into_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].author_id, crate::SYSTEM_ACCOUNT_ID);
-        let exact_key = crate::tracked_state::codec::decode_key(&key)
-            .expect("legacy root key should decode");
+        let exact_key =
+            crate::tracked_state::codec::decode_key(&key).expect("legacy root key should decode");
         let exact = reader
             .load_batch_at_commit(&commit_id.to_string(), &[exact_key.clone()])
             .await
@@ -12352,10 +12475,7 @@ mod tests {
             .expect("rootless child should open");
         let mut reader = context.reader(read);
         let child_rows = reader
-            .scan_batch_at_commit(
-                "legacy-v82-rootless-child",
-                &test_schema_scan_request(),
-            )
+            .scan_batch_at_commit("legacy-v82-rootless-child", &test_schema_scan_request())
             .await
             .expect("rootless child scan should restore the legacy baseline author");
         assert_eq!(child_rows.len(), 2);
@@ -12518,7 +12638,10 @@ mod tests {
             .await
             .expect("catalog identity scan must not hydrate an unneeded author payload");
         assert_eq!(identities.len(), 1);
-        assert_eq!(identities.into_rows()[0].row_pk, RowPk::single("lix_account"));
+        assert_eq!(
+            identities.into_rows()[0].row_pk,
+            RowPk::single("lix_account")
+        );
 
         let mut ordinary_request = identity_request.clone();
         ordinary_request.filter.file_ids.clear();
@@ -12534,10 +12657,12 @@ mod tests {
             },
             ..identity_request
         };
-        assert!(reader
-            .scan_batch_at_commit(&commit_id.to_string(), &invalid_identity_projection)
-            .await
-            .is_err());
+        assert!(
+            reader
+                .scan_batch_at_commit(&commit_id.to_string(), &invalid_identity_projection)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -12553,8 +12678,7 @@ mod tests {
         file_delete.row_pk = RowPk::uuid_from_canonical(FILE_DELETE_ID).unwrap();
         file_delete.file_id = Some(FILE_DELETE_ID.to_owned());
         let mut generation_file = row("unused", "unused", "initial");
-        generation_file.change_id =
-            ChangeId::for_test_label("v82-base-generation-descriptor");
+        generation_file.change_id = ChangeId::for_test_label("v82-base-generation-descriptor");
         generation_file.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_owned();
         generation_file.row_pk = RowPk::uuid_from_canonical(GENERATION_ID).unwrap();
         generation_file.file_id = Some(GENERATION_ID.to_owned());
@@ -12587,11 +12711,7 @@ mod tests {
         file_delete.updated_at = "2026-01-02T00:00:00Z".to_owned();
 
         let marker_key = collection_cascade_payload_key("test_schema", Some(GENERATION_ID));
-        let mut generation_marker = row(
-            "unused",
-            "v82-generation-marker",
-            "v82-cascade-child",
-        );
+        let mut generation_marker = row("unused", "v82-generation-marker", "v82-cascade-child");
         generation_marker.schema_key = marker_key.schema_key.clone();
         generation_marker.file_id = marker_key.file_id.clone();
         generation_marker.row_pk = marker_key.row_pk.clone();
@@ -12639,8 +12759,8 @@ mod tests {
             created_at: timestamp,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             is_checkpoint: false,
-                    first_parent_checkpoint_summary: None,
-};
+            first_parent_checkpoint_summary: None,
+        };
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
             .stage_append(crate::changelog::ChangelogAppend {
@@ -12656,21 +12776,20 @@ mod tests {
         let commit_deltas = changes
             .iter()
             .zip(deltas.iter().copied())
-            .map(|(change, delta)| crate::tracked_state::types::TrackedStateCommitDeltaRef {
-                delta,
-                metadata: change.metadata.as_ref(),
-                snapshot: change.snapshot.as_deref(),
-                origin_key: change.origin_key.as_deref(),
-                base_coordinate: None,
-                authored: true,
-            })
+            .map(
+                |(change, delta)| crate::tracked_state::types::TrackedStateCommitDeltaRef {
+                    delta,
+                    metadata: change.metadata.as_ref(),
+                    snapshot: change.snapshot.as_deref(),
+                    origin_key: change.origin_key.as_deref(),
+                    base_coordinate: None,
+                    authored: true,
+                },
+            )
             .collect::<Vec<_>>();
-        let staged = storage::stage_addressable_commit_deltas(
-            &mut writes,
-            &commit_deltas,
-            &[false, false],
-        )
-        .expect("SYSTEM cascade deltas should stage");
+        let staged =
+            storage::stage_addressable_commit_deltas(&mut writes, &commit_deltas, &[false, false])
+                .expect("SYSTEM cascade deltas should stage");
         storage::stage_change_locators(&mut writes, &staged.locators);
         let mut root_writer = context.writer(&read, &mut writes);
         root_writer
@@ -12694,10 +12813,7 @@ mod tests {
             .expect("initial commit-state authority should load")
             .and_then(|manifest| manifest.row_pk_index_root_id)
             .expect("initial root should publish its identity catalog");
-        let mut catalog_primary =
-            TrackedStateMutationBatchBuilder::with_row_capacity(
-                deltas.len(),
-            );
+        let mut catalog_primary = TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
         for delta in &deltas {
             catalog_primary.push(
                 TrackedStateKeyRef {
@@ -12712,14 +12828,13 @@ mod tests {
                     deleted: false,
                     created_at: delta.created_at,
                     updated_at: delta.updated_at,
-                                    semantic_fingerprint: None,
-},
+                    semantic_fingerprint: None,
+                },
             );
         }
-        let (_, catalog_mutations) = crate::tracked_state::with_row_pk_index_mutations(
-            catalog_primary.finish(),
-        )
-        .expect("cascade identity catalog mutations should encode");
+        let (_, catalog_mutations) =
+            crate::tracked_state::with_row_pk_index_mutations(catalog_primary.finish())
+                .expect("cascade identity catalog mutations should encode");
         let mut catalog_overlay = crate::tracked_state::TrackedStateChunkOverlay::new();
         let catalog_root = TrackedStateTree::new()
             .apply_mutations_with_overlay(
@@ -12781,9 +12896,10 @@ mod tests {
             .into_rows();
         assert_eq!(scan.len(), 2);
         assert!(scan.iter().all(|row| row.deleted));
-        assert!(scan
-            .iter()
-            .all(|row| row.author_id == crate::SYSTEM_ACCOUNT_ID));
+        assert!(
+            scan.iter()
+                .all(|row| row.author_id == crate::SYSTEM_ACCOUNT_ID)
+        );
 
         let diff = reader
             .diff_commits(
@@ -12806,9 +12922,10 @@ mod tests {
         assert_eq!(diff.entries.len(), 2);
         assert!(diff.entries.iter().all(|entry| {
             entry.kind == crate::tracked_state::TrackedStateDiffKind::Removed
-                && entry.after.as_ref().is_some_and(|row| {
-                    row.author_id == crate::SYSTEM_ACCOUNT_ID
-                })
+                && entry
+                    .after
+                    .as_ref()
+                    .is_some_and(|row| row.author_id == crate::SYSTEM_ACCOUNT_ID)
         }));
 
         drop(reader);
@@ -12845,9 +12962,12 @@ mod tests {
             .expect("rootless baseline scan should restore cascaded tombstone authors")
             .into_rows();
         assert_eq!(rootless_scan.iter().filter(|row| row.deleted).count(), 2);
-        assert!(rootless_scan.iter().filter(|row| row.deleted).all(|row| {
-            row.author_id == crate::SYSTEM_ACCOUNT_ID
-        }));
+        assert!(
+            rootless_scan
+                .iter()
+                .filter(|row| row.deleted)
+                .all(|row| { row.author_id == crate::SYSTEM_ACCOUNT_ID })
+        );
         for key in [
             TrackedStateKey {
                 schema_key: "test_schema".to_owned(),
@@ -12884,7 +13004,11 @@ mod tests {
         let alias_commit = CommitId::for_test_label("selected-cascade-alias");
         let source_commit_text = source_commit.to_string();
         let alias_commit_text = alias_commit.to_string();
-        let mut source_row = row("selected-cascade-row", "source-row", "selected-cascade-source");
+        let mut source_row = row(
+            "selected-cascade-row",
+            "source-row",
+            "selected-cascade-source",
+        );
         source_row.file_id = Some(FILE_ID.to_owned());
         write_root_for_test(
             &storage,
@@ -12932,8 +13056,8 @@ mod tests {
             created_at: timestamp,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             is_checkpoint: false,
-                    first_parent_checkpoint_summary: None,
-};
+            first_parent_checkpoint_summary: None,
+        };
 
         let provisional_delta = delta_from_materialized_row(&descriptor);
         let provisional_commit_delta = crate::tracked_state::types::TrackedStateCommitDeltaRef {
@@ -13026,17 +13150,22 @@ mod tests {
 
         let alias_request = storage::load_owned_commit_delta_entries(
             &reader.store,
-            &[(alias_commit, TrackedStateKey {
-                schema_key: "test_schema".to_owned(),
-                file_id: Some(FILE_ID.to_owned()),
-                row_pk: RowPk::single("selected-cascade-row"),
-            })],
+            &[(
+                alias_commit,
+                TrackedStateKey {
+                    schema_key: "test_schema".to_owned(),
+                    file_id: Some(FILE_ID.to_owned()),
+                    row_pk: RowPk::single("selected-cascade-row"),
+                },
+            )],
         )
         .await
         .expect("selected-source row lookup should resolve");
-        assert!(alias_request[0]
-            .as_ref()
-            .is_some_and(|entry| entry.selected_ref && !entry.value.deleted));
+        assert!(
+            alias_request[0]
+                .as_ref()
+                .is_some_and(|entry| entry.selected_ref && !entry.value.deleted)
+        );
     }
 
     async fn overwrite_root_leaf_without_authors_for_test(
@@ -13092,8 +13221,8 @@ mod tests {
                 deleted: value.deleted,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
-                            semantic_fingerprint: None,
-});
+                semantic_fingerprint: None,
+            });
             legacy_leaf.extend_from_slice(&encoded_value[..16]);
             legacy_leaf.push(0);
             legacy_leaf.extend_from_slice(&encoded_value[16..32]);

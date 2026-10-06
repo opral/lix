@@ -1980,6 +1980,22 @@ where
         'a,
         Result<Vec<(String, crate::tracked_state::TrackedStateKey)>, LixError>,
     > {
+        self.prepare_captured_read_interests_with_native_diff_budget(
+            captured,
+            active_account_id,
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_captured_read_interests_with_native_diff_budget<'a>(
+        &'a self,
+        captured: &'a super::ReadInterestSnapshot,
+        active_account_id: &'a str,
+        native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Vec<(String, crate::tracked_state::TrackedStateKey)>, LixError>,
+    > {
         Box::pin(async move {
             if self.partial_scope_policy.is_none() && self.partial_scope_source.is_none() {
                 return Ok(Vec::new());
@@ -2058,8 +2074,11 @@ where
                         if let Some(checkpoint) = control.working_diff_checkpoint_commit_id
                             && checkpoint != control.head_commit_id
                         {
-                            let diff = TrackedStateContext::new()
-                                .reader(&self.store)
+                            let mut tracked = TrackedStateContext::new().reader(&self.store);
+                            if let Some(budget) = native_diff_budget.clone() {
+                                tracked = tracked.with_native_diff_identity_budget(budget);
+                            }
+                            let diff = tracked
                                 .diff_commits(
                                     &checkpoint.to_string(),
                                     &control.head_commit_id.to_string(),

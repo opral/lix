@@ -1363,7 +1363,9 @@ async fn load_current_state_values_from_descriptors(
             });
             if !decoded
                 .author_present(usize::from(found.ordinal))
-                .ok_or_else(|| replacement_payload_error("replacement row omitted author presence"))?
+                .ok_or_else(|| {
+                    replacement_payload_error("replacement row omitted author presence")
+                })?
             {
                 legacy_replacement_author_requests.push((
                     *output_index,
@@ -3182,7 +3184,7 @@ impl CommitDeltaLiveMembershipCursor {
                         first_key: part.first_key,
                         last_key: part.last_key,
                         content_digest: part.content_digest,
-                        replacement_part: part.replacement_part,
+                        replacement_part: part.replacement_part.clone(),
                     },
                 ));
             }
@@ -3698,6 +3700,32 @@ struct DecodedCommitDeltaBatchBuilder {
     rows: Vec<DecodedCommitDeltaRow>,
     values: Vec<TrackedStateIndexValue>,
     author_present: Vec<bool>,
+    native_work_budget: Option<super::NativeDiffIdentityBudget>,
+}
+
+fn native_diff_scan_capacity(
+    expected_rows: usize,
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+) -> Result<usize, LixError> {
+    let Some(budget) = native_work_budget else {
+        return Ok(expected_rows);
+    };
+    Ok(expected_rows.min(budget.remaining_identities()?.saturating_add(1)))
+}
+
+fn native_diff_segment_read_batch_size(
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+) -> Result<usize, LixError> {
+    const MAX_BATCH: usize = 16;
+    Ok(if native_work_budget.is_some() {
+        // Authority readers decode and retain each leaf before its row count
+        // can be charged. Keep that transient input to one sidecar (whose
+        // existing decoder cap is fixed) at a time. Ordinary SQL keeps the
+        // existing multi-segment batching behavior.
+        1
+    } else {
+        MAX_BATCH
+    })
 }
 
 impl DecodedCommitDeltaBatchBuilder {
@@ -3710,7 +3738,16 @@ impl DecodedCommitDeltaBatchBuilder {
             rows: Vec::with_capacity(row_capacity),
             values: Vec::with_capacity(row_capacity),
             author_present: Vec::with_capacity(row_capacity),
+            native_work_budget: None,
         }
+    }
+
+    fn with_native_work_budget(
+        mut self,
+        native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+    ) -> Self {
+        self.native_work_budget = native_work_budget.cloned();
+        self
     }
 
     fn push_leaf(
@@ -3726,7 +3763,15 @@ impl DecodedCommitDeltaBatchBuilder {
             )
         })?;
         let first_row = self.rows.len();
-        visit_commit_delta_leaf(&leaf, commit_id, |entry_index, _encoded_key, value| {
+        let native_work_budget = self.native_work_budget.clone();
+        visit_commit_delta_leaf(&leaf, commit_id, |entry_index, encoded_key, value| {
+            if native_work_budget.is_some() {
+                super::NativeDiffIdentityBudget::validate_key_size(encoded_key.len())?;
+                native_work_budget
+                    .as_ref()
+                    .expect("budget checked above")
+                    .charge_visit(encoded_key.len())?;
+            }
             let key = decode_key_shared(
                 leaf.entry_owned(entry_index)
                     .expect("visited commit-delta leaf entry exists")
@@ -3735,6 +3780,9 @@ impl DecodedCommitDeltaBatchBuilder {
             if !requested_schemas.is_empty() && !requested_schemas.contains(key.schema_key.as_str())
             {
                 return Ok(());
+            }
+            if let Some(budget) = &native_work_budget {
+                budget.charge(encoded_key.len())?;
             }
             let author_present = leaf
                 .author_present(entry_index)
@@ -4752,14 +4800,13 @@ async fn load_scoped_current_state_descriptor_rows(
             let mut rows = Vec::with_capacity(end - start);
             let mut legacy_author_requests = Vec::new();
             for ordinal in start..end {
-                let encoded_key = decoded.key(ordinal)?.ok_or_else(|| {
-                    replacement_payload_error("replacement source omitted a key")
-                })?;
+                let encoded_key = decoded
+                    .key(ordinal)?
+                    .ok_or_else(|| replacement_payload_error("replacement source omitted a key"))?;
                 let packed = source
                     .part_index
                     .checked_mul(
-                        u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                            .expect("row bound fits u32"),
+                        u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row bound fits u32"),
                     )
                     .and_then(|base| {
                         base.checked_add(u32::try_from(ordinal).expect("ordinal fits u32"))
@@ -4792,9 +4839,7 @@ async fn load_scoped_current_state_descriptor_rows(
                     snapshot: decoded
                         .snapshot(ordinal)?
                         .ok_or_else(|| {
-                            replacement_payload_error(
-                                "replacement source omitted typed payload",
-                            )
+                            replacement_payload_error("replacement source omitted typed payload")
                         })?
                         .to_owned(),
                 });
@@ -8477,7 +8522,7 @@ async fn load_physical_direct_change_records(
                     first_key: part.first_key,
                     last_key: part.last_key,
                     content_digest: part.content_digest,
-                    replacement_part: part.replacement_part,
+                    replacement_part: part.replacement_part.clone(),
                 },
                 direct_row_count,
             ),
@@ -8708,11 +8753,13 @@ fn load_selected_change_records_by_ids_optional<'a>(
     Result<Vec<Option<crate::changelog::ChangeRecord>>, LixError>,
 > {
     Box::pin(async move {
-        Ok(load_change_records_by_ids_inner(store, change_ids, true, true, false)
-            .await?
-            .into_iter()
-            .map(|resolved| resolved.record)
-            .collect())
+        Ok(
+            load_change_records_by_ids_inner(store, change_ids, true, true, false)
+                .await?
+                .into_iter()
+                .map(|resolved| resolved.record)
+                .collect(),
+        )
     })
 }
 
@@ -8786,7 +8833,9 @@ async fn load_change_records_by_ids_inner(
         .iter()
         .enumerate()
         .filter(|(index, _)| output[*index].is_none())
-        .filter_map(|(_, &change_id)| direct_change_locator(change_id).map(|locator| locator.commit_id))
+        .filter_map(|(_, &change_id)| {
+            direct_change_locator(change_id).map(|locator| locator.commit_id)
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -8901,10 +8950,8 @@ async fn load_change_records_by_ids_inner(
         }
         match Box::pin(load_explicit_change_records_at_locators(store, &located)).await {
             Ok(records) => {
-                for ((output_index, locator), record) in located_indices
-                    .into_iter()
-                    .zip(located)
-                    .zip(records)
+                for ((output_index, locator), record) in
+                    located_indices.into_iter().zip(located).zip(records)
                 {
                     output[output_index] = Some(record);
                     physical_owners[output_index] = Some(locator.commit_id);
@@ -8926,7 +8973,8 @@ async fn load_change_records_by_ids_inner(
                         }
                         Err(error)
                             if error.code == STALE_SELECTED_CHANGE_LOCATOR
-                                && ((standalone_fallback && standalone[output_index].is_some())
+                                && ((standalone_fallback
+                                    && standalone[output_index].is_some())
                                     || allow_missing) =>
                         {
                             output[output_index] = standalone[output_index].take();
@@ -10386,14 +10434,10 @@ async fn load_columnar_owned_entries(
                 physical_locator: Some(CommitDeltaChangeLocator {
                     change_id,
                     commit_id,
-                    segment_index: u32::try_from(
-                        global_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS,
-                    )
-                    .expect("columnar mutation segment fits u32"),
-                    ordinal: u16::try_from(
-                        global_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS,
-                    )
-                    .expect("columnar mutation ordinal fits u16"),
+                    segment_index: u32::try_from(global_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                        .expect("columnar mutation segment fits u32"),
+                    ordinal: u16::try_from(global_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                        .expect("columnar mutation ordinal fits u16"),
                 }),
                 base_coordinate: Some(TrackedStateBaseCoordinate {
                     base_commit_id: commit_id,
@@ -10517,17 +10561,8 @@ pub(crate) async fn load_exact_tracked_row_change_locators(
         )
         .await?;
         let mut next = Vec::new();
-        for (
-            (
-                index,
-                owner_commit_id,
-                change_id,
-                key,
-                updated_at,
-                expected_coordinate,
-            ),
-            entry,
-        ) in pending.into_iter().zip(entries)
+        for ((index, owner_commit_id, change_id, key, updated_at, expected_coordinate), entry) in
+            pending.into_iter().zip(entries)
         {
             let entry = entry.ok_or_else(|| {
                 replacement_payload_error(&format!(
@@ -10751,9 +10786,7 @@ pub(crate) async fn load_authoritative_live_change_records(
     let standalone_status = standalone
         .iter()
         .zip(requests)
-        .map(|((_, record), request)| {
-            authoritative_live_payload_candidate_status(request, record)
-        })
+        .map(|((_, record), request)| authoritative_live_payload_candidate_status(request, record))
         .collect::<Vec<_>>();
     let mut records = vec![None; requests.len()];
     let mut fallback_indices = Vec::new();
@@ -10836,10 +10869,8 @@ pub(crate) async fn load_authoritative_live_change_records(
     let mut physical_conflict = vec![false; requests.len()];
     let mut physical_status = vec!["absent"; requests.len()];
     for (index, candidate) in physical_indices.into_iter().zip(physical) {
-        let candidate_status = authoritative_live_payload_candidate_status(
-            &requests[index],
-            candidate.as_ref(),
-        );
+        let candidate_status =
+            authoritative_live_payload_candidate_status(&requests[index], candidate.as_ref());
         if candidate_status != "absent" {
             physical_status[index] = candidate_status;
         }
@@ -10893,7 +10924,12 @@ pub(crate) async fn load_authoritative_live_change_records(
         .collect::<Vec<_>>();
     let endpoint_requests = endpoint_outputs
         .iter()
-        .map(|&index| (requests[index].source_commit_id, requests[index].key.clone()))
+        .map(|&index| {
+            (
+                requests[index].source_commit_id,
+                requests[index].key.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     let endpoint = load_commit_delta_change_records_for_owners(store, &endpoint_requests).await?;
     for (index, record) in endpoint_outputs.into_iter().zip(endpoint) {
@@ -10964,9 +11000,9 @@ pub(crate) async fn load_authoritative_live_change_records(
     }
     let mut loaded = Vec::with_capacity(requests.len());
     for (index, (request, record)) in requests.iter().zip(records).enumerate() {
-        if let Some(record) = record.filter(|record| {
-            authoritative_live_change_matches(request, record)
-        }) {
+        if let Some(record) =
+            record.filter(|record| authoritative_live_change_matches(request, record))
+        {
             loaded.push(record);
             continue;
         }
@@ -11366,9 +11402,10 @@ pub(crate) async fn load_commit_delta_parts_members_with_payloads_for_schema(
             || !inventory.inline_part.is_empty()
             || !inventory.direct_addresses_are_fully_owned()
             || inventory.may_contain_finite_selected_members()
-            || inventory.single_partition.as_ref().is_some_and(|scope| {
-                scope.schema_key != schema_key || scope.file_id.is_some()
-            })
+            || inventory
+                .single_partition
+                .as_ref()
+                .is_some_and(|scope| scope.schema_key != schema_key || scope.file_id.is_some())
             || inventory.lifecycle_summary.as_ref().is_none_or(|summary| {
                 summary.scope.schema_key != schema_key || summary.scope.file_id.is_some()
             })
@@ -11394,9 +11431,8 @@ pub(crate) async fn load_commit_delta_parts_members_with_payloads_for_schema(
     }
 
     #[cfg(test)]
-    COMMIT_DELTA_PART_LOAD_PROBE.with(|probe| {
-        probe.set(probe.get().saturating_add(selected_parts.len()))
-    });
+    COMMIT_DELTA_PART_LOAD_PROBE
+        .with(|probe| probe.set(probe.get().saturating_add(selected_parts.len())));
     let values = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?
@@ -11587,9 +11623,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
             .filter_map(|(ordinal, ((_, value, _), owner))| {
                 (value.deleted
                     && (owner.is_none()
-                        || owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.selected_tombstone)))
+                        || owner.as_ref().is_some_and(|owner| owner.selected_tombstone)))
                 .then_some((ordinal, value.change_id))
             })
             .collect::<Vec<_>>();
@@ -11597,14 +11631,8 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
             .iter()
             .map(|(_, change_id)| *change_id)
             .collect::<Vec<_>>();
-        let deleted = load_change_records_by_ids_inner(
-            store,
-            &missing_deleted_ids,
-            true,
-            true,
-            true,
-        )
-        .await?;
+        let deleted =
+            load_change_records_by_ids_inner(store, &missing_deleted_ids, true, true, true).await?;
         let mut canonical_fallbacks = vec![None; rows.len()];
         let mut canonical_physical_owners = vec![None; rows.len()];
         for ((ordinal, _request), change) in missing_live.into_iter().zip(live) {
@@ -11616,13 +11644,11 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
             };
             let (key, value, author_present) = &rows[ordinal];
             if !complete_state_tombstone_matches_change(key, value, &change)? {
-                let explicit_selected_owner = owners[ordinal]
-                    .as_ref()
-                    .is_some_and(|owner| {
-                        owner.selected_tombstone
-                            && (owner.author_present || *author_present)
-                            && complete_state_tombstone_matches_owner(key, value, owner)
-                    });
+                let explicit_selected_owner = owners[ordinal].as_ref().is_some_and(|owner| {
+                    owner.selected_tombstone
+                        && (owner.author_present || *author_present)
+                        && complete_state_tombstone_matches_owner(key, value, owner)
+                });
                 if explicit_selected_owner && resolved.physical_owner_commit_id.is_none() {
                     // A stale standalone projection cannot displace the exact
                     // selected tombstone identity already present in the
@@ -11634,13 +11660,11 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
                 ));
             }
             if *author_present && value.author_id != change.account_id {
-                let explicit_selected_owner = owners[ordinal]
-                    .as_ref()
-                    .is_some_and(|owner| {
-                        owner.selected_tombstone
-                            && (owner.author_present || *author_present)
-                            && complete_state_tombstone_matches_owner(key, value, owner)
-                    });
+                let explicit_selected_owner = owners[ordinal].as_ref().is_some_and(|owner| {
+                    owner.selected_tombstone
+                        && (owner.author_present || *author_present)
+                        && complete_state_tombstone_matches_owner(key, value, owner)
+                });
                 if explicit_selected_owner && resolved.physical_owner_commit_id.is_none() {
                     continue;
                 }
@@ -12489,34 +12513,32 @@ async fn complete_state_file_cascade_mask(
             "complete-state file-cascade owner count does not match its rows",
         ));
     }
-    let direct_owner_matches = |key: &TrackedStateKey,
-                                value: &TrackedStateIndexValue,
-                                owner: &LoadedCommitDeltaEntry| {
-        owner.value.commit_id == value.commit_id
-            && owner.value.deleted
-            && owner.value.change_id == value.change_id
-            && owner.value.updated_at == value.updated_at
-            && owner.change_record.schema_key == key.schema_key
-            && owner.change_record.file_id == key.file_id
-            && owner.change_record.row_pk == key.row_pk
-    };
+    let direct_owner_matches =
+        |key: &TrackedStateKey, value: &TrackedStateIndexValue, owner: &LoadedCommitDeltaEntry| {
+            owner.value.commit_id == value.commit_id
+                && owner.value.deleted
+                && owner.value.change_id == value.change_id
+                && owner.value.updated_at == value.updated_at
+                && owner.change_record.schema_key == key.schema_key
+                && owner.change_record.file_id == key.file_id
+                && owner.change_record.row_pk == key.row_pk
+        };
     let mut routes = Vec::new();
     let mut requests = Vec::new();
     for (ordinal, ((key, value, _), owner)) in rows.iter().zip(owners).enumerate() {
         if !value.deleted
             || key.schema_key == "lix_file_descriptor"
             || key.file_id.is_none()
-            || owner
-                .as_ref()
-                .is_some_and(|owner| {
-                    direct_owner_matches(key, value, owner) && !owner.selected_tombstone
-                })
+            || owner.as_ref().is_some_and(|owner| {
+                direct_owner_matches(key, value, owner) && !owner.selected_tombstone
+            })
         {
             continue;
         }
-        if owner.as_ref().is_some_and(|owner| {
-            !owner.selected_ref && !direct_owner_matches(key, value, owner)
-        }) {
+        if owner
+            .as_ref()
+            .is_some_and(|owner| !owner.selected_ref && !direct_owner_matches(key, value, owner))
+        {
             // A mismatching direct physical owner is corruption. It must not
             // be hidden by a same-scope descriptor cascade.
             continue;
@@ -12599,9 +12621,7 @@ async fn resolve_complete_state_deleted_authors_with_owners(
     let deleted_rows = rows
         .iter()
         .enumerate()
-        .filter_map(|(ordinal, (key, value, _))| {
-            value.deleted.then_some((ordinal, key, value))
-        })
+        .filter_map(|(ordinal, (key, value, _))| value.deleted.then_some((ordinal, key, value)))
         .collect::<Vec<_>>();
     let mut unresolved = BTreeSet::new();
     let mut identity_fallbacks = rows
@@ -12675,10 +12695,8 @@ async fn resolve_complete_state_deleted_authors_with_owners(
             cascade_routes.push((ordinal, key, value, marker_key, true));
         }
         if key.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
-            let marker_key = collection_cascade_payload_key(
-                &key.schema_key,
-                key.file_id.as_deref(),
-            );
+            let marker_key =
+                collection_cascade_payload_key(&key.schema_key, key.file_id.as_deref());
             cascade_requests.push((value.commit_id, marker_key.clone()));
             cascade_routes.push((ordinal, key, value, marker_key, false));
         }
@@ -12811,8 +12829,8 @@ async fn resolve_complete_state_deleted_authors_with_owners(
         .iter()
         .map(|(_, _, value)| value.change_id)
         .collect::<Vec<_>>();
-    let deleted_changes = load_change_records_by_ids_inner(store, &deleted_ids, true, true, true)
-        .await?;
+    let deleted_changes =
+        load_change_records_by_ids_inner(store, &deleted_ids, true, true, true).await?;
     for ((ordinal, key, value), resolved) in unresolved_rows.into_iter().zip(deleted_changes) {
         let Some(change) = resolved.record else {
             if let Some(author_id) = identity_fallbacks[*ordinal].take() {
@@ -12871,15 +12889,11 @@ fn complete_state_tombstone_matches_change(
         && change.snapshot.is_none()
         && let Some(file_id) = key.file_id.as_deref()
     {
-        return Ok(change
-            .row_pk
-            .as_single_string_owned()
-            .map_err(|error| {
-                replacement_payload_error(&format!(
-                    "complete-state file cascade has an invalid descriptor identity: {error}"
-                ))
-            })?
-            == file_id);
+        return Ok(change.row_pk.as_single_string_owned().map_err(|error| {
+            replacement_payload_error(&format!(
+                "complete-state file cascade has an invalid descriptor identity: {error}"
+            ))
+        })? == file_id);
     }
     if change.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
         && change.snapshot.is_some()
@@ -12901,9 +12915,7 @@ async fn resolve_selected_tombstone_authorities_with_authors(
 ) -> Result<Vec<Option<ResolvedChangeRecord>>, LixError> {
     let identity_rows = rows
         .iter()
-        .map(|(key, value, author_present)| {
-            (key.clone(), value.clone(), *author_present)
-        })
+        .map(|(key, value, author_present)| (key.clone(), value.clone(), *author_present))
         .collect::<Vec<_>>();
     let resolved = load_selected_tombstone_source_authorities(store, &identity_rows).await?;
     for ((_key, value, author_present), authority) in rows.iter().zip(&resolved) {
@@ -13005,9 +13017,7 @@ async fn resolve_selected_tombstone_member_authors(
         .collect::<Vec<_>>();
     let rows = selected
         .iter()
-        .map(|(_, key, value, author_present)| {
-            (key.clone(), value.clone(), *author_present)
-        })
+        .map(|(_, key, value, author_present)| (key.clone(), value.clone(), *author_present))
         .collect::<Vec<_>>();
     let authorities = resolve_selected_tombstone_authorities_with_authors(store, &rows).await?;
     for ((index, _, _, author_present), authority) in selected.into_iter().zip(authorities) {
@@ -13112,10 +13122,7 @@ async fn complete_state_fence_delta_batch(
             })?;
         }
         value.commit_id = commit_id;
-        output.push_owned_row(
-            key,
-            value,
-        )?;
+        output.push_owned_row(key, value)?;
     }
     Ok(Some(output.finish()))
 }
@@ -15019,8 +15026,9 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                                 &payloads,
                                 &encoded_keys[encoded_key],
                                 commit_id,
-                                u32::try_from(segment_index)
-                                    .map_err(|_| replacement_payload_error("segment index exceeds u32"))?,
+                                u32::try_from(segment_index).map_err(|_| {
+                                    replacement_payload_error("segment index exceeds u32")
+                                })?,
                                 &manifest.account_id,
                             )?;
                         }
@@ -15333,7 +15341,9 @@ pub(crate) async fn scan_commit_delta_limit_candidate_row_pks(
             .into_iter()
             .next()
             .flatten()
-            .ok_or_else(|| replacement_payload_error("candidate directory references a missing segment"))?;
+            .ok_or_else(|| {
+                replacement_payload_error("candidate directory references a missing segment")
+            })?;
             let bytes = full_value_bytes(value).ok_or_else(|| {
                 replacement_payload_error("candidate segment read omitted its value")
             })?;
@@ -15341,7 +15351,7 @@ pub(crate) async fn scan_commit_delta_limit_candidate_row_pks(
                 first_key: part.first_key,
                 last_key: part.last_key,
                 content_digest: part.content_digest,
-                replacement_part: part.replacement_part,
+                replacement_part: part.replacement_part.clone(),
             };
             append_limit_candidate_row_pks(
                 &bytes,
@@ -15385,11 +15395,8 @@ pub(crate) async fn scan_commit_delta_limit_candidate_row_pks(
                 if bounds.replacement_part.is_some() {
                     return Ok(None);
                 }
-                let segment_key = commit_delta_segment_key_for_bounds(
-                    commit_id,
-                    segment_index,
-                    bounds,
-                )?;
+                let segment_key =
+                    commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?;
                 let value = PointReadPlan::new(
                     TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
                     &[StorageKey(Bytes::from(segment_key))],
@@ -15400,7 +15407,9 @@ pub(crate) async fn scan_commit_delta_limit_candidate_row_pks(
                 .into_iter()
                 .next()
                 .flatten()
-                .ok_or_else(|| replacement_payload_error("candidate manifest references a missing segment"))?;
+                .ok_or_else(|| {
+                    replacement_payload_error("candidate manifest references a missing segment")
+                })?;
                 let bytes = full_value_bytes(value).ok_or_else(|| {
                     replacement_payload_error("candidate segment read omitted its value")
                 })?;
@@ -15451,6 +15460,23 @@ pub(crate) async fn scan_commit_delta_values_from_authenticated_states(
     source: Option<&AuthenticatedReplayCommitStateManifest>,
     schema_keys: &[String],
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
+    scan_commit_delta_values_from_authenticated_states_with_budget(
+        store,
+        state,
+        source,
+        schema_keys,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn scan_commit_delta_values_from_authenticated_states_with_budget(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    source: Option<&AuthenticatedReplayCommitStateManifest>,
+    schema_keys: &[String],
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+) -> Result<DecodedCommitDeltaBatch, LixError> {
     let selected_source_commit_id = state.mutations.selected_source_commit_id();
     match (selected_source_commit_id, source) {
         (None, None) => {
@@ -15458,6 +15484,7 @@ pub(crate) async fn scan_commit_delta_values_from_authenticated_states(
                 store,
                 state,
                 schema_keys,
+                native_work_budget,
             ))
             .await?;
             canonicalize_absent_batch_authors(store, &mut batch).await?;
@@ -15491,12 +15518,14 @@ pub(crate) async fn scan_commit_delta_values_from_authenticated_states(
         store,
         source.expect("validated selected source"),
         schema_keys,
+        native_work_budget,
     ))
     .await?;
     let mut local = Box::pin(scan_authenticated_local_commit_delta_values(
         store,
         state,
         schema_keys,
+        native_work_budget,
     ))
     .await?;
     canonicalize_absent_batch_authors(store, &mut source).await?;
@@ -15626,24 +15655,25 @@ async fn canonicalize_absent_batch_authors(
 
     let live_rows = missing_author_rows
         .into_iter()
-        .filter_map(|(ordinal, change_id, updated_at, commit_id, deleted, key)| {
-            (!deleted).then_some((ordinal, change_id, updated_at, commit_id, key))
-        })
+        .filter_map(
+            |(ordinal, change_id, updated_at, commit_id, deleted, key)| {
+                (!deleted).then_some((ordinal, change_id, updated_at, commit_id, key))
+            },
+        )
         .collect::<Vec<_>>();
     let requests = live_rows
         .iter()
-        .map(|(_, change_id, updated_at, commit_id, key)| {
-            AuthoritativeLiveChangeRequest {
+        .map(
+            |(_, change_id, updated_at, commit_id, key)| AuthoritativeLiveChangeRequest {
                 change_id: *change_id,
                 source_commit_id: *commit_id,
                 key: key.clone(),
                 updated_at: *updated_at,
-            }
-        })
+            },
+        )
         .collect::<Vec<_>>();
     let changes = load_authoritative_live_change_records(store, &requests).await?;
-    for ((ordinal, change_id, updated_at, _, key), canonical) in
-        live_rows.into_iter().zip(changes)
+    for ((ordinal, change_id, updated_at, _, key), canonical) in live_rows.into_iter().zip(changes)
     {
         if canonical.change_id != change_id
             || canonical.created_at != updated_at
@@ -15665,6 +15695,7 @@ async fn scan_authenticated_local_commit_delta_values(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
     let Some(root) = state.mutation_directory_root.as_ref() else {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -15673,13 +15704,20 @@ async fn scan_authenticated_local_commit_delta_values(
             state.commit_id,
             schema_keys,
             &manifest,
+            native_work_budget,
         ))
         .await;
     };
     if root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
         || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
     {
-        return Box::pin(scan_bounded_commit_delta_values(store, state, schema_keys)).await;
+        return Box::pin(scan_bounded_commit_delta_values(
+            store,
+            state,
+            schema_keys,
+            native_work_budget,
+        ))
+        .await;
     }
     if root.layout == super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -15688,6 +15726,7 @@ async fn scan_authenticated_local_commit_delta_values(
             state.commit_id,
             schema_keys,
             &manifest,
+            native_work_budget,
         ))
         .await;
     }
@@ -15736,6 +15775,7 @@ async fn scan_authenticated_local_commit_delta_values(
         state.commit_id,
         schema_keys,
         &manifest,
+        native_work_budget,
     ))
     .await
 }
@@ -15744,6 +15784,7 @@ async fn scan_bounded_commit_delta_values(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
     schema_keys: &[String],
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded mutation scan omitted its directory root")
@@ -15765,7 +15806,7 @@ async fn scan_bounded_commit_delta_values(
             }
         })
         .collect::<Vec<_>>();
-    let runs = super::mutation_directory::load_mutation_part_read_plan(
+    let runs = super::mutation_directory::load_mutation_part_read_plan_with_native_budget(
         store,
         root,
         if ranges.is_empty() {
@@ -15775,80 +15816,76 @@ async fn scan_bounded_commit_delta_values(
         } else {
             super::mutation_directory::MutationDirectoryReadSelection::SortedRanges(&ranges)
         },
+        native_work_budget,
     )
     .await?
     .into_runs();
     if runs.is_empty() {
         return Ok(DecodedCommitDeltaBatch::default());
     }
-    let storage_keys = runs
-        .iter()
-        .map(|run| {
-            let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } =
-                &run.entry
+    let expected_rows = runs.len().saturating_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let row_capacity = native_diff_scan_capacity(expected_rows, native_work_budget)?;
+    let arena_capacity = runs
+        .len()
+        .min(row_capacity.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(row_capacity, arena_capacity)
+        .with_native_work_budget(native_work_budget);
+    let read_batch_size = native_diff_segment_read_batch_size(native_work_budget)?;
+    for run_chunk in runs.chunks(read_batch_size) {
+        let storage_keys = run_chunk
+            .iter()
+            .map(|run| {
+                let super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } =
+                    &run.entry
+                else {
+                    return Err(replacement_payload_error(
+                        "bounded mutation scan selected a non-bounded part",
+                    ));
+                };
+                commit_delta_segment_key_for_part(
+                    state.commit_id,
+                    usize::try_from(run.entry_index)
+                        .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                    part,
+                )
+                .map(|key| StorageKey(Bytes::from(key)))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let segments =
+            PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+        for (run, value) in run_chunk.iter().zip(segments.value) {
+            let super::mutation_directory::MutationDirectoryEntry::Bounded {
+                part,
+                direct_row_count,
+            } = &run.entry
             else {
                 return Err(replacement_payload_error(
                     "bounded mutation scan selected a non-bounded part",
                 ));
             };
-            commit_delta_segment_key_for_part(
-                state.commit_id,
-                usize::try_from(run.entry_index)
-                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
-                part,
-            )
-            .map(|key| StorageKey(Bytes::from(key)))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let segments =
-        PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(
-        runs.len().saturating_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS),
-        runs.len(),
-    );
-    for (run, value) in runs.into_iter().zip(segments.value) {
-        let bytes = value
-            .and_then(full_value_bytes)
-            .ok_or_else(|| match &run.entry {
-                super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
-                    super::NativeObjectRef::CommitDeltaPart {
-                        commit_id: *state.commit_id.as_uuid().as_bytes(),
-                        part_index: run.entry_index,
-                        expected_digest: part.content_digest,
-                        replacement: part.replacement_part.is_some(),
-                    }
-                    .annotate_missing(replacement_payload_error(
-                        "bounded mutation scan references a missing immutable part",
-                    ))
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                super::NativeObjectRef::CommitDeltaPart {
+                    commit_id: *state.commit_id.as_uuid().as_bytes(),
+                    part_index: run.entry_index,
+                    expected_digest: part.content_digest,
+                    replacement: part.replacement_part.is_some(),
                 }
-                _ => replacement_payload_error(
+                .annotate_missing(replacement_payload_error(
                     "bounded mutation scan references a missing immutable part",
-                ),
+                ))
             })?;
-        let super::mutation_directory::MutationDirectoryEntry::Bounded {
-            part,
-            direct_row_count,
-        } = run.entry
-        else {
-            return Err(replacement_payload_error(
-                "bounded mutation scan selected a non-bounded part",
-            ));
-        };
-        let bounds = CommitDeltaSegmentBounds {
-            first_key: part.first_key,
-            last_key: part.last_key,
-            content_digest: part.content_digest,
-            replacement_part: part.replacement_part,
-        };
-        let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
-        validate_bounded_direct_row_count(root.layout, direct_row_count, leaf.len())?;
-        batch.push_leaf(
-            leaf,
-            state.commit_id,
-            &requested_schemas,
-        )?;
+            let bounds = CommitDeltaSegmentBounds {
+                first_key: part.first_key.clone(),
+                last_key: part.last_key.clone(),
+                content_digest: part.content_digest,
+                replacement_part: part.replacement_part.clone(),
+            };
+            let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
+            validate_bounded_direct_row_count(root.layout, *direct_row_count, leaf.len())?;
+            batch.push_leaf(leaf, state.commit_id, &requested_schemas)?;
+        }
     }
     Ok(batch.finish())
 }
@@ -15858,6 +15895,7 @@ async fn scan_local_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
     manifest: &CommitDeltaManifest,
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
     let requested_schemas = schema_keys
         .iter()
@@ -15867,11 +15905,12 @@ async fn scan_local_commit_delta_values(
         if !requested_schemas.is_empty() && !requested_schemas.contains(parts.schema_key.as_str()) {
             return Ok(DecodedCommitDeltaBatch::default());
         }
-        return scan_columnar_mutation_values(store, commit_id, parts).await;
+        return scan_columnar_mutation_values(store, commit_id, parts, native_work_budget).await;
     }
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_leaf(inline_segment, None)?;
-        let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(leaf.len(), 1);
+        let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(leaf.len(), 1)
+            .with_native_work_budget(native_work_budget);
         batch.push_leaf(leaf, commit_id, &requested_schemas)?;
         return Ok(batch.finish());
     }
@@ -15879,39 +15918,45 @@ async fn scan_local_commit_delta_values(
     if segment_indices.is_empty() {
         return Ok(DecodedCommitDeltaBatch::default());
     }
-    let storage_keys = segment_indices
-        .iter()
-        .map(|&segment_index| {
-            commit_delta_segment_key_for_bounds(
-                commit_id,
-                segment_index,
-                &manifest.segments[segment_index],
-            )
-            .map(|key| StorageKey(Bytes::from(key)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(
-        segment_indices
-            .len()
-            .saturating_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS),
-        segment_indices.len(),
-    );
-    for (segment_index, value) in segment_indices.into_iter().zip(segments.value) {
-        let bytes = value
-            .and_then(full_value_bytes)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
-                    ),
+    let expected_rows = segment_indices
+        .len()
+        .saturating_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let row_capacity = native_diff_scan_capacity(expected_rows, native_work_budget)?;
+    let arena_capacity = segment_indices
+        .len()
+        .min(row_capacity.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(row_capacity, arena_capacity)
+        .with_native_work_budget(native_work_budget);
+    let read_batch_size = native_diff_segment_read_batch_size(native_work_budget)?;
+    for segment_chunk in segment_indices.chunks(read_batch_size) {
+        let storage_keys = segment_chunk
+            .iter()
+            .map(|&segment_index| {
+                commit_delta_segment_key_for_bounds(
+                    commit_id,
+                    segment_index,
+                    &manifest.segments[segment_index],
                 )
-            })?;
-        let leaf = decode_commit_delta_leaf(&bytes, Some(&manifest.segments[segment_index]))?;
-        batch.push_leaf(leaf, commit_id, &requested_schemas)?;
+                .map(|key| StorageKey(Bytes::from(key)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+        for (&segment_index, value) in segment_chunk.iter().zip(segments.value) {
+            let bytes = value
+                .and_then(full_value_bytes)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                        ),
+                    )
+                })?;
+            let leaf = decode_commit_delta_leaf(&bytes, Some(&manifest.segments[segment_index]))?;
+            batch.push_leaf(leaf, commit_id, &requested_schemas)?;
+        }
     }
     Ok(batch.finish())
 }
@@ -15920,8 +15965,19 @@ async fn scan_columnar_mutation_values(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
     use datafusion::arrow::array::{Array, StringArray};
+
+    if let Some(budget) = native_work_budget {
+        let rows = usize::try_from(parts.row_count).unwrap_or(usize::MAX);
+        if rows > budget.remaining_identities()? {
+            return Err(LixError::new(
+                super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE,
+                "native diff recipe changed-identity work limit exceeded",
+            ));
+        }
+    }
 
     let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
     let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
@@ -15932,7 +15988,8 @@ async fn scan_columnar_mutation_values(
     let mut builder = DecodedCommitDeltaBatchBuilder::with_capacity(
         parts.row_count as usize,
         (parts.row_count as usize).div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
-    );
+    )
+    .with_native_work_budget(native_work_budget);
     let mut global_ordinal = 0usize;
     for group_index in 0..manifest.groups.len() {
         let batch = crate::columnar_row_group::load_row_group_batch(
@@ -15949,8 +16006,26 @@ async fn scan_columnar_mutation_values(
             .downcast_ref::<StringArray>()
             .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
         for row_index in 0..identities.len() {
-            let row_pk = RowPk::from_json_array_text(identities.value(row_index))
+            let identity_text = identities.value(row_index);
+            if native_work_budget.is_some() {
+                super::NativeDiffIdentityBudget::validate_key_size(
+                    identity_text
+                        .len()
+                        .saturating_add(parts.schema_key.len())
+                        .saturating_add(16),
+                )?;
+            }
+            let row_pk = RowPk::from_json_array_text(identity_text)
                 .map_err(|error| replacement_payload_error(&error.to_string()))?;
+            if let Some(budget) = native_work_budget {
+                let encoded_key = encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &parts.schema_key,
+                    file_id: None,
+                    row_pk: &row_pk,
+                });
+                budget.charge_visit(encoded_key.len())?;
+                budget.charge(encoded_key.len())?;
+            }
             let packed = u32::try_from(global_ordinal)
                 .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
                 .checked_add(1)
@@ -16003,10 +16078,8 @@ fn merge_selected_source_batches(
         )
     })?;
     let columnar_key_offset = source.columnar_keys.len();
-    let mut entries = BTreeMap::<
-        Vec<u8>,
-        (DecodedCommitDeltaRow, TrackedStateIndexValue, bool),
-    >::new();
+    let mut entries =
+        BTreeMap::<Vec<u8>, (DecodedCommitDeltaRow, TrackedStateIndexValue, bool)>::new();
     let source_rows = std::mem::take(&mut source.rows);
     let source_values = std::mem::take(&mut source.values);
     let source_author_present = std::mem::take(&mut source.author_present);
@@ -19189,7 +19262,15 @@ where
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_row_loaded(account_id.len());
     let key = decode_key(entry.key)?;
-    let (metadata, snapshot, origin_key, base_coordinate, selected_ref, selected_tombstone, authored) = match payload {
+    let (
+        metadata,
+        snapshot,
+        origin_key,
+        base_coordinate,
+        selected_ref,
+        selected_tombstone,
+        authored,
+    ) = match payload {
         CommitDeltaPayload::Authored(payload) => (
             payload.metadata,
             payload.snapshot,
@@ -19240,8 +19321,8 @@ where
         created_at: value.updated_at,
         origin_key,
     };
-    let ordinal = u16::try_from(index)
-        .expect("commit-delta segment row count fits the locator ordinal");
+    let ordinal =
+        u16::try_from(index).expect("commit-delta segment row count fits the locator ordinal");
     let change_id = change_record.change_id;
     Ok(LoadedCommitDeltaEntry {
         value,
@@ -19884,7 +19965,9 @@ fn decode_stored_commit_state_authority(
     }
     let Some(inventory_frame) = mutation_inventory
         .strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_FORMAT_MAGIC)
-        .or_else(|| mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_V3_FORMAT_MAGIC))
+        .or_else(|| {
+            mutation_inventory.strip_prefix(COMMIT_STATE_MUTATION_INVENTORY_V3_FORMAT_MAGIC)
+        })
     else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -22265,11 +22348,10 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let owner = CommitId::for_test_label("legacy-owner-without-change-locator");
         let mut fixture = packed_commit_delta_fixtures().remove(1);
-        let mut legacy_change_uuid = *ChangeId::for_test_label(
-            "legacy-nondirect-change-without-locator",
-        )
-        .as_uuid()
-        .as_bytes();
+        let mut legacy_change_uuid =
+            *ChangeId::for_test_label("legacy-nondirect-change-without-locator")
+                .as_uuid()
+                .as_bytes();
         // The only non-direct UUID address is the reserved zero ordinal.
         legacy_change_uuid[12..].fill(0);
         fixture.change_id = ChangeId::new(uuid::Uuid::from_bytes(legacy_change_uuid));
@@ -22555,8 +22637,8 @@ mod tests {
                 deleted: false,
                 created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                 updated_at: fixture.updated_at,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
             author_present: false,
             metadata: None,
             snapshot: b"v82-live-snapshot".to_vec(),
@@ -22566,10 +22648,11 @@ mod tests {
         assert!(encoded.bytes.starts_with(b"LXCSP04"));
         let mut legacy_bytes = b"LXCSP03".to_vec();
         legacy_bytes.extend_from_slice(&encoded.bytes[7..]);
-        let legacy_digest = *blake3::Hasher::new_derive_key("lix native current-state data part v3")
-            .update(&legacy_bytes)
-            .finalize()
-            .as_bytes();
+        let legacy_digest =
+            *blake3::Hasher::new_derive_key("lix native current-state data part v3")
+                .update(&legacy_bytes)
+                .finalize()
+                .as_bytes();
         writes.put(
             CURRENT_STATE_DATA_PART_SPACE,
             super::key(legacy_digest.to_vec()),
@@ -22669,12 +22752,15 @@ mod tests {
 
         // Preserve the v82 physical shape: the old format has no per-row
         // author bytes, though the authenticated commit owner still does.
-        let mut legacy_part = encode_replacement_part_with_compressor(&[ReplacementPartRowRef {
-            encoded_key: &encoded_key,
-            author_id,
-            metadata: None,
-            snapshot: b"typed-v82-replacement",
-        }], &mut None)
+        let mut legacy_part = encode_replacement_part_with_compressor(
+            &[ReplacementPartRowRef {
+                encoded_key: &encoded_key,
+                author_id,
+                metadata: None,
+                snapshot: b"typed-v82-replacement",
+            }],
+            &mut None,
+        )
         .expect("replacement part should encode")
         .bytes()
         .to_vec();
@@ -22682,12 +22768,11 @@ mod tests {
         let author_start = 8 + 2 + 2 + 2 + encoded_key.len();
         let author_end = author_start + 2 + author_id.len();
         legacy_part.drain(author_start..author_end);
-        let legacy_digest = *blake3::Hasher::new_derive_key(
-            "lix tracked-state replacement identity part v1",
-        )
-        .update(&legacy_part)
-        .finalize()
-        .as_bytes();
+        let legacy_digest =
+            *blake3::Hasher::new_derive_key("lix tracked-state replacement identity part v1")
+                .update(&legacy_part)
+                .finalize()
+                .as_bytes();
         let directory = ReplacementPartDirectory::try_new(
             vec![ReplacementPartDirectoryEntry::new(
                 legacy_digest,
@@ -22778,12 +22863,10 @@ mod tests {
             author_id
         );
 
-        let owned = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(owner, key.clone())],
-        )
-        .await
-        .expect("legacy replacement commit-delta owner should resolve");
+        let owned =
+            super::load_commit_delta_change_records_for_owners(&read, &[(owner, key.clone())])
+                .await
+                .expect("legacy replacement commit-delta owner should resolve");
         assert_eq!(
             owned[0]
                 .as_ref()
@@ -22822,11 +22905,12 @@ mod tests {
                 &native_descriptors[0].content_digest,
             )
             .expect("migrated native current-state data part should be staged");
-        let migrated_rows = crate::tracked_state::current_state_data_part::decode_current_state_data_part(
-            &native_descriptors[0].content_digest,
-            &native_bytes,
-        )
-        .expect("migrated native current-state part should decode");
+        let migrated_rows =
+            crate::tracked_state::current_state_data_part::decode_current_state_data_part(
+                &native_descriptors[0].content_digest,
+                &native_bytes,
+            )
+            .expect("migrated native current-state part should decode");
         assert_eq!(migrated_rows[0].value.author_id, author_id);
         assert!(migrated_rows[0].author_present);
     }
@@ -22950,8 +23034,8 @@ mod tests {
 
         let mut authored_deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
         authored_deltas[0].delta.author_id = crate::SYSTEM_ACCOUNT_ID;
-        let staged = super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true])
-            .unwrap();
+        let staged =
+            super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true]).unwrap();
         stage_fixture_manifest_with_author(
             &mut writes,
             authored,
@@ -23011,14 +23095,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(authored, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(authored, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         let mut stale = canonical.clone();
         stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
         stale.snapshot = Some(b"stale-standalone-v82".to_vec());
@@ -23077,12 +23159,10 @@ mod tests {
         assert_eq!(loaded.value.author_id, crate::SYSTEM_ACCOUNT_ID);
         assert_eq!(loaded.change_record.account_id, crate::SYSTEM_ACCOUNT_ID);
 
-        let selected_records = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(selected, fixture.key())],
-        )
-        .await
-        .unwrap();
+        let selected_records =
+            super::load_commit_delta_change_records_for_owners(&read, &[(selected, fixture.key())])
+                .await
+                .unwrap();
         assert_eq!(
             selected_records[0].as_ref().unwrap().account_id,
             crate::SYSTEM_ACCOUNT_ID
@@ -23104,7 +23184,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected_members[0].change, records[0]);
-        assert_eq!(selected_members[0].value.author_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(
+            selected_members[0].value.author_id,
+            crate::SYSTEM_ACCOUNT_ID
+        );
         let inventory = scan_commit_delta_inventory(&read).await.unwrap();
         assert_eq!(inventory.commits[&selected].members[0].change, records[0]);
         assert_eq!(
@@ -23118,13 +23201,10 @@ mod tests {
             file_id: fixture.file_id.as_deref(),
             row_pk: &fixture.row_pk,
         }));
-        let replayed = load_commit_delta_values_encoded(
-            &read,
-            selected,
-            std::slice::from_ref(&encoded_key),
-        )
-        .await
-        .expect("point replay should restore an author omitted by the v82 selected row");
+        let replayed =
+            load_commit_delta_values_encoded(&read, selected, std::slice::from_ref(&encoded_key))
+                .await
+                .expect("point replay should restore an author omitted by the v82 selected row");
         assert_eq!(
             replayed[0].as_ref().unwrap().author_id,
             crate::SYSTEM_ACCOUNT_ID
@@ -23144,15 +23224,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        assert!(load_commit_delta_members_with_payloads(&read, mismatched)
+        assert!(
+            load_commit_delta_members_with_payloads(&read, mismatched)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::load_commit_delta_change_records_for_owners(
+                &read,
+                &[(mismatched, fixture.key())]
+            )
             .await
-            .is_err());
-        assert!(super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(mismatched, fixture.key())]
-        )
-        .await
-        .is_err());
+            .is_err()
+        );
         let resolved = super::load_authoritative_live_change_records(
             &read,
             &[super::AuthoritativeLiveChangeRequest {
@@ -23177,8 +23261,8 @@ mod tests {
         let fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
         let mut writes = storage.new_write_set();
         let authored_deltas = commit_delta_refs(authored, std::slice::from_ref(&fixture));
-        let staged = super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true])
-            .unwrap();
+        let staged =
+            super::stage_addressable_commit_deltas(&mut writes, &authored_deltas, &[true]).unwrap();
         stage_fixture_manifest_with_author(
             &mut writes,
             authored,
@@ -23203,14 +23287,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(authored, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(authored, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         let mut stale = canonical.clone();
         stale.account_id = crate::SYSTEM_ACCOUNT_ID.to_string();
         stale.snapshot = Some(b"stale-standalone".to_vec());
@@ -23245,12 +23327,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(members[0].change, canonical);
-        let point = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(selected, fixture.key())],
-        )
-        .await
-        .unwrap();
+        let point =
+            super::load_commit_delta_change_records_for_owners(&read, &[(selected, fixture.key())])
+                .await
+                .unwrap();
         assert_eq!(point[0], Some(canonical.clone()));
         let selected_source = super::load_authoritative_selected_change_records(
             &read,
@@ -23305,104 +23385,105 @@ mod tests {
     #[tokio::test]
     async fn selected_payload_uses_standalone_when_old_locator_targets_selected_row() {
         for address_shaped in [true, false] {
-        let storage = StorageAdapter::new(Memory::new());
-        let absent_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
-            0x0192_0000_0000_7000_8000_1236_0000_0000,
-        ));
-        let selected = CommitId::for_test_label("selected-stale-locator");
-        let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
-        fixture.change_id = if address_shaped {
-            super::addressable_change_id(absent_owner, 0, 0).unwrap()
-        } else {
-            ChangeId::for_test_label("legacy-selected-stale-locator")
-        };
-        let fixtures = [fixture.clone()];
-        let mut deltas = commit_delta_refs(selected, &fixtures);
-        deltas[0].authored = false;
-        deltas[0].snapshot = None;
-        let mut writes = storage.new_write_set();
-        stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
-        stage_change_locators(
-            &mut writes,
-            &[CommitDeltaChangeLocator {
-                change_id: fixture.change_id,
-                commit_id: selected,
-                segment_index: 0,
-                ordinal: 0,
-            }],
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .unwrap();
-
-        let canonical = crate::changelog::ChangeRecord {
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            format_version: 2,
-            change_id: fixture.change_id,
-            schema_key: fixture.schema_key.clone(),
-            row_pk: fixture.row_pk.clone(),
-            file_id: fixture.file_id.clone(),
-            metadata: None,
-            snapshot: Some(b"typed-live-fixture".to_vec()),
-            created_at: fixture.updated_at,
-            origin_key: None,
-        };
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let mut writes = storage.new_write_set();
-        let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
-        crate::changelog::ChangelogWriter::stage_append(
-            &mut writer,
-            crate::changelog::ChangelogAppend {
-                commits: Vec::new(),
-                changes: vec![canonical.clone()],
-            },
-        )
-        .await
-        .unwrap();
-        drop(writer);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .unwrap();
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let members = load_commit_delta_members_with_payloads(&read, selected)
-            .await
-            .unwrap();
-        assert_eq!(members[0].change, canonical);
-        let point = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(selected, fixture.key())],
-        )
-        .await
-        .unwrap();
-            assert_eq!(point[0], Some(canonical.clone()));
-        assert_eq!(
-            super::load_change_records_by_ids(&read, &[fixture.change_id])
+            let storage = StorageAdapter::new(Memory::new());
+            let absent_owner = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+                0x0192_0000_0000_7000_8000_1236_0000_0000,
+            ));
+            let selected = CommitId::for_test_label("selected-stale-locator");
+            let mut fixture = packed_commit_delta_fixtures().into_iter().nth(1).unwrap();
+            fixture.change_id = if address_shaped {
+                super::addressable_change_id(absent_owner, 0, 0).unwrap()
+            } else {
+                ChangeId::for_test_label("legacy-selected-stale-locator")
+            };
+            let fixtures = [fixture.clone()];
+            let mut deltas = commit_delta_refs(selected, &fixtures);
+            deltas[0].authored = false;
+            deltas[0].snapshot = None;
+            let mut writes = storage.new_write_set();
+            stage_addressable_commit_deltas(&mut writes, &deltas, &[false]).unwrap();
+            stage_change_locators(
+                &mut writes,
+                &[CommitDeltaChangeLocator {
+                    change_id: fixture.change_id,
+                    commit_id: selected,
+                    segment_index: 0,
+                    ordinal: 0,
+                }],
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
                 .await
-                .unwrap(),
-            vec![canonical.clone()],
-            "a stale selected-row locator must retain the standalone payload fallback"
-        );
-        let selected_source = super::load_authoritative_selected_change_records(
-            &read,
-            &[super::AuthoritativeLiveChangeRequest {
+                .unwrap();
+
+            let canonical = crate::changelog::ChangeRecord {
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+                format_version: 2,
                 change_id: fixture.change_id,
-                source_commit_id: selected,
-                key: fixture.key(),
-                updated_at: fixture.updated_at,
-            }],
-        )
-        .await
-        .unwrap();
-        assert_eq!(selected_source, vec![canonical]);
+                schema_key: fixture.schema_key.clone(),
+                row_pk: fixture.row_pk.clone(),
+                file_id: fixture.file_id.clone(),
+                metadata: None,
+                snapshot: Some(b"typed-live-fixture".to_vec()),
+                created_at: fixture.updated_at,
+                origin_key: None,
+            };
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let mut writes = storage.new_write_set();
+            let mut writer =
+                crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
+            crate::changelog::ChangelogWriter::stage_append(
+                &mut writer,
+                crate::changelog::ChangelogAppend {
+                    commits: Vec::new(),
+                    changes: vec![canonical.clone()],
+                },
+            )
+            .await
+            .unwrap();
+            drop(writer);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let members = load_commit_delta_members_with_payloads(&read, selected)
+                .await
+                .unwrap();
+            assert_eq!(members[0].change, canonical);
+            let point = super::load_commit_delta_change_records_for_owners(
+                &read,
+                &[(selected, fixture.key())],
+            )
+            .await
+            .unwrap();
+            assert_eq!(point[0], Some(canonical.clone()));
+            assert_eq!(
+                super::load_change_records_by_ids(&read, &[fixture.change_id])
+                    .await
+                    .unwrap(),
+                vec![canonical.clone()],
+                "a stale selected-row locator must retain the standalone payload fallback"
+            );
+            let selected_source = super::load_authoritative_selected_change_records(
+                &read,
+                &[super::AuthoritativeLiveChangeRequest {
+                    change_id: fixture.change_id,
+                    source_commit_id: selected,
+                    key: fixture.key(),
+                    updated_at: fixture.updated_at,
+                }],
+            )
+            .await
+            .unwrap();
+            assert_eq!(selected_source, vec![canonical]);
         }
     }
 
@@ -23518,14 +23599,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(endpoint, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(endpoint, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         let mut stale = canonical.clone();
         stale.snapshot = Some(b"stale-standalone".to_vec());
         let mut writes = storage.new_write_set();
@@ -23595,14 +23674,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(authored, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(authored, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         let mut stale = canonical.clone();
         stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
         stale.snapshot = Some(b"stale-standalone-payload".to_vec());
@@ -23654,7 +23731,10 @@ mod tests {
         let mut writes = storage.new_write_set();
         let staged = super::stage_addressable_commit_deltas(&mut writes, &deltas, &[true]).unwrap();
         let change_id = staged.assigned_change_ids[0];
-        assert!(staged.locators.is_empty(), "direct IDs need no explicit locator");
+        assert!(
+            staged.locators.is_empty(),
+            "direct IDs need no explicit locator"
+        );
         assert_eq!(
             super::direct_change_locator(change_id)
                 .expect("authored change ID should encode its owner")
@@ -23678,14 +23758,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(source, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(source, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         assert_eq!(canonical.account_id, crate::SYSTEM_ACCOUNT_ID);
         let mut stale = canonical.clone();
         stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
@@ -23738,8 +23816,8 @@ mod tests {
         fixture.change_id = super::addressable_change_id(source, 0, 1).unwrap();
         let mut writes = storage.new_write_set();
         let deltas = commit_delta_refs(source, std::slice::from_ref(&fixture));
-        let staged = super::stage_imported_addressable_commit_deltas(&mut writes, &deltas, &[true])
-            .unwrap();
+        let staged =
+            super::stage_imported_addressable_commit_deltas(&mut writes, &deltas, &[true]).unwrap();
         assert_eq!(staged.locators.len(), 1);
         let explicit = staged.locators[0];
         let embedded = super::direct_change_locator(fixture.change_id).unwrap();
@@ -23759,14 +23837,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(source, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(source, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         let mut stale = canonical.clone();
         stale.snapshot = Some(b"stale-standalone-payload".to_vec());
         let mut writes = storage.new_write_set();
@@ -23838,14 +23914,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .unwrap();
-        let canonical = super::load_commit_delta_change_records_for_owners(
-            &read,
-            &[(source, fixture.key())],
-        )
-        .await
-        .unwrap()
-        .remove(0)
-        .unwrap();
+        let canonical =
+            super::load_commit_delta_change_records_for_owners(&read, &[(source, fixture.key())])
+                .await
+                .unwrap()
+                .remove(0)
+                .unwrap();
         assert_eq!(canonical.account_id, crate::SYSTEM_ACCOUNT_ID);
         let mut stale = canonical.clone();
         stale.account_id = crate::ANONYMOUS_ACCOUNT_ID.to_owned();
@@ -23976,11 +24050,13 @@ mod tests {
             key: fixture.key(),
             updated_at: fixture.updated_at,
         };
-        assert!(super::load_authoritative_live_change_records(&read, &[request])
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("invalid deferred-history marker"));
+        assert!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid deferred-history marker")
+        );
     }
 
     #[tokio::test]
@@ -24125,9 +24201,11 @@ mod tests {
             key: standalone_key,
             updated_at: fixture.updated_at,
         };
-        assert!(super::load_authoritative_live_change_records(&read, &[request])
-            .await
-            .is_err());
+        assert!(
+            super::load_authoritative_live_change_records(&read, &[request])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -25252,19 +25330,22 @@ mod tests {
         let mut writes = storage.new_write_set();
         let staged = super::stage_ordered_addressable_replacement_parts(
             &mut writes,
-            identities.into_iter().zip(&payloads).map(|(row_pk, payload)| {
-                Ok(TrackedStateSingleStringReplacementRef {
-                    schema_key: "compact-direct",
-                    file_id: None,
-                    row_pk,
-                    author_id: crate::ANONYMOUS_ACCOUNT_ID,
-                    commit_id,
-                    created_at,
-                    updated_at,
-                    metadata: None,
-                    snapshot: payload,
-                })
-            }),
+            identities
+                .into_iter()
+                .zip(&payloads)
+                .map(|(row_pk, payload)| {
+                    Ok(TrackedStateSingleStringReplacementRef {
+                        schema_key: "compact-direct",
+                        file_id: None,
+                        row_pk,
+                        author_id: crate::ANONYMOUS_ACCOUNT_ID,
+                        commit_id,
+                        created_at,
+                        updated_at,
+                        metadata: None,
+                        snapshot: payload,
+                    })
+                }),
             &generation,
         )
         .expect("compact replacement should stage");
@@ -25287,9 +25368,11 @@ mod tests {
             .await
             .expect("compact replacement index should scan");
         assert_eq!(decoded_values.len(), 2);
-        assert!(decoded_values
-            .iter()
-            .all(|row| row.value().semantic_fingerprint.is_none()));
+        assert!(
+            decoded_values
+                .iter()
+                .all(|row| row.value().semantic_fingerprint.is_none())
+        );
         super::super::mutation_directory::reset_mutation_directory_read_accounting();
         let change_id = staged
             .change_id_at(1)
@@ -25586,8 +25669,8 @@ mod tests {
         let parent_rows = fixtures
             .iter()
             .enumerate()
-            .map(|(ordinal, fixture)| {
-                crate::tracked_state::types::MaterializedTrackedStateRow {
+            .map(
+                |(ordinal, fixture)| crate::tracked_state::types::MaterializedTrackedStateRow {
                     row_pk: fixture.row_pk.clone(),
                     schema_key: fixture.schema_key.clone(),
                     file_id: fixture.file_id.clone(),
@@ -25602,8 +25685,8 @@ mod tests {
                         "duplicate-selected-tombstone-parent-{ordinal}"
                     )),
                     commit_id: parent_commit,
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
         let mut parent_read = storage
             .begin_read(StorageReadOptions::default())
@@ -25652,8 +25735,8 @@ mod tests {
                         deleted: true,
                         created_at: fixture.created_at,
                         updated_at: fixture.updated_at,
-                                            semantic_fingerprint: None,
-})
+                        semantic_fingerprint: None,
+                    })
                     .into(),
                 })
                 .collect::<Vec<_>>();
@@ -25666,10 +25749,8 @@ mod tests {
             key(root_id.as_bytes().to_vec()),
             value(leaf),
         );
-        let mut manifest = fixture_commit_state_manifest(
-            commit_id,
-            staged.mutation_inventory().clone(),
-        );
+        let mut manifest =
+            fixture_commit_state_manifest(commit_id, staged.mutation_inventory().clone());
         manifest.change_account_id = crate::SYSTEM_ACCOUNT_ID.to_owned();
         manifest.replay_debt = CommitStateReplayDebt::default();
         manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
@@ -25696,8 +25777,8 @@ mod tests {
             first_parent_jump_span: 1,
             account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
             created_at: fixtures[0].updated_at,
-                    first_parent_checkpoint_summary: None,
-};
+            first_parent_checkpoint_summary: None,
+        };
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -25736,14 +25817,18 @@ mod tests {
             .await
             .expect("explicit selected tombstone authors should remain readable");
         assert_eq!(replayed.len(), 2);
-        assert!(replayed
-            .iter()
-            .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID));
-        assert!(scan_change_records_from_commit_deltas(&read)
-            .await
-            .expect("selected tombstones should not conflict with public authority")
-            .iter()
-            .all(|change| change.change_id != fixtures[0].change_id));
+        assert!(
+            replayed
+                .iter()
+                .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID)
+        );
+        assert!(
+            scan_change_records_from_commit_deltas(&read)
+                .await
+                .expect("selected tombstones should not conflict with public authority")
+                .iter()
+                .all(|change| change.change_id != fixtures[0].change_id)
+        );
         scan_commit_delta_inventory(&read)
             .await
             .expect("selected tombstones should be valid inventory members");
@@ -25841,9 +25926,11 @@ mod tests {
             .await
             .expect("stale standalone projection must not displace point replay identity");
         assert_eq!(replay.len(), 2);
-        assert!(replay
-            .iter()
-            .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID));
+        assert!(
+            replay
+                .iter()
+                .all(|row| row.value().author_id == crate::SYSTEM_ACCOUNT_ID)
+        );
     }
 
     #[tokio::test]
@@ -25886,30 +25973,25 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
             metadata: None,
             snapshot: None,
             origin_key: None,
             base_coordinate: None,
             authored: false,
         };
-        let selected_stage = super::stage_addressable_commit_deltas(
-            &mut writes,
-            &[selected_delta],
-            &[false],
-        )
-        .expect("finite selected tombstone should stage");
+        let selected_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &[selected_delta], &[false])
+                .expect("finite selected tombstone should stage");
 
         // Convert only the selected checkpoint leaf to the old v82 layout.
         // The source owner remains current-format and preserves SYSTEM.
         let mut selected_inventory = selected_stage.mutation_inventory().clone();
-        let (_, sidecar) =
-            super::split_commit_delta_segment(&selected_inventory.inline_part)
-                .expect("selected segment should have a payload sidecar");
-        let (leaf, _) =
-            decode_commit_delta_with_payloads(&selected_inventory.inline_part, None)
-                .expect("selected row should decode before legacy conversion");
+        let (_, sidecar) = super::split_commit_delta_segment(&selected_inventory.inline_part)
+            .expect("selected segment should have a payload sidecar");
+        let (leaf, _) = decode_commit_delta_with_payloads(&selected_inventory.inline_part, None)
+            .expect("selected row should decode before legacy conversion");
         let entry = leaf.entry(0).expect("one selected row");
         let value = decode_value(entry.value).expect("selected value should decode");
         let author_suffix_len = 2 + value.author_id.len();
@@ -26020,20 +26102,17 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: fixture.updated_at,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
             metadata: None,
             snapshot: None,
             origin_key: None,
             base_coordinate: None,
             authored: false,
         };
-        let selected_stage = super::stage_addressable_commit_deltas(
-            &mut writes,
-            &[selected_delta],
-            &[false],
-        )
-        .expect("explicit-author selected tombstone should stage");
+        let selected_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &[selected_delta], &[false])
+                .expect("explicit-author selected tombstone should stage");
         stage_fixture_manifest_with_author(
             &mut writes,
             checkpoint_commit,
@@ -26059,16 +26138,20 @@ mod tests {
         )
         .await
         .expect_err("history must reject an explicit author that conflicts with its source");
-        assert!(history_error.message.contains(
-            "selected tombstone author disagrees with canonical author authority"
-        ));
+        assert!(
+            history_error
+                .message
+                .contains("selected tombstone author disagrees with canonical author authority")
+        );
 
         let replay_error = scan_commit_delta_values(&read, checkpoint_commit, &[])
             .await
             .expect_err("point replay must validate explicit selected tombstone authors");
-        assert!(replay_error.message.contains(
-            "selected tombstone author disagrees with canonical author authority"
-        ));
+        assert!(
+            replay_error
+                .message
+                .contains("selected tombstone author disagrees with canonical author authority")
+        );
     }
 
     #[tokio::test]
@@ -26077,7 +26160,8 @@ mod tests {
         const TOMBSTONE_AUTHOR: &str = "identity-only-author";
 
         let storage = StorageAdapter::new(Memory::new());
-        let checkpoint_commit = CommitId::for_test_label("rootless-v83-identity-only-stale-projection");
+        let checkpoint_commit =
+            CommitId::for_test_label("rootless-v83-identity-only-stale-projection");
         let mut fixture = packed_commit_delta_fixtures().remove(1);
         fixture.schema_key = "test_schema".to_owned();
         fixture.row_pk = RowPk::single("rootless-v83-identity-only-row");
@@ -26095,12 +26179,9 @@ mod tests {
             delta.delta.author_id = TOMBSTONE_AUTHOR;
         }
         let mut writes = storage.new_write_set();
-        let selected_stage = super::stage_addressable_commit_deltas(
-            &mut writes,
-            &selected_deltas,
-            &[false, false],
-        )
-        .expect("identity-only selected tombstones should stage");
+        let selected_stage =
+            super::stage_addressable_commit_deltas(&mut writes, &selected_deltas, &[false, false])
+                .expect("identity-only selected tombstones should stage");
         stage_fixture_manifest_with_author(
             &mut writes,
             checkpoint_commit,
@@ -26186,14 +26267,18 @@ mod tests {
             .await
             .expect("point replay should preserve explicit identity without canonical source");
         assert_eq!(replay.len(), 2);
-        assert!(replay
-            .iter()
-            .all(|row| row.value().author_id == TOMBSTONE_AUTHOR));
+        assert!(
+            replay
+                .iter()
+                .all(|row| row.value().author_id == TOMBSTONE_AUTHOR)
+        );
 
-        assert!(super::load_local_selected_change_owner_commit_ids(&read, checkpoint_commit)
-            .await
-            .expect("GC should ignore the stale nonphysical projection")
-            .is_empty());
+        assert!(
+            super::load_local_selected_change_owner_commit_ids(&read, checkpoint_commit)
+                .await
+                .expect("GC should ignore the stale nonphysical projection")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -26235,8 +26320,8 @@ mod tests {
                 deleted: true,
                 created_at: timestamp,
                 updated_at: timestamp,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -26265,9 +26350,8 @@ mod tests {
         let mut checkpoint_inventory = checkpoint_stage.mutation_inventory().clone();
         let (_, sidecar) = super::split_commit_delta_segment(&checkpoint_inventory.inline_part)
             .expect("selected checkpoint segment should split");
-        let (leaf, _) =
-            decode_commit_delta_with_payloads(&checkpoint_inventory.inline_part, None)
-                .expect("selected checkpoint row should decode before legacy conversion");
+        let (leaf, _) = decode_commit_delta_with_payloads(&checkpoint_inventory.inline_part, None)
+            .expect("selected checkpoint row should decode before legacy conversion");
         let entry = leaf.entry(0).expect("one selected tombstone row");
         let value = decode_value(entry.value).expect("selected tombstone value should decode");
         assert_eq!(value.author_id, CHECKPOINT_ACCOUNT);
@@ -26310,18 +26394,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("v82 cascade read should open");
-        let mut owners = load_owned_commit_delta_entries(
-            &read,
-            &[(checkpoint_commit, semantic_key.clone())],
-        )
-        .await
-        .expect("selected tombstone owner should load");
+        let mut owners =
+            load_owned_commit_delta_entries(&read, &[(checkpoint_commit, semantic_key.clone())])
+                .await
+                .expect("selected tombstone owner should load");
         let owner = owners
             .pop()
             .flatten()
             .expect("selected tombstone should have an exact physical owner");
         assert!(owner.selected_tombstone);
-        assert!(!owner.author_present, "fixture should exercise v82 author absence");
+        assert!(
+            !owner.author_present,
+            "fixture should exercise v82 author absence"
+        );
         assert_eq!(owner.value.author_id, CHECKPOINT_ACCOUNT);
 
         let rows = vec![(semantic_key, owner.value.clone(), owner.author_present)];
@@ -26345,10 +26430,8 @@ mod tests {
         let commit_id = CommitId::for_test_label("complete-state-cascade-markers");
         let timestamp = LixTimestamp::from_unix_millis_utc_lossy(42);
         let file_marker_key = super::cascade_payload_key(FILE_ID);
-        let collection_marker_key = super::collection_cascade_payload_key(
-            "test_schema",
-            Some(FILE_ID),
-        );
+        let collection_marker_key =
+            super::collection_cascade_payload_key("test_schema", Some(FILE_ID));
         let fixtures = vec![
             CommitDeltaFixture {
                 schema_key: file_marker_key.schema_key.clone(),
@@ -26395,8 +26478,8 @@ mod tests {
             deleted: true,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(7),
             updated_at: timestamp,
-                    semantic_fingerprint: None,
-};
+            semantic_fingerprint: None,
+        };
         let collection_value = TrackedStateIndexValue {
             change_id: fixtures[1].change_id,
             ..file_value.clone()
@@ -26480,7 +26563,10 @@ mod tests {
             commit_id: parent_commit,
         };
         let tracked_state = crate::tracked_state::TrackedStateContext::new();
-        let mut read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
         let mut parent_writes = storage.new_write_set();
         crate::test_support::stage_tracked_root_from_materialized(
             &mut read,
@@ -26525,8 +26611,8 @@ mod tests {
                 deleted: true,
                 created_at: fixture.created_at,
                 updated_at: timestamp,
-                            semantic_fingerprint: None,
-},
+                semantic_fingerprint: None,
+            },
             metadata: None,
             snapshot: None,
             origin_key: None,
@@ -26557,8 +26643,8 @@ mod tests {
             deleted: true,
             created_at: fixture.created_at,
             updated_at: timestamp,
-                    semantic_fingerprint: None,
-});
+            semantic_fingerprint: None,
+        });
         let author_suffix_len = 2 + CHECKPOINT_ACCOUNT.len();
         let value_end = encoded_value.len() - author_suffix_len;
         let mut legacy_leaf = vec![5, 1, 0, 0, 0, u8::try_from(encoded_key.len()).unwrap()];
@@ -26604,9 +26690,12 @@ mod tests {
             first_parent_jump_span: 1,
             account_id: CHECKPOINT_ACCOUNT.to_owned(),
             created_at: timestamp,
-                    first_parent_checkpoint_summary: None,
-};
-        let mut read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+            first_parent_checkpoint_summary: None,
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
         let mut writer = crate::changelog::ChangelogContext::new().writer(&mut read, &mut writes);
         crate::changelog::ChangelogWriter::stage_append(
             &mut writer,
@@ -26864,10 +26953,7 @@ mod tests {
         // authenticated physical delta and canonical ChangeRecord retain the
         // child's original timestamp, so member hydration must reject this
         // root instead of accepting it by matching only the change id.
-        let stale_updated_at = LixTimestamp::expect_parse(
-            "updated_at",
-            "2026-01-03T00:00:00Z",
-        );
+        let stale_updated_at = LixTimestamp::expect_parse("updated_at", "2026-01-03T00:00:00Z");
         let encoded_key = encode_key_ref(TrackedStateKeyRef {
             schema_key: &deleted.schema_key,
             file_id: deleted.file_id.as_deref(),
@@ -26878,13 +26964,10 @@ mod tests {
             commit_id: child_id,
             author_id: &deleted.author_id,
             deleted: true,
-            created_at: LixTimestamp::expect_parse(
-                "created_at",
-                "2026-01-01T00:00:00Z",
-            ),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
             updated_at: stale_updated_at,
-                    semantic_fingerprint: None,
-});
+            semantic_fingerprint: None,
+        });
         // Leave the legacy author absent so this fixture reaches the
         // lifetime check rather than failing an unrelated explicit-author
         // comparison first.
@@ -27012,8 +27095,8 @@ mod tests {
             deleted: false,
             created_at: fixture.created_at,
             updated_at: fixture.updated_at,
-                    semantic_fingerprint: None,
-});
+            semantic_fingerprint: None,
+        });
         let decoded_value = decode_value(&encoded_value).expect("v83 fixture value should decode");
         let author_suffix_len = 2 + decoded_value.author_id.len();
         let legacy_value_end = encoded_value.len() - author_suffix_len;
@@ -27028,17 +27111,15 @@ mod tests {
             CommitStateMutationInventory::default(),
         );
         manifest.replay_debt = CommitStateReplayDebt::default();
-        manifest.snapshot_root = Some(Box::new(
-            TrackedStateCommitRoot {
-                commit_id: checkpoint_commit,
-                root_id: root_id.clone(),
-                parent_roots: Vec::new(),
-                changed_key_count: 1,
-                row_count_estimate: 1,
-                tree_height: 1,
-                complete_state_fence: true,
-            },
-        ));
+        manifest.snapshot_root = Some(Box::new(TrackedStateCommitRoot {
+            commit_id: checkpoint_commit,
+            root_id: root_id.clone(),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            complete_state_fence: true,
+        }));
         let mut writes = storage.new_write_set();
         writes.put(
             super::TRACKED_STATE_TREE_CHUNK_SPACE,
@@ -27118,16 +27199,10 @@ mod tests {
             commit_id: CommitId::for_test_label("missing-standalone-lifetime-owner"),
             author_id: &row.author_id,
             deleted: false,
-            created_at: LixTimestamp::expect_parse(
-                "created_at",
-                "2026-01-01T00:00:00Z",
-            ),
-            updated_at: LixTimestamp::expect_parse(
-                "updated_at",
-                "2026-01-03T00:00:00Z",
-            ),
-                    semantic_fingerprint: None,
-};
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-03T00:00:00Z"),
+            semantic_fingerprint: None,
+        };
         let encoded_key = encode_key_ref(TrackedStateKeyRef {
             schema_key: &row.schema_key,
             file_id: row.file_id.as_deref(),
@@ -27180,8 +27255,13 @@ mod tests {
         )
         .await
         .expect_err("standalone fallback must check canonical change lifetime");
-        assert!(error.message.contains("no authoritative live payload"), "{error:?}");
-        let details = error.details.expect("payload failure should expose safe diagnostics");
+        assert!(
+            error.message.contains("no authoritative live payload"),
+            "{error:?}"
+        );
+        let details = error
+            .details
+            .expect("payload failure should expose safe diagnostics");
         assert_eq!(details["payloadStandaloneStatus"], "absent");
         assert_eq!(details["payloadPhysicalStatus"], "lifetime_mismatch");
         assert_eq!(details["payloadSourceDeferred"], false);
@@ -28787,7 +28867,9 @@ mod tests {
                 .expect_err("a caller cannot publish an unverified semantic fingerprint")
                 .into_lix_error();
         assert!(
-            error.message.contains("semantic fingerprint disagrees with its payload"),
+            error
+                .message
+                .contains("semantic fingerprint disagrees with its payload"),
             "unexpected error: {error}"
         );
     }
@@ -29501,20 +29583,16 @@ mod tests {
             .await
             .expect("open bounded candidate read");
         let candidates = crate::tracked_state::scan_commit_delta_limit_candidate_row_pks(
-            &read,
-            commit_id,
-            "alpha",
-            8,
-            1,
+            &read, commit_id, "alpha", 8, 1,
         )
         .await
         .expect("bounded candidate scan should succeed")
         .expect("bounded directory should support candidate scan");
         assert_eq!(candidates.len(), 8);
         assert!(candidates.iter().all(|candidate| {
-            fixtures.iter().any(|fixture| {
-                fixture.schema_key == "alpha" && fixture.row_pk == *candidate
-            })
+            fixtures
+                .iter()
+                .any(|fixture| fixture.schema_key == "alpha" && fixture.row_pk == *candidate)
         }));
     }
 

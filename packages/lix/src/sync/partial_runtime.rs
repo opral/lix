@@ -478,7 +478,7 @@ pub(super) fn hydrate_demand_with_receipt<
     })
 }
 
-async fn hydrate_current_payload_after_history_fallback<
+async fn hydrate_current_payload_after_native_fallback<
     S: Storage + Clone + Send + Sync + 'static,
     C: RawHttpClient,
 >(
@@ -489,7 +489,7 @@ async fn hydrate_current_payload_after_history_fallback<
     locator: &NativeMetadataRef,
 ) -> Result<Option<HydratedInputs>, LixError> {
     let Some(current_request) =
-        super::read_fulfillment::current_payload_request_after_history_fallback(request, locator)
+        super::read_fulfillment::current_payload_request_after_native_fallback(request, locator)
     else {
         return Ok(None);
     };
@@ -504,7 +504,7 @@ async fn hydrate_current_payload_after_history_fallback<
     if response.outcome != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
         return Err(LixError::new(
             "LIX_READ_FULFILLMENT_INVALID",
-            "current payload recovery returned a History fallback",
+            "current payload recovery returned a read fallback",
         ));
     }
     super::read_fulfillment::install(storage, state, &current_request, &response)
@@ -547,41 +547,44 @@ fn hydrate_exact_demand_with_receipt<
                         super::read_fulfillment::ClientFailurePhase::Validation,
                     )
                 })?
-            && interests.iter().all(|interest| match interest {
-                crate::hot_state::LogicalReadInterest::History { branch_id, .. } => {
-                    branch_id == &state.descriptor().selected_branch.branch_id
-                }
-                _ => true,
-            })
+            && let Some(plan) = super::read_fulfillment::partial_demand_fulfillment_plan(
+                error,
+                &interests,
+                &state.descriptor().selected_branch.branch_id,
+            )
         {
             use super::read_fulfillment::ReadInputAddress;
             let selected_payload_locator =
                 super::read_fulfillment::selected_change_payload_locator(error);
-            let frontier = match &request {
-                SyncDemandRequest::NativeObject(address, _) => {
-                    vec![ReadInputAddress::Object(*address)]
+            let frontier = if let Some(locator) = &plan.selected_payload_locator {
+                vec![ReadInputAddress::Metadata(locator.clone())]
+            } else {
+                match &request {
+                    SyncDemandRequest::NativeObject(address, _) => {
+                        vec![ReadInputAddress::Object(*address)]
+                    }
+                    SyncDemandRequest::NativeObjects(addresses, _) => addresses
+                        .iter()
+                        .copied()
+                        .map(ReadInputAddress::Object)
+                        .collect(),
+                    SyncDemandRequest::NativeMetadata(addresses, _) => addresses
+                        .iter()
+                        .cloned()
+                        .map(ReadInputAddress::Metadata)
+                        .collect(),
+                    SyncDemandRequest::BlobManifest(blob, _) => {
+                        vec![ReadInputAddress::BlobManifest(*blob.as_bytes())]
+                    }
+                    SyncDemandRequest::ChunksWithRead(ids, _) => ids
+                        .iter()
+                        .map(|id| {
+                            crate::binary_cas::ChunkHash::from_hex(id)
+                                .map(|hash| ReadInputAddress::BlobChunk(*hash.as_bytes()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => unreachable!("only captured read errors carry operation recipes"),
                 }
-                SyncDemandRequest::NativeObjects(addresses, _) => addresses
-                    .iter()
-                    .copied()
-                    .map(ReadInputAddress::Object)
-                    .collect(),
-                SyncDemandRequest::NativeMetadata(addresses, _) => addresses
-                    .iter()
-                    .cloned()
-                    .map(ReadInputAddress::Metadata)
-                    .collect(),
-                SyncDemandRequest::BlobManifest(blob, _) => {
-                    vec![ReadInputAddress::BlobManifest(*blob.as_bytes())]
-                }
-                SyncDemandRequest::ChunksWithRead(ids, _) => ids
-                    .iter()
-                    .map(|id| {
-                        crate::binary_cas::ChunkHash::from_hex(id)
-                            .map(|hash| ReadInputAddress::BlobChunk(*hash.as_bytes()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => unreachable!("only captured read errors carry operation recipes"),
             };
             // A native frontier may also name inputs already present locally
             // (including locally derived immutable nodes). Only ask the
@@ -646,16 +649,22 @@ fn hydrate_exact_demand_with_receipt<
             let fulfillment = super::read_fulfillment::ReadFulfillmentRequest {
                 epoch_id: state.epoch_id().into(),
                 descriptor: state.descriptor().clone(),
-                interests,
+                interests: plan.interests,
                 required,
                 continuation: None,
             };
-            if super::read_fulfillment::history_recipe_is_ineligible(&fulfillment)? {
-                // This memo records only bounded-recipe ineligibility for the
-                // exact leased history basis. It grants no read coverage, so
-                // the original native-demand path below still runs.
+            // Off-lease current scopes can be legitimate local reads, but
+            // cannot be sent as selected-branch authority recipes. Decline
+            // this optional replay and leave the original native frontier in
+            // charge instead of turning request validation into a query error.
+            if fulfillment.validate(state.repository_id()).is_ok()
+                && super::read_fulfillment::request_closure_is_ineligible(&fulfillment)?
+            {
+                // A proof refusal is keyed by descriptor and bounded native
+                // recipes; an operation refusal is keyed by this full request.
+                // Neither grants coverage, so native hydration still runs.
                 if let Some(locator) = selected_payload_locator.as_ref()
-                    && let Some(hydrated) = hydrate_current_payload_after_history_fallback(
+                    && let Some(hydrated) = hydrate_current_payload_after_native_fallback(
                         storage,
                         state,
                         transport,
@@ -666,18 +675,19 @@ fn hydrate_exact_demand_with_receipt<
                 {
                     return Ok(hydrated);
                 }
-            } else {
+            } else if fulfillment.validate(state.repository_id()).is_ok() {
                 match super::read_fulfillment::fetch(transport, &fulfillment).await {
                     Ok(response) => {
                         if response.outcome
-                            == super::read_fulfillment::ReadFulfillmentOutcome::HistoryFallback
+                            != super::read_fulfillment::ReadFulfillmentOutcome::Complete
                         {
-                            super::read_fulfillment::remember_history_recipe_ineligible(
+                            super::read_fulfillment::remember_request_closure_ineligible(
                                 &fulfillment,
+                                response.outcome,
                             )?;
                             if let Some(locator) = selected_payload_locator.as_ref()
                                 && let Some(hydrated) =
-                                    hydrate_current_payload_after_history_fallback(
+                                    hydrate_current_payload_after_native_fallback(
                                         storage,
                                         state,
                                         transport,

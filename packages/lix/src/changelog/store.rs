@@ -280,6 +280,10 @@ mod tests {
             // deletion and replacement without altering the persisted index.
             ("sync/partial_sql_tests/publication.rs .delete(", 1),
             ("sync/partial_sql_tests/publication.rs .put(", 1),
+            // Test-only candidate prefetch fixture changes the account on an
+            // existing graph record to prove local overlay preservation. It
+            // does not introduce a commit identity or change index topology.
+            ("sync/read_fulfillment_candidate_tests.rs .put(", 1),
         ]
         .into_iter()
         .map(|(site, count)| (site.to_string(), count))

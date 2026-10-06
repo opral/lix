@@ -287,7 +287,7 @@ pub(crate) fn annotate_capture(
     let has_bounded_history = snapshot
         .interests
         .iter()
-        .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::History { .. }));
+        .any(|interest| is_bounded_native_recipe(interest.as_ref()));
     if error
         .details
         .as_ref()
@@ -300,13 +300,19 @@ pub(crate) fn annotate_capture(
     if snapshot.interests.is_empty() {
         return error;
     }
-    let has_diff = snapshot
-        .interests
-        .iter()
-        .any(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }));
+    let has_diff = snapshot.interests.iter().any(|interest| {
+        matches!(interest.as_ref(), LogicalReadInterest::Diff { .. })
+            && !super::working_diff_recipe::is_supported_working_diff_recipe(interest.as_ref())
+    });
     let history_over_budget =
         !history_recipes_within_budget(snapshot.interests.iter().map(|interest| interest.as_ref()));
-    let salvage_current_recipes = has_diff || history_over_budget;
+    let working_diff_over_budget = snapshot
+        .interests
+        .iter()
+        .filter(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }))
+        .count()
+        > super::working_diff_recipe::MAX_WORKING_DIFF_RECIPE_COUNT;
+    let salvage_current_recipes = has_diff || history_over_budget || working_diff_over_budget;
     if salvage_current_recipes && selected_change_payload_locator(&error).is_none() {
         // Historical diffs may name local pending commits. Their specialized
         // demand path owns those endpoints; over-budget History has the same
@@ -380,6 +386,100 @@ pub(crate) fn selected_change_payload_locator(error: &LixError) -> Option<Native
         return None;
     }
     Some(NativeMetadataRef::ChangeLocator(change_id.to_owned()))
+}
+
+/// Narrow opportunistic fulfillment recipes against the actual partial lease
+/// before any authority request is sent. Unsupported historical scopes stay
+/// on the native-demand path unless the native error independently identifies
+/// the selected live change payload; in that case only independent current
+/// recipes may accompany its canonical locator.
+pub(super) struct PartialDemandFulfillmentPlan {
+    pub(super) interests: Vec<LogicalReadInterest>,
+    /// Present only when unsupported historical recipes were removed under a
+    /// selected-payload diagnostic. That replay must require the locator alone.
+    pub(super) selected_payload_locator: Option<NativeMetadataRef>,
+}
+
+pub(super) fn partial_demand_fulfillment_plan(
+    error: &LixError,
+    interests: &[LogicalReadInterest],
+    selected_branch_id: &str,
+) -> Option<PartialDemandFulfillmentPlan> {
+    let history_shape_is_supported = |interest: &LogicalReadInterest| {
+        let LogicalReadInterest::History {
+            branch_id,
+            commit_ids,
+            relation,
+            filter,
+            retain_payloads,
+            projected_columns,
+            limit,
+        } = interest
+        else {
+            return true;
+        };
+        if branch_id != selected_branch_id
+            || limit.is_some()
+            || commit_ids.is_empty()
+            || commit_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS
+            || !matches!(relation.as_str(), "lix_file" | "lix_directory")
+        {
+            return false;
+        }
+        let mut seen = BTreeSet::new();
+        if commit_ids.iter().any(|id| {
+            canonical_commit_id(id).map_or(true, |parsed| {
+                !parsed.has_canonical_text(id) || !seen.insert(parsed)
+            })
+        }) {
+            return false;
+        }
+        crate::sql2::validate_bounded_history_recipe_shape(
+            relation,
+            filter,
+            projected_columns,
+            *retain_payloads,
+        )
+        .is_ok()
+    };
+    let working_diff_count = interests
+        .iter()
+        .filter(|interest| matches!(interest, LogicalReadInterest::Diff { .. }))
+        .count();
+    let historical_scope_is_unsupported = !history_recipes_within_budget(interests)
+        || working_diff_count > super::working_diff_recipe::MAX_WORKING_DIFF_RECIPE_COUNT
+        || interests.iter().any(|interest| match interest {
+            LogicalReadInterest::History { .. } => !history_shape_is_supported(interest),
+            LogicalReadInterest::Diff { .. } => {
+                !super::working_diff_recipe::validate_working_diff_recipes(
+                    std::slice::from_ref(interest),
+                    selected_branch_id,
+                )
+                .is_ok()
+            }
+            _ => false,
+        });
+    if !historical_scope_is_unsupported {
+        return Some(PartialDemandFulfillmentPlan {
+            interests: interests.to_vec(),
+            selected_payload_locator: None,
+        });
+    }
+    let selected_payload_locator = selected_change_payload_locator(error)?;
+    let current = interests
+        .iter()
+        .filter(|interest| {
+            !matches!(
+                interest,
+                LogicalReadInterest::History { .. } | LogicalReadInterest::Diff { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!current.is_empty()).then_some(PartialDemandFulfillmentPlan {
+        interests: current,
+        selected_payload_locator: Some(selected_payload_locator),
+    })
 }
 
 pub(super) fn interests_for_error(
@@ -477,73 +577,124 @@ pub(crate) struct ReadFulfillmentResponse {
     pub(crate) outcome: ReadFulfillmentOutcome,
 }
 
-/// A successful, authenticated indication that this exact leased basis is
-/// outside the bounded public-history closure. The client still performs its
-/// original native-demand read; this outcome carries no coverage.
+/// A successful, authenticated indication that bounded discovery declined.
+/// Neither refusal grants coverage; the client still performs its original
+/// native-demand read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReadFulfillmentOutcome {
     Complete,
-    HistoryFallback,
+    NativeFallback,
+    OperationFallback,
 }
 
-const MAX_HISTORY_FALLBACK_BASIS_MEMO: usize = 128;
-static HISTORY_FALLBACK_BASIS_MEMO: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+const MAX_REQUEST_REFUSAL_MEMO: usize = 128;
+static NATIVE_PROOF_REFUSAL_MEMO: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static OPERATION_REFUSAL_MEMO: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
-fn history_fallback_basis(request: &ReadFulfillmentRequest) -> Result<Option<String>, LixError> {
-    let history = request
-        .interests
-        .iter()
-        .filter(|interest| matches!(interest, LogicalReadInterest::History { .. }))
-        .collect::<Vec<_>>();
-    if history.is_empty() {
+fn is_bounded_native_recipe(interest: &LogicalReadInterest) -> bool {
+    matches!(interest, LogicalReadInterest::History { .. })
+        || super::working_diff_recipe::is_supported_working_diff_recipe(interest)
+}
+
+fn native_proof_refusal_basis(
+    request: &ReadFulfillmentRequest,
+) -> Result<Option<String>, LixError> {
+    if request.continuation.is_some() || !request.interests.iter().any(is_bounded_native_recipe) {
         return Ok(None);
     }
+    let native_recipes = request
+        .interests
+        .iter()
+        .filter(|interest| is_bounded_native_recipe(interest))
+        .collect::<Vec<_>>();
     let basis = serde_json::json!({
         "epochId": &request.epoch_id,
         "descriptor": &request.descriptor,
-        "history": history,
+        "nativeRecipes": native_recipes,
     });
     Ok(Some(
-        blake3::hash(&serde_json::to_vec(&basis).map_err(|_| invalid("invalid history basis"))?)
-            .to_hex()
-            .to_string(),
+        blake3::hash(
+            &serde_json::to_vec(&basis).map_err(|_| invalid("invalid native proof basis"))?,
+        )
+        .to_hex()
+        .to_string(),
     ))
 }
 
-pub(crate) fn history_recipe_is_ineligible(
-    request: &ReadFulfillmentRequest,
-) -> Result<bool, LixError> {
-    let Some(basis) = history_fallback_basis(request)? else {
-        return Ok(false);
-    };
-    let memo = HISTORY_FALLBACK_BASIS_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
-    Ok(memo
-        .lock()
-        .map_err(|_| invalid("history eligibility memo poisoned"))?
-        .contains(&basis))
+fn discovery_work_fallback_outcome(
+    error_code: &str,
+    observations_exhausted: bool,
+) -> ReadFulfillmentOutcome {
+    if !observations_exhausted
+        && matches!(
+            error_code,
+            "LIX_HISTORY_RECIPE_FALLBACK"
+                | super::working_diff_recipe::WORKING_DIFF_RECIPE_FALLBACK_CODE
+                | crate::tracked_state::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE
+        )
+    {
+        ReadFulfillmentOutcome::NativeFallback
+    } else {
+        ReadFulfillmentOutcome::OperationFallback
+    }
 }
 
-/// Build the narrow current-row recovery request after a History recipe has
-/// been proven ineligible for this leased basis. Only operation-local current
+fn operation_refusal_basis(request: &ReadFulfillmentRequest) -> Result<Option<String>, LixError> {
+    if request.continuation.is_some() || !request.interests.iter().any(is_bounded_native_recipe) {
+        return Ok(None);
+    }
+    // Discovery bounds include current recipes and explicitly required inputs.
+    // A declined operation must not poison a different closure.
+    Ok(Some(request.digest()?))
+}
+
+/// Whether native proof or an exact request operation was declined. These are
+/// work-avoidance memos, never evidence that a recipe is covered.
+pub(crate) fn request_closure_is_ineligible(
+    request: &ReadFulfillmentRequest,
+) -> Result<bool, LixError> {
+    let Some(operation_basis) = operation_refusal_basis(request)? else {
+        return Ok(false);
+    };
+    let operation_memo = OPERATION_REFUSAL_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
+    let operation_declined = operation_memo
+        .lock()
+        .map_err(|_| invalid("native recipe eligibility memo poisoned"))?
+        .contains(&operation_basis);
+    if operation_declined {
+        return Ok(true);
+    }
+    let Some(proof_basis) = native_proof_refusal_basis(request)? else {
+        return Ok(false);
+    };
+    let proof_memo = NATIVE_PROOF_REFUSAL_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
+    Ok(proof_memo
+        .lock()
+        .map_err(|_| invalid("native recipe eligibility memo poisoned"))?
+        .contains(&proof_basis))
+}
+
+/// Build the narrow current-row recovery request after bounded discovery has
+/// declined. Only operation-local current
 /// recipes remain, and the selected canonical locator is the sole required
 /// input; private historical frontiers are never forwarded to authority.
-pub(crate) fn current_payload_request_after_history_fallback(
+pub(crate) fn current_payload_request_after_native_fallback(
     request: &ReadFulfillmentRequest,
     locator: &NativeMetadataRef,
 ) -> Option<ReadFulfillmentRequest> {
     if !matches!(locator, NativeMetadataRef::ChangeLocator(_))
-        || !request
-            .interests
-            .iter()
-            .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+        || !request.interests.iter().any(is_bounded_native_recipe)
     {
         return None;
     }
     let mut current = request.clone();
-    current
-        .interests
-        .retain(|interest| !matches!(interest, LogicalReadInterest::History { .. }));
+    current.interests.retain(|interest| {
+        !matches!(
+            interest,
+            LogicalReadInterest::History { .. } | LogicalReadInterest::Diff { .. }
+        )
+    });
     if current.interests.is_empty() {
         return None;
     }
@@ -552,19 +703,33 @@ pub(crate) fn current_payload_request_after_history_fallback(
     Some(current)
 }
 
-pub(crate) fn remember_history_recipe_ineligible(
+pub(crate) fn remember_request_closure_ineligible(
     request: &ReadFulfillmentRequest,
+    outcome: ReadFulfillmentOutcome,
 ) -> Result<(), LixError> {
-    let Some(basis) = history_fallback_basis(request)? else {
+    let basis = match outcome {
+        ReadFulfillmentOutcome::NativeFallback => native_proof_refusal_basis(request)?,
+        ReadFulfillmentOutcome::OperationFallback => operation_refusal_basis(request)?,
+        ReadFulfillmentOutcome::Complete => None,
+    };
+    let Some(basis) = basis else {
         return Ok(());
     };
-    let memo = HISTORY_FALLBACK_BASIS_MEMO.get_or_init(|| Mutex::new(VecDeque::new()));
+    let memo = match outcome {
+        ReadFulfillmentOutcome::NativeFallback => {
+            NATIVE_PROOF_REFUSAL_MEMO.get_or_init(|| Mutex::new(VecDeque::new()))
+        }
+        ReadFulfillmentOutcome::OperationFallback => {
+            OPERATION_REFUSAL_MEMO.get_or_init(|| Mutex::new(VecDeque::new()))
+        }
+        ReadFulfillmentOutcome::Complete => return Ok(()),
+    };
     let mut memo = memo
         .lock()
-        .map_err(|_| invalid("history eligibility memo poisoned"))?;
+        .map_err(|_| invalid("native recipe eligibility memo poisoned"))?;
     memo.retain(|existing| existing != &basis);
     memo.push_back(basis);
-    while memo.len() > MAX_HISTORY_FALLBACK_BASIS_MEMO {
+    while memo.len() > MAX_REQUEST_REFUSAL_MEMO {
         memo.pop_front();
     }
     Ok(())
@@ -642,23 +807,16 @@ impl ReadFulfillmentRequest {
         {
             return Err(invalid("invalid read fulfillment request"));
         }
-        // Arbitrary diff endpoints may name private or unleased commits. Their
-        // specialized discovery protocol owns that scope; do not accept them
-        // merely because the foreground capture normally filters them out.
-        if self
-            .interests
-            .iter()
-            .any(|interest| matches!(interest, LogicalReadInterest::Diff { .. }))
-        {
-            return Err(invalid("historical diff recipes require history discovery"));
-        }
+        super::working_diff_recipe::validate_working_diff_recipes(
+            &self.interests,
+            &self.descriptor.selected_branch.branch_id,
+        )?;
         if !history_recipes_within_budget(&self.interests) {
             return Err(invalid("aggregate bounded-history recipe limit exceeded"));
         }
         for interest in &self.interests {
             if let LogicalReadInterest::History {
                 branch_id,
-                anchor,
                 commit_ids,
                 relation,
                 filter,
@@ -673,7 +831,6 @@ impl ReadFulfillmentRequest {
                     || commit_ids.is_empty()
                     || commit_ids.len() > crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS
                     || !matches!(relation.as_str(), "lix_file" | "lix_directory")
-                    || !canonical_commit_id(anchor)?.has_canonical_text(anchor)
                 {
                     return Err(invalid("invalid bounded history recipe scope"));
                 }
@@ -944,15 +1101,17 @@ fn append_receipt_input(
 struct Observations {
     values: BTreeMap<(StorageSpace, StorageKey), Bytes>,
     profile: DiscoveryProfile,
+    exhausted: bool,
 }
 impl Observations {
     fn charge_call(&mut self) -> Result<(), StorageError> {
-        self.profile.storage_calls += 1;
-        if self.profile.storage_calls > MAX_READ_CALLS {
+        if self.profile.storage_calls >= MAX_READ_CALLS {
+            self.exhausted = true;
             return Err(StorageError::Io(
                 "read discovery work limit exceeded".into(),
             ));
         }
+        self.profile.storage_calls += 1;
         Ok(())
     }
     fn observe(
@@ -966,6 +1125,7 @@ impl Observations {
         };
         self.profile.storage_bytes = self.profile.storage_bytes.saturating_add(bytes.len());
         if self.profile.storage_bytes > MAX_READ_BYTES {
+            self.exhausted = true;
             return Err(StorageError::Io(
                 "read discovery byte limit exceeded".into(),
             ));
@@ -976,6 +1136,7 @@ impl Observations {
         if !self.values.contains_key(&(space, key.clone())) {
             self.profile.payload_bytes = self.profile.payload_bytes.saturating_add(bytes.len());
             if self.profile.payload_bytes > MAX_PAYLOAD_BYTES || self.values.len() >= MAX_RECORDS {
+                self.exhausted = true;
                 return Err(StorageError::Io(
                     "read discovery payload limit exceeded".into(),
                 ));
@@ -1224,6 +1385,91 @@ async fn discover_with_read(
     request: &ReadFulfillmentRequest,
     hot: crate::hot_state::HotStateContext,
 ) -> Result<ReadFulfillmentResponse, LixError> {
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let result = discover_bounded_with_read(
+        base,
+        repository,
+        account,
+        lease_id,
+        request,
+        hot,
+        observations.clone(),
+    )
+    .await;
+    let (exhausted, profile) = {
+        let observations = observations
+            .lock()
+            .map_err(|_| invalid("dependency observations poisoned"))?;
+        (observations.exhausted, observations.profile.clone())
+    };
+    match result {
+        Err(error)
+            if request.continuation.is_none()
+                && request.interests.iter().any(is_bounded_native_recipe)
+                && (exhausted
+                    || error.code == "LIX_NATIVE_RECIPE_WORK_BOUND"
+                    || error.code == crate::tracked_state::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE) =>
+        {
+            let outcome = discovery_work_fallback_outcome(&error.code, exhausted);
+            fallback_response(repository, request, outcome, profile)
+        }
+        result => result,
+    }
+}
+
+fn fallback_response(
+    repository: &str,
+    request: &ReadFulfillmentRequest,
+    outcome: ReadFulfillmentOutcome,
+    profile: DiscoveryProfile,
+) -> Result<ReadFulfillmentResponse, LixError> {
+    if !matches!(
+        outcome,
+        ReadFulfillmentOutcome::NativeFallback | ReadFulfillmentOutcome::OperationFallback
+    ) {
+        return Err(invalid("invalid read fulfillment fallback outcome"));
+    }
+    if request.continuation.is_some() {
+        return Err(invalid(
+            "fallback is unavailable for paged read fulfillment",
+        ));
+    }
+    let inputs = Vec::new();
+    Ok(ReadFulfillmentResponse {
+        lix_id: repository.into(),
+        epoch_id: request.epoch_id.clone(),
+        request_digest: request.digest()?,
+        closure_digest: input_digest(request, &inputs)?,
+        inputs,
+        profile,
+        continuation: None,
+        outcome,
+    })
+}
+
+#[cfg(test)]
+fn native_fallback_response(
+    repository: &str,
+    request: &ReadFulfillmentRequest,
+    profile: DiscoveryProfile,
+) -> Result<ReadFulfillmentResponse, LixError> {
+    fallback_response(
+        repository,
+        request,
+        ReadFulfillmentOutcome::NativeFallback,
+        profile,
+    )
+}
+
+async fn discover_bounded_with_read(
+    base: RecipeRead,
+    repository: &str,
+    account: &str,
+    lease_id: &str,
+    request: &ReadFulfillmentRequest,
+    hot: crate::hot_state::HotStateContext,
+    observations: Arc<Mutex<Observations>>,
+) -> Result<ReadFulfillmentResponse, LixError> {
     request.validate(repository)?;
     let lease = crate::gc::require_native_baseline_lease(
         &base,
@@ -1236,7 +1482,6 @@ async fn discover_with_read(
         account,
         &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
     )?;
-    let observations = Arc::new(Mutex::new(Observations::default()));
     let read = DependencyRead {
         base,
         observations: observations.clone(),
@@ -1390,22 +1635,21 @@ async fn discover_with_read(
         {
             Ok(inputs) => inputs,
             Err(error)
-                if error.code == "LIX_HISTORY_RECIPE_FALLBACK"
-                    && request.interests.iter().any(|interest| {
-                        matches!(interest, LogicalReadInterest::History { .. })
-                    }) =>
+                if matches!(
+                    error.code.as_str(),
+                    "LIX_HISTORY_RECIPE_FALLBACK"
+                        | super::working_diff_recipe::WORKING_DIFF_RECIPE_FALLBACK_CODE
+                        | crate::tracked_state::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE
+                ) && request.interests.iter().any(is_bounded_native_recipe) =>
             {
-                let inputs = Vec::new();
-                return Ok(ReadFulfillmentResponse {
-                    lix_id: repository.into(),
-                    epoch_id: request.epoch_id.clone(),
-                    request_digest: request.digest()?,
-                    closure_digest: input_digest(request, &inputs)?,
-                    inputs,
-                    profile: DiscoveryProfile::default(),
-                    continuation: None,
-                    outcome: ReadFulfillmentOutcome::HistoryFallback,
-                });
+                let (exhausted, profile) = {
+                    let observations = observations
+                        .lock()
+                        .map_err(|_| invalid("dependency observations poisoned"))?;
+                    (observations.exhausted, observations.profile.clone())
+                };
+                let outcome = discovery_work_fallback_outcome(&error.code, exhausted);
+                return fallback_response(repository, request, outcome, profile);
             }
             Err(error) => return Err(error),
         };
@@ -1472,7 +1716,10 @@ async fn discover_with_read(
     }
     let native_bytes = inputs.iter().map(|input| input.bytes.len()).sum::<usize>();
     if native_bytes > MAX_PAYLOAD_BYTES || inputs.len() > MAX_RECORDS {
-        return Err(invalid("native discovery payload limit exceeded"));
+        return Err(LixError::new(
+            "LIX_NATIVE_RECIPE_WORK_BOUND",
+            "native discovery payload limit exceeded",
+        ));
     }
     inputs.extend(
         export_blob_inputs(
@@ -1568,17 +1815,14 @@ pub(crate) fn validate_response(
             "read fulfillment belongs to another request or exceeds its bound",
         ));
     }
-    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
-        if !request
-            .interests
-            .iter()
-            .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+    if response.outcome != ReadFulfillmentOutcome::Complete {
+        if !request.interests.iter().any(is_bounded_native_recipe)
             || request.continuation.is_some()
             || !response.inputs.is_empty()
             || response.continuation.is_some()
             || input_digest(request, &response.inputs)? != response.closure_digest
         {
-            return Err(invalid("invalid bounded-history fallback page"));
+            return Err(invalid("invalid bounded-native fallback page"));
         }
         return Ok(());
     }
@@ -2371,17 +2615,14 @@ fn validate_complete(
             "read fulfillment closure is incomplete or mismatched",
         ));
     }
-    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
+    if response.outcome != ReadFulfillmentOutcome::Complete {
         if request.continuation.is_none()
             && response.inputs.is_empty()
-            && request
-                .interests
-                .iter()
-                .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+            && request.interests.iter().any(is_bounded_native_recipe)
         {
             return Ok(());
         }
-        return Err(invalid("invalid bounded-history fallback response"));
+        return Err(invalid("invalid bounded-native fallback response"));
     }
     let mut bytes = 0usize;
     let mut seen = BTreeSet::new();
@@ -2505,7 +2746,7 @@ pub(super) async fn fetch<C: super::http::RawHttpClient>(
 ) -> Result<ReadFulfillmentResponse, LixError> {
     let mut page_request = request.clone();
     let mut response = transport.fulfill_read(&page_request).await?;
-    if response.outcome == ReadFulfillmentOutcome::HistoryFallback {
+    if response.outcome != ReadFulfillmentOutcome::Complete {
         validate_complete(request, &response)?;
         return Ok(response);
     }
@@ -2549,13 +2790,105 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
 ) -> Result<super::runtime::HydratedInputs, LixError> {
     if response.outcome != ReadFulfillmentOutcome::Complete {
         return Err(invalid(
-            "bounded-history fallback cannot be installed as read coverage",
+            "bounded-native fallback cannot be installed as read coverage",
         ));
     }
     validate_complete(request, response)?;
     if request.epoch_id != state.epoch_id() || request.descriptor != *state.descriptor() {
         return Err(invalid("read fulfillment basis changed"));
     }
+    install_inputs(storage, state, request, response, false).await
+}
+
+/// Warm a moving working-diff candidate's dependency closure without publishing
+/// candidate admission or serving state. Absent validated metadata may be
+/// seeded; resident mutable overlays are retained by the shared CAS installer.
+pub(super) async fn install_candidate_immutable<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    previous: &PartialReplicaState,
+    next: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+    response: &ReadFulfillmentResponse,
+) -> Result<(), LixError> {
+    validate_candidate_immutable_basis(previous, next, request, response)?;
+    install_inputs(storage, previous, request, response, true)
+        .await
+        .map(|_| ())
+}
+
+fn validate_candidate_immutable_basis(
+    previous: &PartialReplicaState,
+    next: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+    response: &ReadFulfillmentResponse,
+) -> Result<(), LixError> {
+    let previous_descriptor = previous.descriptor();
+    let next_descriptor = next.descriptor();
+    if previous.repository_id() != next.repository_id()
+        || previous.remote_id() != next.remote_id()
+        || previous.active_account_id() != next.active_account_id()
+        || previous.epoch_id() != next.epoch_id()
+        || previous_descriptor.default_branch_id != next_descriptor.default_branch_id
+        || previous_descriptor.selected_branch.branch_id
+            != next_descriptor.selected_branch.branch_id
+        || previous_descriptor.global_branch.branch_id != next_descriptor.global_branch.branch_id
+        || next_descriptor.cursor < previous_descriptor.cursor
+    {
+        return Err(invalid(
+            "working-diff candidate changed its admission identity",
+        ));
+    }
+    next_descriptor.validate(
+        next.repository_id(),
+        Some(&next_descriptor.selected_branch.branch_id),
+    )?;
+    if request.epoch_id != next.epoch_id()
+        || request.descriptor != *next_descriptor
+        || request.continuation.is_some()
+        || request.interests.is_empty()
+        || request
+            .interests
+            .iter()
+            .any(|interest| !matches!(interest, LogicalReadInterest::Diff { .. }))
+    {
+        return Err(invalid(
+            "candidate request is outside the working-diff basis",
+        ));
+    }
+    super::working_diff_recipe::validate_working_diff_recipes(
+        &request.interests,
+        &next_descriptor.selected_branch.branch_id,
+    )?;
+    let head_header = ReadInputAddress::Metadata(NativeMetadataRef::CommitStateHeader(
+        next_descriptor.selected_branch.head.commit_id.clone(),
+    ));
+    if request.required.len() != 1 || request.required.first() != Some(&head_header) {
+        return Err(invalid(
+            "candidate request must require the exact next selected-head header",
+        ));
+    }
+    if response
+        .inputs
+        .iter()
+        .any(|input| matches!(input.address, ReadInputAddress::ChangeRecord { .. }))
+    {
+        return Err(invalid(
+            "candidate immutable closure cannot contain change records",
+        ));
+    }
+    if response.outcome != ReadFulfillmentOutcome::Complete {
+        return Err(invalid("candidate immutable closure is not complete"));
+    }
+    validate_complete(request, response)
+}
+
+async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+    response: &ReadFulfillmentResponse,
+    immutable_only: bool,
+) -> Result<super::runtime::HydratedInputs, LixError> {
     let payload_change_ids = response
         .inputs
         .iter()
@@ -2670,6 +3003,18 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
         let mut manifests = Vec::new();
         let mut chunks = Vec::new();
         for input in &response.inputs {
+            // The candidate closure may seed absent mutable-key metadata for
+            // later evaluation, but it must never select or replace a local
+            // overlay. Required mutable inputs are outside this route; the
+            // ordinary candidate evaluator remains the authority for them.
+            if immutable_only
+                && preserves_local_mutable_native_overlay(&input.address)
+                && request.required.contains(&input.address)
+            {
+                return Err(invalid(
+                    "candidate immutable closure cannot require a mutable overlay",
+                ));
+            }
             if let Some(owner) = owner_commit_id(&input.address)
                 && let Some(authority) = local_owner_authorities.get(&owner)
             {
@@ -2984,7 +3329,10 @@ impl BlobReadCapture {
             .lock()
             .map_err(|_| invalid("blob read capture poisoned"))?;
         if requests.len() >= 4096 && !requests.contains_key(&blob) {
-            return Err(invalid("blob discovery count limit exceeded"));
+            return Err(LixError::new(
+                "LIX_NATIVE_RECIPE_WORK_BOUND",
+                "blob discovery count limit exceeded",
+            ));
         }
         let selection = requests.entry(blob).or_default();
         selection.full |= full;
@@ -2994,7 +3342,10 @@ impl BlobReadCapture {
             && !selection.ranges.contains(&range)
         {
             if selection.ranges.len() >= 4096 {
-                return Err(invalid("blob range count limit exceeded"));
+                return Err(LixError::new(
+                    "LIX_NATIVE_RECIPE_WORK_BOUND",
+                    "blob range count limit exceeded",
+                ));
             }
             selection.ranges.push(range);
         }
@@ -3097,7 +3448,10 @@ async fn export_blob_inputs(
         let bytes = serde_json::to_vec(&wire).map_err(|_| invalid("invalid canonical manifest"))?;
         payload_bytes = payload_bytes.saturating_add(bytes.len());
         if payload_bytes > remaining_bytes || inputs.len() >= remaining_records {
-            return Err(invalid("blob discovery payload limit exceeded"));
+            return Err(LixError::new(
+                "LIX_NATIVE_RECIPE_WORK_BOUND",
+                "blob discovery payload limit exceeded",
+            ));
         }
         inputs.push(ReadInput {
             address: ReadInputAddress::BlobManifest(*blob.as_bytes()),
@@ -3124,7 +3478,10 @@ async fn export_blob_inputs(
                 if selected.contains(&chunk.receipt.hash) && chunks.insert(chunk.receipt.hash) {
                     payload_bytes = payload_bytes.saturating_add(chunk.bytes.len());
                     if payload_bytes > remaining_bytes || inputs.len() >= remaining_records {
-                        return Err(invalid("blob discovery payload limit exceeded"));
+                        return Err(LixError::new(
+                            "LIX_NATIVE_RECIPE_WORK_BOUND",
+                            "blob discovery payload limit exceeded",
+                        ));
                     }
                     inputs.push(ReadInput {
                         address: ReadInputAddress::BlobChunk(*chunk.receipt.hash.as_bytes()),
@@ -3176,12 +3533,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_history_fallback_is_typed_and_memoized_only_for_its_basis() {
+    async fn native_proof_fallback_is_typed_and_reused_across_frontiers() {
         let (mut request, _) = fixture().await;
         let branch = &request.descriptor.selected_branch;
         request.interests = vec![LogicalReadInterest::History {
             branch_id: branch.branch_id.clone(),
-            anchor: branch.head.commit_id.clone(),
             commit_ids: vec![branch.head.commit_id.clone()],
             relation: "lix_file".into(),
             filter: crate::tracked_state::TrackedStateFilter {
@@ -3204,13 +3560,14 @@ mod tests {
             inputs: empty,
             profile: Default::default(),
             continuation: None,
-            outcome: ReadFulfillmentOutcome::HistoryFallback,
+            outcome: ReadFulfillmentOutcome::NativeFallback,
         };
         validate_complete(&request, &response).unwrap();
         validate_response(&request, &response).unwrap();
-        assert!(!history_recipe_is_ineligible(&request).unwrap());
-        remember_history_recipe_ineligible(&request).unwrap();
-        assert!(history_recipe_is_ineligible(&request).unwrap());
+        assert!(!request_closure_is_ineligible(&request).unwrap());
+        remember_request_closure_ineligible(&request, ReadFulfillmentOutcome::NativeFallback)
+            .unwrap();
+        assert!(request_closure_is_ineligible(&request).unwrap());
 
         let mut same_recipe_different_frontier = request.clone();
         same_recipe_different_frontier
@@ -3220,11 +3577,11 @@ mod tests {
                     request.descriptor.selected_branch.head.commit_id.clone(),
                 ),
             ));
-        assert!(history_recipe_is_ineligible(&same_recipe_different_frontier).unwrap());
+        assert!(request_closure_is_ineligible(&same_recipe_different_frontier).unwrap());
 
         let mut changed_basis = request.clone();
         changed_basis.descriptor.cursor += 1;
-        assert!(!history_recipe_is_ineligible(&changed_basis).unwrap());
+        assert!(!request_closure_is_ineligible(&changed_basis).unwrap());
 
         let current_interest = LogicalReadInterest::FilesystemMetadata {
             directory: false,
@@ -3237,7 +3594,7 @@ mod tests {
         let locator = NativeMetadataRef::ChangeLocator(uuid::Uuid::now_v7().to_string());
         let mut mixed = request.clone();
         mixed.interests.push(current_interest.clone());
-        let current_only = current_payload_request_after_history_fallback(&mixed, &locator)
+        let current_only = current_payload_request_after_native_fallback(&mixed, &locator)
             .expect("current recipe remains eligible after private History fallback");
         assert_eq!(current_only.descriptor, mixed.descriptor);
         assert_eq!(current_only.epoch_id, mixed.epoch_id);
@@ -3247,7 +3604,7 @@ mod tests {
             vec![ReadInputAddress::Metadata(locator.clone())]
         );
         assert!(current_only.continuation.is_none());
-        assert!(current_payload_request_after_history_fallback(&request, &locator).is_none());
+        assert!(current_payload_request_after_native_fallback(&request, &locator).is_none());
 
         response.inputs.push(ReadInput {
             address: ReadInputAddress::BlobChunk([7; 32]),
@@ -3265,6 +3622,20 @@ mod tests {
         assert!(validate_complete(&request, &response).is_err());
         assert!(validate_response(&request, &response).is_err());
         response.continuation = None;
+        let mut constructor_paged_request = request.clone();
+        constructor_paged_request.continuation = Some(ReadContinuation {
+            next_input: 1,
+            closure_digest: response.closure_digest.clone(),
+        });
+        assert!(
+            native_fallback_response(
+                &constructor_paged_request.descriptor.lix_id,
+                &constructor_paged_request,
+                DiscoveryProfile::default(),
+            )
+            .is_err()
+        );
+
         let mut paged_request = request.clone();
         paged_request.continuation = Some(ReadContinuation {
             next_input: 1,
@@ -3282,7 +3653,7 @@ mod tests {
             root_directory: false,
             path_predicate: crate::hot_state::FilePathInterest::All,
         }];
-        let non_history_fallback = ReadFulfillmentResponse {
+        let non_native_fallback = ReadFulfillmentResponse {
             lix_id: non_history_request.descriptor.lix_id.clone(),
             epoch_id: non_history_request.epoch_id.clone(),
             request_digest: non_history_request.digest().unwrap(),
@@ -3290,9 +3661,9 @@ mod tests {
             inputs: Vec::new(),
             profile: Default::default(),
             continuation: None,
-            outcome: ReadFulfillmentOutcome::HistoryFallback,
+            outcome: ReadFulfillmentOutcome::NativeFallback,
         };
-        assert!(validate_response(&non_history_request, &non_history_fallback).is_err());
+        assert!(validate_response(&non_history_request, &non_native_fallback).is_err());
     }
 
     #[test]
@@ -4129,33 +4500,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fulfillment_rejects_fixed_history_endpoints_outside_its_recipe_scope() {
+    async fn operation_fallback_is_exact_and_working_diff_proof_fallback_is_basis_bound() {
         let (mut request, _) = fixture().await;
         request.interests = vec![LogicalReadInterest::Diff {
             branch_id: Some(request.descriptor.selected_branch.branch_id.clone()),
-            relation: "lix_state_diff".into(),
+            relation: "lix_file".into(),
+            from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec![],
+            limit: None,
+        }];
+        request.validate(&request.descriptor.lix_id).unwrap();
+        let identity_budget = crate::tracked_state::NativeDiffIdentityBudget::new(0);
+        let identity_error = identity_budget
+            .charge(0)
+            .expect_err("native identity budget refusal has a distinct source code");
+        assert_eq!(
+            identity_error.code,
+            crate::tracked_state::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE
+        );
+        assert_ne!(
+            identity_error.code, "LIX_NATIVE_RECIPE_WORK_BOUND",
+            "payload/blob operation work limits must retain exact-request memo scope"
+        );
+        let identity_outcome = discovery_work_fallback_outcome(&identity_error.code, false);
+        assert_eq!(identity_outcome, ReadFulfillmentOutcome::NativeFallback);
+        assert_eq!(
+            discovery_work_fallback_outcome("LIX_NATIVE_RECIPE_WORK_BOUND", false),
+            ReadFulfillmentOutcome::OperationFallback
+        );
+        assert_eq!(
+            discovery_work_fallback_outcome(&identity_error.code, true),
+            ReadFulfillmentOutcome::OperationFallback,
+            "a global observation cap takes exact-operation memo scope even if native work also refused"
+        );
+        let response = native_fallback_response(
+            &request.descriptor.lix_id,
+            &request,
+            DiscoveryProfile {
+                storage_calls: 9,
+                storage_bytes: 1_234,
+                payload_bytes: 678,
+            },
+        )
+        .unwrap();
+        validate_response(&request, &response).unwrap();
+        validate_complete(&request, &response).unwrap();
+        assert!(response.inputs.is_empty());
+        assert_eq!(response.profile.storage_calls, 9);
+        assert_eq!(response.profile.storage_bytes, 1_234);
+        assert_eq!(response.profile.payload_bytes, 678);
+
+        let mut new_frontier = request.clone();
+        new_frontier.required = vec![ReadInputAddress::Metadata(
+            NativeMetadataRef::CommitStateHeader(
+                request.descriptor.selected_branch.head.commit_id.clone(),
+            ),
+        )];
+        remember_request_closure_ineligible(&request, identity_outcome).unwrap();
+        assert!(request_closure_is_ineligible(&new_frontier).unwrap());
+        let mut mixed_native_proof = new_frontier.clone();
+        mixed_native_proof
+            .interests
+            .push(LogicalReadInterest::FilesystemMetadata {
+                directory: false,
+                branch_ids: vec![request.descriptor.selected_branch.branch_id.clone()],
+                file_ids: None,
+                directory_ids: None,
+                root_directory: false,
+                path_predicate: crate::hot_state::FilePathInterest::All,
+            });
+        assert!(request_closure_is_ineligible(&mixed_native_proof).unwrap());
+
+        let mut operation = request.clone();
+        operation.epoch_id = uuid::Uuid::now_v7().to_string();
+        let mut mixed = operation.clone();
+        mixed
+            .interests
+            .push(LogicalReadInterest::FilesystemMetadata {
+                directory: false,
+                branch_ids: vec![request.descriptor.selected_branch.branch_id.clone()],
+                file_ids: None,
+                directory_ids: None,
+                root_directory: false,
+                path_predicate: crate::hot_state::FilePathInterest::All,
+            });
+        operation.interests = mixed.interests.clone();
+        let operation_outcome = discovery_work_fallback_outcome(&identity_error.code, true);
+        assert_eq!(operation_outcome, ReadFulfillmentOutcome::OperationFallback);
+        let refused = fallback_response(
+            &operation.descriptor.lix_id,
+            &operation,
+            operation_outcome,
+            DiscoveryProfile {
+                storage_calls: MAX_READ_CALLS,
+                storage_bytes: MAX_READ_BYTES + 1,
+                payload_bytes: MAX_PAYLOAD_BYTES + 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(refused.outcome, ReadFulfillmentOutcome::OperationFallback);
+        assert!(refused.inputs.is_empty());
+        assert_eq!(refused.profile.storage_calls, MAX_READ_CALLS);
+        assert_eq!(refused.profile.storage_bytes, MAX_READ_BYTES + 1);
+        assert_eq!(refused.profile.payload_bytes, MAX_PAYLOAD_BYTES + 2);
+        validate_response(&operation, &refused).unwrap();
+        validate_complete(&operation, &refused).unwrap();
+        remember_request_closure_ineligible(&operation, ReadFulfillmentOutcome::OperationFallback)
+            .unwrap();
+        assert!(request_closure_is_ineligible(&operation).unwrap());
+        let mut narrower = operation.clone();
+        narrower.interests = request.interests.clone();
+        assert!(
+            !request_closure_is_ineligible(&narrower).unwrap(),
+            "a mixed operation refusal must not poison a narrower native proof request"
+        );
+        let mut changed_frontier = operation.clone();
+        changed_frontier.required.push(ReadInputAddress::Metadata(
+            NativeMetadataRef::CommitGraphRecord(
+                request.descriptor.selected_branch.head.commit_id.clone(),
+            ),
+        ));
+        assert!(
+            !request_closure_is_ineligible(&changed_frontier).unwrap(),
+            "operation work refusal is scoped to the exact required frontier"
+        );
+
+        let mut changed = request.clone();
+        changed.epoch_id = uuid::Uuid::now_v7().to_string();
+        assert!(!request_closure_is_ineligible(&changed).unwrap());
+        assert!(validate_complete(&changed, &response).is_err());
+        request.continuation = Some(ReadContinuation {
+            next_input: 1,
+            closure_digest: response.closure_digest.clone(),
+        });
+        assert!(validate_complete(&request, &response).is_err());
+    }
+
+    #[tokio::test]
+    async fn fulfillment_rejects_fixed_history_endpoints_outside_its_recipe_scope() {
+        let (mut request, _) = fixture().await;
+        request.required = vec![ReadInputAddress::Metadata(
+            NativeMetadataRef::CommitStateHeader(
+                request.descriptor.selected_branch.head.commit_id.clone(),
+            ),
+        )];
+        request.interests = vec![LogicalReadInterest::Diff {
+            branch_id: Some(request.descriptor.selected_branch.branch_id.clone()),
+            relation: "lix_file".into(),
             from: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
             to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
             filter: crate::tracked_state::TrackedStateFilter {
                 include_tombstones: true,
                 ..Default::default()
             },
-            retain_payloads: true,
-            projected_columns: vec![],
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
             limit: None,
         }];
         let error = request.validate(&request.descriptor.lix_id).unwrap_err();
-        assert!(error.to_string().contains("historical diff recipes"));
+        assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+        let LogicalReadInterest::Diff { from, .. } = &mut request.interests[0] else {
+            unreachable!();
+        };
+        *from = crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint;
+        request.validate(&request.descriptor.lix_id).unwrap();
     }
 
     #[tokio::test]
     async fn fulfillment_accepts_only_bounded_leased_history_recipes() {
         let (mut request, _) = fixture().await;
         let selected_branch = request.descriptor.selected_branch.branch_id.clone();
-        let anchor = request.descriptor.selected_branch.head.commit_id.clone();
         let recipe = || LogicalReadInterest::History {
             branch_id: selected_branch.clone(),
-            anchor: anchor.clone(),
             commit_ids: vec![uuid::Uuid::now_v7().to_string()],
             relation: "lix_file".into(),
             filter: crate::tracked_state::TrackedStateFilter {
@@ -4169,6 +4691,15 @@ mod tests {
 
         request.interests = vec![recipe()];
         request.validate(&request.descriptor.lix_id).unwrap();
+
+        let mut full_page = request.clone();
+        let LogicalReadInterest::History { commit_ids, .. } = &mut full_page.interests[0] else {
+            unreachable!();
+        };
+        *commit_ids = (0..crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS)
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect();
+        full_page.validate(&full_page.descriptor.lix_id).unwrap();
 
         let mut too_many_recipes = request.clone();
         too_many_recipes.interests = (0..=crate::hot_state::MAX_HISTORY_RECIPE_COUNT)
@@ -4208,7 +4739,9 @@ mod tests {
         let LogicalReadInterest::History { commit_ids, .. } = &mut invalid.interests[0] else {
             unreachable!();
         };
-        *commit_ids = (0..17).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+        *commit_ids = (0..=crate::hot_state::MAX_HISTORY_RECIPE_COMMIT_IDS)
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect();
         assert!(invalid.validate(&invalid.descriptor.lix_id).is_err());
 
         let mut invalid = request.clone();
@@ -4491,7 +5024,6 @@ mod tests {
     fn overbudget_history_capture_keeps_the_original_native_demand() {
         let make_history = || LogicalReadInterest::History {
             branch_id: "branch".into(),
-            anchor: uuid::Uuid::now_v7().to_string(),
             commit_ids: vec![uuid::Uuid::now_v7().to_string()],
             relation: "lix_file".into(),
             filter: crate::tracked_state::TrackedStateFilter {
@@ -4543,7 +5075,6 @@ mod tests {
             capture
                 .register(LogicalReadInterest::History {
                     branch_id: "branch".into(),
-                    anchor: uuid::Uuid::now_v7().to_string(),
                     commit_ids: vec![uuid::Uuid::now_v7().to_string()],
                     relation: "lix_file".into(),
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -4608,12 +5139,8 @@ mod tests {
         let diff = || LogicalReadInterest::Diff {
             branch_id: Some("branch".into()),
             relation: "lix_key_value".into(),
-            from: crate::hot_state::DiffInterestEndpoint::Fixed(
-                uuid::Uuid::now_v7().to_string(),
-            ),
-            to: crate::hot_state::DiffInterestEndpoint::Fixed(
-                uuid::Uuid::now_v7().to_string(),
-            ),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
+            to: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
             filter: crate::tracked_state::TrackedStateFilter::default(),
             retain_payloads: false,
             projected_columns: vec!["key".into()],
@@ -4640,19 +5167,194 @@ mod tests {
             .expect("current recipe should survive a selected payload miss");
         assert_eq!(interests.len(), 1);
         assert!(matches!(interests[0], LogicalReadInterest::Scan { .. }));
-        assert!(annotated
-            .details
-            .as_ref()
-            .is_some_and(|details| details.get("nativeHistoryDemand").is_some()));
+        assert!(
+            annotated
+                .details
+                .as_ref()
+                .is_some_and(|details| details.get("nativeHistoryDemand").is_some())
+        );
 
         let diff_only = ReadInterestRegistry::new(8, 16 * 1024);
         diff_only.register(diff()).unwrap();
         let annotated = annotate_capture(missing_payload(), Some(&diff_only));
-        assert!(annotated
-            .details
-            .as_ref()
-            .is_none_or(|details| details.get(MARKER).is_none()));
+        assert!(
+            annotated
+                .details
+                .as_ref()
+                .is_none_or(|details| details.get(MARKER).is_none())
+        );
         assert!(interests_for_error(&annotated).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_demand_narrowing_declines_unrelated_diff_or_uses_locator_only() {
+        let selected_branch = "00000000-0000-7000-8000-000000000123";
+        let global_branch = crate::GLOBAL_BRANCH_ID;
+        let working_diff = |branch_id: &str| LogicalReadInterest::Diff {
+            branch_id: Some(branch_id.to_owned()),
+            relation: "lix_file".into(),
+            from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+        let current = LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![selected_branch.to_owned()],
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        };
+        let interests = vec![
+            working_diff(selected_branch),
+            working_diff(global_branch),
+            current.clone(),
+        ];
+        let native_miss =
+            || LixError::new(LixError::CODE_INTERNAL_ERROR, "missing native diff input");
+        assert!(
+            partial_demand_fulfillment_plan(&native_miss(), &interests, selected_branch,).is_none(),
+            "off-lease Diff must stay on the original native path"
+        );
+
+        let change_id = "00000000-0000-7000-8000-000000000456";
+        let selected_payload_miss = LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected change payload is unavailable",
+        )
+        .with_details(serde_json::json!({
+            "payloadFailureReason": "selected_change_payload_unavailable",
+            "changeId": change_id,
+        }));
+        let plan =
+            partial_demand_fulfillment_plan(&selected_payload_miss, &interests, selected_branch)
+                .expect("exact selected payload locator permits current-only salvage");
+        assert_eq!(plan.interests, vec![current]);
+        assert_eq!(
+            plan.selected_payload_locator,
+            Some(NativeMetadataRef::ChangeLocator(change_id.to_owned())),
+        );
+        let required = vec![ReadInputAddress::Metadata(
+            plan.selected_payload_locator.clone().unwrap(),
+        )];
+        assert_eq!(
+            required,
+            vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change_id.to_owned(),)
+            )],
+        );
+    }
+
+    #[test]
+    fn selected_nonancestor_history_is_left_for_authenticated_authority_fallback() {
+        let selected_branch = "00000000-0000-7000-8000-000000000123";
+        let interest = LogicalReadInterest::History {
+            branch_id: selected_branch.into(),
+            commit_ids: vec!["00000000-0000-7000-8000-000000000999".into()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+        let native_miss = LixError::new(LixError::CODE_INTERNAL_ERROR, "missing history");
+        let plan = partial_demand_fulfillment_plan(
+            &native_miss,
+            std::slice::from_ref(&interest),
+            selected_branch,
+        )
+        .expect("client must not preempt the authority's ancestry proof");
+        assert_eq!(plan.interests, vec![interest]);
+        assert!(plan.selected_payload_locator.is_none());
+    }
+
+    #[test]
+    fn discovery_work_bounds_are_explicit_and_fail_closed() {
+        let mut calls = Observations::default();
+        calls.profile.storage_calls = MAX_READ_CALLS;
+        assert!(calls.charge_call().is_err());
+        assert!(calls.exhausted);
+        assert_eq!(calls.profile.storage_calls, MAX_READ_CALLS);
+        let key = StorageKey(vec![1].into());
+        let value = StorageProjectedValue::FullValue(Bytes::from_static(&[1]));
+        let mut bytes = Observations::default();
+        bytes.profile.storage_bytes = MAX_READ_BYTES;
+        assert!(
+            bytes
+                .observe(
+                    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                    &key,
+                    &value
+                )
+                .is_err()
+        );
+        assert!(bytes.exhausted);
+        assert_eq!(bytes.profile.storage_bytes, MAX_READ_BYTES + 1);
+        let mut payload = Observations::default();
+        payload.profile.payload_bytes = MAX_PAYLOAD_BYTES;
+        assert!(
+            payload
+                .observe(
+                    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                    &key,
+                    &value
+                )
+                .is_err()
+        );
+        assert!(payload.exhausted);
+        assert_eq!(payload.profile.payload_bytes, MAX_PAYLOAD_BYTES + 1);
+        assert!(
+            payload.values.is_empty(),
+            "bounded failure must not expose partial installable coverage"
+        );
+    }
+
+    #[test]
+    fn bounded_working_diff_capture_preserves_immutable_native_demand() {
+        let capture = ReadInterestRegistry::new(8, 16 * 1024);
+        capture
+            .register(LogicalReadInterest::Diff {
+                branch_id: Some("branch".into()),
+                relation: "lix_file".into(),
+                from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                filter: crate::tracked_state::TrackedStateFilter {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                retain_payloads: false,
+                projected_columns: vec![],
+                limit: None,
+            })
+            .unwrap();
+        let error = LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "working diff dependency unavailable",
+        )
+        .with_details(serde_json::json!({"nativeHistoryDemand": {"version": 1}}));
+        let annotated = annotate_capture(error, Some(&capture));
+        let recipes = interests_for_error(&annotated)
+            .unwrap()
+            .expect("bounded working diff is replayable");
+        assert_eq!(recipes.len(), 1);
+        assert!(super::super::working_diff_recipe::is_supported_working_diff_recipe(&recipes[0]));
+        assert!(
+            annotated
+                .details
+                .as_ref()
+                .unwrap()
+                .get("nativeHistoryDemand")
+                .is_some()
+        );
     }
 
     #[test]
@@ -5150,7 +5852,6 @@ mod tests {
         let mut history_only = request.clone();
         history_only.interests = vec![LogicalReadInterest::History {
             branch_id: leased.descriptor.selected_branch.branch_id.clone(),
-            anchor: leased.descriptor.selected_branch.head.commit_id.clone(),
             commit_ids: vec![leased.descriptor.selected_branch.head.commit_id.clone()],
             relation: "lix_file".into(),
             filter: crate::tracked_state::TrackedStateFilter {
@@ -5712,3 +6413,7 @@ mod tests {
         authority.close().await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "read_fulfillment_candidate_tests.rs"]
+mod candidate_tests;

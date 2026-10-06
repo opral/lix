@@ -214,7 +214,9 @@ where
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         if before.role == RepositoryRole::PartialReplica {
             super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
-            if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+            if let Some((key, bytes)) =
+                crate::sync::legacy_read_interest_journal_upgrade(&read).await?
+            {
                 plan.put_mutable(
                     crate::sync::PARTIAL_READ_INTEREST_SPACE,
                     vec![(key.0.to_vec(), bytes.to_vec())],
@@ -281,7 +283,9 @@ where
         super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         if before.role == RepositoryRole::PartialReplica {
             super::epoch::append_partial_serving_source_plan(&read, &mut plan).await?;
-            if let Some((key, bytes)) = crate::sync::v2_journal_upgrade(&read).await? {
+            if let Some((key, bytes)) =
+                crate::sync::legacy_read_interest_journal_upgrade(&read).await?
+            {
                 plan.put_mutable(
                     crate::sync::PARTIAL_READ_INTEREST_SPACE,
                     vec![(key.0.to_vec(), bytes.to_vec())],
@@ -312,7 +316,8 @@ where
     } else {
         ("exact-records-v1", before_content_digest.clone())
     };
-    let admission = super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
+    let admission =
+        super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
     if before.role == RepositoryRole::PartialReplica {
         super::epoch::restore_missing_partial_serving_witnesses(&admission.adapter).await?;
     }
@@ -600,7 +605,10 @@ mod tests {
         .await
         .unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .unwrap()
             .rows()[0]
@@ -724,9 +732,18 @@ mod tests {
 
     #[tokio::test]
     async fn partial_legacy_formats_to_v86_preserve_admission_and_resident_records_offline() {
-        for (format, receipt_version) in [79, 80, 81, 82, 83, 84, 85, crate::init::CURRENT_FORMAT_VERSION]
-            .into_iter()
-            .flat_map(|format| [1, 2, 3].map(|version| (format, version)))
+        for (format, receipt_version) in [
+            79,
+            80,
+            81,
+            82,
+            83,
+            84,
+            85,
+            crate::init::CURRENT_FORMAT_VERSION,
+        ]
+        .into_iter()
+        .flat_map(|format| [1, 2, 3].map(|version| (format, version)))
         {
             let authority = crate::open_lix().await.unwrap();
             let state = crate::sync::PartialReplicaState::new(
@@ -796,7 +813,10 @@ mod tests {
                         &branch.branch_id,
                     )
                     .unwrap();
-                    writes.delete(crate::sync::partial_serving::PARTIAL_SERVING_SPACE, key.as_slice());
+                    writes.delete(
+                        crate::sync::partial_serving::PARTIAL_SERVING_SPACE,
+                        key.as_slice(),
+                    );
                 }
             }
             // Seed historical metadata through the fixture's migration writer;
@@ -822,7 +842,9 @@ mod tests {
             assert_ne!(content_digest(&storage).await.unwrap(), expected);
             let report = migrate_repository(storage.clone())
                 .await
-                .unwrap_or_else(|error| panic!("format {format}, receipt {receipt_version} migration failed: {error:?}"));
+                .unwrap_or_else(|error| {
+                    panic!("format {format}, receipt {receipt_version} migration failed: {error:?}")
+                });
             assert!(report.semantic_preservation_verified);
             assert_eq!(report.expected_content_digest, report.after_content_digest);
             if receipt_version == 3 || legacy_lease_version == 2 {
@@ -876,16 +898,15 @@ mod tests {
         )
         .unwrap();
         authority.close().await.unwrap();
-        let storage = StorageSession::acquire(crate::sync::durable_memory_for_test(crate::Memory::new()))
-            .await
-            .unwrap();
+        let storage =
+            StorageSession::acquire(crate::sync::durable_memory_for_test(crate::Memory::new()))
+                .await
+                .unwrap();
         let installed = super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
             .await
             .unwrap();
-        let journal_key = crate::storage_codec::id_string::uuid_bytes_from_canonical(
-            state.epoch_id(),
-        )
-        .unwrap();
+        let journal_key =
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(state.epoch_id()).unwrap();
         let mut writes = installed.adapter.new_write_set();
         writes.put(
             crate::sync::PARTIAL_READ_INTEREST_SPACE,
@@ -916,8 +937,14 @@ mod tests {
             .unwrap();
         let rejected_source_digest = content_digest(&storage).await.unwrap();
         assert!(migrate_repository(storage.clone()).await.is_err());
-        assert_eq!(inspect_repository(storage.clone()).await.unwrap().format, Some(82));
-        assert_eq!(content_digest(&storage).await.unwrap(), rejected_source_digest);
+        assert_eq!(
+            inspect_repository(storage.clone()).await.unwrap().format,
+            Some(82)
+        );
+        assert_eq!(
+            content_digest(&storage).await.unwrap(),
+            rejected_source_digest
+        );
         // The failed migration attempt fences its source adapter. Repair the
         // deliberately invalid source journal through a newly inspected view.
         let retry_adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
@@ -937,33 +964,159 @@ mod tests {
                     "include_blob_refs": false,
                     "cache_small_blob_data": false
                 }],
-            })).unwrap(),
+            }))
+            .unwrap(),
         );
-        let mut retry_write = retry_adapter.begin_migration_write(Default::default()).await.unwrap();
+        let mut retry_write = retry_adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
         retry_writes.lower_into(&mut retry_write).await.unwrap();
         retry_write.commit().await.unwrap();
         let report = migrate_repository(storage.clone()).await.unwrap();
         assert_eq!(report.before.format, Some(82));
         assert!(report.semantic_preservation_verified);
         assert_eq!(report.expected_content_digest, report.after_content_digest);
-        let current = super::super::epoch::inspect_existing_epoch_adapter(&storage).await.unwrap();
+        let current = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
         let read = current.begin_read(Default::default()).await.unwrap();
         let (migrated_state, _) = crate::sync::load_partial_replica_state(&read)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         crate::sync::validate_partial_read_interest_journal(&read, &migrated_state)
-            .await.unwrap();
+            .await
+            .unwrap();
         let value = PointReadPlan::new(
             crate::sync::PARTIAL_READ_INTEREST_SPACE,
             &[StorageKey(Bytes::copy_from_slice(&journal_key))],
-        ).materialize(&read, Default::default()).await.unwrap().value.pop().flatten();
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten();
         let Some(StorageProjectedValue::FullValue(bytes)) = value else {
             panic!("upgraded interest journal is missing");
         };
         let journal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(journal["version"], 3);
+        assert_eq!(journal["version"], 4);
         assert_eq!(
             journal["recipes"][0]["scope"],
             serde_json::json!({"file_ids":["selected-file"]})
+        );
+        drop(read);
+    }
+
+    #[tokio::test]
+    async fn current_partial_v3_history_journal_migrates_detached_and_preserves_scopes() {
+        let authority = crate::open_lix().await.unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            authority.active_account_id().to_owned(),
+            "00000000-0000-7000-8000-000000000598".into(),
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap();
+        authority.close().await.unwrap();
+        let storage =
+            StorageSession::acquire(crate::sync::durable_memory_for_test(crate::Memory::new()))
+                .await
+                .unwrap();
+        let installed = super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
+            .await
+            .unwrap();
+        let journal_key =
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(state.epoch_id()).unwrap();
+        let mut history = serde_json::to_value(crate::hot_state::LogicalReadInterest::History {
+            branch_id: state.descriptor().selected_branch.branch_id.clone(),
+            commit_ids: vec![state.descriptor().selected_branch.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: Default::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        })
+        .unwrap();
+        history["anchor"] = serde_json::json!(state.descriptor().selected_branch.head.commit_id);
+        let retained =
+            serde_json::to_value(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::All,
+                branch_ids: vec![state.descriptor().selected_branch.branch_id.clone()],
+                include_blob_refs: false,
+                cache_small_blob_data: false,
+            })
+            .unwrap();
+        let old_journal = serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "epochId": state.epoch_id(),
+            "recipes": [history, retained]
+        }))
+        .unwrap();
+        let mut writes = installed.adapter.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            journal_key.as_slice(),
+            old_journal.as_slice(),
+        );
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = installed
+            .adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
+
+        let source = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        let read = source.begin_read(Default::default()).await.unwrap();
+        assert!(
+            crate::sync::validate_partial_read_interest_journal(&read, &state)
+                .await
+                .is_err()
+        );
+        drop(read);
+
+        let report = migrate_repository(storage.clone()).await.unwrap();
+        assert!(
+            report.before.current,
+            "the fixture exercises same-format journal migration"
+        );
+        assert!(report.semantic_preservation_verified);
+        assert_eq!(report.expected_content_digest, report.after_content_digest);
+        let migrated = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        let read = migrated.begin_read(Default::default()).await.unwrap();
+        crate::sync::validate_partial_read_interest_journal(&read, &state)
+            .await
+            .unwrap();
+        let value = PointReadPlan::new(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            &[StorageKey(Bytes::copy_from_slice(&journal_key))],
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten();
+        let Some(StorageProjectedValue::FullValue(bytes)) = value else {
+            panic!("migrated interest journal is missing");
+        };
+        let journal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(journal["version"], 4);
+        assert_eq!(journal["recipes"].as_array().unwrap().len(), 2);
+        assert!(
+            journal["recipes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|recipe| recipe.get("anchor").is_none())
         );
         drop(read);
     }

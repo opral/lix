@@ -236,6 +236,7 @@ pub(crate) struct TrackedStateTreeDiffBatchBuilder {
     after: Vec<Option<TrackedStateIndexValue>>,
     before_author_present: Vec<bool>,
     after_author_present: Vec<bool>,
+    native_work_budget: Option<super::NativeDiffIdentityBudget>,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +430,7 @@ pub(crate) async fn diff_commits<S>(
     right_commit_id: &str,
     request: &TrackedStateDiffRequest,
     authored_members_only: bool,
+    native_work_budget: Option<super::NativeDiffIdentityBudget>,
 ) -> Result<TrackedStateDiff, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
@@ -437,7 +439,12 @@ where
     record_diff_commits_test_probe(left_commit_id, right_commit_id);
     let scan_request = scan_request_for_diff(request);
     let mut tree_diff = reader
-        .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
+        .diff_semantic_tree_entries_at_commits(
+            left_commit_id,
+            right_commit_id,
+            &scan_request,
+            native_work_budget.as_ref(),
+        )
         .await?;
     if authored_members_only {
         reader
@@ -529,13 +536,12 @@ fn classify_tree_diff_batch(
             after.as_ref(),
             payloads,
             fingerprints,
-        )? else {
+        )?
+        else {
             continue;
         };
-        let identity = TrackedStateDiffIdentity::from_batch_ordinal(
-            Arc::clone(&identities),
-            ordinal_u32,
-        );
+        let identity =
+            TrackedStateDiffIdentity::from_batch_ordinal(Arc::clone(&identities), ordinal_u32);
         let before = before.map(|value| {
             TrackedStateDiffRow::from_index_value(identity.clone(), value, before_author_present)
         });
@@ -578,7 +584,18 @@ fn classify_diff_values(
         (None, None) => None,
         (None, Some(_)) => Some(TrackedStateDiffKind::Added),
         (Some(_), None) => Some(TrackedStateDiffKind::Removed),
-        (Some(before), Some(after)) if tracked_value_payload_eq(schema_key, row_pk, before, after, payloads, fingerprints)? => None,
+        (Some(before), Some(after))
+            if tracked_value_payload_eq(
+                schema_key,
+                row_pk,
+                before,
+                after,
+                payloads,
+                fingerprints,
+            )? =>
+        {
+            None
+        }
         (Some(_), Some(_)) => Some(TrackedStateDiffKind::Modified),
     })
 }
@@ -606,8 +623,7 @@ fn tracked_value_payload_eq(
     {
         return Ok(left == right);
     }
-    let (Some(left), Some(right)) =
-        (payloads.get(left.change_id), payloads.get(right.change_id))
+    let (Some(left), Some(right)) = (payloads.get(left.change_id), payloads.get(right.change_id))
     else {
         return Ok(false);
     };
@@ -621,10 +637,14 @@ fn tracked_value_payload_eq(
         return Ok(false);
     };
     let left = crate::row_payload::TypedRow::decode_durable_payload(
-        Arc::<[u8]>::from(left_snapshot), schema_key, row_pk,
+        Arc::<[u8]>::from(left_snapshot),
+        schema_key,
+        row_pk,
     )?;
     let right = crate::row_payload::TypedRow::decode_durable_payload(
-        Arc::<[u8]>::from(right_snapshot), schema_key, row_pk,
+        Arc::<[u8]>::from(right_snapshot),
+        schema_key,
+        row_pk,
     )?;
     Ok(left == right)
 }
@@ -639,14 +659,57 @@ impl TrackedStateTreeDiffBatchBuilder {
             after: Vec::with_capacity(row_count),
             before_author_present: Vec::with_capacity(row_count),
             after_author_present: Vec::with_capacity(row_count),
+            native_work_budget: None,
         }
     }
 
-    /// Reserves the aligned columns once after the tree root exposes its
-    /// subtree count. Corrupt or overflowing hints are ignored by callers;
-    /// logical rows remain checked when the batch seals.
-    pub(crate) fn reserve_exact_once(&mut self, row_count: usize) {
-        if self.rows.capacity() == 0 {
+    pub(crate) fn set_native_work_budget(
+        &mut self,
+        budget: Option<super::NativeDiffIdentityBudget>,
+    ) {
+        self.native_work_budget = budget;
+    }
+
+    pub(crate) fn charge_native_identity(&self, encoded_key_bytes: usize) -> Result<(), LixError> {
+        if let Some(budget) = &self.native_work_budget {
+            budget.charge(encoded_key_bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn charge_native_visit(&self, encoded_key_bytes: usize) -> Result<(), LixError> {
+        if let Some(budget) = &self.native_work_budget {
+            budget.charge_visit(encoded_key_bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_native_work_budget(&self) -> bool {
+        self.native_work_budget.is_some()
+    }
+
+    pub(crate) fn validate_native_identity_key_size(
+        &self,
+        encoded_key_bytes: usize,
+    ) -> Result<(), LixError> {
+        if self.native_work_budget.is_some() {
+            super::NativeDiffIdentityBudget::validate_key_size(encoded_key_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reserves aligned columns once using the root's subtree hint, capped by
+    /// the authority identity budget when installed.
+    pub(crate) fn reserve_exact_once(&mut self, row_count: usize) -> Result<(), LixError> {
+        let row_count = if let Some(budget) = &self.native_work_budget {
+            row_count.min(budget.remaining_identities()?)
+        } else {
+            row_count
+        };
+        if self.rows.capacity() == 0 && self.native_work_budget.is_none() {
+            // An ordinary reader treats a subtree capacity hint as optional.
+            // A sparse result can grow from its actual rows when an oversized
+            // hint cannot be reserved.
             let _ = self.rows.try_reserve_exact(row_count);
             let _ = self.before.try_reserve_exact(row_count);
             let _ = self.after.try_reserve_exact(row_count);
@@ -654,7 +717,28 @@ impl TrackedStateTreeDiffBatchBuilder {
             let _ = self.after_author_present.try_reserve_exact(row_count);
             self.schema_keys.set_expected_cardinality(row_count);
             self.file_ids.set_expected_cardinality(row_count);
+            return Ok(());
         }
+        if self.rows.capacity() == 0 {
+            self.rows
+                .try_reserve_exact(row_count)
+                .map_err(|_| native_diff_reserve_error())?;
+            self.before
+                .try_reserve_exact(row_count)
+                .map_err(|_| native_diff_reserve_error())?;
+            self.after
+                .try_reserve_exact(row_count)
+                .map_err(|_| native_diff_reserve_error())?;
+            self.before_author_present
+                .try_reserve_exact(row_count)
+                .map_err(|_| native_diff_reserve_error())?;
+            self.after_author_present
+                .try_reserve_exact(row_count)
+                .map_err(|_| native_diff_reserve_error())?;
+            self.schema_keys.set_expected_cardinality(row_count);
+            self.file_ids.set_expected_cardinality(row_count);
+        }
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -726,6 +810,13 @@ impl TrackedStateTreeDiffBatchBuilder {
     }
 }
 
+fn native_diff_reserve_error() -> LixError {
+    LixError::new(
+        "LIX_NATIVE_RECIPE_WORK_BOUND",
+        "native diff recipe result allocation exceeds available memory",
+    )
+}
+
 impl TrackedStateTreeDiffBatch {
     pub(crate) fn len(&self) -> usize {
         self.before.len()
@@ -752,8 +843,12 @@ impl TrackedStateTreeDiffBatch {
             .zip(&self.before_author_present)
             .zip(&self.after_author_present)
             .enumerate()
-            .flat_map(move |(ordinal, (((before, after), before_author), after_author))| {
-                [(before.as_ref(), *before_author), (after.as_ref(), *after_author)]
+            .flat_map(
+                move |(ordinal, (((before, after), before_author), after_author))| {
+                    [
+                        (before.as_ref(), *before_author),
+                        (after.as_ref(), *after_author),
+                    ]
                     .into_iter()
                     .filter_map(move |(value, author_present)| {
                         value.map(|value| TrackedStateTreeDiffRowRef {
@@ -765,7 +860,8 @@ impl TrackedStateTreeDiffBatch {
                             author_present,
                         })
                     })
-            })
+                },
+            )
     }
 
     pub(crate) fn rows(
@@ -814,9 +910,8 @@ impl TrackedStateTreeDiffBatch {
         ),
     > {
         let author_presence = &self.after_author_present;
-        self.rows().map(move |(ordinal, key, _, after)| {
-            (ordinal, key, after, author_presence[ordinal])
-        })
+        self.rows()
+            .map(move |(ordinal, key, _, after)| (ordinal, key, after, author_presence[ordinal]))
     }
 
     pub(crate) fn remove_rows(&mut self, remove: &[bool]) {
@@ -832,14 +927,14 @@ impl TrackedStateTreeDiffBatch {
         let mut after = Vec::with_capacity(self.len());
         let mut before_author_present = Vec::with_capacity(self.len());
         let mut after_author_present = Vec::with_capacity(self.len());
-        for (ordinal, ((((before_value, after_value), before_author), after_author), remove)) in self
-            .before
-            .iter()
-            .zip(&self.after)
-            .zip(&self.before_author_present)
-            .zip(&self.after_author_present)
-            .zip(remove)
-            .enumerate()
+        for (ordinal, ((((before_value, after_value), before_author), after_author), remove)) in
+            self.before
+                .iter()
+                .zip(&self.after)
+                .zip(&self.before_author_present)
+                .zip(&self.after_author_present)
+                .zip(remove)
+                .enumerate()
         {
             if *remove {
                 continue;
@@ -1611,6 +1706,20 @@ mod tests {
         LixTimestamp::expect_parse("timestamp", value)
     }
 
+    #[test]
+    fn native_diff_reservation_caps_unfiltered_subtree_hint() {
+        let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+        builder.set_native_work_budget(Some(super::super::NativeDiffIdentityBudget::new(3)));
+        builder
+            .reserve_exact_once(1_000_000)
+            .expect("bounded reservation should succeed");
+        assert!(builder.rows.capacity() <= 3);
+        assert!(builder.before.capacity() <= 3);
+        assert!(builder.after.capacity() <= 3);
+        assert!(builder.before_author_present.capacity() <= 3);
+        assert!(builder.after_author_present.capacity() <= 3);
+    }
+
     fn change_id(label: &str) -> String {
         ChangeId::for_test_label(label).to_string()
     }
@@ -1774,8 +1883,8 @@ mod tests {
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
-                            semantic_fingerprint: None,
-}),
+                semantic_fingerprint: None,
+            }),
             false,
         );
         let batch = builder.finish().expect("tree diff should seal");
@@ -1870,8 +1979,9 @@ mod tests {
         }
         let tree_entries = tree_entries.finish().expect("tree batch should seal");
         assert_eq!(tree_entries.large_buffer_count(), 5);
-        let rows = classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default(), None)
-            .expect("tree rows should classify");
+        let rows =
+            classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default(), None)
+                .expect("tree rows should classify");
         assert_eq!(rows.len(), row_count);
         let first = &rows[0].identity;
         assert_eq!(first.batch_len(), row_count);
@@ -2110,19 +2220,20 @@ mod tests {
         let same = [0x5a; 32];
         let before = value("before", Some(same));
         let equal_after = value("after-equal", Some(same));
-        let mut fingerprints = HashMap::from([
-            (before.change_id, same),
-            (equal_after.change_id, same),
-        ]);
+        let mut fingerprints =
+            HashMap::from([(before.change_id, same), (equal_after.change_id, same)]);
         let row_pk = RowPk::single("row");
-        assert!(tracked_value_payload_eq(
-            "schema",
-            &row_pk,
-            &before,
-            &equal_after,
-            &empty_payloads,
-            Some(&fingerprints),
-        ).unwrap());
+        assert!(
+            tracked_value_payload_eq(
+                "schema",
+                &row_pk,
+                &before,
+                &equal_after,
+                &empty_payloads,
+                Some(&fingerprints),
+            )
+            .unwrap()
+        );
         let row = TrackedStateDiffRow::from_index_value(
             TrackedStateDiffIdentity::from_key(TrackedStateKey {
                 schema_key: "schema".to_owned(),
@@ -2136,18 +2247,29 @@ mod tests {
 
         let changed_after = value("after-changed", Some([0xa5; 32]));
         fingerprints.insert(changed_after.change_id, [0xa5; 32]);
-        assert!(!tracked_value_payload_eq(
-            "schema",
-            &row_pk,
-            &before,
-            &changed_after,
-            &empty_payloads,
-            Some(&fingerprints),
-        ).unwrap());
+        assert!(
+            !tracked_value_payload_eq(
+                "schema",
+                &row_pk,
+                &before,
+                &changed_after,
+                &empty_payloads,
+                Some(&fingerprints),
+            )
+            .unwrap()
+        );
 
         let legacy_after = value("after-legacy", None);
         assert!(
-            !tracked_value_payload_eq("schema", &row_pk, &before, &legacy_after, &empty_payloads, Some(&fingerprints)).unwrap(),
+            !tracked_value_payload_eq(
+                "schema",
+                &row_pk,
+                &before,
+                &legacy_after,
+                &empty_payloads,
+                Some(&fingerprints)
+            )
+            .unwrap(),
             "an incomplete proof must not infer semantic equality without loading payloads"
         );
     }
@@ -2190,10 +2312,17 @@ mod tests {
         ])
         .unwrap();
         let incomplete_proofs = HashMap::from([(before_id, [9; 32])]);
-        assert!(tracked_value_payload_eq(
-            "lix_key_value", &row_pk, &value(before_id), &value(after_id),
-            &payloads, Some(&incomplete_proofs),
-        ).unwrap());
+        assert!(
+            tracked_value_payload_eq(
+                "lix_key_value",
+                &row_pk,
+                &value(before_id),
+                &value(after_id),
+                &payloads,
+                Some(&incomplete_proofs),
+            )
+            .unwrap()
+        );
         let sql_null = crate::row_payload::TypedRow::from_row(
             plan,
             lix_schema::Row::from([
@@ -2206,20 +2335,43 @@ mod tests {
             plan,
             lix_schema::Row::from([
                 ("key", lix_schema::Value::Text("proofless-row".to_owned())),
-                ("value", lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(serde_json::Value::Null))),
+                (
+                    "value",
+                    lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(
+                        serde_json::Value::Null,
+                    )),
+                ),
             ]),
         )
         .unwrap();
-        assert_eq!(sql_null.to_json_value().unwrap(), json_null.to_json_value().unwrap());
+        assert_eq!(
+            sql_null.to_json_value().unwrap(),
+            json_null.to_json_value().unwrap()
+        );
         let null_payloads = TrackedStatePayloadBatch::from_payloads([
-            (before_id, Some(sql_null.durable_payload().unwrap().to_vec()), None),
-            (after_id, Some(json_null.durable_payload().unwrap().to_vec()), None),
+            (
+                before_id,
+                Some(sql_null.durable_payload().unwrap().to_vec()),
+                None,
+            ),
+            (
+                after_id,
+                Some(json_null.durable_payload().unwrap().to_vec()),
+                None,
+            ),
         ])
         .unwrap();
-        assert!(!tracked_value_payload_eq(
-            "lix_key_value", &row_pk, &value(before_id), &value(after_id),
-            &null_payloads, None,
-        ).unwrap());
+        assert!(
+            !tracked_value_payload_eq(
+                "lix_key_value",
+                &row_pk,
+                &value(before_id),
+                &value(after_id),
+                &null_payloads,
+                None,
+            )
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2475,7 +2627,11 @@ mod tests {
             .expect("read should open");
         let source_diff = tracked_state
             .reader(read)
-            .diff_commits("right-corrupt", "source", &TrackedStateDiffRequest::default())
+            .diff_commits(
+                "right-corrupt",
+                "source",
+                &TrackedStateDiffRequest::default(),
+            )
             .await
             .expect("source row should load");
         let source_row = source_diff.entries[0]
@@ -2484,8 +2640,7 @@ mod tests {
             .expect("source row should be live");
         let (key, mut value) = source_row.clone().into_index_entry();
         value.change_id = ChangeId::for_test_label("forged-tree-change");
-        stage_corrupt_commit_root(&storage, "right-corrupt", vec![(key, value)], Vec::new())
-            .await;
+        stage_corrupt_commit_root(&storage, "right-corrupt", vec![(key, value)], Vec::new()).await;
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4198,6 +4353,91 @@ mod tests {
             )
             .await
             .expect("identity-only diff should load")
+    }
+
+    #[tokio::test]
+    async fn rooted_native_diff_budget_fails_closed_without_changing_unlimited_diff() {
+        let left_rows = [
+            row_with_value("row-a", None, "left-a", "before-a"),
+            row_with_value("row-b", None, "left-b", "before-b"),
+        ];
+        let right_rows = [
+            row_with_value("row-a", None, "right-a", "after-a"),
+            row_with_value("row-b", None, "right-b", "after-b"),
+        ];
+        let (storage, tracked_state) = seed_roots(&left_rows, &right_rows).await;
+
+        let unlimited = diff_identity_only(&storage, &tracked_state).await;
+        assert_eq!(unlimited.entries.len(), 2);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("bounded native diff read should open");
+        let error = tracked_state
+            .reader(read)
+            .with_native_diff_identity_budget(super::super::NativeDiffIdentityBudget::new(1))
+            .diff_commits(
+                "left",
+                "right",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect_err("over-budget rooted native diff must decline rather than truncate");
+        assert_eq!(error.code, super::super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("exact-budget native diff read should open");
+        let exact = tracked_state
+            .reader(read)
+            .with_native_diff_identity_budget(super::super::NativeDiffIdentityBudget::new(2))
+            .diff_commits(
+                "left",
+                "right",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("the exact identity budget should permit the full result");
+        assert_eq!(exact.entries, unlimited.entries);
+
+        let no_match_request = TrackedStateDiffRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec!["test_schema".to_owned()],
+                row_pks: vec![RowPk::single("missing-row")],
+                ..Default::default()
+            },
+            retain_payloads: false,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("unlimited filtered read should open");
+        let no_matches = tracked_state
+            .reader(read)
+            .diff_commits("left", "right", &no_match_request)
+            .await
+            .expect("ordinary filtered diff remains unlimited");
+        assert!(no_matches.entries.is_empty());
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("bounded filtered read should open");
+        let error = tracked_state
+            .reader(read)
+            .with_native_diff_identity_budget(super::super::NativeDiffIdentityBudget::new(1))
+            .diff_commits("left", "right", &no_match_request)
+            .await
+            .expect_err("filtered-out tree traversal must still consume the authority work cap");
+        assert_eq!(error.code, super::super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE);
     }
 
     async fn write_root_with_semantic_fingerprints_for_test(

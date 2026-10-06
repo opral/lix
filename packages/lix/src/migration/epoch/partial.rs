@@ -190,6 +190,19 @@ where
             return Err(error);
         }
     };
+    // Valid prerelease v3 (and released v2) journals must be rewritten inside
+    // the detached epoch migration before Engine restores the strict v4
+    // journal. The upgrader is also the validator here: malformed or unknown
+    // journal data remains a corruption error and is never hidden by routing
+    // it through migration.
+    if crate::sync::legacy_read_interest_journal_upgrade(&read)
+        .await?
+        .is_some()
+    {
+        return Err(migration_required(
+            "partial read-interest journal requires explicit epoch migration",
+        ));
+    }
     drop(read);
     Ok(PartialEpochAdmission { adapter, state })
 }
@@ -412,6 +425,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_partial_open_migrates_v3_journal_and_keeps_pending_push_state() {
+        let state = state().await;
+        let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+        let installed = install_fresh_partial_epoch(storage.clone(), &state)
+            .await
+            .unwrap();
+        let selected = &state.descriptor().selected_branch;
+        let mut history = serde_json::to_value(crate::hot_state::LogicalReadInterest::History {
+            branch_id: selected.branch_id.clone(),
+            commit_ids: vec![selected.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: Default::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        })
+        .unwrap();
+        history["anchor"] = serde_json::json!(selected.head.commit_id);
+        let paths = serde_json::to_value(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+            scope: crate::filesystem::FilesystemPathIndexScope::All,
+            branch_ids: vec![selected.branch_id.clone()],
+            include_blob_refs: false,
+            cache_small_blob_data: false,
+        })
+        .unwrap();
+        let old_journal = serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "epochId": state.epoch_id(),
+            "recipes": [history, paths],
+        }))
+        .unwrap();
+        let journal_key =
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(state.epoch_id()).unwrap();
+        let push_key =
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(&selected.branch_id)
+                .unwrap();
+        let pending_push = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "epochId": state.epoch_id(),
+            "branchId": selected.branch_id,
+            "confirmed": {
+                "head": selected.head.commit_id,
+                "checkpoint": selected.checkpoint.commit_id,
+            },
+            "prepared": {
+                "attemptId": "00000000-0000-7000-8000-000000000455",
+                "createdRefs": [],
+                "expected": {
+                    "head": selected.head.commit_id,
+                    "checkpoint": selected.checkpoint.commit_id,
+                },
+                "target": {
+                    "head": selected.head.commit_id,
+                    "checkpoint": selected.checkpoint.commit_id,
+                },
+            },
+            "bodiesAcknowledged": false,
+        }))
+        .unwrap();
+        let mut writes = installed.adapter.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            journal_key.as_slice(),
+            old_journal.as_slice(),
+        );
+        writes.put(
+            crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+            push_key.as_slice(),
+            pending_push.as_slice(),
+        );
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = installed
+            .adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
+
+        let mut opened = crate::sync::prepare_partial_open(storage, None, None)
+            .await
+            .unwrap();
+        assert!(
+            opened.migration.is_some(),
+            "ordinary open must take the detached migration route"
+        );
+        assert_eq!(opened.state.as_ref(), &state);
+        let read = opened
+            .adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .unwrap();
+        crate::sync::validate_partial_read_interest_journal(&read, &state)
+            .await
+            .unwrap();
+        let journal = crate::storage_adapter::PointReadPlan::new(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            &[crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
+                &journal_key,
+            ))],
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten();
+        let Some(ProjectedValue::FullValue(journal)) = journal else {
+            panic!("migrated journal is missing");
+        };
+        let journal: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(journal["version"], 4);
+        assert_eq!(journal["recipes"].as_array().unwrap().len(), 2);
+        assert!(
+            journal["recipes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|recipe| recipe.get("anchor").is_none())
+        );
+        let push = crate::storage_adapter::PointReadPlan::new(
+            crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+            &[crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
+                &push_key,
+            ))],
+        )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten();
+        let Some(ProjectedValue::FullValue(push)) = push else {
+            panic!("pending upload state was lost during migration");
+        };
+        let push: serde_json::Value = serde_json::from_slice(&push).unwrap();
+        assert_eq!(
+            push["prepared"]["attemptId"],
+            "00000000-0000-7000-8000-000000000455"
+        );
+        drop(read);
+        opened.close_after_error().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_v3_interest_journal_is_corruption_not_migration_routing() {
+        let state = state().await;
+        let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+        let installed = install_fresh_partial_epoch(storage.clone(), &state)
+            .await
+            .unwrap();
+        let journal_key =
+            crate::storage_codec::id_string::uuid_bytes_from_canonical(state.epoch_id()).unwrap();
+        let malformed = serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "epochId": state.epoch_id(),
+            "recipes": [{"kind":"history", "anchor":"noncanonical"}],
+        }))
+        .unwrap();
+        let mut writes = installed.adapter.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            journal_key.as_slice(),
+            malformed.as_slice(),
+        );
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = installed
+            .adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
+
+        let error = match admit_partial_epoch(&storage).await {
+            Ok(_) => panic!("malformed legacy journal was admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "LIX_PARTIAL_INTEREST_JOURNAL_INVALID");
+        assert!(
+            !error
+                .to_string()
+                .contains("requires explicit epoch migration")
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_partial_epoch_is_atomic_durable_and_reopens_fenced() {
         let state = state().await;
         let backing = crate::Memory::new();
@@ -462,13 +662,12 @@ mod tests {
                 current["version"] = serde_json::json!(version);
                 current
             } else {
-                let mut legacy: serde_json::Value = serde_json::from_slice(
-                    &crate::sync::released_v2_receipt_bytes_for_test(
+                let mut legacy: serde_json::Value =
+                    serde_json::from_slice(&crate::sync::released_v2_receipt_bytes_for_test(
                         &state,
                         if version == 1 { 1 } else { 2 },
-                    ),
-                )
-                .unwrap();
+                    ))
+                    .unwrap();
                 legacy["version"] = serde_json::json!(version);
                 if version == 1 {
                     legacy.as_object_mut().unwrap().remove("archivedBranchIds");

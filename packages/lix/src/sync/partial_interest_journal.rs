@@ -1,8 +1,8 @@
 //! Epoch-bound durable native read recipes. Not a coverage certificate.
 //! The inventory is restored off the repository opening path. Warm unchanged
 //! operations do no journal I/O; newly successful operations flush first.
-//! Version 3 requires explicit filesystem path-index scopes; version 2
-//! recipes are rejected instead of being widened during restoration.
+//! Version 4 removes the prerelease History anchor; older journal shapes are
+//! accepted only by detached repository migration.
 use super::partial_state::{
     PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
     partial_replica_state_key,
@@ -42,6 +42,13 @@ struct JournalVersion {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyJournalV2 {
+    version: u32,
+    epoch_id: String,
+    recipes: Vec<serde_json::Value>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyJournalV3 {
     version: u32,
     epoch_id: String,
     recipes: Vec<serde_json::Value>,
@@ -93,13 +100,10 @@ fn encode(
 ) -> Result<Bytes, LixError> {
     encode_epoch(state.epoch_id(), recipes)
 }
-fn encode_epoch(
-    epoch_id: &str,
-    recipes: Vec<LogicalReadInterest>,
-) -> Result<Bytes, LixError> {
+fn encode_epoch(epoch_id: &str, recipes: Vec<LogicalReadInterest>) -> Result<Bytes, LixError> {
     let recipes = canonical_recipes(recipes)?;
     let bytes = serde_json::to_vec(&Journal {
-        version: 3,
+        version: 4,
         epoch_id: epoch_id.into(),
         recipes,
     })
@@ -122,12 +126,14 @@ pub(crate) fn migrate_v2_journal(bytes: &[u8]) -> Result<Option<Bytes>, LixError
     if version.version != 2 {
         return Ok(None);
     }
-    let journal: LegacyJournalV2 =
-        serde_json::from_slice(bytes).map_err(|_| invalid("version 2 interest journal is malformed"))?;
+    let journal: LegacyJournalV2 = serde_json::from_slice(bytes)
+        .map_err(|_| invalid("version 2 interest journal is malformed"))?;
     if journal.version != 2
         || crate::storage_codec::id_string::uuid_bytes_from_canonical(&journal.epoch_id).is_none()
     {
-        return Err(invalid("version 2 interest journal version or epoch is invalid"));
+        return Err(invalid(
+            "version 2 interest journal version or epoch is invalid",
+        ));
     }
     if journal.recipes.len() > MAX_RECIPES {
         return Err(invalid("interest journal exceeds recipe count bound"));
@@ -143,23 +149,79 @@ pub(crate) fn migrate_v2_journal(bytes: &[u8]) -> Result<Option<Bytes>, LixError
             }
             use crate::filesystem::FilesystemPathIndexScope;
             recipes.push(LogicalReadInterest::FilesystemPaths {
-                scope: legacy.file_ids.map_or(FilesystemPathIndexScope::All, FilesystemPathIndexScope::FileIds),
+                scope: legacy.file_ids.map_or(
+                    FilesystemPathIndexScope::All,
+                    FilesystemPathIndexScope::FileIds,
+                ),
                 branch_ids: legacy.branch_ids,
                 include_blob_refs: legacy.include_blob_refs,
                 cache_small_blob_data: legacy.cache_small_blob_data,
             });
         } else {
-            recipes.push(serde_json::from_value(value)
-                .map_err(|_| invalid("version 2 interest recipe is malformed or unsupported"))?);
+            recipes.push(
+                serde_json::from_value(value).map_err(|_| {
+                    invalid("version 2 interest recipe is malformed or unsupported")
+                })?,
+            );
         }
     }
     Ok(Some(encode_epoch(&journal.epoch_id, recipes)?))
 }
 
-/// Return the exact deterministic journal rewrite required by a v2 partial
+/// Rewrite the prerelease v3 journal to the current shape during detached
+/// migration. In v3, History carried a caller-selected anchor; v4 derives its
+/// authority from the selected leased branch instead. Validate and discard
+/// only that obsolete field, preserving every retained logical recipe.
+fn migrate_v3_journal(bytes: &[u8]) -> Result<Option<Bytes>, LixError> {
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid("interest journal exceeds document bound"));
+    }
+    let version: JournalVersion =
+        serde_json::from_slice(bytes).map_err(|_| invalid("interest journal is malformed"))?;
+    if version.version != 3 {
+        return Ok(None);
+    }
+    let journal: LegacyJournalV3 = serde_json::from_slice(bytes)
+        .map_err(|_| invalid("version 3 interest journal is malformed"))?;
+    if journal.version != 3
+        || crate::storage_codec::id_string::uuid_bytes_from_canonical(&journal.epoch_id).is_none()
+    {
+        return Err(invalid(
+            "version 3 interest journal version or epoch is invalid",
+        ));
+    }
+    if journal.recipes.len() > MAX_RECIPES {
+        return Err(invalid("interest journal exceeds recipe count bound"));
+    }
+    let mut recipes = Vec::with_capacity(journal.recipes.len());
+    for mut value in journal.recipes {
+        let kind = value.get("kind").and_then(serde_json::Value::as_str);
+        if kind == Some("history") {
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| invalid("version 3 History recipe is malformed"))?;
+            let anchor = object
+                .remove("anchor")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    invalid("version 3 History recipe anchor is missing or malformed")
+                })?;
+            if crate::storage_codec::id_string::uuid_bytes_from_canonical(&anchor).is_none() {
+                return Err(invalid("version 3 History recipe anchor is noncanonical"));
+            }
+        }
+        recipes.push(
+            serde_json::from_value(value)
+                .map_err(|_| invalid("version 3 interest recipe is malformed or unsupported"))?,
+        );
+    }
+    Ok(Some(encode_epoch(&journal.epoch_id, recipes)?))
+}
+
+/// Return the exact deterministic journal rewrite required by a legacy partial
 /// epoch. Callers use the same result for candidate writes and preservation
 /// projections so verification models precisely what publication performs.
-pub(crate) async fn v2_journal_upgrade(
+pub(crate) async fn legacy_read_interest_journal_upgrade(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Option<(StorageKey, Bytes)>, LixError> {
     // Migration preflight must understand released partial-receipt versions,
@@ -167,31 +229,32 @@ pub(crate) async fn v2_journal_upgrade(
     // upgrade. Runtime journal reads remain strict and still use
     // `load_partial_replica_state` directly.
     let mut receipt_writes = StorageWriteSet::new();
-    let Some((state, _, _)) = crate::sync::prepare_owned_partial_receipt_upgrade(
-        read,
-        &mut receipt_writes,
-    )
-    .await?
+    let Some((state, _, _)) =
+        crate::sync::prepare_owned_partial_receipt_upgrade(read, &mut receipt_writes).await?
     else {
         return Ok(None);
     };
     let journal_key = key(&state)?;
-    let value = PointReadPlan::new(PARTIAL_READ_INTEREST_SPACE, std::slice::from_ref(&journal_key))
-        .materialize(read, Default::default())
-        .await?
-        .value
-        .pop()
-        .flatten();
+    let value = PointReadPlan::new(
+        PARTIAL_READ_INTEREST_SPACE,
+        std::slice::from_ref(&journal_key),
+    )
+    .materialize(read, Default::default())
+    .await?
+    .value
+    .pop()
+    .flatten();
     let Some(StorageProjectedValue::FullValue(bytes)) = value else {
         return Ok(None);
     };
-    let Some(next) = migrate_v2_journal(&bytes)? else {
+    let next = migrate_v2_journal(&bytes)?.or(migrate_v3_journal(&bytes)?);
+    let Some(next) = next else {
         return Ok(None);
     };
     let migrated: Journal = serde_json::from_slice(&next)
         .map_err(|_| invalid("converted interest journal is malformed"))?;
     if migrated.epoch_id != state.epoch_id() {
-        return Err(invalid("version 2 interest journal belongs to another epoch"));
+        return Err(invalid("legacy interest journal belongs to another epoch"));
     }
     Ok(Some((journal_key, next)))
 }
@@ -263,7 +326,7 @@ async fn load(
             "version 2 partial-interest journals require a fresh partial-replica bootstrap",
         ));
     }
-    if journal.version != 3 || journal.epoch_id != expected.epoch_id() {
+    if journal.version != 4 || journal.epoch_id != expected.epoch_id() {
         return Err(invalid("interest journal version or epoch mismatch"));
     }
     let recipes = canonical_recipes(journal.recipes)?;
@@ -407,9 +470,18 @@ mod tests {
         let epoch = "00000000-0000-7000-8000-000000000599";
         for (legacy_scope, expected_scope) in [
             (serde_json::json!({}), FilesystemPathIndexScope::All),
-            (serde_json::json!({"file_ids": null}), FilesystemPathIndexScope::All),
-            (serde_json::json!({"file_ids": []}), FilesystemPathIndexScope::FileIds(vec![])),
-            (serde_json::json!({"file_ids": ["f1"]}), FilesystemPathIndexScope::FileIds(vec!["f1".into()])),
+            (
+                serde_json::json!({"file_ids": null}),
+                FilesystemPathIndexScope::All,
+            ),
+            (
+                serde_json::json!({"file_ids": []}),
+                FilesystemPathIndexScope::FileIds(vec![]),
+            ),
+            (
+                serde_json::json!({"file_ids": ["f1"]}),
+                FilesystemPathIndexScope::FileIds(vec!["f1".into()]),
+            ),
         ] {
             let mut recipe = serde_json::json!({
                 "kind": "filesystem_paths",
@@ -424,24 +496,66 @@ mod tests {
             }
             let source = serde_json::to_vec(&serde_json::json!({
                 "version": 2, "epochId": epoch, "recipes": [recipe]
-            })).unwrap();
+            }))
+            .unwrap();
             let converted = migrate_v2_journal(&source).unwrap().unwrap();
             let journal: Journal = serde_json::from_slice(&converted).unwrap();
-            assert_eq!(journal.version, 3);
+            assert_eq!(journal.version, 4);
             assert_eq!(journal.epoch_id, epoch);
-            assert_eq!(journal.recipes, vec![LogicalReadInterest::FilesystemPaths {
-                scope: expected_scope,
-                branch_ids: vec!["branch".into()],
-                include_blob_refs: true,
-                cache_small_blob_data: false,
-            }]);
+            assert_eq!(
+                journal.recipes,
+                vec![LogicalReadInterest::FilesystemPaths {
+                    scope: expected_scope,
+                    branch_ids: vec!["branch".into()],
+                    include_blob_refs: true,
+                    cache_small_blob_data: false,
+                }]
+            );
         }
         let unsupported = serde_json::to_vec(&serde_json::json!({
             "version": 2, "epochId": epoch,
             "recipes": [{"kind":"filesystem_paths", "file_ids":[], "branch_ids":[],
                 "include_blob_refs":false, "cache_small_blob_data":false, "unknown":true}]
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(migrate_v2_journal(&unsupported).is_err());
+    }
+    #[test]
+    fn prerelease_v3_history_migration_drops_only_canonical_anchor() {
+        let epoch = "00000000-0000-7000-8000-000000000599";
+        let history = LogicalReadInterest::History {
+            branch_id: "selected-branch".into(),
+            commit_ids: vec!["00000000-0000-7000-8000-000000000123".into()],
+            relation: "lix_file".into(),
+            filter: Default::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        };
+        let mut history_value = serde_json::to_value(&history).unwrap();
+        history_value["anchor"] = serde_json::json!("00000000-0000-7000-8000-000000000122");
+        let retained_private = recipe("private-row");
+        let source = serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "epochId": epoch,
+            "recipes": [history_value, serde_json::to_value(&retained_private).unwrap()],
+        }))
+        .unwrap();
+
+        let migrated = migrate_v3_journal(&source).unwrap().unwrap();
+        let journal: Journal = serde_json::from_slice(&migrated).unwrap();
+        assert_eq!(journal.version, 4);
+        assert_eq!(journal.epoch_id, epoch);
+        assert_eq!(journal.recipes, vec![history, retained_private]);
+        let value: serde_json::Value = serde_json::from_slice(&migrated).unwrap();
+        assert!(value["recipes"][0].get("anchor").is_none());
+
+        let mut malformed_anchor: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        malformed_anchor["recipes"][0]["anchor"] = serde_json::json!("not-canonical");
+        assert!(migrate_v3_journal(&serde_json::to_vec(&malformed_anchor).unwrap()).is_err());
+        let mut unknown_field: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        unknown_field["recipes"][0]["futureField"] = serde_json::json!(true);
+        assert!(migrate_v3_journal(&serde_json::to_vec(&unknown_field).unwrap()).is_err());
     }
     #[derive(Clone)]
     struct ExpiringJournalStorage {
@@ -723,7 +837,68 @@ mod tests {
         let read = storage.begin_read(Default::default()).await.unwrap();
         let error = load(&read, &state).await.unwrap_err();
         assert_eq!(error.code, "LIX_PARTIAL_INTEREST_JOURNAL_INVALID");
-        assert!(error.to_string().contains("fresh partial-replica bootstrap"));
+        assert!(
+            error
+                .to_string()
+                .contains("fresh partial-replica bootstrap")
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_journals_are_runtime_rejected_but_migration_upgrade_is_v4() {
+        let (storage, state) = fixture().await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let (_, _, epoch_guard) = load(&read, &state).await.unwrap();
+        drop(read);
+        let legacy_recipe = serde_json::to_value(recipe("retained-v3-scope")).unwrap();
+        // Use a valid History entry so this exercises the removed field, then
+        // retain an unrelated recipe to verify migration does not clear scopes.
+        let mut history = serde_json::to_value(LogicalReadInterest::History {
+            branch_id: state.descriptor().selected_branch.branch_id.clone(),
+            commit_ids: vec![state.descriptor().selected_branch.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: Default::default(),
+            retain_payloads: false,
+            projected_columns: vec!["id".into()],
+            limit: None,
+        })
+        .unwrap();
+        history["anchor"] = serde_json::json!(state.descriptor().selected_branch.head.commit_id);
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version": 3, "epochId": state.epoch_id(), "recipes": [history, legacy_recipe]
+        }))
+        .unwrap();
+        let mut writes = storage.new_write_set();
+        writes.put(
+            PARTIAL_READ_INTEREST_SPACE,
+            key(&state).unwrap(),
+            legacy.as_slice(),
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions: vec![epoch_guard],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert!(
+            load(&read, &state).await.is_err(),
+            "runtime remains strict v4-only"
+        );
+        let upgraded = legacy_read_interest_journal_upgrade(&read)
+            .await
+            .unwrap()
+            .unwrap();
+        let journal: Journal = serde_json::from_slice(&upgraded.1).unwrap();
+        assert_eq!(journal.version, 4);
+        assert_eq!(journal.recipes.len(), 2);
+        drop(read);
     }
 
     #[tokio::test]

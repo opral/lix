@@ -1560,6 +1560,15 @@ pub(crate) async fn load_mutation_part_read_plan(
     root: &MutationDirectoryRoot,
     selection: MutationDirectoryReadSelection<'_>,
 ) -> Result<AuthenticatedMutationPartReadPlan, LixError> {
+    load_mutation_part_read_plan_with_native_budget(store, root, selection, None).await
+}
+
+pub(crate) async fn load_mutation_part_read_plan_with_native_budget(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &MutationDirectoryRoot,
+    selection: MutationDirectoryReadSelection<'_>,
+    native_work_budget: Option<&super::NativeDiffIdentityBudget>,
+) -> Result<AuthenticatedMutationPartReadPlan, LixError> {
     if matches!(
         selection,
         MutationDirectoryReadSelection::All(
@@ -1639,124 +1648,156 @@ pub(crate) async fn load_mutation_part_read_plan(
     while !frontier.is_empty() {
         #[cfg(any(test, feature = "storage-benches"))]
         read_accounting::add(read_accounting::TRAVERSAL_LEVELS, 1);
-        let node_ids = frontier
-            .iter()
-            .map(|pending| pending.node_id)
-            .collect::<Vec<_>>();
-        let loaded = load_nodes(store, &node_ids, is_bounded(root.layout)).await?;
         let mut next = Vec::new();
-        for (pending, node) in frontier.into_iter().zip(loaded) {
-            #[cfg(test)]
-            {
-                visited_node_count += 1;
+        let bounded_batches = native_work_budget.is_some();
+        let mut remaining = frontier.into_iter();
+        loop {
+            // Authority replay processes one decoded node at a time so a wide
+            // level cannot retain thousands of 16 MiB nodes before charging
+            // its work budget. Ordinary callers keep level-batched reads.
+            let pending_batch = if bounded_batches {
+                remaining.next().into_iter().collect::<Vec<_>>()
+            } else {
+                remaining.by_ref().collect::<Vec<_>>()
+            };
+            if pending_batch.is_empty() {
+                break;
             }
-            validate_loaded_node(
-                &node,
-                pending.node_id,
-                pending.expected.as_ref(),
-                root,
-                "mutation read-plan",
-            )?;
-            match node {
-                StoredNode::Leaf { entries, .. } => {
-                    let mut selector_cursor = pending.selector_span.start;
-                    for (index, entry) in entries.into_iter().enumerate() {
-                        let entry_index = pending
-                            .base_index
-                            .checked_add(
-                                u32::try_from(index)
-                                    .map_err(|_| directory_error("leaf entry index overflows"))?,
-                            )
-                            .ok_or_else(|| directory_error("entry index overflows"))?;
-                        let entry_end = entry_index
-                            .checked_add(1)
-                            .ok_or_else(|| directory_error("entry index overflows"))?;
-                        let selector_span = selection_span_for_entry(
-                            selection,
-                            &mut selector_cursor,
-                            pending.selector_span.end,
-                            stored_entry_first_key(&entry),
-                            stored_entry_last_key(&entry),
-                            entry_index,
-                            entry_end,
-                            Some(stored_entry_direct_rows(&entry)),
-                        )?;
-                        let Some(mut selector_span) = selector_span else {
-                            continue;
-                        };
-                        if let MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(
-                            coordinates,
-                        ) = selection
-                        {
-                            let owned_end = selector_span.start
-                                + coordinates[selector_span.clone()].partition_point(
-                                    |coordinate| {
-                                        coordinate.local_row < stored_entry_direct_rows(&entry)
-                                    },
-                                );
-                            if selector_span.start < owned_end {
-                                let owned_span = selector_span.start..owned_end;
-                                direct_coverage.push(owned_span.clone());
-                                runs.push(MutationDirectoryPartRun {
-                                    entry_index,
-                                    selector_span: owned_span,
-                                    entry: runtime_entry(entry)?,
-                                });
-                            }
-                            if owned_end < selector_span.end {
-                                selector_span.start = owned_end;
-                                direct_coverage.push(selector_span.clone());
-                                direct_not_owned.push(MutationDirectoryNotOwnedSpan {
-                                    selector_span,
-                                    reason: MutationDirectoryNotOwnedReason::LocalRowOutOfRange,
-                                });
-                            }
-                            continue;
-                        }
-                        runs.push(MutationDirectoryPartRun {
-                            entry_index,
-                            selector_span,
-                            entry: runtime_entry(entry)?,
-                        });
-                    }
+            if let Some(budget) = native_work_budget {
+                for _ in &pending_batch {
+                    budget.charge_visit(0)?;
                 }
-                StoredNode::Internal { children, .. } => {
-                    let mut preceding = 0u32;
-                    let mut selector_cursor = pending.selector_span.start;
-                    for child in children {
-                        let child_base = pending
-                            .base_index
-                            .checked_add(preceding)
-                            .ok_or_else(|| directory_error("entry offset overflows"))?;
-                        preceding = preceding
-                            .checked_add(child.entry_count)
-                            .ok_or_else(|| directory_error("entry offset overflows"))?;
-                        let child_end = child_base
-                            .checked_add(child.entry_count)
-                            .ok_or_else(|| directory_error("entry offset overflows"))?;
-                        let selector_span = selection_span_for_entry(
-                            selection,
-                            &mut selector_cursor,
-                            pending.selector_span.end,
-                            &child.first_key,
-                            &child.last_key,
-                            child_base,
-                            child_end,
-                            None,
-                        )?;
-                        let Some(selector_span) = selector_span else {
-                            continue;
-                        };
-                        let node_id = child.node_id;
-                        next.push(PendingNode {
-                            node_id,
-                            base_index: child_base,
-                            selector_span,
-                            expected: Some(NodeSummary::from(child)),
-                        });
-                        #[cfg(test)]
-                        {
-                            node_summary_owner_count += 1;
+            }
+            let node_ids = pending_batch
+                .iter()
+                .map(|pending| pending.node_id)
+                .collect::<Vec<_>>();
+            let loaded = load_nodes(store, &node_ids, is_bounded(root.layout)).await?;
+            for (pending, node) in pending_batch.into_iter().zip(loaded) {
+                #[cfg(test)]
+                {
+                    visited_node_count += 1;
+                }
+                validate_loaded_node(
+                    &node,
+                    pending.node_id,
+                    pending.expected.as_ref(),
+                    root,
+                    "mutation read-plan",
+                )?;
+                match node {
+                    StoredNode::Leaf { entries, .. } => {
+                        let mut selector_cursor = pending.selector_span.start;
+                        for (index, entry) in entries.into_iter().enumerate() {
+                            if let Some(budget) = native_work_budget {
+                                budget.charge_visit(
+                                    stored_entry_first_key(&entry)
+                                        .len()
+                                        .saturating_add(stored_entry_last_key(&entry).len()),
+                                )?;
+                            }
+                            let entry_index =
+                                pending
+                                    .base_index
+                                    .checked_add(u32::try_from(index).map_err(|_| {
+                                        directory_error("leaf entry index overflows")
+                                    })?)
+                                    .ok_or_else(|| directory_error("entry index overflows"))?;
+                            let entry_end = entry_index
+                                .checked_add(1)
+                                .ok_or_else(|| directory_error("entry index overflows"))?;
+                            let selector_span = selection_span_for_entry(
+                                selection,
+                                &mut selector_cursor,
+                                pending.selector_span.end,
+                                stored_entry_first_key(&entry),
+                                stored_entry_last_key(&entry),
+                                entry_index,
+                                entry_end,
+                                Some(stored_entry_direct_rows(&entry)),
+                            )?;
+                            let Some(mut selector_span) = selector_span else {
+                                continue;
+                            };
+                            if let MutationDirectoryReadSelection::SortedUniqueDirectCoordinates(
+                                coordinates,
+                            ) = selection
+                            {
+                                let owned_end = selector_span.start
+                                    + coordinates[selector_span.clone()].partition_point(
+                                        |coordinate| {
+                                            coordinate.local_row < stored_entry_direct_rows(&entry)
+                                        },
+                                    );
+                                if selector_span.start < owned_end {
+                                    let owned_span = selector_span.start..owned_end;
+                                    direct_coverage.push(owned_span.clone());
+                                    runs.push(MutationDirectoryPartRun {
+                                        entry_index,
+                                        selector_span: owned_span,
+                                        entry: runtime_entry(entry)?,
+                                    });
+                                }
+                                if owned_end < selector_span.end {
+                                    selector_span.start = owned_end;
+                                    direct_coverage.push(selector_span.clone());
+                                    direct_not_owned.push(MutationDirectoryNotOwnedSpan {
+                                        selector_span,
+                                        reason: MutationDirectoryNotOwnedReason::LocalRowOutOfRange,
+                                    });
+                                }
+                                continue;
+                            }
+                            runs.push(MutationDirectoryPartRun {
+                                entry_index,
+                                selector_span,
+                                entry: runtime_entry(entry)?,
+                            });
+                        }
+                    }
+                    StoredNode::Internal { children, .. } => {
+                        let mut preceding = 0u32;
+                        let mut selector_cursor = pending.selector_span.start;
+                        for child in children {
+                            if let Some(budget) = native_work_budget {
+                                budget.charge_visit(
+                                    child.first_key.len().saturating_add(child.last_key.len()),
+                                )?;
+                            }
+                            let child_base = pending
+                                .base_index
+                                .checked_add(preceding)
+                                .ok_or_else(|| directory_error("entry offset overflows"))?;
+                            preceding = preceding
+                                .checked_add(child.entry_count)
+                                .ok_or_else(|| directory_error("entry offset overflows"))?;
+                            let child_end = child_base
+                                .checked_add(child.entry_count)
+                                .ok_or_else(|| directory_error("entry offset overflows"))?;
+                            let selector_span = selection_span_for_entry(
+                                selection,
+                                &mut selector_cursor,
+                                pending.selector_span.end,
+                                &child.first_key,
+                                &child.last_key,
+                                child_base,
+                                child_end,
+                                None,
+                            )?;
+                            let Some(selector_span) = selector_span else {
+                                continue;
+                            };
+                            let node_id = child.node_id;
+                            next.push(PendingNode {
+                                node_id,
+                                base_index: child_base,
+                                selector_span,
+                                expected: Some(NodeSummary::from(child)),
+                            });
+                            #[cfg(test)]
+                            {
+                                node_summary_owner_count += 1;
+                            }
                         }
                     }
                 }
@@ -1842,11 +1883,7 @@ pub(crate) async fn load_first_mutation_part_runs_for_range(
     }
 
     let overlaps = |first: &[u8], last: &[u8]| {
-        last >= range.start.as_ref()
-            && range
-                .end
-                .as_ref()
-                .is_none_or(|end| first < end.as_ref())
+        last >= range.start.as_ref() && range.end.as_ref().is_none_or(|end| first < end.as_ref())
     };
     let mut pending = vec![PendingNode {
         node_id: root.root_id,
@@ -1877,9 +1914,10 @@ pub(crate) async fn load_first_mutation_part_runs_for_range(
                     }
                     let entry_index = current
                         .base_index
-                        .checked_add(u32::try_from(offset).map_err(|_| {
-                            directory_error("candidate part index exceeds u32")
-                        })?)
+                        .checked_add(
+                            u32::try_from(offset)
+                                .map_err(|_| directory_error("candidate part index exceeds u32"))?,
+                        )
                         .ok_or_else(|| directory_error("candidate part index overflows"))?;
                     let entry = runtime_entry(entry)?;
                     if !matches!(&entry, MutationDirectoryEntry::Bounded { .. }) {
@@ -3437,6 +3475,27 @@ mod tests {
                 .len(),
             built.node_bytes().len()
         );
+    }
+
+    #[tokio::test]
+    async fn native_budget_stops_directory_plan_before_unbounded_run_materialization() {
+        let entries = (0..(FANOUT as u32 * 2 + 17))
+            .map(bounded_entry)
+            .collect::<Vec<_>>();
+        let built = build_mutation_directory(LAYOUT_BOUNDED_DIRECT, &entries).unwrap();
+        let (_storage, read) = stored_directory(&built).await;
+
+        let error = load_mutation_part_read_plan_with_native_budget(
+            &read,
+            &built.root,
+            MutationDirectoryReadSelection::All(
+                MutationDirectoryFullTraversalContext::EmptySchemaValueScan,
+            ),
+            Some(&super::super::NativeDiffIdentityBudget::new(1)),
+        )
+        .await
+        .expect_err("native work budget must stop the all-parts plan");
+        assert_eq!(error.code, super::super::NATIVE_DIFF_RECIPE_WORK_BOUND_CODE);
     }
 
     #[tokio::test]
