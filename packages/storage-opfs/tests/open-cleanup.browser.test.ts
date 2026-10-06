@@ -23,3 +23,7 @@ test("a failed ownership callback releases the physical OPFS locks", async () =>
 test("full OPFS ownership rejects aliases of the same physical filename", async () => {
 	expect(await runScenario("aliases")).toEqual({ code: "LIX_STORAGE_FENCED" });
 }, 30_000);
+
+test("an interrupted SQLite initialization can be retried in the same worker", async () => {
+	expect(await runScenario("sqlite-retry")).toEqual({ ok: true });
+}, 30_000);

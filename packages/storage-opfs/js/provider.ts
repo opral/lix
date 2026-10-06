@@ -1012,14 +1012,20 @@ class OpfsScan implements LixStorageScanSource {
 
 async function initializeSqlite(): Promise<SqliteInit> {
 	if (!sqliteModule) {
-		const { default: sqlite3InitModule } =
-			await import("@sqlite.org/sqlite-wasm");
-		sqliteModule = initializeBundledSqlite(
-			sqlite3InitModule as unknown as Parameters<
-				typeof initializeBundledSqlite<SqliteInit>
-			>[0],
-			decodeDataUrl(sqliteWasmUrl),
-		);
+		const initializing = (async () => {
+			const { default: sqlite3InitModule } =
+				await import("@sqlite.org/sqlite-wasm");
+			return initializeBundledSqlite(
+				sqlite3InitModule as unknown as Parameters<
+					typeof initializeBundledSqlite<SqliteInit>
+				>[0],
+				decodeDataUrl(sqliteWasmUrl),
+			);
+		})();
+		sqliteModule = initializing;
+		void initializing.catch(() => {
+			if (sqliteModule === initializing) sqliteModule = undefined;
+		});
 	}
 	return sqliteModule;
 }

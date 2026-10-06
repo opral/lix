@@ -4,6 +4,24 @@ import { OpfsBackend } from "../dist/direct.js";
 self.onmessage = async (event) => {
 	const name = `open-cleanup:${crypto.randomUUID()}`;
 	try {
+		if (event.data.scenario === "sqlite-retry") {
+			const compile = WebAssembly.compile;
+			const failure = new Error("interrupted SQLite compilation");
+			WebAssembly.compile = async () => { throw failure; };
+			let original;
+			try {
+				await OpfsBackend.open(name);
+			} catch (error) {
+				original = error;
+			} finally {
+				WebAssembly.compile = compile;
+			}
+			if (original !== failure) throw new Error("opening did not preserve compilation error");
+			const reopened = await OpfsBackend.open(name);
+			await reopened.close();
+			self.postMessage({ ok: true });
+			return;
+		}
 		if (event.data.scenario === "aliases") {
 			const first = await OpfsBackend.open(name + "\ud800");
 			let alias;
