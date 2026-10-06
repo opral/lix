@@ -303,6 +303,7 @@ pub(crate) async fn prepare_native_file_content_inputs(
     indexed: bool,
     path: &FilePathInterest,
     byte_range: Option<(u64, u64)>,
+    record_blob: &(dyn Fn(BlobId, Option<Range<u64>>) -> Result<(), LixError> + Send + Sync),
 ) -> Result<(), LixError> {
     let Some((prepared, range)) = select_native_file_content_rows(
         &hot_state,
@@ -321,12 +322,17 @@ pub(crate) async fn prepare_native_file_content_inputs(
         return Ok(());
     };
     prepare_native_file_plugin_inputs(&hot_state, &blob_reader, &prepared).await?;
-    // This deliberately supplies no PluginRenderContext. It still asks the
-    // canonical blob reader for the selected full/ranged bytes so the
-    // authority recorder can emit verified blob dependencies, without
-    // executing user/plugin code.
-    let _ =
-        exact_path_data_rows_from_prepared(&blob_reader, None, prepared, range.as_ref()).await?;
+    // Selection is native state work. Transferring its immutable payload is
+    // separate: record exact blob/range dependencies without loading unused
+    // SQL result bytes or constructing a closure-sized batch of file contents.
+    for file in prepared.file_rows.values() {
+        if let Some(blob) = prepared
+            .blob_rows
+            .get(&file.blob_ref_key(&prepared.live_rows))
+        {
+            record_blob(BlobId::from_hex(&blob.blob_hash)?, range.clone())?;
+        }
+    }
     Ok(())
 }
 

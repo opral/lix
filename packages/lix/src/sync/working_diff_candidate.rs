@@ -70,6 +70,7 @@ where
         return Ok(false);
     }
     let request = ReadFulfillmentRequest {
+        release: false,
         epoch_id: next.epoch_id().to_owned(),
         descriptor: next.descriptor().clone(),
         interests,
@@ -83,19 +84,16 @@ where
     if super::read_fulfillment::request_closure_is_ineligible(&request)? {
         return Ok(false);
     }
-    let response = super::read_fulfillment::fetch(transport, &request).await?;
-    if response.outcome != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
-        super::read_fulfillment::remember_request_closure_ineligible(&request, response.outcome)?;
+    let storage = engine.storage();
+    let mut response =
+        super::read_fulfillment::staging::fetch_staged(&storage, previous, transport, &request)
+            .await?;
+    if response.outcome() != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
+        super::read_fulfillment::remember_request_closure_ineligible(&request, response.outcome())?;
         return Ok(false);
     }
-    super::read_fulfillment::install_candidate_immutable(
-        &engine.storage(),
-        previous,
-        next,
-        &request,
-        &response,
-    )
-    .await?;
+    super::read_fulfillment::validate_candidate_basis(previous, next, &request)?;
+    response.promote(&request, true).await?;
     Ok(true)
 }
 

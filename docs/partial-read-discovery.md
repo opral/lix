@@ -80,19 +80,32 @@ avoids replacing an existing physical layout or exposing newer mutable rows.
 
 Recipes have a 512 KiB / 4,096-interest limit. Discovery is bounded by 65,536
 storage calls, 1 GiB of observed storage bytes, and a 256 MiB / 16,384-input
-closure. Pages carry up to 4 MiB of payload, except one native input may be as
-large as 64 MiB. A continuation identifies the next input and closure digest.
-The authority re-evaluates the pinned recipe for each page; deterministic input
-ordering and the closure digest reject changed or incomplete pagination. This
-keeps server state bounded without a cursor registry, at the cost of repeating
-local discovery work for large closures.
+closure. Every wire page has at most 4 MiB decoded payload; larger canonical
+members use ranges carrying address, total length, offset, and whole-member digest.
+A codec member remains capped separately at 64 MiB. Continuations carry opaque
+spool ownership plus exact input/offset progress and the complete closure digest.
+The authority discovers once in the pinned snapshot, seals its bounded spool,
+and revalidates account/repository/lease/epoch/request admission before serving
+later pages. Native scratch has a 512 MiB operation and 1 GiB process disk cap;
+sealed operations expire within two minutes and their baseline lease. In-flight
+capacity is reserved before discovery, and replay egress is charged to a hard
+three-times operation page/byte budget. Bound release requests finish or cancel
+idempotently; abrupt cancellation uses bounded expiry.
 
-The client assembles and verifies the bounded complete closure before publishing
-it. Oversized operations return an explicit bound error rather than silently
-falling back to per-pointer RPCs. Existing lower-level transfer primitives remain
-for writes and specialized history/diff paths. Captured historical diffs stay
-on that path because their endpoints can belong to private pending client
-history that the authority cannot evaluate. Protocol 19 peers are rejected; there is no compatibility fallback.
+The client reserves private physical scratch before receiving data, stages each
+page with admission fencing, then verifies the complete commitment, required
+frontier and selected-row membership using compact proof facts. Scratch grants
+no coverage. Only fully validated dependency groups enter normal storage through
+the existing CAS installer; owner bundles and payload/locator pairs remain atomic.
+Scratch is registered in format87, excluded from semantic snapshots and copied
+repository epochs, and has durable ownership/expiry/reaping. Its migration from86
+starts empty without changing authored rows or durable prepared attempts.
+
+Oversized operations return an explicit bound error or a supported typed native
+fallback. Lower-level bounded transfer primitives remain for writes and specialized
+history/diff paths. Captured historical diffs retain that path because private
+pending client history can be absent from the authority. Sync30 peers share this
+wire cutover; old live peers are rejected.
 
 ## Profiling
 
@@ -183,3 +196,32 @@ their scope, owner-representation, and receipt findings were addressed.
 
 CI follow-up also passes all 28 sync E2E tests (3 ignored), including offline
 folder moves and checkpoint publication after ordinary read warmup.
+
+Provider admission uses ordered point prefixes and bounded scan prefixes.
+Missing point slots and duplicate slots retain their positions, and each
+returned duplicate full value charges its bytes. Exact codec collectors may
+assemble provider pages only within a separate explicit aggregate codec limit;
+selected-row production consumes each page before advancing.
+
+SlateDB stores atomic value-length metadata in a tagged physical generation.
+Bounded mutable reads consult the corresponding snapshot/overlay length before
+payload I/O, and bounded scans traverse metadata before loading admitted values.
+The physical upgrade journals copied keys and the source sequence, retains the
+original generation, and protects its immutable segments from current-generation
+GC. Old binaries must be stopped for this physical upgrade; this is not a rolling
+protocol compatibility path. Legacy SlateDB has no size-only read API, so the
+upgrade can retain one unknown-size legacy value plus its bounded copy batch.
+Its ordinary new-generation reads do not have that exception. Tagged keys allow
+65,530 logical key bytes; an unrepresentable maximal legacy key causes a typed,
+recoverable refusal before completion publication and leaves the original
+physical repository intact. Native repository coordinates fit this limit.
+
+Client scratch admission is a durable two-operation ledger. Each frame append
+renews its operation lease in the same CAS publication as the frame bytes. An
+owned heartbeat renews the lease during network waits and promotion. Cleanup
+first marks the operation Reaping with a durable CAS, then removes frames in
+bounded pages, then releases the ledger slot. A cleanup crash leaves a resumable
+fence. Opening a partial replica holds its exclusive physical owner lease before
+reclaiming the previous owner's unfinished operations, including same-epoch work
+whose TTL has not elapsed. The periodic janitor reaps expired or old-epoch work
+without taking ownership away from a successfully renewed operation.

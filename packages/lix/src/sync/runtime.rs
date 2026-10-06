@@ -383,8 +383,7 @@ pub(super) fn native_sync_demand_request_for_error(
     if error.automatic_retry_is_forbidden() {
         return Ok(None);
     }
-    if let Some(locator) =
-        crate::sync::read_fulfillment::selected_change_payload_locator(error)
+    if let Some(locator) = crate::sync::read_fulfillment::selected_change_payload_locator(error)
         && crate::sync::read_fulfillment::interests_for_error(error)?.is_some()
     {
         return Ok(Some(SyncDemandRequest::NativeMetadata(
@@ -1703,7 +1702,9 @@ where
         let mut missing = Vec::new();
         for id in page {
             super::validate_blake3_id(id, "sync demanded chunk id")?;
-            if lix.get_sync_chunk(id).await?.is_none() { missing.push(id.clone()); }
+            if lix.get_sync_chunk(id).await?.is_none() {
+                missing.push(id.clone());
+            }
         }
         let values = super::transfer::fetch_chunk_page(transport, &missing).await?;
         for (id, value) in missing.iter().zip(values) {
@@ -1785,37 +1786,75 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    let inline_blob_ids = request.inline_blobs.iter()
-        .map(|manifest| manifest.blob_id.as_str()).collect::<BTreeSet<_>>();
-    let mut group = super::transfer::TransferBatch::new();
-    let load_chunk = |id: String| async move {
-        lix.get_sync_chunk(&id).await?
-            .ok_or_else(|| missing_chunk_error(&id, "upload group", "local push"))
+    let inline_blob_ids = request
+        .inline_blobs
+        .iter()
+        .map(|manifest| manifest.blob_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let storage = lix.storage_adapter();
+    let begin_read = || async {
+        storage
+            .begin_read(Default::default())
+            .await
+            .map_err(LixError::from)
     };
-    for blob_id in super::repository::sync_commit_blob_ids(&request.commits)? {
-        if inline_blob_ids.contains(blob_id.as_str()) { continue; }
-        let manifest = lix.get_sync_blob_manifest(&blob_id).await?.ok_or_else(|| {
-            LixError::new(LixError::CODE_INTERNAL_ERROR,
-                format!("local push references missing sync blob '{blob_id}'"))
-        })?;
-        let encoded = serde_json::to_vec(&manifest)
-            .map_err(|error| LixError::unknown(error.to_string()))?.len();
-        let decoded = if manifest.inline_bytes_base64.is_some() { manifest.size_bytes as usize } else { 0 };
-        if encoded.saturating_add(2) > super::transfer::CONTENT_GROUP_BYTES {
-            super::transfer::upload_manifest_page(transport, &group.items, load_chunk).await?;
-            group = super::transfer::TransferBatch::new();
-            super::transfer::upload_manifest_page(transport, &[manifest], load_chunk).await?;
-            continue;
-        }
-        if let Some(manifest) = group.push(manifest, encoded, decoded)? {
-            super::transfer::upload_manifest_page(transport, &group.items, load_chunk).await?;
-            group = super::transfer::TransferBatch::new();
-            if group.push(manifest, encoded, decoded)?.is_some() {
-                return Err(LixError::unknown("single content group member did not fit"));
+    let mut canonical_group = super::transfer::TransferBatch::new();
+    let mut inline_group = super::transfer::TransferBatch::new();
+    let ids = super::repository::sync_commit_blob_ids(&request.commits)?
+        .into_iter()
+        .filter(|id| !inline_blob_ids.contains(id.as_str()))
+        .map(|id| crate::binary_cas::BlobId::from_hex(&id))
+        .collect::<Result<Vec<_>, _>>()?;
+    for ids in ids.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+        let read = begin_read().await?;
+        let metadata = crate::binary_cas::load_metadata_many(&read, ids)
+            .await?
+            .into_vec();
+        drop(read);
+        for (id, metadata) in ids.iter().zip(metadata) {
+            let metadata = metadata.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("local push references missing sync blob '{}'", id.to_hex()),
+                )
+            })?;
+            let read = begin_read().await?;
+            if metadata.size_bytes <= super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+                let chunks = crate::binary_cas::load_canonical_blob_chunks(&read, *id)
+                    .await?
+                    .ok_or_else(|| LixError::unknown("local push blob content is missing"))?;
+                let manifest = super::blob::encode_manifest(*id, &chunks)?;
+                drop(read);
+                let encoded = serde_json::to_vec(&manifest)
+                    .map_err(|error| LixError::unknown(error.to_string()))?
+                    .len();
+                let decoded = manifest.size_bytes as usize;
+                if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+                    super::transfer::register_inline_group(transport, &inline_group).await?;
+                    inline_group = super::transfer::TransferBatch::new();
+                    if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                        return Err(LixError::unknown("single inline upload member did not fit"));
+                    }
+                }
+            } else {
+                let canonical =
+                    crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
+                drop(read);
+                super::transfer::pack_canonical_plan(
+                    transport,
+                    &mut canonical_group,
+                    super::transfer::CanonicalUploadPlan {
+                        metadata,
+                        canonical,
+                    },
+                    &begin_read,
+                )
+                .await?;
             }
         }
     }
-    super::transfer::upload_manifest_page(transport, &group.items, load_chunk).await
+    super::transfer::upload_canonical_page(transport, &canonical_group.items, &begin_read).await?;
+    super::transfer::register_inline_group(transport, &inline_group).await
 }
 
 async fn push_with_inline_fallback<StorageImpl, Transport>(
@@ -2315,17 +2354,19 @@ mod tests {
         }
 
         fn register_blobs<'a>(
-        &'a self,
-        manifests: &'a [crate::sync::SyncBlobManifest],
-    ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            for manifest in manifests { results.push(self.register_blob(manifest).await?); }
-            Ok(results)
-        })
-    }
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
 
-    fn register_blob<'a>(
+        fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {
@@ -2416,17 +2457,19 @@ mod tests {
         }
 
         fn register_blobs<'a>(
-        &'a self,
-        manifests: &'a [crate::sync::SyncBlobManifest],
-    ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            for manifest in manifests { results.push(self.register_blob(manifest).await?); }
-            Ok(results)
-        })
-    }
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
 
-    fn register_blob<'a>(
+        fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {
@@ -2728,17 +2771,19 @@ mod tests {
         }
 
         fn register_blobs<'a>(
-        &'a self,
-        manifests: &'a [crate::sync::SyncBlobManifest],
-    ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            for manifest in manifests { results.push(self.register_blob(manifest).await?); }
-            Ok(results)
-        })
-    }
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
 
-    fn register_blob<'a>(
+        fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {
@@ -2859,17 +2904,19 @@ mod tests {
         }
 
         fn register_blobs<'a>(
-        &'a self,
-        manifests: &'a [crate::sync::SyncBlobManifest],
-    ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            for manifest in manifests { results.push(self.register_blob(manifest).await?); }
-            Ok(results)
-        })
-    }
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
 
-    fn register_blob<'a>(
+        fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
         ) -> super::super::SyncTransportFuture<'a, super::super::SyncBlobRegistration> {

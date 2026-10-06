@@ -3,6 +3,7 @@ import type {
 	LixStorageGetManyRequest,
 	LixStorageKeyRange,
 	LixStorageReadOptions,
+	LixStorageReadBudget,
 	LixStorageScanOrder,
 	LixStorageSpace,
 } from "@lix-js/sdk";
@@ -26,6 +27,7 @@ export type OpfsRpcRequest = {
 		| "beginRead"
 		| "beginWrite"
 		| "readMany"
+		| "readManyPrefix"
 		| "scanPage"
 		| "commit";
 	payload: unknown;
@@ -88,6 +90,7 @@ export type OpfsReadManyPayload = {
 	sessionToken?: string;
 };
 export type OpfsScanPagePayload = {
+	budget?: LixStorageReadBudget;
 	space: LixStorageSpace;
 	range: LixStorageKeyRange;
 	after?: Uint8Array;

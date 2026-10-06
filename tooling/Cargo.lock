@@ -3341,6 +3341,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2",
  "smallvec",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

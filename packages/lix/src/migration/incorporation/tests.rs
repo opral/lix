@@ -262,6 +262,9 @@ async fn legacy_sql_checkpoints_preserve_members_without_inferred_provenance() {
         super::super::api::migrate_v86_marker(&adapter)
             .await
             .unwrap();
+        super::super::api::migrate_v87_marker(&adapter)
+            .await
+            .unwrap();
         let engine = crate::engine::Engine::new_with_adapter(
             adapter.clone(),
             crate::engine::EngineOptions::new(),
@@ -380,6 +383,9 @@ async fn legacy_headers_upgrade_without_rewriting_rows_history_or_membership() {
         .await
         .unwrap();
     super::super::api::migrate_v86_marker(&adapter)
+        .await
+        .unwrap();
+    super::super::api::migrate_v87_marker(&adapter)
         .await
         .unwrap();
     let engine =

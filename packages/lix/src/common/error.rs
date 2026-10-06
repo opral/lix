@@ -547,6 +547,11 @@ impl LixError {
 impl From<crate::storage_adapter::StorageError> for LixError {
     fn from(error: crate::storage_adapter::StorageError) -> Self {
         match error {
+            crate::storage_adapter::StorageError::ReadBudgetExceeded { singleton } => Self::new(
+                "LIX_NATIVE_RECIPE_WORK_BOUND",
+                "storage provider read byte budget exceeded",
+            )
+            .with_details(json!({"singleton": singleton})),
             crate::storage_adapter::StorageError::InUse => Self::new(
                 Self::CODE_STORAGE_IN_USE,
                 "storage is already open by another owner",
@@ -727,12 +732,16 @@ mod tests {
                 .as_deref(),
             Some("packages/storage-filesystem/src/filesystem.rs")
         );
-        assert!(origin("/build/agent/src/sql.rs")
-            .repository_relative_file()
-            .is_none());
-        assert!(origin("packages/lix/../private.rs")
-            .repository_relative_file()
-            .is_none());
+        assert!(
+            origin("/build/agent/src/sql.rs")
+                .repository_relative_file()
+                .is_none()
+        );
+        assert!(
+            origin("packages/lix/../private.rs")
+                .repository_relative_file()
+                .is_none()
+        );
     }
 
     #[test]

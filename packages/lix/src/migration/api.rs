@@ -92,7 +92,9 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83 | 84 | 85),
+            found_version:
+                found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 | 83 | 84 | 85
+                | 86),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -126,7 +128,8 @@ where
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
     let commit_records_rewritten = if from_version <= 74 {
-        migration_step(|| rewrite_commit_records_to_v6(&adapter, &storage, options, from_version)).await?
+        migration_step(|| rewrite_commit_records_to_v6(&adapter, &storage, options, from_version))
+            .await?
     } else {
         0
     };
@@ -144,7 +147,8 @@ where
         migration_step(|| migrate_v73_row_pk_indexes(&adapter, &storage, options)).await?;
     }
     let commit_members_rewritten = if from_version <= 74 {
-        migration_step(|| migrate_v74_complete_snapshot_commits(&adapter, &storage, options)).await?
+        migration_step(|| migrate_v74_complete_snapshot_commits(&adapter, &storage, options))
+            .await?
     } else {
         0
     };
@@ -205,23 +209,27 @@ where
         _ => None,
     };
     let legacy_commit_records_rewritten = if let Some(marker) = legacy_commit_records_rewritten {
-        migration_step(|| super::checkpoint_metadata::normalize_v7_records(&adapter, options, marker))
-            .await?
+        migration_step(|| {
+            super::checkpoint_metadata::normalize_v7_records(&adapter, options, marker)
+        })
+        .await?
     } else {
         0
     };
     if from_version <= 78 {
-        migration_step(|| backfill_missing_row_pk_indexes(
-            &adapter,
-            &storage,
-            options,
-            78,
-            crate::init::REPOSITORY_PROTOCOL_V78,
-            crate::init::REPOSITORY_PROTOCOL_V78,
-            "v79 complete row-PK catalog repair",
-            false,
-            true,
-        ))
+        migration_step(|| {
+            backfill_missing_row_pk_indexes(
+                &adapter,
+                &storage,
+                options,
+                78,
+                crate::init::REPOSITORY_PROTOCOL_V78,
+                crate::init::REPOSITORY_PROTOCOL_V78,
+                "v79 complete row-PK catalog repair",
+                false,
+                true,
+            )
+        })
         .await?;
         migration_step(|| super::deterministic_witness::backfill(&adapter, options, true)).await?;
     }
@@ -238,16 +246,17 @@ where
         migration_step(|| super::author_storage::migrate(&adapter, options, false)).await?;
     }
     if from_version <= 83 {
-        migration_step(|| {
-            super::first_parent_checkpoints::migrate(&adapter, options, false)
-        })
-        .await?;
+        migration_step(|| super::first_parent_checkpoints::migrate(&adapter, options, false))
+            .await?;
     }
     if from_version <= 84 {
         migration_step(|| super::semantic_fingerprint_format::migrate(&adapter, false)).await?;
     }
     if from_version <= 85 {
         migration_step(|| migrate_v86_marker(&adapter)).await?;
+    }
+    if from_version <= 86 {
+        migration_step(|| migrate_v87_marker(&adapter)).await?;
     }
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
@@ -277,22 +286,72 @@ where
         .ok_or_else(|| migration_error("v86 format migration has no repository marker"))?;
     if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_VALUE
         || marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE
+        || marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V86
+        || marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86
     {
         return Ok(());
     }
     let (expected, next) = if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V85 {
         (
             crate::init::REPOSITORY_PROTOCOL_V85,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::init::REPOSITORY_PROTOCOL_V86,
         )
     } else if marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85 {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85,
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86,
         )
     } else {
         return Err(migration_error(
             "v86 format migration observed an unexpected repository marker",
+        ));
+    };
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
+    let revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .map_err(storage_error)?;
+    read.finish().map_err(storage_error)?;
+    crate::migration::publish::publish(
+        adapter,
+        revision,
+        expected,
+        next,
+        crate::migration::publish::PublicationPlan::bounded(0, 0),
+    )
+    .await?;
+    Ok(())
+}
+
+/// New scratch starts empty; no authored row or durable replay identity changes.
+pub(super) async fn migrate_v87_marker<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let marker = load_repository_protocol_marker(adapter)
+        .await?
+        .ok_or_else(|| migration_error("v87 format migration has no repository marker"))?;
+    if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_VALUE
+        || marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE
+    {
+        return Ok(());
+    }
+    let (expected, next) = if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V86 {
+        (
+            crate::init::REPOSITORY_PROTOCOL_V86,
+            crate::init::REPOSITORY_PROTOCOL_VALUE,
+        )
+    } else if marker.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86 {
+        (
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+        )
+    } else {
+        return Err(migration_error(
+            "v87 format migration observed an unexpected repository marker",
         ));
     };
     let read = super::MigrationPlanningRead::new(adapter)
@@ -776,8 +835,8 @@ where
                 .map_err(|error| migration_error(format!("repair created_at: {error}")))?,
             updated_at: crate::common::LixTimestamp::parse(&row.updated_at)
                 .map_err(|error| migration_error(format!("repair updated_at: {error}")))?,
-                semantic_fingerprint: None,
-            })
+            semantic_fingerprint: None,
+        })
     }
 
     fn push_missing_directories(

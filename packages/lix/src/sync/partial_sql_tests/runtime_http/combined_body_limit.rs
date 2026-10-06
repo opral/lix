@@ -300,32 +300,33 @@ async fn content_groups_split_explicit_proxy_limits_and_preserve_all_identities(
     crate::sync::transfer::register_inline_group(&transport, &group)
         .await
         .unwrap();
-    let requests = requests.lock().unwrap();
-    assert_eq!(
-        requests.len(),
-        7,
-        "8 members split into four bounded groups of two"
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|(_, _, status)| *status == 413)
-            .count(),
-        3
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|(_, bytes, status)| *status == 200 && *bytes <= BODY_CAP)
-            .count(),
-        4
-    );
-    assert!(
-        requests
-            .iter()
-            .all(|(url, _, _)| url.ends_with("/sync/blobs"))
-    );
-    drop(requests);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            7,
+            "8 members split into four bounded groups of two"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, _, status)| *status == 413)
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, bytes, status)| *status == 200 && *bytes <= BODY_CAP)
+                .count(),
+            4
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|(url, _, _)| url.ends_with("/sync/blobs"))
+        );
+    }
     for id in ids {
         assert!(
             authority

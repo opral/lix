@@ -60,15 +60,22 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
 use std::io::{Read, Seek, SeekFrom};
 
 const DB_PATH: &str = "db";
-const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
+const LEGACY_SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
+const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v3";
+const VALUE_TAG: u8 = b'V';
+const LENGTH_TAG: u8 = b'L';
+const LAYOUT_COMPLETE_KEY: &[u8] = b"\0lix-physical-layout-complete";
+const LAYOUT_PROGRESS_KEY: &[u8] = b"\0lix-physical-layout-progress";
+const LAYOUT_SOURCE_SEQ_KEY: &[u8] = b"\0lix-physical-layout-source-sequence";
+const LEGACY_SEGMENT_PREFIX: &[u8] = b"\0lix-legacy-immutable-segment:";
 const IMMUTABLE_VALUE_PATH: &str = "lix-immutable-value-segment-v1";
 const IMMUTABLE_VALUE_CACHE_PATH: &str = "lix-immutable-value-segment-v1";
 const IMMUTABLE_CACHE_VALUE_MAGIC: &[u8; 8] = b"LIXICV5\0";
 const IMMUTABLE_VALUE_IO_CONCURRENCY: usize = 32;
 const IMMUTABLE_CACHE_EXTENT_BYTES: usize = 8 * 1024 * 1024;
 const IMMUTABLE_GC_GRACE: Duration = Duration::from_secs(60 * 60);
-const SPACE_PREFIX_LEN: usize = 4;
-const SPACE_PREFIX_EXTRACTOR_NAME: &str = "lix-storage-space-be32-v1";
+const SPACE_PREFIX_LEN: usize = 5;
+const SPACE_PREFIX_EXTRACTOR_NAME: &str = "lix-storage-tag-space-be32-v2";
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
 const POINT_READ_CONCURRENCY: usize = 64;
@@ -2672,14 +2679,48 @@ async fn collect_startup_immutable_garbage_from_database(
     let snapshot = database.snapshot().await.map_err(slatedb_error)?;
     let scan_options = slatedb_scan_options(ReadDurability::Visible);
     let mut rows = snapshot
-        .scan_with_options(.., &scan_options)
+        .scan_with_options(
+            (
+                Bound::Included(Bytes::from_static(b"L")),
+                Bound::Excluded(Bytes::from_static(b"M")),
+            ),
+            &scan_options,
+        )
         .await
         .map_err(slatedb_error)?;
     let mut reachable = HashSet::new();
     while let Some(row) = rows.next().await.map_err(slatedb_error)? {
-        if let Ok(locator) = decode_immutable_locator(&row.value) {
+        let length = decode_value_length(&row.value)?;
+        if length > 1024 {
+            continue;
+        }
+        let key = tagged_key(&Key(row.key), VALUE_TAG)?;
+        let value = get_snapshot_value(snapshot.clone(), key, ReadDurability::Visible)
+            .await?
+            .ok_or_else(|| StorageError::Corruption("indexed GC payload is absent".into()))?;
+        if value.len() != length {
+            return Err(StorageError::Corruption(
+                "indexed GC payload length changed".into(),
+            ));
+        }
+        if let Ok(locator) = decode_immutable_locator(&value) {
             reachable.insert(locator.segment_id);
         }
+    }
+    let mut protected = snapshot
+        .scan((
+            Bound::Included(Bytes::from_static(LEGACY_SEGMENT_PREFIX)),
+            Bound::Excluded(Bytes::from_static(b"\0lix-legacy-immutable-segment;")),
+        ))
+        .await
+        .map_err(slatedb_error)?;
+    while let Some(row) = protected.next().await.map_err(slatedb_error)? {
+        if !row.value.is_empty() || row.key.len() != LEGACY_SEGMENT_PREFIX.len() + 32 {
+            return Err(StorageError::Corruption(
+                "invalid protected legacy immutable segment".into(),
+            ));
+        }
+        reachable.insert(Key(row.key.slice(LEGACY_SEGMENT_PREFIX.len()..)));
     }
     store.collect_unreachable(reachable, cutoff).await
 }
@@ -2780,7 +2821,7 @@ async fn check_preconditions(
 
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
-                        let range = physical_range(space.id, range.clone())?;
+                        let range = tagged_physical_range(LENGTH_TAG, space.id, range.clone())?;
                         let bounds = EncodedBounds::new(range.clone());
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
                         let visible_writes =
@@ -2856,13 +2897,39 @@ async fn get_cached_snapshot_values(
         .collect())
 }
 
+async fn read_visible_snapshot_point(
+    snapshot: &Arc<DbSnapshot>,
+    durability: ReadDurability,
+    pipeline: &WritePipeline,
+    view: Option<(u64, u64)>,
+    cache: &SnapshotPointCache,
+    key: Key,
+) -> Result<Option<Bytes>, StorageError> {
+    if let Some(value) =
+        view.and_then(|(sequence, publication)| pipeline.point_value(sequence, publication, &key))
+    {
+        return Ok(value);
+    }
+    if durability == ReadDurability::Visible {
+        if let Some(value) = cache.get(snapshot.seq(), &key) {
+            return Ok(value);
+        }
+        let value = get_snapshot_value(snapshot.clone(), key.clone(), durability).await?;
+        cache.insert(snapshot.seq(), key, value.clone());
+        Ok(value)
+    } else {
+        get_snapshot_value(snapshot.clone(), key, durability).await
+    }
+}
+
 fn point_precondition_physical_key(
     precondition: &Precondition,
 ) -> Result<Option<Key>, StorageError> {
     match precondition {
-        Precondition::KeyAbsent { space, key }
-        | Precondition::KeyPresent { space, key }
-        | Precondition::KeyValueHashEquals { space, key, .. }
+        Precondition::KeyAbsent { space, key } | Precondition::KeyPresent { space, key } => {
+            tagged_key(&physical_key(space.id, key)?, LENGTH_TAG).map(Some)
+        }
+        Precondition::KeyValueHashEquals { space, key, .. }
         | Precondition::KeyValueEquals { space, key, .. } => physical_key(space.id, key).map(Some),
         Precondition::RangeEmpty { .. } => Ok(None),
     }
@@ -3053,6 +3120,237 @@ impl StorageRead for SlateDBRead {
         }
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: lix::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        self.write_pipeline.terminal_error()?;
+        let singleton = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>()
+            == 1;
+        let owned = requests
+            .iter()
+            .flat_map(|request| {
+                request.keys.iter().map(move |key| {
+                    Ok((
+                        physical_key(request.space.id, key)?,
+                        request.space.value_semantics,
+                        request.opts.projection,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let snapshot = Arc::clone(&self.snapshot);
+        let durability = self.durability;
+        let pipeline = self.write_pipeline.clone();
+        let view = self
+            .publication_view
+            .as_ref()
+            .map(|view| (view.snapshot_sequence, view.publication_id));
+        let cache = self.point_cache.clone();
+        let mut results = self
+            .worker
+            .call_read(move |_db| async move {
+                let mut results = Vec::with_capacity(owned.len());
+                let mut admitted = 0usize;
+                for (key, semantics, projection) in owned {
+                    let length_key = tagged_key(&key, LENGTH_TAG)?;
+                    let length_record = read_visible_snapshot_point(
+                        &snapshot, durability, &pipeline, view, &cache, length_key,
+                    )
+                    .await?;
+                    let Some(length_record) = length_record else {
+                        results.push(None);
+                        continue;
+                    };
+                    let physical_bytes = decode_value_length(&length_record)?;
+                    // Key-only projections never load the payload. Mutable
+                    // values are admitted using their MVCC length row first.
+                    if projection == CoreProjection::KeyOnly {
+                        results.push(Some(ProjectedValue::KeyOnly));
+                        continue;
+                    }
+                    if semantics != ValueSemantics::Immutable {
+                        budget.admit_value(physical_bytes, admitted, singleton)?;
+                    } else if physical_bytes > 1024 {
+                        return Err(StorageError::Corruption(
+                            "immutable locator exceeds metadata codec bound".into(),
+                        ));
+                    }
+                    let value = read_visible_snapshot_point(
+                        &snapshot, durability, &pipeline, view, &cache, key,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        StorageError::Corruption("SlateDB indexed payload is absent".into())
+                    })?;
+                    if value.len() != physical_bytes {
+                        return Err(StorageError::Corruption(
+                            "SlateDB indexed payload length changed".into(),
+                        ));
+                    }
+                    let value = Some(value);
+                    if let Some(value) = value {
+                        let logical_bytes = if projection == CoreProjection::KeyOnly {
+                            0
+                        } else if semantics == ValueSemantics::Immutable {
+                            // The authenticated physical locator supplies the
+                            // exact encoded range before out-of-line content I/O.
+                            decode_immutable_locator(&value)?
+                                .range
+                                .len()
+                                .checked_sub(16)
+                                .ok_or_else(|| {
+                                    StorageError::Corruption(
+                                        "immutable locator lacks value envelope".into(),
+                                    )
+                                })?
+                        } else {
+                            value.len()
+                        };
+                        admitted = budget.admit_value(logical_bytes, admitted, singleton)?;
+                        results.push(Some(project_value(value, projection)));
+                    } else {
+                        results.push(None);
+                    }
+                }
+                Ok(results)
+            })
+            .await?;
+        // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
+        // operation. Exact ranges retain the existing shared/coalesced loader.
+        let mut exact_store = self.immutable_value_store.clone();
+        exact_store.cache = None;
+        hydrate_immutable_value_gets(&self.worker, &exact_store, requests, &mut results).await?;
+        budget.validate_result(&results)?;
+        Ok(GetManyResult::new(results))
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> Result<lix::storage::GetManyPrefixResult, StorageError> {
+        self.write_pipeline.terminal_error()?;
+        let (window, total) = lix::storage::bounded_prefix_requests(requests, offset, max_slots)?;
+        let requests = window.as_slice();
+        let owned = requests
+            .iter()
+            .flat_map(|request| {
+                request.keys.iter().map(move |key| {
+                    Ok((
+                        physical_key(request.space.id, key)?,
+                        request.space.value_semantics,
+                        request.opts.projection,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let snapshot = Arc::clone(&self.snapshot);
+        let durability = self.durability;
+        let pipeline = self.write_pipeline.clone();
+        let view = self
+            .publication_view
+            .as_ref()
+            .map(|view| (view.snapshot_sequence, view.publication_id));
+        let cache = self.point_cache.clone();
+        let mut results = self
+            .worker
+            .call_read(move |_db| async move {
+                let mut results = Vec::with_capacity(owned.len());
+                let mut admitted = 0usize;
+                for (key, semantics, projection) in owned {
+                    let length_key = tagged_key(&key, LENGTH_TAG)?;
+                    let length_record = read_visible_snapshot_point(
+                        &snapshot, durability, &pipeline, view, &cache, length_key,
+                    )
+                    .await?;
+                    let Some(length_record) = length_record else {
+                        results.push(None);
+                        continue;
+                    };
+                    let physical_bytes = decode_value_length(&length_record)?;
+                    // Key-only projections never load the payload. Mutable
+                    // values are admitted using their MVCC length row first.
+                    if projection == CoreProjection::KeyOnly {
+                        results.push(Some(ProjectedValue::KeyOnly));
+                        continue;
+                    }
+                    if semantics != ValueSemantics::Immutable {
+                        match budget.admit_value(physical_bytes, admitted, results.is_empty()) {
+                            Ok(_) => {}
+                            Err(error) if results.is_empty() => return Err(error),
+                            Err(_) => break,
+                        }
+                    } else if physical_bytes > 1024 {
+                        return Err(StorageError::Corruption(
+                            "immutable locator exceeds metadata codec bound".into(),
+                        ));
+                    }
+                    let value = read_visible_snapshot_point(
+                        &snapshot, durability, &pipeline, view, &cache, key,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        StorageError::Corruption("SlateDB indexed payload is absent".into())
+                    })?;
+                    if value.len() != physical_bytes {
+                        return Err(StorageError::Corruption(
+                            "SlateDB indexed payload length changed".into(),
+                        ));
+                    }
+                    let value = Some(value);
+                    if let Some(value) = value {
+                        let logical_bytes = if projection == CoreProjection::KeyOnly {
+                            0
+                        } else if semantics == ValueSemantics::Immutable {
+                            // The authenticated physical locator supplies the
+                            // exact encoded range before out-of-line content I/O.
+                            decode_immutable_locator(&value)?
+                                .range
+                                .len()
+                                .checked_sub(16)
+                                .ok_or_else(|| {
+                                    StorageError::Corruption(
+                                        "immutable locator lacks value envelope".into(),
+                                    )
+                                })?
+                        } else {
+                            value.len()
+                        };
+                        match budget.admit_value(logical_bytes, admitted, results.is_empty()) {
+                            Ok(next) => admitted = next,
+                            Err(error) if results.is_empty() => return Err(error),
+                            Err(_) => break,
+                        }
+                        results.push(Some(project_value(value, projection)));
+                    } else {
+                        results.push(None);
+                    }
+                    if admitted > budget.max_result_bytes {
+                        break;
+                    }
+                }
+                Ok(results)
+            })
+            .await?;
+        // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
+        // operation. Exact ranges retain the existing shared/coalesced loader.
+        let mut exact_store = self.immutable_value_store.clone();
+        exact_store.cache = None;
+        let (admitted_requests, _) =
+            lix::storage::bounded_prefix_requests(requests, 0, results.len().max(1))?;
+        hydrate_immutable_value_gets(&self.worker, &exact_store, &admitted_requests, &mut results)
+            .await?;
+        budget.validate_result(&results)?;
+        lix::storage::GetManyPrefixResult::new(results, offset, total)
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -3065,7 +3363,8 @@ impl StorageRead for SlateDBRead {
             if opts.order == ScanOrder::Descending {
                 return Err(StorageError::Unsupported(Capability::ReverseScan));
             }
-            let bounds = EncodedBounds::new(physical_range(space.id, range.clone())?);
+            let bounds =
+                EncodedBounds::new(tagged_physical_range(LENGTH_TAG, space.id, range.clone())?);
             let visible_writes = self
                 .publication_view
                 .as_ref()
@@ -3074,15 +3373,27 @@ impl StorageRead for SlateDBRead {
                         .visible_writes(view.snapshot_sequence, view.publication_id)
                 });
             let state = if bounds.is_empty() {
-                SlateStreamingScanState::empty(bounds, visible_writes)
+                SlateStreamingScanState::empty(
+                    bounds,
+                    visible_writes,
+                    self.snapshot.clone(),
+                    self.durability,
+                )
             } else {
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
                 let scan_bounds = bounds.clone();
                 self.worker
                     .call_read(move |_db| async move {
-                        let iter = open_snapshot_scan(snapshot, scan_bounds, durability).await?;
-                        Ok(SlateStreamingScanState::new(iter, bounds, visible_writes))
+                        let iter =
+                            open_snapshot_scan(snapshot.clone(), scan_bounds, durability).await?;
+                        Ok(SlateStreamingScanState::new(
+                            iter,
+                            bounds,
+                            visible_writes,
+                            snapshot,
+                            durability,
+                        ))
                     })
                     .await?
             };
@@ -3128,7 +3439,7 @@ impl StorageScanSource for SlateDBScanSource {
             self.write_pipeline.terminal_error()?;
             let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
             let projection = self.projection;
-            let space_id = self.space.id;
+            let space = self.space;
             #[cfg(test)]
             let worker_gate = self.worker_gate.clone();
             let (state, chunk) = self
@@ -3140,7 +3451,14 @@ impl StorageScanSource for SlateDBScanSource {
                         gate.entered_notify.notify_waiters();
                         gate.release.notified().await;
                     }
-                    streaming_scan_page(state, limit_rows, projection, space_id).await
+                    streaming_scan_page_bounded(
+                        state,
+                        limit_rows,
+                        projection,
+                        space,
+                        lix::storage::ReadBudget::UNBOUNDED,
+                    )
+                    .await
                 })
                 .await?;
             self.state = Some(state);
@@ -3162,6 +3480,37 @@ impl StorageScanSource for SlateDBScanSource {
             Ok(ScanChunk::new(entries, has_more))
         })
     }
+    fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            self.write_pipeline.terminal_error()?;
+            let state = self.state.take().ok_or(StorageError::InvalidCursor)?;
+            let projection = self.projection;
+            let space = self.space;
+            let (state, chunk) = self
+                .worker
+                .call_read(move |_db| async move {
+                    streaming_scan_page_bounded(state, limit_rows, projection, space, budget).await
+                })
+                .await?;
+            self.state = Some(state);
+            let (mut entries, more) = chunk.into_parts();
+            let mut exact_store = self.immutable_value_store.clone();
+            exact_store.cache = None;
+            hydrate_immutable_value_scan(
+                &self.worker,
+                &exact_store,
+                self.space,
+                self.projection,
+                &mut entries,
+            )
+            .await?;
+            Ok(ScanChunk::new(entries, more))
+        })
+    }
 }
 
 struct SlateStreamingScanState {
@@ -3169,29 +3518,69 @@ struct SlateStreamingScanState {
     base_pending: Option<KeyValue>,
     overlays: StreamingOverlayCursor,
     output_pending: Option<(Key, Bytes)>,
+    snapshot: Arc<DbSnapshot>,
+    durability: ReadDurability,
+    visible_writes: Vec<Arc<PublishedWrite>>,
 }
-
 impl SlateStreamingScanState {
     fn new(
         iter: DbIterator,
         bounds: EncodedBounds,
         visible_writes: Vec<Arc<PublishedWrite>>,
+        snapshot: Arc<DbSnapshot>,
+        durability: ReadDurability,
     ) -> Self {
         Self {
             iter: Some(iter),
             base_pending: None,
-            overlays: StreamingOverlayCursor::new(bounds, visible_writes),
+            overlays: StreamingOverlayCursor::new(bounds, visible_writes.clone()),
             output_pending: None,
+            snapshot,
+            durability,
+            visible_writes,
         }
     }
-
-    fn empty(bounds: EncodedBounds, visible_writes: Vec<Arc<PublishedWrite>>) -> Self {
+    fn empty(
+        bounds: EncodedBounds,
+        visible_writes: Vec<Arc<PublishedWrite>>,
+        snapshot: Arc<DbSnapshot>,
+        durability: ReadDurability,
+    ) -> Self {
         Self {
             iter: None,
             base_pending: None,
-            overlays: StreamingOverlayCursor::new(bounds, visible_writes),
+            overlays: StreamingOverlayCursor::new(bounds, visible_writes.clone()),
             output_pending: None,
+            snapshot,
+            durability,
+            visible_writes,
         }
+    }
+    async fn payload(
+        &self,
+        length_key: &Key,
+        expected_bytes: usize,
+    ) -> Result<Bytes, StorageError> {
+        let key = tagged_key(length_key, VALUE_TAG)?;
+        let overlay = self
+            .visible_writes
+            .iter()
+            .rev()
+            .find_map(|write| write.overlay.get(&key));
+        let value = if let Some(value) = overlay {
+            value.clone()
+        } else {
+            get_snapshot_value(self.snapshot.clone(), key, self.durability).await?
+        };
+        let value = value.ok_or_else(|| {
+            StorageError::Corruption("SlateDB indexed scan payload is absent".into())
+        })?;
+        if value.len() != expected_bytes {
+            return Err(StorageError::Corruption(
+                "SlateDB indexed scan payload length changed".into(),
+            ));
+        }
+        Ok(value)
     }
 }
 
@@ -3312,42 +3701,83 @@ fn bound_vec_to_key(bound: &Bound<Vec<u8>>) -> Bound<Key> {
     }
 }
 
-async fn streaming_scan_page(
+async fn streaming_scan_page_bounded(
     mut state: SlateStreamingScanState,
     limit_rows: usize,
     projection: CoreProjection,
-    space_id: SpaceId,
+    space: StorageSpace,
+    budget: lix::storage::ReadBudget,
 ) -> Result<(SlateStreamingScanState, ScanChunk), StorageError> {
-    let mut rows = Vec::with_capacity(limit_rows);
-    if let Some(row) = state.output_pending.take() {
-        rows.push(row);
-    }
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
     while rows.len() < limit_rows {
-        let Some(row) = next_streaming_visible_row(&mut state).await? else {
+        let row = if let Some(row) = state.output_pending.take() {
+            Some(row)
+        } else {
+            next_streaming_visible_row(&mut state).await?
+        };
+        let Some((key, length_record)) = row else {
             break;
         };
-        rows.push(row);
-    }
-    state.output_pending = next_streaming_visible_row(&mut state).await?;
-    let has_more = state.output_pending.is_some();
-    let entries = rows
-        .into_iter()
-        .map(|(key, value)| {
-            if key.0.len() < SPACE_PREFIX_LEN
-                || key.0[..SPACE_PREFIX_LEN] != space_id.0.to_be_bytes()
-            {
-                return Err(StorageError::Corruption(format!(
-                    "slatedb scan key escaped its storage space: {:?}",
-                    key.0
-                )));
+        if key.0.len() < SPACE_PREFIX_LEN
+            || key.0[..SPACE_PREFIX_LEN] != tagged_space_prefix(LENGTH_TAG, space.id)[..]
+        {
+            return Err(StorageError::Corruption(
+                "SlateDB length scan escaped storage space".into(),
+            ));
+        }
+        let physical_bytes = decode_value_length(&length_record)?;
+        let mut marker = None;
+        let logical_bytes = if projection == CoreProjection::KeyOnly {
+            0
+        } else if space.value_semantics == ValueSemantics::Immutable {
+            if physical_bytes > 1024 {
+                return Err(StorageError::Corruption(
+                    "immutable locator exceeds metadata codec bound".into(),
+                ));
             }
-            Ok(ReadEntry {
-                key: Key(key.0.slice(SPACE_PREFIX_LEN..)),
-                value: project_value(value, projection),
+            let value = state.payload(&key, physical_bytes).await?;
+            let logical_bytes = decode_immutable_locator(&value)?
+                .range
+                .len()
+                .checked_sub(16)
+                .ok_or_else(|| {
+                    StorageError::Corruption("immutable locator lacks value envelope".into())
+                })?;
+            marker = Some(value);
+            logical_bytes
+        } else {
+            physical_bytes
+        };
+        match budget.admit_value(logical_bytes, bytes, rows.is_empty()) {
+            Ok(next) => bytes = next,
+            Err(error) if rows.is_empty() => return Err(error),
+            Err(_) => {
+                state.output_pending = Some((key, length_record));
+                break;
+            }
+        }
+        let value = if projection == CoreProjection::KeyOnly {
+            ProjectedValue::KeyOnly
+        } else {
+            ProjectedValue::FullValue(match marker {
+                Some(value) => value,
+                None => state.payload(&key, physical_bytes).await?,
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((state, ScanChunk::new(entries, has_more)))
+        };
+        rows.push(ReadEntry {
+            key: Key(key.0.slice(SPACE_PREFIX_LEN..)),
+            value,
+        });
+        if bytes > budget.max_result_bytes {
+            break;
+        }
+    }
+    if state.output_pending.is_none() {
+        state.output_pending = next_streaming_visible_row(&mut state).await?;
+    }
+    let more = state.output_pending.is_some();
+    Ok((state, ScanChunk::new(rows, more)))
 }
 
 async fn next_streaming_visible_row(
@@ -3668,6 +4098,7 @@ impl StorageWrite for SlateDBWrite {
             let space_prefix = space.id.0.to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for entry in &entries.entries {
+                physical_keys.push(VALUE_TAG);
                 physical_keys.extend_from_slice(&space_prefix);
                 physical_keys.extend_from_slice(&entry.key.0);
             }
@@ -3764,6 +4195,7 @@ impl StorageWrite for SlateDBWrite {
             let space_prefix = space.id.0.to_be_bytes();
             let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for key in keys {
+                physical_keys.push(VALUE_TAG);
                 physical_keys.extend_from_slice(&space_prefix);
                 physical_keys.extend_from_slice(&key.0);
             }
@@ -3795,8 +4227,9 @@ impl StorageWrite for SlateDBWrite {
             if !self.background_maintenance {
                 self.serialize_publication().await?;
             }
+            let bounds =
+                EncodedBounds::new(tagged_physical_range(LENGTH_TAG, space.id, range.clone())?);
             let range = physical_range(space.id, range)?;
-            let bounds = EncodedBounds::new(range.clone());
             if bounds.is_empty() {
                 self.stats.deleted_ranges += 1;
                 self.stats.storage_calls += 1;
@@ -3822,7 +4255,10 @@ impl StorageWrite for SlateDBWrite {
             let base_keys = self
                 .worker
                 .call_read(move |_db| collect_snapshot_keys(base, bounds))
-                .await?;
+                .await?
+                .iter()
+                .map(|key| tagged_key(key, VALUE_TAG))
+                .collect::<Result<Vec<_>, StorageError>>()?;
 
             let overlay_keys = self
                 .overlay
@@ -3853,15 +4289,6 @@ impl StorageWrite for SlateDBWrite {
             // serialized publication lane. Maintenance then holds the gate
             // only for validation and atomic pipeline publication.
             let overlay_entries = this.overlay.len();
-            let overlay_bytes = this
-                .overlay
-                .iter()
-                .map(|(key, value)| {
-                    key.0
-                        .len()
-                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
-                })
-                .sum::<usize>();
             if this.background_maintenance
                 && (overlay_entries > BACKGROUND_MAINTENANCE_MAX_MUTATIONS
                     || this.stats.written_bytes > BACKGROUND_MAINTENANCE_MAX_WRITTEN_BYTES
@@ -3874,6 +4301,31 @@ impl StorageWrite for SlateDBWrite {
                 )));
             }
             this.serialize_publication().await?;
+            // Backend metadata and values share the same MVCC publication,
+            // visible overlay, WAL batch, and tombstone lifecycle.
+            let lengths = this
+                .overlay
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        tagged_key(key, LENGTH_TAG)?,
+                        value.as_ref().map(|value| encode_value_length(value.len())),
+                    ))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            for (key, value) in lengths {
+                this.overlay.insert(key, value);
+            }
+            let overlay_entries = this.overlay.len();
+            let overlay_bytes = this
+                .overlay
+                .iter()
+                .map(|(key, value)| {
+                    key.0
+                        .len()
+                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
+                })
+                .sum::<usize>();
             let Self {
                 worker,
                 write_pipeline,
@@ -4543,7 +4995,7 @@ fn open_slatedb(
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
         let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
-        let mut builder = Db::builder(physical_db_path, object_store)
+        let mut builder = Db::builder(physical_db_path, Arc::clone(&object_store))
             .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
             .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))]);
         if let Some(metrics) = metrics {
@@ -4575,8 +5027,188 @@ fn open_slatedb(
                 DEFAULT_METADATA_CACHE_BYTES,
             ));
         }
-        builder.build().await.map_err(slatedb_error)
+        let db = builder.build().await.map_err(slatedb_error)?;
+        if let Err(error) = migrate_physical_layout(&db, &db_path, object_store).await {
+            let _ = db.close().await;
+            return Err(error);
+        }
+        Ok(db)
     })
+}
+
+/// One-time physical upgrade. Legacy SlateDB has no size-only projection:
+/// migration retains one legacy codec member in addition to its bounded batch.
+/// Routine reads of the new generation use length rows before payload I/O.
+/// The original generation stays intact, and every durable batch journals its
+/// last copied key; interruption resumes the same immutable legacy snapshot.
+async fn migrate_physical_layout(
+    db: &Db,
+    db_path: &str,
+    store: Arc<dyn ObjectStore>,
+) -> Result<(), StorageError> {
+    if let Some(version) = db.get(LAYOUT_COMPLETE_KEY).await.map_err(slatedb_error)? {
+        return if version.as_ref() == b"3" {
+            Ok(())
+        } else {
+            Err(StorageError::Corruption(
+                "unsupported SlateDB physical layout marker".into(),
+            ))
+        };
+    }
+    let legacy_path = join_db_path(db_path, LEGACY_SEGMENTED_FORMAT_PATH);
+    let legacy_prefix = ObjectPath::from(legacy_path.clone());
+    let has_legacy = store
+        .list(Some(&legacy_prefix))
+        .next()
+        .await
+        .transpose()
+        .map_err(object_store_error)?
+        .is_some();
+    if has_legacy {
+        let legacy = Db::builder(legacy_path, store)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .map_err(slatedb_error)?;
+        let copied = async {
+            copy_legacy_physical_rows(db, &legacy).await?;
+            let final_sequence = legacy
+                .snapshot()
+                .await
+                .map_err(slatedb_error)?
+                .seq()
+                .to_be_bytes();
+            let expected = db.get(LAYOUT_SOURCE_SEQ_KEY).await.map_err(slatedb_error)?;
+            if expected.as_ref().map(Bytes::as_ref) != Some(final_sequence.as_slice()) {
+                return Err(StorageError::Corruption(
+                    "legacy SlateDB generation advanced before migration publication".into(),
+                ));
+            }
+            // The migration's old-path writer remains open (and fences prior
+            // writers) through completion. Concurrent old binaries are not a
+            // supported rolling-upgrade mode.
+            finish_physical_layout(db).await
+        }
+        .await;
+        let closed = legacy.close().await.map_err(slatedb_error);
+        copied?;
+        closed?;
+        return Ok(());
+    }
+    finish_physical_layout(db).await
+}
+async fn finish_physical_layout(db: &Db) -> Result<(), StorageError> {
+    let mut batch = WriteBatch::new();
+    batch.put(LAYOUT_COMPLETE_KEY, b"3");
+    batch.delete(LAYOUT_PROGRESS_KEY);
+    batch.delete(LAYOUT_SOURCE_SEQ_KEY);
+    db.write_with_options(
+        batch,
+        &SlateDBWriteOptions {
+            await_durable: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(slatedb_error)?;
+    Ok(())
+}
+#[derive(Debug)]
+struct LegacyStorageSpacePrefixExtractor;
+impl PrefixExtractor for LegacyStorageSpacePrefixExtractor {
+    fn name(&self) -> &str {
+        "lix-storage-space-be32-v1"
+    }
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let len = match target {
+            PrefixTarget::Point(bytes) | PrefixTarget::Prefix(bytes) => bytes.len(),
+        };
+        (len >= 4).then_some(4)
+    }
+}
+async fn copy_legacy_physical_rows(db: &Db, legacy: &Db) -> Result<(), StorageError> {
+    let snapshot = legacy.snapshot().await.map_err(slatedb_error)?;
+    let sequence = snapshot.seq().to_be_bytes();
+    if let Some(expected) = db.get(LAYOUT_SOURCE_SEQ_KEY).await.map_err(slatedb_error)? {
+        if expected.as_ref() != sequence {
+            return Err(StorageError::Corruption(
+                "legacy SlateDB generation advanced during physical migration".into(),
+            ));
+        }
+    } else {
+        let mut initial = WriteBatch::new();
+        initial.put(LAYOUT_SOURCE_SEQ_KEY, sequence);
+        db.write_with_options(
+            initial,
+            &SlateDBWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(slatedb_error)?;
+    }
+    let progress = db.get(LAYOUT_PROGRESS_KEY).await.map_err(slatedb_error)?;
+    let lower = progress.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut rows = snapshot
+        .scan((lower, Bound::<Bytes>::Unbounded))
+        .await
+        .map_err(slatedb_error)?;
+    let mut batch = WriteBatch::new();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next().await.map_err(slatedb_error)? {
+        if row.key.len() < 4 || row.key.len() >= MAX_SLATEDB_KEY_LEN {
+            return Err(StorageError::InvalidKey);
+        }
+        let mut key = Vec::with_capacity(row.key.len() + 1);
+        key.push(VALUE_TAG);
+        key.extend_from_slice(&row.key);
+        let key = Key(Bytes::from(key));
+        batch.put(&key.0, &row.value);
+        if let Ok(locator) = decode_immutable_locator(&row.value) {
+            let mut protected = LEGACY_SEGMENT_PREFIX.to_vec();
+            protected.extend_from_slice(&locator.segment_id.0);
+            // Preserve legacy object reachability even if its copied v3 key is
+            // deleted. The original physical repository is retained in v2.
+            batch.put(protected, Bytes::new());
+        }
+        batch.put(
+            tagged_key(&key, LENGTH_TAG)?.0,
+            encode_value_length(row.value.len()),
+        );
+        batch.put(LAYOUT_PROGRESS_KEY, &row.key);
+        count += 1;
+        bytes = bytes.saturating_add(row.value.len());
+        if count >= 32 || bytes >= 2 * 1024 * 1024 {
+            db.write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(slatedb_error)?;
+            batch = WriteBatch::new();
+            count = 0;
+            bytes = 0;
+        }
+    }
+    if count != 0 {
+        db.write_with_options(
+            batch,
+            &SlateDBWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(slatedb_error)?;
+    }
+    Ok(())
 }
 
 fn disk_cache_budgets(total_bytes: usize) -> (usize, usize) {
@@ -4650,30 +5282,68 @@ fn physical_key(space: SpaceId, key: &Key) -> Result<Key, StorageError> {
         return Err(StorageError::InvalidKey);
     }
     let mut bytes = Vec::with_capacity(len);
+    bytes.push(VALUE_TAG);
     bytes.extend_from_slice(&space.0.to_be_bytes());
     bytes.extend_from_slice(&key.0);
     Ok(Key(Bytes::from(bytes)))
 }
 
+fn tagged_space_prefix(tag: u8, space: SpaceId) -> Bytes {
+    let mut prefix = Vec::with_capacity(SPACE_PREFIX_LEN);
+    prefix.push(tag);
+    prefix.extend_from_slice(&space.0.to_be_bytes());
+    Bytes::from(prefix)
+}
+fn tagged_key(key: &Key, tag: u8) -> Result<Key, StorageError> {
+    if key.0.len() < SPACE_PREFIX_LEN || key.0[0] != VALUE_TAG && key.0[0] != LENGTH_TAG {
+        return Err(StorageError::Corruption(
+            "invalid tagged SlateDB key".into(),
+        ));
+    }
+    let mut bytes = key.0.to_vec();
+    bytes[0] = tag;
+    Ok(Key(Bytes::from(bytes)))
+}
+fn encode_value_length(bytes: usize) -> Bytes {
+    let mut encoded = Vec::with_capacity(9);
+    encoded.push(1);
+    encoded.extend_from_slice(&(bytes as u64).to_be_bytes());
+    Bytes::from(encoded)
+}
+fn decode_value_length(bytes: &Bytes) -> Result<usize, StorageError> {
+    if bytes.len() != 9 || bytes[0] != 1 {
+        return Err(StorageError::Corruption(
+            "invalid SlateDB value-length record".into(),
+        ));
+    }
+    usize::try_from(u64::from_be_bytes(bytes[1..].try_into().unwrap()))
+        .map_err(|_| StorageError::Corruption("SlateDB value length exceeds address space".into()))
+}
 fn physical_range(space: SpaceId, range: KeyRange) -> Result<KeyRange, StorageError> {
+    tagged_physical_range(VALUE_TAG, space, range)
+}
+fn tagged_physical_range(
+    tag: u8,
+    space: SpaceId,
+    range: KeyRange,
+) -> Result<KeyRange, StorageError> {
     let map = |bound: Bound<Key>, unbounded: Bound<Key>| -> Result<Bound<Key>, StorageError> {
         Ok(match bound {
-            Bound::Included(key) => Bound::Included(physical_key(space, &key)?),
-            Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)?),
+            Bound::Included(key) => Bound::Included(tagged_key(&physical_key(space, &key)?, tag)?),
+            Bound::Excluded(key) => Bound::Excluded(tagged_key(&physical_key(space, &key)?, tag)?),
             Bound::Unbounded => unbounded,
         })
     };
+    let upper = space.0.checked_add(1).map_or_else(
+        || Bound::Excluded(Key(Bytes::from(vec![tag + 1]))),
+        |next| Bound::Excluded(Key(tagged_space_prefix(tag, SpaceId(next)))),
+    );
     Ok(KeyRange {
         lower: map(
             range.lower,
-            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+            Bound::Included(Key(tagged_space_prefix(tag, space))),
         )?,
-        upper: map(
-            range.upper,
-            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
-                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
-            }),
-        )?,
+        upper: map(range.upper, upper)?,
     })
 }
 
@@ -4956,6 +5626,587 @@ mod tests {
 
     const TEST_IMMUTABLE_SPACE: StorageSpace =
         StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+
+    #[tokio::test]
+    async fn retained_legacy_generation_keeps_immutable_segments_after_v3_deletion_and_gc() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = "legacy-immutable-preservation";
+        let key = Key(Bytes::from_static(b"legacy-value"));
+        let mut physical = TEST_IMMUTABLE_SPACE.id.0.to_be_bytes().to_vec();
+        physical.extend_from_slice(&key.0);
+        let mut writer = ImmutableSegmentWriter::default();
+        writer
+            .insert(
+                Key(Bytes::from(physical.clone())),
+                Bytes::from_static(b"preserved-legacy-content"),
+            )
+            .unwrap();
+        let segments = writer.finish(|_| true).unwrap();
+        let segment = &segments[0];
+        let locator = encode_immutable_locator(&ImmutableValueLocator {
+            segment_id: segment.id.clone(),
+            segment_len: segment.values.last().unwrap().1.end,
+            range: segment.values[0].1.clone(),
+        })
+        .unwrap();
+        let original_objects = ImmutableValueStore::new(root, objects.clone(), None, None);
+        original_objects.put_segments(segments).await.unwrap();
+        let legacy = Db::builder(
+            join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+            objects.clone(),
+        )
+        .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+        .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+        .with_settings(slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(&physical, &locator);
+        legacy
+            .write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+        drop(original_objects);
+        let current =
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
+                .unwrap();
+        let mut write = current.begin_write(Default::default()).await.unwrap();
+        write
+            .delete_many(TEST_IMMUTABLE_SPACE, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        current.flush().await.unwrap();
+        collect_startup_immutable_garbage(
+            &current.worker,
+            &current.immutable_value_store,
+            SystemTime::now() + Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            current
+                .immutable_value_store
+                .get_many(vec![locator.clone()])
+                .await
+                .unwrap(),
+            vec![Bytes::from_static(b"preserved-legacy-content")]
+        );
+        drop(current);
+        let legacy = Db::builder(join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH), objects)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(legacy.get(&physical).await.unwrap(), Some(locator));
+        legacy.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maximal_legacy_key_refuses_upgrade_before_completion_and_preserves_source() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = "maximal-legacy-key";
+        let mut physical = SpaceId(7).0.to_be_bytes().to_vec();
+        physical.resize(MAX_SLATEDB_KEY_LEN, 1);
+        let legacy = Db::builder(
+            join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+            objects.clone(),
+        )
+        .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+        .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+        .with_settings(slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(&physical, b"unchanged");
+        legacy
+            .write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+        assert!(matches!(
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default()),
+            Err(StorageError::InvalidKey)
+        ));
+        let destination = Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+            .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            destination
+                .get(LAYOUT_COMPLETE_KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        destination.close().await.unwrap();
+        let legacy = Db::builder(join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH), objects)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy.get(&physical).await.unwrap(),
+            Some(Bytes::from_static(b"unchanged"))
+        );
+        legacy.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_layout_resumes_old_generation_and_preserves_large_values() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = "physical-upgrade";
+        let legacy = Db::builder(
+            join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+            objects.clone(),
+        )
+        .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+        .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+        .with_settings(slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+        let space = StorageSpace::mutable(SpaceId(92), "physical.old.mutable");
+        let mut old_key = space.id.0.to_be_bytes().to_vec();
+        old_key.extend_from_slice(b"large");
+        let bytes = Bytes::from(vec![0x5a; 65 * 1024 * 1024]);
+        let mut batch = WriteBatch::new();
+        batch.put(&old_key, &bytes);
+        let mut first_key = space.id.0.to_be_bytes().to_vec();
+        first_key.extend_from_slice(b"first");
+        batch.put(&first_key, b"already-copied");
+        legacy
+            .write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+        // Simulate interruption after the first durable value+length batch:
+        // reopening must resume after the progress key, without replacing the
+        // old database or publishing the partial destination to consumers.
+        let partial = Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+            .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        let first_physical = physical_key(space.id, &Key(Bytes::from_static(b"first"))).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(&first_physical.0, b"already-copied");
+        batch.put(
+            tagged_key(&first_physical, LENGTH_TAG).unwrap().0,
+            encode_value_length(14),
+        );
+        batch.put(LAYOUT_PROGRESS_KEY, &first_key);
+        partial
+            .write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        partial.close().await.unwrap();
+        let storage =
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
+                .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let key = Key(Bytes::from_static(b"large"));
+        let requests = [GetManyRequest {
+            space,
+            keys: std::slice::from_ref(&key),
+            opts: Default::default(),
+        }];
+        assert!(matches!(
+            read.get_many_bounded(
+                &requests,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 8 * 1024 * 1024,
+                    max_single_value_bytes: 64 * 1024 * 1024
+                }
+            )
+            .await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+        let values = read.get_many(&requests).await.unwrap();
+        assert_eq!(
+            values.values,
+            vec![Some(ProjectedValue::FullValue(bytes.clone()))]
+        );
+        let mut scan = read
+            .begin_scan(
+                space,
+                KeyRange {
+                    lower: Bound::Included(key.clone()),
+                    upper: Bound::Unbounded,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            scan.next_page_bounded(
+                32,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 8 * 1024 * 1024,
+                    max_single_value_bytes: 64 * 1024 * 1024
+                }
+            )
+            .await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+        drop(scan);
+        drop(read);
+        storage.flush().await.unwrap();
+        drop(storage);
+        let legacy = Db::builder(join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH), objects)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(legacy.get(&old_key).await.unwrap(), Some(bytes));
+        legacy.close().await.unwrap();
+    }
+
+    /// Exercise the engine as well as the backend copier: the old generation
+    /// contains a full repository, a >64 MiB file, and v86 admission markers.
+    #[tokio::test]
+    async fn old_physical_repository_above_64_mib_migrates_edits_and_cold_reopens() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = "legacy-real-large-repository";
+        let current =
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
+                .unwrap();
+        let lix = lix::open_lix().with_storage(current.clone()).await.unwrap();
+        let mut content = Vec::with_capacity(65 * 1024 * 1024);
+        for index in 0u64..(65 * 1024 * 1024 / 32) {
+            content.extend_from_slice(blake3::hash(&index.to_be_bytes()).as_bytes());
+        }
+        lix.execute(
+            "INSERT INTO lix_file(path,content) VALUES('/preserved.bin',$1)",
+            &[lix::Value::Blob(Bytes::from(content.clone()).into())],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('preserved','before')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.close().await.unwrap();
+        current.flush().await.unwrap();
+        let snapshot = current
+            .worker
+            .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+            .await
+            .unwrap();
+        let legacy = Db::builder(
+            join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+            objects.clone(),
+        )
+        .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+        .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+        .with_settings(slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+        let mut rows = snapshot
+            .scan((
+                Bound::Included(Bytes::from(vec![VALUE_TAG])),
+                Bound::Excluded(Bytes::from(vec![VALUE_TAG + 1])),
+            ))
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        let mut count = 0usize;
+        let mut protocol_key = None;
+        let mut pointers = 0;
+        while let Some(row) = rows.next().await.unwrap() {
+            let key = row.key.slice(1..);
+            let value = if row.value.as_ref() == b"tracked-default-branch.v87" {
+                protocol_key = Some(key.clone());
+                Bytes::from_static(b"tracked-default-branch.v86")
+            } else if row.value.starts_with(b"lix.repository-epoch.v1|active|") {
+                let mut fields = std::str::from_utf8(&row.value)
+                    .unwrap()
+                    .split('|')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_eq!(fields[4], "87");
+                fields[4] = "86".into();
+                pointers += 1;
+                Bytes::from(fields.join("|"))
+            } else {
+                row.value
+            };
+            batch.put(key, value);
+            count += 1;
+            if count == 32 {
+                legacy
+                    .write_with_options(
+                        batch,
+                        &SlateDBWriteOptions {
+                            await_durable: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                batch = WriteBatch::new();
+                count = 0;
+            }
+        }
+        if count > 0 {
+            legacy
+                .write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(protocol_key.is_some());
+        assert_eq!(pointers, 1);
+        drop(rows);
+        drop(snapshot);
+        legacy.close().await.unwrap();
+        drop(current);
+        // Remove only the fixture's v3 generation. Its immutable objects are
+        // shared by the old physical repository and deliberately preserved.
+        let current_prefix = ObjectPath::from(join_db_path(root, SEGMENTED_FORMAT_PATH));
+        let stale = objects
+            .list(Some(&current_prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for object in stale {
+            objects.delete(&object.location).await.unwrap();
+        }
+        let physical_bytes = objects
+            .list(Some(&ObjectPath::from(root)))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|object| object.size)
+            .sum::<u64>();
+        assert!(
+            physical_bytes > 64 * 1024 * 1024,
+            "fixture must exercise a physically large old repository"
+        );
+        let upgraded =
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
+                .unwrap();
+        let lix = lix::open_lix()
+            .with_storage(upgraded.clone())
+            .await
+            .unwrap();
+        for (index, expected) in content.chunks(4 * 1024 * 1024).enumerate() {
+            let start = (index * 4 * 1024 * 1024) as i64 + 1;
+            let file = lix.execute(
+                "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice FROM lix_file WHERE path='/preserved.bin'",
+                &[lix::Value::Integer(start), lix::Value::Integer(expected.len() as i64)],
+            ).await.unwrap();
+            assert_eq!(file.rows()[0].get::<Vec<u8>>("slice").unwrap(), expected);
+        }
+        lix.execute(
+            "UPDATE lix_key_value SET value='after' WHERE key='preserved'",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.close().await.unwrap();
+        upgraded.flush().await.unwrap();
+        drop(upgraded);
+        let reopened =
+            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
+                .unwrap();
+        let lix = lix::open_lix()
+            .with_storage(reopened.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            lix.execute("SELECT value FROM lix_key_value WHERE key='preserved'", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("after")
+        );
+        let tail = lix.execute(
+            "SELECT SUBSTRING(content FROM $1 FOR 1024) AS slice FROM lix_file WHERE path='/preserved.bin'",
+            &[lix::Value::Integer((content.len() - 1024) as i64 + 1)],
+        ).await.unwrap();
+        assert_eq!(
+            tail.rows()[0].get::<Vec<u8>>("slice").unwrap(),
+            &content[content.len() - 1024..]
+        );
+        lix.close().await.unwrap();
+        reopened.flush().await.unwrap();
+        drop(reopened);
+        let retained = Db::builder(join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH), objects)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            retained
+                .get(protocol_key.unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"tracked-default-branch.v86"
+        );
+        retained.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexed_lengths_follow_visible_overlays_snapshots_and_range_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let space = StorageSpace::mutable(SpaceId(93), "indexed.mutable");
+        let key = Key(Bytes::from_static(b"row"));
+        let mut write = storage.begin_write(Default::default()).await.unwrap();
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key.clone(),
+                        value: StoredValue {
+                            bytes: Bytes::from(vec![1; 1024]),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        let old = storage.begin_read(Default::default()).await.unwrap();
+        let mut write = storage.begin_write(Default::default()).await.unwrap();
+        write
+            .put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: key.clone(),
+                        value: StoredValue {
+                            bytes: Bytes::from(vec![2; 2048]),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        let requests = [GetManyRequest {
+            space,
+            keys: std::slice::from_ref(&key),
+            opts: Default::default(),
+        }];
+        let budget = lix::storage::ReadBudget {
+            max_result_bytes: 1024,
+            max_single_value_bytes: 1024,
+        };
+        assert_eq!(
+            old.get_many_bounded(&requests, budget)
+                .await
+                .unwrap()
+                .values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from(vec![1; 1024])))]
+        );
+        let latest = storage.begin_read(Default::default()).await.unwrap();
+        assert!(matches!(
+            latest.get_many_bounded(&requests, budget).await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+        let mut write = storage.begin_write(Default::default()).await.unwrap();
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        let deleted = storage.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            deleted
+                .get_many_bounded(&requests, budget)
+                .await
+                .unwrap()
+                .values,
+            vec![None]
+        );
+        assert!(matches!(
+            latest.get_many_bounded(&requests, budget).await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+        assert_eq!(
+            old.get_many_bounded(&requests, budget)
+                .await
+                .unwrap()
+                .values[0],
+            Some(ProjectedValue::FullValue(Bytes::from(vec![1; 1024])))
+        );
+        drop(deleted);
+        drop(latest);
+        drop(old);
+        storage.flush().await.unwrap();
+        drop(storage);
+        let reopened = SlateDB::open(directory.path()).unwrap();
+        let read = reopened.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            read.get_many_bounded(&requests, budget)
+                .await
+                .unwrap()
+                .values,
+            vec![None]
+        );
+    }
 
     #[tokio::test]
     async fn session_acquisition_serializes_with_commits_and_fences_prepared_tokenless_writes() {
@@ -6100,11 +7351,11 @@ mod tests {
     }
 
     #[test]
-    fn storage_space_extractor_uses_the_four_byte_physical_prefix() {
+    fn storage_space_extractor_uses_the_tagged_space_physical_prefix() {
         let extractor = StorageSpacePrefixExtractor;
         assert_eq!(extractor.name(), SPACE_PREFIX_EXTRACTOR_NAME);
         assert_eq!(
-            extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"\0\0\0\x07key"))),
+            extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"V\0\0\0\x07key"))),
             Some(SPACE_PREFIX_LEN)
         );
         assert_eq!(
@@ -6850,7 +8101,7 @@ mod tests {
 
         let first = block_on(storage.worker.call_read(|db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-            snapshot.get(b"\0\0\0\x07key").await.map_err(slatedb_error)
+            snapshot.get(b"V\0\0\0\x07key").await.map_err(slatedb_error)
         }))
         .expect("warm raw SlateDB SST read");
         assert_eq!(first, Some(Bytes::from_static(b"value")));
@@ -6861,7 +8112,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let result = block_on(reader_storage.worker.call_read(|db| async move {
                 let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-                snapshot.get(b"\0\0\0\x07key").await.map_err(slatedb_error)
+                snapshot.get(b"V\0\0\0\x07key").await.map_err(slatedb_error)
             }));
             result_tx.send(result).expect("send warm raw read result");
         });
@@ -6894,7 +8145,7 @@ mod tests {
                     .await
                     .expect("open raw SlateDB");
                 let mut batch = WriteBatch::new();
-                batch.put(b"\0\0\0\x07key", b"value");
+                batch.put(b"V\0\0\0\x07key", b"value");
                 db.write_with_options(
                     batch,
                     &SlateDBWriteOptions {
@@ -6955,9 +8206,15 @@ mod tests {
             );
             assert!(
                 db.manifest()
-                    .segment(&space.id.0.to_be_bytes())
+                    .segment(&tagged_space_prefix(VALUE_TAG, space.id))
                     .is_some_and(|segment| !segment.l0().is_empty()),
                 "the row must be isolated in its storage-space segment"
+            );
+            assert!(
+                db.manifest()
+                    .segment(&tagged_space_prefix(LENGTH_TAG, space.id))
+                    .is_some_and(|segment| !segment.l0().is_empty()),
+                "length metadata must have its own payload-free segment"
             );
             assert!(
                 db.manifest()

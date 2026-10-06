@@ -20,6 +20,9 @@ enum NativeReadPreparationPurpose {
     },
     Authority {
         blob_capture: Arc<crate::sync::read_fulfillment::BlobReadCapture>,
+        input_sink: Arc<
+            dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync,
+        >,
     },
 }
 
@@ -77,6 +80,9 @@ pub(crate) async fn prepare_native_read_interests_authority<R>(
     active_account_id: &str,
     hot: HotStateContext,
     blob_capture: Arc<crate::sync::read_fulfillment::BlobReadCapture>,
+    input_sink: Arc<
+        dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync,
+    >,
 ) -> Result<Vec<crate::sync::read_fulfillment::ReadInput>, LixError>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -87,7 +93,10 @@ where
         interests,
         active_account_id,
         hot,
-        NativeReadPreparationPurpose::Authority { blob_capture },
+        NativeReadPreparationPurpose::Authority {
+            blob_capture,
+            input_sink,
+        },
     )
     .await
 }
@@ -111,7 +120,7 @@ where
     let candidate_catalog = crate::catalog::CatalogContext::new();
     let dependency_blobs: Arc<dyn crate::binary_cas::BlobDataReader> = match &purpose {
         NativeReadPreparationPurpose::Candidate { .. } => Arc::new(blob.reader(read.clone())),
-        NativeReadPreparationPurpose::Authority { blob_capture } => {
+        NativeReadPreparationPurpose::Authority { blob_capture, .. } => {
             blob_capture.wrap(blob.reader(read.clone()))
         }
     };
@@ -523,7 +532,7 @@ where
                         )
                         .await?;
                     }
-                    NativeReadPreparationPurpose::Authority { .. } => {
+                    NativeReadPreparationPurpose::Authority { blob_capture, .. } => {
                         crate::sql2::prepare_native_file_content_inputs(
                             Arc::new(replay_hot.reader(read.clone())),
                             filesystem_path_index,
@@ -535,6 +544,7 @@ where
                             *indexed,
                             path_predicate,
                             *byte_range,
+                            &|blob, range| blob_capture.record(blob, range.is_none(), range),
                         )
                         .await?;
                     }
@@ -640,8 +650,29 @@ where
     }
     match purpose {
         NativeReadPreparationPurpose::Candidate { .. } => Ok(Vec::new()),
-        NativeReadPreparationPurpose::Authority { .. } => {
-            prepare_canonical_returned_row_inputs(&read, &hot, &returned_identities).await
+        NativeReadPreparationPurpose::Authority { input_sink, .. } => {
+            // Known identities cross the native/provider boundary in bounded
+            // groups. Emit each completed group immediately into the shared
+            // operation sink rather than retaining all selected payloads.
+            let mut pending = std::collections::BTreeSet::new();
+            for identity in returned_identities {
+                pending.insert(identity);
+                if pending.len() == 32 {
+                    prepare_canonical_returned_row_inputs(
+                        &read,
+                        &hot,
+                        &pending,
+                        input_sink.as_ref(),
+                    )
+                    .await?;
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                prepare_canonical_returned_row_inputs(&read, &hot, &pending, input_sink.as_ref())
+                    .await?;
+            }
+            Ok(Vec::new())
         }
     }
 }
@@ -688,12 +719,13 @@ async fn prepare_canonical_returned_row_inputs<R>(
     read: &R,
     hot: &HotStateContext,
     identities: &std::collections::BTreeSet<(String, crate::tracked_state::TrackedStateKey)>,
-) -> Result<Vec<crate::sync::read_fulfillment::ReadInput>, LixError>
+    sink: &(dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync),
+) -> Result<(), LixError>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     if identities.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let rows = identities
         .iter()
@@ -711,7 +743,11 @@ where
         .load_exact_batch(&crate::hot_state::HotStateExactBatchRequest {
             rows,
             projection: crate::hot_state::HotStateProjection {
-                columns: vec!["snapshot_content".to_owned()],
+                columns: vec![
+                    "change_id".to_owned(),
+                    "commit_id".to_owned(),
+                    "updated_at".to_owned(),
+                ],
             },
             untracked: Some(false),
             include_tombstones: false,
@@ -833,9 +869,72 @@ where
     // payload is preferred, while an absent or stale projection can fall back
     // to the exact physical owner selected by the locator. In either case the
     // resolver enforces row identity and lifetime before producing wire data.
-    let resolved_payloads = crate::tracked_state::load_authoritative_live_change_records(
-        read,
-        &payload_requests
+    // Fetch only the admitted ordered standalone prefix. The authority policy
+    // resolves this page before its encoded records enter the operation sink;
+    // no operation-wide decoded or encoded payload vector survives a page.
+    let keys = payload_requests
+        .iter()
+        .map(|(_, request)| {
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+                request.change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let point_requests = [crate::storage_adapter::StorageGetManyRequest {
+        space: crate::changelog::CHANGE_SPACE,
+        keys: &keys,
+        opts: Default::default(),
+    }];
+    let mut offset = 0;
+    while offset < payload_requests.len() {
+        let page = read
+            .get_many_bounded_prefix(
+                &point_requests,
+                offset,
+                32,
+                crate::storage_adapter::ReadBudget {
+                    max_result_bytes: 8 * 1024 * 1024,
+                    max_single_value_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .await?;
+        let count = page.values.len();
+        let next = offset.checked_add(count).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "selected payload page overflow",
+            )
+        })?;
+        if count == 0
+            || next > payload_requests.len()
+            || page.next_offset != (next < payload_requests.len()).then_some(next)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "selected payload page changed request positions",
+            ));
+        }
+        let selected = &payload_requests[offset..next];
+        let standalone = selected
+            .iter()
+            .zip(page.values)
+            .map(|((_, request), value)| {
+                let record = match value {
+                    Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => Some(
+                        crate::changelog::decode_change_record(&bytes, request.change_id)?,
+                    ),
+                    None => None,
+                    Some(crate::storage_adapter::StorageProjectedValue::KeyOnly) => {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "selected payload page omitted full value",
+                        ));
+                    }
+                };
+                Ok((request.change_id, record))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let authority_requests = selected
             .iter()
             .map(
                 |(_, request)| crate::tracked_state::AuthoritativeLiveChangeRequest {
@@ -845,40 +944,40 @@ where
                     updated_at: request.updated_at,
                 },
             )
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let mut payload_inputs = Vec::with_capacity(resolved_payloads.len());
-    for ((branch_id, request), record) in payload_requests.into_iter().zip(resolved_payloads) {
-        let bytes = crate::changelog::encode_change_record(&record)?;
-        payload_inputs.push(crate::sync::read_fulfillment::ReadInput {
-            address: crate::sync::read_fulfillment::ReadInputAddress::ChangeRecord {
-                change_id: request.change_id.to_string(),
-                source_commit_id: request.source_commit_id.to_string(),
-                branch_id,
-                schema_key: request.key.schema_key,
-                file_id: request.key.file_id,
-                row_pk: request.key.row_pk,
-                updated_at: request.updated_at.to_string(),
-                payload_digest: *blake3::hash(&bytes).as_bytes(),
-            },
-            bytes,
-        });
-    }
-
-    let mut inputs = locators
-        .into_iter()
-        .map(
-            |(change_id, locator)| crate::sync::read_fulfillment::ReadInput {
-                address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
-                    NativeMetadataRef::ChangeLocator(change_id.to_string()),
-                ),
-                bytes: crate::tracked_state::encode_change_locator(locator),
-            },
+            .collect::<Vec<_>>();
+        let resolved = crate::tracked_state::resolve_authoritative_live_change_records(
+            read,
+            &authority_requests,
+            standalone,
         )
-        .collect::<Vec<_>>();
-    inputs.extend(payload_inputs);
-    Ok(inputs)
+        .await?;
+        for ((branch_id, request), record) in selected.iter().zip(resolved) {
+            let bytes = crate::changelog::encode_change_record(&record)?;
+            sink(crate::sync::read_fulfillment::ReadInput {
+                address: crate::sync::read_fulfillment::ReadInputAddress::ChangeRecord {
+                    change_id: request.change_id.to_string(),
+                    source_commit_id: request.source_commit_id.to_string(),
+                    branch_id: branch_id.clone(),
+                    schema_key: request.key.schema_key.clone(),
+                    file_id: request.key.file_id.clone(),
+                    row_pk: request.key.row_pk.clone(),
+                    updated_at: request.updated_at.to_string(),
+                    payload_digest: *blake3::hash(&bytes).as_bytes(),
+                },
+                bytes,
+            })?;
+        }
+        offset = next;
+    }
+    for (change_id, locator) in locators {
+        sink(crate::sync::read_fulfillment::ReadInput {
+            address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change_id.to_string()),
+            ),
+            bytes: crate::tracked_state::encode_change_locator(locator),
+        })?;
+    }
+    Ok(())
 }
 
 /// Reproduce the path-index eager-blob policy while routing the actual CAS
@@ -928,9 +1027,12 @@ async fn prepare_path_index_small_blob_inputs(
         hashes.insert(crate::binary_cas::BlobId::from_hex(&snapshot.blob_hash)?);
     }
     if !hashes.is_empty() {
-        blobs
-            .load_bytes_many(&hashes.into_iter().collect::<Vec<_>>())
-            .await?;
+        // Known payloads are small but their aggregate can exceed a transfer
+        // page. Release every bounded provider result before the next batch.
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        for group in hashes.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+            blobs.load_bytes_many(group).await?;
+        }
     }
     Ok(())
 }

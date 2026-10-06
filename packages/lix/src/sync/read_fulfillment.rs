@@ -15,8 +15,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod spool;
+pub(crate) mod staging;
+
+const DISCOVERY_READ_BUDGET: ReadBudget = ReadBudget {
+    max_result_bytes: 8 * 1024 * 1024,
+    max_single_value_bytes: 64 * 1024 * 1024,
+};
+
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_RESPONSE_BYTES: usize = MAX_INPUT_BYTES.div_ceil(3) * 4 + 2 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = PAGE_PAYLOAD_BYTES.div_ceil(3) * 4 + 2 * 1024 * 1024;
 const PAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 // Greedy pages are at least half full, except the final page. Oversize
@@ -509,6 +517,7 @@ pub(super) fn interests_for_error(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadFulfillmentRequest {
+    pub(crate) release: bool,
     pub(crate) epoch_id: String,
     pub(crate) descriptor: super::PartialReplicaDescriptor,
     pub(crate) interests: Vec<LogicalReadInterest>,
@@ -519,6 +528,8 @@ pub(crate) struct ReadFulfillmentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadContinuation {
     pub(crate) next_input: usize,
+    pub(crate) next_offset: usize,
+    pub(crate) spool_id: String,
     pub(crate) closure_digest: String,
 }
 
@@ -557,10 +568,24 @@ pub(crate) struct ReadInput {
     #[serde(with = "payload")]
     pub(crate) bytes: Vec<u8>,
 }
+/// A bounded range of one canonical member. Whole-member identity and codec
+/// validation happens against private staged bytes before any publication.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReadInputFrame {
+    pub(crate) address: ReadInputAddress,
+    pub(crate) total_bytes: usize,
+    pub(crate) offset: usize,
+    pub(crate) digest: [u8; 32],
+    #[serde(with = "payload")]
+    pub(crate) bytes: Vec<u8>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DiscoveryProfile {
     pub(crate) storage_calls: usize,
+    pub(crate) storage_keys: usize,
+    pub(crate) peak_provider_bytes: usize,
     pub(crate) storage_bytes: usize,
     pub(crate) payload_bytes: usize,
 }
@@ -571,6 +596,7 @@ pub(crate) struct ReadFulfillmentResponse {
     pub(crate) epoch_id: String,
     pub(crate) request_digest: String,
     pub(crate) inputs: Vec<ReadInput>,
+    pub(crate) frame: Option<ReadInputFrame>,
     pub(crate) profile: DiscoveryProfile,
     pub(crate) closure_digest: String,
     pub(crate) continuation: Option<ReadContinuation>,
@@ -911,9 +937,11 @@ impl ReadFulfillmentRequest {
             }
         }
         if let Some(cursor) = &self.continuation {
-            if cursor.next_input == 0
+            if (cursor.next_input == 0 && cursor.next_offset == 0)
+                || cursor.next_offset >= MAX_INPUT_BYTES
                 || cursor.next_input >= MAX_RECORDS
                 || !valid_digest(&cursor.closure_digest)
+                || uuid::Uuid::parse_str(&cursor.spool_id).is_err()
             {
                 return Err(invalid("invalid read continuation"));
             }
@@ -923,6 +951,7 @@ impl ReadFulfillmentRequest {
     fn digest(&self) -> Result<String, LixError> {
         let mut basis = self.clone();
         basis.continuation = None;
+        basis.release = false;
         Ok(
             blake3::hash(&serde_json::to_vec(&basis).map_err(|_| invalid("invalid request"))?)
                 .to_hex()
@@ -1099,7 +1128,8 @@ fn append_receipt_input(
 // explicit immutable input algebra above can become installable wire data.
 #[derive(Default)]
 struct Observations {
-    values: BTreeMap<(StorageSpace, StorageKey), Bytes>,
+    values: BTreeMap<(StorageSpace, StorageKey), spool::PayloadRef>,
+    payloads: Arc<Mutex<spool::PayloadSpool>>,
     profile: DiscoveryProfile,
     exhausted: bool,
 }
@@ -1141,7 +1171,16 @@ impl Observations {
                     "read discovery payload limit exceeded".into(),
                 ));
             }
-            self.values.insert((space, key.clone()), bytes.clone());
+            let payload = self
+                .payloads
+                .lock()
+                .map_err(|_| StorageError::Io("operation spool poisoned".into()))?
+                .append(bytes)
+                .map_err(|error| {
+                    self.exhausted = true;
+                    StorageError::Io(error.to_string())
+                })?;
+            self.values.insert((space, key.clone()), payload);
         }
         Ok(())
     }
@@ -1173,10 +1212,45 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
         &self,
         requests: &[StorageGetManyRequest<'_>],
     ) -> Result<StorageGetManyResult, StorageError> {
-        self.observations.lock().unwrap().charge_call()?;
-        let result = self.base.get_many(requests).await?;
+        {
+            let mut observations = self.observations.lock().unwrap();
+            observations.charge_call()?;
+            let keys = requests
+                .iter()
+                .map(|request| request.keys.len())
+                .sum::<usize>();
+            observations.profile.storage_keys =
+                observations.profile.storage_keys.saturating_add(keys);
+            if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
+                observations.exhausted = true;
+                return Err(StorageError::Io(
+                    "read discovery physical key budget exceeded".into(),
+                ));
+            }
+        }
+        let (result, peak_provider_bytes, pages) = collect_bounded_point_pages(
+            &self.base,
+            requests,
+            DISCOVERY_READ_BUDGET,
+            MAX_INPUT_BYTES,
+            32,
+        )
+        .await
+        .map_err(|error| {
+            if matches!(error, StorageError::ReadBudgetExceeded { .. }) {
+                self.observations.lock().unwrap().exhausted = true;
+            }
+            error
+        })?;
         let mut values = result.values.iter();
         let mut observations = self.observations.lock().unwrap();
+        for _ in 1..pages {
+            observations.charge_call()?;
+        }
+        observations.profile.peak_provider_bytes = observations
+            .profile
+            .peak_provider_bytes
+            .max(peak_provider_bytes);
         for request in requests {
             for key in request.keys {
                 let value = values.next().ok_or_else(|| {
@@ -1191,6 +1265,70 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
             return Err(StorageError::Io(
                 "discovery storage cardinality mismatch".into(),
             ));
+        }
+        Ok(result)
+    }
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[StorageGetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: ReadBudget,
+    ) -> Result<GetManyPrefixResult, StorageError> {
+        self.observations.lock().unwrap().charge_call()?;
+        let budget = ReadBudget {
+            max_result_bytes: budget
+                .max_result_bytes
+                .min(DISCOVERY_READ_BUDGET.max_result_bytes),
+            max_single_value_bytes: budget
+                .max_single_value_bytes
+                .min(DISCOVERY_READ_BUDGET.max_single_value_bytes),
+        };
+        let result = self
+            .base
+            .get_many_bounded_prefix(requests, offset, max_slots.min(32), budget)
+            .await?;
+        budget.validate_result(&result.values)?;
+        let (window, total) =
+            bounded_prefix_requests(requests, offset, result.values.len().max(1))?;
+        let next = offset
+            .checked_add(result.values.len())
+            .ok_or(StorageError::InvalidCursor)?;
+        if result.values.len() > max_slots.min(32).min(MAX_SCAN_PAGE_ROWS)
+            || next > total
+            || result.next_offset != (next < total).then_some(next)
+            || (result.values.is_empty() && next < total)
+        {
+            return Err(StorageError::InvalidCursor);
+        }
+        let mut observations = self.observations.lock().unwrap();
+        observations.profile.storage_keys = observations
+            .profile
+            .storage_keys
+            .saturating_add(result.values.len());
+        if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
+            observations.exhausted = true;
+            return Err(StorageError::ReadBudgetExceeded { singleton: false });
+        }
+        let bytes = result
+            .values
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                StorageProjectedValue::FullValue(bytes) => bytes.len(),
+                StorageProjectedValue::KeyOnly => 0,
+            })
+            .sum();
+        observations.profile.peak_provider_bytes =
+            observations.profile.peak_provider_bytes.max(bytes);
+        for ((space, key), value) in window
+            .iter()
+            .flat_map(|request| request.keys.iter().map(move |key| (request.space, key)))
+            .zip(&result.values)
+        {
+            if let Some(value) = value {
+                observations.observe(space, key, value)?;
+            }
         }
         Ok(result)
     }
@@ -1231,10 +1369,33 @@ impl StorageScanSource for DependencyScan<'_> {
             self.observations.lock().unwrap().charge_call()?;
             let (rows, more) = self
                 .base
-                .next_page(limit.min(MAX_SCAN_PAGE_ROWS))
-                .await?
+                .next_page_bounded(limit.min(MAX_SCAN_PAGE_ROWS), DISCOVERY_READ_BUDGET)
+                .await
+                .map_err(|error| {
+                    if matches!(error, StorageError::ReadBudgetExceeded { .. }) {
+                        self.observations.lock().unwrap().exhausted = true;
+                    }
+                    error
+                })?
                 .into_parts();
             let mut observations = self.observations.lock().unwrap();
+            observations.profile.storage_keys =
+                observations.profile.storage_keys.saturating_add(rows.len());
+            let provider_bytes = rows
+                .iter()
+                .map(|row| match &row.value {
+                    StorageProjectedValue::FullValue(bytes) => bytes.len(),
+                    StorageProjectedValue::KeyOnly => 0,
+                })
+                .sum::<usize>();
+            observations.profile.peak_provider_bytes =
+                observations.profile.peak_provider_bytes.max(provider_bytes);
+            if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
+                observations.exhausted = true;
+                return Err(StorageError::Io(
+                    "read discovery physical row budget exceeded".into(),
+                ));
+            }
             for row in &rows {
                 observations.observe(self.space, &row.key, &row.value)?;
             }
@@ -1313,6 +1474,18 @@ trait RecipeReadSource: Send + Sync {
         &'a self,
         requests: &'a [StorageGetManyRequest<'a>],
     ) -> futures_util::future::BoxFuture<'a, Result<StorageGetManyResult, StorageError>>;
+    fn get_many_bounded<'a>(
+        &'a self,
+        requests: &'a [StorageGetManyRequest<'a>],
+        budget: ReadBudget,
+    ) -> futures_util::future::BoxFuture<'a, Result<StorageGetManyResult, StorageError>>;
+    fn get_many_bounded_prefix<'a>(
+        &'a self,
+        requests: &'a [StorageGetManyRequest<'a>],
+        offset: usize,
+        max_slots: usize,
+        budget: ReadBudget,
+    ) -> futures_util::future::BoxFuture<'a, Result<GetManyPrefixResult, StorageError>>;
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -1327,6 +1500,26 @@ impl<R: StorageAdapterRead> RecipeReadSource for ReadBackend<R> {
         requests: &'a [StorageGetManyRequest<'a>],
     ) -> futures_util::future::BoxFuture<'a, Result<StorageGetManyResult, StorageError>> {
         Box::pin(StorageAdapterRead::get_many(&self.0, requests))
+    }
+    fn get_many_bounded<'a>(
+        &'a self,
+        requests: &'a [StorageGetManyRequest<'a>],
+        budget: ReadBudget,
+    ) -> futures_util::future::BoxFuture<'a, Result<StorageGetManyResult, StorageError>> {
+        Box::pin(StorageAdapterRead::get_many_bounded(
+            &self.0, requests, budget,
+        ))
+    }
+    fn get_many_bounded_prefix<'a>(
+        &'a self,
+        requests: &'a [StorageGetManyRequest<'a>],
+        offset: usize,
+        max_slots: usize,
+        budget: ReadBudget,
+    ) -> futures_util::future::BoxFuture<'a, Result<GetManyPrefixResult, StorageError>> {
+        Box::pin(StorageAdapterRead::get_many_bounded_prefix(
+            &self.0, requests, offset, max_slots, budget,
+        ))
     }
     fn begin_scan(
         &self,
@@ -1345,6 +1538,24 @@ impl StorageAdapterRead for RecipeRead {
         requests: &[StorageGetManyRequest<'_>],
     ) -> Result<StorageGetManyResult, StorageError> {
         self.0.get_many(requests).await
+    }
+    async fn get_many_bounded(
+        &self,
+        requests: &[StorageGetManyRequest<'_>],
+        budget: ReadBudget,
+    ) -> Result<StorageGetManyResult, StorageError> {
+        self.0.get_many_bounded(requests, budget).await
+    }
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[StorageGetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: ReadBudget,
+    ) -> Result<GetManyPrefixResult, StorageError> {
+        self.0
+            .get_many_bounded_prefix(requests, offset, max_slots, budget)
+            .await
     }
     async fn begin_scan(
         &self,
@@ -1436,6 +1647,7 @@ fn fallback_response(
     }
     let inputs = Vec::new();
     Ok(ReadFulfillmentResponse {
+        frame: None,
         lix_id: repository.into(),
         epoch_id: request.epoch_id.clone(),
         request_digest: request.digest()?,
@@ -1482,12 +1694,36 @@ async fn discover_bounded_with_read(
         account,
         &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
     )?;
+    if request.release {
+        spool::release(repository, account, lease_id, request)?;
+        return Ok(ReadFulfillmentResponse {
+            lix_id: repository.into(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest()?,
+            inputs: Vec::new(),
+            frame: None,
+            profile: DiscoveryProfile::default(),
+            closure_digest: input_digest(request, &[])?,
+            continuation: None,
+            outcome: ReadFulfillmentOutcome::Complete,
+        });
+    }
+    if request.continuation.is_some() {
+        return spool::continuation_page(repository, account, lease_id, request);
+    }
+    let admission = spool::Admission::reserve(repository, account)?;
+    let lease_expires_at_ms = lease.expires_at_ms;
     let read = DependencyRead {
         base,
         observations: observations.clone(),
     };
     let blobs = Arc::new(BlobReadCapture::default());
-    let mut required_chunks = Vec::new();
+    let payloads = observations
+        .lock()
+        .map_err(|_| invalid("dependency observations poisoned"))?
+        .payloads
+        .clone();
+    let logical_spool = Arc::new(Mutex::new(spool::InputSpool::new(payloads.clone())));
     for address in &request.required {
         if let ReadInputAddress::BlobChunk(hash) = address {
             let bytes = crate::binary_cas::load_verified_chunk(
@@ -1497,10 +1733,13 @@ async fn discover_bounded_with_read(
             .await?
             .ok_or_else(|| invalid("authority lacks required chunk"))?;
             address.validate(&bytes)?;
-            required_chunks.push(ReadInput {
-                address: address.clone(),
-                bytes,
-            });
+            logical_spool
+                .lock()
+                .map_err(|_| invalid("logical spool poisoned"))?
+                .append(ReadInput {
+                    address: address.clone(),
+                    bytes,
+                })?;
             continue;
         }
         let (space, key) = address.coordinate()?;
@@ -1630,6 +1869,15 @@ async fn discover_bounded_with_read(
             account,
             hot,
             blobs.clone(),
+            {
+                let logical_spool = logical_spool.clone();
+                Arc::new(move |input| {
+                    logical_spool
+                        .lock()
+                        .map_err(|_| invalid("logical spool poisoned"))?
+                        .append(input)
+                })
+            },
         )
         .await
         {
@@ -1653,134 +1901,54 @@ async fn discover_bounded_with_read(
             }
             Err(error) => return Err(error),
         };
-    // Some immutable metadata addresses are canonical derivations rather than
-    // physical rows (notably direct ChangeLocator values). Merge those typed
-    // inputs into the same observation map as physical reads so one operation
-    // closes its complete native dependency graph.
-    let mut explicit_selected_inputs = Vec::new();
-    for input in logical_inputs {
-        input.address.validate(&input.bytes)?;
-        if matches!(&input.address, ReadInputAddress::ChangeRecord { .. }) {
-            explicit_selected_inputs.push(input);
-            continue;
-        }
-        let (space, key) = input.address.coordinate()?;
-        let observed = StorageProjectedValue::FullValue(Bytes::from(input.bytes));
-        observations
-            .lock()
-            .map_err(|_| invalid("dependency observations poisoned"))?
-            .observe(space, &key, &observed)
-            .map_err(LixError::from)?;
-    }
-    let mut typed = BTreeMap::new();
+    // Logical selected rows were emitted incrementally, while physical
+    // observations retain only compact references into the same payload file.
+    debug_assert!(logical_inputs.is_empty());
+    let mut inputs = Arc::try_unwrap(logical_spool)
+        .map_err(|_| invalid("logical operation sink still retained"))?
+        .into_inner()
+        .map_err(|_| invalid("logical spool poisoned"))?;
+    let mut typed = BTreeSet::new();
     loop {
         let pending = observations
             .lock()
             .map_err(|_| invalid("dependency observations poisoned"))?
             .values
             .iter()
-            .filter(|(coordinate, _)| !typed.contains_key(*coordinate))
-            .map(|(coordinate, bytes)| (coordinate.clone(), bytes.clone()))
+            .filter(|(coordinate, _)| !typed.contains(*coordinate))
+            .map(|(coordinate, payload)| (coordinate.clone(), *payload))
             .collect::<Vec<_>>();
         if pending.is_empty() {
             break;
         }
-        for ((space, key), bytes) in pending {
-            let input = typed_input(&read, space, &key.0, bytes).await?;
-            typed.insert((space, key), input);
+        for ((space, key), payload) in pending {
+            let bytes = payloads
+                .lock()
+                .map_err(|_| invalid("operation spool poisoned"))?
+                .read(payload)?;
+            let input = typed_input(&read, space, &key.0, Bytes::from(bytes)).await?;
+            inputs.append(input)?;
+            typed.insert((space, key));
         }
     }
-    let mut inputs = typed.into_values().collect::<Vec<_>>();
-    for input in explicit_selected_inputs {
-        let coordinate = input.address.coordinate()?;
-        if let Some(existing) = inputs
-            .iter()
-            .find(|existing| existing.address.coordinate().ok().as_ref() == Some(&coordinate))
-        {
-            if existing.bytes != input.bytes {
-                return Err(invalid(
-                    "selected change payload conflicts with observed input",
-                ));
-            }
-            continue;
-        }
-        inputs.push(input);
-    }
-    for input in required_chunks {
-        if !inputs
-            .iter()
-            .any(|existing| existing.address == input.address)
-        {
-            inputs.push(input);
-        }
-    }
-    let native_bytes = inputs.iter().map(|input| input.bytes.len()).sum::<usize>();
-    if native_bytes > MAX_PAYLOAD_BYTES || inputs.len() > MAX_RECORDS {
-        return Err(LixError::new(
-            "LIX_NATIVE_RECIPE_WORK_BOUND",
-            "native discovery payload limit exceeded",
-        ));
-    }
-    inputs.extend(
-        export_blob_inputs(
-            &read,
-            &blobs,
-            MAX_PAYLOAD_BYTES - native_bytes,
-            MAX_RECORDS - inputs.len(),
-            &inputs,
-        )
-        .await?,
-    );
-
+    export_blob_inputs(&read, &blobs, &mut inputs).await?;
+    validate_spooled_complete(request, &inputs)?;
     let mut profile = observations
         .lock()
         .map_err(|_| invalid("read discovery accounting poisoned"))?
         .profile
         .clone();
-    profile.payload_bytes = inputs.iter().map(|input| input.bytes.len()).sum();
-    let closure_digest = input_digest(request, &inputs)?;
-    let mut response = ReadFulfillmentResponse {
-        lix_id: repository.into(),
-        epoch_id: request.epoch_id.clone(),
-        request_digest: request.digest()?,
+    profile.payload_bytes = inputs.payload_bytes;
+    let response = spool::seal_and_page(
         inputs,
+        repository,
+        account,
+        lease_id,
+        lease_expires_at_ms,
+        request,
         profile,
-        closure_digest: closure_digest.clone(),
-        continuation: None,
-        outcome: ReadFulfillmentOutcome::Complete,
-    };
-    validate_complete(request, &response)?;
-    let start = if let Some(cursor) = &request.continuation {
-        if cursor.closure_digest != closure_digest
-            || cursor.next_input == 0
-            || cursor.next_input >= response.inputs.len()
-        {
-            return Err(invalid("invalid or changed read continuation"));
-        }
-        cursor.next_input
-    } else {
-        0
-    };
-    let mut end = start;
-    let mut bytes = 0usize;
-    while end < response.inputs.len() {
-        let next = response.inputs[end].bytes.len();
-        if end > start && bytes.saturating_add(next) > PAGE_PAYLOAD_BYTES {
-            break;
-        }
-        bytes += next;
-        end += 1;
-    }
-    response.continuation = (end < response.inputs.len()).then_some(ReadContinuation {
-        next_input: end,
-        closure_digest,
-    });
-    response.inputs = response
-        .inputs
-        .into_iter()
-        .skip(start)
-        .take(end - start)
-        .collect();
+        admission,
+    )?;
     validate_response(request, &response)?;
     Ok(response)
 }
@@ -1815,10 +1983,23 @@ pub(crate) fn validate_response(
             "read fulfillment belongs to another request or exceeds its bound",
         ));
     }
+    if request.release {
+        if request.continuation.is_none()
+            || !response.inputs.is_empty()
+            || response.frame.is_some()
+            || response.continuation.is_some()
+            || response.outcome != ReadFulfillmentOutcome::Complete
+            || response.closure_digest != input_digest(request, &[])?
+        {
+            return Err(invalid("invalid read operation release acknowledgement"));
+        }
+        return Ok(());
+    }
     if response.outcome != ReadFulfillmentOutcome::Complete {
         if !request.interests.iter().any(is_bounded_native_recipe)
             || request.continuation.is_some()
             || !response.inputs.is_empty()
+            || response.frame.is_some()
             || response.continuation.is_some()
             || input_digest(request, &response.inputs)? != response.closure_digest
         {
@@ -1842,13 +2023,39 @@ pub(crate) fn validate_response(
         }
         input.address.validate(&input.bytes)?;
     }
-    if response.inputs.len() > 1 && bytes > PAGE_PAYLOAD_BYTES {
+    if bytes > PAGE_PAYLOAD_BYTES {
         return Err(invalid("read page exceeds byte bound"));
     }
-    let start = request
+    let (start, offset) = request
         .continuation
         .as_ref()
-        .map_or(0, |cursor| cursor.next_input);
+        .map_or((0, 0), |cursor| (cursor.next_input, cursor.next_offset));
+    let (next_input, next_offset) = if let Some(frame) = &response.frame {
+        if !response.inputs.is_empty()
+            || frame.total_bytes <= PAGE_PAYLOAD_BYTES
+            || frame.total_bytes > MAX_INPUT_BYTES
+            || frame.offset != offset
+            || frame.bytes.is_empty()
+            || frame.bytes.len() > PAGE_PAYLOAD_BYTES
+            || frame.offset.saturating_add(frame.bytes.len()) > frame.total_bytes
+        {
+            return Err(invalid("invalid bounded read frame"));
+        }
+        frame.address.coordinate()?;
+        let end = frame.offset + frame.bytes.len();
+        if end == frame.total_bytes {
+            (start + 1, 0)
+        } else {
+            (start, end)
+        }
+    } else {
+        if offset != 0 {
+            return Err(invalid(
+                "read frame sequence ended before member completion",
+            ));
+        }
+        (start + response.inputs.len(), 0)
+    };
     if request
         .continuation
         .as_ref()
@@ -1857,13 +2064,20 @@ pub(crate) fn validate_response(
         return Err(invalid("read continuation changed its closure"));
     }
     if let Some(next) = &response.continuation {
-        if response.inputs.is_empty()
-            || next.next_input != start + response.inputs.len()
+        if (next_input, next_offset) <= (start, offset)
+            || (next.next_input, next.next_offset) != (next_input, next_offset)
             || next.next_input >= MAX_RECORDS
             || next.closure_digest != response.closure_digest
+            || uuid::Uuid::parse_str(&next.spool_id).is_err()
+            || request
+                .continuation
+                .as_ref()
+                .is_some_and(|cursor| cursor.spool_id != next.spool_id)
         {
             return Err(invalid("read continuation did not advance exactly"));
         }
+    } else if next_offset != 0 {
+        return Err(invalid("terminal read page contains an incomplete member"));
     }
     Ok(())
 }
@@ -2608,6 +2822,7 @@ fn validate_complete(
     if response.epoch_id != request.epoch_id
         || response.request_digest != request.digest()?
         || response.continuation.is_some()
+        || response.frame.is_some()
         || response.inputs.len() > MAX_RECORDS
         || input_digest(request, &response.inputs)? != response.closure_digest
     {
@@ -2647,12 +2862,83 @@ fn validate_complete(
             return Err(invalid("read fulfillment omitted a required input"));
         }
     }
+    validate_payload_membership(request, &response.inputs)
+}
+
+// Membership checks need identity facts for every selected row, but payload
+// bytes only for filesystem descriptors and the reserved executable-owner row.
+// The input's address/digest and canonical lifetime are validated separately.
+fn proof_requires_payload(address: &ReadInputAddress) -> bool {
+    match address {
+        ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(_)) => true,
+        ReadInputAddress::ChangeRecord {
+            schema_key, row_pk, ..
+        } => {
+            matches!(
+                schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
+            ) || (schema_key == "lix_key_value"
+                && row_pk.as_single_string().ok() == Some(crate::plugin::runtime::PLUGIN_OWNER_KEY))
+        }
+        _ => false,
+    }
+}
+fn proof_fact(address: ReadInputAddress, bytes: Vec<u8>) -> Result<(ReadInput, usize), LixError> {
+    let index_bytes = serde_json::to_vec(&address)
+        .map_err(|_| invalid("invalid proof address"))?
+        .len()
+        .saturating_mul(2)
+        .saturating_add(256)
+        .saturating_add(bytes.len());
+    Ok((ReadInput { address, bytes }, index_bytes))
+}
+
+fn validate_spooled_complete(
+    request: &ReadFulfillmentRequest,
+    spool: &spool::InputSpool,
+) -> Result<(), LixError> {
+    for required in &request.required {
+        if !spool.contains(required)? {
+            return Err(invalid("read fulfillment omitted a required input"));
+        }
+    }
+    let mut proof_inputs = Vec::new();
+    let mut proof_bytes = 0usize;
+    for (index, entry) in spool.inputs.iter().enumerate() {
+        if matches!(
+            &entry.address,
+            ReadInputAddress::ChangeRecord { .. }
+                | ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(_))
+        ) {
+            let bytes = if proof_requires_payload(&entry.address) {
+                spool.read(index)?.bytes
+            } else {
+                Vec::new()
+            };
+            let (fact, resident_bytes) = proof_fact(entry.address.clone(), bytes)?;
+            proof_bytes = proof_bytes.saturating_add(resident_bytes);
+            if proof_bytes > 4 * 1024 * 1024 {
+                return Err(LixError::new(
+                    "LIX_NATIVE_RECIPE_WORK_BOUND",
+                    "read closure proof facts exceed byte budget",
+                ));
+            }
+            proof_inputs.push(fact);
+        }
+    }
+    validate_payload_membership(request, &proof_inputs)
+}
+
+fn validate_payload_membership(
+    request: &ReadFulfillmentRequest,
+    inputs: &[ReadInput],
+) -> Result<(), LixError> {
     let payload_context = if request
         .interests
         .iter()
         .any(|interest| matches!(interest, LogicalReadInterest::FileContent { .. }))
     {
-        ReadFulfillmentPayloadContext::new(&response.inputs)?
+        ReadFulfillmentPayloadContext::new(inputs)?
     } else {
         ReadFulfillmentPayloadContext::default()
     };
@@ -2661,7 +2947,7 @@ fn validate_complete(
         .iter()
         .map(|interest| payload_context.selected_files(interest))
         .collect::<Vec<_>>();
-    for input in &response.inputs {
+    for input in inputs {
         let ReadInputAddress::ChangeRecord {
             change_id,
             source_commit_id,
@@ -2701,8 +2987,8 @@ fn validate_complete(
                     schema_key,
                     file_id.as_deref(),
                     row_pk,
-                ) || plugin_registry_dependency_matches(interest, input, &response.inputs)
-                    || plugin_owner_dependency_matches(interest, input, &response.inputs)
+                ) || plugin_registry_dependency_matches(interest, input, inputs)
+                    || plugin_owner_dependency_matches(interest, input, inputs)
             });
         if !selected_by_recipe {
             return Err(
@@ -2723,8 +3009,7 @@ fn validate_complete(
         }
         let locator_address =
             ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id.clone()));
-        let locator = response
-            .inputs
+        let locator = inputs
             .iter()
             .find(|candidate| candidate.address == locator_address)
             .ok_or_else(|| invalid("canonical change payload has no selected source locator"))?;
@@ -2740,48 +3025,7 @@ fn validate_complete(
     Ok(())
 }
 
-pub(super) async fn fetch<C: super::http::RawHttpClient>(
-    transport: &super::http::HttpSyncTransport<C>,
-    request: &ReadFulfillmentRequest,
-) -> Result<ReadFulfillmentResponse, LixError> {
-    let mut page_request = request.clone();
-    let mut response = transport.fulfill_read(&page_request).await?;
-    if response.outcome != ReadFulfillmentOutcome::Complete {
-        validate_complete(request, &response)?;
-        return Ok(response);
-    }
-    let mut payload_bytes = response
-        .inputs
-        .iter()
-        .map(|input| input.bytes.len())
-        .sum::<usize>();
-    for _ in 0..MAX_PAGES {
-        let Some(next) = response.continuation.take() else {
-            validate_complete(request, &response)?;
-            return Ok(response);
-        };
-        page_request.continuation = Some(next);
-        let page = transport.fulfill_read(&page_request).await?;
-        if page.outcome != ReadFulfillmentOutcome::Complete {
-            return Err(invalid("read fulfillment page changed its outcome"));
-        }
-        payload_bytes = payload_bytes.saturating_add(
-            page.inputs
-                .iter()
-                .map(|input| input.bytes.len())
-                .sum::<usize>(),
-        );
-        if payload_bytes > MAX_PAYLOAD_BYTES
-            || response.inputs.len() + page.inputs.len() > MAX_RECORDS
-        {
-            return Err(invalid("read assembly exceeds bound"));
-        }
-        response.inputs.extend(page.inputs);
-        response.continuation = page.continuation;
-    }
-    Err(invalid("read continuation count exceeds bound"))
-}
-
+#[cfg(test)]
 pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
@@ -2803,6 +3047,7 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
 /// Warm a moving working-diff candidate's dependency closure without publishing
 /// candidate admission or serving state. Absent validated metadata may be
 /// seeded; resident mutable overlays are retained by the shared CAS installer.
+#[cfg(test)]
 pub(super) async fn install_candidate_immutable<S: Storage + Clone + Send + Sync + 'static>(
     storage: &StorageAdapter<S>,
     previous: &PartialReplicaState,
@@ -2816,11 +3061,10 @@ pub(super) async fn install_candidate_immutable<S: Storage + Clone + Send + Sync
         .map(|_| ())
 }
 
-fn validate_candidate_immutable_basis(
+pub(super) fn validate_candidate_basis(
     previous: &PartialReplicaState,
     next: &PartialReplicaState,
     request: &ReadFulfillmentRequest,
-    response: &ReadFulfillmentResponse,
 ) -> Result<(), LixError> {
     let previous_descriptor = previous.descriptor();
     let next_descriptor = next.descriptor();
@@ -2867,6 +3111,16 @@ fn validate_candidate_immutable_basis(
             "candidate request must require the exact next selected-head header",
         ));
     }
+    Ok(())
+}
+
+fn validate_candidate_immutable_basis(
+    previous: &PartialReplicaState,
+    next: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+    response: &ReadFulfillmentResponse,
+) -> Result<(), LixError> {
+    validate_candidate_basis(previous, next, request)?;
     if response
         .inputs
         .iter()
@@ -3302,7 +3556,13 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
 /// This preserves range selection even when the authority's physical layout
 /// differs from the canonical layout installed by a partial replica.
 #[derive(Default)]
-pub(crate) struct BlobReadCapture(Mutex<BTreeMap<crate::binary_cas::BlobId, BlobSelection>>);
+pub(crate) struct BlobReadCapture(Mutex<BlobSelections>);
+#[derive(Default)]
+struct BlobSelections {
+    values: BTreeMap<crate::binary_cas::BlobId, BlobSelection>,
+    range_count: usize,
+    range_bytes: u64,
+}
 #[derive(Clone, Default)]
 struct BlobSelection {
     full: bool,
@@ -3318,7 +3578,7 @@ impl BlobReadCapture {
             capture: self.clone(),
         })
     }
-    fn record(
+    pub(crate) fn record(
         &self,
         blob: crate::binary_cas::BlobId,
         full: bool,
@@ -3328,26 +3588,47 @@ impl BlobReadCapture {
             .0
             .lock()
             .map_err(|_| invalid("blob read capture poisoned"))?;
-        if requests.len() >= 4096 && !requests.contains_key(&blob) {
+        if requests.values.len() >= 4096 && !requests.values.contains_key(&blob) {
             return Err(LixError::new(
                 "LIX_NATIVE_RECIPE_WORK_BOUND",
                 "blob discovery count limit exceeded",
             ));
         }
-        let selection = requests.entry(blob).or_default();
-        selection.full |= full;
-        if selection.full {
+        let selection = requests.values.entry(blob).or_default();
+        if full || selection.full {
+            let removed_count = selection.ranges.len();
+            let removed_bytes = selection
+                .ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>();
+            selection.full = true;
             selection.ranges.clear();
+            requests.range_count -= removed_count;
+            requests.range_bytes -= removed_bytes;
         } else if let Some(range) = range
             && !selection.ranges.contains(&range)
         {
-            if selection.ranges.len() >= 4096 {
+            let len = range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| invalid("invalid blob read range"))?;
+            if requests.range_count >= MAX_RECORDS
+                || requests.range_bytes.saturating_add(len) > MAX_PAYLOAD_BYTES as u64
+            {
                 return Err(LixError::new(
                     "LIX_NATIVE_RECIPE_WORK_BOUND",
-                    "blob range count limit exceeded",
+                    "aggregate blob range budget exceeded",
                 ));
             }
-            selection.ranges.push(range);
+            requests
+                .values
+                .get_mut(&blob)
+                .expect("selected blob exists")
+                .ranges
+                .push(range);
+            requests.range_count += 1;
+            requests.range_bytes += len;
         }
         Ok(())
     }
@@ -3402,18 +3683,22 @@ impl crate::binary_cas::BlobDataReader for RecordingBlobReader {
 async fn export_blob_inputs(
     read: &impl StorageAdapterRead,
     capture: &BlobReadCapture,
-    remaining_bytes: usize,
-    remaining_records: usize,
-    existing: &[ReadInput],
-) -> Result<Vec<ReadInput>, LixError> {
+    inputs: &mut spool::InputSpool,
+) -> Result<(), LixError> {
     use crate::binary_cas::*;
-    let selections = capture
-        .0
-        .lock()
-        .map_err(|_| invalid("blob read capture poisoned"))?
-        .clone();
-    let mut inputs = Vec::new();
-    let mut chunks = existing
+    // Discovery is complete; consume the bounded selection index rather than
+    // cloning all blob/range identities during export.
+    let selections = std::mem::take(
+        &mut capture
+            .0
+            .lock()
+            .map_err(|_| invalid("blob read capture poisoned"))?
+            .values,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    let mut chunks = inputs
+        .inputs
         .iter()
         .filter_map(|input| {
             if let ReadInputAddress::BlobChunk(hash) = input.address {
@@ -3423,75 +3708,61 @@ async fn export_blob_inputs(
             }
         })
         .collect::<BTreeSet<_>>();
-    let mut payload_bytes = 0usize;
-    for (blob, selection) in selections {
-        let metadata = load_metadata_many(read, &[blob])
-            .await?
-            .into_vec()
-            .pop()
-            .flatten()
-            .ok_or_else(|| invalid("authority lacks selected blob"))?;
-        let manifest = load_streaming_canonical_manifest(read, &metadata).await?;
-        let wire = super::SyncBlobManifest {
-            blob_id: blob.to_hex(),
-            size_bytes: manifest.size_bytes,
-            chunks: manifest
-                .chunks
-                .iter()
-                .map(|chunk| super::SyncBlobChunk {
-                    chunk_id: chunk.hash.to_hex(),
-                    size_bytes: chunk.size_bytes,
-                })
-                .collect(),
-            inline_bytes_base64: None,
-        };
-        let bytes = serde_json::to_vec(&wire).map_err(|_| invalid("invalid canonical manifest"))?;
-        payload_bytes = payload_bytes.saturating_add(bytes.len());
-        if payload_bytes > remaining_bytes || inputs.len() >= remaining_records {
-            return Err(LixError::new(
-                "LIX_NATIVE_RECIPE_WORK_BOUND",
-                "blob discovery payload limit exceeded",
-            ));
-        }
-        inputs.push(ReadInput {
-            address: ReadInputAddress::BlobManifest(*blob.as_bytes()),
-            bytes,
-        });
-        let mut offset = 0u64;
-        let mut selected = BTreeSet::new();
-        let mut anchors = BTreeSet::new();
-        for chunk in &manifest.chunks {
-            let end = offset + chunk.size_bytes;
-            if selection.full
-                || selection
-                    .ranges
+    for group in selections.chunks(32) {
+        let ids = group.iter().map(|(blob, _)| *blob).collect::<Vec<_>>();
+        let metadata = load_metadata_many(read, &ids).await?.into_vec();
+        for ((blob, selection), metadata) in group.iter().zip(metadata) {
+            let metadata = metadata.ok_or_else(|| invalid("authority lacks selected blob"))?;
+            let manifest = load_streaming_canonical_manifest(read, &metadata).await?;
+            let wire = super::SyncBlobManifest {
+                blob_id: blob.to_hex(),
+                size_bytes: manifest.size_bytes,
+                chunks: manifest
+                    .chunks
                     .iter()
-                    .any(|range| range.start < end && offset < range.end)
-            {
-                selected.insert(chunk.hash);
-                anchors.insert(offset / (CHUNK_ANCHOR_BYTES as u64) * (CHUNK_ANCHOR_BYTES as u64));
+                    .map(|chunk| super::SyncBlobChunk {
+                        chunk_id: chunk.hash.to_hex(),
+                        size_bytes: chunk.size_bytes,
+                    })
+                    .collect(),
+                inline_bytes_base64: None,
+            };
+            let bytes =
+                serde_json::to_vec(&wire).map_err(|_| invalid("invalid canonical manifest"))?;
+            inputs.append(ReadInput {
+                address: ReadInputAddress::BlobManifest(*blob.as_bytes()),
+                bytes,
+            })?;
+            let mut offset = 0u64;
+            let mut selected = BTreeSet::new();
+            let mut anchors = BTreeSet::new();
+            for chunk in &manifest.chunks {
+                let end = offset + chunk.size_bytes;
+                if selection.full
+                    || selection
+                        .ranges
+                        .iter()
+                        .any(|range| range.start < end && offset < range.end)
+                {
+                    selected.insert(chunk.hash);
+                    anchors
+                        .insert(offset / (CHUNK_ANCHOR_BYTES as u64) * (CHUNK_ANCHOR_BYTES as u64));
+                }
+                offset = end;
             }
-            offset = end;
-        }
-        for offset in anchors {
-            for chunk in load_canonical_blob_anchor(read, &metadata, offset).await? {
-                if selected.contains(&chunk.receipt.hash) && chunks.insert(chunk.receipt.hash) {
-                    payload_bytes = payload_bytes.saturating_add(chunk.bytes.len());
-                    if payload_bytes > remaining_bytes || inputs.len() >= remaining_records {
-                        return Err(LixError::new(
-                            "LIX_NATIVE_RECIPE_WORK_BOUND",
-                            "blob discovery payload limit exceeded",
-                        ));
+            for offset in anchors {
+                for chunk in load_canonical_blob_anchor(read, &metadata, offset).await? {
+                    if selected.contains(&chunk.receipt.hash) && chunks.insert(chunk.receipt.hash) {
+                        inputs.append(ReadInput {
+                            address: ReadInputAddress::BlobChunk(*chunk.receipt.hash.as_bytes()),
+                            bytes: chunk.bytes,
+                        })?;
                     }
-                    inputs.push(ReadInput {
-                        address: ReadInputAddress::BlobChunk(*chunk.receipt.hash.as_bytes()),
-                        bytes: chunk.bytes,
-                    });
                 }
             }
         }
     }
-    Ok(inputs)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3504,6 +3775,7 @@ mod tests {
         let bytes = b"a verified immutable chunk".to_vec();
         let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
                 directory: false,
@@ -3519,6 +3791,7 @@ mod tests {
         };
         let inputs = vec![ReadInput { address, bytes }];
         let response = ReadFulfillmentResponse {
+            frame: None,
             lix_id: request.descriptor.lix_id.clone(),
             epoch_id: request.epoch_id.clone(),
             request_digest: request.digest().unwrap(),
@@ -3553,6 +3826,7 @@ mod tests {
 
         let empty = Vec::new();
         let mut response = ReadFulfillmentResponse {
+            frame: None,
             lix_id: request.descriptor.lix_id.clone(),
             epoch_id: request.epoch_id.clone(),
             request_digest: request.digest().unwrap(),
@@ -3616,7 +3890,9 @@ mod tests {
         response.inputs.clear();
         response.closure_digest = input_digest(&request, &response.inputs).unwrap();
         response.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 1,
+            spool_id: uuid::Uuid::now_v7().to_string(),
             closure_digest: response.closure_digest.clone(),
         });
         assert!(validate_complete(&request, &response).is_err());
@@ -3624,7 +3900,9 @@ mod tests {
         response.continuation = None;
         let mut constructor_paged_request = request.clone();
         constructor_paged_request.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 1,
+            spool_id: uuid::Uuid::now_v7().to_string(),
             closure_digest: response.closure_digest.clone(),
         });
         assert!(
@@ -3638,7 +3916,9 @@ mod tests {
 
         let mut paged_request = request.clone();
         paged_request.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 1,
+            spool_id: uuid::Uuid::now_v7().to_string(),
             closure_digest: response.closure_digest.clone(),
         });
         response.request_digest = paged_request.digest().unwrap();
@@ -3654,6 +3934,7 @@ mod tests {
             path_predicate: crate::hot_state::FilePathInterest::All,
         }];
         let non_native_fallback = ReadFulfillmentResponse {
+            frame: None,
             lix_id: non_history_request.descriptor.lix_id.clone(),
             epoch_id: non_history_request.epoch_id.clone(),
             request_digest: non_history_request.digest().unwrap(),
@@ -4546,6 +4827,7 @@ mod tests {
                 storage_calls: 9,
                 storage_bytes: 1_234,
                 payload_bytes: 678,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -4601,6 +4883,7 @@ mod tests {
                 storage_calls: MAX_READ_CALLS,
                 storage_bytes: MAX_READ_BYTES + 1,
                 payload_bytes: MAX_PAYLOAD_BYTES + 2,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -4636,7 +4919,9 @@ mod tests {
         assert!(!request_closure_is_ineligible(&changed).unwrap());
         assert!(validate_complete(&changed, &response).is_err());
         request.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 1,
+            spool_id: uuid::Uuid::now_v7().to_string(),
             closure_digest: response.closure_digest.clone(),
         });
         assert!(validate_complete(&request, &response).is_err());
@@ -4918,14 +5203,22 @@ mod tests {
     async fn read_continuation_rejects_replay_skips_and_closure_changes() {
         let (mut request, mut response) = fixture().await;
         request.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 1,
+            spool_id: uuid::Uuid::now_v7().to_string(),
             closure_digest: response.closure_digest.clone(),
         });
         response.continuation = Some(ReadContinuation {
+            next_offset: 0,
             next_input: 2,
+            spool_id: request.continuation.as_ref().unwrap().spool_id.clone(),
             closure_digest: response.closure_digest.clone(),
         });
         validate_response(&request, &response).unwrap();
+        let token = response.continuation.as_ref().unwrap().spool_id.clone();
+        response.continuation.as_mut().unwrap().spool_id = uuid::Uuid::now_v7().to_string();
+        assert!(validate_response(&request, &response).is_err());
+        response.continuation.as_mut().unwrap().spool_id = token;
         response.continuation.as_mut().unwrap().next_input = 1;
         assert!(validate_response(&request, &response).is_err());
         response.continuation.as_mut().unwrap().next_input = 3;
@@ -5541,6 +5834,7 @@ mod tests {
             .await
             .unwrap();
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![
@@ -5718,6 +6012,7 @@ mod tests {
             .await
             .unwrap();
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -5741,6 +6036,100 @@ mod tests {
             .find(|input| input.address == ReadInputAddress::Metadata(address.clone()))
             .expect("required direct locator should be returned");
         crate::sync::native_metadata::validate_bytes(&address, &input.bytes).unwrap();
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_medium_payloads_stream_through_byte_bounded_provider_pages() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let mut content = String::with_capacity(450 * 1024);
+        for index in 0..(450 * 1024 / 32) {
+            let hash = blake3::hash(&(index as u64).to_be_bytes());
+            content.extend(
+                hash.as_bytes()
+                    .iter()
+                    .map(|byte| char::from(33 + byte % 94)),
+            );
+        }
+        let mut row_pks = Vec::new();
+        for index in 0..32 {
+            let key = format!("bounded-payload-{index}");
+            row_pks.push(crate::row_pk::RowPk::single(&key));
+            authority
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[crate::Value::Text(key), crate::Value::Text(content.clone())],
+                )
+                .await
+                .unwrap();
+        }
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let mut request = ReadFulfillmentRequest {
+            release: false,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_key_value".into()],
+                        row_pks,
+                        branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                domain: InterestDomain::Combined,
+            }],
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::CommitGraphRecord(
+                    leased.descriptor.selected_branch.head.commit_id.clone(),
+                ),
+            )],
+            continuation: None,
+        };
+        let mut inputs = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let response = authority
+                .read_sync_fulfillment(&request, &leased.lease.lease_id)
+                .await
+                .unwrap();
+            assert_eq!(response.outcome, ReadFulfillmentOutcome::Complete);
+            assert!(
+                response.profile.peak_provider_bytes <= DISCOVERY_READ_BUDGET.max_result_bytes,
+                "medium selected rows must use ordinary provider pages"
+            );
+            validate_response(&request, &response).unwrap();
+            assert!(
+                response.frame.is_none(),
+                "medium codec members should fit ordinary transport pages"
+            );
+            inputs.extend(response.inputs);
+            pages += 1;
+            match response.continuation {
+                Some(cursor) => request.continuation = Some(cursor),
+                None => break,
+            }
+        }
+        assert!(pages > 1, "the closure exceeds one transport page");
+        let selected = inputs.iter().filter(|input| matches!(&input.address, ReadInputAddress::ChangeRecord { schema_key, .. } if schema_key == "lix_key_value")).collect::<Vec<_>>();
+        assert_eq!(selected.len(), 32);
+        for input in selected {
+            let ReadInputAddress::ChangeRecord { change_id, .. } = &input.address else {
+                unreachable!()
+            };
+            let record =
+                crate::changelog::decode_change_record(&input.bytes, change_id.parse().unwrap())
+                    .unwrap();
+            assert!(record.snapshot.unwrap().len() > 300 * 1024);
+        }
         authority.close().await.unwrap();
     }
 
@@ -5793,6 +6182,7 @@ mod tests {
             .unwrap();
         let change = change_id.to_string();
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::Scan {
@@ -6198,6 +6588,7 @@ mod tests {
             .unwrap();
         let change = change_id.to_string();
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::Scan {
@@ -6357,6 +6748,7 @@ mod tests {
         // mutation validation; the batch CAS lowerer emits one final demand
         // mutation per chunk key.
         let request = ReadFulfillmentRequest {
+            release: false,
             epoch_id: state.epoch_id().to_owned(),
             descriptor: state.descriptor().clone(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -6372,6 +6764,7 @@ mod tests {
         };
         let inputs = vec![chunk_input, manifest_input];
         let response = ReadFulfillmentResponse {
+            frame: None,
             lix_id: request.descriptor.lix_id.clone(),
             epoch_id: request.epoch_id.clone(),
             request_digest: request.digest().unwrap(),

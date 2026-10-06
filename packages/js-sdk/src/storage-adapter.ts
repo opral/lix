@@ -42,11 +42,10 @@ export function isLixStorage(value: unknown): value is FilesystemLixStorage {
 	const adapter = (value as { lixStorage?: unknown }).lixStorage;
 	return Boolean(
 		adapter &&
-			typeof adapter === "object" &&
-			(adapter as { version?: unknown }).version === 1 &&
-			typeof (adapter as { connect?: unknown }).connect === "function" &&
-			(adapter as { config?: { kind?: unknown } }).config?.kind ===
-				"filesystem",
+		typeof adapter === "object" &&
+		(adapter as { version?: unknown }).version === 1 &&
+		typeof (adapter as { connect?: unknown }).connect === "function" &&
+		(adapter as { config?: { kind?: unknown } }).config?.kind === "filesystem",
 	);
 }
 
@@ -59,9 +58,9 @@ export function isJsProviderLixStorage(
 	const registration = (value as { lixStorage?: unknown }).lixStorage;
 	return Boolean(
 		registration &&
-			typeof registration === "object" &&
-			(registration as { version?: unknown }).version === 3 &&
-			typeof (registration as { moduleUrl?: unknown }).moduleUrl === "string",
+		typeof registration === "object" &&
+		(registration as { version?: unknown }).version === 3 &&
+		typeof (registration as { moduleUrl?: unknown }).moduleUrl === "string",
 	);
 }
 
@@ -201,12 +200,32 @@ export interface LixStorageChangeWatch {
 	close(): void;
 }
 
+/** Call-wide byte admission, including duplicate returned slots. */
+export type LixStorageReadBudget = {
+	maxResultBytes: number;
+	maxSingleValueBytes: number;
+};
+
 /** Mirrors `lix::storage::StorageRead`. */
 export interface LixStorageRead {
+	getManyBoundedPrefix(
+		requests: LixStorageGetManyRequest[],
+		offset: number,
+		maxSlots: number,
+		budget: LixStorageReadBudget,
+	): Promise<{
+		values: Array<LixStorageProjectedValue | null>;
+		nextOffset: number | null;
+	}>;
+
 	/** Decimal u128, or undefined to disable snapshot-derived caching. */
 	snapshotCacheKey(): string | undefined;
 	getMany(
 		requests: LixStorageGetManyRequest[],
+	): Promise<Array<LixStorageProjectedValue | null>>;
+	getManyBounded(
+		requests: LixStorageGetManyRequest[],
+		budget: LixStorageReadBudget,
 	): Promise<Array<LixStorageProjectedValue | null>>;
 	beginScan(
 		space: LixStorageSpace,
@@ -220,6 +239,11 @@ export interface LixStorageRead {
 
 /** Mirrors `lix::storage::StorageScanSource`. */
 export interface LixStorageScanSource {
+	nextPageBounded(
+		limitRows: number,
+		budget: LixStorageReadBudget,
+	): Promise<{ entries: LixStorageReadEntry[]; hasMore: boolean }>;
+
 	nextPage(limitRows: number): Promise<{
 		entries: LixStorageReadEntry[];
 		hasMore: boolean;
@@ -228,24 +252,20 @@ export interface LixStorageScanSource {
 
 /** Mirrors `lix::storage::StorageWrite`. */
 export interface LixStorageWrite {
-	putMany(
-		space: LixStorageSpace,
-		entries: LixStoragePutEntry[],
-	): Promise<void>;
+	putMany(space: LixStorageSpace, entries: LixStoragePutEntry[]): Promise<void>;
 	replaceMany(
 		space: LixStorageSpace,
 		entries: LixStoragePutEntry[],
 	): Promise<void>;
 	deleteMany(space: LixStorageSpace, keys: Uint8Array[]): Promise<void>;
-	deleteRange(
-		space: LixStorageSpace,
-		range: LixStorageKeyRange,
-	): Promise<void>;
+	deleteRange(space: LixStorageSpace, range: LixStorageKeyRange): Promise<void>;
 	commit(): Promise<LixStorageCommitResult>;
 	rollback(): Promise<void>;
 }
 
 export type LixStorageErrorCode =
+	| "LIX_STORAGE_READ_BUDGET_EXCEEDED"
+	| "LIX_STORAGE_SINGLE_VALUE_BUDGET_EXCEEDED"
 	| "LIX_STORAGE_UNSUPPORTED"
 	| "LIX_STORAGE_INVALID_KEY"
 	| "LIX_STORAGE_INVALID_CURSOR"
@@ -265,11 +285,7 @@ export class LixStorageError extends Error {
 	readonly code: LixStorageErrorCode;
 	readonly details?: unknown;
 
-	constructor(
-		code: LixStorageErrorCode,
-		message: string,
-		details?: unknown,
-	) {
+	constructor(code: LixStorageErrorCode, message: string, details?: unknown) {
 		super(message);
 		this.name = "LixStorageError";
 		this.code = code;

@@ -17,6 +17,7 @@ import type {
 	LixStorageProviderOpenProfile,
 	LixStorageRead,
 	LixStorageReadOptions,
+	LixStorageReadBudget,
 	LixStorageScanOrder,
 	LixStorageScanSource,
 	LixStorageSpace,
@@ -73,6 +74,10 @@ const SQLITE_VFS_DIRECTORY = "/lix/sqlite-sahpool";
 // ceiling while collapsing hundreds of JS/Wasm bind-step-reset crossings into
 // a handful of indexed joins.
 const READ_MANY_KEYS_PER_QUERY = 300;
+const MIGRATION_READ_BUDGET: LixStorageReadBudget = {
+	maxResultBytes: 8 * 1024 * 1024,
+	maxSingleValueBytes: 64 * 1024 * 1024,
+};
 // Bounded undo history gives async readers a stable view without blocking a
 // writer or copying the database. History is private to this owner lifetime.
 export const OPFS_READ_HISTORY_MAX_BYTES = 32 * 1024 * 1024;
@@ -115,7 +120,9 @@ function profileNow(): number {
 
 function profileElapsed(startedAt: number): number {
 	const duration = profileNow() - startedAt;
-	return Number.isFinite(duration) ? Math.min(86_400_000, Math.max(0, duration)) : 0;
+	return Number.isFinite(duration)
+		? Math.min(86_400_000, Math.max(0, duration))
+		: 0;
 }
 
 let sqliteModule: Promise<SqliteInit> | undefined;
@@ -274,11 +281,19 @@ export class OpfsBackend implements LixStorageProvider {
 	async copyForMigration(destination: OpfsBackend): Promise<string> {
 		this.#assertOpen();
 		destination.#assertOpen();
-		if (this === destination || Number(destination.#database.selectValue("SELECT COUNT(*) FROM lix_entries")) !== 0) {
+		if (
+			this === destination ||
+			Number(
+				destination.#database.selectValue("SELECT COUNT(*) FROM lix_entries"),
+			) !== 0
+		) {
 			throw new Error("Migration requires a fresh empty destination");
 		}
 		const digest = await this.#visitMigrationEntries((space, key, value) => {
-			destination.#database.exec({sql: "INSERT INTO lix_entries(space,key,value) VALUES (?,?,?)", bind: [space, key, value]});
+			destination.#database.exec({
+				sql: "INSERT INTO lix_entries(space,key,value) VALUES (?,?,?)",
+				bind: [space, key, value],
+			});
 		});
 		destination.#generation += 1;
 		destination.#oldestReadGeneration = destination.#generation;
@@ -292,7 +307,8 @@ export class OpfsBackend implements LixStorageProvider {
 	isEmptyForMigration(): boolean {
 		this.#assertOpen();
 		return (
-			this.#database.selectValue("SELECT 1 FROM lix_entries LIMIT 1") === undefined
+			this.#database.selectValue("SELECT 1 FROM lix_entries LIMIT 1") ===
+			undefined
 		);
 	}
 
@@ -320,21 +336,35 @@ export class OpfsBackend implements LixStorageProvider {
 			for (const row of rows) {
 				const space = Number(row[0]);
 				const key = row[1] as Uint8Array;
-				if (!(key instanceof Uint8Array) || Number(row[3]) > 64 * 1024 || Number(row[2]) > 16 * 1024 * 1024) throw new Error("Migration record exceeds bounded transfer limits");
-				const value = this.#database.selectValue("SELECT value FROM lix_entries WHERE space=? AND key=?", [space, key]) as Uint8Array;
-				if (!(value instanceof Uint8Array)) throw new Error("Migration source changed during transfer");
-				const keyHash = new Uint8Array(await crypto.subtle.digest("SHA-256", key.slice().buffer));
-				const valueHash = new Uint8Array(await crypto.subtle.digest("SHA-256", value.slice().buffer));
+				if (!(key instanceof Uint8Array) || Number(row[3]) > 64 * 1024)
+					throw new Error("Migration record exceeds bounded transfer limits");
+				admitReadBytes(MIGRATION_READ_BUDGET, Number(row[2]), 0, true);
+				const value = this.#database.selectValue(
+					"SELECT value FROM lix_entries WHERE space=? AND key=?",
+					[space, key],
+				) as Uint8Array;
+				if (!(value instanceof Uint8Array))
+					throw new Error("Migration source changed during transfer");
+				const keyHash = new Uint8Array(
+					await crypto.subtle.digest("SHA-256", key.slice().buffer),
+				);
+				const valueHash = new Uint8Array(
+					await crypto.subtle.digest("SHA-256", value.slice().buffer),
+				);
 				const record = new Uint8Array(100);
-				record.set(digest); new DataView(record.buffer).setUint32(32, space); record.set(keyHash, 36); record.set(valueHash, 68);
+				record.set(digest);
+				new DataView(record.buffer).setUint32(32, space);
+				record.set(keyHash, 36);
+				record.set(valueHash, 68);
 				digest = new Uint8Array(await crypto.subtle.digest("SHA-256", record));
-				if (generation !== this.#generation) throw new Error("Migration source changed during transfer");
+				if (generation !== this.#generation)
+					throw new Error("Migration source changed during transfer");
 				visit(space, key, value);
-				previous = {space, key};
+				previous = { space, key };
 			}
 		}
 		return Array.from(digest, (byte) =>
-		byte.toString(16).padStart(2, "0"),
+			byte.toString(16).padStart(2, "0"),
 		).join("");
 	}
 
@@ -347,6 +377,7 @@ export class OpfsBackend implements LixStorageProvider {
 		requests: LixStorageGetManyRequest[],
 		generation: number,
 		sessionToken?: string,
+		budget?: LixStorageReadBudget,
 	): Array<LixStorageProjectedValue | null> {
 		this.assertSession(sessionToken);
 		this.#assertGeneration(generation);
@@ -358,6 +389,18 @@ export class OpfsBackend implements LixStorageProvider {
 			})),
 		);
 		const values: Array<LixStorageProjectedValue | null> = [];
+		if (budget) {
+			const lengths = this.readManyLengths(requests, generation, sessionToken);
+			let admitted = 0;
+			for (const length of lengths)
+				admitted = admitReadBytes(
+					budget,
+					length,
+					admitted,
+					lengths.length === 1,
+				);
+			return this.readMany(requests, generation, sessionToken);
+		}
 		for (
 			let offset = 0;
 			offset < entries.length;
@@ -376,7 +419,10 @@ export class OpfsBackend implements LixStorageProvider {
 				);
 			}
 			const rows: SqliteValue[][] = [];
-			const valueExpression = generation === this.#generation ? "entries.value" : `
+			const valueExpression =
+				generation === this.#generation
+					? "entries.value"
+					: `
                 CASE WHEN EXISTS (SELECT 1 FROM lix_read_history h
                     WHERE h.space=requested.space AND h.key=requested.key AND h.generation >= ${generation})
                 THEN (SELECT h.value FROM lix_read_history h
@@ -413,6 +459,106 @@ export class OpfsBackend implements LixStorageProvider {
 		return values;
 	}
 
+	readManyLengths(
+		requests: LixStorageGetManyRequest[],
+		generation: number,
+		sessionToken?: string,
+	): number[] {
+		this.assertSession(sessionToken);
+		this.#assertGeneration(generation);
+		const entries = requests.flatMap((request) =>
+			request.keys.map((key) => ({
+				spaceId: request.space.id,
+				key,
+				projection: request.options.projection,
+			})),
+		);
+		const values: number[] = [];
+		for (
+			let offset = 0;
+			offset < entries.length;
+			offset += READ_MANY_KEYS_PER_QUERY
+		) {
+			const chunk = entries.slice(offset, offset + READ_MANY_KEYS_PER_QUERY);
+			const requestedRows = chunk
+				.map((_, index) => `(${index}, ?, ?, ?)`)
+				.join(", ");
+			const bindings: SqliteValue[] = [];
+			for (const entry of chunk) {
+				bindings.push(
+					entry.spaceId,
+					entry.key,
+					entry.projection === "fullValue" ? 1 : 0,
+				);
+			}
+			const rows: SqliteValue[][] = [];
+			const historyWhere = `h.space=requested.space AND h.key=requested.key AND h.generation >= ${generation}`;
+			const hasHistory = `EXISTS (SELECT 1 FROM lix_read_history h WHERE ${historyWhere})`;
+			const present =
+				generation === this.#generation
+					? "entries.key IS NOT NULL"
+					: `CASE WHEN ${hasHistory} THEN (SELECT h.value IS NOT NULL FROM lix_read_history h WHERE ${historyWhere} ORDER BY h.generation LIMIT 1) ELSE entries.key IS NOT NULL END`;
+			const length =
+				generation === this.#generation
+					? "length(entries.value)"
+					: `CASE WHEN ${hasHistory} THEN (SELECT length(h.value) FROM lix_read_history h WHERE ${historyWhere} ORDER BY h.generation LIMIT 1) ELSE length(entries.value) END`;
+			this.#database.exec({
+				sql: `WITH requested(ordinal, space, key, wants_value) AS (
+                    VALUES ${requestedRows}
+                ) SELECT ${present}, CASE WHEN requested.wants_value = 1 THEN ${length} END
+                FROM requested LEFT JOIN lix_entries entries
+                ON entries.space=requested.space AND entries.key=requested.key
+                ORDER BY requested.ordinal`,
+				bind: bindings,
+				rowMode: "array",
+				resultRows: rows,
+			});
+			for (let index = 0; index < rows.length; index += 1) {
+				const row = rows[index]!;
+				const entry = chunk[index]!;
+				values.push(
+					row[0] !== 1 || entry.projection === "keyOnly" ? 0 : Number(row[1]),
+				);
+			}
+		}
+		this.#assertGeneration(generation);
+		this.assertSession(sessionToken);
+		return values;
+	}
+
+	readManyPrefix(
+		requests: LixStorageGetManyRequest[],
+		generation: number,
+		sessionToken: string | undefined,
+		offset: number,
+		maxSlots: number,
+		budget: LixStorageReadBudget,
+	) {
+		const { window, total } = pointRequestWindow(requests, offset, maxSlots);
+		const lengths = this.readManyLengths(window, generation, sessionToken);
+		let count = 0,
+			bytes = 0;
+		for (const length of lengths) {
+			try {
+				bytes = admitReadBytes(budget, length, bytes, count === 0);
+			} catch (error) {
+				if (count === 0) throw error;
+				break;
+			}
+			count += 1;
+			if (bytes > budget.maxResultBytes) break;
+		}
+		const admitted = pointRequestWindow(window, 0, Math.max(1, count)).window;
+		const values = this.readMany(admitted, generation, sessionToken, budget);
+		const next = offset + values.length;
+		if (next > total || (values.length === 0 && next < total))
+			throw storageError(
+				"LIX_STORAGE_INVALID_CURSOR",
+				"Invalid bounded point prefix",
+			);
+		return { values, nextOffset: next < total ? next : null };
+	}
+
 	scanPage(request: {
 		space: LixStorageSpace;
 		range: LixStorageKeyRange;
@@ -422,6 +568,7 @@ export class OpfsBackend implements LixStorageProvider {
 		projection: "keyOnly" | "fullValue";
 		generation: number;
 		sessionToken?: string;
+		budget?: LixStorageReadBudget;
 	}): {
 		entries: Array<{ key: Uint8Array; value: LixStorageProjectedValue }>;
 		hasMore: boolean;
@@ -440,14 +587,48 @@ export class OpfsBackend implements LixStorageProvider {
 		const limit = Math.max(0, Math.min(10_000, request.limit));
 		const rows: SqliteValue[][] = [];
 		this.#database.exec({
-			sql: `WITH ${this.#readHistoryCte(request.generation)} scan_marker AS (SELECT 1)
-            SELECT key, value FROM ${request.generation === this.#generation ? "lix_entries" : "read_entries"} WHERE ${predicates.join(
-				" AND ",
-			)} ORDER BY key ${direction} LIMIT ?`,
+			sql: `WITH ${this.#readHistoryCte(request.generation, Boolean(request.budget) || request.projection === "keyOnly")} scan_marker AS (SELECT 1)
+            SELECT key, ${request.projection === "keyOnly" ? "NULL" : request.budget ? (request.generation === this.#generation ? "length(value)" : "value_bytes") : "value"} FROM ${request.generation === this.#generation ? "lix_entries" : "read_entries"} WHERE ${predicates.join(
+							" AND ",
+						)} ORDER BY key ${direction} LIMIT ?`,
 			bind: [...bindings, limit + 1],
 			rowMode: "array",
 			resultRows: rows,
 		});
+		let admitted = Math.min(rows.length, limit);
+		if (request.budget) {
+			let bytes = 0;
+			admitted = 0;
+			for (const row of rows.slice(0, limit)) {
+				const length = request.projection === "keyOnly" ? 0 : Number(row[1]);
+				if (admitted > 0 && bytes + length > request.budget.maxResultBytes)
+					break;
+				bytes = admitReadBytes(request.budget, length, bytes, admitted === 0);
+				admitted += 1;
+				if (bytes >= request.budget.maxResultBytes) break;
+			}
+			const keys = rows.slice(0, admitted).map(([key]) => copyBlob(key));
+			const values = this.readMany(
+				[
+					{
+						space: request.space,
+						keys,
+						options: { projection: request.projection },
+					},
+				],
+				request.generation,
+				request.sessionToken,
+			);
+			if (values.some((value) => value === null))
+				throw storageError(
+					"LIX_STORAGE_CORRUPTION",
+					"Bounded scan changed within a snapshot",
+				);
+			return {
+				entries: keys.map((key, index) => ({ key, value: values[index]! })),
+				hasMore: rows.length > admitted,
+			};
+		}
 		const hasMore = rows.length > limit;
 		const entries = rows.slice(0, limit).map(([key, value]) => ({
 			key: copyBlob(key),
@@ -539,10 +720,7 @@ export class OpfsBackend implements LixStorageProvider {
 			throw error;
 		} finally {
 			if (changes.strictDurability) {
-				restoreSynchronousModeBestEffort(
-					this.#database,
-					previousSynchronous,
-				);
+				restoreSynchronousModeBestEffort(this.#database, previousSynchronous);
 			}
 		}
 	}
@@ -555,10 +733,7 @@ export class OpfsBackend implements LixStorageProvider {
 
 	#assertOpen(): void {
 		if (this.#closed) {
-			throw storageError(
-				"LIX_STORAGE_CLOSED",
-				"SQLite OPFS storage is closed",
-			);
+			throw storageError("LIX_STORAGE_CLOSED", "SQLite OPFS storage is closed");
 		}
 	}
 
@@ -579,35 +754,61 @@ export class OpfsBackend implements LixStorageProvider {
 		oldestGeneration: number;
 		generation: number;
 	} {
-        this.#assertOpen();
-        return {
-            bytes: Number(this.#database.selectValue("SELECT COALESCE(SUM(length(key) + COALESCE(length(value), 0) + 32), 0) FROM lix_read_history")),
-            oldestGeneration: this.#oldestReadGeneration,
-            generation: this.#generation,
-        };
-    }
+		this.#assertOpen();
+		return {
+			bytes: Number(
+				this.#database.selectValue(
+					"SELECT COALESCE(SUM(length(key) + COALESCE(length(value), 0) + 32), 0) FROM lix_read_history",
+				),
+			),
+			oldestGeneration: this.#oldestReadGeneration,
+			generation: this.#generation,
+		};
+	}
 
 	#retainReadHistory(changes: OpfsWritePayload): number {
-		let oldest = Math.max(this.#oldestReadGeneration,
-            this.#generation + 1 - OPFS_READ_HISTORY_MAX_GENERATIONS);
-		this.#database.exec({sql: "DELETE FROM lix_read_history WHERE generation < ?", bind: [oldest]});
-		let bytes = Number(this.#database.selectValue(
-            "SELECT COALESCE(SUM(length(key) + COALESCE(length(value), 0) + 32), 0) FROM lix_read_history"));
+		let oldest = Math.max(
+			this.#oldestReadGeneration,
+			this.#generation + 1 - OPFS_READ_HISTORY_MAX_GENERATIONS,
+		);
+		this.#database.exec({
+			sql: "DELETE FROM lix_read_history WHERE generation < ?",
+			bind: [oldest],
+		});
+		let bytes = Number(
+			this.#database.selectValue(
+				"SELECT COALESCE(SUM(length(key) + COALESCE(length(value), 0) + 32), 0) FROM lix_read_history",
+			),
+		);
 		// Count before allocating. Duplicate keys/ranges overestimate, which can
 		// expire a read early but never break coherence or exceed the bound.
 		for (const range of changes.deleteRanges) {
-            const { sql, bindings } = deleteRangeSql(range);
-            bytes += Number(this.#database.selectValue(sql.replace("DELETE FROM", "SELECT COALESCE(SUM(length(key) + length(value) + 32), 0) FROM"), bindings));
-        }
+			const { sql, bindings } = deleteRangeSql(range);
+			bytes += Number(
+				this.#database.selectValue(
+					sql.replace(
+						"DELETE FROM",
+						"SELECT COALESCE(SUM(length(key) + length(value) + 32), 0) FROM",
+					),
+					bindings,
+				),
+			);
+		}
 		for (const entry of [...changes.deletes, ...changes.puts]) {
-            bytes += entry.key.byteLength + 32 + Number(this.#database.selectValue(
-                "SELECT COALESCE(length(value), 0) FROM lix_entries WHERE space = ? AND key = ?",
-                [entry.space.id, entry.key]) ?? 0);
-        }
+			bytes +=
+				entry.key.byteLength +
+				32 +
+				Number(
+					this.#database.selectValue(
+						"SELECT COALESCE(length(value), 0) FROM lix_entries WHERE space = ? AND key = ?",
+						[entry.space.id, entry.key],
+					) ?? 0,
+				);
+		}
 		if (bytes > OPFS_READ_HISTORY_MAX_BYTES) {
-            this.#database.exec("DELETE FROM lix_read_history");
-            return this.#generation + 1;
-        }
+			this.#database.exec("DELETE FROM lix_read_history");
+			return this.#generation + 1;
+		}
 		for (const range of changes.deleteRanges) {
 			const { sql, bindings } = deleteRangeSql(range);
 			this.#database.exec({
@@ -618,28 +819,37 @@ export class OpfsBackend implements LixStorageProvider {
 				bind: bindings,
 			});
 		}
-		const statement = this.#database.prepare(`INSERT OR IGNORE INTO lix_read_history(space, key, generation, value)
+		const statement = this.#database
+			.prepare(`INSERT OR IGNORE INTO lix_read_history(space, key, generation, value)
             VALUES (?, ?, ?, (SELECT value FROM lix_entries WHERE space = ? AND key = ?))`);
 		try {
-            for (const entry of [...changes.deletes, ...changes.puts]) {
-                statement.bind([entry.space.id, entry.key, this.#generation, entry.space.id, entry.key]);
-                statement.step();
-                statement.reset(true);
-            }
-        } finally { statement.finalize(); }
+			for (const entry of [...changes.deletes, ...changes.puts]) {
+				statement.bind([
+					entry.space.id,
+					entry.key,
+					this.#generation,
+					entry.space.id,
+					entry.key,
+				]);
+				statement.step();
+				statement.reset(true);
+			}
+		} finally {
+			statement.finalize();
+		}
 		return oldest;
 	}
 
-	#readHistoryCte(generation: number): string {
+	#readHistoryCte(generation: number, lengthsOnly = false): string {
 		if (generation === this.#generation) return "";
 		// Each historical key uses its earliest undo value at/after the read.
 		// Unchanged keys remain in the live table; tombstones exclude new keys.
 		return `read_entries AS (
-            SELECT e.space, e.key, e.value FROM lix_entries e
+            SELECT e.space, e.key, ${lengthsOnly ? "length(e.value) AS value_bytes" : "e.value"} FROM lix_entries e
             WHERE NOT EXISTS (SELECT 1 FROM lix_read_history h
                 WHERE h.space = e.space AND h.key = e.key AND h.generation >= ${generation})
             UNION ALL
-            SELECT h.space, h.key, h.value FROM lix_read_history h
+            SELECT h.space, h.key, ${lengthsOnly ? "length(h.value) AS value_bytes" : "h.value"} FROM lix_read_history h
             WHERE h.value IS NOT NULL AND h.generation = (
                 SELECT MIN(first.generation) FROM lix_read_history first
                 WHERE first.space = h.space AND first.key = h.key AND first.generation >= ${generation})
@@ -648,7 +858,11 @@ export class OpfsBackend implements LixStorageProvider {
 
 	#assertGeneration(generation: number): void {
 		this.#assertOpen();
-		if (!Number.isSafeInteger(generation) || generation < this.#oldestReadGeneration || generation > this.#generation) {
+		if (
+			!Number.isSafeInteger(generation) ||
+			generation < this.#oldestReadGeneration ||
+			generation > this.#generation
+		) {
 			throw storageError(
 				"LIX_STORAGE_READ_EXPIRED",
 				"read transaction is no longer valid",
@@ -702,6 +916,34 @@ class OpfsRead implements LixStorageRead {
 		);
 	}
 
+	async getManyBounded(
+		requests: LixStorageGetManyRequest[],
+		budget: LixStorageReadBudget,
+	) {
+		return this.#backend.readMany(
+			requests,
+			this.#generation,
+			this.#sessionToken,
+			budget,
+		);
+	}
+
+	async getManyBoundedPrefix(
+		requests: LixStorageGetManyRequest[],
+		offset: number,
+		maxSlots: number,
+		budget: LixStorageReadBudget,
+	) {
+		return this.#backend.readManyPrefix(
+			requests,
+			this.#generation,
+			this.#sessionToken,
+			offset,
+			maxSlots,
+			budget,
+		);
+	}
+
 	async beginScan(
 		space: LixStorageSpace,
 		range: LixStorageKeyRange,
@@ -736,6 +978,22 @@ class OpfsScan implements LixStorageScanSource {
 		},
 	) {}
 
+	async nextPageBounded(limitRows: number, budget: LixStorageReadBudget) {
+		const page = this.backend.scanPage({
+			space: this.space,
+			range: this.range,
+			after: this.#after,
+			limit: limitRows,
+			order: this.options.order,
+			projection: this.options.projection,
+			generation: this.generation,
+			sessionToken: this.sessionToken,
+			budget,
+		});
+		if (page.entries.length) this.#after = page.entries.at(-1)!.key;
+		return page;
+	}
+
 	async nextPage(limitRows: number) {
 		const page = this.backend.scanPage({
 			space: this.space,
@@ -754,9 +1012,8 @@ class OpfsScan implements LixStorageScanSource {
 
 async function initializeSqlite(): Promise<SqliteInit> {
 	if (!sqliteModule) {
-		const { default: sqlite3InitModule } = await import(
-			"@sqlite.org/sqlite-wasm"
-		);
+		const { default: sqlite3InitModule } =
+			await import("@sqlite.org/sqlite-wasm");
 		sqliteModule = initializeBundledSqlite(
 			sqlite3InitModule as unknown as Parameters<
 				typeof initializeBundledSqlite<SqliteInit>
@@ -853,22 +1110,22 @@ function acquireExclusiveLock(
 	});
 	let requestFinished!: Promise<void>;
 	requestFinished = locks
-			.request(
-				lockName,
-				{ ifAvailable: true, mode: "exclusive" },
-				async (lock) => {
-					if (!lock) {
-						rejectAcquired(unavailableError);
-						return;
-					}
-					resolveAcquired(async () => {
-						signalRelease();
-						await requestFinished;
-					});
-					await released;
-				},
-			)
-			.catch(rejectAcquired);
+		.request(
+			lockName,
+			{ ifAvailable: true, mode: "exclusive" },
+			async (lock) => {
+				if (!lock) {
+					rejectAcquired(unavailableError);
+					return;
+				}
+				resolveAcquired(async () => {
+					signalRelease();
+					await requestFinished;
+				});
+				await released;
+			},
+		)
+		.catch(rejectAcquired);
 	return acquired;
 }
 
@@ -915,9 +1172,7 @@ function appendBound(
 	bindings.push(bound.key);
 }
 
-function deleteRangeSql(
-	range: OpfsWritePayload["deleteRanges"][number],
-): {
+function deleteRangeSql(range: OpfsWritePayload["deleteRanges"][number]): {
 	sql: string;
 	bindings: SqliteValue[];
 } {
@@ -981,11 +1236,7 @@ function preconditionMatches(
 	}
 }
 
-function hasKey(
-	database: Database,
-	space: number,
-	key: Uint8Array,
-): boolean {
+function hasKey(database: Database, space: number, key: Uint8Array): boolean {
 	return (
 		(database.selectValue(
 			"SELECT 1 FROM lix_entries WHERE space = ? AND key = ? LIMIT 1",
@@ -1022,4 +1273,73 @@ function storageError(
 	error.name = "LixStorageError";
 	Object.assign(error, { code, details });
 	return error;
+}
+
+function admitReadBytes(
+	budget: LixStorageReadBudget,
+	length: number,
+	retained: number,
+	singleton: boolean,
+): number {
+	if (
+		!Number.isSafeInteger(length) ||
+		length < 0 ||
+		!Number.isSafeInteger(budget.maxResultBytes) ||
+		budget.maxResultBytes < 0 ||
+		!Number.isSafeInteger(budget.maxSingleValueBytes) ||
+		budget.maxSingleValueBytes < 0
+	)
+		throw storageError("LIX_STORAGE_CORRUPTION", "Invalid bounded read budget");
+	if (length > budget.maxSingleValueBytes)
+		throw storageError(
+			"LIX_STORAGE_SINGLE_VALUE_BUDGET_EXCEEDED",
+			"Storage value exceeds codec byte budget",
+		);
+	const total = retained + length;
+	if (
+		!Number.isSafeInteger(total) ||
+		(total > budget.maxResultBytes && !(singleton && retained === 0))
+	)
+		throw storageError(
+			"LIX_STORAGE_READ_BUDGET_EXCEEDED",
+			"Storage result exceeds byte budget",
+		);
+	return total;
+}
+
+function pointRequestWindow(
+	requests: LixStorageGetManyRequest[],
+	offset: number,
+	maxSlots: number,
+) {
+	const total = requests.reduce((sum, request) => sum + request.keys.length, 0);
+	if (
+		!Number.isSafeInteger(total) ||
+		!Number.isSafeInteger(offset) ||
+		offset < 0 ||
+		offset > total ||
+		!Number.isSafeInteger(maxSlots) ||
+		maxSlots < 1
+	)
+		throw storageError(
+			"LIX_STORAGE_INVALID_CURSOR",
+			"Invalid point prefix cursor",
+		);
+	let skip = offset,
+		left = Math.min(maxSlots, 10000);
+	const window: LixStorageGetManyRequest[] = [];
+	for (const request of requests) {
+		const begin = Math.min(skip, request.keys.length);
+		skip -= begin;
+		const count = Math.min(request.keys.length - begin, left);
+		if (count > 0) {
+			window.push({
+				...request,
+				keys: request.keys.slice(begin, begin + count),
+			});
+			left -= count;
+		}
+		if (left === 0) break;
+	}
+	return { window, total };
 }

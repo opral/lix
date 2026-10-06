@@ -59,6 +59,7 @@ fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
         83 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V83),
         84 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V84),
         85 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85),
+        86 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86),
         crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
         _ => None,
     }
@@ -73,6 +74,7 @@ fn partial_repository_format(marker: &[u8]) -> Option<u32> {
         83,
         84,
         85,
+        86,
         crate::init::CURRENT_FORMAT_VERSION,
     ]
     .into_iter()
@@ -1620,7 +1622,7 @@ where
         73 | 74 | 75 | 76 | 77 | 78 => {
             super::older_witness::verify_candidate(source, target, from_format, options).await
         }
-        79 | 80 | 81 | 82 | 83 | 84 | 85 | crate::init::CURRENT_FORMAT_VERSION => {
+        79 | 80 | 81 | 82 | 83 | 84 | 85 | 86 | crate::init::CURRENT_FORMAT_VERSION => {
             let mut plan = if from_format == 79 {
                 let read = MigrationPlanningRead::new(source).await?;
                 let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -1950,7 +1952,10 @@ where
     if from_format <= 84 {
         super::semantic_fingerprint_format::migrate(target, true).await?;
     }
-    super::api::migrate_v86_marker(target).await?;
+    if from_format <= 85 {
+        super::api::migrate_v86_marker(target).await?;
+    }
+    super::api::migrate_v87_marker(target).await?;
     crate::sync::upgrade_owned_partial_receipt(target).await?;
     if let Some((key, bytes)) = crate::sync::legacy_read_interest_journal_upgrade(
         &target.begin_read(ReadOptions::default()).await?,
@@ -2254,7 +2259,9 @@ async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
 where
     S: Storage,
 {
-    for space in epoch_data_spaces() {
+    for space in
+        epoch_data_spaces().chain(std::iter::once(crate::sync::READ_OPERATION_SCRATCH_SPACE))
+    {
         adapter
             .clear_space(space, durable_candidate_write_options())
             .await

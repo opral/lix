@@ -128,45 +128,62 @@ where
         ));
     }
     let mut inline_group = super::transfer::TransferBatch::new();
-    for blob in super::repository::sync_commit_blob_ids(&request.commits)? {
-        let id = BlobId::from_hex(&blob)?;
-        let read = crate::migration::MigrationPlanningRead::new(storage).await?;
-        let metadata = load_metadata_many(&read, &[id])
-            .await?
-            .into_vec()
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| LixError::unknown("captured local blob metadata is missing"))?;
-        if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
-            let canonical =
-                crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
-            drop(read);
-            super::transfer::upload_canonical_blob(transport, &metadata, &canonical, || async {
-                crate::migration::MigrationPlanningRead::new(storage).await.map_err(LixError::from)
-            })
-            .await?;
-            continue;
-        }
-        let chunks = load_canonical_blob_chunks(&read, id)
-            .await?
-            .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
-        let manifest = super::blob::encode_manifest(id, &chunks)?;
+    let mut canonical_group = super::transfer::TransferBatch::new();
+    let begin_read = || async {
+        crate::migration::MigrationPlanningRead::new(storage)
+            .await
+            .map_err(LixError::from)
+    };
+    let ids = super::repository::sync_commit_blob_ids(&request.commits)?
+        .into_iter()
+        .map(|blob| BlobId::from_hex(&blob))
+        .collect::<Result<Vec<_>, _>>()?;
+    for ids in ids.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+        let read = begin_read().await?;
+        let metadata = load_metadata_many(&read, ids).await?.into_vec();
         drop(read);
-        let encoded = serde_json::to_vec(&manifest)
-            .map_err(|error| LixError::unknown(error.to_string()))?
-            .len();
-        let decoded = manifest.size_bytes as usize;
-        if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
-            super::transfer::register_inline_group(transport, &inline_group).await?;
-            inline_group = super::transfer::TransferBatch::new();
-            if inline_group.push(manifest, encoded, decoded)?.is_some() {
-                return Err(LixError::unknown(
-                    "single migration content member did not fit",
-                ));
+        for (id, metadata) in ids.iter().zip(metadata) {
+            let id = *id;
+            let metadata = metadata
+                .ok_or_else(|| LixError::unknown("captured local blob metadata is missing"))?;
+            let read = begin_read().await?;
+            if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+                let canonical =
+                    crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
+                drop(read);
+                super::transfer::pack_canonical_plan(
+                    transport,
+                    &mut canonical_group,
+                    super::transfer::CanonicalUploadPlan {
+                        metadata,
+                        canonical,
+                    },
+                    &begin_read,
+                )
+                .await?;
+                continue;
+            }
+            let chunks = load_canonical_blob_chunks(&read, id)
+                .await?
+                .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
+            let manifest = super::blob::encode_manifest(id, &chunks)?;
+            drop(read);
+            let encoded = serde_json::to_vec(&manifest)
+                .map_err(|error| LixError::unknown(error.to_string()))?
+                .len();
+            let decoded = manifest.size_bytes as usize;
+            if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+                super::transfer::register_inline_group(transport, &inline_group).await?;
+                inline_group = super::transfer::TransferBatch::new();
+                if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                    return Err(LixError::unknown(
+                        "single migration content member did not fit",
+                    ));
+                }
             }
         }
     }
+    super::transfer::upload_canonical_page(transport, &canonical_group.items, &begin_read).await?;
     super::transfer::register_inline_group(transport, &inline_group).await?;
     Ok(())
 }

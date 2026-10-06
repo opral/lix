@@ -1,4 +1,4 @@
-use crate::storage::conformance::{StorageFactory, baseline, model_based, persistence};
+use crate::storage::conformance::{StorageFactory, baseline, bounded, model_based, persistence};
 
 pub type ConformanceResult = Result<(), String>;
 
@@ -27,6 +27,7 @@ where
     let mut report = ConformanceReport::default();
 
     baseline::register(&mut report, factory).await;
+    bounded::register(&mut report, factory).await;
     model_based::register(&mut report, factory).await;
     if !factory.config().ephemeral {
         persistence::register(&mut report, factory).await;

@@ -52,8 +52,8 @@ pub(crate) use context::{
     stage_mutation_revision,
 };
 pub(crate) use epoch::{EpochBank, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE};
-pub(crate) use point::exact_get_many;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
+pub(crate) use point::{collect_bounded_point_pages, exact_get_many};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub(crate) use spaces::{
@@ -67,3 +67,5 @@ pub use stats::{
 #[cfg(any(test, feature = "storage-benches"))]
 pub use write_set::StorageWriteSetArenaStats;
 pub use write_set::{StorageWriteSet, StorageWriteSetError};
+
+pub use crate::storage::{GetManyPrefixResult, ReadBudget, bounded_prefix_requests};

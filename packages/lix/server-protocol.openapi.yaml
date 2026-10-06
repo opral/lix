@@ -1034,7 +1034,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 29 }
+      schema: { type: integer, const: 30 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1092,7 +1092,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 29 }
+        syncProtocolVersion: { type: integer, const: 30 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1654,8 +1654,9 @@ components:
     ReadFulfillmentRequest:
       type: object
       additionalProperties: false
-      required: [epochId, descriptor, interests, required]
+      required: [release, epochId, descriptor, interests, required, continuation]
       properties:
+        release: { type: boolean, description: Release a bound sealed operation idempotently; requires continuation and grants no coverage. }
         epochId: { type: string, format: uuid }
         descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }
         interests:
@@ -1680,9 +1681,11 @@ components:
     ReadContinuation:
       type: object
       additionalProperties: false
-      required: [nextInput, closureDigest]
+      required: [nextInput, nextOffset, spoolId, closureDigest]
       properties:
-        nextInput: { type: integer, minimum: 1, maximum: 16383 }
+        nextInput: { type: integer, minimum: 0, maximum: 16383 }
+        nextOffset: { type: integer, minimum: 0, maximum: 67108863, description: Exact progress within a framed member; input zero requires a positive offset. }
+        spoolId: { type: string, format: uuid, description: Opaque sealed operation bound to account, repository, lease, epoch, descriptor roots and recipe digest. Expiry requires restarting the operation. }
         closureDigest: { type: string, minLength: 64, maxLength: 64 }
     LogicalReadInterest:
       type: object
@@ -1744,24 +1747,37 @@ components:
       required: [address, bytes]
       properties:
         address: { $ref: "#/components/schemas/ReadInputAddress" }
-        bytes: { type: string, format: byte, maxLength: 89478488, description: One typed native dependency, at most 64 MiB decoded. }
+        bytes: { type: string, format: byte, maxLength: 5592408, description: One complete typed native dependency, at most 4 MiB decoded; larger members use ReadInputFrame. }
+    ReadInputFrame:
+      type: object
+      additionalProperties: false
+      required: [address, totalBytes, offset, digest, bytes]
+      properties:
+        address: { $ref: "#/components/schemas/ReadInputAddress" }
+        totalBytes: { type: integer, minimum: 4194305, maximum: 67108864 }
+        offset: { type: integer, minimum: 0, maximum: 67108863 }
+        digest: { $ref: "#/components/schemas/NativeDigest" }
+        bytes: { type: string, format: byte, maxLength: 5592408, description: Nonempty range of at most 4 MiB decoded bytes. }
     DiscoveryProfile:
       type: object
       additionalProperties: false
-      required: [storageCalls, storageBytes, payloadBytes]
+      required: [storageCalls, storageKeys, peakProviderBytes, storageBytes, payloadBytes]
       properties:
+        storageKeys: { type: integer, minimum: 0, description: Observed physical key and row count. }
+        peakProviderBytes: { type: integer, minimum: 0, description: Largest materialized provider response in decoded bytes. }
         storageCalls: { type: integer, minimum: 0, description: Storage calls admitted by the work limit; a rejected next call is excluded. }
         storageBytes: { type: integer, minimum: 0, description: Observed storage bytes including a final input that crosses the work limit. }
         payloadBytes: { type: integer, minimum: 0 }
     ReadFulfillmentResponse:
       type: object
       additionalProperties: false
-      required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation, outcome]
+      required: [lixId, epochId, requestDigest, inputs, frame, profile, closureDigest, continuation, outcome]
       allOf:
         - if: { properties: { outcome: { enum: [native_fallback, operation_fallback] } } }
           then:
             properties:
               inputs: { type: array, maxItems: 0 }
+              frame: { type: "null" }
               continuation: { type: "null" }
       properties:
         lixId: { type: string, format: uuid }
@@ -1774,8 +1790,12 @@ components:
         inputs:
           type: array
           maxItems: 16384
-          description: One page of the typed dependency closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB unless it contains one 64 MiB input.
+          description: One page of the typed dependency closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB. A framed page has empty inputs; whole-member validation precedes publication.
           items: { $ref: "#/components/schemas/ReadInput" }
+        frame:
+          oneOf:
+            - { $ref: "#/components/schemas/ReadInputFrame" }
+            - { type: "null" }
         profile: { $ref: "#/components/schemas/DiscoveryProfile" }
         closureDigest: { type: string, minLength: 64, maxLength: 64 }
         continuation:

@@ -104,46 +104,70 @@ where
     }
     let mut inline_group = super::transfer::TransferBatch::new();
     let mut authority_group = Vec::new();
-    for blob in super::repository::sync_commit_blob_ids(&request.commits)? {
-        let id = BlobId::from_hex(&blob)?;
-        let read = storage.begin_read(Default::default()).await?;
-        if load_partial_replica_state(&read)
-            .await?
-            .as_ref()
-            .map(|(actual, _)| actual)
-            != Some(state)
-        {
-            return Err(LixError::new(
-                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                "blob upload epoch changed",
-            ));
-        }
-        let metadata = load_metadata_many(&read, &[id])
-            .await?
-            .into_vec()
-            .into_iter()
-            .next()
-            .flatten();
-        let Some(metadata) = metadata else {
-            // A checkpoint can copy an authority-backed reference whose content
-            // was never demanded locally. Confirm its exact immutable identity
-            // at the authority instead of hydrating and uploading it again.
-            drop(read);
-            authority_group.push(blob);
-            if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
-                super::transfer::confirm_authority_group(transport, &authority_group).await?;
-                authority_group.clear();
+    let mut canonical_group = super::transfer::TransferBatch::new();
+    let ids = super::repository::sync_commit_blob_ids(&request.commits)?
+        .into_iter()
+        .map(|blob| BlobId::from_hex(&blob))
+        .collect::<Result<Vec<_>, _>>()?;
+    for ids in ids.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+        let read = guarded_upload_read(storage, state).await?;
+        let metadata = load_metadata_many(&read, ids).await?.into_vec();
+        drop(read);
+        for (id, metadata) in ids.iter().zip(metadata) {
+            let id = *id;
+            let blob = id.to_hex();
+            let Some(metadata) = metadata else {
+                // A checkpoint can copy an authority-backed reference whose content
+                // was never demanded locally. Confirm its exact immutable identity
+                // at the authority instead of hydrating and uploading it again.
+                authority_group.push(blob);
+                if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
+                    super::transfer::confirm_authority_group(transport, &authority_group).await?;
+                    authority_group.clear();
+                }
+                continue;
+            };
+            let read = guarded_upload_read(storage, state).await?;
+            if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+                let manifest =
+                    match crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata)
+                        .await
+                    {
+                        Ok(manifest) => manifest,
+                        Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
+                            drop(read);
+                            authority_group.push(blob);
+                            if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
+                                super::transfer::confirm_authority_group(
+                                    transport,
+                                    &authority_group,
+                                )
+                                .await?;
+                                authority_group.clear();
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                drop(read);
+                pack_canonical_upload(
+                    storage,
+                    state,
+                    transport,
+                    &mut canonical_group,
+                    super::transfer::CanonicalUploadPlan {
+                        metadata,
+                        canonical: manifest,
+                    },
+                )
+                .await?;
+                continue;
             }
-            continue;
-        };
-        if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
-            let manifest = match crate::binary_cas::load_streaming_canonical_manifest(
-                &read, &metadata,
-            )
-            .await
-            {
-                Ok(manifest) => manifest,
+            let chunks = match load_canonical_blob_chunks(&read, id).await {
+                Ok(Some(chunks)) => chunks,
                 Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
+                    // A resident deferred manifest is also a valid sparse state.
+                    // Other storage errors, including corruption, remain errors.
                     drop(read);
                     authority_group.push(blob);
                     if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
@@ -153,130 +177,110 @@ where
                     }
                     continue;
                 }
+                Ok(None) => {
+                    return Err(LixError::unknown("captured local blob content is missing"));
+                }
                 Err(error) => return Err(error),
             };
+            let mut manifest = super::blob::encode_manifest(id, &chunks)?;
             drop(read);
-            upload_streaming_blob(storage, state, transport, &metadata, &manifest).await?;
-            continue;
-        }
-        let chunks = match load_canonical_blob_chunks(&read, id).await {
-            Ok(Some(chunks)) => chunks,
-            Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
-                // A resident deferred manifest is also a valid sparse state.
-                // Other storage errors, including corruption, remain errors.
-                drop(read);
-                authority_group.push(blob);
-                if authority_group.len() == super::MAX_SYNC_BLOB_BATCH_ITEMS {
-                    super::transfer::confirm_authority_group(transport, &authority_group).await?;
-                    authority_group.clear();
+            if mode == TransferMode::Combined && manifest.inline_bytes_base64.is_some() {
+                let addition = serde_json::to_vec(&manifest)
+                    .map_err(|error| LixError::unknown(format!("encode inline content: {error}")))?
+                    .len()
+                    .saturating_add(usize::from(!request.inline_blobs.is_empty()));
+                if encoded_bytes.saturating_add(addition) <= MAX_COMBINED_REQUEST_BYTES {
+                    encoded_bytes += addition;
+                    request.inline_blobs.push(manifest);
+                    continue;
+                }
+            }
+            if mode != TransferMode::Chunks && manifest.inline_bytes_base64.is_some() {
+                let encoded = serde_json::to_vec(&manifest)
+                    .map_err(|error| LixError::unknown(error.to_string()))?
+                    .len();
+                let decoded = manifest.size_bytes as usize;
+                if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+                    super::transfer::register_inline_group(transport, &inline_group).await?;
+                    inline_group = super::transfer::TransferBatch::new();
+                    if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                        return Err(LixError::unknown("single inline group member did not fit"));
+                    }
                 }
                 continue;
             }
-            Ok(None) => return Err(LixError::unknown("captured local blob content is missing")),
-            Err(error) => return Err(error),
-        };
-        let mut manifest = super::blob::encode_manifest(id, &chunks)?;
-        drop(read);
-        if mode == TransferMode::Combined && manifest.inline_bytes_base64.is_some() {
-            let addition = serde_json::to_vec(&manifest)
-                .map_err(|error| LixError::unknown(format!("encode inline content: {error}")))?
-                .len()
-                .saturating_add(usize::from(!request.inline_blobs.is_empty()));
-            if encoded_bytes.saturating_add(addition) <= MAX_COMBINED_REQUEST_BYTES {
-                encoded_bytes += addition;
-                request.inline_blobs.push(manifest);
-                continue;
-            }
-        }
-        if mode == TransferMode::Prepare && manifest.inline_bytes_base64.is_some() {
-            let encoded = serde_json::to_vec(&manifest)
-                .map_err(|error| LixError::unknown(error.to_string()))?
-                .len();
-            let decoded = manifest.size_bytes as usize;
-            if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
-                super::transfer::register_inline_group(transport, &inline_group).await?;
-                inline_group = super::transfer::TransferBatch::new();
-                if inline_group.push(manifest, encoded, decoded)?.is_some() {
-                    return Err(LixError::unknown("single inline group member did not fit"));
-                }
-            }
-            continue;
-        }
-        if mode == TransferMode::Chunks {
             manifest.inline_bytes_base64 = None;
-        }
-        let registration =
-            super::transfer::register_manifest_page(transport, std::slice::from_ref(&manifest))
-                .await?
-                .remove(0);
-        let mut missing = std::collections::BTreeSet::new();
-        for id in &registration.missing_chunk_ids {
-            if !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id) {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "authority requested an unrelated upload chunk",
-                ));
-            }
-            missing.insert(id.as_str());
-        }
-        let uploaded = !missing.is_empty();
-        let uploads = chunks
-            .iter()
-            .filter_map(|chunk| {
-                let id = chunk.receipt.hash.to_hex();
-                missing
-                    .remove(id.as_str())
-                    .then_some((id, chunk.bytes.as_slice()))
-            })
-            .collect::<Vec<_>>();
-        for page in uploads.chunks(super::transfer::CHUNK_CONCURRENCY) {
-            super::transfer::upload_chunk_page(transport, page).await?;
-        }
-        if uploaded
-            && !super::transfer::register_manifest_page(transport, std::slice::from_ref(&manifest))
-                .await?
-                .remove(0)
-                .missing_chunk_ids
-                .is_empty()
-        {
-            return Err(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "authority blob remains incomplete after upload",
-            ));
+            let canonical = super::blob::decode_manifest(&manifest)?;
+            pack_canonical_upload(
+                storage,
+                state,
+                transport,
+                &mut canonical_group,
+                super::transfer::CanonicalUploadPlan {
+                    metadata,
+                    canonical,
+                },
+            )
+            .await?;
         }
     }
+    upload_canonical_group(storage, state, transport, &canonical_group.items).await?;
     super::transfer::register_inline_group(transport, &inline_group).await?;
     super::transfer::confirm_authority_group(transport, &authority_group).await?;
     Ok(())
 }
 
-/// Transfer large flat or delta-backed blobs with at most one forced anchor's
-/// payload in memory. No storage read remains open across an HTTP request.
-async fn upload_streaming_blob<S, T>(
+async fn pack_canonical_upload<S, T>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     transport: &T,
-    metadata: &crate::binary_cas::BlobMetadata,
-    canonical: &crate::binary_cas::CanonicalBlobManifest,
+    group: &mut super::transfer::TransferBatch<super::transfer::CanonicalUploadPlan>,
+    plan: super::transfer::CanonicalUploadPlan,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
-    super::transfer::upload_canonical_blob(transport, metadata, canonical, || async {
-        let read = storage.begin_read(Default::default()).await?;
-        if load_partial_replica_state(&read)
-            .await?
-            .as_ref()
-            .map(|(actual, _)| actual)
-            != Some(state)
-        {
-            return Err(LixError::new(
-                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                "blob upload epoch changed",
-            ));
-        }
-        Ok(read)
+    super::transfer::pack_canonical_plan(transport, group, plan, || async {
+        guarded_upload_read(storage, state).await
     })
     .await
+}
+
+async fn upload_canonical_group<S, T>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &T,
+    plans: &[super::transfer::CanonicalUploadPlan],
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    T: SyncTransport,
+{
+    super::transfer::upload_canonical_page(transport, plans, || async {
+        guarded_upload_read(storage, state).await
+    })
+    .await
+}
+
+async fn guarded_upload_read<S>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+) -> Result<impl crate::storage_adapter::StorageAdapterRead, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = storage.begin_read(Default::default()).await?;
+    if load_partial_replica_state(&read)
+        .await?
+        .as_ref()
+        .map(|(actual, _)| actual)
+        != Some(state)
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+            "blob upload epoch changed",
+        ));
+    }
+    Ok(read)
 }

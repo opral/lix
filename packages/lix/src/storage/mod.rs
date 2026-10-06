@@ -35,3 +35,6 @@ pub use types::{
     StorageSpace, StorageSpaceRole, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions,
     WriteStats,
 };
+
+mod read_budget;
+pub use read_budget::{GetManyPrefixResult, ReadBudget, bounded_prefix_requests};

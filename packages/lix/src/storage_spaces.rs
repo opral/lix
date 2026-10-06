@@ -90,6 +90,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::PARTIAL_GLOBAL_MERGE_SPACE,
     crate::sync::SYNC_REPLICA_RETIREMENT_SPACE,
     crate::sync::partial_serving::PARTIAL_SERVING_SPACE,
+    crate::sync::READ_OPERATION_SCRATCH_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -153,9 +154,9 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 /// with its original descriptor so snapshots written before that retirement
 /// can still be decoded and migrated. Space ids are never reused.
 ///
-/// New active logical spaces must be added here as well; the registry tests
-/// enforce that relationship. The epoch-control space is deliberately absent
-/// because snapshots publish their own fresh epoch at restore time.
+/// Semantic spaces are retained permanently. Epoch controls and private
+/// expiring operation scratch are excluded: snapshots create a fresh epoch
+/// and contain no in-flight reads or publication coverage.
 pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     RETIRED_JSON_SPACE,
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,

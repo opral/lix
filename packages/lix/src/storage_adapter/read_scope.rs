@@ -29,6 +29,39 @@ pub trait StorageAdapterRead: Send + Sync {
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send;
 
+    /// Returns the exact ordered point result or refuses before constructing
+    /// an oversized response. Unsupported adapters fail closed; ordinary
+    /// unbounded reads never provide an implicit compatibility path.
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        let _ = (requests, budget);
+        async {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::BoundedReads,
+            ))
+        }
+    }
+
+    /// Returns one byte-admitted prefix without changing exact point-read semantics.
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        let _ = (requests, offset, max_slots, budget);
+        async {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::BoundedReads,
+            ))
+        }
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -223,6 +256,42 @@ where
         }
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        let requests = requests
+            .iter()
+            .map(|request| GetManyRequest {
+                space: self.routing.map_space(request.space),
+                keys: request.keys,
+                opts: request.opts,
+            })
+            .collect::<Vec<_>>();
+        self.read.get_many_bounded(&requests, budget).await
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> Result<crate::storage::GetManyPrefixResult, StorageError> {
+        let requests = requests
+            .iter()
+            .map(|request| GetManyRequest {
+                space: self.routing.map_space(request.space),
+                keys: request.keys,
+                opts: request.opts,
+            })
+            .collect::<Vec<_>>();
+        self.read
+            .get_many_bounded_prefix(&requests, offset, max_slots, budget)
+            .await
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -255,8 +324,10 @@ where
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         if self.hydrated.is_none() {
-            return futures_util::future::Either::Left(
-                StorageAdapterRead::get_many(self.read.as_ref(), requests));
+            return futures_util::future::Either::Left(StorageAdapterRead::get_many(
+                self.read.as_ref(),
+                requests,
+            ));
         }
         // Keep the ordinary read future small and allocation-free. The larger
         // pinned-hydration state machine must not inflate every SQL/commit poll.
@@ -307,6 +378,38 @@ where
         }))
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        // Authority discovery uses one original scoped snapshot; hydrated
+        // client overlays are not an admissible authority snapshot.
+        if self.hydrated.is_some() {
+            return Err(StorageError::Unsupported(
+                crate::storage::Capability::BoundedReads,
+            ));
+        }
+        self.read.get_many_bounded(requests, budget).await
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> Result<crate::storage::GetManyPrefixResult, StorageError> {
+        if self.hydrated.is_some() {
+            return Err(StorageError::Unsupported(
+                crate::storage::Capability::BoundedReads,
+            ));
+        }
+        self.read
+            .get_many_bounded_prefix(requests, offset, max_slots, budget)
+            .await
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -314,8 +417,12 @@ where
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         if self.hydrated.is_none() {
-            return futures_util::future::Either::Left(
-                StorageAdapterRead::begin_scan(self.read.as_ref(), space, range, opts));
+            return futures_util::future::Either::Left(StorageAdapterRead::begin_scan(
+                self.read.as_ref(),
+                space,
+                range,
+                opts,
+            ));
         }
         futures_util::future::Either::Right(Box::pin(async move {
             // A prior manifest scan keeps its original immutable rows even if
@@ -401,6 +508,25 @@ where
         (*self).get_many(requests)
     }
 
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        (**self).get_many_bounded(requests, budget)
+    }
+
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        (**self).get_many_bounded_prefix(requests, offset, max_slots, budget)
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -430,6 +556,25 @@ where
         (**self).get_many(requests)
     }
 
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        (**self).get_many_bounded(requests, budget)
+    }
+
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        (**self).get_many_bounded_prefix(requests, offset, max_slots, budget)
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -457,6 +602,25 @@ where
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         self.as_ref().get_many(requests)
+    }
+
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        (**self).get_many_bounded(requests, budget)
+    }
+
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        (**self).get_many_bounded_prefix(requests, offset, max_slots, budget)
     }
 
     fn begin_scan(

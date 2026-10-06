@@ -216,6 +216,7 @@ async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 			case "readMany": {
 				const payload = request.payload as {
 					requests: Parameters<OpfsBackend["readMany"]>[0];
+					budget?: Parameters<OpfsBackend["readMany"]>[3];
 					generation: number;
 					ownerEpoch: string;
 					sessionToken?: string;
@@ -225,8 +226,30 @@ async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 					payload.requests,
 					payload.generation,
 					payload.sessionToken,
+					payload.budget,
 				);
 			}
+			case "readManyPrefix": {
+				const payload = request.payload as {
+					requests: Parameters<OpfsBackend["readManyPrefix"]>[0];
+					generation: number;
+					ownerEpoch: string;
+					sessionToken?: string;
+					offset: number;
+					maxSlots: number;
+					budget: Parameters<OpfsBackend["readManyPrefix"]>[5];
+				};
+				assertOwnerEpoch(entry, payload.ownerEpoch);
+				return backend.readManyPrefix(
+					payload.requests,
+					payload.generation,
+					payload.sessionToken,
+					payload.offset,
+					payload.maxSlots,
+					payload.budget,
+				);
+			}
+
 			case "scanPage": {
 				const payload = request.payload as OpfsScanPagePayload;
 				assertOwnerEpoch(entry, payload.ownerEpoch);

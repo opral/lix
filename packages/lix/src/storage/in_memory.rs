@@ -210,6 +210,54 @@ impl StorageRead for MemoryRead {
         Ok(GetManyResult::new(values))
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        let singleton = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>()
+            == 1;
+        let mut bytes = 0usize;
+        for request in requests {
+            if request.opts.projection == CoreProjection::FullValue {
+                for key in request.keys {
+                    if let Some(value) = self.entries.get(&physical_key(request.space.id, key)) {
+                        bytes = budget.admit_value(value.len(), bytes, singleton)?;
+                    }
+                }
+            }
+        }
+        self.get_many(requests).await
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> Result<crate::storage::GetManyPrefixResult, StorageError> {
+        let (window, total) = crate::storage::bounded_prefix_requests(requests, offset, max_slots)?;
+        let lengths = window.iter().flat_map(|request| {
+            request.keys.iter().map(move |key| {
+                if request.opts.projection == CoreProjection::KeyOnly {
+                    0
+                } else {
+                    self.entries
+                        .get(&physical_key(request.space.id, key))
+                        .map_or(0, |value| value.len())
+                }
+            })
+        });
+        let count = budget.admitted_prefix(lengths)?;
+        let (admitted, _) = crate::storage::bounded_prefix_requests(&window, 0, count.max(1))?;
+        let result = self.get_many_bounded(&admitted, budget).await?;
+        crate::storage::GetManyPrefixResult::new(result.values, offset, total)
+    }
+
     async fn begin_scan(
         &self,
         space: StorageSpace,
@@ -260,6 +308,45 @@ impl StorageScanSource for MemoryScanSource<'_> {
                 });
             }
             self.pending = self.cursor.next();
+            Ok(ScanChunk::new(entries, self.pending.is_some()))
+        })
+    }
+    fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::new();
+            let mut bytes = 0usize;
+            while entries.len() < limit_rows {
+                let Some((key, value)) = self.pending.take().or_else(|| self.cursor.next()) else {
+                    break;
+                };
+                let len = if self.projection == CoreProjection::FullValue {
+                    value.len()
+                } else {
+                    0
+                };
+                if len > budget.max_single_value_bytes {
+                    return Err(StorageError::ReadBudgetExceeded { singleton: true });
+                }
+                if !entries.is_empty() && bytes.saturating_add(len) > budget.max_result_bytes {
+                    self.pending = Some((key, value));
+                    break;
+                }
+                bytes = budget.admit_value(len, bytes, entries.is_empty())?;
+                entries.push(ReadEntry {
+                    key: decode_memory_scan_key(self.space, key)?,
+                    value: project_value(&value, self.projection),
+                });
+                if bytes >= budget.max_result_bytes {
+                    break;
+                }
+            }
+            if self.pending.is_none() {
+                self.pending = self.cursor.next();
+            }
             Ok(ScanChunk::new(entries, self.pending.is_some()))
         })
     }

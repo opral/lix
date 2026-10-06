@@ -111,18 +111,24 @@ where
         }
     }
     storage.admit_partial_replica_writer(super::partial_replica_write_capability());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
     let owner_guard = engine
         .as_ref()
         .filter(|engine| engine.partial_owner().is_installed())
         .map(|engine| engine.partial_owner().retain_for_owned_work())
         .transpose()?;
+    if owner_guard.is_some() {
+        super::read_fulfillment::staging::reap_abandoned(&storage).await?;
+    } else {
+        super::read_fulfillment::staging::reap_expired(&storage).await?;
+    }
+    let janitor_storage = storage.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
     let health = engine.as_ref().map(|engine| engine.sync_mode().health());
     let task = spawn_sync_task(async move {
         let _owner_guard = owner_guard;
-        let result = run_platform_partial_worker(
+        let worker = run_platform_partial_worker(
             storage,
             state,
             transport,
@@ -132,7 +138,19 @@ where
             changes,
             engine,
         )
-        .await;
+        .fuse();
+        let janitor = async {
+            loop {
+                sleep(Duration::from_secs(60)).await;
+                // Cleanup is bounded and advisory. A transient backend read
+                // or CAS race can retry on the next tick; live synchronization
+                // retains its own error and admission checks.
+                let _ = super::read_fulfillment::staging::reap_expired(&janitor_storage).await;
+            }
+        }
+        .fuse();
+        futures_util::pin_mut!(worker, janitor);
+        let result = select_biased! { result = worker => result, _ = janitor => unreachable!("scratch janitor has no terminal success") };
         if let Some(health) = health {
             health.stopped(result.as_ref().err());
         }
@@ -223,14 +241,22 @@ async fn hydrate_write_frontier<S: Storage + Clone + Send + Sync + 'static, C: R
     let NativeMetadataRef::CommitGraphRecord(anchor) = address else {
         return Err(LixError::unknown("write frontier requires graph metadata"));
     };
-    hydrate_metadata_selection(storage, state, transport,
+    hydrate_metadata_selection(
+        storage,
+        state,
+        transport,
         &super::native_metadata_walk::NativeMetadataWalkRequest {
-            epoch_id: state.epoch_id().to_owned(), anchor,
+            epoch_id: state.epoch_id().to_owned(),
+            anchor,
             max_commits: super::native_metadata_walk::MAX_METADATA_WALK_COMMITS,
             include_state_headers: false,
             selection: super::native_metadata_walk::MetadataSelection::JumpSpine,
-            stops: Vec::new(), minimum_generation: None, require_state_header: false,
-        }).await
+            stops: Vec::new(),
+            minimum_generation: None,
+            require_state_header: false,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -291,10 +317,14 @@ where
     C: RawHttpClient,
 {
     if request.epoch_id != state.epoch_id() {
-        return Err(LixError::new("LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH", "metadata selection epoch differs"));
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+            "metadata selection epoch differs",
+        ));
     }
     let response = transport.native_metadata_walk(request).await?;
-    let exact = super::native_metadata_walk::validate_response(state.repository_id(), request, &response)?;
+    let exact =
+        super::native_metadata_walk::validate_response(state.repository_id(), request, &response)?;
     install_metadata_response_inner(storage, state, &exact, &response, true).await
 }
 
@@ -339,31 +369,53 @@ async fn install_metadata_response_inner<S: Storage + Clone + Send + Sync + 'sta
         let selected;
         let selected_request;
         let (request, response) = if selection {
-            let keys = request.objects.iter().map(super::native_metadata::key)
+            let keys = request
+                .objects
+                .iter()
+                .map(super::native_metadata::key)
                 .collect::<Result<Vec<_>, _>>()?;
-            let requests = request.objects.iter().zip(&keys).map(|(address, key)| {
-                crate::storage_adapter::StorageGetManyRequest {
-                    space: super::native_metadata::space(address),
-                    keys: std::slice::from_ref(key),
-                    opts: Default::default(),
-                }
-            }).collect::<Vec<_>>();
+            let requests = request
+                .objects
+                .iter()
+                .zip(&keys)
+                .map(
+                    |(address, key)| crate::storage_adapter::StorageGetManyRequest {
+                        space: super::native_metadata::space(address),
+                        keys: std::slice::from_ref(key),
+                        opts: Default::default(),
+                    },
+                )
+                .collect::<Vec<_>>();
             let values = read.get_many(&requests).await?.values;
             if values.len() != response.objects.len() {
-                return Err(LixError::unknown("metadata selection residency cardinality mismatch"));
+                return Err(LixError::unknown(
+                    "metadata selection residency cardinality mismatch",
+                ));
             }
             selected = super::native_metadata::NativeMetadataResponse {
-                objects: response.objects.iter().zip(values)
-                    .filter_map(|(object, value)| value.is_none().then(|| object.clone())).collect(),
+                objects: response
+                    .objects
+                    .iter()
+                    .zip(values)
+                    .filter_map(|(object, value)| value.is_none().then(|| object.clone()))
+                    .collect(),
                 ..response.clone()
             };
-            if selected.objects.is_empty() { return Ok(()); }
+            if selected.objects.is_empty() {
+                return Ok(());
+            }
             selected_request = NativeMetadataRequest {
-                objects: selected.objects.iter().map(|object| object.address.clone()).collect(),
+                objects: selected
+                    .objects
+                    .iter()
+                    .map(|object| object.address.clone())
+                    .collect(),
                 ..request.clone()
             };
             (&selected_request, &selected)
-        } else { (request, response) };
+        } else {
+            (request, response)
+        };
         let mut writes = storage.new_write_set();
         let preconditions =
             stage_native_metadata(&read, &mut writes, state, request, response).await?;
@@ -576,21 +628,23 @@ async fn hydrate_current_payload_after_native_fallback<
     else {
         return Ok(None);
     };
-    let response = super::read_fulfillment::fetch(transport, &current_request)
-        .await
-        .map_err(|error| {
-            super::read_fulfillment::annotate_client_failure(
-                error,
-                super::read_fulfillment::ClientFailurePhase::Validation,
-            )
-        })?;
-    if response.outcome != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
+    let mut response =
+        super::read_fulfillment::staging::fetch_staged(storage, state, transport, &current_request)
+            .await
+            .map_err(|error| {
+                super::read_fulfillment::annotate_client_failure(
+                    error,
+                    super::read_fulfillment::ClientFailurePhase::Validation,
+                )
+            })?;
+    if response.outcome() != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
         return Err(LixError::new(
             "LIX_READ_FULFILLMENT_INVALID",
             "current payload recovery returned a read fallback",
         ));
     }
-    super::read_fulfillment::install(storage, state, &current_request, &response)
+    response
+        .promote(&current_request, false)
         .await
         .map(Some)
         .map_err(|error| {
@@ -730,6 +784,7 @@ fn hydrate_exact_demand_with_receipt<
                 return Ok(HydratedInputs::default());
             }
             let fulfillment = super::read_fulfillment::ReadFulfillmentRequest {
+                release: false,
                 epoch_id: state.epoch_id().into(),
                 descriptor: state.descriptor().clone(),
                 interests: plan.interests,
@@ -759,14 +814,21 @@ fn hydrate_exact_demand_with_receipt<
                     return Ok(hydrated);
                 }
             } else if fulfillment.validate(state.repository_id()).is_ok() {
-                match super::read_fulfillment::fetch(transport, &fulfillment).await {
-                    Ok(response) => {
-                        if response.outcome
+                match super::read_fulfillment::staging::fetch_staged(
+                    storage,
+                    state,
+                    transport,
+                    &fulfillment,
+                )
+                .await
+                {
+                    Ok(mut response) => {
+                        if response.outcome()
                             != super::read_fulfillment::ReadFulfillmentOutcome::Complete
                         {
                             super::read_fulfillment::remember_request_closure_ineligible(
                                 &fulfillment,
-                                response.outcome,
+                                response.outcome(),
                             )?;
                             if let Some(locator) = selected_payload_locator.as_ref()
                                 && let Some(hydrated) =
@@ -782,19 +844,15 @@ fn hydrate_exact_demand_with_receipt<
                                 return Ok(hydrated);
                             }
                         } else {
-                            return super::read_fulfillment::install(
-                                storage,
-                                state,
-                                &fulfillment,
-                                &response,
-                            )
-                            .await
-                            .map_err(|error| {
-                                super::read_fulfillment::annotate_client_failure(
-                                    error,
-                                    super::read_fulfillment::ClientFailurePhase::Installation,
-                                )
-                            });
+                            return response
+                                .promote(&fulfillment, false)
+                                .await
+                                .map_err(|error| {
+                                    super::read_fulfillment::annotate_client_failure(
+                                        error,
+                                        super::read_fulfillment::ClientFailurePhase::Installation,
+                                    )
+                                });
                         }
                     }
                     Err(error) => {
@@ -845,12 +903,25 @@ fn hydrate_exact_demand_with_receipt<
                     let mut missing = Vec::new();
                     for id in page {
                         let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
-                        if !super::partial_blob::chunk_is_resident(storage, state, hash).await? { missing.push(id.clone()); }
+                        if !super::partial_blob::chunk_is_resident(storage, state, hash).await? {
+                            missing.push(id.clone());
+                        }
                     }
                     let chunks = super::transfer::fetch_chunk_page(transport, &missing).await?;
                     for (id, bytes) in missing.into_iter().zip(chunks) {
-                        let bytes = bytes.ok_or_else(|| LixError::new(LixError::CODE_STORAGE_ERROR, "authority lacks demanded blob chunk"))?;
-                        super::partial_blob::install_chunk(storage, state, crate::binary_cas::ChunkHash::from_hex(&id)?, &bytes).await?;
+                        let bytes = bytes.ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_STORAGE_ERROR,
+                                "authority lacks demanded blob chunk",
+                            )
+                        })?;
+                        super::partial_blob::install_chunk(
+                            storage,
+                            state,
+                            crate::binary_cas::ChunkHash::from_hex(&id)?,
+                            &bytes,
+                        )
+                        .await?;
                     }
                 }
                 Ok(HydratedInputs::default())
@@ -2576,28 +2647,46 @@ mod tests {
             fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
                 Box::pin(async move {
                     if !request.url.ends_with("/sync/native-metadata")
-                        && !request.url.ends_with("/sync/native-metadata-walk") {
+                        && !request.url.ends_with("/sync/native-metadata-walk")
+                    {
                         return self.handshake.send(request).await;
                     }
                     self.handshake.fetches.fetch_add(1, Ordering::SeqCst);
-                    let request: NativeMetadataRequest = if request.url.ends_with("/sync/native-metadata-walk") {
+                    let request: NativeMetadataRequest = if request
+                        .url
+                        .ends_with("/sync/native-metadata-walk")
+                    {
                         let walk: super::super::native_metadata_walk::NativeMetadataWalkRequest =
                             serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-                        assert_eq!(walk.selection, super::super::native_metadata_walk::MetadataSelection::Causal);
-                        let mut pending = vec![CommitId::parse_lix(&walk.anchor, "test walk").unwrap()];
-                        let mut seen = std::collections::BTreeSet::new();
+                        assert_eq!(
+                            walk.selection,
+                            super::super::native_metadata_walk::MetadataSelection::Causal
+                        );
+                        let mut pending =
+                            vec![CommitId::parse_lix(&walk.anchor, "test walk").unwrap()];
+                        let mut seen = BTreeSet::new();
                         let mut objects = Vec::new();
                         while let Some(id) = pending.pop() {
-                            if objects.len() == usize::from(walk.max_commits) { break; }
-                            if !seen.insert(id) { continue; }
+                            if objects.len() == usize::from(walk.max_commits) {
+                                break;
+                            }
+                            if !seen.insert(id) {
+                                continue;
+                            }
                             objects.push(NativeMetadataRef::CommitGraphRecord(id.to_string()));
                             let record = &self.records[&id];
                             if !walk.stops.contains(&id.to_string())
-                                && walk.minimum_generation.is_none_or(|minimum| record.generation > minimum) {
+                                && walk
+                                    .minimum_generation
+                                    .is_none_or(|minimum| record.generation > minimum)
+                            {
                                 pending.extend(record.parent_commit_ids.iter().copied());
                             }
                         }
-                        NativeMetadataRequest { epoch_id: walk.epoch_id, objects }
+                        NativeMetadataRequest {
+                            epoch_id: walk.epoch_id,
+                            objects,
+                        }
                     } else {
                         serde_json::from_slice(request.body.as_ref().unwrap()).unwrap()
                     };
@@ -2712,8 +2801,10 @@ mod tests {
             .await
             .unwrap()
         );
-        assert!(client.fetches.load(Ordering::SeqCst) <= 3,
-            "proof requests must grow with bounded pages rather than commits");
+        assert!(
+            client.fetches.load(Ordering::SeqCst) <= 3,
+            "proof requests must grow with bounded pages rather than commits"
+        );
     }
 
     #[tokio::test]

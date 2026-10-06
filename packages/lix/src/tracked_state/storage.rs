@@ -10798,10 +10798,41 @@ pub(crate) async fn load_authoritative_live_change_records(
             change_ids: &change_ids,
         })
         .await?;
+    resolve_authoritative_live_change_records(
+        store,
+        requests,
+        standalone
+            .into_iter()
+            .map(|(id, record)| (*id, record))
+            .collect(),
+    )
+    .await
+}
+
+/// Canonical authority selection after one admitted standalone payload page.
+/// The caller owns page admission and drains the resolved records before
+/// advancing. Keep identity, lifetime, and physical-owner precedence shared
+/// with exact callers.
+pub(crate) async fn resolve_authoritative_live_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[AuthoritativeLiveChangeRequest],
+    standalone: Vec<(
+        crate::changelog::ChangeId,
+        Option<crate::changelog::ChangeRecord>,
+    )>,
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if standalone.len() != requests.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "standalone page lost request cardinality",
+        ));
+    }
     let standalone_status = standalone
         .iter()
         .zip(requests)
-        .map(|((_, record), request)| authoritative_live_payload_candidate_status(request, record))
+        .map(|((_, record), request)| {
+            authoritative_live_payload_candidate_status(request, record.as_ref())
+        })
         .collect::<Vec<_>>();
     let mut records = vec![None; requests.len()];
     let mut fallback_indices = Vec::new();
@@ -10811,7 +10842,7 @@ pub(crate) async fn load_authoritative_live_change_records(
         .zip(records.iter_mut())
         .enumerate()
     {
-        if *change_id != request.change_id {
+        if change_id != request.change_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "standalone change batch lost request order",

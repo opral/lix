@@ -7,6 +7,7 @@ async fn fixture() -> (ReadFulfillmentRequest, ReadFulfillmentResponse) {
     let bytes = b"candidate installer test chunk".to_vec();
     let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
     let request = ReadFulfillmentRequest {
+        release: false,
         epoch_id: uuid::Uuid::now_v7().to_string(),
         descriptor,
         interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -22,6 +23,7 @@ async fn fixture() -> (ReadFulfillmentRequest, ReadFulfillmentResponse) {
     };
     let inputs = vec![ReadInput { address, bytes }];
     let response = ReadFulfillmentResponse {
+        frame: None,
         lix_id: request.descriptor.lix_id.clone(),
         epoch_id: request.epoch_id.clone(),
         request_digest: request.digest().unwrap(),
@@ -47,6 +49,7 @@ fn candidate_state(request: &ReadFulfillmentRequest) -> PartialReplicaState {
 
 fn working_diff_request(state: &PartialReplicaState) -> ReadFulfillmentRequest {
     ReadFulfillmentRequest {
+        release: false,
         epoch_id: state.epoch_id().to_owned(),
         descriptor: state.descriptor().clone(),
         interests: vec![LogicalReadInterest::Diff {

@@ -238,6 +238,7 @@ wit-parser = "0.247"
 wit-bindgen-rust = "0.57"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+tempfile = "3"
 futures-timer = "3"
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }

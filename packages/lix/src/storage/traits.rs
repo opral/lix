@@ -115,6 +115,31 @@ pub trait StorageRead: Send + Sync {
     /// The returned cursor is ephemeral and cannot outlive this read handle.
     /// It advances source state bound to this view and must never acquire a
     /// replacement read view as pages advance.
+    /// Returns the exact ordered point result or refuses before constructing
+    /// an oversized response. Unsupported adapters fail closed; ordinary
+    /// unbounded reads never provide an implicit compatibility path.
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        let _ = (requests, budget);
+        async { Err(StorageError::Unsupported(Capability::BoundedReads)) }
+    }
+
+    /// Returns one byte-admitted prefix without changing exact point-read semantics.
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        let _ = (requests, offset, max_slots, budget);
+        async { Err(StorageError::Unsupported(Capability::BoundedReads)) }
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,

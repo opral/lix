@@ -1,6 +1,7 @@
 //! Shared admission and packing budgets at the transfer boundary.
 //! Operation validators retain ownership of proof, coverage and publication.
 use crate::LixError;
+use std::future::Future;
 
 pub(crate) const CONTENT_GROUP_ITEMS: usize = 32;
 pub(crate) const CONTENT_GROUP_BYTES: usize = 1024 * 1024;
@@ -269,158 +270,166 @@ pub(super) async fn register_manifest_page<T: super::SyncTransport>(
     Ok(vec![result])
 }
 
-/// Shared negotiation, deduplicated content transfer and completion barrier.
-/// Loaders provide immutable bytes and release their reads before upload starts.
-pub(super) async fn upload_manifest_page<T, F, Fut>(
-    transport: &T,
-    manifests: &[super::SyncBlobManifest],
-    load_chunk: F,
-) -> Result<(), LixError>
-where
-    T: super::SyncTransport,
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>, LixError>>,
-{
-    if manifests.is_empty() {
-        return Ok(());
-    }
-    let registrations = register_manifest_page(transport, manifests).await?;
-    let missing = registrations
-        .into_iter()
-        .flat_map(|result| result.missing_chunk_ids)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    for ids in missing.chunks(CHUNK_CONCURRENCY) {
-        let bytes =
-            futures_util::future::try_join_all(ids.iter().map(|id| load_chunk(id.clone()))).await?;
-        let page = ids
-            .iter()
-            .cloned()
-            .zip(bytes.iter().map(Vec::as_slice))
-            .collect::<Vec<_>>();
-        upload_chunk_page(transport, &page).await?;
-    }
-    if register_manifest_page(transport, manifests)
-        .await?
-        .iter()
-        .any(|result| !result.missing_chunk_ids.is_empty())
-    {
-        return Err(LixError::new(
-            LixError::CODE_STORAGE_ERROR,
-            "authority content group remains incomplete after upload",
-        ));
-    }
-    Ok(())
-}
-
 /// Canonical content from flat or historical delta storage uses the same
 /// bounded anchor decoder and chunk executor. The caller supplies a fresh,
 /// guarded read; it is dropped before any network transfer.
-pub(super) async fn upload_canonical_blob<T, R, F, Fut>(
+#[derive(Clone)]
+pub(super) struct CanonicalUploadPlan {
+    pub(super) metadata: crate::binary_cas::BlobMetadata,
+    pub(super) canonical: crate::binary_cas::CanonicalBlobManifest,
+}
+
+impl CanonicalUploadPlan {
+    pub(super) fn manifest(&self) -> super::SyncBlobManifest {
+        super::SyncBlobManifest {
+            blob_id: self.canonical.blob_id.to_hex(),
+            size_bytes: self.canonical.size_bytes,
+            chunks: self
+                .canonical
+                .chunks
+                .iter()
+                .map(|chunk| super::SyncBlobChunk {
+                    chunk_id: chunk.hash.to_hex(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+            inline_bytes_base64: None,
+        }
+    }
+    pub(super) fn encoded_bytes(&self) -> Result<usize, LixError> {
+        serde_json::to_vec(&self.manifest())
+            .map(|bytes| bytes.len())
+            .map_err(|error| LixError::unknown(error.to_string()))
+    }
+}
+
+/// Negotiate all compatible manifests before transferring their shared missing
+/// chunk frontier. Receipt indexes are bounded independently of blob payloads.
+pub(super) async fn upload_canonical_page<T, R, F, Fut>(
     transport: &T,
-    metadata: &crate::binary_cas::BlobMetadata,
-    canonical: &crate::binary_cas::CanonicalBlobManifest,
+    plans: &[CanonicalUploadPlan],
     begin_read: F,
 ) -> Result<(), LixError>
 where
     T: super::SyncTransport,
     R: crate::storage_adapter::StorageAdapterRead,
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<R, LixError>>,
+    Fut: Future<Output = Result<R, LixError>>,
 {
-    let manifest = super::SyncBlobManifest {
-        blob_id: canonical.blob_id.to_hex(),
-        size_bytes: canonical.size_bytes,
-        chunks: canonical
-            .chunks
-            .iter()
-            .map(|chunk| super::SyncBlobChunk {
-                chunk_id: chunk.hash.to_hex(),
-                size_bytes: chunk.size_bytes,
-            })
-            .collect(),
-        inline_bytes_base64: None,
-    };
-    super::blob::validate_sync_blob_manifest(&manifest)?;
-    let registration = register_manifest_page(transport, std::slice::from_ref(&manifest))
-        .await?
-        .remove(0);
-    let declared = manifest
-        .chunks
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let manifests = plans
         .iter()
-        .map(|chunk| chunk.chunk_id.as_str())
+        .map(CanonicalUploadPlan::manifest)
+        .collect::<Vec<_>>();
+    let registrations = register_manifest_page(transport, &manifests).await?;
+    let incomplete = manifests
+        .iter()
+        .zip(&registrations)
+        .filter_map(|(manifest, registration)| {
+            (!registration.missing_chunk_ids.is_empty()).then(|| manifest.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut missing = registrations
+        .into_iter()
+        .flat_map(|registration| registration.missing_chunk_ids)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut missing = std::collections::BTreeSet::new();
-    for id in registration.missing_chunk_ids {
-        if !declared.contains(id.as_str()) {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "authority requested an unrelated upload chunk",
-            ));
-        }
-        // A flat manifest can reference the same chunk at many offsets. The
-        // authority may report each occurrence; transfer the immutable bytes once.
-        missing.insert(id);
-    }
-    let uploaded = !missing.is_empty();
-    let mut offset = 0u64;
-    let mut first = 0;
-    while first < manifest.chunks.len() && !missing.is_empty() {
-        let mut end = first;
-        let mut size = 0u64;
-        while end < manifest.chunks.len() && size < crate::binary_cas::CHUNK_ANCHOR_BYTES as u64 {
-            size += manifest.chunks[end].size_bytes;
-            end += 1;
-        }
-        let expected = &manifest.chunks[first..end];
-        if expected
-            .iter()
-            .any(|chunk| missing.contains(&chunk.chunk_id))
-        {
-            let read = begin_read().await?;
-            let chunks =
-                crate::binary_cas::load_canonical_blob_anchor(&read, metadata, offset).await?;
-            drop(read);
-            if chunks.len() != expected.len()
-                || chunks.iter().zip(expected).any(|(chunk, receipt)| {
-                    chunk.receipt.hash.to_hex() != receipt.chunk_id
-                        || chunk.receipt.size_bytes != receipt.size_bytes
-                })
+    for (plan, manifest) in plans.iter().zip(&manifests) {
+        let mut offset = 0u64;
+        let mut first = 0;
+        while first < manifest.chunks.len() && !missing.is_empty() {
+            let mut end = first;
+            let mut size = 0u64;
+            while end < manifest.chunks.len() && size < crate::binary_cas::CHUNK_ANCHOR_BYTES as u64
             {
-                return Err(LixError::new(
-                    LixError::CODE_STORAGE_ERROR,
-                    "canonical upload anchor changed after manifest preparation",
-                ));
+                size += manifest.chunks[end].size_bytes;
+                end += 1;
             }
-            let uploads = chunks
+            let expected = &manifest.chunks[first..end];
+            if expected
                 .iter()
-                .filter_map(|chunk| {
-                    let id = chunk.receipt.hash.to_hex();
-                    missing.remove(&id).then_some((id, chunk.bytes.as_slice()))
-                })
-                .collect::<Vec<_>>();
-            for page in uploads.chunks(CHUNK_CONCURRENCY) {
-                upload_chunk_page(transport, page).await?;
+                .any(|chunk| missing.contains(&chunk.chunk_id))
+            {
+                let read = begin_read().await?;
+                let chunks =
+                    crate::binary_cas::load_canonical_blob_anchor(&read, &plan.metadata, offset)
+                        .await?;
+                drop(read);
+                if chunks.len() != expected.len()
+                    || chunks.iter().zip(expected).any(|(chunk, receipt)| {
+                        chunk.receipt.hash.to_hex() != receipt.chunk_id
+                            || chunk.receipt.size_bytes != receipt.size_bytes
+                    })
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "canonical upload anchor changed after manifest preparation",
+                    ));
+                }
+                let uploads = chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let id = chunk.receipt.hash.to_hex();
+                        missing.remove(&id).then_some((id, chunk.bytes.as_slice()))
+                    })
+                    .collect::<Vec<_>>();
+                for page in uploads.chunks(CHUNK_CONCURRENCY) {
+                    upload_chunk_page(transport, page).await?;
+                }
             }
+            offset += size;
+            first = end;
         }
-        offset += size;
-        first = end;
     }
-    if uploaded
-        && !register_manifest_page(transport, std::slice::from_ref(&manifest))
+    if !missing.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "canonical upload plan did not supply its negotiated chunk frontier",
+        ));
+    }
+    if !incomplete.is_empty()
+        && register_manifest_page(transport, &incomplete)
             .await?
-            .remove(0)
-            .missing_chunk_ids
-            .is_empty()
+            .iter()
+            .any(|registration| !registration.missing_chunk_ids.is_empty())
     {
         return Err(LixError::new(
             LixError::CODE_STORAGE_ERROR,
-            "authority blob remains incomplete after upload",
+            "authority content group remains incomplete after canonical upload",
         ));
+    }
+    Ok(())
+}
+
+/// Pack canonical plans through the same byte and member budgets for every
+/// upload owner. Oversized receipt inventories have their explicit bounded lane.
+pub(super) async fn pack_canonical_plan<T, R, F, Fut>(
+    transport: &T,
+    group: &mut TransferBatch<CanonicalUploadPlan>,
+    plan: CanonicalUploadPlan,
+    begin_read: F,
+) -> Result<(), LixError>
+where
+    T: super::SyncTransport,
+    R: crate::storage_adapter::StorageAdapterRead,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<R, LixError>>,
+{
+    let encoded = plan.encoded_bytes()?;
+    if encoded.saturating_add(2) > CONTENT_GROUP_BYTES {
+        upload_canonical_page(transport, &group.items, &begin_read).await?;
+        *group = TransferBatch::new();
+        return upload_canonical_page(transport, &[plan], &begin_read).await;
+    }
+    if let Some(plan) = group.push(plan, encoded, 0)? {
+        upload_canonical_page(transport, &group.items, &begin_read).await?;
+        *group = TransferBatch::new();
+        if group.push(plan, encoded, 0)?.is_some() {
+            return Err(LixError::unknown(
+                "single canonical upload plan did not fit",
+            ));
+        }
     }
     Ok(())
 }

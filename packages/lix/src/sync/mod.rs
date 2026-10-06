@@ -20,10 +20,10 @@ pub(crate) use partial_attempt_restart::{
 };
 
 mod blob;
-mod transfer;
 mod bootstrap;
 mod commit;
 mod partial_checkpoint_upload;
+mod transfer;
 #[cfg(test)]
 pub(crate) use commit::{
     export_sync_commit, load_sync_commit as load_sync_commit_for_migration_test,
@@ -231,7 +231,7 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v27 adds bounded leased first-parent history recipes to read fulfillment.
 // v28 removes the History anchor and adds bounded moving-diff dependency replay
 // with separate ancestry-proof and operation-work fallback outcomes.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 29;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 30;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -556,3 +556,5 @@ mod partial_created_refs;
 
 #[cfg(all(test, feature = "server-protocol"))]
 mod partial_public_api_tests;
+
+pub(crate) use read_fulfillment::staging::STAGING_SPACE as READ_OPERATION_SCRATCH_SPACE;

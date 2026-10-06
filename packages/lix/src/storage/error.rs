@@ -6,6 +6,10 @@ use crate::storage::{Key, KeyRange, StorageSpace, Support};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
+    /// The provider refused before constructing an oversized result.
+    ReadBudgetExceeded {
+        singleton: bool,
+    },
     Unsupported(Capability),
     /// Another engine owns exclusive use of this physical storage.
     InUse,
@@ -31,6 +35,7 @@ pub enum StorageError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     StorageSessions,
+    BoundedReads,
     PartialReplicaOwner,
     ChangeWatch,
     EnvelopeProjection,
@@ -108,6 +113,10 @@ impl fmt::Display for StorageError {
             }
             Self::Corruption(message) => write!(f, "storage corruption: {message}"),
             Self::Unavailable(message) => write!(f, "storage unavailable: {message}"),
+            Self::ReadBudgetExceeded { singleton } => write!(
+                f,
+                "storage read byte budget exceeded (singleton: {singleton})"
+            ),
             Self::Io(message) => write!(f, "io error: {message}"),
         }
     }
