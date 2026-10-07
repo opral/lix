@@ -559,6 +559,250 @@ async fn lifecycle_transport(
     transport
 }
 
+#[derive(Clone)]
+struct NestedFallbackReadClient {
+    lix_id: String,
+    account: String,
+    fallback_outcome: ReadFulfillmentOutcome,
+    locator: ReadInput,
+    fallback_requests: Arc<AtomicUsize>,
+    current_requests: Arc<AtomicUsize>,
+}
+
+impl NestedFallbackReadClient {
+    fn response(
+        &self,
+        request: &ReadFulfillmentRequest,
+        inputs: Vec<ReadInput>,
+        outcome: ReadFulfillmentOutcome,
+    ) -> crate::sync::http::RawHttpResponse {
+        let response = ReadFulfillmentResponse {
+            frame: None,
+            lix_id: self.lix_id.clone(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest().unwrap(),
+            closure_digest: input_digest(request, &inputs).unwrap(),
+            inputs,
+            profile: Default::default(),
+            continuation: None,
+            outcome,
+        };
+        crate::sync::http::RawHttpResponse {
+            status: 200,
+            status_text: "nested-fallback test fixture".into(),
+            body: serde_json::to_vec(&response).unwrap(),
+        }
+    }
+}
+
+impl crate::sync::http::RawHttpClient for NestedFallbackReadClient {
+    fn send(
+        &self,
+        raw: crate::sync::http::RawHttpRequest,
+    ) -> crate::sync::SyncTransportFuture<'_, crate::sync::http::RawHttpResponse> {
+        let client = self.clone();
+        Box::pin(async move {
+            if raw.method == http::Method::GET {
+                return Ok(crate::sync::http::RawHttpResponse {
+                    status: 200,
+                    status_text: "nested-fallback test handshake".into(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": client.lix_id,
+                        "sessionId": "nested-fallback-test-session",
+                        "activeAccountId": client.account,
+                    }))
+                    .unwrap(),
+                });
+            }
+            let request: ReadFulfillmentRequest =
+                serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
+            if request
+                .interests
+                .iter()
+                .any(|interest| matches!(interest, LogicalReadInterest::History { .. }))
+            {
+                client.fallback_requests.fetch_add(1, Ordering::SeqCst);
+                return Ok(client.response(&request, Vec::new(), client.fallback_outcome));
+            }
+            client.current_requests.fetch_add(1, Ordering::SeqCst);
+            let inputs = if request.required.contains(&client.locator.address) {
+                vec![client.locator.clone()]
+            } else {
+                Vec::new()
+            };
+            Ok(client.response(&request, inputs, ReadFulfillmentOutcome::Complete))
+        })
+    }
+}
+
+fn nested_fallback_request(
+    mut request: ReadFulfillmentRequest,
+) -> (ReadFulfillmentRequest, NativeMetadataRef, ReadInput) {
+    let branch = &request.descriptor.selected_branch;
+    request.interests = vec![
+        LogicalReadInterest::History {
+            branch_id: branch.branch_id.clone(),
+            commit_ids: vec![branch.head.commit_id.clone()],
+            relation: "lix_file".into(),
+            filter: crate::tracked_state::TrackedStateFilter {
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: Vec::new(),
+            limit: None,
+        },
+        LogicalReadInterest::FilesystemMetadata {
+            directory: false,
+            branch_ids: vec![branch.branch_id.clone()],
+            file_ids: None,
+            directory_ids: None,
+            root_directory: false,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+        },
+    ];
+    let change_id = crate::changelog::ChangeId::for_test_label("nested-fallback-change");
+    let locator = NativeMetadataRef::ChangeLocator(change_id.to_string());
+    request.required = vec![ReadInputAddress::Metadata(locator.clone())];
+    let owner = crate::changelog::CommitId::parse_lix(
+        &request.descriptor.selected_branch.head.commit_id,
+        "nested-fallback owner",
+    )
+    .unwrap();
+    let input = ReadInput {
+        address: ReadInputAddress::Metadata(locator.clone()),
+        bytes: crate::tracked_state::encode_change_locator(
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id,
+                commit_id: owner,
+                segment_index: 0,
+                ordinal: 0,
+            },
+        ),
+    };
+    (request, locator, input)
+}
+
+async fn durable_scratch_owner_count(storage: &StorageAdapter<Memory>) -> usize {
+    let key = StorageKey(Bytes::from_static(b"operations"));
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let values = read
+        .get_many(&[StorageGetManyRequest {
+            space: STAGING_SPACE,
+            keys: &[key],
+            opts: Default::default(),
+        }])
+        .await
+        .unwrap()
+        .values;
+    let Some(StorageProjectedValue::FullValue(bytes)) = values[0].as_ref() else {
+        return 0;
+    };
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn staged_fallback_releases_both_quotas_before_nested_current_payload_fetch() {
+    for fallback_outcome in [
+        ReadFulfillmentOutcome::NativeFallback,
+        ReadFulfillmentOutcome::OperationFallback,
+    ] {
+        let (storage, state, request) = fixture().await;
+        let mut blocker = stage(&storage, &state, &request).await;
+        let (request, locator, locator_input) = nested_fallback_request(request);
+        let account = crate::SYSTEM_ACCOUNT_ID.to_owned();
+        let fallback_requests = Arc::new(AtomicUsize::new(0));
+        let current_requests = Arc::new(AtomicUsize::new(0));
+        let client = NestedFallbackReadClient {
+            lix_id: request.descriptor.lix_id.clone(),
+            account: account.clone(),
+            fallback_outcome,
+            locator: locator_input.clone(),
+            fallback_requests: fallback_requests.clone(),
+            current_requests: current_requests.clone(),
+        };
+        let transport = crate::sync::http::HttpSyncTransport::connect_with(
+            client,
+            &format!("https://example.test/lix/{}", request.descriptor.lix_id),
+        )
+        .await
+        .unwrap();
+        let lease = crate::sync::LeasedPartialReplicaDescriptor::for_test(
+            request.descriptor.clone(),
+            &account,
+        );
+        transport.bind_native_baseline_lease(&lease.lease).unwrap();
+
+        let fallback_started = std::time::Instant::now();
+        let fallback = fetch_staged(&storage, &state, &transport, &request)
+            .await
+            .unwrap();
+        let fallback_ms = fallback_started.elapsed().as_secs_f64() * 1000.0;
+        let owners_before_child = durable_scratch_owner_count(&storage).await;
+        println!(
+            "STAGED_FALLBACK_PRE_CHILD_JSON={}",
+            serde_json::json!({
+                "outcome": format!("{fallback_outcome:?}"),
+                "durableOwnerCount": owners_before_child,
+                "fallbackPermitHeld": fallback.permit.is_some(),
+                "expectedBlockerCount": 1,
+            })
+        );
+        assert_eq!(fallback.outcome(), fallback_outcome);
+        assert!(fallback.released);
+        assert!(fallback.permit.is_none());
+        assert_eq!(owners_before_child, 1, "only the blocker remains owned");
+        assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
+
+        let current_request =
+            current_payload_request_after_native_fallback(&request, &locator).unwrap();
+        let child_started = std::time::Instant::now();
+        let mut child = fetch_staged(&storage, &state, &transport, &current_request)
+            .await
+            .expect("nested current-payload fetch should fit after fallback retirement");
+        let child_ms = child_started.elapsed().as_secs_f64() * 1000.0;
+        let promoted = child.promote(&current_request, false).await.unwrap();
+        assert!(
+            promoted
+                .keys
+                .contains(&locator_input.address.coordinate().unwrap())
+        );
+        assert_eq!(durable_scratch_owner_count(&storage).await, 1);
+
+        let mut normal_request = current_request.clone();
+        normal_request.operation_id = uuid::Uuid::now_v7().to_string();
+        let normal_started = std::time::Instant::now();
+        let mut normal = fetch_staged(&storage, &state, &transport, &normal_request)
+            .await
+            .unwrap();
+        normal.promote(&normal_request, false).await.unwrap();
+        let normal_ms = normal_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(current_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_scratch_owner_count(&storage).await, 1);
+
+        drop(fallback);
+        blocker.release_scratch().await.unwrap();
+        drop(blocker);
+        assert_eq!(durable_scratch_owner_count(&storage).await, 0);
+        println!(
+            "STAGED_FALLBACK_PROFILE_JSON={}",
+            serde_json::json!({
+                "outcome": format!("{fallback_outcome:?}"),
+                "fallbackFetchAndRetirementMs": fallback_ms,
+                "nestedCurrentPayloadFetchMs": child_ms,
+                "normalCompleteFetchAndPromoteMs": normal_ms,
+            })
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TerminalLossMode {
     SinglePage,

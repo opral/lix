@@ -65,6 +65,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         self.header.outcome
     }
 
+    async fn release_scratch(&mut self) -> Result<(), LixError> {
+        if self.released {
+            return Ok(());
+        }
+        if let Some(heartbeat) = &self.heartbeat {
+            let _ = heartbeat.cancel_and_join();
+        }
+        self.heartbeat.take();
+        lifecycle::release(self.storage.clone(), self.id).await?;
+        self.released = true;
+        self.permit.take();
+        Ok(())
+    }
+
     fn start_heartbeat(&mut self) -> Result<(), LixError> {
         let (storage, state, id) = (self.storage.clone(), self.state.clone(), self.id);
         self.heartbeat = Some(crate::background_task::spawn_owned(
@@ -436,6 +450,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             .await?
             .ok_or_else(|| invalid("partial admission is absent after promotion"))?
             .0;
+        drop(read);
         if actual != self.state {
             return Err(LixError::new(
                 super::super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
@@ -443,10 +458,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             ));
         }
         lifecycle::commit_frames(&self.storage, &self.state, self.id, &[]).await?;
-        self.heartbeat.take();
-        lifecycle::release(self.storage.clone(), self.id).await?;
-        self.released = true;
-        self.permit.take();
+        self.release_scratch().await?;
         Ok(hydrated)
     }
 }
@@ -557,20 +569,16 @@ where
         outcome: ReadFulfillmentOutcome::Complete,
     };
     let mut stage = StagedClosure::new(storage, state, header, id, permit);
-    stage.start_heartbeat()?;
+    if let Err(error) = stage.start_heartbeat() {
+        let _ = stage.release_scratch().await;
+        return Err(error);
+    }
     let mut page_request = request.clone();
     *request_may_have_reached_server = true;
     let mut page = match transport.fulfill_read(&page_request).await {
         Ok(page) => page,
         Err(error) => {
-            stage.heartbeat.take();
-            if lifecycle::release(stage.storage.clone(), stage.id)
-                .await
-                .is_ok()
-            {
-                stage.released = true;
-                stage.permit.take();
-            }
+            let _ = stage.release_scratch().await;
             return Err(error);
         }
     };
@@ -578,7 +586,11 @@ where
     stage.header.inputs.clear();
     stage.header.frame = None;
     if page.outcome != ReadFulfillmentOutcome::Complete {
-        validate_complete(request, &page)?;
+        if let Err(error) = validate_complete(request, &page) {
+            let _ = stage.release_scratch().await;
+            return Err(error);
+        }
+        stage.release_scratch().await?;
         return Ok(stage);
     }
     let result = async {
@@ -609,14 +621,7 @@ where
     }
     .await;
     if let Err(error) = result {
-        stage.heartbeat.take();
-        if lifecycle::release(stage.storage.clone(), stage.id)
-            .await
-            .is_ok()
-        {
-            stage.released = true;
-            stage.permit.take();
-        }
+        let _ = stage.release_scratch().await;
         return Err(error);
     }
     Ok(stage)
