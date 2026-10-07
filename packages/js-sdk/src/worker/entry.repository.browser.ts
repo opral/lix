@@ -4,6 +4,10 @@ import {
 	CLOSE_TIMEOUT_MS,
 	type RepositoryMessage,
 } from "./repository-protocol.js";
+import {
+	isSessionCloseTransportResult,
+	isSessionCloseTransportResponse,
+} from "./protocol.js";
 
 let runtimeWarm = false;
 const start = (event: MessageEvent) => {
@@ -19,6 +23,7 @@ const start = (event: MessageEvent) => {
 	const generation = crypto.randomUUID();
 	const clients = new Map<string, MessagePort>();
 	const departed = new Set<string>();
+	const teardownCallbacks = new Map<string, Set<number>>();
 	const opening = new Map<string, number>();
 	const host = createRepositoryHost();
 	let active = false;
@@ -86,7 +91,9 @@ const start = (event: MessageEvent) => {
 			if (!clients.has(message.client)) {
 				const { port1, port2 } = new MessageChannel();
 				clients.set(message.client, port1);
+				teardownCallbacks.set(message.client, new Set());
 				port1.onmessage = (event) => {
+					const response = event.data;
 					if (opening.has(message.client) && opening.get(message.client) === event.data?.id) {
 						opening.delete(message.client);
 						// Failed opening may have left a rejected compiler or uncertain
@@ -98,6 +105,7 @@ const start = (event: MessageEvent) => {
 					if (event.data?.kind === "repository.disconnected") {
 						cleanupFailed ||= event.data.error !== undefined;
 						clients.delete(message.client);
+						teardownCallbacks.delete(message.client);
 						departed.delete(message.client);
 						port1.close();
 						send({
@@ -107,13 +115,20 @@ const start = (event: MessageEvent) => {
 							error: event.data.error,
 						});
 						retire();
-					} else
+					} else if (
+						!departed.has(message.client) ||
+						isSessionCloseTransportResponse(response)
+					) {
+						if (departed.has(message.client) && "kind" in response && "requestId" in response) {
+							teardownCallbacks.get(message.client)?.add(response.requestId);
+						}
 						send({
 							kind: "output",
 							client: message.client,
 							generation,
 							message: event.data,
 						});
+					}
 				};
 				port1.start();
 				host.connect(port2);
@@ -134,10 +149,21 @@ const start = (event: MessageEvent) => {
 				});
 			}
 			send({ kind: "connected", client: message.client, generation });
-		} else if (message.kind === "input" && !departed.has(message.client)) {
-			if ("operation" in message.message && message.message.operation.kind === "open")
-				opening.set(message.client, message.message.id);
-			clients.get(message.client)?.postMessage(message.message);
+		} else if (message.kind === "input") {
+			const teardownRequestId = "requestId" in message.message
+				? message.message.requestId
+				: undefined;
+			const allowedTeardownResult = departed.has(message.client) &&
+				teardownRequestId !== undefined &&
+				isSessionCloseTransportResult(message.message) &&
+				teardownCallbacks.get(message.client)?.has(teardownRequestId);
+			if (!departed.has(message.client) || allowedTeardownResult) {
+				if ("operation" in message.message && message.message.operation.kind === "open")
+					opening.set(message.client, message.message.id);
+				clients.get(message.client)?.postMessage(message.message);
+				if (allowedTeardownResult && teardownRequestId !== undefined)
+					teardownCallbacks.get(message.client)?.delete(teardownRequestId);
+			}
 		} else if (message.kind === "disconnect") {
 			departed.add(message.client);
 			clients

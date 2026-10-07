@@ -329,17 +329,24 @@ export function createRepositoryHost() {
 			const disconnect = async () => {
 				if (disconnected) return;
 				disconnected = true;
-				if (client) owner?.deactivate(client);
 				let failure: unknown;
+				let detachAttempted = false;
 				try {
-					await controller.close();
+					await controller.close(async () => {
+						if (client) {
+							detachAttempted = true;
+							await owner?.detach(client);
+						}
+					});
 				} catch (error) {
 					failure = error;
 				}
-				try {
-					if (client) await owner?.detach(client);
-				} catch (error) {
-					failure ??= error;
+				if (client && !detachAttempted) {
+					try {
+						await owner?.detach(client);
+					} catch (error) {
+						failure ??= error;
+					}
 				}
 				try {
 					port.postMessage({

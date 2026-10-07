@@ -27,6 +27,7 @@ import {
 	type WorkerSyncFetchRequest,
 	type WorkerSyncFetchResponse,
 	type WorkerSyncServerOptions,
+	isSessionCloseRequest,
 } from "./protocol.js";
 
 export function startWorkerHost(
@@ -34,8 +35,9 @@ export function startWorkerHost(
 	openBinding: typeof openLixBinding = openLixBinding,
 	convertBinding: typeof convertReplicaBinding = convertReplicaBinding,
 	checkpointSessions = false,
-): { close(): Promise<void> } {
+): { close(afterSessionsClosed?: () => Promise<void>): Promise<void> } {
 	let closed = false;
+	let closing = false;
 	const sessions = new Map<number, LixBinding>();
 	let nextSessionId = 1;
 	let nextTransactionId = 1;
@@ -508,43 +510,81 @@ export function startWorkerHost(
 		await input.writer.close();
 	}
 
-	return { async close() {
+	return { async close(afterSessionsClosed) {
         if (closed) return;
         closed = true;
-        const failure = workerStateError("Worker client disconnected");
-        for (const requestId of Array.from(activeSyncFetches)) {
+        closing = true;
+        let closeFailure: unknown;
+        let closeFailed = false;
+        const capture = async (action: () => void | Promise<void>) => {
+          try { await action(); }
+          catch (error) {
+            if (!closeFailed) closeFailure = error;
+            closeFailed = true;
+          }
+        };
+        const captureSync = (action: () => void) => {
+          try { action(); }
+          catch (error) {
+            if (!closeFailed) closeFailure = error;
+            closeFailed = true;
+          }
+        };
+        try {
+          const failure = workerStateError("Worker client disconnected");
+          for (const requestId of Array.from(activeSyncFetches)) {
             // The peer may still own a fetch/reader even with no pull pending.
             // A disconnected channel cannot receive cancellation; local close
             // must still retire all streams and database handles in that case.
-            cancelSyncFetch(requestId, failure);
+            captureSync(() => cancelSyncFetch(requestId, failure));
+          }
+          for (const pending of pendingSyncHeaders.values()) captureSync(() => pending.reject(failure));
+          pendingSyncHeaders.clear();
+          for (const pending of pendingSyncFetch.values()) captureSync(() => pending.reject(failure));
+          pendingSyncFetch.clear();
+          for (const cleanup of syncStreamCleanup.values()) captureSync(() => cleanup(failure));
+          syncStreamCleanup.clear();
+          for (const pending of pendingSyncStreamPulls.values()) {
+            captureSync(() => pending.controller.error(failure));
+            captureSync(() => pending.reject(failure));
+          }
+          pendingSyncStreamPulls.clear();
+          await capture(async () => {
+            await Promise.allSettled(
+              Array.from(observations.values(), (observation) =>
+                Promise.resolve().then(() => observation.close()),
+              ),
+            );
+          });
+          observations.clear();
+          await Promise.allSettled([...observationClosures]);
+          for (const snapshot of snapshotExports.values()) {
+            await capture(() => Promise.resolve().then(() => snapshot.cancel()));
+          }
+          snapshotExports.clear();
+          await finiteQueue.catch(() => undefined);
+          await Promise.allSettled(registrations);
+          // The active finite operation has finished; never roll back a handle
+          // concurrently with its execute/commit operation.
+          for (const transaction of transactions.values()) await transaction.rollback().catch(() => undefined);
+          transactions.clear();
+          for (const snapshot of snapshotExports.values()) {
+            await capture(() => Promise.resolve().then(() => snapshot.cancel()));
+          }
+          snapshotExports.clear();
+          for (const session of sessions.values()) await capture(() => session.close());
+          sessions.clear();
+        } catch (error) {
+          if (!closeFailed) closeFailure = error;
+          closeFailed = true;
+        } finally {
+          // The owner detaches after local sessions have closed. Keep this
+          // narrow lane available through that final remote DELETE, and always
+          // retire it even if any local cleanup step failed unexpectedly.
+          await capture(() => afterSessionsClosed?.());
+          closing = false;
         }
-        for (const pending of pendingSyncHeaders.values()) pending.reject(failure);
-        pendingSyncHeaders.clear();
-        for (const pending of pendingSyncFetch.values()) pending.reject(failure);
-        pendingSyncFetch.clear();
-        for (const cleanup of syncStreamCleanup.values()) cleanup(failure);
-        syncStreamCleanup.clear();
-        for (const pending of pendingSyncStreamPulls.values()) { pending.controller.error(failure); pending.reject(failure); }
-        pendingSyncStreamPulls.clear();
-        await Promise.allSettled(
-          Array.from(observations.values(), (observation) =>
-            Promise.resolve(observation.close()),
-          ),
-        );
-        observations.clear();
-        await Promise.allSettled([...observationClosures]);
-        for (const snapshot of snapshotExports.values()) await Promise.resolve(snapshot.cancel()).catch(() => undefined);
-        snapshotExports.clear();
-        await finiteQueue.catch(() => undefined);
-        await Promise.allSettled(registrations);
-        // The active finite operation has finished; never roll back a handle
-        // concurrently with its execute/commit operation.
-        for (const transaction of transactions.values()) await transaction.rollback().catch(() => undefined);
-        transactions.clear();
-        for (const snapshot of snapshotExports.values()) await Promise.resolve(snapshot.cancel()).catch(() => undefined);
-        snapshotExports.clear();
-        for (const session of sessions.values()) await session.close();
-        sessions.clear();
+        if (closeFailed) throw closeFailure;
     } };
 
 	function createSyncServerBridge(
@@ -564,7 +604,7 @@ export function startWorkerHost(
 			headers: server.headers ?? [],
 			headerProvider: server.dynamicHeaders
 				? () => {
-						if (closed) throw workerStateError("Worker client disconnected");
+						if (closed && !closing) throw workerStateError("Worker client disconnected");
 						const requestId = nextSyncRequestId++;
 						return new Promise((resolve, reject) => {
 							const timer = setTimeout(() => {
@@ -592,18 +632,20 @@ export function startWorkerHost(
 						});
 					}
 				: undefined,
-			transport: (request) => bridgeFetch(request, transportScope),
+			transport: (request) => bridgeFetch(request, transportScope, server.url),
 		};
 	}
 
 	async function bridgeFetch(
         httpRequest: HttpRequest,
         transportScope?: number,
+        authorityUrl?: string,
     ): Promise<Response> {
         validateHttpRequest(httpRequest);
         const { url: input, init, response: policy } = httpRequest;
         const streaming = policy.mode === "streaming";
-		if (closed) throw workerStateError("Worker client disconnected");
+        const closingSession = closing && isSessionCloseRequest({ url: input, method: init?.method, headers: init?.headers }, authorityUrl);
+		if (closed && !closingSession) throw workerStateError("Worker client disconnected");
                     const requestId = nextSyncRequestId++;
 		const requestBase = {
             url: input,
@@ -642,7 +684,7 @@ export function startWorkerHost(
 		let streamEstablished = false;
 		try {
 			const resolved = await response;
-			if (closed) throw workerStateError("Worker client disconnected");
+			if (closed && !closingSession) throw workerStateError("Worker client disconnected");
 			if (resolved.streaming) {
 				const signal = init?.signal;
 				if (signal?.aborted) {

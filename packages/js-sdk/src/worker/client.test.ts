@@ -91,6 +91,118 @@ test("worker observation keeps its creation parent for only the first frame", as
 	await third;
 });
 
+test("worker termination preserves only the remote session-close fetch until disconnect acknowledgment", async () => {
+	const sent: WorkerInput[] = [];
+	let receive!: (message: WorkerResponse) => void;
+	let fetchCount = 0;
+	const connection: WorkerConnection = {
+		postMessage(message) { sent.push(message); },
+		onMessage(listener) { receive = listener; },
+		onFatal() {},
+		ref() {},
+		unref() {},
+		async terminate() {
+			receive({ kind: "sync.fetch", requestId: 41, request: {
+				url: "https://example.test/lix/v1/repo-a/sync/pull",
+				method: "POST",
+				headers: [],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			receive({ kind: "sync.fetch", requestId: 42, request: {
+				url: "https://example.test/lix/v1/repo-a/session",
+				method: "DELETE",
+				headers: [["lix-session-id", "session-a"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+				kind: "sync.fetch.result",
+				requestId: 42,
+				result: { ok: true, response: expect.objectContaining({ status: 204 }) },
+			})));
+		},
+	};
+	const client = new LixWorkerClient(connection, false);
+	client.beginLease(undefined, undefined, {
+		url: "https://example.test/lix/v1/repo-a",
+		headers: [],
+		transport: async ({ url, init }) => {
+			fetchCount++;
+			expect(init?.method).toBe("DELETE");
+			expect(url).toBe("https://example.test/lix/v1/repo-a/session");
+			return new Response(null, { status: 204 });
+		},
+	});
+	await client.terminate();
+	expect(fetchCount).toBe(1);
+	expect(client.isDisposed).toBe(true);
+	expect(sent.filter((message) => "kind" in message && message.kind === "sync.fetch.result")).toHaveLength(1);
+	receive({ kind: "sync.fetch", requestId: 43, request: {
+		url: "https://example.test/lix/v1/repo-a/session",
+		method: "DELETE",
+		headers: [["lix-session-id", "session-a"]],
+		response: { mode: "buffered", maxBytes: 128 },
+	} });
+	expect(fetchCount).toBe(1);
+});
+
+test("worker termination routes only a scoped recovery session DELETE through its server", async () => {
+	const sent: WorkerInput[] = [];
+	let receive!: (message: WorkerResponse) => void;
+	let activeScope: number | undefined;
+	let primaryFetches = 0;
+	let scopedFetches = 0;
+	const connection: WorkerConnection = {
+		postMessage(message) { sent.push(message); },
+		onMessage(listener) { receive = listener; },
+		onFatal() {},
+		ref() {},
+		unref() {},
+		async terminate() {
+			receive({ kind: "sync.fetch", requestId: 51, transportScope: 999, request: {
+				url: "https://recovery.test/lix/v1/repo-b/session",
+				method: "DELETE",
+				headers: [["lix-session-id", "session-b"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			receive({ kind: "sync.fetch", requestId: 52, transportScope: activeScope, request: {
+				url: "https://recovery.test/lix/v1/repo-b/session",
+				method: "DELETE",
+				headers: [["lix-session-id", "session-b"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+				kind: "sync.fetch.result",
+				requestId: 52,
+				result: { ok: true, response: expect.objectContaining({ status: 204 }) },
+			})));
+		},
+	};
+	const client = new LixWorkerClient(connection, false);
+	client.beginLease(undefined, undefined, {
+		url: "https://primary.test/lix/v1/repo-a",
+		headers: [],
+		transport: async () => {
+			primaryFetches++;
+			return new Response(null, { status: 204 });
+		},
+	});
+	await client.withRecoveryServer({
+		url: "https://recovery.test/lix/v1/repo-b",
+		headers: [],
+		transport: async ({ init }) => {
+			scopedFetches++;
+			expect(init?.method).toBe("DELETE");
+			return new Response(null, { status: 204 });
+		},
+	}, async (scope) => {
+		activeScope = scope;
+		await client.terminate();
+	});
+	expect(primaryFetches).toBe(0);
+	expect(scopedFetches).toBe(1);
+	expect(sent.filter((message) => "kind" in message && message.kind === "sync.fetch.result")).toHaveLength(1);
+});
+
 test("failed close terminates the worker before releasing its binding", async () => {
 	const termination = deferred<void>();
 	const events: string[] = [];

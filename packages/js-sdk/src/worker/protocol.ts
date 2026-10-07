@@ -33,6 +33,50 @@ export type WorkerSyncFetchRequest = {
     response: HttpResponsePolicy;
 };
 
+/** The only network operation permitted after a repository client starts closing. */
+export function isSessionCloseRequest(request: {
+	url: string;
+	method?: string;
+	headers?: HeadersInit;
+	init?: { method?: string; headers?: HeadersInit };
+	}, authorityUrl?: string | URL): boolean {
+	const method = request.init?.method ?? request.method;
+	const headers = request.init?.headers ?? request.headers;
+	if ((method ?? "GET").toUpperCase() !== "DELETE") return false;
+	try {
+		const url = new URL(request.url);
+		const sessionId = new Headers(headers).get("lix-session-id");
+		if (!/^\/lix\/v1\/[^/]+\/session\/?$/.test(url.pathname) ||
+			!sessionId?.trim()) return false;
+		if (authorityUrl !== undefined) {
+			const authority = new URL(authorityUrl.toString());
+			const expectedPath = `${authority.pathname.replace(/\/+$/, "")}/session`;
+			if (url.origin !== authority.origin || url.pathname !== expectedPath) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Notifications needed to finish an already-started remote session close. */
+export function isSessionCloseTransportResponse(
+	message: WorkerResponse,
+): boolean {
+	return "kind" in message && (
+		message.kind === "sync.headers" ||
+		(message.kind === "sync.fetch" && isSessionCloseRequest(message.request))
+	);
+}
+
+/** Acknowledgments for teardown-only transport callbacks. */
+export function isSessionCloseTransportResult(message: WorkerInput): boolean {
+	return !("id" in message) && (
+		message.kind === "sync.headers.result" ||
+		message.kind === "sync.fetch.result"
+	);
+}
+
 type WorkerSyncFetchResponseHead = {
 	status: number;
 	statusText: string;

@@ -120,6 +120,55 @@ test("queues initial open until elected owner connects and rejects stale output"
 	await closing;
 	expect(c.worker.postMessage).toHaveBeenCalledWith({ kind: "release" });
 });
+
+test("routes the final session-close callback while termination awaits owner cleanup", async () => {
+	const c = connection();
+	const client = c.elect();
+	const closing = c.result.terminate();
+	c.receive({
+		kind: "output",
+		client,
+		generation: "owner-1",
+		message: {
+			kind: "sync.fetch",
+			requestId: 77,
+			request: {
+				url: "https://example.test/lix/v1/repo-a/session",
+				method: "DELETE",
+				headers: [["lix-session-id", "session-a"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			},
+		},
+	});
+	const request = c.listener.mock.calls
+		.map(([message]) => message)
+		.find((message) => message.kind === "sync.fetch");
+	expect(request).toBeDefined();
+	const callbackId = request.requestId;
+	c.result.postMessage({
+		kind: "sync.fetch.result",
+		requestId: callbackId,
+		result: { ok: true, response: { status: 204, statusText: "No Content", headers: [], body: new Uint8Array() } },
+	});
+	expect(c.sent).toContainEqual({
+		kind: "input",
+		client,
+		generation: "owner-1",
+		message: {
+			kind: "sync.fetch.result",
+			requestId: 77,
+			result: { ok: true, response: { status: 204, statusText: "No Content", headers: [], body: new Uint8Array() } },
+		},
+	});
+	c.result.postMessage({
+		kind: "sync.fetch.result",
+		requestId: 999,
+		result: { ok: true, response: { status: 200, statusText: "OK", headers: [], body: new Uint8Array() } },
+	});
+	expect(c.sent.filter((message) => message.kind === "input")).toHaveLength(1);
+	c.receive({ kind: "disconnected", client, generation: "owner-1" });
+	await closing;
+});
 test("owner replacement reconnects without a fatal error", async () => {
 	const c = connection();
 	const client = c.elect();

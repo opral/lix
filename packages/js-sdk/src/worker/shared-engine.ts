@@ -1,6 +1,7 @@
 import type { LixOpenReport } from "../types.js";
 import { fetchTransport, HttpTransportError } from "../http-transport.js";
 import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch, TelemetryParentContext, OpenProgressDispatch } from "../binding-types.js";
+import { isSessionCloseRequest } from "./protocol.js";
 
 export type SharedEngineClient = {
   server: SyncServerBindingOptions;
@@ -16,6 +17,7 @@ export type SharedEngineClient = {
 /** One physical owner; ports receive independent sessions, never the root. */
 export class SharedEngineOwner {
   private root: LixBinding | undefined;
+  private closingClient: SharedEngineClient | undefined;
   private principalId: string | undefined;
   private state: "closed" | "opening" | "ready" | "closing" | "migration-exclusive" = "closed";
   get lifecycleState() { return this.state; }
@@ -55,12 +57,16 @@ export class SharedEngineOwner {
           this.principalId = principal;
           this.state = "ready";
         } catch (error) {
-          this.clients.delete(client);
           if (this.root) {
             this.state = "closing";
+            this.closingClient = client;
             await this.root.close();
             this.root = undefined;
             this.principalId = undefined;
+            this.clients.delete(client);
+            this.closingClient = undefined;
+          } else {
+            this.clients.delete(client);
           }
           this.state = "closed";
           throw error;
@@ -109,13 +115,17 @@ export class SharedEngineOwner {
           },
         });
       } catch (error) {
-        this.clients.delete(client);
-        if (this.clients.size === 0) {
+        if (this.clients.size === 1 && this.clients.has(client)) {
           this.state = "closing";
+          this.closingClient = client;
           await root.close();
           this.root = undefined;
           this.principalId = undefined;
+          this.clients.delete(client);
+          this.closingClient = undefined;
           this.state = "closed";
+        } else {
+          this.clients.delete(client);
         }
         throw error;
       }
@@ -163,15 +173,20 @@ export class SharedEngineOwner {
 
   async detach(client: SharedEngineClient): Promise<void> {
     const operation = this.queue.then(async () => {
-      this.clients.delete(client);
-      if (this.clients.size === 0 && this.root) {
-        const root = this.root;
+      const root = this.root;
+      const closesRoot = this.clients.size === 1 && this.clients.has(client) && root !== undefined;
+      if (closesRoot) {
         // Keep ownership on a failed close; never open a second engine over it.
         this.state = "closing";
+        this.closingClient = client;
         await root.close();
+        this.clients.delete(client);
+        this.closingClient = undefined;
         this.root = undefined;
         this.principalId = undefined;
         this.state = "closed";
+      } else {
+        this.clients.delete(client);
       }
     });
     this.queue = operation.catch(() => undefined);
@@ -186,14 +201,19 @@ export class SharedEngineOwner {
       headers: [],
       transport: async (request) => {
         let unavailable: unknown;
+        const closingSession = this.state === "closing" &&
+          this.closingClient !== undefined &&
+          isSessionCloseRequest(request, first.server.url);
         // Credentials and callback remain paired when a tab leaves or suspends.
         for (const client of this.clients) {
-          if (client.isDisconnected?.()) continue;
+          const teardown = closingSession && client === this.closingClient;
+          if (this.state === "closing" && !teardown) continue;
+          if (client.isDisconnected?.() && !teardown) continue;
           const server = client.server;
           let supplied: [string, string][];
           try { supplied = (server.headerProvider ? await server.headerProvider() : server.headers).map(([name, value]) => [name, value]); }
           catch (error) { unavailable = error; continue; }
-          if (!this.clients.has(client) || client.isDisconnected?.()) continue;
+          if (!this.clients.has(client) || (client.isDisconnected?.() && !teardown)) continue;
           const headers = new Headers(request.init.headers);
           for (const [name, value] of supplied) headers.set(name, value);
           const response = await (server.transport ?? fetchTransport())({ ...request, init: { ...request.init, headers, credentials: "omit" } });

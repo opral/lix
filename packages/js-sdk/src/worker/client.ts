@@ -23,6 +23,7 @@ import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isSessionCloseRequest,
 	type WorkerConnection,
 	type WorkerNotification,
 	type WorkerOperation,
@@ -550,8 +551,8 @@ function workerObserveBinding(
 }
 
 async function releaseWorker(client: LixWorkerClient): Promise<void> {
-	client.endLease();
 	if (client.reusable && !client.isDisposed && idleWorkers.length < MAX_IDLE_WORKERS) {
+		client.endLease();
 		idleWorkers.push(client);
 		return;
 	}
@@ -563,6 +564,7 @@ export class LixWorkerClient {
 	private nextSnapshotInputId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
 	private disposed = false;
+	private terminating = false;
 	private leased = false;
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
@@ -583,6 +585,8 @@ export class LixWorkerClient {
 		number,
 		ReadableStreamDefaultReader<Uint8Array> | undefined
 	>();
+	private readonly teardownHeaderRequests = new Set<number>();
+	private readonly teardownSessionRequests = new Set<number>();
 
 	constructor(
 		private readonly connection: WorkerConnection = createWorkerConnection(),
@@ -623,6 +627,13 @@ export class LixWorkerClient {
 		this.syncServer = undefined;
 		this.onProgress = undefined;
 		this.openReport = undefined;
+		this.abortSyncFetches();
+		this.teardownHeaderRequests.clear();
+		this.teardownSessionRequests.clear();
+		onDisposed?.();
+	}
+
+	private abortSyncFetches(): void {
 		for (const controller of this.syncFetchControllers.values())
 			controller.abort();
 		this.syncFetchControllers.clear();
@@ -630,7 +641,6 @@ export class LixWorkerClient {
 			void reader?.cancel().catch(() => undefined);
 		}
 		this.syncFetchStreams.clear();
-		onDisposed?.();
 	}
 
 	currentTelemetryParent(): TelemetryParentContext | undefined {
@@ -695,22 +705,38 @@ export class LixWorkerClient {
 	}
 
 	notify(notification: WorkerNotification): void {
-		if (this.disposed || !this.leased) return;
+		if (!this.leased) return;
+		const teardownId = "requestId" in notification ? notification.requestId : undefined;
+		const teardownResult = this.terminating && teardownId !== undefined && (
+			(notification.kind === "sync.headers.result" && this.teardownHeaderRequests.has(teardownId)) ||
+			(notification.kind === "sync.fetch.result" && this.teardownSessionRequests.has(teardownId))
+		);
+		if (this.disposed && !teardownResult) return;
 		try {
 			this.connection.postMessage(notification);
 		} catch {
 			// A best-effort finalizer/close notification can race worker shutdown.
+		} finally {
+			if (teardownResult && teardownId !== undefined) {
+				this.teardownHeaderRequests.delete(teardownId);
+				this.teardownSessionRequests.delete(teardownId);
+			}
 		}
 	}
 
 	async terminate(): Promise<void> {
 		if (this.disposed) return;
+		this.terminating = true;
 		this.disposed = true;
 		this.rejectPending(workerClosedError());
+		this.abortSyncFetches();
 		try {
 			await this.connection.terminate();
 		} finally {
 			this.endLease();
+			this.terminating = false;
+			this.teardownHeaderRequests.clear();
+			this.teardownSessionRequests.clear();
 		}
 	}
 
@@ -730,6 +756,13 @@ export class LixWorkerClient {
 	private handleWorkerEvent(
 		message: Extract<WorkerResponse, { kind: string }>,
 	): void {
+		if (this.disposed && !this.terminating) return;
+		if (
+			this.terminating &&
+			message.kind !== "sync.headers" &&
+			message.kind !== "sync.fetch" &&
+			message.kind !== "sync.fetch.cancel"
+		) return;
 		switch (message.kind) {
 			case "telemetry":
 				try {
@@ -746,9 +779,17 @@ export class LixWorkerClient {
 				}
 				break;
 			case "sync.headers":
+				if (this.terminating) this.teardownHeaderRequests.add(message.requestId);
 				void this.resolveSyncHeaders(message.requestId, message.transportScope);
 				break;
 			case "sync.fetch":
+				if (this.terminating) {
+					const server = message.transportScope === undefined
+						? this.syncServer
+						: this.scopedServers.get(message.transportScope);
+					if (!server || !isSessionCloseRequest(message.request, server.url)) break;
+					this.teardownSessionRequests.add(message.requestId);
+				}
 				void this.resolveSyncFetch(message.requestId, message.request, message.transportScope);
 				break;
 			case "sync.fetch.stream.pull":

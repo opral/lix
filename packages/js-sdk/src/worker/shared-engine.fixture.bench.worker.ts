@@ -78,11 +78,9 @@ scope.onconnect = (event) => {
   const close = async () => {
     if (closed) return;
     closed = true;
-    owner.deactivate(client);
     try {
-      await host.close();
+      await host.close(() => owner.detach(client));
     } finally {
-      await owner.detach(client);
       port.close();
     }
   };

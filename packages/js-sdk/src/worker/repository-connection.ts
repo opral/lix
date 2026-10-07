@@ -1,6 +1,11 @@
 /// <reference lib="webworker" />
 import { RepositorySession } from "./repository-session.js";
-import type { WorkerConnection, WorkerResponse } from "./protocol.js";
+import {
+	isSessionCloseTransportResponse,
+	isSessionCloseTransportResult,
+	type WorkerConnection,
+	type WorkerResponse,
+} from "./protocol.js";
 import { deserializeWorkerError } from "./protocol.js";
 import {
 	OPEN_TIMEOUT_MS,
@@ -119,6 +124,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 	let release!: () => void;
 	let leased = false,
 		closed = false,
+		closing = false,
 		connected = false;
 	let generation: string | undefined, nonce: string | undefined;
 	let lastSeen = Date.now();
@@ -196,6 +202,14 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 				finishClose?.(
 					message.error ? deserializeWorkerError(message.error) : undefined,
 				);
+			else if (
+				closing &&
+				message.kind === "output" &&
+				message.client === client &&
+				message.generation === generation &&
+				isSessionCloseTransportResponse(message.message)
+			)
+				session.receive(message.message);
 			return;
 		}
 		if (failure) return;
@@ -255,7 +269,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 	};
 	return {
 		postMessage(message) {
-			if (closed || failure)
+			if ((closed && !(closing && isSessionCloseTransportResult(message))) || failure)
 				throw (
 					failure ??
 					repositoryError("LIX_ERROR_CLOSED", "Repository connection closed")
@@ -274,9 +288,9 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		terminate() {
 			return (termination ??= (async () => {
 				closed = true;
+				closing = true;
 				clearInterval(poll);
 				clearTimeout(deadline);
-				session.close();
 				try {
 					if (connected && generation && !failure)
 						await new Promise<void>((resolve, reject) => {
@@ -298,6 +312,8 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 							release();
 						});
 				} finally {
+					closing = false;
+					session.close();
 					release();
 					channel.close();
 					retained.failures.delete(fail);

@@ -643,3 +643,101 @@ test("worker disconnect during header handoff retires the paired client fetch", 
       .toBe(false);
   } finally {await host.close();}
 });
+
+test("worker teardown permits only the scoped session DELETE until owner detach completes", async () => {
+  const replies: WorkerResponse[] = [];
+  const forwarded: string[] = [];
+  let receive!: (message: WorkerInput) => void;
+  let transport!: import("../http-transport.js").HttpTransport;
+  const host = startWorkerHost({
+    postMessage(message) {
+      replies.push(message);
+      if ("kind" in message && message.kind === "sync.fetch") {
+        forwarded.push(`${message.request.method}:${message.request.url}`);
+        queueMicrotask(() => receive({
+          kind: "sync.fetch.result",
+          requestId: message.requestId,
+          result: { ok: true, response: { status: 204, statusText: "No Content", headers: [], body: new Uint8Array() } },
+        }));
+      }
+    },
+    onMessage(listener) { receive = listener; },
+  }, async (_storage, _telemetry, _parent, server) => {
+    transport = server!.transport!;
+    return {
+      setTelemetryParent() {},
+      async close() {},
+    } as unknown as LixBinding;
+  });
+  receive({ id: 1, sessionId: 0, operation: {
+    kind: "open",
+    storage: { kind: "memory" },
+    telemetryEnabled: false,
+    progressEnabled: false,
+    server: { url: "https://example.test/lix/v1/repo-a", headers: [] },
+  } });
+  await vi.waitFor(() => expect(replies).toContainEqual({ id: 1, ok: true }));
+  await host.close(async () => {
+    await expect(transport({
+      url: "https://example.test/lix/v1/repo-a/sync/pull",
+      init: { method: "POST" },
+      response: { mode: "buffered", maxBytes: 128 },
+    })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
+    const response = await transport({
+      url: "https://example.test/lix/v1/repo-a/session",
+      init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+      response: { mode: "buffered", maxBytes: 128 },
+    });
+    expect(response.status).toBe(204);
+  });
+  expect(forwarded).toEqual(["DELETE:https://example.test/lix/v1/repo-a/session"]);
+  await expect(transport({
+    url: "https://example.test/lix/v1/repo-a/session",
+    init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+    response: { mode: "buffered", maxBytes: 128 },
+  })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
+});
+
+test("worker teardown disables its session DELETE lane after owner detach fails", async () => {
+  const replies: WorkerResponse[] = [];
+  let receive!: (message: WorkerInput) => void;
+  let transport!: import("../http-transport.js").HttpTransport;
+  const host = startWorkerHost({
+    postMessage(message) {
+      replies.push(message);
+      if ("kind" in message && message.kind === "sync.fetch") {
+        queueMicrotask(() => receive({
+          kind: "sync.fetch.result",
+          requestId: message.requestId,
+          result: { ok: true, response: { status: 204, statusText: "No Content", headers: [], body: new Uint8Array() } },
+        }));
+      }
+    },
+    onMessage(listener) { receive = listener; },
+  }, async (_storage, _telemetry, _parent, server) => {
+    transport = server!.transport!;
+    return { setTelemetryParent() {}, async close() {} } as unknown as LixBinding;
+  });
+  receive({ id: 1, sessionId: 0, operation: {
+    kind: "open",
+    storage: { kind: "memory" },
+    telemetryEnabled: false,
+    progressEnabled: false,
+    server: { url: "https://example.test/lix/v1/repo-a", headers: [] },
+  } });
+  await vi.waitFor(() => expect(replies).toContainEqual({ id: 1, ok: true }));
+  const closeError = new Error("owner detach failed");
+  await expect(host.close(async () => {
+    await transport({
+      url: "https://example.test/lix/v1/repo-a/session",
+      init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+      response: { mode: "buffered", maxBytes: 128 },
+    });
+    throw closeError;
+  })).rejects.toBe(closeError);
+  await expect(transport({
+    url: "https://example.test/lix/v1/repo-a/session",
+    init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+    response: { mode: "buffered", maxBytes: 128 },
+  })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
+});
