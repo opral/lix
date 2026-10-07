@@ -1,8 +1,10 @@
 use super::*;
 use std::sync::{
     Arc,
+    Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::future::Future;
 
 pub(super) async fn fixture() -> (
     StorageAdapter<Memory>,
@@ -46,11 +48,173 @@ pub(super) async fn fixture() -> (
     (storage, state, request)
 }
 
-pub(super) async fn stage(
-    storage: &StorageAdapter<Memory>,
+#[derive(Clone)]
+struct CountingStorage {
+    memory: Memory,
+    canonical_commits: Arc<Mutex<Vec<Vec<(StorageSpace, StorageKey)>>>>,
+}
+
+struct CountingWrite<W> {
+    inner: W,
+    canonical_commits: Arc<Mutex<Vec<Vec<(StorageSpace, StorageKey)>>>>,
+    canonical_write: bool,
+    canonical_keys: Vec<(StorageSpace, StorageKey)>,
+}
+
+impl Storage for CountingStorage {
+    type Read<'a> = <Memory as Storage>::Read<'a> where Self: 'a;
+    type Write<'a> = CountingWrite<<Memory as Storage>::Write<'a>> where Self: 'a;
+
+    fn acquire_session(
+        &self,
+    ) -> impl Future<
+        Output = Result<StorageSessionToken, StorageError>,
+    > + Send {
+        self.memory.acquire_session()
+    }
+
+    fn acquire_partial_replica_owner(
+        &self,
+        session: StorageSessionToken,
+    ) -> impl Future<
+        Output = Result<StorageOwnerLease, StorageError>,
+    > + Send {
+        self.memory.acquire_partial_replica_owner(session)
+    }
+
+    fn begin_read(
+        &self,
+        opts: StorageReadOptions,
+    ) -> impl Future<
+        Output = Result<Self::Read<'_>, StorageError>,
+    > + Send {
+        self.memory.begin_read(opts)
+    }
+
+    fn begin_write(
+        &self,
+        opts: StorageWriteOptions,
+    ) -> impl Future<
+        Output = Result<Self::Write<'_>, StorageError>,
+    > + Send {
+        let write = self.memory.begin_write(opts);
+        let canonical_commits = Arc::clone(&self.canonical_commits);
+        async move {
+            Ok(CountingWrite {
+                inner: write.await?,
+                canonical_commits,
+                canonical_write: false,
+                canonical_keys: Vec::new(),
+            })
+        }
+    }
+}
+
+impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
+    fn put_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        if space != STAGING_SPACE {
+            self.canonical_write = true;
+            self.canonical_keys.extend(
+                entries
+                    .entries
+                    .iter()
+                    .map(|entry| (space, entry.key.clone())),
+            );
+        }
+        self.inner.put_many(space, entries)
+    }
+
+    fn replace_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        if space != STAGING_SPACE {
+            self.canonical_write = true;
+            self.canonical_keys.extend(
+                entries
+                    .entries
+                    .iter()
+                    .map(|entry| (space, entry.key.clone())),
+            );
+        }
+        self.inner.replace_many(space, entries)
+    }
+
+    fn delete_many(
+        &mut self,
+        space: StorageSpace,
+        keys: &[StorageKey],
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        if space != STAGING_SPACE {
+            self.canonical_write = true;
+            self.canonical_keys
+                .extend(keys.iter().cloned().map(|key| (space, key)));
+        }
+        self.inner.delete_many(space, keys)
+    }
+
+    fn delete_range(
+        &mut self,
+        space: StorageSpace,
+        range: StorageKeyRange,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        if space != STAGING_SPACE {
+            self.canonical_write = true;
+        }
+        self.inner.delete_range(space, range)
+    }
+
+    fn commit(
+        self,
+    ) -> impl Future<
+        Output = Result<StorageCommitResult, StorageError>,
+    > + Send {
+        async move {
+            let result = self.inner.commit().await?;
+            if self.canonical_write {
+                self.canonical_commits
+                    .lock()
+                    .expect("test commit counter is not poisoned")
+                    .push(self.canonical_keys);
+            }
+            Ok(result)
+        }
+    }
+
+    fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.inner.rollback()
+    }
+}
+
+async fn counting_fixture() -> (
+    StorageAdapter<CountingStorage>,
+    PartialReplicaState,
+    ReadFulfillmentRequest,
+    Arc<Mutex<Vec<Vec<(StorageSpace, StorageKey)>>>>,
+) {
+    let (storage, state, request) = fixture().await;
+    let canonical_commits = Arc::new(Mutex::new(Vec::new()));
+    let counted = StorageAdapter::new(CountingStorage {
+        memory: storage.storage().clone(),
+        canonical_commits: Arc::clone(&canonical_commits),
+    });
+    counted.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    (counted, state, request, canonical_commits)
+}
+
+pub(super) async fn stage<S>(
+    storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     request: &ReadFulfillmentRequest,
-) -> StagedClosure<Memory> {
+) -> StagedClosure<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     let (id, permit) = lifecycle::reserve(storage, state).await.unwrap();
     StagedClosure::new(
         storage,
@@ -78,6 +242,387 @@ fn chunk(index: u32, bytes: usize) -> ReadInput {
         bytes: data,
     }
 }
+
+fn staged_ref(index: usize, len: usize) -> StagedInputRef {
+    StagedInputRef {
+        address: ReadInputAddress::BlobChunk(*blake3::hash(&(index as u64).to_be_bytes()).as_bytes()),
+        len,
+        received: len,
+        digest: [0; 32],
+        frames: Vec::new(),
+    }
+}
+
+#[test]
+fn promotion_packs_whole_owner_units_into_bounded_commit_batches() {
+    let mut inputs = Vec::new();
+    let mut units = Vec::new();
+    for _ in 0..18 {
+        let index = inputs.len();
+        inputs.push(staged_ref(index, 256));
+        units.push(vec![index]);
+    }
+    for _ in 0..9 {
+        let mut unit = Vec::new();
+        for _ in 0..3 {
+            let index = inputs.len();
+            inputs.push(staged_ref(index, 256));
+            unit.push(index);
+        }
+        units.push(unit);
+    }
+    assert_eq!(units.len(), 27);
+    assert_eq!(inputs.len(), 45);
+
+    // Two ordinary codec pages model the captured closure's two large plugin
+    // blob groups. They remain intact while the small owner units are packed
+    // around the same 32-input and two-MiB promotion limits.
+    let mut first_page = Vec::new();
+    let index = inputs.len();
+    inputs.push(staged_ref(index, 1_123_269));
+    first_page.push(index);
+    for _ in 0..22 {
+        let index = inputs.len();
+        inputs.push(staged_ref(index, 700));
+        first_page.push(index);
+    }
+    units.push(first_page);
+    let index = inputs.len();
+    inputs.push(staged_ref(index, 1_302_845));
+    units.push(vec![index]);
+
+    assert_eq!(inputs.len(), 69);
+    assert_eq!(units.len(), 29);
+    let batches = pack_promotion_groups(units.clone(), &inputs).unwrap();
+    assert_eq!(
+        batches.len(),
+        4,
+        "one promotion commit per packed batch replaces 29 per-unit commits"
+    );
+
+    let mut seen = BTreeSet::new();
+    for batch in &batches {
+        assert!(batch.len() <= PROMOTION_ITEMS);
+        let (encoded, decoded) = promotion_unit_weights(batch, &inputs).unwrap();
+        assert!(encoded.saturating_add(2) <= PROMOTION_BYTES);
+        assert!(decoded <= PROMOTION_BYTES);
+        for &index in batch {
+            assert!(seen.insert(index), "an input appears in two commits");
+        }
+    }
+    assert_eq!(seen.len(), inputs.len());
+    for unit in units {
+        assert!(
+            batches
+                .iter()
+                .any(|batch| unit.iter().all(|index| batch.contains(index))),
+            "promotion split an indivisible owner or ordinary unit"
+        );
+    }
+}
+
+#[test]
+fn promotion_rejects_an_oversized_unit_before_batching_any_unit() {
+    let inputs = vec![staged_ref(1, 256), staged_ref(2, MAX_INPUT_BYTES + 1)];
+    let units = vec![vec![0], vec![1]];
+    let error = validate_promotion_unit_sizes(&units, &inputs).unwrap_err();
+    assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+    assert!(
+        error.message.contains("codec allocation budget"),
+        "the whole closure is refused before the earlier valid unit can be installed"
+    );
+}
+
+#[tokio::test]
+async fn promotion_preflights_oversized_owner_before_installing_earlier_valid_change() {
+    let (storage, state, mut request, canonical_commits) = counting_fixture().await;
+    let branch_id = request.descriptor.selected_branch.branch_id.clone();
+    let row_pk = crate::row_pk::RowPk::single("preflight-row");
+    let change_id = crate::changelog::ChangeId::for_test_label("preflight-change");
+    let owner = crate::changelog::CommitId::for_test_label("preflight-change-owner");
+    let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(1);
+    let typed = crate::row_payload::TypedRow::from_builtin_json(
+        "lix_key_value",
+        &row_pk,
+        &serde_json::json!({"key":"preflight-row", "value":1}),
+    )
+    .unwrap();
+    let payload = typed.durable_payload().unwrap().to_vec();
+    let record = crate::changelog::ChangeRecord {
+        format_version: 2,
+        change_id,
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.into(),
+        schema_key: "lix_key_value".into(),
+        row_pk: row_pk.clone(),
+        file_id: None,
+        metadata: None,
+        snapshot: Some(payload),
+        created_at,
+        origin_key: None,
+    };
+    let record_bytes = crate::changelog::encode_change_record(&record).unwrap();
+    let record_input = ReadInput {
+        address: ReadInputAddress::ChangeRecord {
+            change_id: record.change_id.to_string(),
+            source_commit_id: owner.to_string(),
+            branch_id: branch_id.clone(),
+            schema_key: record.schema_key.clone(),
+            file_id: None,
+            row_pk: row_pk.clone(),
+            updated_at: created_at.to_string(),
+            payload_digest: *blake3::hash(&record_bytes).as_bytes(),
+        },
+        bytes: record_bytes,
+    };
+    let locator_input = ReadInput {
+        address: ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(
+            record.change_id.to_string(),
+        )),
+        bytes: crate::tracked_state::encode_change_locator(
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id: record.change_id,
+                commit_id: owner,
+                segment_index: 0,
+                ordinal: 0,
+            },
+        ),
+    };
+    let earlier_pair = (
+        record_input.address.coordinate().unwrap(),
+        locator_input.address.coordinate().unwrap(),
+    );
+    request.interests = vec![LogicalReadInterest::Scan {
+        request: crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec!["lix_key_value".into()],
+                row_pks: vec![row_pk],
+                branch_ids: vec![branch_id],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        domain: InterestDomain::Combined,
+    }];
+
+    let mut stage = stage(&storage, &state, &request).await;
+    stage
+        .append_page(vec![record_input, locator_input])
+        .await
+        .unwrap();
+
+    // Model two members of a single validated owner bundle. Each member is
+    // individually within MAX_INPUT_BYTES, while the indivisible bundle is
+    // over budget. The valid ChangeRecord+locator unit sorts before this owner
+    // group and would otherwise be durably installed first.
+    let oversized_owner = uuid::Uuid::from_u128(2).into_bytes();
+    let large_members = [
+        ReadInputAddress::Object(NativeObjectRef::MutationCatalog {
+            commit_id: oversized_owner,
+            expected_digest: [2; 32],
+        }),
+        ReadInputAddress::Object(NativeObjectRef::CommitDeltaPart {
+            commit_id: oversized_owner,
+            part_index: 0,
+            expected_digest: [3; 32],
+            replacement: false,
+        }),
+    ];
+    stage.inputs.extend(large_members.into_iter().map(|address| StagedInputRef {
+        address,
+        len: 33 * 1024 * 1024,
+        received: 0,
+        digest: [0; 32],
+        frames: Vec::new(),
+    }));
+    stage.validated = true;
+
+    let error = stage.promote(&request, false).await.unwrap_err();
+    assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+    assert!(error.message.contains("codec allocation budget"));
+    assert_eq!(
+        canonical_commits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|commit| {
+                commit.contains(&earlier_pair.0) || commit.contains(&earlier_pair.1)
+            })
+            .count(),
+        0,
+        "oversized later unit must be refused before the earlier valid pair is published"
+    );
+}
+
+#[tokio::test]
+async fn promotion_co_packs_valid_change_locator_units_in_two_canonical_commits() {
+    let (storage, state, mut request, canonical_commits) = counting_fixture().await;
+    let branch_id = request.descriptor.selected_branch.branch_id.clone();
+    let mut inputs = Vec::new();
+    let mut expected_pairs = Vec::new();
+    let mut row_pks = Vec::new();
+    for index in 0..27 {
+        let row_key = format!("batched-row-{index:02}");
+        let row_pk = crate::row_pk::RowPk::single(row_key.clone());
+        row_pks.push(row_pk.clone());
+        let change_id = crate::changelog::ChangeId::for_test_label(&format!(
+            "batched-change-{index:02}"
+        ));
+        let owner = crate::changelog::CommitId::for_test_label(&format!(
+            "batched-owner-{index:02}"
+        ));
+        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(
+            100 + index as i64,
+        );
+        let typed = crate::row_payload::TypedRow::from_builtin_json(
+            "lix_key_value",
+            &row_pk,
+            &serde_json::json!({"key": row_key, "value": index}),
+        )
+        .unwrap();
+        let payload = typed.durable_payload().unwrap().to_vec();
+        let record = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id,
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.into(),
+            schema_key: "lix_key_value".into(),
+            row_pk: row_pk.clone(),
+            file_id: None,
+            metadata: None,
+            snapshot: Some(payload),
+            created_at,
+            origin_key: None,
+        };
+        let record_bytes = crate::changelog::encode_change_record(&record).unwrap();
+        let record_input = ReadInput {
+            address: ReadInputAddress::ChangeRecord {
+                change_id: record.change_id.to_string(),
+                source_commit_id: owner.to_string(),
+                branch_id: branch_id.clone(),
+                schema_key: record.schema_key.clone(),
+                file_id: None,
+                row_pk,
+                updated_at: created_at.to_string(),
+                payload_digest: *blake3::hash(&record_bytes).as_bytes(),
+            },
+            bytes: record_bytes,
+        };
+        let locator_input = ReadInput {
+            address: ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(
+                record.change_id.to_string(),
+            )),
+            bytes: crate::tracked_state::encode_change_locator(
+                crate::tracked_state::CommitDeltaChangeLocator {
+                    change_id: record.change_id,
+                    commit_id: owner,
+                    segment_index: 0,
+                    ordinal: 0,
+                },
+            ),
+        };
+        expected_pairs.push((
+            record_input.address.coordinate().unwrap(),
+            locator_input.address.coordinate().unwrap(),
+        ));
+        inputs.extend([record_input, locator_input]);
+    }
+    request.interests = vec![LogicalReadInterest::Scan {
+        request: crate::hot_state::HotStateScanRequest {
+            filter: crate::hot_state::HotStateFilter {
+                schema_keys: vec!["lix_key_value".into()],
+                row_pks,
+                branch_ids: vec![branch_id],
+                file_ids: vec![crate::NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        domain: InterestDomain::Combined,
+    }];
+
+    let mut stage = stage(&storage, &state, &request).await;
+    stage.header.closure_digest = input_digest(&request, &inputs).unwrap();
+    stage.append_page(inputs.clone()).await.unwrap();
+    let commits_before = canonical_commits.lock().unwrap().len();
+    let hydrated = stage.promote(&request, false).await.unwrap();
+    let commits = canonical_commits.lock().unwrap();
+    let promoted_commits = commits[commits_before..]
+        .iter()
+        .filter(|commit| {
+            expected_pairs
+                .iter()
+                .any(|(record, locator)| commit.contains(record) || commit.contains(locator))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(promoted_commits.len(), 2);
+    for (record, locator) in &expected_pairs {
+        assert!(promoted_commits.iter().any(|commit| {
+            commit.contains(record) && commit.contains(locator)
+        }), "selected payload and locator must publish atomically");
+    }
+    for input in &inputs {
+        assert!(hydrated.keys.contains(&input.address.coordinate().unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn promotion_rejects_changed_admission_before_installing_inputs() {
+    let (storage, state, request) = fixture().await;
+    let mut stage = stage(&storage, &state, &request).await;
+    let input = chunk(240, 1024);
+    let coordinate = input.address.coordinate().unwrap();
+    stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    stage.append_page(vec![input]).await.unwrap();
+
+    let mut descriptor = state.descriptor().clone();
+    descriptor.cursor = descriptor.cursor.saturating_add(1);
+    let changed = state
+        .with_descriptor_and_fresh_generations(descriptor)
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (_, previous) = super::super::super::partial_state::load_partial_replica_state(&read)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(read);
+    let mut writes = storage.new_write_set();
+    let precondition = super::super::super::partial_state::stage_partial_replica_state(
+        &mut writes,
+        &changed,
+        Some(previous),
+    )
+    .unwrap();
+    storage
+        .commit_migration_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions: vec![precondition],
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = stage.promote(&request, false).await.unwrap_err();
+    assert_eq!(
+        error.code,
+        crate::sync::runtime::PARTIAL_ADMISSION_CHANGED_CODE
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(
+        PointReadPlan::new(coordinate.0, std::slice::from_ref(&coordinate.1))
+            .materialize(&read, Default::default())
+            .await
+            .unwrap()
+            .value
+            .pop()
+            .flatten()
+            .is_none(),
+        "a stale admission cannot publish any batch"
+    );
+}
+
 fn update_digest(digest: &mut blake3::Hasher, input: &ReadInput) {
     let address = serde_json::to_vec(&input.address).unwrap();
     digest.update(&(address.len() as u64).to_be_bytes());
@@ -203,7 +748,7 @@ async fn repository_scratch_admission_is_bounded_and_release_restores_capacity()
 
 #[tokio::test]
 async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_promotion() {
-    let (storage, state, mut request) = fixture().await;
+    let (storage, state, mut request, canonical_commits) = counting_fixture().await;
     let change_id = crate::changelog::ChangeId::for_test_label("large-framed-change");
     let owner = crate::changelog::CommitId::for_test_label("large-framed-owner");
     let row_pk = crate::row_pk::RowPk::single("large-framed-row");
@@ -302,7 +847,26 @@ async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_p
     }
     drop(read);
     stage.header.closure_digest = digest.finalize().to_hex().to_string();
+    let commits_before = canonical_commits.lock().unwrap().len();
     stage.promote(&request, false).await.unwrap();
+    let record_coordinate = input.address.coordinate().unwrap();
+    let locator_coordinate = locator.address.coordinate().unwrap();
+    {
+        let commits = canonical_commits.lock().unwrap();
+        let promoted_commits = commits[commits_before..]
+            .iter()
+            .filter(|commit| {
+                commit.contains(&record_coordinate) || commit.contains(&locator_coordinate)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            promoted_commits.len(),
+            1,
+            "an oversized indivisible pair is published in one commit"
+        );
+        assert!(promoted_commits[0].contains(&record_coordinate));
+        assert!(promoted_commits[0].contains(&locator_coordinate));
+    }
     let read = storage.begin_read(Default::default()).await.unwrap();
     for expected in [&input, &locator] {
         let (space, key) = expected.address.coordinate().unwrap();

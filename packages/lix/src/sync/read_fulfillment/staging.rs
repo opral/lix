@@ -10,6 +10,7 @@ pub(crate) const STAGING_SPACE: StorageSpace = StorageSpace::declare(
     ValueSemantics::Mutable,
 );
 const FRAME_BYTES: usize = PAGE_PAYLOAD_BYTES;
+const PROMOTION_ITEMS: usize = super::super::transfer::CONTENT_GROUP_ITEMS;
 const PROMOTION_BYTES: usize = PAGE_PAYLOAD_BYTES / 2;
 
 #[derive(Clone)]
@@ -400,18 +401,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         if !page.is_empty() {
             groups.push(page);
         }
-        // Refuse an oversized atomic owner before publishing any group.
-        if groups.iter().any(|group| {
-            group
-                .iter()
-                .map(|&index| self.inputs[index].len)
-                .sum::<usize>()
-                > MAX_INPUT_BYTES
-        }) {
-            return Err(invalid(
-                "native owner bundle exceeds codec allocation budget",
-            ));
-        }
+        // Refuse an oversized indivisible owner before publishing any group.
+        validate_promotion_unit_sizes(&groups, &self.inputs)?;
+        let groups = pack_promotion_groups(groups, &self.inputs)?;
         if immutable_only
             && self
                 .inputs
@@ -461,6 +453,100 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         self.release_scratch().await?;
         Ok(hydrated)
     }
+}
+
+/// Co-pack independent validation units without splitting an owner bundle or
+/// one of the existing ordinary codec pages. A unit that exceeds this normal
+/// lane remains a standalone codec operation, up to the existing per-unit
+/// allocation bound checked by `promote` above.
+fn pack_promotion_groups(
+    units: Vec<Vec<usize>>,
+    inputs: &[StagedInputRef],
+) -> Result<Vec<Vec<usize>>, LixError> {
+    use super::super::transfer::TransferBatch;
+
+    fn new_batch() -> TransferBatch<Vec<usize>> {
+        TransferBatch::with_limits(PROMOTION_ITEMS, PROMOTION_BYTES, PROMOTION_BYTES)
+    }
+
+    fn flatten_units(units: Vec<Vec<usize>>) -> Vec<usize> {
+        units.into_iter().flatten().collect()
+    }
+
+    let mut batches = Vec::new();
+    let mut pending = new_batch();
+    for unit in units {
+        let (encoded, decoded) = promotion_unit_weights(&unit, inputs)?;
+        let item_count = unit.len();
+        let indivisible_oversize = item_count > PROMOTION_ITEMS
+            || encoded.saturating_add(2) > PROMOTION_BYTES
+            || decoded > PROMOTION_BYTES;
+        if indivisible_oversize {
+            if !pending.items.is_empty() {
+                batches.push(flatten_units(std::mem::take(&mut pending.items)));
+                pending = new_batch();
+            }
+            batches.push(unit);
+            continue;
+        }
+
+        if let Some(unit) = pending.push_counted(unit, item_count, encoded, decoded)? {
+            batches.push(flatten_units(std::mem::take(&mut pending.items)));
+            pending = new_batch();
+            if pending
+                .push_counted(unit, item_count, encoded, decoded)?
+                .is_some()
+            {
+                return Err(invalid("promotion unit did not fit an empty batch"));
+            }
+        }
+    }
+    if !pending.items.is_empty() {
+        batches.push(flatten_units(pending.items));
+    }
+    Ok(batches)
+}
+
+fn promotion_unit_weights(
+    unit: &[usize],
+    inputs: &[StagedInputRef],
+) -> Result<(usize, usize), LixError> {
+    let mut encoded = 0usize;
+    let mut decoded = 0usize;
+    for &index in unit {
+        let input = inputs
+            .get(index)
+            .ok_or_else(|| invalid("promotion unit references an absent input"))?;
+        let address_bytes = serde_json::to_vec(&input.address)
+            .map_err(|_| invalid("invalid promotion address"))?
+            .len();
+        // Read fulfillment uses JSON/base64 on the wire. Include its address
+        // and small envelope overhead while bounding raw decoded bytes too.
+        encoded = encoded
+            .saturating_add(address_bytes)
+            .saturating_add(input.len.div_ceil(3).saturating_mul(4))
+            .saturating_add(32);
+        decoded = decoded.saturating_add(input.len);
+    }
+    Ok((encoded, decoded))
+}
+
+fn validate_promotion_unit_sizes(
+    units: &[Vec<usize>],
+    inputs: &[StagedInputRef],
+) -> Result<(), LixError> {
+    if units.iter().any(|unit| {
+        unit.iter()
+            .filter_map(|&index| inputs.get(index))
+            .map(|input| input.len)
+            .sum::<usize>()
+            > MAX_INPUT_BYTES
+    }) {
+        return Err(invalid(
+            "native owner bundle exceeds codec allocation budget",
+        ));
+    }
+    Ok(())
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static> Drop for StagedClosure<S> {

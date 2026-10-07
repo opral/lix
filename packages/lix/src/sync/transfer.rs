@@ -10,16 +10,39 @@ pub(super) const CHUNK_CONCURRENCY: usize = 6;
 #[derive(Debug)]
 pub(super) struct TransferBatch<T> {
     pub(super) items: Vec<T>,
+    item_count: usize,
     encoded: usize,
     decoded: usize,
+    item_limit: usize,
+    encoded_limit: usize,
+    decoded_limit: usize,
 }
 
 impl<T> TransferBatch<T> {
     pub(super) fn new() -> Self {
+        Self::with_limits(
+            CONTENT_GROUP_ITEMS,
+            CONTENT_GROUP_BYTES,
+            CONTENT_GROUP_BYTES,
+        )
+    }
+
+    /// Construct a batch with the caller's explicit policy limits. Items may
+    /// represent several indivisible transfer members; `push_counted` keeps
+    /// the member budget meaningful when those validation units are packed.
+    pub(super) fn with_limits(
+        item_limit: usize,
+        encoded_limit: usize,
+        decoded_limit: usize,
+    ) -> Self {
         Self {
             items: Vec::new(),
+            item_count: 0,
             encoded: 2,
             decoded: 0,
+            item_limit,
+            encoded_limit,
+            decoded_limit,
         }
     }
 
@@ -31,21 +54,38 @@ impl<T> TransferBatch<T> {
         encoded: usize,
         decoded: usize,
     ) -> Result<Option<T>, LixError> {
-        if encoded.saturating_add(2) > CONTENT_GROUP_BYTES || decoded > CONTENT_GROUP_BYTES {
+        self.push_counted(item, 1, encoded, decoded)
+    }
+
+    /// Push one indivisible unit that contains `item_count` transfer members.
+    /// The unit is either retained whole or returned whole for the next page.
+    pub(super) fn push_counted(
+        &mut self,
+        item: T,
+        item_count: usize,
+        encoded: usize,
+        decoded: usize,
+    ) -> Result<Option<T>, LixError> {
+        if item_count == 0
+            || item_count > self.item_limit
+            || encoded.saturating_add(2) > self.encoded_limit
+            || decoded > self.decoded_limit
+        {
             return Err(LixError::new(
                 "LIX_TRANSFER_MEMBER_TOO_LARGE",
                 "transfer member requires the streaming lane",
             ));
         }
         let encoded = encoded.saturating_add(usize::from(!self.items.is_empty()));
-        if self.items.len() >= CONTENT_GROUP_ITEMS
-            || self.encoded.saturating_add(encoded) > CONTENT_GROUP_BYTES
-            || self.decoded.saturating_add(decoded) > CONTENT_GROUP_BYTES
+        if self.item_count.saturating_add(item_count) > self.item_limit
+            || self.encoded.saturating_add(encoded) > self.encoded_limit
+            || self.decoded.saturating_add(decoded) > self.decoded_limit
         {
             return Ok(Some(item));
         }
         self.encoded += encoded;
         self.decoded += decoded;
+        self.item_count += item_count;
         self.items.push(item);
         Ok(None)
     }
