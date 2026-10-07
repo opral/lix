@@ -2897,29 +2897,246 @@ async fn get_cached_snapshot_values(
         .collect())
 }
 
-async fn read_visible_snapshot_point(
-    snapshot: &Arc<DbSnapshot>,
+/// Read all bounded-operation point metadata and payloads in ordered batches.
+/// Length rows are fetched first, immutable locators second, and mutable
+/// payloads only after admission. Each stage uses SlateDB's bounded concurrent
+/// point reader instead of serially entering the snapshot for every key.
+async fn read_bounded_snapshot_points(
+    snapshot: Arc<DbSnapshot>,
+    durability: ReadDurability,
+    pipeline: WritePipeline,
+    view: Option<(u64, u64)>,
+    cache: SnapshotPointCache,
+    owned: Vec<(Key, ValueSemantics, CoreProjection)>,
+    budget: lix::storage::ReadBudget,
+    prefix: bool,
+) -> Result<Vec<Option<ProjectedValue>>, StorageError> {
+    let singleton = owned.len() == 1;
+    let length_keys = owned
+        .iter()
+        .map(|(key, _, _)| tagged_key(key, LENGTH_TAG))
+        .collect::<Result<Vec<_>, _>>()?;
+    let length_records = read_snapshot_point_outcomes(
+        Arc::clone(&snapshot),
+        durability,
+        &pipeline,
+        view,
+        &cache,
+        &length_keys,
+    )
+    .await;
+    // Decode and bound immutable locators before they enter a point-read batch.
+    // Keep failures attached to their slots so a bounded prefix does not
+    // surface corruption from a slot after its byte-budget cutoff.
+    let mut physical_lengths = Vec::with_capacity(owned.len());
+    for ((_, semantics, projection), record) in owned.iter().zip(length_records) {
+        physical_lengths.push(record.and_then(|record| {
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let bytes = decode_value_length(&record)?;
+            if *semantics == ValueSemantics::Immutable
+                && *projection == CoreProjection::FullValue
+                && bytes > 1024
+            {
+                return Err(StorageError::Corruption(
+                    "immutable locator exceeds metadata codec bound".into(),
+                ));
+            }
+            Ok(Some(bytes))
+        }));
+    }
+
+    // Immutable point values are small locators. Fetch those together, then
+    // admit by the authenticated encoded range before touching content bytes.
+    let mut locator_keys = Vec::new();
+    let mut locator_slots = vec![None; owned.len()];
+    for (index, ((key, semantics, projection), length)) in
+        owned.iter().zip(&physical_lengths).enumerate()
+    {
+        if length.as_ref().is_ok_and(Option::is_some)
+            && *semantics == ValueSemantics::Immutable
+            && *projection == CoreProjection::FullValue
+        {
+            locator_slots[index] = Some(locator_keys.len());
+            locator_keys.push(key.clone());
+        }
+    }
+    let locator_values = read_snapshot_point_outcomes(
+        snapshot.clone(),
+        durability,
+        &pipeline,
+        view,
+        &cache,
+        &locator_keys,
+    )
+    .await;
+
+    let mut results = Vec::with_capacity(owned.len());
+    let mut mutable_payloads = Vec::new();
+    let mut admitted = 0usize;
+    for (index, ((key, semantics, projection), physical_bytes)) in
+        owned.into_iter().zip(physical_lengths).enumerate()
+    {
+        let Some(physical_bytes) = physical_bytes? else {
+            results.push(None);
+            continue;
+        };
+        if projection == CoreProjection::KeyOnly {
+            results.push(Some(ProjectedValue::KeyOnly));
+            continue;
+        }
+
+        let (logical_bytes, immutable_marker) = if semantics == ValueSemantics::Immutable {
+            if physical_bytes > 1024 {
+                return Err(StorageError::Corruption(
+                    "immutable locator exceeds metadata codec bound".into(),
+                ));
+            }
+            let locator_slot =
+                locator_slots[index].expect("full immutable value has a planned locator read");
+            let marker = locator_values[locator_slot]
+                .clone()?
+                .as_ref()
+                .ok_or_else(|| {
+                    StorageError::Corruption("SlateDB indexed payload is absent".into())
+                })?
+                .clone();
+            if marker.len() != physical_bytes {
+                return Err(StorageError::Corruption(
+                    "SlateDB indexed payload length changed".into(),
+                ));
+            }
+            let logical_bytes = decode_immutable_locator(&marker)?
+                .range
+                .len()
+                .checked_sub(16)
+                .ok_or_else(|| {
+                    StorageError::Corruption("immutable locator lacks value envelope".into())
+                })?;
+            (logical_bytes, Some(marker))
+        } else {
+            (physical_bytes, None)
+        };
+
+        if prefix {
+            match budget.admit_value(logical_bytes, admitted, results.is_empty()) {
+                Ok(next) => admitted = next,
+                Err(error) if results.is_empty() => return Err(error),
+                Err(_) => break,
+            }
+        } else {
+            admitted = budget.admit_value(logical_bytes, admitted, singleton)?;
+        }
+
+        if let Some(marker) = immutable_marker {
+            results.push(Some(ProjectedValue::FullValue(marker)));
+        } else {
+            mutable_payloads.push((results.len(), key, physical_bytes));
+            // The admitted payload is installed into this slot after the
+            // second batched snapshot read.
+            results.push(Some(ProjectedValue::FullValue(Bytes::new())));
+        }
+        if prefix && admitted > budget.max_result_bytes {
+            break;
+        }
+    }
+
+    let payload_keys = mutable_payloads
+        .iter()
+        .map(|(_, key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let payload_values =
+        read_snapshot_point_outcomes(snapshot, durability, &pipeline, view, &cache, &payload_keys)
+            .await;
+    for ((result_index, _, expected_bytes), value) in
+        mutable_payloads.into_iter().zip(payload_values)
+    {
+        let value = value?
+            .ok_or_else(|| StorageError::Corruption("SlateDB indexed payload is absent".into()))?;
+        if value.len() != expected_bytes {
+            return Err(StorageError::Corruption(
+                "SlateDB indexed payload length changed".into(),
+            ));
+        }
+        results[result_index] = Some(ProjectedValue::FullValue(value));
+    }
+    Ok(results)
+}
+
+/// Resolve point keys from one snapshot with one bounded-concurrency fetch per
+/// unique cache miss, retaining errors by slot so prefix reads can stop before
+/// an unadmitted tail slot. Apply publication overlays in request order.
+async fn read_snapshot_point_outcomes(
+    snapshot: Arc<DbSnapshot>,
     durability: ReadDurability,
     pipeline: &WritePipeline,
     view: Option<(u64, u64)>,
     cache: &SnapshotPointCache,
-    key: Key,
-) -> Result<Option<Bytes>, StorageError> {
-    if let Some(value) =
-        view.and_then(|(sequence, publication)| pipeline.point_value(sequence, publication, &key))
-    {
-        return Ok(value);
-    }
+    keys: &[Key],
+) -> Vec<Result<Option<Bytes>, StorageError>> {
+    let sequence = snapshot.seq();
+    let mut cached = vec![None; keys.len()];
     if durability == ReadDurability::Visible {
-        if let Some(value) = cache.get(snapshot.seq(), &key) {
-            return Ok(value);
-        }
-        let value = get_snapshot_value(snapshot.clone(), key.clone(), durability).await?;
-        cache.insert(snapshot.seq(), key, value.clone());
-        Ok(value)
-    } else {
-        get_snapshot_value(snapshot.clone(), key, durability).await
+        cache.get_many(sequence, keys, &mut cached);
     }
+
+    let mut seen = HashSet::new();
+    let missing = keys
+        .iter()
+        .zip(&cached)
+        .filter_map(|(key, value)| {
+            (value.is_none() && seen.insert(key.clone())).then_some(key.clone())
+        })
+        .collect::<Vec<_>>();
+    let read_options = slatedb_read_options(durability);
+    let fetched = stream::iter(missing.iter().cloned())
+        .map(|key| {
+            let snapshot = Arc::clone(&snapshot);
+            let read_options = read_options.clone();
+            async move {
+                snapshot
+                    .get_with_options(key.0, &read_options)
+                    .await
+                    .map_err(slatedb_error)
+            }
+        })
+        .buffered(POINT_READ_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut fetched_by_key = HashMap::with_capacity(missing.len());
+    for (key, value) in missing.into_iter().zip(fetched) {
+        if durability == ReadDurability::Visible
+            && let Ok(value) = &value
+        {
+            cache.insert(sequence, key.clone(), value.clone());
+        }
+        fetched_by_key.insert(key, value);
+    }
+
+    let mut values = keys
+        .iter()
+        .zip(cached)
+        .map(|(key, value)| {
+            value.map_or_else(
+                || {
+                    fetched_by_key
+                        .get(key)
+                        .expect("every uncached snapshot point was fetched")
+                        .clone()
+                },
+                Ok,
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some((snapshot_sequence, publication_id)) = view {
+        for (key, value) in keys.iter().zip(&mut values) {
+            if let Some(published) = pipeline.point_value(snapshot_sequence, publication_id, key) {
+                *value = Ok(published);
+            }
+        }
+    }
+    values
 }
 
 fn point_precondition_physical_key(
@@ -3126,11 +3343,6 @@ impl StorageRead for SlateDBRead {
         budget: lix::storage::ReadBudget,
     ) -> Result<GetManyResult, StorageError> {
         self.write_pipeline.terminal_error()?;
-        let singleton = requests
-            .iter()
-            .map(|request| request.keys.len())
-            .sum::<usize>()
-            == 1;
         let owned = requests
             .iter()
             .flat_map(|request| {
@@ -3154,70 +3366,10 @@ impl StorageRead for SlateDBRead {
         let mut results = self
             .worker
             .call_read(move |_db| async move {
-                let mut results = Vec::with_capacity(owned.len());
-                let mut admitted = 0usize;
-                for (key, semantics, projection) in owned {
-                    let length_key = tagged_key(&key, LENGTH_TAG)?;
-                    let length_record = read_visible_snapshot_point(
-                        &snapshot, durability, &pipeline, view, &cache, length_key,
-                    )
-                    .await?;
-                    let Some(length_record) = length_record else {
-                        results.push(None);
-                        continue;
-                    };
-                    let physical_bytes = decode_value_length(&length_record)?;
-                    // Key-only projections never load the payload. Mutable
-                    // values are admitted using their MVCC length row first.
-                    if projection == CoreProjection::KeyOnly {
-                        results.push(Some(ProjectedValue::KeyOnly));
-                        continue;
-                    }
-                    if semantics != ValueSemantics::Immutable {
-                        budget.admit_value(physical_bytes, admitted, singleton)?;
-                    } else if physical_bytes > 1024 {
-                        return Err(StorageError::Corruption(
-                            "immutable locator exceeds metadata codec bound".into(),
-                        ));
-                    }
-                    let value = read_visible_snapshot_point(
-                        &snapshot, durability, &pipeline, view, &cache, key,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        StorageError::Corruption("SlateDB indexed payload is absent".into())
-                    })?;
-                    if value.len() != physical_bytes {
-                        return Err(StorageError::Corruption(
-                            "SlateDB indexed payload length changed".into(),
-                        ));
-                    }
-                    let value = Some(value);
-                    if let Some(value) = value {
-                        let logical_bytes = if projection == CoreProjection::KeyOnly {
-                            0
-                        } else if semantics == ValueSemantics::Immutable {
-                            // The authenticated physical locator supplies the
-                            // exact encoded range before out-of-line content I/O.
-                            decode_immutable_locator(&value)?
-                                .range
-                                .len()
-                                .checked_sub(16)
-                                .ok_or_else(|| {
-                                    StorageError::Corruption(
-                                        "immutable locator lacks value envelope".into(),
-                                    )
-                                })?
-                        } else {
-                            value.len()
-                        };
-                        admitted = budget.admit_value(logical_bytes, admitted, singleton)?;
-                        results.push(Some(project_value(value, projection)));
-                    } else {
-                        results.push(None);
-                    }
-                }
-                Ok(results)
+                read_bounded_snapshot_points(
+                    snapshot, durability, pipeline, view, cache, owned, budget, false,
+                )
+                .await
             })
             .await?;
         // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
@@ -3262,81 +3414,10 @@ impl StorageRead for SlateDBRead {
         let mut results = self
             .worker
             .call_read(move |_db| async move {
-                let mut results = Vec::with_capacity(owned.len());
-                let mut admitted = 0usize;
-                for (key, semantics, projection) in owned {
-                    let length_key = tagged_key(&key, LENGTH_TAG)?;
-                    let length_record = read_visible_snapshot_point(
-                        &snapshot, durability, &pipeline, view, &cache, length_key,
-                    )
-                    .await?;
-                    let Some(length_record) = length_record else {
-                        results.push(None);
-                        continue;
-                    };
-                    let physical_bytes = decode_value_length(&length_record)?;
-                    // Key-only projections never load the payload. Mutable
-                    // values are admitted using their MVCC length row first.
-                    if projection == CoreProjection::KeyOnly {
-                        results.push(Some(ProjectedValue::KeyOnly));
-                        continue;
-                    }
-                    if semantics != ValueSemantics::Immutable {
-                        match budget.admit_value(physical_bytes, admitted, results.is_empty()) {
-                            Ok(_) => {}
-                            Err(error) if results.is_empty() => return Err(error),
-                            Err(_) => break,
-                        }
-                    } else if physical_bytes > 1024 {
-                        return Err(StorageError::Corruption(
-                            "immutable locator exceeds metadata codec bound".into(),
-                        ));
-                    }
-                    let value = read_visible_snapshot_point(
-                        &snapshot, durability, &pipeline, view, &cache, key,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        StorageError::Corruption("SlateDB indexed payload is absent".into())
-                    })?;
-                    if value.len() != physical_bytes {
-                        return Err(StorageError::Corruption(
-                            "SlateDB indexed payload length changed".into(),
-                        ));
-                    }
-                    let value = Some(value);
-                    if let Some(value) = value {
-                        let logical_bytes = if projection == CoreProjection::KeyOnly {
-                            0
-                        } else if semantics == ValueSemantics::Immutable {
-                            // The authenticated physical locator supplies the
-                            // exact encoded range before out-of-line content I/O.
-                            decode_immutable_locator(&value)?
-                                .range
-                                .len()
-                                .checked_sub(16)
-                                .ok_or_else(|| {
-                                    StorageError::Corruption(
-                                        "immutable locator lacks value envelope".into(),
-                                    )
-                                })?
-                        } else {
-                            value.len()
-                        };
-                        match budget.admit_value(logical_bytes, admitted, results.is_empty()) {
-                            Ok(next) => admitted = next,
-                            Err(error) if results.is_empty() => return Err(error),
-                            Err(_) => break,
-                        }
-                        results.push(Some(project_value(value, projection)));
-                    } else {
-                        results.push(None);
-                    }
-                    if admitted > budget.max_result_bytes {
-                        break;
-                    }
-                }
-                Ok(results)
+                read_bounded_snapshot_points(
+                    snapshot, durability, pipeline, view, cache, owned, budget, true,
+                )
+                .await
             })
             .await?;
         // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
@@ -6206,6 +6287,343 @@ mod tests {
                 .values,
             vec![None]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_point_batches_preserve_order_duplicates_absence_and_cutoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let mutable = StorageSpace::mutable(SpaceId(94), "bounded.mutable");
+        let a = Key(Bytes::from_static(b"a"));
+        let missing = Key(Bytes::from_static(b"missing"));
+        let b = Key(Bytes::from_static(b"b"));
+        let c = Key(Bytes::from_static(b"c"));
+        let immutable_key = Key(Bytes::from_static(b"immutable"));
+        let mut write = storage.begin_write(Default::default()).await.unwrap();
+        write
+            .put_many(
+                mutable,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: a.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"aaa"),
+                            },
+                        },
+                        PutEntry {
+                            key: b.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"bbbb"),
+                            },
+                        },
+                        PutEntry {
+                            key: c.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"cccc"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        write
+            .put_many(
+                TEST_IMMUTABLE_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: immutable_key.clone(),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"iiiii"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mutable_head = [a, missing];
+        let immutable = [immutable_key];
+        let key_only = [c.clone()];
+        let mutable_tail = [b.clone(), b, c];
+        let full = GetOptions {
+            projection: CoreProjection::FullValue,
+        };
+        let key_only_opts = GetOptions {
+            projection: CoreProjection::KeyOnly,
+        };
+        let requests = [
+            GetManyRequest {
+                space: mutable,
+                keys: &mutable_head,
+                opts: full,
+            },
+            GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: &immutable,
+                opts: full,
+            },
+            GetManyRequest {
+                space: mutable,
+                keys: &key_only,
+                opts: key_only_opts,
+            },
+            GetManyRequest {
+                space: mutable,
+                keys: &mutable_tail,
+                opts: full,
+            },
+        ];
+        let expected = read.get_many(&requests).await.unwrap().values;
+        let exact = read
+            .get_many_bounded(
+                &requests,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 20,
+                    max_single_value_bytes: 5,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.values, expected);
+
+        let page_budget = lix::storage::ReadBudget {
+            max_result_bytes: 8,
+            max_single_value_bytes: 5,
+        };
+        let mut offset = 0;
+        let mut actual = Vec::new();
+        loop {
+            let page = read
+                .get_many_bounded_prefix(&requests, offset, 8, page_budget)
+                .await
+                .unwrap();
+            assert!(!page.values.is_empty(), "a nonterminal page must progress");
+            let next = offset + page.values.len();
+            assert_eq!(page.next_offset, (next < expected.len()).then_some(next));
+            actual.extend(page.values);
+            match page.next_offset {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(actual, expected);
+
+        // A singleton may exceed the aggregate page budget only when it is the
+        // first admitted slot. It still stops the page before later values.
+        let singleton_page = read
+            .get_many_bounded_prefix(
+                &requests,
+                2,
+                8,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 4,
+                    max_single_value_bytes: 5,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(singleton_page.values, vec![expected[2].clone()]);
+        assert_eq!(singleton_page.next_offset, Some(3));
+
+        assert!(matches!(
+            read.get_many_bounded(
+                &requests[3..4],
+                lix::storage::ReadBudget {
+                    max_result_bytes: 8,
+                    max_single_value_bytes: 3,
+                },
+            )
+            .await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_immutable_locator_bound_precedes_locator_point_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let counters = SlateDBIoCounters::default();
+        let storage = SlateDB::open_object_store_with_options_and_io_counters(
+            "bounded-immutable-locator-guard",
+            objects,
+            SlateDBObjectStoreOptions {
+                cache: Some(SlateDBCacheOptions {
+                    root_folder: directory.path().join("cache"),
+                    max_disk_cache_bytes: 2,
+                    block_cache_bytes: 0,
+                    metadata_cache_bytes: 0,
+                }),
+            },
+            counters.clone(),
+        )
+        .unwrap();
+        let mutable = StorageSpace::mutable(SpaceId(96), "bounded.locator.guard.mutable");
+        let prefix_key = Key(Bytes::from_static(b"prefix"));
+        let valid_immutable_key = Key(Bytes::from_static(b"valid-immutable"));
+        let key = Key(Bytes::from_static(b"oversized-locator"));
+        let mut write = storage.begin_write(Default::default()).await.unwrap();
+        write
+            .put_many(
+                mutable,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: prefix_key.clone(),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"one"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write
+            .put_many(
+                TEST_IMMUTABLE_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: valid_immutable_key.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"iiiii"),
+                            },
+                        },
+                        PutEntry {
+                            key: key.clone(),
+                            value: StoredValue {
+                                bytes: Bytes::from_static(b"valid immutable content"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        storage.flush().await.unwrap();
+
+        // Corrupt the indexed row as if an oversized physical locator reached
+        // SlateDB. A bounded key-only read primes only the indexed length row.
+        let physical = physical_key(TEST_IMMUTABLE_SPACE.id, &key).unwrap();
+        let length_key = tagged_key(&physical, LENGTH_TAG).unwrap();
+        let corrupt_value = Bytes::from(vec![0x5a; 1025]);
+        let mut batch = WriteBatch::new();
+        batch.put(&physical.0, &corrupt_value);
+        batch.put(length_key.0, encode_value_length(corrupt_value.len()));
+        storage
+            .worker
+            .call_read(move |db| async move {
+                db.write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(slatedb_error)
+            })
+            .await
+            .unwrap();
+        storage.flush().await.unwrap();
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let requests = [GetManyRequest {
+            space: TEST_IMMUTABLE_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }];
+        let key_only = [GetManyRequest {
+            space: TEST_IMMUTABLE_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions {
+                projection: CoreProjection::KeyOnly,
+            },
+        }];
+        assert_eq!(
+            read.get_many_bounded(
+                &key_only,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 4096,
+                    max_single_value_bytes: 4096,
+                },
+            )
+            .await
+            .unwrap()
+            .values,
+            vec![Some(ProjectedValue::KeyOnly)]
+        );
+        let before = counters.snapshot();
+        assert!(matches!(
+            read.get_many_bounded(
+                &requests,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 4096,
+                    max_single_value_bytes: 4096,
+                },
+            )
+            .await,
+            Err(StorageError::Corruption(message))
+                if message.contains("locator exceeds metadata codec bound")
+        ));
+        let after = counters.snapshot();
+        assert_eq!(
+            after.read_objects, before.read_objects,
+            "oversized locator rejection must happen before its physical row read"
+        );
+
+        // A malformed later locator must not invalidate an earlier bounded
+        // prefix once a valid immutable member exceeds its remaining budget.
+        let prefix_keys = [prefix_key];
+        let valid_immutable_keys = [valid_immutable_key];
+        let prefix_requests = [
+            GetManyRequest {
+                space: mutable,
+                keys: &prefix_keys,
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            },
+            GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: &valid_immutable_keys,
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            },
+            GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions {
+                    projection: CoreProjection::FullValue,
+                },
+            },
+        ];
+        let prefix = read
+            .get_many_bounded_prefix(
+                &prefix_requests,
+                0,
+                3,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 4,
+                    max_single_value_bytes: 5,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prefix.values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(b"one")))]
+        );
+        assert_eq!(prefix.next_offset, Some(1));
+        drop(read);
+        storage.flush().await.unwrap();
     }
 
     #[tokio::test]
