@@ -103,8 +103,10 @@ starts empty without changing authored rows or durable prepared attempts.
 
 Oversized operations return an explicit bound error or a supported typed native
 fallback. Lower-level bounded transfer primitives remain for writes and specialized
-history/diff paths. Captured historical diffs retain that path because private
-pending client history can be absent from the authority. Sync30 peers share this
+history/diff paths. Bounded fixed historical metadata diffs use read fulfillment
+when both endpoints prove on the leased selected-branch first-parent lane. Captured
+historical diffs retain specialized discovery because private pending client
+history can be absent from the authority. Sync31 peers share this
 wire cutover; old live peers are rejected.
 
 ## Profiling
@@ -190,7 +192,8 @@ Regressions cover one-request cold point reads with an explicit plugin registry,
 warm reads without network, unrelated content exclusion, pending local edits,
 pinned transactions across authority updates, ranged reads, multi-page blobs,
 corruption and omission rejection, continuation integrity, lease validation,
-and rejection of historical-diff recipes at this endpoint. Two GPT-5.6 Luna
+bounded fixed historical metadata diffs, and rejection of out-of-scope or
+unproved historical-diff recipes at this endpoint. Two GPT-5.6 Luna
 reviews at extra-high reasoning examined discovery and installation independently;
 their scope, owner-representation, and receipt findings were addressed.
 

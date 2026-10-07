@@ -93,7 +93,7 @@ Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected part
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are 64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 30` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. Version 30 adds sealed operation continuations, bounded within-member frames, and explicit read-operation release; version 29 added bounded metadata selection and grouped manifests. Older live peers are rejected. Stored native attempts and supported physical-format migrations retain their exact identities. Version 25 added typed canonical change payloads to descriptor-scoped exact-row read-fulfillment closures. Version 26 requires the nullable `checkpointConversationId` member in commit bodies and headers and adds graph-bound native metadata envelopes that distinguish an explicit NULL from unavailable metadata. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
+All sync routes require exactly one `lix-sync-protocol-version: 31` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. Version 31 adds client-known read operation identities, fixed lease validity, cursorless cancellation, and terminal-page retirement. Version 30 added sealed operation continuations, bounded within-member frames, and explicit read-operation release; version 29 added bounded metadata selection and grouped manifests. Older live peers are rejected. Stored native attempts and supported physical-format migrations retain their exact identities. Version 25 added typed canonical change payloads to descriptor-scoped exact-row read-fulfillment closures. Version 26 requires the nullable `checkpointConversationId` member in commit bodies and headers and adds graph-bound native metadata envelopes that distinguish an explicit NULL from unavailable metadata. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
 
 Bootstrap installs checkpoint headers alongside current branch heads and working bases. Historical checkpoint state remains deferred until an explicit history or snapshot read requests it; bootstrap does not scan every checkpoint state or fetch its binary content.
 
@@ -130,17 +130,30 @@ Partial merge receipts use the authority head at admission as the first parent, 
   Spools expire within two minutes and the lease; payload disk is capped at
   512 MiB per operation and 1 GiB per process, with a 4 MiB address index.
   Egress/replays consume a maximum of three times the operation byte/page budget.
-  `release: true` with the bound continuation idempotently finishes or cancels
-  the operation. Expired or missing process-local spools return
-  `LIX_READ_FULFILLMENT_RESTART`; multi-worker deployments need affinity or shared
-  scratch. Browser authorities have an explicit 8 MiB scratch cap.
+  The client chooses `operationId` before sending the first request and fixes
+  `operationExpiresAtMs` to the server-issued lease expiry. A continuation names
+  that same immutable operation. `release: true` without a continuation cancels
+  work by that client-known identity. When constructing the terminal page, the
+  authority atomically retires the sealed spool before returning the response;
+  successful reads require no separate cleanup acknowledgement. A bounded
+  fixed-expiry identity makes later retries return `LIX_READ_FULFILLMENT_RESTART`.
+  One-page reads retain no spool or completed marker and can be recomputed.
+  Clients allow at most three attempts: one same-ID network retry and one
+  fresh-ID restart, preserving the leased basis and fixed expiry. Expired or
+  missing process-local spools also return `LIX_READ_FULFILLMENT_RESTART`;
+  multi-worker deployments need affinity or shared scratch. Browser authorities
+  have an explicit 8 MiB scratch cap.
   Clients reserve private physical scratch before receiving pages (two operations
   per repository, 256 MiB each, and 1 GiB per process). A durable ownership ledger
   expires after five minutes; later admissions reap abandoned/old-epoch frames.
   Clients validate the complete closure before bounded admission-fenced CAS
-  promotion; no scratch page grants coverage. Abrupt cancellation uses bounded
-  expiry when a release cannot arrive. Historical diffs retain their specialized
-  discovery path.
+  promotion; no scratch page grants coverage. A validated fallback releases its
+  empty scratch owner and permit before returning its outcome, so nested
+  current-payload recovery can obtain bounded admission. Abrupt cancellation uses bounded
+  expiry when a release cannot arrive. Bounded fixed historical metadata diffs
+  whose endpoints prove on the leased selected-branch first-parent lane use this
+  read-fulfillment path. Captured diffs that can name private pending client
+  commits retain specialized discovery.
   See [Partial-read discovery](./partial-read-discovery.md) for bounds and isolation.
 - `POST /sync/native-objects`, `/sync/native-object-range`, and
   `/sync/native-metadata` fetch explicitly typed native inputs. They require `lix-native-baseline-lease`, checked against the authenticated account in the same storage snapshot as the native read. Request JSON is capped at 16 KiB; object/range payloads are capped at 1 MiB and metadata payloads at 256 KiB.
@@ -201,7 +214,7 @@ Before rolling out the lifecycle catalog to an existing host, quiesce old writer
 
 ### Transfer and durable repository identity
 
-Sync 30 requires bounded dependency selection, grouped content registration and sealed read-operation framing. Clients and authorities use the same protocol cutover; old live clients are not supported by this cutover. Normal manifests use `POST /sync/blobs`. A single non-inline manifest whose receipt inventory exceeds 1 MiB uses `POST /sync/blob`, with an explicit 2 MiB client ceiling; its content still transfers through bounded chunk pages. This lane preserves the 16,384-receipt native manifest limit. An explicit intermediary `413` may split an ordinary group. An ambiguous response does not authorize changing a prepared publication attempt.
+Sync 31 requires bounded dependency selection, grouped content registration, client-known operation identities and sealed read-operation framing. Clients and authorities use the same protocol cutover; old live clients are not supported by this cutover. Normal manifests use `POST /sync/blobs`. A single non-inline manifest whose receipt inventory exceeds 1 MiB uses `POST /sync/blob`, with an explicit 2 MiB client ceiling; its content still transfers through bounded chunk pages. This lane preserves the 16,384-receipt native manifest limit. An explicit intermediary `413` may split an ordinary group. An ambiguous response does not authorize changing a prepared publication attempt.
 
 Format 87 admits private expiring read-operation scratch, excluded from semantic snapshots and copied epoch data. Its 86→87 migration starts scratch empty and rewrites no authored rows. Transfer scheduling preserves durable publication identities:
 
