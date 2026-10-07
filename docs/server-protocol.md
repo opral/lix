@@ -140,8 +140,12 @@ Partial merge receipts use the authority head at admission as the first parent, 
   One-page reads retain no spool or completed marker and can be recomputed.
   Clients allow at most three attempts: one same-ID network retry and one
   fresh-ID restart, preserving the leased basis and fixed expiry. Expired or
-  missing process-local spools also return `LIX_READ_FULFILLMENT_RESTART`;
-  multi-worker deployments need affinity or shared scratch. Browser authorities
+  missing process-local spools also return `LIX_READ_FULFILLMENT_RESTART`. Under
+  admission or byte pressure, the authority may retire an inactive sealed spool
+  early and return that same restart response; active handlers and pending
+  discovery remain protected. A healthy client between pages can also need a
+  restart when concurrent operations exceed the bounded cache. Multi-worker
+  deployments need affinity or shared scratch. Browser authorities
   have an explicit 8 MiB scratch cap.
   Clients reserve private physical scratch before receiving pages (two operations
   per repository, 256 MiB each, and 1 GiB per process). A durable ownership ledger
