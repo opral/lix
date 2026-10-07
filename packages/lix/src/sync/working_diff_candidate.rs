@@ -72,7 +72,6 @@ where
     let request = ReadFulfillmentRequest {
         operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
-        release_completed: false,
         operation_expires_at_ms: next.baseline_lease().expires_at_ms,
         epoch_id: next.epoch_id().to_owned(),
         descriptor: next.descriptor().clone(),

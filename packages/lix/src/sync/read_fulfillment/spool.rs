@@ -2,7 +2,7 @@
 //! File lifetime follows the owned spool, including cancellation and failure.
 use super::{LixError, MAX_INPUT_BYTES, MAX_PAYLOAD_BYTES, invalid};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 static LIVE_SPOOL_BYTES: AtomicUsize = AtomicUsize::new(0);
 const MAX_LIVE_SPOOL_BYTES: usize = 1024 * 1024 * 1024;
 struct ByteReservation(usize);
@@ -316,7 +316,6 @@ struct SealedSpool {
     closure_digest: String,
     operation_expires_at_ms: u64,
     expires_at_ms: u64,
-    terminal_page_egressed: AtomicBool,
     profile: DiscoveryProfile,
     page_starts: Vec<(usize, usize)>,
 }
@@ -352,17 +351,6 @@ fn request_digest_fingerprint(request_digest: &str) -> [u8; 32] {
     *blake3::hash(request_digest.as_bytes()).as_bytes()
 }
 
-fn continuation_fingerprint(cursor: &ReadContinuation) -> [u8; 32] {
-    let mut digest = blake3::Hasher::new();
-    digest.update(&(cursor.spool_id.len() as u64).to_be_bytes());
-    digest.update(cursor.spool_id.as_bytes());
-    digest.update(&(cursor.closure_digest.len() as u64).to_be_bytes());
-    digest.update(cursor.closure_digest.as_bytes());
-    digest.update(&(cursor.next_input as u64).to_be_bytes());
-    digest.update(&(cursor.next_offset as u64).to_be_bytes());
-    *digest.finalize().as_bytes()
-}
-
 fn block_scope(registry: &mut OperationRegistry, scope: [u8; 16], expires_at_ms: u64) {
     if let Some(previous) = registry.blocked_scopes.get(&scope).copied() {
         if previous >= expires_at_ms {
@@ -385,7 +373,6 @@ fn record_completed(
     key: &OperationKey,
     request_digest: &str,
     operation_expires_at_ms: u64,
-    terminal_cursor: Option<&ReadContinuation>,
 ) {
     let scope = scope_fingerprint(&key.0, &key.1, &key.2);
     let fingerprint = operation_fingerprint(key);
@@ -394,7 +381,14 @@ fn record_completed(
         .get(&scope)
         .copied()
         .unwrap_or_default();
-    if registry.completed.len() >= MAX_COMPLETED_FINGERPRINTS
+    let has_capacity = has_retirement_capacity(
+        registry,
+        scope,
+        MAX_COMPLETED_FINGERPRINTS,
+        MAX_COMPLETED_FINGERPRINTS_PER_SCOPE,
+    )
+    .unwrap_or(false);
+    if !has_capacity
         || registry
             .completed
             .len()
@@ -410,7 +404,6 @@ fn record_completed(
         scope,
         request_digest: request_digest_fingerprint(request_digest),
         expires_at_ms: operation_expires_at_ms,
-        terminal_cursor: terminal_cursor.map(continuation_fingerprint),
     };
     if registry.completed.insert(fingerprint, retired).is_none() {
         registry
@@ -418,6 +411,51 @@ fn record_completed(
             .insert((operation_expires_at_ms, fingerprint));
         *registry.completed_scope_counts.entry(scope).or_default() += 1;
     }
+}
+
+/// Pending and sealed operations each reserve one compact retirement marker.
+/// The registry is bounded at 272 operation records, so counting the active
+/// reservations here keeps the marker ledger's admission checks bounded without
+/// scanning its 65,536-entry expiry index.
+fn completion_reservations(
+    registry: &OperationRegistry,
+    scope: Option<[u8; 16]>,
+) -> Result<usize, LixError> {
+    let mut count = 0usize;
+    for (key, operation) in &registry.operations {
+        if scope.is_some_and(|scope| scope_fingerprint(&key.0, &key.1, &key.2) != scope) {
+            continue;
+        }
+        if matches!(
+            *operation
+                .state
+                .lock()
+                .map_err(|_| invalid("read operation state poisoned"))?,
+            OperationState::Pending(_) | OperationState::Sealed(_)
+        ) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn has_retirement_capacity(
+    registry: &OperationRegistry,
+    scope: [u8; 16],
+    global_limit: usize,
+    scope_limit: usize,
+) -> Result<bool, LixError> {
+    let global_reservations = completion_reservations(registry, None)?;
+    let scoped_reservations = completion_reservations(registry, Some(scope))?;
+    let scoped_completed = registry
+        .completed_scope_counts
+        .get(&scope)
+        .copied()
+        .unwrap_or_default();
+    Ok(
+        registry.completed.len().saturating_add(global_reservations) < global_limit
+            && scoped_completed.saturating_add(scoped_reservations) < scope_limit,
+    )
 }
 
 enum OperationState {
@@ -441,19 +479,19 @@ struct CompletedFingerprint {
     scope: [u8; 16],
     request_digest: [u8; 32],
     expires_at_ms: u64,
-    terminal_cursor: Option<[u8; 32]>,
 }
 
 // The compact completed-operation ledger holds at most 65,536 entries. Each
-// entry stores a 32-byte operation fingerprint and a 96-byte value, including
-// the 16-byte scope fingerprint, 32-byte request digest, 8-byte fixed expiry,
-// and optional 32-byte terminal cursor proof. The padded value allowance keeps
-// the identity/payload ceiling at 8,388,608 bytes before map indexing overhead.
+// entry stores a 32-byte operation fingerprint and reserves an 80-byte value
+// allowance. The value contains a 16-byte scope fingerprint, 32-byte request
+// digest, and 8-byte fixed expiry; the allowance is padded before map and
+// expiry-index overhead. Each Pending or Sealed operation reserves one marker
+// before work starts, so every retired spool has a stable restart identity.
 // Entries expire at the client-captured server lease expiry; lease renewal
 // cannot extend an old operation.
 const MAX_COMPLETED_FINGERPRINTS: usize = 65_536;
 const MAX_COMPLETED_FINGERPRINTS_PER_SCOPE: usize = 4_096;
-const COMPLETED_FINGERPRINT_BYTES: usize = 32 + 96;
+const COMPLETED_FINGERPRINT_BYTES: usize = 32 + 80;
 const MAX_COMPLETED_FINGERPRINT_BYTES: usize =
     MAX_COMPLETED_FINGERPRINTS * COMPLETED_FINGERPRINT_BYTES;
 const MAX_BLOCKED_SCOPES: usize = 65_536;
@@ -543,7 +581,6 @@ fn sweep_expired(registry: &mut OperationRegistry, now_ms: u64) {
                     &key,
                     &operation.request_digest,
                     operation.operation_expires_at_ms,
-                    None,
                 );
                 operation.changed.send_replace(());
             }
@@ -737,6 +774,17 @@ where
                         "read operation registry quota exceeded",
                     ));
                 }
+                if !has_retirement_capacity(
+                    &registry,
+                    scope,
+                    MAX_COMPLETED_FINGERPRINTS,
+                    MAX_COMPLETED_FINGERPRINTS_PER_SCOPE,
+                )? {
+                    return Err(LixError::new(
+                        "LIX_NATIVE_RECIPE_WORK_BOUND",
+                        "read operation retirement identity quota exceeded",
+                    ));
+                }
                 let admission = Admission::reserve(repository, account)?;
                 let expiry = request
                     .operation_expires_at_ms
@@ -881,9 +929,6 @@ fn page(sealed: &SealedSpool, start: (usize, usize)) -> Result<ReadFulfillmentRe
     };
     if sealed.expires_at_ms <= crate::telemetry::unix_time_ms() {
         return Err(restart_error());
-    }
-    if response.continuation.is_none() {
-        sealed.terminal_page_egressed.store(true, Ordering::Release);
     }
     Ok(response)
 }
@@ -1071,7 +1116,6 @@ pub(super) fn seal_and_page(
         request_digest: request.digest()?,
         operation_expires_at_ms,
         expires_at_ms,
-        terminal_page_egressed: AtomicBool::new(false),
         profile,
     };
     let response = page(&sealed, (0, 0))?;
@@ -1138,6 +1182,9 @@ pub(super) fn seal_and_page(
         let Some(admission) = admission.take() else {
             return Err(invalid("read operation admission absent"));
         };
+        // One-page closures retain no spool after this response is built, so
+        // they release their reserved retirement slot here. Retrying a lost
+        // one-page response safely re-runs this immutable bounded read.
         *state = OperationState::Complete;
         registry.operations.remove(&key);
         pending.finished = true;
@@ -1190,7 +1237,64 @@ pub(super) fn continuation_page(
     if sealed.token != cursor.spool_id || sealed.closure_digest != cursor.closure_digest {
         return Err(invalid("read continuation admission binding differs"));
     }
-    page(&sealed, (cursor.next_input, cursor.next_offset))
+    let response = page(&sealed, (cursor.next_input, cursor.next_offset))?;
+    if response.continuation.is_none() {
+        retire_terminal_page(repository, account, lease, request, &operation, &sealed)?;
+    }
+    Ok(response)
+}
+
+/// Retire the sealed spool before returning its terminal page. Rechecking the
+/// operation and exact spool under registry -> operation lock order prevents a
+/// late page from resurrecting work after cancellation, expiry, or another
+/// duplicate terminal request.
+fn retire_terminal_page(
+    repository: &str,
+    account: &str,
+    lease: &str,
+    request: &ReadFulfillmentRequest,
+    operation: &Arc<Operation>,
+    sealed: &Arc<SealedSpool>,
+) -> Result<(), LixError> {
+    let key = operation_key(repository, account, lease, request);
+    let mut registry = operation_registry()
+        .lock()
+        .map_err(|_| invalid("read operation registry poisoned"))?;
+    let now = crate::telemetry::unix_time_ms();
+    sweep_expired(&mut registry, now);
+    if request.operation_expires_at_ms <= now
+        || !registry
+            .operations
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, operation))
+    {
+        return Err(restart_error());
+    }
+    let mut state = operation
+        .state
+        .lock()
+        .map_err(|_| invalid("read operation state poisoned"))?;
+    let OperationState::Sealed(current) = &*state else {
+        return Err(restart_error());
+    };
+    if !Arc::ptr_eq(current, sealed)
+        || current.expires_at_ms <= now
+        || current.operation_expires_at_ms != request.operation_expires_at_ms
+        || current.request_digest != request.digest()?
+    {
+        return Err(restart_error());
+    }
+    *state = OperationState::Complete;
+    registry.operations.remove(&key);
+    drop(state);
+    record_completed(
+        &mut registry,
+        &key,
+        &operation.request_digest,
+        operation.operation_expires_at_ms,
+    );
+    operation.changed.send_replace(());
+    Ok(())
 }
 
 pub(super) fn release(
@@ -1212,9 +1316,6 @@ pub(super) fn release(
             "operation expiry exceeds authenticated lease expiry",
         ));
     }
-    if request.release_completed != request.continuation.is_some() {
-        return Err(invalid("release disposition and continuation disagree"));
-    }
     let key = operation_key(repository, account, lease, request);
     let scope = scope_fingerprint(repository, account, lease);
     let fingerprint = operation_fingerprint(&key);
@@ -1230,61 +1331,8 @@ pub(super) fn release(
         {
             return Err(invalid("completed operation identity binding differs"));
         }
-        if request.release_completed
-            && request.continuation.as_ref().is_some_and(|cursor| {
-                retired.terminal_cursor == Some(continuation_fingerprint(cursor))
-            })
-        {
-            return Ok(());
-        }
         return Err(restart_error());
     }
-    if request.release_completed {
-        let operation = registry
-            .operations
-            .get(&key)
-            .cloned()
-            .ok_or_else(restart_error)?;
-        if operation.request_digest != request_digest
-            || operation.epoch != request.epoch_id
-            || operation.operation_expires_at_ms != request.operation_expires_at_ms
-        {
-            return Err(invalid("completed release binding differs"));
-        }
-        let mut state = operation
-            .state
-            .lock()
-            .map_err(|_| invalid("read operation state poisoned"))?;
-        let OperationState::Sealed(sealed) = &*state else {
-            return Err(restart_error());
-        };
-        let cursor = request
-            .continuation
-            .as_ref()
-            .ok_or_else(|| invalid("completed release cursor absent"))?;
-        if sealed.expires_at_ms <= now
-            || sealed.token != cursor.spool_id
-            || sealed.closure_digest != cursor.closure_digest
-            || sealed.page_starts.last() != Some(&(cursor.next_input, cursor.next_offset))
-            || !sealed.terminal_page_egressed.load(Ordering::Acquire)
-        {
-            return Err(invalid(
-                "completed release does not acknowledge the terminal page",
-            ));
-        }
-        *state = OperationState::Complete;
-        registry.operations.remove(&key);
-        record_completed(
-            &mut registry,
-            &key,
-            &request_digest,
-            request.operation_expires_at_ms,
-            Some(cursor),
-        );
-        operation.changed.send_replace(());
-        return Ok(());
-    }
-
     if let Some(operation) = registry.operations.get(&key).cloned() {
         if operation.request_digest != request_digest
             || operation.epoch != request.epoch_id
@@ -1398,7 +1446,6 @@ mod tests {
         let mut request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: u64::MAX,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor,
@@ -1481,7 +1528,6 @@ mod tests {
             let mut cancellation = request.clone();
             cancellation.operation_id = uuid::Uuid::now_v7().to_string();
             cancellation.release = true;
-            cancellation.release_completed = false;
             cancellation.continuation = None;
             release(&repository, &account, &lease, u64::MAX, &cancellation).unwrap();
         }
@@ -1505,22 +1551,6 @@ mod tests {
                 .unwrap()
                 .code,
             "LIX_NATIVE_RECIPE_WORK_BOUND"
-        );
-        let first_cursor = initial.continuation.as_ref().unwrap();
-        let mut premature_release = request.clone();
-        premature_release.release = true;
-        premature_release.release_completed = true;
-        premature_release.continuation = Some(ReadContinuation {
-            next_input: 124,
-            next_offset: 0,
-            spool_id: first_cursor.spool_id.clone(),
-            closure_digest: first_cursor.closure_digest.clone(),
-        });
-        assert_eq!(
-            release(&repository, &account, &lease, u64::MAX, &premature_release,)
-                .unwrap_err()
-                .code,
-            "LIX_READ_FULFILLMENT_INVALID"
         );
         let replay = match begin(&repository, &account, &lease, u64::MAX, &request)
             .await
@@ -1575,14 +1605,24 @@ mod tests {
             let Some(cursor) = next else {
                 break;
             };
+            let terminal_page = cursor.next_input == 124;
             request.continuation = Some(cursor);
-            let replay = continuation_page(&repository, &account, &lease, &request).unwrap();
             page = continuation_page(&repository, &account, &lease, &request).unwrap();
-            assert_eq!(
-                serde_json::to_vec(&replay).unwrap(),
-                serde_json::to_vec(&page).unwrap()
-            );
-            drop(replay);
+            if terminal_page {
+                assert_eq!(
+                    continuation_page(&repository, &account, &lease, &request)
+                        .unwrap_err()
+                        .code,
+                    "LIX_READ_FULFILLMENT_RESTART"
+                );
+            } else {
+                let replay = continuation_page(&repository, &account, &lease, &request).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&replay).unwrap(),
+                    serde_json::to_vec(&page).unwrap()
+                );
+                drop(replay);
+            }
             assert!(continuation_page(&repository, "other-account", &lease, &request).is_err());
             assert!(continuation_page(&repository, &account, "other-lease", &request).is_err());
             assert!(continuation_page("other-repository", &account, &lease, &request).is_err());
@@ -1590,18 +1630,11 @@ mod tests {
         assert_eq!(pages, 32);
         assert_eq!(members, 128);
         assert_eq!(digest.finalize().to_hex().to_string(), closure_digest);
-        let mut release_request = request.clone();
-        release_request.release = true;
-        release_request.release_completed = true;
-        release(&repository, &account, &lease, u64::MAX, &release_request).unwrap();
-        // A completed-release acknowledgement may be safely retried after a
-        // lost response, but only with the same terminal page proof.
-        release(&repository, &account, &lease, u64::MAX, &release_request).unwrap();
-        let mut mismatched_release = release_request.clone();
-        mismatched_release.continuation.as_mut().unwrap().next_input += 1;
         assert_eq!(
-            release(&repository, &account, &lease, u64::MAX, &mismatched_release)
-                .unwrap_err()
+            begin(&repository, &account, &lease, u64::MAX, &request)
+                .await
+                .err()
+                .unwrap()
                 .code,
             "LIX_READ_FULFILLMENT_RESTART"
         );
@@ -1625,11 +1658,11 @@ mod tests {
         let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
         let started = Instant::now();
 
+        clear_test_scope(&repository, &account, &lease);
         for _ in 0..COMPLETIONS {
-            let mut request = ReadFulfillmentRequest {
+            let request = ReadFulfillmentRequest {
                 operation_id: uuid::Uuid::now_v7().to_string(),
                 release: false,
-                release_completed: false,
                 operation_expires_at_ms,
                 epoch_id: uuid::Uuid::now_v7().to_string(),
                 descriptor: descriptor.clone(),
@@ -1642,18 +1675,12 @@ mod tests {
             let closure_digest = blake3::hash(b"registry retirement closure")
                 .to_hex()
                 .to_string();
-            let cursor = ReadContinuation {
-                next_input: 1,
-                next_offset: 0,
-                spool_id: token.clone(),
-                closure_digest: closure_digest.clone(),
-            };
             let key = operation_key(&repository, &account, &lease, &request);
             let (changed, _) = watch::channel(());
-            let sealed = SealedSpool {
+            let sealed = Arc::new(SealedSpool {
                 spool: InputSpool::new(Arc::new(Mutex::new(PayloadSpool::default()))),
                 _admission: Some(Admission::reserve(&repository, &account).unwrap()),
-                egress_pages: AtomicUsize::new(2),
+                egress_pages: AtomicUsize::new(1),
                 egress_bytes: AtomicUsize::new(0),
                 token,
                 repository: repository.clone(),
@@ -1664,16 +1691,15 @@ mod tests {
                 closure_digest,
                 operation_expires_at_ms,
                 expires_at_ms: operation_expires_at_ms,
-                terminal_page_egressed: AtomicBool::new(true),
                 profile: DiscoveryProfile::default(),
                 page_starts: vec![(0, 0), (1, 0)],
-            };
+            });
             let operation = Arc::new(Operation {
                 request_digest,
                 epoch: request.epoch_id.clone(),
                 operation_expires_at_ms,
                 expires_at_ms: AtomicU64::new(operation_expires_at_ms),
-                state: Mutex::new(OperationState::Sealed(Arc::new(sealed))),
+                state: Mutex::new(OperationState::Sealed(sealed.clone())),
                 changed,
             });
             {
@@ -1681,27 +1707,32 @@ mod tests {
                 assert!(registry.operations.insert(key, operation).is_none());
             }
 
-            request.release = true;
-            request.release_completed = true;
-            request.continuation = Some(cursor);
-            release(
-                &repository,
-                &account,
-                &lease,
-                operation_expires_at_ms,
-                &request,
-            )
-            .unwrap();
-            // Simulate a lost acknowledgement: the same terminal proof must
-            // remain idempotent and must not consume cancellation capacity.
-            release(
-                &repository,
-                &account,
-                &lease,
-                operation_expires_at_ms,
-                &request,
-            )
-            .unwrap();
+            let key = operation_key(&repository, &account, &lease, &request);
+            let operation = operation_registry()
+                .lock()
+                .unwrap()
+                .operations
+                .get(&key)
+                .cloned()
+                .unwrap();
+            retire_terminal_page(&repository, &account, &lease, &request, &operation, &sealed)
+                .unwrap();
+            assert_eq!(
+                begin(
+                    &repository,
+                    &account,
+                    &lease,
+                    operation_expires_at_ms,
+                    &request,
+                )
+                .await
+                .err()
+                .unwrap()
+                .code,
+                "LIX_READ_FULFILLMENT_RESTART"
+            );
+            drop(operation);
+            drop(sealed);
         }
 
         let scope = scope_fingerprint(&repository, &account, &lease);
@@ -1716,11 +1747,10 @@ mod tests {
 
         // Completed operations are not counted against the cursorless
         // cancellation budget; a new paginated read in the same scope remains
-        // admissible after more than 64 completions.
+        // admissible after more than 64 automatic retirements.
         let fresh = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor,
@@ -1764,7 +1794,6 @@ mod tests {
         let new_request = || ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: lease_expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: descriptor.clone(),
@@ -1877,7 +1906,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: lease_expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: descriptor.clone(),
@@ -1968,7 +1996,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor,

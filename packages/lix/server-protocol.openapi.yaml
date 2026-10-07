@@ -1654,11 +1654,10 @@ components:
     ReadFulfillmentRequest:
       type: object
       additionalProperties: false
-      required: [operationId, release, releaseCompleted, operationExpiresAtMs, epochId, descriptor, interests, required, continuation]
+      required: [operationId, release, operationExpiresAtMs, epochId, descriptor, interests, required, continuation]
       properties:
         operationId: { type: string, format: uuid, description: Client-generated stable identity for one immutable read attempt and its retries. }
-        release: { type: boolean, description: Retire or cancel this operation. A completed release requires releaseCompleted=true and the final acknowledged continuation cursor; cancellation requires releaseCompleted=false and a null continuation. Neither disposition grants coverage. }
-        releaseCompleted: { type: boolean, description: Acknowledge that every page was received and validated; requires release=true and the terminal continuation cursor. }
+        release: { type: boolean, description: Cancel this operation with a null continuation cursor. Successful operations retire when their terminal response is constructed; neither disposition grants coverage. }
         operationExpiresAtMs: { type: integer, format: int64, minimum: 1, description: Fixed server-issued lease expiry captured when this operation is created. Retries and renewals cannot extend it. }
         epochId: { type: string, format: uuid }
         descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }

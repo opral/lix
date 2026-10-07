@@ -21,7 +21,6 @@ pub(super) async fn fixture() -> (
     let request = ReadFulfillmentRequest {
         operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
-        release_completed: false,
         operation_expires_at_ms: state.baseline_lease().expires_at_ms,
         epoch_id: state.epoch_id().into(),
         descriptor,
@@ -419,8 +418,7 @@ struct LifecycleReadClient {
     malformed_first_once: Arc<AtomicBool>,
     active_spools: Arc<AtomicUsize>,
     peak_spools: Arc<AtomicUsize>,
-    completed_releases: Arc<AtomicUsize>,
-    cancelled_releases: Arc<AtomicUsize>,
+    release_requests: Arc<AtomicUsize>,
 }
 
 impl LifecycleReadClient {
@@ -491,16 +489,12 @@ impl crate::sync::http::RawHttpClient for LifecycleReadClient {
             let request: ReadFulfillmentRequest =
                 serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
             if request.release {
-                if request.release_completed {
-                    assert!(request.continuation.is_some());
-                    client.completed_releases.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    client.cancelled_releases.fetch_add(1, Ordering::SeqCst);
-                }
+                client.release_requests.fetch_add(1, Ordering::SeqCst);
                 client.retire_spool();
                 return Ok(client.response(&request, Vec::new(), None));
             }
             if request.continuation.is_some() {
+                client.retire_spool();
                 return Ok(client.response(&request, vec![client.inputs[1].clone()], None));
             }
             if client.malformed_first_once.swap(false, Ordering::SeqCst) {
@@ -544,8 +538,7 @@ fn lifecycle_client(
         malformed_first_once: Arc::new(AtomicBool::new(malformed_first_once)),
         active_spools: Arc::new(AtomicUsize::new(0)),
         peak_spools: Arc::new(AtomicUsize::new(0)),
-        completed_releases: Arc::new(AtomicUsize::new(0)),
-        cancelled_releases: Arc::new(AtomicUsize::new(0)),
+        release_requests: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -564,6 +557,197 @@ async fn lifecycle_transport(
         crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
     transport.bind_native_baseline_lease(&lease.lease).unwrap();
     transport
+}
+
+#[derive(Clone, Copy)]
+enum TerminalLossMode {
+    SinglePage,
+    PaginatedTerminalPage,
+}
+
+struct TerminalLossState {
+    mode: TerminalLossMode,
+    network_loss_injected: AtomicBool,
+    completed_operation_ids: Mutex<BTreeSet<String>>,
+    requests: Mutex<Vec<(String, bool, bool)>>,
+    release_requests: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct TerminalLossReadClient {
+    lix_id: String,
+    account: String,
+    inputs: Vec<ReadInput>,
+    state: Arc<TerminalLossState>,
+}
+
+impl TerminalLossReadClient {
+    fn response(
+        &self,
+        request: &ReadFulfillmentRequest,
+        inputs: Vec<ReadInput>,
+        continuation: Option<ReadContinuation>,
+    ) -> crate::sync::http::RawHttpResponse {
+        let closure_inputs = if request.release {
+            &[][..]
+        } else {
+            &self.inputs
+        };
+        let response = ReadFulfillmentResponse {
+            frame: None,
+            lix_id: self.lix_id.clone(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest().unwrap(),
+            inputs,
+            profile: Default::default(),
+            closure_digest: input_digest(request, closure_inputs).unwrap(),
+            continuation,
+            outcome: ReadFulfillmentOutcome::Complete,
+        };
+        crate::sync::http::RawHttpResponse {
+            status: 200,
+            status_text: "terminal-loss test fixture".into(),
+            body: serde_json::to_vec(&response).unwrap(),
+        }
+    }
+
+    fn restart() -> crate::sync::http::RawHttpResponse {
+        crate::sync::http::RawHttpResponse {
+			status: 410,
+			status_text: "retired operation".into(),
+			body: serde_json::to_vec(&serde_json::json!({
+				"error": {"code":"LIX_READ_FULFILLMENT_RESTART", "message":"operation already retired"}
+			})).unwrap(),
+		}
+    }
+}
+
+impl crate::sync::http::RawHttpClient for TerminalLossReadClient {
+    fn send(
+        &self,
+        raw: crate::sync::http::RawHttpRequest,
+    ) -> crate::sync::SyncTransportFuture<'_, crate::sync::http::RawHttpResponse> {
+        let client = self.clone();
+        Box::pin(async move {
+            if raw.method == http::Method::GET {
+                return Ok(crate::sync::http::RawHttpResponse {
+                    status: 200,
+                    status_text: "terminal-loss test handshake".into(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": client.lix_id,
+                        "sessionId": "terminal-loss-test-session",
+                        "activeAccountId": client.account,
+                    }))
+                    .unwrap(),
+                });
+            }
+            let request: ReadFulfillmentRequest =
+                serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
+            client.state.requests.lock().unwrap().push((
+                request.operation_id.clone(),
+                request.continuation.is_some(),
+                request.release,
+            ));
+            if request.release {
+                client.state.release_requests.fetch_add(1, Ordering::SeqCst);
+                return Ok(client.response(&request, Vec::new(), None));
+            }
+            if client
+                .state
+                .completed_operation_ids
+                .lock()
+                .unwrap()
+                .contains(&request.operation_id)
+            {
+                return Ok(Self::restart());
+            }
+            match client.state.mode {
+                TerminalLossMode::SinglePage => {
+                    if !client
+                        .state
+                        .network_loss_injected
+                        .swap(true, Ordering::SeqCst)
+                    {
+                        // A one-page closure retains no server resource. Once the
+                        // response is lost, retrying the same ID may re-run it.
+                        return Err(LixError::new(
+                            "LIX_TRANSPORT_NETWORK",
+                            "injected lost one-page response",
+                        ));
+                    }
+                    Ok(client.response(&request, client.inputs.clone(), None))
+                }
+                TerminalLossMode::PaginatedTerminalPage => {
+                    if request.continuation.is_none() {
+                        let closure_digest = input_digest(&request, &client.inputs).unwrap();
+                        return Ok(client.response(
+                            &request,
+                            vec![client.inputs[0].clone()],
+                            Some(ReadContinuation {
+                                next_input: 1,
+                                next_offset: 0,
+                                spool_id: uuid::Uuid::now_v7().to_string(),
+                                closure_digest,
+                            }),
+                        ));
+                    }
+                    if !client
+                        .state
+                        .network_loss_injected
+                        .swap(true, Ordering::SeqCst)
+                    {
+                        client
+                            .state
+                            .completed_operation_ids
+                            .lock()
+                            .unwrap()
+                            .insert(request.operation_id.clone());
+                        return Err(LixError::new(
+                            "LIX_TRANSPORT_NETWORK",
+                            "injected lost terminal page response",
+                        ));
+                    }
+                    Ok(client.response(&request, vec![client.inputs[1].clone()], None))
+                }
+            }
+        })
+    }
+}
+
+async fn terminal_loss_transport(
+    request: &ReadFulfillmentRequest,
+    inputs: Vec<ReadInput>,
+    mode: TerminalLossMode,
+) -> (
+    crate::sync::http::HttpSyncTransport<TerminalLossReadClient>,
+    Arc<TerminalLossState>,
+) {
+    let account = crate::SYSTEM_ACCOUNT_ID.to_owned();
+    let state = Arc::new(TerminalLossState {
+        mode,
+        network_loss_injected: AtomicBool::new(false),
+        completed_operation_ids: Mutex::new(BTreeSet::new()),
+        requests: Mutex::new(Vec::new()),
+        release_requests: AtomicUsize::new(0),
+    });
+    let client = TerminalLossReadClient {
+        lix_id: request.descriptor.lix_id.clone(),
+        account: account.clone(),
+        inputs,
+        state: state.clone(),
+    };
+    let transport = crate::sync::http::HttpSyncTransport::connect_with(
+        client,
+        &format!("https://example.test/lix/{}", request.descriptor.lix_id),
+    )
+    .await
+    .unwrap();
+    let lease =
+        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
+    transport.bind_native_baseline_lease(&lease.lease).unwrap();
+    (transport, state)
 }
 
 fn lifecycle_request(
@@ -585,7 +769,7 @@ async fn successful_paginated_operations_complete_more_than_64_times() {
     inputs.sort_by_key(|input| input.address.coordinate().unwrap());
     let request = lifecycle_request(request, &inputs);
     let client = lifecycle_client(&request, inputs, true, false);
-    let completed_releases = client.completed_releases.clone();
+    let release_requests = client.release_requests.clone();
     let peak_spools = client.peak_spools.clone();
     let transport = lifecycle_transport(&request, client).await;
     let started = std::time::Instant::now();
@@ -598,17 +782,95 @@ async fn successful_paginated_operations_complete_more_than_64_times() {
         stage.promote(&operation_request, false).await.unwrap();
     }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!(completed_releases.load(Ordering::SeqCst), 65);
+    assert_eq!(release_requests.load(Ordering::SeqCst), 0);
     assert_eq!(peak_spools.load(Ordering::SeqCst), 1);
     println!(
         "READ_OPERATION_RETIREMENT_PROFILE_JSON={}",
         serde_json::json!({
             "completedPaginatedOperations": 65,
-            "completedReleases": completed_releases.load(Ordering::SeqCst),
+            "terminalReleaseRequests": release_requests.load(Ordering::SeqCst),
             "peakActiveSpools": peak_spools.load(Ordering::SeqCst),
             "elapsedMs": elapsed_ms,
         })
     );
+}
+
+#[tokio::test]
+async fn lost_terminal_response_retries_once_then_restarts_with_a_fresh_id() {
+    for mode in [
+        TerminalLossMode::SinglePage,
+        TerminalLossMode::PaginatedTerminalPage,
+    ] {
+        let (storage, state, request) = fixture().await;
+        let mut inputs = match mode {
+            TerminalLossMode::SinglePage => vec![chunk(210, 1024)],
+            TerminalLossMode::PaginatedTerminalPage => {
+                vec![chunk(211, 1024), chunk(212, 1024)]
+            }
+        };
+        inputs.sort_by_key(|input| input.address.coordinate().unwrap());
+        let request = lifecycle_request(request, &inputs);
+        let expected_digest = input_digest(&request, &inputs).unwrap();
+        let (transport, fault_state) =
+            terminal_loss_transport(&request, inputs.clone(), mode).await;
+
+        let mut stage = fetch_staged(&storage, &state, &transport, &request)
+            .await
+            .unwrap();
+        assert_eq!(stage.header.closure_digest, expected_digest);
+        let promoted = stage.promote(&request, false).await.unwrap();
+        assert!(
+            inputs
+                .iter()
+                .all(|input| { promoted.keys.contains(&input.address.coordinate().unwrap()) }),
+            "every member of the complete validated closure is promoted"
+        );
+        let observed_requests = fault_state.requests.lock().unwrap().clone();
+        assert_eq!(
+            fault_state.release_requests.load(Ordering::SeqCst),
+            usize::from(matches!(mode, TerminalLossMode::PaginatedTerminalPage))
+        );
+        match mode {
+            TerminalLossMode::SinglePage => {
+                assert_eq!(
+                    observed_requests,
+                    vec![
+                        (request.operation_id.clone(), false, false),
+                        (request.operation_id.clone(), false, false),
+                    ],
+                    "a resource-free one-page operation can recompute under the same ID"
+                );
+            }
+            TerminalLossMode::PaginatedTerminalPage => {
+                assert_eq!(observed_requests.len(), 6);
+                assert_eq!(
+                    observed_requests[0],
+                    (request.operation_id.clone(), false, false)
+                );
+                assert_eq!(
+                    observed_requests[1],
+                    (request.operation_id.clone(), true, false)
+                );
+                assert_eq!(
+                    observed_requests[2],
+                    (request.operation_id.clone(), false, false)
+                );
+                assert_eq!(
+                    observed_requests[3],
+                    (request.operation_id.clone(), false, true)
+                );
+                let restarted_id = observed_requests[4].0.clone();
+                assert_ne!(restarted_id, request.operation_id);
+                assert_eq!(observed_requests[4], (restarted_id.clone(), false, false));
+                assert_eq!(observed_requests[5], (restarted_id, true, false));
+                assert_eq!(
+                    fault_state.completed_operation_ids.lock().unwrap().len(),
+                    1,
+                    "the lost terminal response retires only the original operation"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -619,7 +881,7 @@ async fn malformed_first_response_releases_possible_remote_operation() {
     let request = lifecycle_request(request, &inputs);
     let client = lifecycle_client(&request, inputs, false, true);
     let active_spools = client.active_spools.clone();
-    let cancelled_releases = client.cancelled_releases.clone();
+    let release_requests = client.release_requests.clone();
     let transport = lifecycle_transport(&request, client).await;
 
     let error = fetch_staged(&storage, &state, &transport, &request)
@@ -628,7 +890,7 @@ async fn malformed_first_response_releases_possible_remote_operation() {
         .unwrap();
     assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
     assert_eq!(active_spools.load(Ordering::SeqCst), 0);
-    assert_eq!(cancelled_releases.load(Ordering::SeqCst), 1);
+    assert_eq!(release_requests.load(Ordering::SeqCst), 1);
 
     let mut healthy_request = request.clone();
     healthy_request.operation_id = uuid::Uuid::now_v7().to_string();

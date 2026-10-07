@@ -9,7 +9,6 @@ async fn fixture() -> (ReadFulfillmentRequest, ReadFulfillmentResponse) {
     let request = ReadFulfillmentRequest {
         operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
-        release_completed: false,
         operation_expires_at_ms: crate::telemetry::unix_time_ms() + 60_000,
         epoch_id: uuid::Uuid::now_v7().to_string(),
         descriptor,
@@ -54,7 +53,6 @@ fn working_diff_request(state: &PartialReplicaState) -> ReadFulfillmentRequest {
     ReadFulfillmentRequest {
         operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
-        release_completed: false,
         operation_expires_at_ms: state.baseline_lease().expires_at_ms,
         epoch_id: state.epoch_id().to_owned(),
         descriptor: state.descriptor().clone(),

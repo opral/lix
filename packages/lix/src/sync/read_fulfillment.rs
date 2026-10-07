@@ -460,11 +460,8 @@ pub(super) fn partial_demand_fulfillment_plan(
             matches!(interest, LogicalReadInterest::History { .. })
                 && !history_shape_is_supported(interest)
         })
-        || super::working_diff_recipe::validate_bounded_diff_recipes(
-            interests,
-            selected_branch_id,
-        )
-        .is_err();
+        || super::working_diff_recipe::validate_bounded_diff_recipes(interests, selected_branch_id)
+            .is_err();
     if !historical_scope_is_unsupported {
         return Some(PartialDemandFulfillmentPlan {
             interests: interests.to_vec(),
@@ -520,10 +517,6 @@ pub(crate) struct ReadFulfillmentRequest {
     /// up even when the first response never arrives.
     pub(crate) operation_id: String,
     pub(crate) release: bool,
-    /// True only after every page was received and validated. The cursor then
-    /// identifies the final acknowledged page so the authority can retire a
-    /// sealed spool without recording a cancellation tombstone.
-    pub(crate) release_completed: bool,
     /// Fixed operation validity copied from the server-issued lease at request
     /// creation. Lease renewal must not extend a delayed operation or its
     /// cancellation/retirement identity.
@@ -835,8 +828,7 @@ impl ReadFulfillmentRequest {
         if uuid::Uuid::parse_str(&self.operation_id).is_err()
             || uuid::Uuid::parse_str(&self.epoch_id).is_err()
             || self.operation_expires_at_ms == 0
-            || (self.release_completed && (!self.release || self.continuation.is_none()))
-            || (self.release && !self.release_completed && self.continuation.is_some())
+            || (self.release && self.continuation.is_some())
             || self.required.is_empty()
             || self.required.len() > 32
             || self.interests.is_empty()
@@ -967,7 +959,6 @@ impl ReadFulfillmentRequest {
         let mut basis = self.clone();
         basis.continuation = None;
         basis.release = false;
-        basis.release_completed = false;
         basis.operation_expires_at_ms = 0;
         // The operation id identifies an attempt, not the immutable recipe.
         // Keeping it out of this digest preserves semantic refusal memoization
@@ -1728,13 +1719,7 @@ async fn discover_bounded_with_read(
         &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
     )?;
     if request.release {
-        spool::release(
-            repository,
-            account,
-            lease_id,
-            lease.expires_at_ms,
-            request,
-        )?;
+        spool::release(repository, account, lease_id, lease.expires_at_ms, request)?;
         return Ok(ReadFulfillmentResponse {
             lix_id: repository.into(),
             epoch_id: request.epoch_id.clone(),
@@ -1750,18 +1735,11 @@ async fn discover_bounded_with_read(
     if request.continuation.is_some() {
         return spool::continuation_page(repository, account, lease_id, request);
     }
-    let mut operation = match spool::begin(
-        repository,
-        account,
-        lease_id,
-        lease.expires_at_ms,
-        request,
-    )
-    .await?
-    {
-        spool::BeginOperation::Owner(operation) => operation,
-        spool::BeginOperation::Replay(response) => return Ok(response),
-    };
+    let mut operation =
+        match spool::begin(repository, account, lease_id, lease.expires_at_ms, request).await? {
+            spool::BeginOperation::Owner(operation) => operation,
+            spool::BeginOperation::Replay(response) => return Ok(response),
+        };
     let read = DependencyRead {
         base: base.clone(),
         observations: observations.clone(),
@@ -2044,14 +2022,16 @@ pub(crate) fn validate_response(
         ));
     }
     if request.release {
-        if request.release_completed != request.continuation.is_some()
+        if request.continuation.is_some()
             || !response.inputs.is_empty()
             || response.frame.is_some()
             || response.continuation.is_some()
             || response.outcome != ReadFulfillmentOutcome::Complete
             || response.closure_digest != input_digest(request, &[])?
         {
-            return Err(invalid("invalid read operation release acknowledgement"));
+            return Err(invalid(
+                "invalid read operation cancellation acknowledgement",
+            ));
         }
         return Ok(());
     }
@@ -3837,7 +3817,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: crate::telemetry::unix_time_ms() + 60_000,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -5899,7 +5878,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
@@ -6080,7 +6058,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
@@ -6142,7 +6119,6 @@ mod tests {
         let mut request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
@@ -6256,7 +6232,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
@@ -6665,7 +6640,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
@@ -6828,7 +6802,6 @@ mod tests {
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
-            release_completed: false,
             operation_expires_at_ms: state.baseline_lease().expires_at_ms,
             epoch_id: state.epoch_id().to_owned(),
             descriptor: state.descriptor().clone(),
