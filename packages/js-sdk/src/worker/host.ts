@@ -71,7 +71,7 @@ export function startWorkerHost(
 			reject(error: unknown): void;
 		}
 	>();
-	const syncStreamCleanup = new Map<number, () => void>();
+	const syncStreamCleanup = new Map<number, (failure?: unknown) => void>();
 	let finiteQueue = Promise.resolve();
 	const registrations = new Set<Promise<void>>();
 	const observationClosures = new Set<Promise<void>>();
@@ -504,7 +504,7 @@ export function startWorkerHost(
         pendingSyncHeaders.clear();
         for (const pending of pendingSyncFetch.values()) pending.reject(failure);
         pendingSyncFetch.clear();
-        for (const cleanup of syncStreamCleanup.values()) cleanup();
+        for (const cleanup of syncStreamCleanup.values()) cleanup(failure);
         syncStreamCleanup.clear();
         for (const pending of pendingSyncStreamPulls.values()) { pending.controller.error(failure); pending.reject(failure); }
         pendingSyncStreamPulls.clear();
@@ -642,9 +642,10 @@ export function startWorkerHost(
 						headers: resolved.headers,
 					});
 				}
-				syncStreamCleanup.set(requestId, () =>
-					signal?.removeEventListener("abort", abort),
-				);
+				syncStreamCleanup.set(requestId, (failure) => {
+					signal?.removeEventListener("abort", abort);
+					if (failure !== undefined) responseController?.error(failure);
+				});
 				const body = new ReadableStream<Uint8Array>({
 					start: (controller) => { responseController = controller; },
 					pull: (controller) =>
