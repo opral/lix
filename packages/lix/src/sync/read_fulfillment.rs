@@ -515,7 +515,19 @@ pub(super) fn interests_for_error(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadFulfillmentRequest {
+    /// Client-known idempotency key for this logical read operation. This is
+    /// separate from the server's sealed-spool cursor so the client can clean
+    /// up even when the first response never arrives.
+    pub(crate) operation_id: String,
     pub(crate) release: bool,
+    /// True only after every page was received and validated. The cursor then
+    /// identifies the final acknowledged page so the authority can retire a
+    /// sealed spool without recording a cancellation tombstone.
+    pub(crate) release_completed: bool,
+    /// Fixed operation validity copied from the server-issued lease at request
+    /// creation. Lease renewal must not extend a delayed operation or its
+    /// cancellation/retirement identity.
+    pub(crate) operation_expires_at_ms: u64,
     pub(crate) epoch_id: String,
     pub(crate) descriptor: super::PartialReplicaDescriptor,
     pub(crate) interests: Vec<LogicalReadInterest>,
@@ -724,6 +736,7 @@ pub(crate) fn current_payload_request_after_native_fallback(
     }
     current.required = vec![ReadInputAddress::Metadata(locator.clone())];
     current.continuation = None;
+    current.operation_id = uuid::Uuid::now_v7().to_string();
     Some(current)
 }
 
@@ -819,7 +832,11 @@ impl ReadFulfillmentRequest {
     pub(crate) fn validate(&self, repository: &str) -> Result<(), LixError> {
         self.descriptor
             .validate(repository, Some(&self.descriptor.selected_branch.branch_id))?;
-        if uuid::Uuid::parse_str(&self.epoch_id).is_err()
+        if uuid::Uuid::parse_str(&self.operation_id).is_err()
+            || uuid::Uuid::parse_str(&self.epoch_id).is_err()
+            || self.operation_expires_at_ms == 0
+            || (self.release_completed && (!self.release || self.continuation.is_none()))
+            || (self.release && !self.release_completed && self.continuation.is_some())
             || self.required.is_empty()
             || self.required.len() > 32
             || self.interests.is_empty()
@@ -950,6 +967,12 @@ impl ReadFulfillmentRequest {
         let mut basis = self.clone();
         basis.continuation = None;
         basis.release = false;
+        basis.release_completed = false;
+        basis.operation_expires_at_ms = 0;
+        // The operation id identifies an attempt, not the immutable recipe.
+        // Keeping it out of this digest preserves semantic refusal memoization
+        // and lets a bounded restart use a fresh operation id.
+        basis.operation_id.clear();
         Ok(
             blake3::hash(&serde_json::to_vec(&basis).map_err(|_| invalid("invalid request"))?)
                 .to_hex()
@@ -1688,12 +1711,30 @@ async fn discover_bounded_with_read(
         crate::telemetry::unix_time_ms(),
     )
     .await?;
+    let now_ms = crate::telemetry::unix_time_ms();
+    if request.operation_expires_at_ms <= now_ms {
+        return Err(LixError::new(
+            "LIX_READ_FULFILLMENT_RESTART",
+            "read operation validity expired",
+        ));
+    }
+    if request.operation_expires_at_ms > lease.expires_at_ms {
+        return Err(invalid(
+            "read operation expiry exceeds authenticated lease expiry",
+        ));
+    }
     lease.validate_for_roots(
         account,
         &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
     )?;
     if request.release {
-        spool::release(repository, account, lease_id, request)?;
+        spool::release(
+            repository,
+            account,
+            lease_id,
+            lease.expires_at_ms,
+            request,
+        )?;
         return Ok(ReadFulfillmentResponse {
             lix_id: repository.into(),
             epoch_id: request.epoch_id.clone(),
@@ -1709,10 +1750,20 @@ async fn discover_bounded_with_read(
     if request.continuation.is_some() {
         return spool::continuation_page(repository, account, lease_id, request);
     }
-    let admission = spool::Admission::reserve(repository, account)?;
-    let lease_expires_at_ms = lease.expires_at_ms;
+    let mut operation = match spool::begin(
+        repository,
+        account,
+        lease_id,
+        lease.expires_at_ms,
+        request,
+    )
+    .await?
+    {
+        spool::BeginOperation::Owner(operation) => operation,
+        spool::BeginOperation::Replay(response) => return Ok(response),
+    };
     let read = DependencyRead {
-        base,
+        base: base.clone(),
         observations: observations.clone(),
     };
     let blobs = Arc::new(BlobReadCapture::default());
@@ -1937,15 +1988,26 @@ async fn discover_bounded_with_read(
         .profile
         .clone();
     profile.payload_bytes = inputs.payload_bytes;
+    let sealing_lease = crate::gc::require_native_baseline_lease(
+        &base,
+        lease_id,
+        account,
+        crate::telemetry::unix_time_ms(),
+    )
+    .await?;
+    sealing_lease.validate_for_roots(
+        account,
+        &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
+    )?;
     let response = spool::seal_and_page(
         inputs,
         repository,
         account,
         lease_id,
-        lease_expires_at_ms,
+        request.operation_expires_at_ms,
         request,
         profile,
-        admission,
+        &mut operation,
     )?;
     validate_response(request, &response)?;
     Ok(response)
@@ -1982,7 +2044,7 @@ pub(crate) fn validate_response(
         ));
     }
     if request.release {
-        if request.continuation.is_none()
+        if request.release_completed != request.continuation.is_some()
             || !response.inputs.is_empty()
             || response.frame.is_some()
             || response.continuation.is_some()
@@ -3773,7 +3835,10 @@ mod tests {
         let bytes = b"a verified immutable chunk".to_vec();
         let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: crate::telemetry::unix_time_ms() + 60_000,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
                 directory: false,
@@ -5832,7 +5897,10 @@ mod tests {
             .await
             .unwrap();
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![
@@ -6010,7 +6078,10 @@ mod tests {
             .await
             .unwrap();
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -6069,7 +6140,10 @@ mod tests {
             .await
             .unwrap();
         let mut request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::Scan {
@@ -6180,7 +6254,10 @@ mod tests {
             .unwrap();
         let change = change_id.to_string();
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::Scan {
@@ -6586,7 +6663,10 @@ mod tests {
             .unwrap();
         let change = change_id.to_string();
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![LogicalReadInterest::Scan {
@@ -6746,7 +6826,10 @@ mod tests {
         // mutation validation; the batch CAS lowerer emits one final demand
         // mutation per chunk key.
         let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
+            release_completed: false,
+            operation_expires_at_ms: state.baseline_lease().expires_at_ms,
             epoch_id: state.epoch_id().to_owned(),
             descriptor: state.descriptor().clone(),
             interests: vec![LogicalReadInterest::FilesystemMetadata {

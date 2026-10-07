@@ -7,7 +7,10 @@ async fn fixture() -> (ReadFulfillmentRequest, ReadFulfillmentResponse) {
     let bytes = b"candidate installer test chunk".to_vec();
     let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
     let request = ReadFulfillmentRequest {
+        operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
+        release_completed: false,
+        operation_expires_at_ms: crate::telemetry::unix_time_ms() + 60_000,
         epoch_id: uuid::Uuid::now_v7().to_string(),
         descriptor,
         interests: vec![LogicalReadInterest::FilesystemMetadata {
@@ -49,7 +52,10 @@ fn candidate_state(request: &ReadFulfillmentRequest) -> PartialReplicaState {
 
 fn working_diff_request(state: &PartialReplicaState) -> ReadFulfillmentRequest {
     ReadFulfillmentRequest {
+        operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
+        release_completed: false,
+        operation_expires_at_ms: state.baseline_lease().expires_at_ms,
         epoch_id: state.epoch_id().to_owned(),
         descriptor: state.descriptor().clone(),
         interests: vec![LogicalReadInterest::Diff {
@@ -178,7 +184,8 @@ async fn candidate_install_warms_dependencies_without_publishing_admission() {
         next.descriptor().selected_branch.head.commit_id,
         "fixture must advance the candidate head"
     );
-    let request = working_diff_request(&next);
+    let mut request = working_diff_request(&next);
+    request.operation_expires_at_ms = leased.lease.expires_at_ms;
     let response = authority
         .read_sync_fulfillment(&request, &leased.lease.lease_id)
         .await
@@ -310,7 +317,8 @@ async fn candidate_install_prefetches_graph_metadata_without_publishing_controls
         leased.descriptor.clone(),
     )
     .unwrap();
-    let request = working_diff_request(&next);
+    let mut request = working_diff_request(&next);
+    request.operation_expires_at_ms = leased.lease.expires_at_ms;
     let mut response = authority
         .read_sync_fulfillment(&request, &leased.lease.lease_id)
         .await

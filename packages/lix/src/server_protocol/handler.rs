@@ -10327,7 +10327,10 @@ mod tests {
         let descriptor = envelope["descriptor"].clone();
         let commit = descriptor["selectedBranch"]["head"]["commitId"].clone();
         let body = json!({
+            "operationId": uuid::Uuid::now_v7().to_string(),
             "release": false,
+            "releaseCompleted": false,
+            "operationExpiresAtMs": crate::telemetry::unix_time_ms() + 60_000,
             "epochId": uuid::Uuid::now_v7().to_string(),
             "descriptor": descriptor,
             "interests": [{

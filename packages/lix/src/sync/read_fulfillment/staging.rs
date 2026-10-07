@@ -481,13 +481,56 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     C: super::super::http::RawHttpClient,
 {
+    let mut attempt_request = request.clone();
     for attempt in 0..2 {
-        match fetch_staged_once(storage, state, transport, request).await {
-            Err(error) if error.code == "LIX_READ_FULFILLMENT_RESTART" && attempt == 0 => continue,
-            result => return result,
+        let mut request_may_have_reached_server = false;
+        match fetch_staged_once(
+            storage,
+            state,
+            transport,
+            &attempt_request,
+            &mut request_may_have_reached_server,
+        )
+        .await
+        {
+            Ok(stage) => return Ok(stage),
+            Err(error)
+                if attempt == 0
+                    && matches!(
+                        error.code.as_str(),
+                        "LIX_READ_FULFILLMENT_RESTART" | "LIX_TRANSPORT_NETWORK"
+                    ) =>
+            {
+                if error.code == "LIX_READ_FULFILLMENT_RESTART" {
+                    if request_may_have_reached_server {
+                        release_remote_operation(transport, &attempt_request, None).await;
+                    }
+                    attempt_request.operation_id = uuid::Uuid::now_v7().to_string();
+                }
+            }
+            Err(error) => {
+                if request_may_have_reached_server {
+                    release_remote_operation(transport, &attempt_request, None).await;
+                }
+                return Err(error);
+            }
         }
     }
     unreachable!("bounded staged fetch always returns on its final attempt")
+}
+
+async fn release_remote_operation<C>(
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    completed_cursor: Option<ReadContinuation>,
+) where
+    C: super::super::http::RawHttpClient,
+{
+    let mut release = request.clone();
+    release.release = true;
+    release.release_completed = completed_cursor.is_some();
+    release.continuation = completed_cursor;
+    let _ = transport.fulfill_read(&release).await;
 }
 
 async fn fetch_staged_once<S, C>(
@@ -495,6 +538,7 @@ async fn fetch_staged_once<S, C>(
     state: &PartialReplicaState,
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
+    request_may_have_reached_server: &mut bool,
 ) -> Result<StagedClosure<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -517,7 +561,18 @@ where
     let mut stage = StagedClosure::new(storage, state, header, id, permit);
     stage.start_heartbeat()?;
     let mut page_request = request.clone();
-    let mut page = transport.fulfill_read(&page_request).await?;
+    *request_may_have_reached_server = true;
+    let mut page = match transport.fulfill_read(&page_request).await {
+        Ok(page) => page,
+        Err(error) => {
+            stage.heartbeat.take();
+            if lifecycle::release(stage.storage.clone(), stage.id).await.is_ok() {
+                stage.released = true;
+                stage.permit.take();
+            }
+            return Err(error);
+        }
+    };
     stage.header = page.clone();
     stage.header.inputs.clear();
     stage.header.frame = None;
@@ -525,6 +580,7 @@ where
         validate_complete(request, &page)?;
         return Ok(stage);
     }
+    let mut terminal_cursor = None;
     let result = async {
         for _ in 0..MAX_PAGES {
             validate_response(&page_request, &page)?;
@@ -542,6 +598,7 @@ where
                 stage.append_page(page.inputs).await?;
             }
             let Some(next) = next else {
+                terminal_cursor = page_request.continuation.clone();
                 stage.header.continuation = None;
                 stage.validate(request).await?;
                 return Ok(());
@@ -552,19 +609,18 @@ where
         Err(invalid("staged read continuation count exceeds bound"))
     }
     .await;
-    if page_request.continuation.is_some() {
-        let mut release = page_request.clone();
-        release.release = true;
-        // Cleanup acknowledgements never grant coverage. TTL is the bounded
-        // crash/cancellation fallback when the release request cannot arrive.
-        let _ = transport.fulfill_read(&release).await;
-    }
     if let Err(error) = result {
         stage.heartbeat.take();
-        lifecycle::release(stage.storage.clone(), stage.id).await?;
-        stage.released = true;
-        stage.permit.take();
+        if lifecycle::release(stage.storage.clone(), stage.id).await.is_ok() {
+            stage.released = true;
+            stage.permit.take();
+        }
         return Err(error);
+    }
+    if let Some(cursor) = terminal_cursor {
+        // The cursor names the terminal page that the client has now fully
+        // validated and staged. A lost acknowledgement falls back to TTL.
+        release_remote_operation(transport, request, Some(cursor)).await;
     }
     Ok(stage)
 }

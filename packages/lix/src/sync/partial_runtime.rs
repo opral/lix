@@ -784,7 +784,10 @@ fn hydrate_exact_demand_with_receipt<
                 return Ok(HydratedInputs::default());
             }
             let fulfillment = super::read_fulfillment::ReadFulfillmentRequest {
+                operation_id: uuid::Uuid::now_v7().to_string(),
                 release: false,
+                release_completed: false,
+                operation_expires_at_ms: state.baseline_lease().expires_at_ms,
                 epoch_id: state.epoch_id().into(),
                 descriptor: state.descriptor().clone(),
                 interests: plan.interests,

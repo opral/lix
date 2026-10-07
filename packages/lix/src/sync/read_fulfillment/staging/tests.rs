@@ -1,5 +1,8 @@
 use super::*;
-use std::sync::atomic::AtomicUsize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 pub(super) async fn fixture() -> (
     StorageAdapter<Memory>,
@@ -16,7 +19,10 @@ pub(super) async fn fixture() -> (
     )
     .unwrap();
     let request = ReadFulfillmentRequest {
+        operation_id: uuid::Uuid::now_v7().to_string(),
         release: false,
+        release_completed: false,
+        operation_expires_at_ms: state.baseline_lease().expires_at_ms,
         epoch_id: state.epoch_id().into(),
         descriptor,
         interests: vec![],
@@ -344,7 +350,7 @@ impl crate::sync::http::RawHttpClient for ExpiringReadClient {
                 assert!(raw.url.ends_with("/sync/read-fulfillment"));
                 let request: ReadFulfillmentRequest =
                     serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
-                let attempt = if request.continuation.is_none() {
+                let attempt = if !request.release && request.continuation.is_none() {
                     self.attempts.fetch_add(1, Ordering::SeqCst) + 1
                 } else {
                     self.attempts.load(Ordering::SeqCst)
@@ -404,6 +410,234 @@ impl crate::sync::http::RawHttpClient for ExpiringReadClient {
         })
     }
 }
+#[derive(Clone)]
+struct LifecycleReadClient {
+    lix_id: String,
+    account: String,
+    inputs: Vec<ReadInput>,
+    paginate: bool,
+    malformed_first_once: Arc<AtomicBool>,
+    active_spools: Arc<AtomicUsize>,
+    peak_spools: Arc<AtomicUsize>,
+    completed_releases: Arc<AtomicUsize>,
+    cancelled_releases: Arc<AtomicUsize>,
+}
+
+impl LifecycleReadClient {
+    fn response(
+        &self,
+        request: &ReadFulfillmentRequest,
+        inputs: Vec<ReadInput>,
+        continuation: Option<ReadContinuation>,
+    ) -> crate::sync::http::RawHttpResponse {
+        let closure_inputs = if request.release {
+            &[][..]
+        } else {
+            &self.inputs
+        };
+        let response = ReadFulfillmentResponse {
+            frame: None,
+            lix_id: self.lix_id.clone(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest().unwrap(),
+            inputs,
+            profile: Default::default(),
+            closure_digest: input_digest(request, closure_inputs).unwrap(),
+            continuation,
+            outcome: ReadFulfillmentOutcome::Complete,
+        };
+        crate::sync::http::RawHttpResponse {
+            status: 200,
+            status_text: "lifecycle test fixture".into(),
+            body: serde_json::to_vec(&response).unwrap(),
+        }
+    }
+
+    fn note_spool(&self) {
+        let current = self.active_spools.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_spools.fetch_max(current, Ordering::SeqCst);
+    }
+
+    fn retire_spool(&self) {
+        let _ = self
+            .active_spools
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+}
+
+impl crate::sync::http::RawHttpClient for LifecycleReadClient {
+    fn send(
+        &self,
+        raw: crate::sync::http::RawHttpRequest,
+    ) -> crate::sync::SyncTransportFuture<'_, crate::sync::http::RawHttpResponse> {
+        let client = self.clone();
+        Box::pin(async move {
+            if raw.method == http::Method::GET {
+                return Ok(crate::sync::http::RawHttpResponse {
+                    status: 200,
+                    status_text: "lifecycle test handshake".into(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": client.lix_id,
+                        "sessionId": "lifecycle-test-session",
+                        "activeAccountId": client.account,
+                    }))
+                    .unwrap(),
+                });
+            }
+            let request: ReadFulfillmentRequest =
+                serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
+            if request.release {
+                if request.release_completed {
+                    assert!(request.continuation.is_some());
+                    client.completed_releases.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    client.cancelled_releases.fetch_add(1, Ordering::SeqCst);
+                }
+                client.retire_spool();
+                return Ok(client.response(&request, Vec::new(), None));
+            }
+            if request.continuation.is_some() {
+                return Ok(client.response(&request, vec![client.inputs[1].clone()], None));
+            }
+            if client.malformed_first_once.swap(false, Ordering::SeqCst) {
+                client.note_spool();
+                return Ok(crate::sync::http::RawHttpResponse {
+                    status: 200,
+                    status_text: "simulated malformed first page".into(),
+                    body: b"{".to_vec(),
+                });
+            }
+            if client.paginate {
+                client.note_spool();
+                let closure_digest = input_digest(&request, &client.inputs).unwrap();
+                return Ok(client.response(
+                    &request,
+                    vec![client.inputs[0].clone()],
+                    Some(ReadContinuation {
+                        next_input: 1,
+                        next_offset: 0,
+                        spool_id: uuid::Uuid::now_v7().to_string(),
+                        closure_digest,
+                    }),
+                ));
+            }
+            Ok(client.response(&request, client.inputs.clone(), None))
+        })
+    }
+}
+
+fn lifecycle_client(
+    request: &ReadFulfillmentRequest,
+    inputs: Vec<ReadInput>,
+    paginate: bool,
+    malformed_first_once: bool,
+) -> LifecycleReadClient {
+    LifecycleReadClient {
+        lix_id: request.descriptor.lix_id.clone(),
+        account: crate::SYSTEM_ACCOUNT_ID.into(),
+        inputs,
+        paginate,
+        malformed_first_once: Arc::new(AtomicBool::new(malformed_first_once)),
+        active_spools: Arc::new(AtomicUsize::new(0)),
+        peak_spools: Arc::new(AtomicUsize::new(0)),
+        completed_releases: Arc::new(AtomicUsize::new(0)),
+        cancelled_releases: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+async fn lifecycle_transport(
+    request: &ReadFulfillmentRequest,
+    client: LifecycleReadClient,
+) -> crate::sync::http::HttpSyncTransport<LifecycleReadClient> {
+    let account = client.account.clone();
+    let transport = crate::sync::http::HttpSyncTransport::connect_with(
+        client,
+        &format!("https://example.test/lix/{}", request.descriptor.lix_id),
+    )
+    .await
+    .unwrap();
+    let lease =
+        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
+    transport.bind_native_baseline_lease(&lease.lease).unwrap();
+    transport
+}
+
+fn lifecycle_request(
+    mut request: ReadFulfillmentRequest,
+    inputs: &[ReadInput],
+) -> ReadFulfillmentRequest {
+    request.required = inputs.iter().map(|input| input.address.clone()).collect();
+    request.interests = vec![LogicalReadInterest::Scan {
+        request: Default::default(),
+        domain: InterestDomain::Combined,
+    }];
+    request
+}
+
+#[tokio::test]
+async fn successful_paginated_operations_complete_more_than_64_times() {
+    let (storage, state, request) = fixture().await;
+    let mut inputs = vec![chunk(200, 1024), chunk(201, 1024)];
+    inputs.sort_by_key(|input| input.address.coordinate().unwrap());
+    let request = lifecycle_request(request, &inputs);
+    let client = lifecycle_client(&request, inputs, true, false);
+    let completed_releases = client.completed_releases.clone();
+    let peak_spools = client.peak_spools.clone();
+    let transport = lifecycle_transport(&request, client).await;
+    let started = std::time::Instant::now();
+    for _ in 0..65 {
+        let mut operation_request = request.clone();
+        operation_request.operation_id = uuid::Uuid::now_v7().to_string();
+        let mut stage = fetch_staged(&storage, &state, &transport, &operation_request)
+            .await
+            .unwrap();
+        stage.promote(&operation_request, false).await.unwrap();
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(completed_releases.load(Ordering::SeqCst), 65);
+    assert_eq!(peak_spools.load(Ordering::SeqCst), 1);
+    println!(
+        "READ_OPERATION_RETIREMENT_PROFILE_JSON={}",
+        serde_json::json!({
+            "completedPaginatedOperations": 65,
+            "completedReleases": completed_releases.load(Ordering::SeqCst),
+            "peakActiveSpools": peak_spools.load(Ordering::SeqCst),
+            "elapsedMs": elapsed_ms,
+        })
+    );
+}
+
+#[tokio::test]
+async fn malformed_first_response_releases_possible_remote_operation() {
+    let (storage, state, request) = fixture().await;
+    let mut inputs = vec![chunk(202, 1024), chunk(203, 1024)];
+    inputs.sort_by_key(|input| input.address.coordinate().unwrap());
+    let request = lifecycle_request(request, &inputs);
+    let client = lifecycle_client(&request, inputs, false, true);
+    let active_spools = client.active_spools.clone();
+    let cancelled_releases = client.cancelled_releases.clone();
+    let transport = lifecycle_transport(&request, client).await;
+
+    let error = fetch_staged(&storage, &state, &transport, &request)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+    assert_eq!(active_spools.load(Ordering::SeqCst), 0);
+    assert_eq!(cancelled_releases.load(Ordering::SeqCst), 1);
+
+    let mut healthy_request = request.clone();
+    healthy_request.operation_id = uuid::Uuid::now_v7().to_string();
+    let mut stage = fetch_staged(&storage, &state, &transport, &healthy_request)
+        .await
+        .unwrap();
+    stage.promote(&healthy_request, false).await.unwrap();
+}
+
 async fn exercise_cursor_restart(repeated: bool) {
     use std::sync::{
         Arc,

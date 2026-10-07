@@ -1034,7 +1034,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 30 }
+      schema: { type: integer, const: 31 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1092,7 +1092,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 30 }
+        syncProtocolVersion: { type: integer, const: 31 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1654,9 +1654,12 @@ components:
     ReadFulfillmentRequest:
       type: object
       additionalProperties: false
-      required: [release, epochId, descriptor, interests, required, continuation]
+      required: [operationId, release, releaseCompleted, operationExpiresAtMs, epochId, descriptor, interests, required, continuation]
       properties:
-        release: { type: boolean, description: Release a bound sealed operation idempotently; requires continuation and grants no coverage. }
+        operationId: { type: string, format: uuid, description: Client-generated stable identity for one immutable read attempt and its retries. }
+        release: { type: boolean, description: Retire or cancel this operation. A completed release requires releaseCompleted=true and the final acknowledged continuation cursor; cancellation requires releaseCompleted=false and a null continuation. Neither disposition grants coverage. }
+        releaseCompleted: { type: boolean, description: Acknowledge that every page was received and validated; requires release=true and the terminal continuation cursor. }
+        operationExpiresAtMs: { type: integer, format: int64, minimum: 1, description: Fixed server-issued lease expiry captured when this operation is created. Retries and renewals cannot extend it. }
         epochId: { type: string, format: uuid }
         descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }
         interests:
