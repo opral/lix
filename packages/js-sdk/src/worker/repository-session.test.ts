@@ -87,6 +87,30 @@ function fixture() {
 		},
 	};
 }
+test("owner loss during detached migration cleanup preserves the unknown outcome", async () => {
+	const f = fixture();
+	f.session.connected();
+	await tick();
+	f.pause();
+	const cleanup = f.request({
+		kind: "replica.cleanup",
+		storage: { kind: "memory" },
+		server: { url: "https://synthetic.invalid", dynamicHeaders: false },
+	});
+	f.session.lost();
+	expect(f.result(cleanup)).toMatchObject({
+		ok: false,
+		error: { code: "LIX_WRITE_OUTCOME_UNKNOWN" },
+	});
+	const sent = f.sent.length;
+	f.resume();
+	f.session.connected();
+	await tick();
+	expect(f.sent.slice(sent).some(message =>
+		"id" in message && message.operation.kind === "replica.cleanup",
+	)).toBe(false);
+});
+
 test("recovers acknowledged contexts and observations without replaying writes or transactions", async () => {
 	const f = fixture();
 	await f.open();
