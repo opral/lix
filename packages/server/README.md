@@ -90,6 +90,14 @@ and will remain red until that one-time setting is complete.
 not change it for an existing deployment. Cache settings affect only local,
 rebuildable data.
 
+The server budgets retained SlateDB cache file handles across
+`LIX_SERVER_MAX_OPEN_LIXS`. On Unix, the total retained-handle budget is the
+smaller of 512 and half the process soft `RLIMIT_NOFILE`; the configured runtime
+capacity must fit that budget. Each runtime receives an equal share. The
+remaining descriptors provide headroom for active reads, sockets, and runtime
+workers. This limits retained cache handles, not every transient descriptor.
+Evicting a cached handle preserves its cached object bytes on disk.
+
 ## Build the image
 
 Use the repository root as the Docker build context:

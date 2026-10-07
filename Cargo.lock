@@ -3335,6 +3335,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "libc",
  "lix",
  "lix-storage-filesystem",
  "lix-storage-slatedb",

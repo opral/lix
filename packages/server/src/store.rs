@@ -449,6 +449,14 @@ impl LixRuntimeManager {
         );
         prepare_cache_namespace(owner_root, &namespace_root)?;
         let cache = cache_options(&storage.cache, config.max_open_lixes, namespace_root);
+        info!(
+            max_open_lixes = config.max_open_lixes,
+            cache_file_handles_per_lix = cache.max_open_file_handles,
+            max_retained_cache_file_handles = cache
+                .max_open_file_handles
+                .saturating_mul(config.max_open_lixes),
+            "configured SlateDB cached file-handle budget"
+        );
         let builder = AmazonS3Builder::new()
             .with_http_connector(object_store::client::SpawnedReqwestConnector::new(
                 io_runtime,
@@ -2003,6 +2011,7 @@ fn cache_options(
         max_disk_cache_bytes: per_lix_usize(cache.max_disk_cache_bytes, max_open_lixes),
         block_cache_bytes: per_lix_u64(cache.block_cache_bytes, max_open_lixes),
         metadata_cache_bytes: per_lix_u64(cache.metadata_cache_bytes, max_open_lixes),
+        max_open_file_handles: cache.max_open_file_handles_per_lix,
     }
 }
 
@@ -3488,6 +3497,7 @@ mod tests {
             max_disk_cache_bytes: 2_048,
             block_cache_bytes: 128,
             metadata_cache_bytes: 32,
+            max_open_file_handles_per_lix: 16,
         };
 
         let namespace = namespace_root(&cache.root_folder, "https://s3.example");
@@ -3497,6 +3507,7 @@ mod tests {
         assert_eq!(options.max_disk_cache_bytes, 512);
         assert_eq!(options.block_cache_bytes, 32);
         assert_eq!(options.metadata_cache_bytes, 8);
+        assert_eq!(options.max_open_file_handles, 16);
         assert_eq!(
             cache_child_path(&options.root_folder, LIX_A),
             Some(options.root_folder.join(LIX_A))
@@ -4152,6 +4163,7 @@ mod tests {
                     max_disk_cache_bytes: 1024 * 1024,
                     block_cache_bytes: 1024 * 1024,
                     metadata_cache_bytes: 1024 * 1024,
+                    max_open_file_handles_per_lix: 16,
                 },
             },
         };

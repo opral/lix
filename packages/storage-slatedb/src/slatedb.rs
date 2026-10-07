@@ -924,6 +924,10 @@ pub struct SlateDBCacheOptions {
     pub max_disk_cache_bytes: usize,
     pub block_cache_bytes: u64,
     pub metadata_cache_bytes: u64,
+    /// Positive maximum number of cached file handles retained by this
+    /// SlateDB runtime. The server divides its process-wide handle budget
+    /// across live runtimes.
+    pub max_open_file_handles: usize,
 }
 
 #[derive(Clone)]
@@ -5084,16 +5088,7 @@ fn open_slatedb(
         }
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
-            let (slatedb_max_bytes, _) = disk_cache_budgets(cache.max_disk_cache_bytes);
-            settings.object_store_cache_options = ObjectStoreCacheOptions {
-                root_folder: Some(cache.root_folder),
-                max_cache_size_bytes: Some(slatedb_max_bytes),
-                part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
-                cache_puts: true,
-                preload_disk_cache_on_startup: None,
-                scan_interval: None,
-                ..ObjectStoreCacheOptions::default()
-            };
+            settings.object_store_cache_options = object_store_cache_options(&cache);
             builder = builder.with_settings(settings).with_db_cache(db_cache(
                 cache.block_cache_bytes,
                 cache.metadata_cache_bytes,
@@ -5115,6 +5110,20 @@ fn open_slatedb(
         }
         Ok(db)
     })
+}
+
+fn object_store_cache_options(cache: &SlateDBCacheOptions) -> ObjectStoreCacheOptions {
+    let (slatedb_max_bytes, _) = disk_cache_budgets(cache.max_disk_cache_bytes);
+    ObjectStoreCacheOptions {
+        root_folder: Some(cache.root_folder.clone()),
+        max_cache_size_bytes: Some(slatedb_max_bytes),
+        part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
+        cache_puts: true,
+        preload_disk_cache_on_startup: None,
+        scan_interval: None,
+        max_open_file_handles: cache.max_open_file_handles,
+        ..ObjectStoreCacheOptions::default()
+    }
 }
 
 /// One-time physical upgrade. Legacy SlateDB has no size-only projection:
@@ -5332,6 +5341,11 @@ fn validate_object_store_options(options: &SlateDBObjectStoreOptions) -> Result<
     if cache.max_disk_cache_bytes == 0 {
         return Err(StorageError::Io(
             "slatedb disk cache size must be greater than zero".to_string(),
+        ));
+    }
+    if cache.max_open_file_handles == 0 {
+        return Err(StorageError::Io(
+            "slatedb cache open file-handle limit must be greater than zero".to_string(),
         ));
     }
     Ok(())
@@ -5707,6 +5721,48 @@ mod tests {
 
     const TEST_IMMUTABLE_SPACE: StorageSpace =
         StorageSpace::immutable(SpaceId(0x00ff_0001), "test.immutable");
+
+    #[test]
+    fn zero_cached_file_handle_limit_is_rejected_before_database_startup() {
+        let options = SlateDBObjectStoreOptions {
+            cache: Some(SlateDBCacheOptions {
+                root_folder: PathBuf::from("cache"),
+                max_disk_cache_bytes: 1,
+                block_cache_bytes: 0,
+                metadata_cache_bytes: 0,
+                max_open_file_handles: 0,
+            }),
+        };
+
+        let result = SlateDB::open_object_store_with_options(
+            "zero-file-handle-limit",
+            Arc::new(InMemory::new()),
+            options,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Io(message))
+                if message.contains("open file-handle limit must be greater than zero")
+        ));
+    }
+
+    #[test]
+    fn per_runtime_file_handle_limit_is_forwarded_to_slatedb() {
+        let cache = SlateDBCacheOptions {
+            root_folder: PathBuf::from("cache"),
+            max_disk_cache_bytes: 2 * 1024 * 1024,
+            block_cache_bytes: 0,
+            metadata_cache_bytes: 0,
+            max_open_file_handles: 16,
+        };
+
+        let options = object_store_cache_options(&cache);
+
+        assert_eq!(options.max_open_file_handles, 16);
+        assert_eq!(options.max_cache_size_bytes, Some(1024 * 1024));
+        assert_eq!(options.root_folder, Some(PathBuf::from("cache")));
+    }
 
     #[tokio::test]
     async fn retained_legacy_generation_keeps_immutable_segments_after_v3_deletion_and_gc() {
@@ -6456,6 +6512,7 @@ mod tests {
                     max_disk_cache_bytes: 2,
                     block_cache_bytes: 0,
                     metadata_cache_bytes: 0,
+                    max_open_file_handles: 1000,
                 }),
             },
             counters.clone(),
@@ -7101,6 +7158,7 @@ mod tests {
                 max_disk_cache_bytes: 128 * 1024 * 1024,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             }),
             Some(counters.clone()),
         );
@@ -7140,6 +7198,7 @@ mod tests {
                 max_disk_cache_bytes: 128 * 1024 * 1024,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             }),
             Some(counters.clone()),
         );
@@ -7166,6 +7225,7 @@ mod tests {
                 max_disk_cache_bytes: 128 * 1024 * 1024,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             }),
             None,
         );
@@ -7220,6 +7280,7 @@ mod tests {
                 max_disk_cache_bytes: 64 * 1024 * 1024,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             }),
             None,
         );
@@ -7249,6 +7310,7 @@ mod tests {
                 max_disk_cache_bytes: 1024,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             },
             None,
         );
@@ -8282,6 +8344,7 @@ mod tests {
                     max_disk_cache_bytes: 8 * 1024 * 1024,
                     block_cache_bytes: 1024 * 1024,
                     metadata_cache_bytes: 1024 * 1024,
+                    max_open_file_handles: 1000,
                 }),
             },
         )
@@ -8349,6 +8412,7 @@ mod tests {
                 max_disk_cache_bytes: 2048,
                 block_cache_bytes: 0,
                 metadata_cache_bytes: 0,
+                max_open_file_handles: 1000,
             },
             None,
         );
@@ -8465,6 +8529,7 @@ mod tests {
                     max_disk_cache_bytes: 16 * 1024 * 1024,
                     block_cache_bytes: 0,
                     metadata_cache_bytes: 0,
+                    max_open_file_handles: 1000,
                 }),
             },
         );

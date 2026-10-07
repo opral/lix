@@ -769,6 +769,7 @@ fn cache_options(root_folder: PathBuf) -> SlateDBCacheOptions {
         max_disk_cache_bytes: 16 * 1024 * 1024,
         block_cache_bytes: 4 * 1024 * 1024,
         metadata_cache_bytes: 1024 * 1024,
+        max_open_file_handles: 1000,
     }
 }
 

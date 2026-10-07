@@ -207,6 +207,7 @@ fn options(cache_root: std::path::PathBuf) -> SlateDBObjectStoreOptions {
             max_disk_cache_bytes: 2,
             block_cache_bytes: 0,
             metadata_cache_bytes: 0,
+            max_open_file_handles: 1000,
         }),
     }
 }
