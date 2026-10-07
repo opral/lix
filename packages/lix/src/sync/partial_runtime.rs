@@ -1142,18 +1142,39 @@ where
             Err(error) if error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" => {}
             Err(error) if is_terminal_partial_transport_error(&error) => return Err(error),
             Err(error) => {
-                deferred_error.get_or_insert(error);
+                defer_upload_error(&mut deferred_error, error);
             }
         }
     }
-    // A divergent GLOBAL lane must not starve an independently publishable
-    // selected upload. Its acknowledgment can be the fence recovery needs.
-    if !progress {
-        if let Some(error) = deferred_error {
+    finish_upload_progress(progress, deferred_error)
+}
+
+fn finish_upload_progress(
+    progress: bool,
+    deferred_error: Option<LixError>,
+) -> Result<bool, LixError> {
+    if let Some(error) = deferred_error {
+        // A successful independent lane does not resolve a conflicting lane's
+        // frozen expected-head tuple. Surface that conflict so the worker must
+        // observe/reconcile the authoritative descriptor before another push.
+        if !progress || error.code == LixError::CODE_TRANSACTION_CONFLICT {
             return Err(error);
         }
     }
     Ok(progress)
+}
+
+fn defer_upload_error(deferred: &mut Option<LixError>, error: LixError) {
+    // Conflict recovery is a worker scheduling dependency even if an earlier
+    // branch reported a different retryable failure. Keep the authority CAS
+    // result as the error that reaches the worker.
+    if error.code == LixError::CODE_TRANSACTION_CONFLICT
+        || deferred
+            .as_ref()
+            .is_none_or(|previous| previous.code != LixError::CODE_TRANSACTION_CONFLICT)
+    {
+        *deferred = Some(error);
+    }
 }
 
 /// A recoverable owner transition, never an application retry instruction.
@@ -1187,52 +1208,153 @@ where
     C: RawHttpClient + Clone + 'static,
 {
     Box::pin(async move {
-        match super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
-            engine.clone(),
-            state.clone(),
-            transport,
-            wrapper,
-            policy,
-        )
-        .await
-        {
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "LIX_PARTIAL_GLOBAL_SCOPE_UNSUPPORTED"
-                        | "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED"
-                        | "LIX_PARTIAL_GLOBAL_MERGE_PENDING"
-                        | "LIX_PARTIAL_GLOBAL_SELECTED_RECONCILIATION_REQUIRED"
-                        | "LIX_PARTIAL_GLOBAL_NEWER_LOCAL_RECONCILIATION_REQUIRED"
-                        | "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED"
-                        | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
-                ) =>
+        let retry_lease = wrapper.wire.lease.clone();
+        let retry_descriptor = wrapper.wire.descriptor.clone();
+        let mut retry_allowed = true;
+        let result =
+            match super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+                engine.clone(),
+                state.clone(),
+                transport,
+                wrapper,
+                policy,
+            )
+            .await
             {
-                let storage = engine.storage();
-                super::partial_global_merge_runtime::abandon_global_merge(
-                    &storage,
-                    state.clone(),
-                    transport,
-                )
-                .await?;
-                super::partial_merge_runtime::abandon_partial_merge(&storage, &state, transport)
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "LIX_PARTIAL_GLOBAL_SCOPE_UNSUPPORTED"
+                            | "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED"
+                            | "LIX_PARTIAL_GLOBAL_MERGE_PENDING"
+                            | "LIX_PARTIAL_GLOBAL_SELECTED_RECONCILIATION_REQUIRED"
+                            | "LIX_PARTIAL_GLOBAL_NEWER_LOCAL_RECONCILIATION_REQUIRED"
+                            | "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED"
+                            | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
+                    ) =>
+                {
+                    retry_allowed = false;
+                    let storage = engine.storage();
+                    super::partial_global_merge_runtime::abandon_global_merge(
+                        &storage,
+                        state.clone(),
+                        transport,
+                    )
                     .await?;
-                let wrapper = transport
-                    .partial_replica_descriptor(Some(&state.descriptor().selected_branch.branch_id))
+                    super::partial_merge_runtime::abandon_partial_merge(
+                        &storage, &state, transport,
+                    )
                     .await?;
-                tracing::warn!(code=%error.code, "partial replica adopts authoritative state after unsupported reconciliation");
-                super::partial_reconcile::prepare_clean_descriptor(
-                    engine,
-                    state,
-                    transport,
-                    wrapper,
-                    super::partial_publication::PartialRecoveryPolicy::AuthorityWins,
-                )
-                .await
+                    let wrapper = transport
+                        .partial_replica_descriptor(Some(
+                            &state.descriptor().selected_branch.branch_id,
+                        ))
+                        .await?;
+                    tracing::warn!(code=%error.code, "partial replica adopts authoritative state after unsupported reconciliation");
+                    super::partial_reconcile::prepare_clean_descriptor(
+                        engine.clone(),
+                        state.clone(),
+                        transport,
+                        wrapper,
+                        super::partial_publication::PartialRecoveryPolicy::AuthorityWins,
+                    )
+                    .await
+                }
+                result => result,
+            };
+        match result {
+            Err(error)
+                if retry_allowed
+                    && matches!(
+                        error.code.as_str(),
+                        "LIX_PARTIAL_REPLICA_REBASE_REQUIRED"
+                            | "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING"
+                    )
+                    && frozen_uploads_match_fresh_authority(&engine, &state, &retry_descriptor)
+                        .await? =>
+            {
+                // The inclusion/reconciliation path ran first. An exact
+                // expected-coordinate match proves the frozen request remains
+                // admissible under the server's head/checkpoint CAS contract.
+                // Keep its identity/body and retry under this fresh lease. When
+                // the serving baseline expired, this refreshes transport only;
+                // the old serving admission remains fenced until publication.
+                Ok(super::partial_reconcile::PreparedDescriptor::RetryUpload(
+                    retry_lease,
+                ))
             }
             result => result,
         }
     })
+}
+
+async fn frozen_uploads_match_fresh_authority<S>(
+    engine: &crate::engine::Engine<S>,
+    state: &PartialReplicaState,
+    descriptor: &super::PartialReplicaDescriptor,
+) -> Result<bool, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await?;
+    let (global_merge, _, _) =
+        super::partial_global_merge_state::load_partial_global_merge_state(&read, state).await?;
+    if global_merge.is_some() {
+        return Ok(false);
+    }
+
+    let selected = &state.descriptor().selected_branch.branch_id;
+    let global = crate::GLOBAL_BRANCH_ID;
+    let mut has_pending_upload = false;
+    for branch_id in [global, selected.as_str()] {
+        if branch_id == selected.as_str() && branch_id == global && has_pending_upload {
+            continue;
+        }
+        if branch_id != global
+            && super::partial_merge_state::load_partial_merge_state(&read, state, branch_id)
+                .await?
+                .0
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let authority = if branch_id == selected {
+            &descriptor.selected_branch
+        } else {
+            &descriptor.global_branch
+        };
+        if authority.branch_id != branch_id {
+            return Ok(false);
+        }
+        let (push, _, _) =
+            super::partial_push_state::load_partial_push_state(&read, state, branch_id).await?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await?
+            .ok_or_else(|| LixError::unknown("partial retry branch disappeared"))?;
+        let control_checkpoint = control
+            .working_diff_checkpoint_commit_id
+            .map(|id| id.to_string());
+        let pending = push.prepared.is_some()
+            || control.head_commit_id != push.confirmed.head
+            || control_checkpoint.as_deref() != Some(push.confirmed.checkpoint.as_str());
+        if !pending {
+            continue;
+        }
+        let expected = push
+            .prepared
+            .as_ref()
+            .map_or(&push.confirmed, |prepared| &prepared.expected);
+        if expected.head != authority.head.commit_id
+            || expected.checkpoint != authority.checkpoint.commit_id
+        {
+            return Ok(false);
+        }
+        has_pending_upload = true;
+    }
+    Ok(has_pending_upload)
 }
 
 /// The same owner drives foreground recovery and branch admission. Never wait
@@ -1292,6 +1414,7 @@ where
                 }
             }
             Ok(super::partial_reconcile::PreparedDescriptor::LocalProgress) => {}
+            Ok(super::partial_reconcile::PreparedDescriptor::RetryUpload(_)) => {}
             Ok(super::partial_reconcile::PreparedDescriptor::NoChange) => {
                 if !settle {
                     return Ok(());
@@ -1436,6 +1559,12 @@ where
     let mut watch_after = web_time::Instant::now();
     let mut upload_due = changes.is_some();
     let mut retry_upload = false;
+    // A stale CAS or expired baseline makes uploads depend on one completed
+    // fresh descriptor/reconciliation. Keep prepared tuples intact (a prior
+    // attempt may have been accepted before its ACK was lost), and do not let
+    // local changes or retry timers preempt that authority observation.
+    let mut authority_recovery_pending = false;
+    let mut retry_upload_lease: Option<crate::gc::NativeBaselineLease> = None;
     let mut retry_delay = Duration::from_millis(100);
     let mut retry_deadline = web_time::Instant::now();
     let mut queued_demand = None;
@@ -1456,6 +1585,7 @@ where
             })?;
             if current.as_ref() != state.as_ref() {
                 pending_descriptor = None;
+                authority_recovery_pending = false;
                 let lease_changed =
                     current.baseline_lease().lease_id != state.baseline_lease().lease_id;
                 transport = transport
@@ -1474,6 +1604,12 @@ where
                     baseline_expired = None;
                 }
             }
+        }
+        if let Some(lease) = retry_upload_lease.take() {
+            let connected = transport
+                .as_ref()
+                .ok_or_else(|| LixError::unknown("descriptor retry lost its HTTP transport"))?;
+            transport = Some(connected.fork_native_baseline_lease(&lease)?);
         }
         // Foreground missing inputs preempt background upload. Cancellation can
         // have an ambiguous server outcome; the durable captured tuple survives.
@@ -1510,6 +1646,7 @@ where
                             // Successful adoption advances the cursor, so the
                             // server long poll is the wait. Failed adoption
                             // retains the cursor and needs the existing backoff.
+                            let published = result.is_ok();
                             watch_after = web_time::Instant::now() + if let Err(error) = result {
                                 health.failed(SyncPhase::Publication, &error);
                                 tracing::warn!(code=%error.code, "partial publication did not complete");
@@ -1519,6 +1656,12 @@ where
                                 if let Some(current) = engine.as_ref().and_then(|engine| engine.sync_mode().partial_admission()) { health.applied(current.descriptor().cursor); }
                                 Duration::ZERO
                             };
+                            if published {
+                                authority_recovery_pending = false;
+                                retry_upload = false;
+                                retry_delay = Duration::from_millis(100);
+                                force_descriptor_refresh = false;
+                            }
                             continue;
                         }
                     }
@@ -1567,6 +1710,7 @@ where
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica baseline renewal failed");
                         if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                             baseline_expired = Some(error);
+                            authority_recovery_pending = true;
                             force_descriptor_refresh = true;
                             watch_after = web_time::Instant::now();
                         } else {
@@ -1579,12 +1723,17 @@ where
                 continue;
             }
         }
-        if retry_upload && web_time::Instant::now() >= retry_deadline {
+        if retry_upload && !authority_recovery_pending && web_time::Instant::now() >= retry_deadline
+        {
             upload_due = true;
         }
-        if queued_demand.is_none() && upload_due {
+        if queued_demand.is_none()
+            && upload_due
+            && !authority_recovery_pending
+            && (baseline_expired.is_none() || retry_upload)
+            && (!retry_upload || web_time::Instant::now() >= retry_deadline)
+        {
             upload_due = false;
-            retry_upload = false;
             let upload = upload_pending_once(&storage, &state, &mut transport, &mut connect).fuse();
             let shutdown = shutdown_rx.changed().fuse();
             let demand = demand_rx.recv().fuse();
@@ -1611,6 +1760,9 @@ where
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
                             break 'worker;
+                        }
+                        if error.code == LixError::CODE_TRANSACTION_CONFLICT {
+                            authority_recovery_pending = true;
                         }
                         force_descriptor_refresh=true;
                         health.failed(SyncPhase::Upload, &error);
@@ -1707,10 +1859,19 @@ where
             let shutdown = shutdown_rx.changed().fuse();
             let demand = demand_rx.recv().fuse();
             let renew_while_watching = changes.is_some() && baseline_expired.is_none();
+            let gate_local_changes =
+                authority_recovery_pending || retry_upload || baseline_expired.is_some();
             let changed = async {
-                match changes.as_mut() {
-                    Some(receiver) => receiver.changed().await.is_ok(),
-                    None => futures_util::future::pending::<bool>().await,
+                if gate_local_changes {
+                    // A fresh descriptor is a dependency of a rejected frozen
+                    // upload, and local notifications cannot bypass its retry
+                    // backoff. Preserve notifications until retry eligibility.
+                    futures_util::future::pending::<bool>().await
+                } else {
+                    match changes.as_mut() {
+                        Some(receiver) => receiver.changed().await.is_ok(),
+                        None => futures_util::future::pending::<bool>().await,
+                    }
                 }
             }
             .fuse();
@@ -1723,7 +1884,7 @@ where
                 }
             }
             .fuse();
-            let retry_enabled = retry_upload;
+            let retry_enabled = retry_upload && !authority_recovery_pending;
             let retry_at = retry_deadline;
             let retry = async {
                 if retry_enabled {
@@ -1747,23 +1908,56 @@ where
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::LocalProgress)) => {
                         health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
                         watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
+                        // The merge receipt/cleanup completed, but its confirmed
+                        // coordinates can be newer than the installed admission.
+                        // Acquire one more descriptor before planning the next
+                        // ordinary wave so its CAS basis is current.
                         force_descriptor_refresh=true;upload_due=true;retry_upload=false;
+                        retry_delay=Duration::from_millis(100);
                         watch_after=web_time::Instant::now();
                     },
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::NoChange)) => {
+                        let was_recovering_authority = authority_recovery_pending;
                         health.observed(cursor);
                         if !blocked_global_cursor.is_some_and(|blocked| cursor <= blocked) {
                             health.succeeded(SyncPhase::Descriptor);
                         }
                         force_descriptor_refresh=false;
+                        authority_recovery_pending = false;
+                        if was_recovering_authority {
+                            upload_due |= retry_upload;
+                        }
                         if blocked_global_cursor.is_some_and(|blocked|cursor>blocked){blocked_global_cursor=None;}
                         watch_cursor = watch_cursor.max(cursor);
                         // The next request long-polls after this processed cursor.
                         watch_after = web_time::Instant::now();
                     },
+                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::RetryUpload(lease))) => {
+                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
+                        retry_upload_lease = Some(lease);
+                        watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
+                        force_descriptor_refresh=false;
+                        authority_recovery_pending=false;
+                        if !retry_upload {
+                            // A fresh typed proof may follow durable merge
+                            // progress rather than an earlier failed send.
+                            // Make this exact tuple immediately eligible while
+                            // still queuing local changes until it settles.
+                            retry_deadline = web_time::Instant::now();
+                            retry_delay = Duration::from_millis(100);
+                        }
+                        retry_upload = true;
+                        // Schedule the exact frozen tuple. If the previous
+                        // send established a retry deadline, keep it; actual
+                        // reconciliation progress clears retry_upload and can
+                        // make subsequent work immediately eligible.
+                        upload_due=true;
+                        watch_after=web_time::Instant::now();
+                    },
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
                         health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
-                        force_descriptor_refresh=false; blocked_global_cursor=None;
+                        force_descriptor_refresh=authority_recovery_pending; blocked_global_cursor=None;
+                        upload_due |= baseline_expired.is_some();
                         publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
                     },
                     Err(error) => {
@@ -1780,7 +1974,19 @@ where
                             watch_after=web_time::Instant::now();
                             continue 'worker;
                         }
-                        if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" && !retry_upload { upload_due = true; }
+                        if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" {
+                            if authority_recovery_pending {
+                                // The authenticated descriptor did not prove the
+                                // frozen tuple was included, so keep it intact and
+                                // gated. Retry descriptor/reconciliation after the
+                                // existing backoff; never resend stale coordinates
+                                // just because local notifications accumulated.
+                                force_descriptor_refresh = true;
+                                upload_due = false;
+                            } else if !retry_upload {
+                                upload_due = true;
+                            }
+                        }
                         tracing::warn!(code=%error.code, message=%error.message, "partial reconciliation retained existing working set");
 
                         watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
@@ -1795,14 +2001,22 @@ where
             let shutdown = shutdown_rx.changed().fuse();
             let next = demand_rx.recv().fuse();
             let renewal_enabled = changes.is_some() && baseline_expired.is_none();
+            let gate_local_changes =
+                authority_recovery_pending || retry_upload || baseline_expired.is_some();
             let changed = async {
-                match changes.as_mut() {
-                    Some(receiver) => receiver.changed().await.is_ok(),
-                    None => futures_util::future::pending::<bool>().await,
+                if gate_local_changes {
+                    // Keep local notifications queued until the frozen upload
+                    // is both reconciled and retry-eligible.
+                    futures_util::future::pending::<bool>().await
+                } else {
+                    match changes.as_mut() {
+                        Some(receiver) => receiver.changed().await.is_ok(),
+                        None => futures_util::future::pending::<bool>().await,
+                    }
                 }
             }
             .fuse();
-            let retry_enabled = retry_upload;
+            let retry_enabled = retry_upload && !authority_recovery_pending;
             let retry_at = retry_deadline;
             let retry = async move {
                 if retry_enabled {
@@ -1896,6 +2110,7 @@ where
                         }
                         if let Some(engine) = &engine {
                             baseline_expired = result.as_ref().err().cloned();
+                            authority_recovery_pending = true;
                             force_descriptor_refresh = true;
                             watch_after = web_time::Instant::now();
                             Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, false)).await?;
@@ -1934,6 +2149,7 @@ where
             if let Err(error) = &result {
                 if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                     baseline_expired = Some(error.clone());
+                    authority_recovery_pending = true;
                     force_descriptor_refresh = true;
                     watch_after = web_time::Instant::now();
                 }
@@ -2016,6 +2232,60 @@ mod tests {
             LixError::CODE_STORAGE_CORRUPTION,
             "segment hash mismatch",
         )));
+    }
+
+    #[test]
+    fn independent_lane_progress_does_not_hide_authority_conflict() {
+        let conflict = LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "authority ref changed during publication",
+        );
+        assert_eq!(
+            finish_upload_progress(true, Some(conflict))
+                .unwrap_err()
+                .code,
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "worker must schedule descriptor recovery for a conflict in either lane"
+        );
+
+        assert!(
+            finish_upload_progress(true, Some(LixError::unknown("other lane failed"))).unwrap()
+        );
+        assert!(finish_upload_progress(true, None).unwrap());
+        assert!(!finish_upload_progress(false, None).unwrap());
+    }
+
+    #[test]
+    fn authority_conflict_takes_priority_over_an_earlier_lane_error() {
+        let mut deferred = None;
+        defer_upload_error(
+            &mut deferred,
+            LixError::unknown("earlier lane transport error"),
+        );
+        defer_upload_error(
+            &mut deferred,
+            LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "later authority ref conflict",
+            ),
+        );
+        assert_eq!(
+            finish_upload_progress(true, deferred).unwrap_err().code,
+            LixError::CODE_TRANSACTION_CONFLICT
+        );
+
+        let mut deferred_conflict = Some(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "authority ref conflict",
+        ));
+        defer_upload_error(
+            &mut deferred_conflict,
+            LixError::unknown("later lane transport error"),
+        );
+        assert_eq!(
+            deferred_conflict.unwrap().code,
+            LixError::CODE_TRANSACTION_CONFLICT
+        );
     }
 
     #[tokio::test]
