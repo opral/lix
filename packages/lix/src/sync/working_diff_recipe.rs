@@ -1,7 +1,7 @@
-//! Narrow authority proof for moving working-diff recipes.
+//! Narrow authority proof for bounded diff recipes.
 //!
 //! This module validates recipe shape and proves only that the leased
-//! selected-branch checkpoint is on the leased selected-branch first-parent
+//! selected-branch endpoints are on the leased selected-branch first-parent
 //! lane. It does not turn diff output into row authority or write coverage.
 
 use crate::LixError;
@@ -13,6 +13,7 @@ use crate::sync::PartialReplicaDescriptor;
 use std::collections::BTreeSet;
 
 pub(crate) const MAX_WORKING_DIFF_RECIPE_COUNT: usize = 8;
+pub(crate) const MAX_BOUNDED_DIFF_RECIPE_COUNT: usize = MAX_WORKING_DIFF_RECIPE_COUNT;
 pub(crate) const WORKING_DIFF_RECIPE_FALLBACK_CODE: &str = "LIX_WORKING_DIFF_RECIPE_FALLBACK";
 
 fn invalid(message: &str) -> LixError {
@@ -84,6 +85,123 @@ pub(crate) fn is_supported_working_diff_recipe(interest: &LogicalReadInterest) -
     validate_working_diff_recipes(std::slice::from_ref(interest), branch_id).is_ok()
 }
 
+/// Validate the fixed historical diffs used to render a checkpoint's changed
+/// files. These recipes remain scoped to the selected branch and contain no
+/// live payloads; their commit pair is proved against the leased first-parent
+/// lane before authority-side closure preparation.
+pub(crate) fn validate_fixed_diff_recipes(
+    interests: &[LogicalReadInterest],
+    selected_branch_id: &str,
+) -> Result<(), LixError> {
+    let mut count = 0usize;
+    for interest in interests {
+        let LogicalReadInterest::Diff {
+            branch_id,
+            relation,
+            from,
+            to,
+            filter,
+            retain_payloads,
+            projected_columns,
+            limit,
+        } = interest
+        else {
+            continue;
+        };
+        count += 1;
+        if count > MAX_BOUNDED_DIFF_RECIPE_COUNT {
+            return Err(invalid("fixed diff recipe count limit exceeded"));
+        }
+        let (DiffInterestEndpoint::Fixed(from), DiffInterestEndpoint::Fixed(to)) = (from, to)
+        else {
+            return Err(invalid("fixed diff recipe requires two fixed endpoints"));
+        };
+        if branch_id.as_deref() != Some(selected_branch_id)
+            || !matches!(relation.as_str(), "lix_file" | "lix_directory")
+            || *retain_payloads
+            || limit.is_some()
+            || projected_columns
+                .iter()
+                .any(|column| matches!(column.as_str(), "from_content" | "to_content"))
+        {
+            return Err(invalid("fixed diff recipe is outside the bounded route"));
+        }
+        for (commit, label) in [(from, "from"), (to, "to")] {
+            let parsed = CommitId::parse_lix(commit, &format!("fixed diff {label} commit ID"))?;
+            if !parsed.has_canonical_text(commit) {
+                return Err(LixError::new(
+                    crate::sync::SYNC_PROTOCOL_MISMATCH_CODE,
+                    "fixed diff recipe contains a noncanonical commit ID",
+                ));
+            }
+        }
+        crate::sql2::validate_bounded_history_recipe_shape(
+            relation,
+            filter,
+            projected_columns,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate both bounded authority diff shapes. Candidate warming deliberately
+/// continues to use `validate_working_diff_recipes` alone.
+pub(crate) fn validate_bounded_diff_recipes(
+    interests: &[LogicalReadInterest],
+    selected_branch_id: &str,
+) -> Result<(), LixError> {
+    let mut count = 0usize;
+    for interest in interests {
+        let LogicalReadInterest::Diff { from, to, .. } = interest else {
+            continue;
+        };
+        count += 1;
+        if count > MAX_BOUNDED_DIFF_RECIPE_COUNT {
+            return Err(invalid("bounded diff recipe count limit exceeded"));
+        }
+        match (from, to) {
+            (DiffInterestEndpoint::WorkingCheckpoint, DiffInterestEndpoint::ActiveHead) => {
+                validate_working_diff_recipes(
+                    std::slice::from_ref(interest),
+                    selected_branch_id,
+                )?;
+            }
+            (DiffInterestEndpoint::Fixed(_), DiffInterestEndpoint::Fixed(_)) => {
+                validate_fixed_diff_recipes(
+                    std::slice::from_ref(interest),
+                    selected_branch_id,
+                )?;
+            }
+            _ => return Err(invalid("diff recipe endpoints are outside the bounded route")),
+        }
+    }
+    Ok(())
+}
+
+/// Syntactic authority-recipe eligibility. Branch equality and ancestry are
+/// checked against the actual lease when a fulfillment request is planned.
+pub(crate) fn is_supported_bounded_diff_recipe(interest: &LogicalReadInterest) -> bool {
+    let LogicalReadInterest::Diff {
+        branch_id: Some(branch_id),
+        from,
+        to,
+        ..
+    } = interest
+    else {
+        return false;
+    };
+    match (from, to) {
+        (DiffInterestEndpoint::WorkingCheckpoint, DiffInterestEndpoint::ActiveHead) => {
+            is_supported_working_diff_recipe(interest)
+        }
+        (DiffInterestEndpoint::Fixed(_), DiffInterestEndpoint::Fixed(_)) => {
+            validate_fixed_diff_recipes(std::slice::from_ref(interest), branch_id).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Prove the exact selected-branch checkpoint/head pair in this descriptor
 /// lies on one bounded, strictly generation-decreasing first-parent lane.
 /// Missing ancestry and exhausted budget are fallback outcomes; structural
@@ -111,6 +229,46 @@ where
     let checkpoint = parse_descriptor_commit(&branch.checkpoint.commit_id)?;
     let mut graph = CommitGraphContext::new().reader(read);
     prove_first_parent_ancestor(&mut graph, head, checkpoint, remaining_graph_nodes).await
+}
+
+/// Prove that a fixed diff's `from` endpoint is an ancestor of `to` and that
+/// both endpoints belong to the leased selected-branch first-parent lane.
+pub(crate) async fn prove_selected_branch_fixed_diff_ancestry<R>(
+    read: R,
+    leased_branch_head: &str,
+    from: &str,
+    to: &str,
+    remaining_graph_nodes: &mut usize,
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead,
+{
+    let parse = |value: &str, label: &str| -> Result<CommitId, LixError> {
+        let parsed = CommitId::parse_lix(value, label)?;
+        if !parsed.has_canonical_text(value) {
+            return Err(LixError::new(
+                crate::sync::SYNC_PROTOCOL_MISMATCH_CODE,
+                "fixed diff descriptor contains a noncanonical commit ID",
+            ));
+        }
+        Ok(parsed)
+    };
+    let head = parse(leased_branch_head, "fixed diff leased branch head")?;
+    let from = parse(from, "fixed diff from commit ID")?;
+    let to = parse(to, "fixed diff to commit ID")?;
+    let mut graph = CommitGraphContext::new().reader(read);
+    prove_first_parent_interval(&mut graph, head, from, to, remaining_graph_nodes).await
+}
+
+async fn prove_first_parent_interval<R: CommitGraphReader>(
+    graph: &mut R,
+    head: CommitId,
+    from: CommitId,
+    to: CommitId,
+    remaining_graph_nodes: &mut usize,
+) -> Result<(), LixError> {
+    prove_first_parent_ancestor(graph, head, to, remaining_graph_nodes).await?;
+    prove_first_parent_ancestor(graph, to, from, remaining_graph_nodes).await
 }
 
 async fn prove_first_parent_ancestor<R: CommitGraphReader>(
@@ -201,7 +359,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct Graph {
         nodes: HashMap<CommitId, CommitGraphNode>,
         missing_as_history_demand: bool,
@@ -243,6 +401,27 @@ mod tests {
             },
             retain_payloads: false,
             projected_columns: vec!["id".to_owned()],
+            limit: None,
+        }
+    }
+
+    fn fixed_file_interest(from: &str, to: &str) -> LogicalReadInterest {
+        LogicalReadInterest::Diff {
+            branch_id: Some("branch".to_owned()),
+            relation: "lix_file".to_owned(),
+            from: DiffInterestEndpoint::Fixed(from.to_owned()),
+            to: DiffInterestEndpoint::Fixed(to.to_owned()),
+            filter: TrackedStateFilter {
+                include_tombstones: true,
+                ..TrackedStateFilter::default()
+            },
+            retain_payloads: false,
+            projected_columns: vec![
+                "id".to_owned(),
+                "diff_type".to_owned(),
+                "from_path".to_owned(),
+                "to_path".to_owned(),
+            ],
             limit: None,
         }
     }
@@ -294,6 +473,65 @@ mod tests {
         assert!(validate_working_diff_recipes(&recipes, "branch").is_err());
     }
 
+    #[test]
+    fn accepts_only_selected_branch_fixed_metadata_diffs_for_authority() {
+        let from = id("fixed-from").to_string();
+        let to = id("fixed-to").to_string();
+        let fixed = fixed_file_interest(&from, &to);
+        validate_fixed_diff_recipes(std::slice::from_ref(&fixed), "branch").unwrap();
+        validate_bounded_diff_recipes(std::slice::from_ref(&fixed), "branch").unwrap();
+        assert!(is_supported_bounded_diff_recipe(&fixed));
+        assert!(
+            !is_supported_working_diff_recipe(&fixed),
+            "candidate warming must remain limited to moving diffs"
+        );
+
+        let mut wrong_branch = fixed.clone();
+        if let LogicalReadInterest::Diff { branch_id, .. } = &mut wrong_branch {
+            *branch_id = Some("other-branch".to_owned());
+        }
+        assert!(validate_fixed_diff_recipes(&[wrong_branch], "branch").is_err());
+
+        let mut payload = fixed.clone();
+        if let LogicalReadInterest::Diff {
+            retain_payloads, ..
+        } = &mut payload
+        {
+            *retain_payloads = true;
+        }
+        assert!(validate_fixed_diff_recipes(&[payload], "branch").is_err());
+
+        let mut content = fixed.clone();
+        if let LogicalReadInterest::Diff {
+            projected_columns, ..
+        } = &mut content
+        {
+            projected_columns.push("to_content".to_owned());
+        }
+        assert!(validate_fixed_diff_recipes(&[content], "branch").is_err());
+
+        let mut limited = fixed.clone();
+        if let LogicalReadInterest::Diff { limit, .. } = &mut limited {
+            *limit = Some(1);
+        }
+        assert!(validate_fixed_diff_recipes(&[limited], "branch").is_err());
+
+        let mut wrong_relation = fixed.clone();
+        if let LogicalReadInterest::Diff { relation, .. } = &mut wrong_relation {
+            *relation = "private_table".to_owned();
+        }
+        assert!(validate_fixed_diff_recipes(&[wrong_relation], "branch").is_err());
+
+        let mut moving_endpoint = fixed.clone();
+        if let LogicalReadInterest::Diff { to, .. } = &mut moving_endpoint {
+            *to = DiffInterestEndpoint::ActiveHead;
+        }
+        assert!(validate_fixed_diff_recipes(&[moving_endpoint], "branch").is_err());
+
+        let too_many = vec![fixed; MAX_BOUNDED_DIFF_RECIPE_COUNT + 1];
+        assert!(validate_bounded_diff_recipes(&too_many, "branch").is_err());
+    }
+
     #[tokio::test]
     async fn proves_first_parent_ancestry_and_falls_back_on_wrong_lane() {
         let head = id("head");
@@ -325,6 +563,44 @@ mod tests {
             .unwrap();
         assert_eq!(shared_budget, 0);
         let error = prove_first_parent_ancestor(&mut graph, head, checkpoint, &mut shared_budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, WORKING_DIFF_RECIPE_FALLBACK_CODE);
+    }
+
+    #[tokio::test]
+    async fn proves_fixed_diff_interval_and_falls_back_for_reverse_or_off_lane_pairs() {
+        let head = id("fixed-head");
+        let newer = id("fixed-newer");
+        let to = id("fixed-to");
+        let middle = id("fixed-middle");
+        let from = id("fixed-from");
+        let root = id("fixed-root");
+        let mut graph = Graph::default();
+        graph.nodes.insert(head, node(head, Some(newer), 6));
+        graph.nodes.insert(newer, node(newer, Some(to), 5));
+        graph.nodes.insert(to, node(to, Some(middle), 4));
+        graph.nodes.insert(middle, node(middle, Some(from), 3));
+        graph.nodes.insert(from, node(from, Some(root), 2));
+        graph.nodes.insert(root, node(root, None, 1));
+
+        let mut budget = 6;
+        prove_first_parent_interval(&mut graph, head, from, to, &mut budget)
+            .await
+            .unwrap();
+        assert_eq!(budget, 0);
+
+        let mut graph = graph.clone();
+        let mut budget = 10;
+        let error = prove_first_parent_interval(&mut graph, head, to, from, &mut budget)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, WORKING_DIFF_RECIPE_FALLBACK_CODE);
+
+        let off_lane = id("fixed-off-lane");
+        let mut graph = graph.clone();
+        let mut budget = 12;
+        let error = prove_first_parent_interval(&mut graph, head, off_lane, to, &mut budget)
             .await
             .unwrap_err();
         assert_eq!(error.code, WORKING_DIFF_RECIPE_FALLBACK_CODE);

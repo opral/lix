@@ -1397,7 +1397,8 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .with_embedded_lix_id()
         .await
         .unwrap();
-    let open_cold_replica = |log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>| {
+    let open_cold_replica_with_delay = |log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+                                        delay| {
         let server = server.clone();
         let repository_id = authority.lix_id().to_owned();
         let account_id = authority.active_account_id().to_owned();
@@ -1409,7 +1410,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
                         lose_body: Arc::new(AtomicBool::new(false)),
                     },
                     log,
-                    delay: 0,
+                    delay,
                 },
                 &format!("https://example.test/lix/{repository_id}"),
             )
@@ -1481,6 +1482,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
             (replica, worker, storage, state, transport, engine)
         }
     };
+    let open_cold_replica = |log| open_cold_replica_with_delay(log, 0);
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (replica, worker, ..) = open_cold_replica(log.clone()).await;
     log.lock().unwrap().clear();
@@ -1534,6 +1536,142 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         physical <= 2,
         "bounded public checkpoint history needs operation-sized closure; got {physical} pointer fetches"
     );
+
+    // Match the History UI's checkpoint review query: it takes the selected
+    // commit's first-parent endpoint from `lix_history` and asks for the
+    // relation-scoped fixed Diff. The old native-demand path expands this into
+    // one range request per missing commit/mutation object.
+    let fixed_to = checkpoint_ids.last().unwrap().clone();
+    let parent_rows = authority
+        .execute(
+            "SELECT lixcol_from_commit_id AS parent_commit_id \
+             FROM lix_history('lix_file', $1) \
+             WHERE lixcol_to_commit_id = $1 LIMIT 1",
+            &[Value::Text(fixed_to.clone())],
+        )
+        .await
+        .unwrap();
+    let fixed_from = parent_rows.rows()[0]
+        .get::<String>("parent_commit_id")
+        .unwrap();
+    let fixed_diff_sql = "SELECT id, diff_type, coalesce(to_path, from_path) AS path, from_path, to_path \
+         FROM lix_diff('lix_file', $1, $2) \
+         ORDER BY coalesce(to_path, from_path), id";
+    let fixed_diff_params = [Value::Text(fixed_from), Value::Text(fixed_to)];
+    let fixed_diff_expected = authority
+        .execute(&fixed_diff_sql, &fixed_diff_params)
+        .await
+        .unwrap();
+    assert!(!fixed_diff_expected.rows().is_empty());
+    let diff_values = |result: &ExecuteResult| {
+        result
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("id").unwrap(),
+                    row.get::<String>("diff_type").unwrap(),
+                    row.get::<String>("path").unwrap(),
+                    row.value("from_path").unwrap().clone(),
+                    row.value("to_path").unwrap().clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for delay_ms in [100_u64, 500] {
+        let diff_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (diff_replica, diff_worker, ..) =
+            open_cold_replica_with_delay(diff_log.clone(), delay_ms).await;
+        diff_log.lock().unwrap().clear();
+        let started = Instant::now();
+        let diff_rows = diff_replica
+            .execute(&fixed_diff_sql, &fixed_diff_params)
+            .await
+            .unwrap();
+        let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_budget_ms = if delay_ms == 100 { 3_000.0 } else { 5_000.0 };
+        assert_eq!(diff_values(&diff_rows), diff_values(&fixed_diff_expected));
+        assert!(
+            cold_ms < elapsed_budget_ms,
+            "fixed checkpoint Diff exceeded the {elapsed_budget_ms:.0}ms cold latency budget at {delay_ms}ms RTT: {cold_ms:.1}ms"
+        );
+        let requests = diff_log.lock().unwrap().clone();
+        let recipes = fulfillment_requests(&diff_log);
+        assert!(
+            !recipes.is_empty(),
+            "fixed Diff should use typed fulfillment"
+        );
+        assert!(
+            only_read_fulfillment(&diff_log),
+            "eligible fixed Diff should not fall back to pointer range requests"
+        );
+        eprintln!(
+            "FIXED_CHECKPOINT_DIFF_PROFILE_JSON={}",
+            serde_json::json!({
+                "controlled_rtt_ms": delay_ms,
+                "rows": diff_rows.rows().len(),
+                "cold_ms": cold_ms,
+                "elapsed_budget_ms": elapsed_budget_ms,
+                "fulfillment_calls": recipes.len(),
+                "fulfillment_response_bytes": response_bytes(&recipes),
+                "requests": requests,
+            })
+        );
+        diff_log.lock().unwrap().clear();
+        let warm = diff_replica
+            .execute(&fixed_diff_sql, &fixed_diff_params)
+            .await
+            .unwrap();
+        assert_eq!(diff_values(&warm), diff_values(&fixed_diff_expected));
+        assert!(
+            diff_log.lock().unwrap().is_empty(),
+            "retained fixed checkpoint Diff must execute offline"
+        );
+        diff_replica.close().await.unwrap();
+        diff_worker.abort();
+    }
+
+    // Reversed fixed ranges remain public SQL. The authority must decline the
+    // bounded recipe and let the original native-demand path produce the same
+    // rows instead of treating the optimization's ancestry proof as a query
+    // error.
+    let reverse_diff_params = [fixed_diff_params[1].clone(), fixed_diff_params[0].clone()];
+    let reverse_diff_expected = authority
+        .execute(&fixed_diff_sql, &reverse_diff_params)
+        .await
+        .unwrap();
+    let reverse_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (reverse_replica, reverse_worker, ..) = open_cold_replica(reverse_log.clone()).await;
+    reverse_log.lock().unwrap().clear();
+    let reverse_rows = reverse_replica
+        .execute(&fixed_diff_sql, &reverse_diff_params)
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_values(&reverse_rows),
+        diff_values(&reverse_diff_expected)
+    );
+    let reverse_requests = reverse_log.lock().unwrap().clone();
+    assert!(
+        fulfillment_requests(&reverse_log).len() > 0,
+        "the bounded optimization should report its ancestry fallback"
+    );
+    assert!(
+        reverse_requests.iter().any(|request| {
+            matches!(
+                request["operation"].as_str(),
+                Some(
+                    "native-objects"
+                        | "native-object-range"
+                        | "native-metadata"
+                        | "native-metadata-walk"
+                )
+            )
+        }),
+        "a reversed range must retain the original native-demand fallback"
+    );
+    reverse_replica.close().await.unwrap();
+    reverse_worker.abort();
 
     // Directory history uses the same bounded operation contract, with typed
     // directory identities rather than file IDs. Each checkpoint introduced

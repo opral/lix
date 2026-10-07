@@ -310,17 +310,17 @@ pub(crate) fn annotate_capture(
     }
     let has_diff = snapshot.interests.iter().any(|interest| {
         matches!(interest.as_ref(), LogicalReadInterest::Diff { .. })
-            && !super::working_diff_recipe::is_supported_working_diff_recipe(interest.as_ref())
+            && !super::working_diff_recipe::is_supported_bounded_diff_recipe(interest.as_ref())
     });
     let history_over_budget =
         !history_recipes_within_budget(snapshot.interests.iter().map(|interest| interest.as_ref()));
-    let working_diff_over_budget = snapshot
+    let bounded_diff_over_budget = snapshot
         .interests
         .iter()
         .filter(|interest| matches!(interest.as_ref(), LogicalReadInterest::Diff { .. }))
         .count()
-        > super::working_diff_recipe::MAX_WORKING_DIFF_RECIPE_COUNT;
-    let salvage_current_recipes = has_diff || history_over_budget || working_diff_over_budget;
+        > super::working_diff_recipe::MAX_BOUNDED_DIFF_RECIPE_COUNT;
+    let salvage_current_recipes = has_diff || history_over_budget || bounded_diff_over_budget;
     if salvage_current_recipes && selected_change_payload_locator(&error).is_none() {
         // Historical diffs may name local pending commits. Their specialized
         // demand path owns those endpoints; over-budget History has the same
@@ -450,23 +450,21 @@ pub(super) fn partial_demand_fulfillment_plan(
         )
         .is_ok()
     };
-    let working_diff_count = interests
+    let bounded_diff_count = interests
         .iter()
         .filter(|interest| matches!(interest, LogicalReadInterest::Diff { .. }))
         .count();
     let historical_scope_is_unsupported = !history_recipes_within_budget(interests)
-        || working_diff_count > super::working_diff_recipe::MAX_WORKING_DIFF_RECIPE_COUNT
-        || interests.iter().any(|interest| match interest {
-            LogicalReadInterest::History { .. } => !history_shape_is_supported(interest),
-            LogicalReadInterest::Diff { .. } => {
-                !super::working_diff_recipe::validate_working_diff_recipes(
-                    std::slice::from_ref(interest),
-                    selected_branch_id,
-                )
-                .is_ok()
-            }
-            _ => false,
-        });
+        || bounded_diff_count > super::working_diff_recipe::MAX_BOUNDED_DIFF_RECIPE_COUNT
+        || interests.iter().any(|interest| {
+            matches!(interest, LogicalReadInterest::History { .. })
+                && !history_shape_is_supported(interest)
+        })
+        || super::working_diff_recipe::validate_bounded_diff_recipes(
+            interests,
+            selected_branch_id,
+        )
+        .is_err();
     if !historical_scope_is_unsupported {
         return Some(PartialDemandFulfillmentPlan {
             interests: interests.to_vec(),
@@ -620,7 +618,7 @@ static OPERATION_REFUSAL_MEMO: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new
 
 fn is_bounded_native_recipe(interest: &LogicalReadInterest) -> bool {
     matches!(interest, LogicalReadInterest::History { .. })
-        || super::working_diff_recipe::is_supported_working_diff_recipe(interest)
+        || super::working_diff_recipe::is_supported_bounded_diff_recipe(interest)
 }
 
 fn native_proof_refusal_basis(
@@ -833,7 +831,7 @@ impl ReadFulfillmentRequest {
         {
             return Err(invalid("invalid read fulfillment request"));
         }
-        super::working_diff_recipe::validate_working_diff_recipes(
+        super::working_diff_recipe::validate_bounded_diff_recipes(
             &self.interests,
             &self.descriptor.selected_branch.branch_id,
         )?;

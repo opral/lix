@@ -151,16 +151,44 @@ where
             .iter()
             .map(|interest| interest.as_ref().clone())
             .collect::<Vec<_>>();
-        super::working_diff_recipe::validate_working_diff_recipes(
+        super::working_diff_recipe::validate_bounded_diff_recipes(
             &recipes,
             &descriptor.selected_branch.branch_id,
         )?;
-        super::working_diff_recipe::prove_selected_branch_checkpoint_ancestry(
-            read.clone(),
-            descriptor,
-            &mut history_graph_nodes_remaining,
-        )
-        .await?;
+        let mut working_diff_ancestry_proved = false;
+        for recipe in &recipes {
+            let LogicalReadInterest::Diff { from, to, .. } = recipe else {
+                continue;
+            };
+            match (from, to) {
+                (
+                    crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                    crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                ) if !working_diff_ancestry_proved => {
+                    super::working_diff_recipe::prove_selected_branch_checkpoint_ancestry(
+                        read.clone(),
+                        descriptor,
+                        &mut history_graph_nodes_remaining,
+                    )
+                    .await?;
+                    working_diff_ancestry_proved = true;
+                }
+                (
+                    crate::hot_state::DiffInterestEndpoint::Fixed(from),
+                    crate::hot_state::DiffInterestEndpoint::Fixed(to),
+                ) => {
+                    super::working_diff_recipe::prove_selected_branch_fixed_diff_ancestry(
+                        read.clone(),
+                        &descriptor.selected_branch.head.commit_id,
+                        from,
+                        to,
+                        &mut history_graph_nodes_remaining,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
     }
 
     for interest in &interests.interests {
@@ -274,6 +302,16 @@ where
                 projected_columns,
                 limit: _,
             } => {
+                // Candidate warming remains limited to moving working diffs.
+                // Fixed historical spans are closed only for the exact
+                // foreground operation that asks for them.
+                if matches!(&purpose, NativeReadPreparationPurpose::Candidate { .. })
+                    && !super::working_diff_recipe::is_supported_working_diff_recipe(
+                        interest.as_ref(),
+                    )
+                {
+                    continue;
+                }
                 let from = super::partial_candidate_prepare::endpoint(
                     descriptor,
                     branch_id.as_deref(),
