@@ -182,6 +182,8 @@ datafusion = { version = "55.1.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
+# musli 0.0.149 cannot compile against newer musli-core 0.1.x allocator traits.
+musli-core = { version = "=0.1.4", default-features = false }
 sha2 = "0.10"
 smallvec = "1.15"
 globset = "0.4"
