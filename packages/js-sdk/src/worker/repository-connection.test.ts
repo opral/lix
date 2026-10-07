@@ -122,6 +122,7 @@ test("queues initial open until elected owner connects and rejects stale output"
 });
 
 test("routes the final session-close callback while termination awaits owner cleanup", async () => {
+	const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
 	const c = connection();
 	const client = c.elect();
 	const closing = c.result.terminate();
@@ -133,7 +134,7 @@ test("routes the final session-close callback while termination awaits owner cle
 			kind: "sync.fetch",
 			requestId: 77,
 			request: {
-				url: "https://example.test/lix/v1/repo-a/session",
+				url: `https://example.test/lix/v1/${repositoryId}/session`,
 				method: "DELETE",
 				headers: [["lix-session-id", "session-a"]],
 				response: { mode: "buffered", maxBytes: 128 },

@@ -92,6 +92,7 @@ test("worker observation keeps its creation parent for only the first frame", as
 });
 
 test("worker termination preserves only the remote session-close fetch until disconnect acknowledgment", async () => {
+	const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
 	const sent: WorkerInput[] = [];
 	let receive!: (message: WorkerResponse) => void;
 	let fetchCount = 0;
@@ -103,13 +104,13 @@ test("worker termination preserves only the remote session-close fetch until dis
 		unref() {},
 		async terminate() {
 			receive({ kind: "sync.fetch", requestId: 41, request: {
-				url: "https://example.test/lix/v1/repo-a/sync/pull",
+				url: `https://example.test/lix/v1/${repositoryId}/sync/pull`,
 				method: "POST",
 				headers: [],
 				response: { mode: "buffered", maxBytes: 128 },
 			} });
 			receive({ kind: "sync.fetch", requestId: 42, request: {
-				url: "https://example.test/lix/v1/repo-a/session",
+				url: `https://example.test/lix/v1/${repositoryId}/session`,
 				method: "DELETE",
 				headers: [["lix-session-id", "session-a"]],
 				response: { mode: "buffered", maxBytes: 128 },
@@ -123,12 +124,12 @@ test("worker termination preserves only the remote session-close fetch until dis
 	};
 	const client = new LixWorkerClient(connection, false);
 	client.beginLease(undefined, undefined, {
-		url: "https://example.test/lix/v1/repo-a",
+		url: `https://example.test/lix/${repositoryId}`,
 		headers: [],
 		transport: async ({ url, init }) => {
 			fetchCount++;
 			expect(init?.method).toBe("DELETE");
-			expect(url).toBe("https://example.test/lix/v1/repo-a/session");
+			expect(url).toBe(`https://example.test/lix/v1/${repositoryId}/session`);
 			return new Response(null, { status: 204 });
 		},
 	});
@@ -137,7 +138,7 @@ test("worker termination preserves only the remote session-close fetch until dis
 	expect(client.isDisposed).toBe(true);
 	expect(sent.filter((message) => "kind" in message && message.kind === "sync.fetch.result")).toHaveLength(1);
 	receive({ kind: "sync.fetch", requestId: 43, request: {
-		url: "https://example.test/lix/v1/repo-a/session",
+		url: `https://example.test/lix/v1/${repositoryId}/session`,
 		method: "DELETE",
 		headers: [["lix-session-id", "session-a"]],
 		response: { mode: "buffered", maxBytes: 128 },
@@ -146,6 +147,8 @@ test("worker termination preserves only the remote session-close fetch until dis
 });
 
 test("worker termination routes only a scoped recovery session DELETE through its server", async () => {
+	const primaryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+	const recoveryId = "01936f4e-7b6c-7c3d-8f9a-abcdefabcdef";
 	const sent: WorkerInput[] = [];
 	let receive!: (message: WorkerResponse) => void;
 	let activeScope: number | undefined;
@@ -159,13 +162,13 @@ test("worker termination routes only a scoped recovery session DELETE through it
 		unref() {},
 		async terminate() {
 			receive({ kind: "sync.fetch", requestId: 51, transportScope: 999, request: {
-				url: "https://recovery.test/lix/v1/repo-b/session",
+				url: `https://recovery.test/lix/v1/${recoveryId}/session`,
 				method: "DELETE",
 				headers: [["lix-session-id", "session-b"]],
 				response: { mode: "buffered", maxBytes: 128 },
 			} });
 			receive({ kind: "sync.fetch", requestId: 52, transportScope: activeScope, request: {
-				url: "https://recovery.test/lix/v1/repo-b/session",
+				url: `https://recovery.test/lix/v1/${recoveryId}/session`,
 				method: "DELETE",
 				headers: [["lix-session-id", "session-b"]],
 				response: { mode: "buffered", maxBytes: 128 },
@@ -179,7 +182,7 @@ test("worker termination routes only a scoped recovery session DELETE through it
 	};
 	const client = new LixWorkerClient(connection, false);
 	client.beginLease(undefined, undefined, {
-		url: "https://primary.test/lix/v1/repo-a",
+		url: `https://primary.test/lix/${primaryId}`,
 		headers: [],
 		transport: async () => {
 			primaryFetches++;
@@ -187,7 +190,7 @@ test("worker termination routes only a scoped recovery session DELETE through it
 		},
 	});
 	await client.withRecoveryServer({
-		url: "https://recovery.test/lix/v1/repo-b",
+		url: `https://recovery.test/lix/${recoveryId}`,
 		headers: [],
 		transport: async ({ init }) => {
 			scopedFetches++;

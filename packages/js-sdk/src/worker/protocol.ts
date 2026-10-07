@@ -46,12 +46,16 @@ export function isSessionCloseRequest(request: {
 	try {
 		const url = new URL(request.url);
 		const sessionId = new Headers(headers).get("lix-session-id");
-		if (!/^\/lix\/v1\/[^/]+\/session\/?$/.test(url.pathname) ||
-			!sessionId?.trim()) return false;
+		const sessionPath = /^\/lix\/v1\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/session\/?$/;
+		const sessionMatch = sessionPath.exec(url.pathname);
+		if (!sessionMatch || url.search || url.hash || url.username || url.password || !sessionId?.trim()) return false;
 		if (authorityUrl !== undefined) {
 			const authority = new URL(authorityUrl.toString());
-			const expectedPath = `${authority.pathname.replace(/\/+$/, "")}/session`;
-			if (url.origin !== authority.origin || url.pathname !== expectedPath) return false;
+			const authorityMatch = /^\/lix\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(authority.pathname);
+			if (
+				!authorityMatch || authority.search || authority.hash || authority.username || authority.password ||
+				url.origin !== authority.origin || sessionMatch[1] !== authorityMatch[1]
+			) return false;
 		}
 		return true;
 	} catch {

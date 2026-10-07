@@ -61,6 +61,7 @@ test("concurrent clients share one root and independent local sessions", async (
 });
 
 test("final detach keeps its transport only for the exact session DELETE", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
   let transport!: SyncServerBindingOptions;
   let disconnected = false;
   let owner!: SharedEngineOwner;
@@ -70,13 +71,13 @@ test("final detach keeps its transport only for the exact session DELETE", async
     openAnotherSession: async () => ({ close: async () => {} }) as unknown as LixBinding,
     close: async () => {
       const close = await transport.transport!({
-        url: "https://example.test/lix/v1/repo-a/session",
+        url: `https://example.test/lix/v1/${repositoryId}/session`,
         init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
         response: { mode: "buffered", maxBytes: 128 },
       });
       expect(close.status).toBe(204);
       await expect(transport.transport!({
-        url: "https://example.test/lix/v1/repo-a/sync/pull",
+        url: `https://example.test/lix/v1/${repositoryId}/sync/pull`,
         init: { method: "POST" },
         response: { mode: "buffered", maxBytes: 128 },
       })).rejects.toMatchObject({ code: "LIX_TRANSPORT_UNAVAILABLE" });
@@ -84,7 +85,7 @@ test("final detach keeps its transport only for the exact session DELETE", async
   } as unknown as LixBinding;
   const client: SharedEngineClient = {
     server: {
-      url: "https://example.test/lix/v1/repo-a",
+      url: `https://example.test/lix/${repositoryId}`,
       headers: [["authorization", "token"]],
       transport: async ({ url, init }) => {
         sent.push(`${init?.method}:${url}`);
@@ -93,7 +94,7 @@ test("final detach keeps its transport only for the exact session DELETE", async
     },
     isDisconnected: () => disconnected,
     verifyIdentity: async () => ({
-      authorityUrl: "https://example.test/lix/v1/repo-a",
+      authorityUrl: `https://example.test/lix/${repositoryId}`,
       accountId: "account-a",
       headers: [["authorization", "token"]],
     }),
@@ -105,7 +106,7 @@ test("final detach keeps its transport only for the exact session DELETE", async
   await owner.attach(client);
   disconnected = true;
   await owner.detach(client);
-  expect(sent).toEqual(["DELETE:https://example.test/lix/v1/repo-a/session"]);
+  expect(sent).toEqual([`DELETE:https://example.test/lix/v1/${repositoryId}/session`]);
   expect(owner.lifecycleState).toBe("closed");
 });
 
@@ -135,6 +136,7 @@ test("failed final root close retains the owner fence", async () => {
 });
 
 test("failed initial admission retains its authenticated transport through root cleanup", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
   let transport!: SyncServerBindingOptions;
   const sent: string[] = [];
   const root = {
@@ -142,7 +144,7 @@ test("failed initial admission retains its authenticated transport through root 
     openAnotherSession: async () => ({ close: async () => {} }) as unknown as LixBinding,
     close: async () => {
       await transport.transport!({
-        url: "https://example.test/lix/v1/repo-a/session",
+        url: `https://example.test/lix/v1/${repositoryId}/session`,
         init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
         response: { mode: "buffered", maxBytes: 128 },
       });
@@ -154,7 +156,7 @@ test("failed initial admission retains its authenticated transport through root 
   });
   const client: SharedEngineClient = {
     server: {
-      url: "https://example.test/lix/v1/repo-a",
+      url: `https://example.test/lix/${repositoryId}`,
       headers: [["authorization", "token"]],
       transport: async ({ init }) => {
         sent.push(init?.method ?? "GET");
@@ -162,7 +164,7 @@ test("failed initial admission retains its authenticated transport through root 
       },
     },
     verifyIdentity: async () => ({
-      authorityUrl: "https://example.test/lix/v1/repo-a",
+      authorityUrl: `https://example.test/lix/${repositoryId}`,
       accountId: "account-a",
       headers: [["authorization", "token"]],
     }),

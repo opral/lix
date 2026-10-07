@@ -645,6 +645,7 @@ test("worker disconnect during header handoff retires the paired client fetch", 
 });
 
 test("worker teardown permits only the scoped session DELETE until owner detach completes", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
   const replies: WorkerResponse[] = [];
   const forwarded: string[] = [];
   let receive!: (message: WorkerInput) => void;
@@ -674,31 +675,32 @@ test("worker teardown permits only the scoped session DELETE until owner detach 
     storage: { kind: "memory" },
     telemetryEnabled: false,
     progressEnabled: false,
-    server: { url: "https://example.test/lix/v1/repo-a", headers: [] },
+    server: { url: `https://example.test/lix/${repositoryId}`, headers: [] },
   } });
   await vi.waitFor(() => expect(replies).toContainEqual({ id: 1, ok: true }));
   await host.close(async () => {
     await expect(transport({
-      url: "https://example.test/lix/v1/repo-a/sync/pull",
+      url: `https://example.test/lix/v1/${repositoryId}/sync/pull`,
       init: { method: "POST" },
       response: { mode: "buffered", maxBytes: 128 },
     })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
     const response = await transport({
-      url: "https://example.test/lix/v1/repo-a/session",
+      url: `https://example.test/lix/v1/${repositoryId}/session`,
       init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
       response: { mode: "buffered", maxBytes: 128 },
     });
     expect(response.status).toBe(204);
   });
-  expect(forwarded).toEqual(["DELETE:https://example.test/lix/v1/repo-a/session"]);
+  expect(forwarded).toEqual([`DELETE:https://example.test/lix/v1/${repositoryId}/session`]);
   await expect(transport({
-    url: "https://example.test/lix/v1/repo-a/session",
+    url: `https://example.test/lix/v1/${repositoryId}/session`,
     init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
     response: { mode: "buffered", maxBytes: 128 },
   })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
 });
 
 test("worker teardown disables its session DELETE lane after owner detach fails", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
   const replies: WorkerResponse[] = [];
   let receive!: (message: WorkerInput) => void;
   let transport!: import("../http-transport.js").HttpTransport;
@@ -723,20 +725,20 @@ test("worker teardown disables its session DELETE lane after owner detach fails"
     storage: { kind: "memory" },
     telemetryEnabled: false,
     progressEnabled: false,
-    server: { url: "https://example.test/lix/v1/repo-a", headers: [] },
+    server: { url: `https://example.test/lix/${repositoryId}`, headers: [] },
   } });
   await vi.waitFor(() => expect(replies).toContainEqual({ id: 1, ok: true }));
   const closeError = new Error("owner detach failed");
   await expect(host.close(async () => {
     await transport({
-      url: "https://example.test/lix/v1/repo-a/session",
+      url: `https://example.test/lix/v1/${repositoryId}/session`,
       init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
       response: { mode: "buffered", maxBytes: 128 },
     });
     throw closeError;
   })).rejects.toBe(closeError);
   await expect(transport({
-    url: "https://example.test/lix/v1/repo-a/session",
+    url: `https://example.test/lix/v1/${repositoryId}/session`,
     init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
     response: { mode: "buffered", maxBytes: 128 },
   })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
