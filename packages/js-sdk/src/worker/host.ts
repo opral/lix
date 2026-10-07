@@ -600,17 +600,20 @@ export function startWorkerHost(
 			pendingSyncFetch.set(requestId, { resolve, reject });
 			endpoint.postMessage({ kind: "sync.fetch", requestId, request, transportScope });
 		});
+		let responseController: ReadableStreamDefaultController<Uint8Array> | undefined;
 		const abort = () => {
+			const error = transportAbortFailure(init?.signal);
 			const pending = pendingSyncFetch.get(requestId);
 			pendingSyncFetch.delete(requestId);
 			if (pending) {
-				pending.reject(transportAbortFailure(init?.signal));
+				pending.reject(error);
 			}
 			const pull = pendingSyncStreamPulls.get(requestId);
 			pendingSyncStreamPulls.delete(requestId);
+			// Cancellation belongs to the response, including when backpressure
+			// means there is no active pull RPC to reject.
+			responseController?.error(error);
 			if (pull) {
-				const error = transportAbortFailure(init?.signal);
-				pull.controller.error(error);
 				pull.reject(error);
 			}
 			endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
@@ -643,6 +646,7 @@ export function startWorkerHost(
 					signal?.removeEventListener("abort", abort),
 				);
 				const body = new ReadableStream<Uint8Array>({
+					start: (controller) => { responseController = controller; },
 					pull: (controller) =>
 						new Promise<void>((resolve, reject) => {
 							pendingSyncStreamPulls.set(requestId, {

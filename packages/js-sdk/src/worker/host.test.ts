@@ -462,3 +462,45 @@ for (const reasonName of ["TimeoutError", "AbortError"] as const) {
     });
   }
 }
+
+for (const reasonName of ["TimeoutError", "AbortError"] as const) {
+  test(`worker stream abort reaches a backpressured body (${reasonName})`, async () => {
+    const responses: WorkerResponse[] = [];
+    let receive!: (message: WorkerInput) => void;
+    let transport!: import("../http-transport.js").HttpTransport;
+    const host = startWorkerHost({
+      postMessage: message => {responses.push(message);},
+      onMessage: listener => {receive = listener;},
+    }, async (_storage, _telemetry, _parent, server) => {
+      transport = server!.transport!;
+      return {setTelemetryParent() {}, close: async () => {}} as unknown as LixBinding;
+    });
+    try {
+      receive({id: 1, sessionId: 0, operation: {
+        kind: "open", storage: {kind: "memory"}, server: {url: "https://example.test", headers: []},
+      }});
+      await vi.waitFor(() => expect(responses).toContainEqual({id: 1, ok: true}));
+      const controller = new AbortController();
+      const pending = transport({url: "https://example.test", init: {signal: controller.signal}, response: {mode: "streaming"}});
+      const message = responses.find(message => "kind" in message && message.kind === "sync.fetch");
+      if (!message || !("requestId" in message)) throw new Error("Missing fetch request");
+      receive({kind: "sync.fetch.result", requestId: message.requestId, result: {
+        ok: true, response: {streaming: true, status: 200, statusText: "OK", headers: []},
+      }});
+      const response = await pending;
+      await vi.waitFor(() => expect(responses).toContainEqual({kind: "sync.fetch.stream.pull", requestId: message.requestId}));
+      receive({kind: "sync.fetch.stream.result", requestId: message.requestId, result: {
+        ok: true, done: false, chunk: new Uint8Array([7]),
+      }});
+      // With one queued chunk the producer is backpressured: no RPC pull is pending.
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      const pulls = responses.filter(message => "kind" in message && message.kind === "sync.fetch.stream.pull").length;
+      expect(pulls).toBe(1);
+      controller.abort(new DOMException("cancelled while backpressured", reasonName));
+      await expect(response.body!.getReader().read()).rejects.toMatchObject({
+        code: reasonName === "TimeoutError" ? "LIX_TRANSPORT_NETWORK" : "LIX_TRANSPORT_ABORTED",
+      });
+      expect(responses.filter(message => "kind" in message && message.kind === "sync.fetch.stream.pull")).toHaveLength(pulls);
+    } finally {await host.close();}
+  });
+}
