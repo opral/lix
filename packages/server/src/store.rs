@@ -2085,6 +2085,18 @@ fn delete_retired_cache_child(retired: &Path) -> Result<()> {
 }
 
 fn delete_cache_directory(path: &Path, label: &str) -> Result<()> {
+    delete_cache_directory_with_listing(path, label, &|path| fs::read_dir(path))
+}
+
+// Cache retirement is idempotent. Another cleanup may have already removed
+// an entry after enumeration; only absence is success, never unsafe paths or
+// other I/O failures. The listing boundary also permits a deterministic race
+// regression without sleeps or probabilistic thread scheduling.
+fn delete_cache_directory_with_listing(
+    path: &Path,
+    label: &str,
+    list: &impl Fn(&Path) -> std::io::Result<fs::ReadDir>,
+) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2095,11 +2107,24 @@ fn delete_cache_directory(path: &Path, label: &str) -> Result<()> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         anyhow::bail!("refuse to delete non-directory {label} {}", path.display());
     }
-    for entry in fs::read_dir(path).with_context(|| format!("list {label} {}", path.display()))? {
+    let entries = match list(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("list {label} {}", path.display()));
+        }
+    };
+    for entry in entries {
         let entry = entry.with_context(|| format!("read {label} {}", path.display()))?;
         let child = entry.path();
-        let child_metadata = fs::symlink_metadata(&child)
-            .with_context(|| format!("inspect {label} entry {}", child.display()))?;
+        let child_metadata = match fs::symlink_metadata(&child) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect {label} entry {}", child.display()));
+            }
+        };
         if child_metadata.file_type().is_symlink() {
             anyhow::bail!(
                 "refuse to recurse through symlink in {label} {}",
@@ -2107,10 +2132,16 @@ fn delete_cache_directory(path: &Path, label: &str) -> Result<()> {
             );
         }
         if child_metadata.is_dir() {
-            delete_cache_directory(&child, label)?;
+            delete_cache_directory_with_listing(&child, label, list)?;
         } else if child_metadata.is_file() {
-            fs::remove_file(&child)
-                .with_context(|| format!("delete {label} file {}", child.display()))?;
+            match fs::remove_file(&child) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("delete {label} file {}", child.display()));
+                }
+            }
         } else {
             anyhow::bail!(
                 "refuse to delete non-file entry in {label} {}",
@@ -2118,7 +2149,11 @@ fn delete_cache_directory(path: &Path, label: &str) -> Result<()> {
             );
         }
     }
-    fs::remove_dir(path).with_context(|| format!("delete {label} {}", path.display()))
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("delete {label} {}", path.display())),
+    }
 }
 
 fn reap_retired_cache_children(root_folder: &Path) -> Result<()> {
@@ -3555,6 +3590,27 @@ mod tests {
             "manager state must drop before releasing the cache-root lease"
         );
         CacheRootLease::acquire(&root.0).expect("lease is released after manager state drops");
+    }
+
+    #[test]
+    fn retired_cache_cleanup_accepts_directory_disappearance_after_inspection() {
+        let root = TestCacheRoot::new("cache-delete-disappearance");
+        let cache = root.0.join("retired");
+        let wal = cache.join("nested/wal");
+        fs::create_dir_all(&wal).expect("create retired WAL");
+        fs::write(wal.join("segment"), b"disposable cache").expect("write cache");
+        let disappeared = std::cell::Cell::new(false);
+        delete_cache_directory_with_listing(&cache, "retired cache child", &|path| {
+            if path == wal {
+                fs::remove_dir_all(path).expect("concurrent cleanup removes inspected WAL");
+                disappeared.set(true);
+            }
+            fs::read_dir(path)
+        })
+        .expect("already deleted cache is successful cleanup");
+        assert!(disappeared.get(), "exercise the nested inspect/list race");
+        assert!(!cache.exists());
+        delete_retired_cache_child(&cache).expect("repeated cleanup succeeds");
     }
 
     #[test]
