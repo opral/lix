@@ -6,6 +6,7 @@ import type {
 	WorkerResponse,
 } from "./protocol.js";
 import { startWorkerHost } from "./host.js";
+import { LixWorkerClient } from "./client.js";
 
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
@@ -538,9 +539,56 @@ for (const reasonName of ["TimeoutError", "AbortError"] as const) {
       const pulls = responses.filter(message => "kind" in message && message.kind === "sync.fetch.stream.pull").length;
       expect(pulls).toBe(1);
       await host.close();
+      expect(responses).toContainEqual({kind: "sync.fetch.cancel", requestId: message.requestId});
       await expect(response.body!.getReader().read()).rejects.toMatchObject({
         code: "LIX_ERROR_CLOSED",
       });
       expect(responses.filter(message => "kind" in message && message.kind === "sync.fetch.stream.pull")).toHaveLength(pulls);
     } finally {await host.close();}
   });
+
+test("worker disconnect cancels the paired client's retained fetch and reader", async () => {
+  let receiveHost!: (message: WorkerInput) => void;
+  let receiveClient!: (message: WorkerResponse) => void;
+  let transport!: import("../http-transport.js").HttpTransport;
+  let fetchSignal: AbortSignal | undefined;
+  let cancelled = false;
+  const replies: WorkerResponse[] = [];
+  const client = new LixWorkerClient({
+    postMessage: message => {queueMicrotask(() => receiveHost(message));},
+    onMessage: listener => {receiveClient = listener;},
+    onFatal() {}, ref() {}, unref() {}, async terminate() {},
+  });
+  client.beginLease(undefined, undefined, {
+    url: "https://example.test",
+    fetch: async (_input, init) => {
+      fetchSignal = init?.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {controller.enqueue(new Uint8Array([7]));},
+        cancel() {cancelled = true;},
+      }));
+    },
+  });
+  const host = startWorkerHost({
+    postMessage: message => {replies.push(message); queueMicrotask(() => receiveClient(message));},
+    onMessage: listener => {receiveHost = listener;},
+  }, async (_storage, _telemetry, _parent, server) => {
+    transport = server!.transport!;
+    return {setTelemetryParent() {}, close: async () => {}} as unknown as LixBinding;
+  });
+  try {
+    receiveHost({id: 1, sessionId: 0, operation: {
+      kind: "open", storage: {kind: "memory"}, server: {url: "https://example.test", headers: []},
+    }});
+    await vi.waitFor(() => expect(replies).toContainEqual({id: 1, ok: true}));
+    const response = await transport({url: "https://example.test", init: {}, response: {mode: "streaming"}});
+    await vi.waitFor(() => expect(replies.some(message => "kind" in message && message.kind === "sync.fetch.stream.pull")).toBe(true));
+    for (let index = 0; index < 10; index++) await Promise.resolve();
+    expect(fetchSignal?.aborted).toBe(false);
+    expect(cancelled).toBe(false);
+    await host.close();
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(fetchSignal?.aborted).toBe(true);
+    await expect(response.body!.getReader().read()).rejects.toMatchObject({code: "LIX_ERROR_CLOSED"});
+  } finally {await host.close();}
+});

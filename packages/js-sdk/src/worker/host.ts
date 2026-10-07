@@ -500,6 +500,18 @@ export function startWorkerHost(
         if (closed) return;
         closed = true;
         const failure = workerStateError("Worker client disconnected");
+        const activeFetches = new Set([
+            ...pendingSyncFetch.keys(),
+            ...syncStreamCleanup.keys(),
+            ...pendingSyncStreamPulls.keys(),
+        ]);
+        for (const requestId of activeFetches) {
+            // The peer may still own a fetch/reader even with no pull pending.
+            // A disconnected channel cannot receive cancellation; local close
+            // must still retire all streams and database handles in that case.
+            try { endpoint.postMessage({ kind: "sync.fetch.cancel", requestId }); }
+            catch { /* The peer has already disconnected. */ }
+        }
         for (const pending of pendingSyncHeaders.values()) pending.reject(failure);
         pendingSyncHeaders.clear();
         for (const pending of pendingSyncFetch.values()) pending.reject(failure);
