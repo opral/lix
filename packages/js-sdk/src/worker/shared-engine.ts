@@ -11,6 +11,7 @@ export type SharedEngineClient = {
   progress?: OpenProgressDispatch;
   commitIdentity?(): void | Promise<void>;
   rejectCredentials?(headers: [string, string][]): void | Promise<void>;
+  clearTeardownCredentials?(): void;
   verifyIdentity(): Promise<{ authorityUrl: string; accountId: string; headers: [string, string][]; online?: boolean; report?: LixOpenReport }>;
 };
 
@@ -65,8 +66,10 @@ export class SharedEngineOwner {
             this.principalId = undefined;
             this.clients.delete(client);
             this.closingClient = undefined;
+            client.clearTeardownCredentials?.();
           } else {
             this.clients.delete(client);
+            client.clearTeardownCredentials?.();
           }
           this.state = "closed";
           throw error;
@@ -124,8 +127,10 @@ export class SharedEngineOwner {
           this.clients.delete(client);
           this.closingClient = undefined;
           this.state = "closed";
+          client.clearTeardownCredentials?.();
         } else {
           this.clients.delete(client);
+          client.clearTeardownCredentials?.();
         }
         throw error;
       }
@@ -139,19 +144,23 @@ export class SharedEngineOwner {
     const operation = this.queue.then(async () => {
       if (client.isDisconnected?.()) throw new Error("Shared engine client disconnected before conversion");
       if (this.root) {
-        const identity = await client.verifyIdentity();
-        if (client.server.url !== identity.authorityUrl ||
-            this.principalId !== identity.accountId) {
-          throw Object.assign(new Error("Shared engine repository/account does not match this client"),
-            { code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH" });
+        try {
+          const identity = await client.verifyIdentity();
+          if (client.server.url !== identity.authorityUrl ||
+              this.principalId !== identity.accountId) {
+            throw Object.assign(new Error("Shared engine repository/account does not match this client"),
+              { code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH" });
+          }
+          if (branchId !== undefined && branchId !== await this.root.activeBranchId()) {
+            throw Object.assign(new Error("The converted replica selected a different branch"),
+              { code: "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH" });
+          }
+          // A competing caller already admitted the converted partial store.
+          // Never close its live sessions just to repeat an explicit conversion.
+          return;
+        } finally {
+          if (!this.clients.has(client)) client.clearTeardownCredentials?.();
         }
-        if (branchId !== undefined && branchId !== await this.root.activeBranchId()) {
-          throw Object.assign(new Error("The converted replica selected a different branch"),
-            { code: "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH" });
-        }
-        // A competing caller already admitted the converted partial store.
-        // Never close its live sessions just to repeat an explicit conversion.
-        return;
       }
       if (this.state !== "closed") throw new HttpTransportError("LIX_OWNER_NOT_CLOSED", "Migration requires a closed storage owner");
       this.state = "migration-exclusive";
@@ -161,6 +170,7 @@ export class SharedEngineOwner {
       } finally {
         this.clients.delete(client);
         this.state = "closed";
+        client.clearTeardownCredentials?.();
       }
     });
     this.queue = operation.catch(() => undefined);
@@ -169,6 +179,7 @@ export class SharedEngineOwner {
 
   deactivate(client: SharedEngineClient): void {
     this.clients.delete(client);
+    client.clearTeardownCredentials?.();
   }
 
   async detach(client: SharedEngineClient): Promise<void> {
@@ -185,8 +196,10 @@ export class SharedEngineOwner {
         this.root = undefined;
         this.principalId = undefined;
         this.state = "closed";
+        client.clearTeardownCredentials?.();
       } else {
         this.clients.delete(client);
+        client.clearTeardownCredentials?.();
       }
     });
     this.queue = operation.catch(() => undefined);
@@ -211,7 +224,16 @@ export class SharedEngineOwner {
           if (client.isDisconnected?.() && !teardown) continue;
           const server = client.server;
           let supplied: [string, string][];
-          try { supplied = (server.headerProvider ? await server.headerProvider() : server.headers).map(([name, value]) => [name, value]); }
+          try {
+            if (teardown && !server.teardownHeaders) {
+              throw new HttpTransportError(
+                "LIX_TRANSPORT_UNAVAILABLE",
+                "No admitted credentials are available for session teardown",
+              );
+            }
+            const provider = teardown ? server.teardownHeaders : server.headerProvider;
+            supplied = (provider ? await provider() : server.headers).map(([name, value]) => [name, value]);
+          }
           catch (error) { unavailable = error; continue; }
           if (!this.clients.has(client) || (client.isDisconnected?.() && !teardown)) continue;
           const headers = new Headers(request.init.headers);

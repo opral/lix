@@ -541,7 +541,7 @@ for (const reasonName of ["TimeoutError", "AbortError"] as const) {
       await host.close();
       expect(responses).toContainEqual({kind: "sync.fetch.cancel", requestId: message.requestId});
       await expect(response.body!.getReader().read()).rejects.toMatchObject({
-        code: "LIX_ERROR_CLOSED",
+        code: "LIX_TRANSPORT_ABORTED",
       });
       expect(responses.filter(message => "kind" in message && message.kind === "sync.fetch.stream.pull")).toHaveLength(pulls);
     } finally {await host.close();}
@@ -589,7 +589,7 @@ test("worker disconnect cancels the paired client's retained fetch and reader", 
     await host.close();
     await vi.waitFor(() => expect(cancelled).toBe(true));
     expect(fetchSignal?.aborted).toBe(true);
-    await expect(response.body!.getReader().read()).rejects.toMatchObject({code: "LIX_ERROR_CLOSED"});
+    await expect(response.body!.getReader().read()).rejects.toMatchObject({code: "LIX_TRANSPORT_ABORTED"});
   } finally {await host.close();}
 });
 
@@ -635,7 +635,7 @@ test("worker disconnect during header handoff retires the paired client fetch", 
     }});
     await vi.waitFor(() => expect(replies).toContainEqual({id: 1, ok: true}));
     await expect(transport({url: "https://example.test", init: {}, response: {mode: "streaming"}}))
-      .rejects.toMatchObject({code: "LIX_ERROR_CLOSED"});
+      .rejects.toMatchObject({code: "LIX_TRANSPORT_ABORTED"});
     await closing;
     await vi.waitFor(() => expect(cancelled).toBe(true));
     expect(fetchSignal?.aborted).toBe(true);

@@ -51,6 +51,10 @@ export function createRepositoryHost() {
 					raw.headerProvider ? await raw.headerProvider() : raw.headers;
 				let verifiedKey: string | undefined;
 				let verifiedGeneration: number | undefined;
+				let teardownCredential: {
+					identity: AdmissionIdentity;
+					headers: [string, string][];
+				} | undefined;
 				let candidateIdentity: AdmissionIdentity | undefined;
 				let candidateHeaders: [string, string][] | undefined;
 				let candidateOnline = false;
@@ -104,6 +108,11 @@ export function createRepositoryHost() {
 						const code = (error as { code?: string })?.code;
 						if (code === "LIX_ADMISSION_AUTH_REJECTED") {
 							if (
+								teardownCredential &&
+								sharedCredentialKey(raw.url, teardownCredential.headers) ===
+									sharedCredentialKey(raw.url, headers)
+							) teardownCredential = undefined;
+							if (
 								candidateHeaders &&
 								sharedCredentialKey(raw.url, candidateHeaders) ===
 									sharedCredentialKey(raw.url, headers)
@@ -137,6 +146,12 @@ export function createRepositoryHost() {
 					if (result.online) {
 						verifiedKey = sharedCredentialKey(raw.url, headers);
 						verifiedGeneration = credentialGeneration;
+						if (!rootIdentity || sameAdmission(result.identity, rootIdentity)) {
+							teardownCredential = {
+								identity: result.identity,
+								headers: headers.map(([name, value]) => [name, value]),
+							};
+						}
 					}
 					candidateCredentialGeneration = credentialGeneration;
 					candidateGeneration++;
@@ -147,6 +162,19 @@ export function createRepositoryHost() {
 				};
 				const routed: SyncServerBindingOptions = {
 					...raw,
+					teardownHeaders: async () => {
+						const credential = teardownCredential;
+						if (
+							!credential ||
+							(rootIdentity && !sameAdmission(credential.identity, rootIdentity))
+						) {
+							throw new HttpTransportError(
+								"LIX_TRANSPORT_UNAVAILABLE",
+								"No previously admitted credentials are available for session teardown",
+							);
+						}
+						return credential.headers.map(([name, value]) => [name, value]);
+					},
 					transport: async (request) => {
 						try {
 							const response = await transport(request);
@@ -199,6 +227,10 @@ export function createRepositoryHost() {
 						const rejectedKey = sharedCredentialKey(raw.url, headers);
 						if (verifiedKey === rejectedKey) verifiedKey = undefined;
 						if (
+							teardownCredential &&
+							sharedCredentialKey(raw.url, teardownCredential.headers) === rejectedKey
+						) teardownCredential = undefined;
+						if (
 							candidateHeaders &&
 							sharedCredentialKey(raw.url, candidateHeaders) === rejectedKey
 						) {
@@ -207,6 +239,9 @@ export function createRepositoryHost() {
 						}
 						admitted.remove(raw.url, headers);
 						await localAdmission.remove(headers).catch(() => undefined);
+					},
+					clearTeardownCredentials: () => {
+						teardownCredential = undefined;
 					},
 					commitIdentity: async () => {
 						if (!candidateIdentity)

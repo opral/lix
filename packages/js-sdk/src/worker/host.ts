@@ -532,21 +532,24 @@ export function startWorkerHost(
         };
         try {
           const failure = workerStateError("Worker client disconnected");
+          const fetchFailure = transportAbortFailure();
           for (const requestId of Array.from(activeSyncFetches)) {
             // The peer may still own a fetch/reader even with no pull pending.
             // A disconnected channel cannot receive cancellation; local close
             // must still retire all streams and database handles in that case.
-            captureSync(() => cancelSyncFetch(requestId, failure));
+            captureSync(() => cancelSyncFetch(requestId, fetchFailure));
           }
-          for (const pending of pendingSyncHeaders.values()) captureSync(() => pending.reject(failure));
+          for (const pending of pendingSyncHeaders.values())
+            captureSync(() => pending.reject(failure));
           pendingSyncHeaders.clear();
-          for (const pending of pendingSyncFetch.values()) captureSync(() => pending.reject(failure));
+          for (const pending of pendingSyncFetch.values())
+            captureSync(() => pending.reject(fetchFailure));
           pendingSyncFetch.clear();
-          for (const cleanup of syncStreamCleanup.values()) captureSync(() => cleanup(failure));
+          for (const cleanup of syncStreamCleanup.values()) captureSync(() => cleanup(fetchFailure));
           syncStreamCleanup.clear();
           for (const pending of pendingSyncStreamPulls.values()) {
-            captureSync(() => pending.controller.error(failure));
-            captureSync(() => pending.reject(failure));
+            captureSync(() => pending.controller.error(fetchFailure));
+            captureSync(() => pending.reject(fetchFailure));
           }
           pendingSyncStreamPulls.clear();
           await capture(async () => {
@@ -684,7 +687,7 @@ export function startWorkerHost(
 		let streamEstablished = false;
 		try {
 			const resolved = await response;
-			if (closed && !closingSession) throw workerStateError("Worker client disconnected");
+			if (closed && !closingSession) throw transportAbortFailure();
 			if (resolved.streaming) {
 				const signal = init?.signal;
 				if (signal?.aborted) {

@@ -87,6 +87,7 @@ test("final detach keeps its transport only for the exact session DELETE", async
     server: {
       url: `https://example.test/lix/${repositoryId}`,
       headers: [["authorization", "token"]],
+      teardownHeaders: async () => [["authorization", "token"]],
       transport: async ({ url, init }) => {
         sent.push(`${init?.method}:${url}`);
         return new Response(null, { status: 204 });
@@ -158,6 +159,7 @@ test("failed initial admission retains its authenticated transport through root 
     server: {
       url: `https://example.test/lix/${repositoryId}`,
       headers: [["authorization", "token"]],
+      teardownHeaders: async () => [["authorization", "token"]],
       transport: async ({ init }) => {
         sent.push(init?.method ?? "GET");
         return new Response(null, { status: 204 });
