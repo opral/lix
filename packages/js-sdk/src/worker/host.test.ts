@@ -592,3 +592,54 @@ test("worker disconnect cancels the paired client's retained fetch and reader", 
     await expect(response.body!.getReader().read()).rejects.toMatchObject({code: "LIX_ERROR_CLOSED"});
   } finally {await host.close();}
 });
+
+test("worker disconnect during header handoff retires the paired client fetch", async () => {
+  let receiveHost!: (message: WorkerInput) => void;
+  let receiveClient!: (message: WorkerResponse) => void;
+  let transport!: import("../http-transport.js").HttpTransport;
+  let host!: ReturnType<typeof startWorkerHost>;
+  let closing: Promise<void> | undefined;
+  let fetchSignal: AbortSignal | undefined;
+  let cancelled = false;
+  const replies: WorkerResponse[] = [];
+  const client = new LixWorkerClient({
+    postMessage: message => {
+      receiveHost(message);
+      if ("kind" in message && message.kind === "sync.fetch.result" && message.result.ok) {
+        closing = host.close();
+      }
+    },
+    onMessage: listener => {receiveClient = listener;},
+    onFatal() {}, ref() {}, unref() {}, async terminate() {},
+  });
+  client.beginLease(undefined, undefined, {
+    url: "https://example.test",
+    fetch: async (_input, init) => {
+      fetchSignal = init?.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {controller.enqueue(new Uint8Array([7]));},
+        cancel() {cancelled = true;},
+      }));
+    },
+  });
+  host = startWorkerHost({
+    postMessage: message => {replies.push(message); queueMicrotask(() => receiveClient(message));},
+    onMessage: listener => {receiveHost = listener;},
+  }, async (_storage, _telemetry, _parent, server) => {
+    transport = server!.transport!;
+    return {setTelemetryParent() {}, close: async () => {}} as unknown as LixBinding;
+  });
+  try {
+    receiveHost({id: 1, sessionId: 0, operation: {
+      kind: "open", storage: {kind: "memory"}, server: {url: "https://example.test", headers: []},
+    }});
+    await vi.waitFor(() => expect(replies).toContainEqual({id: 1, ok: true}));
+    await expect(transport({url: "https://example.test", init: {}, response: {mode: "streaming"}}))
+      .rejects.toMatchObject({code: "LIX_ERROR_CLOSED"});
+    await closing;
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(fetchSignal?.aborted).toBe(true);
+    expect(replies.some(message => "kind" in message && message.kind === "sync.fetch.stream.pull"))
+      .toBe(false);
+  } finally {await host.close();}
+});

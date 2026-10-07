@@ -72,6 +72,9 @@ export function startWorkerHost(
 		}
 	>();
 	const syncStreamCleanup = new Map<number, (failure?: unknown) => void>();
+	// Fetch ownership spans the header/body handoff; waiter maps only describe
+	// the currently pending callback, not the lifetime of the peer's reader.
+	const activeSyncFetches = new Set<number>();
 	let finiteQueue = Promise.resolve();
 	const registrations = new Set<Promise<void>>();
 	const observationClosures = new Set<Promise<void>>();
@@ -225,10 +228,19 @@ export function startWorkerHost(
 		}
 	}
 
-	function finishSyncStream(requestId: number): void {
+	function finishSyncStream(requestId: number, failure?: unknown): void {
+		activeSyncFetches.delete(requestId);
 		const cleanup = syncStreamCleanup.get(requestId);
 		syncStreamCleanup.delete(requestId);
-		cleanup?.();
+		cleanup?.(failure);
+	}
+
+	function cancelSyncFetch(requestId: number, failure?: unknown): void {
+		if (activeSyncFetches.delete(requestId)) {
+			try { endpoint.postMessage({ kind: "sync.fetch.cancel", requestId }); }
+			catch { /* Local retirement must finish after peer disconnection. */ }
+		}
+		finishSyncStream(requestId, failure);
 	}
 
 	async function respond(
@@ -500,17 +512,11 @@ export function startWorkerHost(
         if (closed) return;
         closed = true;
         const failure = workerStateError("Worker client disconnected");
-        const activeFetches = new Set([
-            ...pendingSyncFetch.keys(),
-            ...syncStreamCleanup.keys(),
-            ...pendingSyncStreamPulls.keys(),
-        ]);
-        for (const requestId of activeFetches) {
+        for (const requestId of Array.from(activeSyncFetches)) {
             // The peer may still own a fetch/reader even with no pull pending.
             // A disconnected channel cannot receive cancellation; local close
             // must still retire all streams and database handles in that case.
-            try { endpoint.postMessage({ kind: "sync.fetch.cancel", requestId }); }
-            catch { /* The peer has already disconnected. */ }
+            cancelSyncFetch(requestId, failure);
         }
         for (const pending of pendingSyncHeaders.values()) pending.reject(failure);
         pendingSyncHeaders.clear();
@@ -608,6 +614,7 @@ export function startWorkerHost(
             cache: init?.cache, redirect: init?.redirect,
 		};
         const request: WorkerSyncFetchRequest = {...requestBase, response: policy};
+		activeSyncFetches.add(requestId);
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });
 			endpoint.postMessage({ kind: "sync.fetch", requestId, request, transportScope });
@@ -628,14 +635,14 @@ export function startWorkerHost(
 			if (pull) {
 				pull.reject(error);
 			}
-			endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
-			finishSyncStream(requestId);
+			cancelSyncFetch(requestId, error);
 		};
 		if (init?.signal?.aborted) abort();
 		else init?.signal?.addEventListener("abort", abort, { once: true });
 		let streamEstablished = false;
 		try {
 			const resolved = await response;
+			if (closed) throw workerStateError("Worker client disconnected");
 			if (resolved.streaming) {
 				const signal = init?.signal;
 				if (signal?.aborted) {
@@ -647,7 +654,7 @@ export function startWorkerHost(
 					resolved.status === 205 ||
 					resolved.status === 304
 				) {
-					endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
+					cancelSyncFetch(requestId);
 					return new Response(null, {
 						status: resolved.status,
 						statusText: resolved.statusText,
@@ -685,13 +692,13 @@ export function startWorkerHost(
 			return responseFromSyncFetch(resolved);
 		} catch (error) {
 			if (streaming && !streamEstablished) {
-				endpoint.postMessage({ kind: "sync.fetch.cancel", requestId });
-				finishSyncStream(requestId);
+				cancelSyncFetch(requestId, error);
 			}
 			throw error;
 		} finally {
 			pendingSyncFetch.delete(requestId);
 			if (!streamEstablished) {
+				activeSyncFetches.delete(requestId);
 				init?.signal?.removeEventListener("abort", abort);
 			}
 		}
