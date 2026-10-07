@@ -1,5 +1,5 @@
 import { CALLBACK_TIMEOUT_MS } from "./repository-protocol.js";
-import { validateHttpRequest, type HttpRequest, type HttpTransport } from "../http-transport.js";
+import { transportAbortFailure, validateHttpRequest, type HttpRequest, type HttpTransport } from "../http-transport.js";
 import {
 	openLixBinding,
 	convertReplicaBinding,
@@ -604,17 +604,12 @@ export function startWorkerHost(
 			const pending = pendingSyncFetch.get(requestId);
 			pendingSyncFetch.delete(requestId);
 			if (pending) {
-				pending.reject(
-					new DOMException("The operation was aborted", "AbortError"),
-				);
+				pending.reject(transportAbortFailure(init?.signal));
 			}
 			const pull = pendingSyncStreamPulls.get(requestId);
 			pendingSyncStreamPulls.delete(requestId);
 			if (pull) {
-				const error = new DOMException(
-					"The operation was aborted",
-					"AbortError",
-				);
+				const error = transportAbortFailure(init?.signal);
 				pull.controller.error(error);
 				pull.reject(error);
 			}
@@ -630,7 +625,7 @@ export function startWorkerHost(
 				const signal = init?.signal;
 				if (signal?.aborted) {
 					abort();
-					throw new DOMException("The operation was aborted", "AbortError");
+					throw transportAbortFailure(signal);
 				}
 				if (
 					resolved.status === 204 ||

@@ -57,9 +57,19 @@ function classifiedResponse(response: Response, classify: (error: unknown) => Er
   return new Response(body, {status:response.status,statusText:response.statusText,headers:response.headers});
 }
 
+/** Deadline exhaustion is retryable network unavailability; caller cancellation is not.
+ * Keep the distinction at every I/O/worker boundary without forwarding reason text.
+ */
+export function transportAbortFailure(signal?: AbortSignal | null): HttpTransportError {
+  const reason = signal?.reason;
+  return reason instanceof Error && reason.name === "TimeoutError"
+    ? new HttpTransportError("LIX_TRANSPORT_NETWORK", "HTTP request deadline elapsed")
+    : new HttpTransportError("LIX_TRANSPORT_ABORTED", "HTTP request was cancelled");
+}
+
 function nativeNetworkFailure(error: unknown, signal: AbortSignal): HttpTransportError {
   if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
-    return new HttpTransportError("LIX_TRANSPORT_ABORTED", "HTTP request was cancelled");
+    return transportAbortFailure(signal);
   }
   if (error instanceof TypeError) return new HttpTransportError("LIX_TRANSPORT_NETWORK", "HTTP network request failed");
   return new HttpTransportError("LIX_TRANSPORT_CALLBACK", "HTTP adapter failed");
@@ -76,7 +86,7 @@ export function fetchTransport(fetcher?: typeof fetch): HttpTransport {
       response = await (fetcher ?? networkFetch)(validated.url, request.init);
     } catch (error) {
       if (request.init.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
-        throw new HttpTransportError("LIX_TRANSPORT_ABORTED", "HTTP request was cancelled");
+        throw transportAbortFailure(request.init.signal);
       }
       if (isTransportFailure(error)) throw error;
       // Arbitrary user callbacks may throw TypeError for programming errors.
@@ -85,7 +95,7 @@ export function fetchTransport(fetcher?: typeof fetch): HttpTransport {
     if (fetcher) {
       response = classifiedResponse(response, error => {
         if (isTransportFailure(error)) return error;
-        if (request.init.signal?.aborted) return new HttpTransportError("LIX_TRANSPORT_ABORTED", "HTTP request was cancelled");
+        if (request.init.signal?.aborted) return transportAbortFailure(request.init.signal);
         return new HttpTransportError("LIX_TRANSPORT_CALLBACK", "HTTP response adapter failed");
       });
     }

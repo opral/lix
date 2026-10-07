@@ -421,3 +421,44 @@ test("a credential callback from a nonresponsive page cannot leave opening pendi
 		vi.useRealTimers();
 	}
 });
+
+for (const reasonName of ["TimeoutError", "AbortError"] as const) {
+  for (const streaming of [false, true]) {
+    test(`worker bridge preserves ${reasonName} during ${streaming ? "body pull" : "headers"}`, async () => {
+      const responses: WorkerResponse[] = [];
+      let receive!: (message: WorkerInput) => void;
+      let transport!: import("../http-transport.js").HttpTransport;
+      const host = startWorkerHost({
+        postMessage: message => {responses.push(message);},
+        onMessage: listener => {receive = listener;},
+      }, async (_storage, _telemetry, _parent, server) => {
+        transport = server!.transport!;
+        return {setTelemetryParent() {}, close: async () => {}} as unknown as LixBinding;
+      });
+      receive({id: 1, sessionId: 0, operation: {
+        kind: "open", storage: {kind: "memory"}, server: {url: "https://example.test", headers: []},
+      }});
+      await vi.waitFor(() => expect(responses).toContainEqual({id: 1, ok: true}));
+      const controller = new AbortController();
+      const pending = transport({url: "https://example.test", init: {signal: controller.signal},
+        response: streaming ? {mode: "streaming"} : {mode: "buffered", maxBytes: 8}});
+      const message = responses.find(message => "kind" in message && message.kind === "sync.fetch");
+      if (!message || !("requestId" in message)) throw new Error("Missing fetch request");
+      let completion: Promise<unknown> = pending;
+      if (streaming) {
+        receive({kind: "sync.fetch.result", requestId: message.requestId, result: {
+          ok: true, response: {streaming: true, status: 200, statusText: "OK", headers: []},
+        }});
+        completion = (await pending).text();
+        await vi.waitFor(() => expect(responses).toContainEqual({kind: "sync.fetch.stream.pull", requestId: message.requestId}));
+      }
+      const checked = expect(completion).rejects.toMatchObject({
+        code: reasonName === "TimeoutError" ? "LIX_TRANSPORT_NETWORK" : "LIX_TRANSPORT_ABORTED",
+      });
+      controller.abort(new DOMException("private reason", reasonName));
+      await checked;
+      expect(responses).toContainEqual({kind: "sync.fetch.cancel", requestId: message.requestId});
+      await host.close();
+    });
+  }
+}

@@ -197,7 +197,7 @@ impl AuthorityHttp {
         let timeout_state = state.clone();
         let timeout_callback: Closure<dyn FnMut()> = Closure::wrap(Box::new(move || {
             timeout_state.cancel();
-            abort_controller(&timeout_controller);
+            abort_controller_on_timeout(&timeout_controller);
         }));
         let set_timeout = Reflect::get(&global, &"setTimeout".into())
             .map_err(js_transport_error)?
@@ -682,7 +682,7 @@ async fn fetch(
     let controller: Object = controller.into();
     let timeout_controller = controller.clone();
     let timeout_callback: Closure<dyn FnMut()> = Closure::wrap(Box::new(move || {
-        abort_controller(&timeout_controller);
+        abort_controller_on_timeout(&timeout_controller);
     }));
     let set_timeout = Reflect::get(&global, &"setTimeout".into())
         .map_err(js_transport_error)?
@@ -897,6 +897,18 @@ impl Drop for AbortOnDrop {
         if self.armed {
             abort_controller(&self.controller);
         }
+    }
+}
+
+// Use the standard AbortSignal timeout reason so the SDK and worker bridge
+// retain retryable deadline exhaustion instead of terminal caller cancellation.
+fn abort_controller_on_timeout(controller: &Object) {
+    let reason = js_sys::Error::new("HTTP request deadline elapsed");
+    reason.set_name("TimeoutError");
+    if let Ok(abort) = Reflect::get(controller, &"abort".into())
+        && let Ok(abort) = abort.dyn_into::<Function>()
+    {
+        let _ = abort.call1(controller, &reason);
     }
 }
 
