@@ -5,15 +5,49 @@ use super::{LixError, MAX_INPUT_BYTES, MAX_PAYLOAD_BYTES, invalid};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 static LIVE_SPOOL_BYTES: AtomicUsize = AtomicUsize::new(0);
 const MAX_LIVE_SPOOL_BYTES: usize = 1024 * 1024 * 1024;
-struct ByteReservation(usize);
+#[derive(Clone, Default)]
+enum LiveSpoolCounter {
+    #[default]
+    Global,
+    #[cfg(test)]
+    Local(Arc<AtomicUsize>),
+}
+impl LiveSpoolCounter {
+    fn atomic(&self) -> &AtomicUsize {
+        match self {
+            Self::Global => &LIVE_SPOOL_BYTES,
+            #[cfg(test)]
+            Self::Local(counter) => counter,
+        }
+    }
+
+    fn same_budget(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Global, Self::Global) => true,
+            #[cfg(test)]
+            (Self::Local(left), Self::Local(right)) => Arc::ptr_eq(left, right),
+            #[cfg(test)]
+            _ => false,
+        }
+    }
+}
+
+struct ByteReservation {
+    counter: LiveSpoolCounter,
+    bytes: usize,
+}
 impl Drop for ByteReservation {
     fn drop(&mut self) {
-        LIVE_SPOOL_BYTES.fetch_sub(self.0, Ordering::AcqRel);
+        self.counter
+            .atomic()
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 impl Drop for PayloadSpool {
     fn drop(&mut self) {
-        LIVE_SPOOL_BYTES.fetch_sub(self.len as usize, Ordering::AcqRel);
+        self.counter
+            .atomic()
+            .fetch_sub(self.len as usize, Ordering::AcqRel);
     }
 }
 
@@ -24,16 +58,45 @@ pub(super) struct PayloadRef {
     pub(super) digest: [u8; 32],
 }
 
-#[derive(Default)]
 pub(super) struct PayloadSpool {
     #[cfg(not(target_family = "wasm"))]
     file: Option<std::fs::File>,
     #[cfg(target_family = "wasm")]
     bytes: Vec<u8>,
     len: u64,
+    pressure_key: Option<OperationKey>,
+    counter: LiveSpoolCounter,
+    live_limit: usize,
+}
+
+impl Default for PayloadSpool {
+    fn default() -> Self {
+        Self {
+            #[cfg(not(target_family = "wasm"))]
+            file: None,
+            #[cfg(target_family = "wasm")]
+            bytes: Vec::new(),
+            len: 0,
+            pressure_key: None,
+            counter: LiveSpoolCounter::default(),
+            live_limit: MAX_LIVE_SPOOL_BYTES,
+        }
+    }
 }
 
 impl PayloadSpool {
+    fn bind_operation(&mut self, key: OperationKey) -> Result<(), LixError> {
+        if self
+            .pressure_key
+            .as_ref()
+            .is_some_and(|existing| *existing != key)
+        {
+            return Err(invalid("operation spool is already bound to another read"));
+        }
+        self.pressure_key = Some(key);
+        Ok(())
+    }
+
     pub(super) fn append(&mut self, bytes: &[u8]) -> Result<PayloadRef, LixError> {
         if bytes.len() > MAX_INPUT_BYTES
             || self.len.saturating_add(bytes.len() as u64) > (2 * MAX_PAYLOAD_BYTES) as u64
@@ -43,19 +106,12 @@ impl PayloadSpool {
                 "operation spool quota exceeded",
             ));
         }
-        LIVE_SPOOL_BYTES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes_in_use| {
-                bytes_in_use
-                    .checked_add(bytes.len())
-                    .filter(|total| *total <= MAX_LIVE_SPOOL_BYTES)
-            })
-            .map_err(|_| {
-                LixError::new(
-                    "LIX_NATIVE_RECIPE_WORK_BOUND",
-                    "global operation spool byte quota exceeded",
-                )
-            })?;
-        let reservation = ByteReservation(bytes.len());
+        let reservation = reserve_live_spool_bytes(
+            bytes.len(),
+            self.pressure_key.as_ref(),
+            &self.counter,
+            self.live_limit,
+        )?;
         let reference = PayloadRef {
             offset: self.len,
             len: bytes.len(),
@@ -271,6 +327,18 @@ pub(super) struct Admission {
     key: (String, String),
 }
 impl Admission {
+    fn usage(repository: &str, account: &str) -> Result<(usize, usize), LixError> {
+        let active = ADMISSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| invalid("spool admission poisoned"))?;
+        let scoped = active
+            .get(&(repository.to_owned(), account.to_owned()))
+            .copied()
+            .unwrap_or_default();
+        Ok((active.values().sum(), scoped))
+    }
+
     pub(super) fn reserve(repository: &str, account: &str) -> Result<Self, LixError> {
         let key = (repository.to_owned(), account.to_owned());
         let mut active = ADMISSIONS
@@ -304,6 +372,8 @@ impl Drop for Admission {
 
 struct SealedSpool {
     spool: InputSpool,
+    resident_bytes: usize,
+    live_counter: LiveSpoolCounter,
     _admission: Option<Admission>,
     egress_pages: AtomicUsize,
     egress_bytes: AtomicUsize,
@@ -351,6 +421,13 @@ fn request_digest_fingerprint(request_digest: &str) -> [u8; 32] {
     *blake3::hash(request_digest.as_bytes()).as_bytes()
 }
 
+fn operation_state_busy() -> LixError {
+    LixError::new(
+        "LIX_NATIVE_RECIPE_WORK_BOUND",
+        "read operation state is busy; retry the request",
+    )
+}
+
 fn block_scope(registry: &mut OperationRegistry, scope: [u8; 16], expires_at_ms: u64) {
     if let Some(previous) = registry.blocked_scopes.get(&scope).copied() {
         if previous >= expires_at_ms {
@@ -381,20 +458,17 @@ fn record_completed(
         .get(&scope)
         .copied()
         .unwrap_or_default();
-    let has_capacity = has_retirement_capacity(
-        registry,
-        scope,
-        MAX_COMPLETED_FINGERPRINTS,
-        MAX_COMPLETED_FINGERPRINTS_PER_SCOPE,
-    )
-    .unwrap_or(false);
-    if !has_capacity
-        || registry
-            .completed
-            .len()
-            .saturating_add(1)
-            .saturating_mul(COMPLETED_FINGERPRINT_BYTES)
-            > MAX_COMPLETED_FINGERPRINT_BYTES
+    // Every caller retires a Sealed operation that reserved its completed
+    // identity before discovery began. The registry mutex serializes that
+    // reservation conversion, so do not rescan and lock unrelated operations
+    // here; payload-pressure callers may hold a payload mutex while retiring.
+    if registry
+        .completed
+        .len()
+        .saturating_add(1)
+        .saturating_mul(COMPLETED_FINGERPRINT_BYTES)
+        > MAX_COMPLETED_FINGERPRINT_BYTES
+        || registry.completed.len() >= MAX_COMPLETED_FINGERPRINTS
         || scope_count >= MAX_COMPLETED_FINGERPRINTS_PER_SCOPE
     {
         block_scope(registry, scope, operation_expires_at_ms);
@@ -426,14 +500,21 @@ fn completion_reservations(
         if scope.is_some_and(|scope| scope_fingerprint(&key.0, &key.1, &key.2) != scope) {
             continue;
         }
-        if matches!(
-            *operation
-                .state
-                .lock()
-                .map_err(|_| invalid("read operation state poisoned"))?,
-            OperationState::Pending(_) | OperationState::Sealed(_)
-        ) {
-            count += 1;
+        match operation.state.try_lock() {
+            Ok(state) => {
+                if matches!(
+                    *state,
+                    OperationState::Pending(_) | OperationState::Sealed(_)
+                ) {
+                    count += 1;
+                }
+            }
+            // A busy state may still own a completion reservation. Count it
+            // conservatively instead of blocking while holding the registry.
+            Err(std::sync::TryLockError::WouldBlock) => count += 1,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
         }
     }
     Ok(count)
@@ -557,9 +638,16 @@ fn sweep_expired(registry: &mut OperationRegistry, now_ms: u64) {
         if operation.expires_at_ms.load(Ordering::Acquire) > now_ms {
             continue;
         }
-        let Ok(mut state) = operation.state.lock() else {
-            registry.operations.remove(&key);
-            continue;
+        let mut state = match operation.state.try_lock() {
+            Ok(state) => state,
+            // Expiry is opportunistic. A request which currently owns this
+            // state can finish or publish its cancellation; a later sweep
+            // will reap it without blocking every registry operation here.
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                registry.operations.remove(&key);
+                continue;
+            }
         };
         match std::mem::replace(&mut *state, OperationState::Complete) {
             OperationState::Pending(admission) => {
@@ -621,6 +709,318 @@ fn sweep_expired(registry: &mut OperationRegistry, now_ms: u64) {
     }
 }
 
+const MAX_PRESSURE_RETIRE_ATTEMPTS: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvictionNeed {
+    Slot,
+    SealedBytes,
+    LiveBytes,
+}
+
+#[derive(Clone)]
+struct SealedCandidate {
+    key: OperationKey,
+    admission_count: usize,
+    tenant_spools: usize,
+    tenant_bytes: usize,
+    egress_bytes: usize,
+    resident_bytes: usize,
+    operation_expires_at_ms: u64,
+}
+
+/// Retire one inactive sealed spool to make room for a bounded operation.
+/// The registry lock is held by the caller, preserving registry -> operation
+/// lock order. Candidate payload mutexes are never acquired here: append may
+/// call this while holding its own shared payload mutex.
+fn retire_one_sealed_for_pressure(
+    registry: &mut OperationRegistry,
+    protected_key: Option<&OperationKey>,
+    tenant_only: Option<(&str, &str)>,
+    need: EvictionNeed,
+    live_counter: Option<&LiveSpoolCounter>,
+) -> Result<bool, LixError> {
+    let active_admissions = ADMISSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| invalid("spool admission poisoned"))?
+        .clone();
+
+    let mut tenant_usage = BTreeMap::<(String, String), (usize, usize)>::new();
+    let mut candidates = Vec::new();
+    for (key, operation) in &registry.operations {
+        if protected_key.is_some_and(|protected| protected == key) {
+            continue;
+        }
+        if Arc::strong_count(operation) != 1 {
+            continue;
+        }
+        let state = match operation.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
+        };
+        let OperationState::Sealed(sealed) = &*state else {
+            continue;
+        };
+        let tenant = (key.0.clone(), key.1.clone());
+        let usage = tenant_usage.entry(tenant).or_default();
+        usage.0 = usage.0.saturating_add(1);
+        usage.1 = usage.1.saturating_add(sealed.resident_bytes);
+
+        if tenant_only.is_some_and(|(repository, account)| key.0 != repository || key.1 != account)
+            || Arc::strong_count(operation) != 1
+            || Arc::strong_count(sealed) != 1
+            || sealed._admission.is_none()
+            || (need != EvictionNeed::Slot && sealed.resident_bytes == 0)
+            || (need == EvictionNeed::LiveBytes && Arc::strong_count(&sealed.spool.payloads) != 1)
+            || (need == EvictionNeed::LiveBytes
+                && !live_counter.is_some_and(|counter| sealed.live_counter.same_budget(counter)))
+        {
+            continue;
+        }
+        candidates.push(SealedCandidate {
+            key: key.clone(),
+            admission_count: active_admissions
+                .get(&(key.0.clone(), key.1.clone()))
+                .copied()
+                .unwrap_or_default(),
+            tenant_spools: 0,
+            tenant_bytes: 0,
+            egress_bytes: sealed.egress_bytes.load(Ordering::Acquire),
+            resident_bytes: sealed.resident_bytes,
+            operation_expires_at_ms: operation.operation_expires_at_ms,
+        });
+    }
+    for candidate in &mut candidates {
+        if let Some((spools, bytes)) =
+            tenant_usage.get(&(candidate.key.0.clone(), candidate.key.1.clone()))
+        {
+            candidate.tenant_spools = *spools;
+            candidate.tenant_bytes = *bytes;
+        }
+    }
+    // Global pressure is shared fairly: retire from the tenant with the
+    // largest active reservation first, then prefer its larger sealed cache,
+    // least-served egress, oldest fixed expiry, and stable key order.
+    candidates.sort_by(|left, right| {
+        right
+            .admission_count
+            .cmp(&left.admission_count)
+            .then_with(|| right.tenant_spools.cmp(&left.tenant_spools))
+            .then_with(|| right.tenant_bytes.cmp(&left.tenant_bytes))
+            .then_with(|| left.egress_bytes.cmp(&right.egress_bytes))
+            .then_with(|| {
+                left.operation_expires_at_ms
+                    .cmp(&right.operation_expires_at_ms)
+            })
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    for candidate in candidates.into_iter().take(MAX_PRESSURE_RETIRE_ATTEMPTS) {
+        let Some(operation_in_registry) = registry.operations.get(&candidate.key) else {
+            continue;
+        };
+        // The registry owns the only strong reference for an inactive spool.
+        // Clone only after that check, then recheck the expected map+local
+        // references before changing state.
+        if Arc::strong_count(operation_in_registry) != 1 {
+            continue;
+        }
+        let operation = operation_in_registry.clone();
+        if Arc::strong_count(&operation) != 2 {
+            drop(operation);
+            continue;
+        }
+        let mut state = match operation.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
+        };
+        let OperationState::Sealed(sealed) = &*state else {
+            continue;
+        };
+        if Arc::strong_count(sealed) != 1
+            || sealed._admission.is_none()
+            || sealed.resident_bytes != candidate.resident_bytes
+            || (need != EvictionNeed::Slot && sealed.resident_bytes == 0)
+            || (need == EvictionNeed::LiveBytes && Arc::strong_count(&sealed.spool.payloads) != 1)
+            || (need == EvictionNeed::LiveBytes
+                && !live_counter.is_some_and(|counter| sealed.live_counter.same_budget(counter)))
+        {
+            continue;
+        }
+        *state = OperationState::Complete;
+        drop(state);
+        registry.operations.remove(&candidate.key);
+        record_completed(
+            registry,
+            &candidate.key,
+            &operation.request_digest,
+            operation.operation_expires_at_ms,
+        );
+        operation.changed.send_replace(());
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn reclaimable_live_bytes(
+    registry: &OperationRegistry,
+    protected_key: Option<&OperationKey>,
+    live_counter: &LiveSpoolCounter,
+) -> Result<usize, LixError> {
+    let mut reclaimable = 0usize;
+    for (key, operation) in &registry.operations {
+        if protected_key.is_some_and(|protected| protected == key)
+            || Arc::strong_count(operation) != 1
+        {
+            continue;
+        }
+        let state = match operation.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
+        };
+        let OperationState::Sealed(sealed) = &*state else {
+            continue;
+        };
+        if Arc::strong_count(sealed) == 1
+            && sealed._admission.is_some()
+            && sealed.resident_bytes > 0
+            && Arc::strong_count(&sealed.spool.payloads) == 1
+            && sealed.live_counter.same_budget(live_counter)
+        {
+            reclaimable = reclaimable.saturating_add(sealed.resident_bytes);
+        }
+    }
+    Ok(reclaimable)
+}
+
+fn reserve_live_spool_bytes(
+    bytes: usize,
+    current_key: Option<&OperationKey>,
+    counter: &LiveSpoolCounter,
+    limit: usize,
+) -> Result<ByteReservation, LixError> {
+    let quota_error = || {
+        LixError::new(
+            "LIX_NATIVE_RECIPE_WORK_BOUND",
+            "global operation spool byte quota exceeded",
+        )
+    };
+    for attempt in 0..=MAX_PRESSURE_RETIRE_ATTEMPTS {
+        if counter
+            .atomic()
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes_in_use| {
+                bytes_in_use
+                    .checked_add(bytes)
+                    .filter(|total| *total <= limit)
+            })
+            .is_ok()
+        {
+            return Ok(ByteReservation {
+                counter: counter.clone(),
+                bytes,
+            });
+        }
+        if attempt == MAX_PRESSURE_RETIRE_ATTEMPTS {
+            break;
+        }
+        let Some(key) = current_key else {
+            break;
+        };
+        let mut registry = operation_registry()
+            .lock()
+            .map_err(|_| invalid("read operation registry poisoned"))?;
+        let needed = counter
+            .atomic()
+            .load(Ordering::Acquire)
+            .saturating_add(bytes)
+            .saturating_sub(limit);
+        if needed == 0 {
+            // A concurrent payload drop freed the required space after our
+            // failed reservation CAS. Retry the real atomic reservation.
+            continue;
+        }
+        if reclaimable_live_bytes(&registry, Some(key), counter)? < needed {
+            // No sealed spool can reclaim enough under this snapshot. Drop the
+            // registry and do one final CAS so a concurrent drop between the
+            // snapshot and this decision is not turned into a false quota
+            // failure, without repeating a full registry scan.
+            drop(registry);
+            if counter
+                .atomic()
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes_in_use| {
+                    bytes_in_use
+                        .checked_add(bytes)
+                        .filter(|total| *total <= limit)
+                })
+                .is_ok()
+            {
+                return Ok(ByteReservation {
+                    counter: counter.clone(),
+                    bytes,
+                });
+            }
+            break;
+        }
+        if !retire_one_sealed_for_pressure(
+            &mut registry,
+            Some(key),
+            None,
+            EvictionNeed::LiveBytes,
+            Some(counter),
+        )? {
+            break;
+        }
+    }
+    Err(quota_error())
+}
+
+fn reserve_admission_with_pressure(
+    registry: &mut OperationRegistry,
+    repository: &str,
+    account: &str,
+) -> Result<Admission, LixError> {
+    for attempt in 0..=MAX_PRESSURE_RETIRE_ATTEMPTS {
+        match Admission::reserve(repository, account) {
+            Ok(admission) => return Ok(admission),
+            Err(error) if error.code != "LIX_NATIVE_RECIPE_WORK_BOUND" => return Err(error),
+            Err(error) => {
+                if attempt == MAX_PRESSURE_RETIRE_ATTEMPTS {
+                    return Err(error);
+                }
+                let (global_count, scoped_count) = Admission::usage(repository, account)?;
+                let tenant_only =
+                    (scoped_count >= MAX_ACCOUNT_SPOOLS).then_some((repository, account));
+                if global_count < 16 && scoped_count < MAX_ACCOUNT_SPOOLS {
+                    return Err(error);
+                }
+                if !retire_one_sealed_for_pressure(
+                    registry,
+                    None,
+                    tenant_only,
+                    EvictionNeed::Slot,
+                    None,
+                )? {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Err(LixError::new(
+        "LIX_NATIVE_RECIPE_WORK_BOUND",
+        "in-flight read operation quota exceeded",
+    ))
+}
+
 fn restart_error() -> LixError {
     LixError::new(
         "LIX_READ_FULFILLMENT_RESTART",
@@ -637,6 +1037,18 @@ pub(super) struct PendingOperation {
     key: OperationKey,
     operation: Arc<Operation>,
     finished: bool,
+}
+
+impl PendingOperation {
+    pub(super) fn bind_payload_spool(
+        &self,
+        payloads: &Arc<Mutex<PayloadSpool>>,
+    ) -> Result<(), LixError> {
+        payloads
+            .lock()
+            .map_err(|_| invalid("operation spool poisoned"))?
+            .bind_operation(self.key.clone())
+    }
 }
 
 impl Drop for PendingOperation {
@@ -768,12 +1180,6 @@ where
                         "read operation cancellation registry is saturated for this scope",
                     ));
                 }
-                if registry.operations.len() >= MAX_OPERATION_RECORDS {
-                    return Err(LixError::new(
-                        "LIX_NATIVE_RECIPE_WORK_BOUND",
-                        "read operation registry quota exceeded",
-                    ));
-                }
                 if !has_retirement_capacity(
                     &registry,
                     scope,
@@ -785,7 +1191,25 @@ where
                         "read operation retirement identity quota exceeded",
                     ));
                 }
-                let admission = Admission::reserve(repository, account)?;
+                if registry.operations.len() >= MAX_OPERATION_RECORDS {
+                    let (_, scoped_count) = Admission::usage(repository, account)?;
+                    let tenant_only =
+                        (scoped_count >= MAX_ACCOUNT_SPOOLS).then_some((repository, account));
+                    if !retire_one_sealed_for_pressure(
+                        &mut registry,
+                        None,
+                        tenant_only,
+                        EvictionNeed::Slot,
+                        None,
+                    )? {
+                        return Err(LixError::new(
+                            "LIX_NATIVE_RECIPE_WORK_BOUND",
+                            "read operation registry quota exceeded",
+                        ));
+                    }
+                }
+                let admission =
+                    reserve_admission_with_pressure(&mut registry, repository, account)?;
                 let expiry = request
                     .operation_expires_at_ms
                     .min(now_ms.saturating_add(120_000));
@@ -974,10 +1398,15 @@ fn sealed_usage(
         if key == current_key {
             continue;
         }
-        let state = operation
-            .state
-            .lock()
-            .map_err(|_| invalid("read operation state poisoned"))?;
+        let state = match operation.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(operation_state_busy());
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
+        };
         let OperationState::Sealed(sealed) = &*state else {
             continue;
         };
@@ -985,14 +1414,7 @@ fn sealed_usage(
         if key.0 == current_key.0 && key.1 == current_key.1 {
             scoped_count += 1;
         }
-        bytes = bytes.saturating_add(
-            sealed
-                .spool
-                .payloads
-                .lock()
-                .map(|payloads| payloads.len as usize)
-                .unwrap_or(MAX_SEALED_BYTES),
-        );
+        bytes = bytes.saturating_add(sealed.resident_bytes);
     }
     Ok((count, scoped_count, bytes))
 }
@@ -1006,14 +1428,18 @@ fn cancellation_count(
         if scoped.is_some_and(|scope| scope_fingerprint(&key.0, &key.1, &key.2) != scope) {
             continue;
         }
-        if matches!(
-            *operation
-                .state
-                .lock()
-                .map_err(|_| invalid("read operation state poisoned"))?,
-            OperationState::Cancelled(_)
-        ) {
-            count += 1;
+        match operation.state.try_lock() {
+            Ok(state) => {
+                if matches!(*state, OperationState::Cancelled(_)) {
+                    count += 1;
+                }
+            }
+            // Saturation checks fail closed when another request is changing
+            // the operation state, rather than waiting under the registry.
+            Err(std::sync::TryLockError::WouldBlock) => count += 1,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("read operation state poisoned"));
+            }
         }
     }
     Ok(count)
@@ -1101,9 +1527,18 @@ pub(super) fn seal_and_page(
     }
     let token = uuid::Uuid::now_v7().to_string();
     let expires_at_ms = pending.operation.expires_at_ms.load(Ordering::Acquire);
+    let (resident_bytes, live_counter) = {
+        let payloads = spool
+            .payloads
+            .lock()
+            .map_err(|_| invalid("operation spool poisoned"))?;
+        (payloads.len as usize, payloads.counter.clone())
+    };
     let mut sealed = SealedSpool {
         closure_digest: spool.digest(request)?,
         spool,
+        resident_bytes,
+        live_counter,
         _admission: None,
         egress_pages: AtomicUsize::new(0),
         egress_bytes: AtomicUsize::new(0),
@@ -1132,6 +1567,57 @@ pub(super) fn seal_and_page(
     {
         return Err(restart_error());
     }
+    {
+        let state = pending
+            .operation
+            .state
+            .lock()
+            .map_err(|_| invalid("read operation state poisoned"))?;
+        match &*state {
+            OperationState::Pending(_) => {}
+            OperationState::Cancelled(_) | OperationState::Sealed(_) | OperationState::Complete => {
+                return Err(restart_error());
+            }
+        }
+        if operation_expires_at_ms <= commit_now
+            || pending.operation.expires_at_ms.load(Ordering::Acquire) <= commit_now
+        {
+            return Err(restart_error());
+        }
+    }
+    if response.continuation.is_some() {
+        let mut admitted = false;
+        for attempt in 0..=MAX_PRESSURE_RETIRE_ATTEMPTS {
+            let (count, scoped_count, existing_bytes) = sealed_usage(&registry, &key)?;
+            let needs_account_slot = scoped_count >= MAX_ACCOUNT_SPOOLS;
+            let needs_global_slot = count >= 16;
+            let needs_bytes = existing_bytes.saturating_add(resident_bytes) > MAX_SEALED_BYTES;
+            if !needs_account_slot && !needs_global_slot && !needs_bytes {
+                admitted = true;
+                break;
+            }
+            if attempt == MAX_PRESSURE_RETIRE_ATTEMPTS {
+                break;
+            }
+            let (tenant_only, need) = if needs_account_slot {
+                (Some((repository, account)), EvictionNeed::Slot)
+            } else if needs_global_slot {
+                (None, EvictionNeed::Slot)
+            } else {
+                (None, EvictionNeed::SealedBytes)
+            };
+            if !retire_one_sealed_for_pressure(&mut registry, Some(&key), tenant_only, need, None)?
+            {
+                break;
+            }
+        }
+        if !admitted {
+            return Err(LixError::new(
+                "LIX_NATIVE_RECIPE_WORK_BOUND",
+                "sealed spool admission quota exceeded",
+            ));
+        }
+    }
     let mut state = pending
         .operation
         .state
@@ -1139,31 +1625,17 @@ pub(super) fn seal_and_page(
         .map_err(|_| invalid("read operation state poisoned"))?;
     let admission = match &mut *state {
         OperationState::Pending(admission) => admission,
-        OperationState::Cancelled(_) => return Err(restart_error()),
-        OperationState::Sealed(_) | OperationState::Complete => return Err(restart_error()),
+        OperationState::Cancelled(_) | OperationState::Sealed(_) | OperationState::Complete => {
+            return Err(restart_error());
+        }
     };
-    if operation_expires_at_ms <= commit_now
-        || pending.operation.expires_at_ms.load(Ordering::Acquire) <= commit_now
+    if operation_expires_at_ms <= crate::telemetry::unix_time_ms()
+        || pending.operation.expires_at_ms.load(Ordering::Acquire)
+            <= crate::telemetry::unix_time_ms()
     {
         return Err(restart_error());
     }
     if let Some(cursor) = &response.continuation {
-        let (count, scoped_count, existing_bytes) = sealed_usage(&registry, &key)?;
-        let owned_bytes = sealed
-            .spool
-            .payloads
-            .lock()
-            .map_err(|_| invalid("operation spool poisoned"))?
-            .len as usize;
-        if count >= 16
-            || scoped_count >= MAX_ACCOUNT_SPOOLS
-            || existing_bytes.saturating_add(owned_bytes) > MAX_SEALED_BYTES
-        {
-            return Err(LixError::new(
-                "LIX_NATIVE_RECIPE_WORK_BOUND",
-                "sealed spool admission quota exceeded",
-            ));
-        }
         let Some(admission) = admission.take() else {
             return Err(invalid("read operation admission absent"));
         };
@@ -1413,6 +1885,73 @@ pub(super) fn release(
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
+
+    fn test_payload_spool_with_budget(
+        counter: Arc<AtomicUsize>,
+        live_limit: usize,
+    ) -> PayloadSpool {
+        PayloadSpool {
+            #[cfg(not(target_family = "wasm"))]
+            file: None,
+            #[cfg(target_family = "wasm")]
+            bytes: Vec::new(),
+            len: 0,
+            pressure_key: None,
+            counter: LiveSpoolCounter::Local(counter),
+            live_limit,
+        }
+    }
+
+    fn insert_test_sealed(
+        repository: &str,
+        account: &str,
+        lease: &str,
+        request: &ReadFulfillmentRequest,
+        spool: InputSpool,
+        resident_bytes: usize,
+    ) {
+        let request_digest = request.digest().unwrap();
+        let live_counter = spool.payloads.lock().unwrap().counter.clone();
+        let key = operation_key(repository, account, lease, request);
+        let (changed, _) = watch::channel(());
+        let sealed = Arc::new(SealedSpool {
+            spool,
+            resident_bytes,
+            live_counter,
+            _admission: Some(Admission::reserve(repository, account).unwrap()),
+            egress_pages: AtomicUsize::new(1),
+            egress_bytes: AtomicUsize::new(0),
+            token: uuid::Uuid::now_v7().to_string(),
+            repository: repository.into(),
+            account: account.into(),
+            lease: lease.into(),
+            epoch: request.epoch_id.clone(),
+            request_digest: request_digest.clone(),
+            closure_digest: blake3::hash(b"inactive pressure victim")
+                .to_hex()
+                .to_string(),
+            operation_expires_at_ms: request.operation_expires_at_ms,
+            expires_at_ms: request.operation_expires_at_ms,
+            profile: DiscoveryProfile::default(),
+            page_starts: vec![(0, 0), (1, 0)],
+        });
+        let operation = Arc::new(Operation {
+            request_digest,
+            epoch: request.epoch_id.clone(),
+            operation_expires_at_ms: request.operation_expires_at_ms,
+            expires_at_ms: AtomicU64::new(request.operation_expires_at_ms),
+            state: Mutex::new(OperationState::Sealed(sealed)),
+            changed,
+        });
+        assert!(
+            operation_registry()
+                .lock()
+                .unwrap()
+                .operations
+                .insert(key, operation)
+                .is_none()
+        );
+    }
 
     fn clear_test_scope(repository: &str, account: &str, lease: &str) {
         let scope = scope_fingerprint(repository, account, lease);
@@ -1679,6 +2218,8 @@ mod tests {
             let (changed, _) = watch::channel(());
             let sealed = Arc::new(SealedSpool {
                 spool: InputSpool::new(Arc::new(Mutex::new(PayloadSpool::default()))),
+                resident_bytes: 0,
+                live_counter: LiveSpoolCounter::default(),
                 _admission: Some(Admission::reserve(&repository, &account).unwrap()),
                 egress_pages: AtomicUsize::new(1),
                 egress_bytes: AtomicUsize::new(0),
@@ -1776,6 +2317,541 @@ mod tests {
             "READ_OPERATION_REGISTRY_RETIREMENT_PROFILE_JSON={{\"completedPaginatedOperations\":{COMPLETIONS},\"completedMarkers\":{COMPLETIONS},\"cursorlessCancellations\":0,\"elapsedMs\":{}}}",
             started.elapsed().as_secs_f64() * 1000.0
         );
+        clear_test_scope(&repository, &account, &lease);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_read_retires_an_inactive_sealed_spool_at_account_capacity() {
+        let authority = crate::open_lix().await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let repository = descriptor.lix_id.clone();
+        let account = uuid::Uuid::now_v7().to_string();
+        let lease = uuid::Uuid::now_v7().to_string();
+        let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+        let new_request = || ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: Vec::new(),
+            required: Vec::new(),
+            continuation: None,
+        };
+
+        clear_test_scope(&repository, &account, &lease);
+        let mut retired_requests = Vec::new();
+        for _ in 0..MAX_ACCOUNT_SPOOLS {
+            let request = new_request();
+            let request_digest = request.digest().unwrap();
+            let key = operation_key(&repository, &account, &lease, &request);
+            let (changed, _) = watch::channel(());
+            let sealed = Arc::new(SealedSpool {
+                spool: InputSpool::new(Arc::new(Mutex::new(PayloadSpool::default()))),
+                resident_bytes: 0,
+                live_counter: LiveSpoolCounter::default(),
+                _admission: Some(Admission::reserve(&repository, &account).unwrap()),
+                egress_pages: AtomicUsize::new(1),
+                egress_bytes: AtomicUsize::new(0),
+                token: uuid::Uuid::now_v7().to_string(),
+                repository: repository.clone(),
+                account: account.clone(),
+                lease: lease.clone(),
+                epoch: request.epoch_id.clone(),
+                request_digest: request_digest.clone(),
+                closure_digest: blake3::hash(b"inactive pressure victim")
+                    .to_hex()
+                    .to_string(),
+                operation_expires_at_ms,
+                expires_at_ms: operation_expires_at_ms,
+                profile: DiscoveryProfile::default(),
+                page_starts: vec![(0, 0), (1, 0)],
+            });
+            let operation = Arc::new(Operation {
+                request_digest,
+                epoch: request.epoch_id.clone(),
+                operation_expires_at_ms,
+                expires_at_ms: AtomicU64::new(operation_expires_at_ms),
+                state: Mutex::new(OperationState::Sealed(sealed)),
+                changed,
+            });
+            assert!(
+                operation_registry()
+                    .lock()
+                    .unwrap()
+                    .operations
+                    .insert(key, operation)
+                    .is_none()
+            );
+            retired_requests.push(request);
+        }
+
+        let fresh = new_request();
+        let owner = match begin(
+            &repository,
+            &account,
+            &lease,
+            operation_expires_at_ms,
+            &fresh,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+        let retired =
+            retired_requests
+                .iter()
+                .find(|request| {
+                    operation_registry().lock().unwrap().completed.contains_key(
+                        &operation_fingerprint(&operation_key(
+                            &repository,
+                            &account,
+                            &lease,
+                            request,
+                        )),
+                    )
+                })
+                .expect("one sealed operation is retained as a restart marker")
+                .clone();
+        assert_eq!(
+            begin(
+                &repository,
+                &account,
+                &lease,
+                operation_expires_at_ms,
+                &retired
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "LIX_READ_FULFILLMENT_RESTART"
+        );
+        let mut mismatched = retired;
+        mismatched.epoch_id = uuid::Uuid::now_v7().to_string();
+        assert_eq!(
+            begin(
+                &repository,
+                &account,
+                &lease,
+                operation_expires_at_ms,
+                &mismatched,
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "LIX_READ_FULFILLMENT_INVALID"
+        );
+        drop(owner);
+        clear_test_scope(&repository, &account, &lease);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_admission_pressure_retires_from_a_heavy_tenant_first() {
+        let authority = crate::open_lix().await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let repository = descriptor.lix_id.clone();
+        let lease = uuid::Uuid::now_v7().to_string();
+        let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+        let accounts = (0..6)
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect::<Vec<_>>();
+        let new_request = || ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: Vec::new(),
+            required: Vec::new(),
+            continuation: None,
+        };
+
+        for account in &accounts {
+            clear_test_scope(&repository, account, &lease);
+        }
+        let mut requests_by_account = BTreeMap::<String, Vec<ReadFulfillmentRequest>>::new();
+        for (account_index, count) in [4, 4, 4, 3, 1].into_iter().enumerate() {
+            let account = &accounts[account_index];
+            for _ in 0..count {
+                let request = new_request();
+                insert_test_sealed(
+                    &repository,
+                    account,
+                    &lease,
+                    &request,
+                    InputSpool::new(Arc::new(Mutex::new(PayloadSpool::default()))),
+                    0,
+                );
+                requests_by_account
+                    .entry(account.clone())
+                    .or_default()
+                    .push(request);
+            }
+        }
+        assert_eq!(Admission::usage(&repository, &accounts[0]).unwrap().0, 16);
+
+        let fresh = new_request();
+        let fresh_owner = match begin(
+            &repository,
+            &accounts[5],
+            &lease,
+            operation_expires_at_ms,
+            &fresh,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+
+        let retired = {
+            let registry = operation_registry().lock().unwrap();
+            let mut retired = Vec::new();
+            for (account, requests) in &requests_by_account {
+                for request in requests {
+                    if registry
+                        .completed
+                        .contains_key(&operation_fingerprint(&operation_key(
+                            &repository,
+                            account,
+                            &lease,
+                            request,
+                        )))
+                    {
+                        retired.push(account.clone());
+                    }
+                }
+            }
+            retired
+        };
+        assert_eq!(
+            retired.len(),
+            1,
+            "one completed marker should replace one admission"
+        );
+        assert!(
+            accounts[..3].contains(&retired[0]),
+            "global eviction should select a heavy tenant, got account index {}",
+            accounts
+                .iter()
+                .position(|account| account == &retired[0])
+                .unwrap()
+        );
+        assert_eq!(Admission::usage(&repository, &accounts[0]).unwrap().0, 16);
+
+        let retired_request =
+            requests_by_account[&retired[0]]
+                .iter()
+                .find(|request| {
+                    operation_registry().lock().unwrap().completed.contains_key(
+                        &operation_fingerprint(&operation_key(
+                            &repository,
+                            &retired[0],
+                            &lease,
+                            request,
+                        )),
+                    )
+                })
+                .unwrap();
+        assert_eq!(
+            begin(
+                &repository,
+                &retired[0],
+                &lease,
+                operation_expires_at_ms,
+                retired_request,
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "LIX_READ_FULFILLMENT_RESTART"
+        );
+
+        drop(fresh_owner);
+        for account in &accounts {
+            clear_test_scope(&repository, account, &lease);
+        }
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_byte_pressure_retires_sealed_payload_before_retrying_append() {
+        let authority = crate::open_lix().await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let repository = descriptor.lix_id.clone();
+        let account = uuid::Uuid::now_v7().to_string();
+        let lease = uuid::Uuid::now_v7().to_string();
+        let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+        let new_request = || ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: Vec::new(),
+            required: Vec::new(),
+            continuation: None,
+        };
+        clear_test_scope(&repository, &account, &lease);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let retired = new_request();
+        let retired_bytes = b"12345678".to_vec();
+        let retired_address = ReadInputAddress::BlobChunk(*blake3::hash(&retired_bytes).as_bytes());
+        let retired_payloads = Arc::new(Mutex::new(test_payload_spool_with_budget(
+            counter.clone(),
+            8,
+        )));
+        let mut retired_spool = InputSpool::new(retired_payloads.clone());
+        retired_spool
+            .append(ReadInput {
+                address: retired_address,
+                bytes: retired_bytes,
+            })
+            .unwrap();
+        drop(retired_payloads);
+        insert_test_sealed(&repository, &account, &lease, &retired, retired_spool, 8);
+        assert_eq!(counter.load(Ordering::Acquire), 8);
+
+        let current = new_request();
+        let owner = match begin(
+            &repository,
+            &account,
+            &lease,
+            operation_expires_at_ms,
+            &current,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+        let payloads = Arc::new(Mutex::new(test_payload_spool_with_budget(
+            counter.clone(),
+            8,
+        )));
+        owner.bind_payload_spool(&payloads).unwrap();
+        let mut current_spool = InputSpool::new(payloads.clone());
+        let current_bytes = b"data".to_vec();
+        current_spool
+            .append(ReadInput {
+                address: ReadInputAddress::BlobChunk(*blake3::hash(&current_bytes).as_bytes()),
+                bytes: current_bytes,
+            })
+            .unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 4);
+        assert_eq!(
+            begin(
+                &repository,
+                &account,
+                &lease,
+                operation_expires_at_ms,
+                &retired
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "LIX_READ_FULFILLMENT_RESTART"
+        );
+        drop(current_spool);
+        drop(payloads);
+        drop(owner);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        clear_test_scope(&repository, &account, &lease);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_pressure_skips_a_locked_active_spool_without_blocking() {
+        let authority = crate::open_lix().await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let repository = descriptor.lix_id.clone();
+        let account = uuid::Uuid::now_v7().to_string();
+        let lease = uuid::Uuid::now_v7().to_string();
+        let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+        let new_request = || ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: Vec::new(),
+            required: Vec::new(),
+            continuation: None,
+        };
+        clear_test_scope(&repository, &account, &lease);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let active = new_request();
+        let inactive = new_request();
+        for (request, bytes) in [(&active, b"live".to_vec()), (&inactive, b"free".to_vec())] {
+            let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
+            let payloads = Arc::new(Mutex::new(test_payload_spool_with_budget(
+                counter.clone(),
+                32,
+            )));
+            let mut spool = InputSpool::new(payloads.clone());
+            spool.append(ReadInput { address, bytes }).unwrap();
+            drop(payloads);
+            insert_test_sealed(&repository, &account, &lease, request, spool, 4);
+        }
+
+        let active_key = operation_key(&repository, &account, &lease, &active);
+        let active_operation = operation_registry()
+            .lock()
+            .unwrap()
+            .operations
+            .get(&active_key)
+            .unwrap()
+            .clone();
+        let current = new_request();
+        let owner = match begin(
+            &repository,
+            &account,
+            &lease,
+            operation_expires_at_ms,
+            &current,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+        let active_state = active_operation.state.lock().unwrap();
+        let payloads = Arc::new(Mutex::new(test_payload_spool_with_budget(
+            counter.clone(),
+            8,
+        )));
+        owner.bind_payload_spool(&payloads).unwrap();
+        let append_payloads = payloads.clone();
+        let bytes = b"data".to_vec();
+        let address = ReadInputAddress::BlobChunk(*blake3::hash(&bytes).as_bytes());
+        let (sent, received) = std::sync::mpsc::channel();
+        let append = std::thread::spawn(move || {
+            let mut spool = InputSpool::new(append_payloads);
+            sent.send(spool.append(ReadInput { address, bytes }).map(|_| ()))
+                .unwrap();
+        });
+        let append_result = received.recv_timeout(std::time::Duration::from_secs(1));
+        drop(active_state);
+        append.join().unwrap();
+        append_result
+            .expect("pressure retirement blocked on a state held by an active reader")
+            .unwrap();
+        assert_eq!(counter.load(Ordering::Acquire), 8);
+        assert!(
+            operation_registry()
+                .lock()
+                .unwrap()
+                .operations
+                .contains_key(&active_key)
+        );
+        assert_eq!(
+            begin(
+                &repository,
+                &account,
+                &lease,
+                operation_expires_at_ms,
+                &inactive
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            "LIX_READ_FULFILLMENT_RESTART"
+        );
+        drop(active_operation);
+        drop(payloads);
+        drop(owner);
+        clear_test_scope(&repository, &account, &lease);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealed_pressure_never_retires_a_pending_owner() {
+        let authority = crate::open_lix().await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let repository = descriptor.lix_id.clone();
+        let account = uuid::Uuid::now_v7().to_string();
+        let lease = uuid::Uuid::now_v7().to_string();
+        let operation_expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+        let new_request = || ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: Vec::new(),
+            required: Vec::new(),
+            continuation: None,
+        };
+        clear_test_scope(&repository, &account, &lease);
+
+        let pending_request = new_request();
+        let pending_owner = match begin(
+            &repository,
+            &account,
+            &lease,
+            operation_expires_at_ms,
+            &pending_request,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+        for _ in 0..(MAX_ACCOUNT_SPOOLS - 1) {
+            let request = new_request();
+            insert_test_sealed(
+                &repository,
+                &account,
+                &lease,
+                &request,
+                InputSpool::new(Arc::new(Mutex::new(PayloadSpool::default()))),
+                0,
+            );
+        }
+
+        let fresh = new_request();
+        let fresh_owner = match begin(
+            &repository,
+            &account,
+            &lease,
+            operation_expires_at_ms,
+            &fresh,
+        )
+        .await
+        .unwrap()
+        {
+            BeginOperation::Owner(owner) => owner,
+            BeginOperation::Replay(_) => panic!("fresh operation unexpectedly replayed"),
+        };
+        assert!(matches!(
+            *pending_owner.operation.state.lock().unwrap(),
+            OperationState::Pending(Some(_))
+        ));
+        assert!(
+            operation_registry()
+                .lock()
+                .unwrap()
+                .operations
+                .get(&pending_owner.key)
+                .is_some_and(|operation| Arc::ptr_eq(operation, &pending_owner.operation))
+        );
+        drop(fresh_owner);
+        drop(pending_owner);
         clear_test_scope(&repository, &account, &lease);
         authority.close().await.unwrap();
     }

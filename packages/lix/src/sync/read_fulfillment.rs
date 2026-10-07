@@ -1750,6 +1750,7 @@ async fn discover_bounded_with_read(
         .map_err(|_| invalid("dependency observations poisoned"))?
         .payloads
         .clone();
+    operation.bind_payload_spool(&payloads)?;
     let logical_spool = Arc::new(Mutex::new(spool::InputSpool::new(payloads.clone())));
     for address in &request.required {
         if let ReadInputAddress::BlobChunk(hash) = address {
