@@ -1007,7 +1007,7 @@ components:
       in: header
       required: true
       description: Exact SQL protocol version. Missing or incompatible versions are rejected before session creation or writes; upgrade the client.
-      schema: { type: integer, const: 9 }
+      schema: { type: integer, const: 12 }
     SessionId:
       name: Lix-Session-Id
       in: header
