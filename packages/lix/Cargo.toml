@@ -244,7 +244,7 @@ tempfile = "3"
 futures-timer = "3"
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 [target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]

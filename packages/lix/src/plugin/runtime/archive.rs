@@ -9,6 +9,7 @@ use crate::LixError;
 use crate::binary_cas::BlobId;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
+use super::manifest::MAX_PLUGIN_MANIFEST_BYTES;
 #[cfg(test)]
 use super::{InstalledPlugin, InstalledPluginMetadata};
 use super::{PluginCapabilities, PluginManifest, parse_plugin_manifest_json};
@@ -51,7 +52,7 @@ impl PluginArchiveLimits {
         entries: 128,
         entry_bytes: 32 * MIB,
         expanded_bytes: 64 * MIB,
-        manifest_bytes: 64 * KIB,
+        manifest_bytes: MAX_PLUGIN_MANIFEST_BYTES as u64,
         schema_bytes: MIB,
         path_bytes: 512,
     };

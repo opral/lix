@@ -13,6 +13,11 @@ const FRAME_BYTES: usize = PAGE_PAYLOAD_BYTES;
 const PROMOTION_ITEMS: usize = super::super::transfer::CONTENT_GROUP_ITEMS;
 const PROMOTION_BYTES: usize = PAGE_PAYLOAD_BYTES / 2;
 
+#[cfg(not(target_family = "wasm"))]
+type RemoteOperationCleanup = Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+#[cfg(target_family = "wasm")]
+type RemoteOperationCleanup = Box<dyn FnOnce() -> futures_util::future::LocalBoxFuture<'static, ()>>;
+
 #[derive(Clone)]
 struct StagedInputRef {
     address: ReadInputAddress,
@@ -35,6 +40,8 @@ pub(crate) struct StagedClosure<S: Storage + Clone + Send + Sync + 'static> {
     validated: bool,
     released: bool,
     heartbeat: Option<crate::background_task::OwnedBackgroundTask>,
+    remote_operation_cleanup: Option<RemoteOperationCleanup>,
+    read_operation_owner: Option<super::super::http::ReadOperationOwner>,
 }
 
 /// The only authority to fold a scratch-owner reaping claim into a canonical
@@ -61,6 +68,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         mut header: ReadFulfillmentResponse,
         id: uuid::Uuid,
         permit: lifecycle::Permit,
+        read_operation_owner: Option<super::super::http::ReadOperationOwner>,
     ) -> Self {
         header.inputs.clear();
         Self {
@@ -76,6 +84,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             validated: false,
             released: false,
             heartbeat: None,
+            remote_operation_cleanup: None,
+            read_operation_owner,
         }
     }
 
@@ -83,7 +93,52 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         self.header.outcome
     }
 
+    fn track_remote_operation_send<C>(
+        &mut self,
+        transport: &super::super::http::HttpSyncTransport<C>,
+        request: &ReadFulfillmentRequest,
+        event: super::super::http::ReadSendEvent,
+        cancellation: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), LixError>
+    where
+        C: super::super::http::RawHttpClient + Clone + 'static,
+    {
+        match event {
+            super::super::http::ReadSendEvent::RejectedBeforeExecution => {
+                // The server proved this session rejected the request before
+                // execution. Do not release through a stale session if
+                // recovery fails; a replacement dispatch below installs its
+                // own exact capability.
+                self.remote_operation_cleanup.take();
+            }
+            super::super::http::ReadSendEvent::Dispatched(session_id) => {
+                self.remote_operation_cleanup = Some(remote_operation_cleanup(
+                    transport,
+                    request,
+                    session_id,
+                ));
+            }
+        }
+        if cancellation_requested(cancellation) {
+            return Err(cancellation_error());
+        }
+        Ok(())
+    }
+
     async fn release_scratch(&mut self) -> Result<(), LixError> {
+        if self.released {
+            return Ok(());
+        }
+        if let Some(cleanup) = self.remote_operation_cleanup.take() {
+            cleanup().await;
+        }
+        self.release_local_scratch().await?;
+        self.permit.take();
+        self.read_operation_owner.take();
+        Ok(())
+    }
+
+    async fn release_local_scratch(&mut self) -> Result<(), LixError> {
         if self.released {
             return Ok(());
         }
@@ -91,9 +146,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             let _ = heartbeat.cancel_and_join();
         }
         self.heartbeat.take();
-        lifecycle::release(self.storage.clone(), self.id).await?;
+        lifecycle::release_until_acknowledged(self.storage.clone(), self.id).await;
         self.released = true;
-        self.permit.take();
         Ok(())
     }
 
@@ -462,6 +516,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         if self.inputs.is_empty() {
             lifecycle::finalize_empty(&self.storage, &self.state, self.id).await?;
         }
+        // A fully promoted operation needs no foreground release request.
+        // The server operation is already terminal; disarming here preserves
+        // the existing one-pass success latency.
+        self.remote_operation_cleanup.take();
         self.release_scratch().await?;
         Ok(hydrated)
     }
@@ -569,12 +627,50 @@ impl<S: Storage + Clone + Send + Sync + 'static> Drop for StagedClosure<S> {
         }
         let storage = self.storage.clone();
         let id = self.id;
-        let permit = self.permit.take();
-        let _ =
-            crate::background_task::spawn("read-operation-scratch-cleanup", move || async move {
-                let _ = lifecycle::release(storage, id).await;
-                drop(permit);
-            });
+        let permit = Arc::new(Mutex::new(self.permit.take()));
+        let worker_permit = Arc::clone(&permit);
+        let remote_operation_cleanup = self.remote_operation_cleanup.take();
+        let read_operation_owner = self.read_operation_owner.take();
+        let worker_read_operation_owner =
+            Arc::new(Mutex::new(read_operation_owner));
+        let deferred_read_operation_owner = Arc::clone(&worker_read_operation_owner);
+        let queued = crate::background_task::spawn_runtime_compatible(
+            "read-operation-scratch-cleanup",
+            move || async move {
+                if let Some(cleanup) = remote_operation_cleanup {
+                    cleanup().await;
+                }
+                lifecycle::release_until_acknowledged(storage, id).await;
+                worker_permit
+                    .lock()
+                    .expect("scratch cleanup permit lock is not poisoned")
+                    .take();
+                deferred_read_operation_owner
+                    .lock()
+                    .expect("read operation owner lock is not poisoned")
+                    .take();
+            },
+        );
+        if queued.is_err()
+            && let Some(permit) = permit
+                .lock()
+                .expect("scratch cleanup permit lock is not poisoned")
+                .take()
+        {
+            // Fail closed if no executor can own cleanup: do not advertise
+            // process capacity while this owner's durable state is unknown.
+            std::mem::forget(permit);
+        }
+        if queued.is_err()
+            && let Some(owner) = worker_read_operation_owner
+                .lock()
+                .expect("read operation owner lock is not poisoned")
+                .take()
+        {
+            // Session deletion must remain behind remote and durable cleanup.
+            // Keep the capability alive if no executor can own that work.
+            std::mem::forget(owner);
+        }
     }
 }
 
@@ -589,56 +685,282 @@ pub(crate) async fn fetch_staged<S, C>(
 ) -> Result<StagedClosure<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::super::http::RawHttpClient,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
+    fetch_staged_with_permit(
+        storage,
+        state,
+        transport,
+        request,
+        lifecycle::Permit::acquire()?,
+    )
+    .await
+}
+
+async fn fetch_staged_with_permit<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    owner_permit: lifecycle::Permit,
+) -> Result<StagedClosure<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+    let mut cancellation = FetchCancellation(Some(cancel_sender));
+    let owner_id = uuid::Uuid::now_v7();
+    let read_operation_owner = transport.acquire_read_operation_owner()?;
+    let storage = storage.clone();
+    let state = state.clone();
+    let transport = transport.clone();
+    let request = request.clone();
+    crate::background_task::spawn_runtime_compatible(
+        "read-operation-staged-fetch",
+        move || async move {
+            let result = fetch_staged_owned(
+                &storage,
+                &state,
+                &transport,
+                &request,
+                (owner_id, owner_permit),
+                read_operation_owner,
+                cancel_receiver,
+            )
+            .await;
+            let _ = result_sender.send(result);
+        },
+    )?;
+
+    match result_receiver.await {
+        Ok(result) => {
+            cancellation.disarm();
+            result
+        }
+        Err(_) => {
+            cancellation.disarm();
+            Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "staged fetch owner ended before returning a result",
+            ))
+        }
+    }
+}
+
+struct FetchCancellation(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl FetchCancellation {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for FetchCancellation {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn cancellation_requested(receiver: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+    matches!(
+        receiver.try_recv(),
+        Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    )
+}
+
+fn cancellation_error() -> LixError {
+    LixError::new("LIX_READ_FULFILLMENT_CANCELED", "staged fetch was canceled")
+}
+
+struct StagedFetchAttemptError {
+    error: LixError,
+    remote_operation_cleanup: Option<RemoteOperationCleanup>,
+    permit: Option<lifecycle::Permit>,
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
+    async fn into_attempt_error(&mut self, error: LixError) -> StagedFetchAttemptError {
+        // The scratch ledger owns only private client frames, so this attempt
+        // may acknowledge their deletion before the driver releases the
+        // remote operation. The returned process permit stays with the
+        // driver's retry/error state, and its outer ReadOperationOwner stays
+        // alive until that remote cleanup (or same-ID network retry) finishes.
+        let remote_operation_cleanup = self.remote_operation_cleanup.take();
+        let _ = self.release_local_scratch().await;
+        StagedFetchAttemptError {
+            error,
+            remote_operation_cleanup,
+            permit: self.permit.take(),
+        }
+    }
+}
+
+impl From<LixError> for StagedFetchAttemptError {
+    fn from(error: LixError) -> Self {
+        Self {
+            error,
+            remote_operation_cleanup: None,
+            permit: None,
+        }
+    }
+}
+
+async fn fetch_staged_owned<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    initial_owner: (uuid::Uuid, lifecycle::Permit),
+    read_operation_owner: super::super::http::ReadOperationOwner,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+) -> Result<StagedClosure<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
 {
     let mut attempt_request = request.clone();
     let mut network_retry_used = false;
     let mut operation_restart_used = false;
+    let mut reusable_permit = Some(initial_owner.1);
+    let mut next_owner_id = initial_owner.0;
+    let mut retry_remote_cleanup: Option<RemoteOperationCleanup> = None;
     for _ in 0..3 {
-        let mut request_may_have_reached_server = false;
+        if cancellation_requested(&mut cancellation) {
+            if let Some(cleanup) = retry_remote_cleanup.take() {
+                cleanup().await;
+            }
+            drop(reusable_permit.take());
+            return Err(cancellation_error());
+        }
         match fetch_staged_once(
             storage,
             state,
             transport,
             &attempt_request,
-            &mut request_may_have_reached_server,
+            reusable_permit
+                .take()
+                .map(|permit| (next_owner_id, permit)),
+            read_operation_owner.clone(),
+            &mut cancellation,
         )
         .await
         {
-            Ok(stage) => return Ok(stage),
-            Err(error) if error.code == "LIX_TRANSPORT_NETWORK" && !network_retry_used => {
+            Ok(mut stage) => {
+                if cancellation_requested(&mut cancellation) {
+                    let _ = stage.release_scratch().await;
+                    if let Some(cleanup) = retry_remote_cleanup.take() {
+                        cleanup().await;
+                    }
+                    return Err(cancellation_error());
+                }
+                // A prior same-ID network attempt may have reached the same
+                // server operation. The successful attempt now owns its
+                // terminal cleanup capability, so discard the older unpolled
+                // duplicate without sending a release request.
+                retry_remote_cleanup.take();
+                return Ok(stage);
+            }
+            Err(mut failure)
+                if failure.error.code == "LIX_TRANSPORT_NETWORK" && !network_retry_used =>
+            {
+                if cancellation_requested(&mut cancellation) {
+                    if let Some(cleanup) = failure
+                        .remote_operation_cleanup
+                        .take()
+                        .or_else(|| retry_remote_cleanup.take())
+                    {
+                        cleanup().await;
+                    }
+                    drop(failure.permit.take());
+                    drop(retry_remote_cleanup.take());
+                    drop(reusable_permit.take());
+                    return Err(cancellation_error());
+                }
+                if let Some(cleanup) = failure.remote_operation_cleanup.take() {
+                    retry_remote_cleanup = Some(cleanup);
+                }
+                reusable_permit = failure.permit.take();
+                next_owner_id = uuid::Uuid::now_v7();
                 network_retry_used = true;
             }
-            Err(error)
-                if error.code == "LIX_READ_FULFILLMENT_RESTART" && !operation_restart_used =>
+            Err(mut failure)
+                if failure.error.code == "LIX_READ_FULFILLMENT_RESTART"
+                    && !operation_restart_used =>
             {
-                if request_may_have_reached_server {
-                    release_remote_operation(transport, &attempt_request).await;
+                if cancellation_requested(&mut cancellation) {
+                    if let Some(cleanup) = failure
+                        .remote_operation_cleanup
+                        .take()
+                        .or_else(|| retry_remote_cleanup.take())
+                    {
+                        cleanup().await;
+                    }
+                    drop(failure.permit.take());
+                    drop(retry_remote_cleanup.take());
+                    drop(reusable_permit.take());
+                    return Err(cancellation_error());
                 }
+                if let Some(cleanup) = failure
+                    .remote_operation_cleanup
+                    .take()
+                    .or_else(|| retry_remote_cleanup.take())
+                {
+                    cleanup().await;
+                }
+                drop(retry_remote_cleanup.take());
+                reusable_permit = failure.permit.take().or_else(|| reusable_permit.take());
                 attempt_request.operation_id = uuid::Uuid::now_v7().to_string();
+                next_owner_id = uuid::Uuid::now_v7();
                 operation_restart_used = true;
             }
-            Err(error) => {
-                if request_may_have_reached_server {
-                    release_remote_operation(transport, &attempt_request).await;
+            Err(mut failure) => {
+                if let Some(cleanup) = failure
+                    .remote_operation_cleanup
+                    .take()
+                    .or_else(|| retry_remote_cleanup.take())
+                {
+                    cleanup().await;
                 }
-                return Err(error);
+                drop(failure.permit.take());
+                drop(retry_remote_cleanup.take());
+                drop(reusable_permit.take());
+                return Err(failure.error);
             }
         }
     }
     unreachable!("bounded staged fetch always returns on its third attempt")
 }
 
-async fn release_remote_operation<C>(
+fn remote_operation_cleanup<C>(
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
-) where
-    C: super::super::http::RawHttpClient,
+    session_id: String,
+) -> RemoteOperationCleanup
+where
+    C: super::super::http::RawHttpClient + Clone + 'static,
 {
+    let transport = transport.clone();
     let mut release = request.clone();
     release.release = true;
     release.continuation = None;
-    let _ = transport.fulfill_read(&release).await;
+    Box::new(move || {
+        Box::pin(async move {
+            // Release is idempotent for the same operation identity. Retry one
+            // ambiguous network failure so a request lost before authority
+            // acceptance does not retain a sealed spool until lease expiry.
+            for attempt in 0..2 {
+                match transport.release_read_operation(&release, &session_id).await {
+                    Ok(_) => return,
+                    Err(error) if attempt == 0 && error.code == "LIX_TRANSPORT_NETWORK" => {}
+                    Err(_) => return,
+                }
+            }
+        })
+    })
 }
 
 async fn fetch_staged_once<S, C>(
@@ -646,15 +968,14 @@ async fn fetch_staged_once<S, C>(
     state: &PartialReplicaState,
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
-    request_may_have_reached_server: &mut bool,
-) -> Result<StagedClosure<S>, LixError>
+    owner: Option<(uuid::Uuid, lifecycle::Permit)>,
+    read_operation_owner: super::super::http::ReadOperationOwner,
+    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Result<StagedClosure<S>, StagedFetchAttemptError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::super::http::RawHttpClient,
+    C: super::super::http::RawHttpClient + Clone + 'static,
 {
-    // Both process capacity and crash-safe physical ownership precede the
-    // first network receive, so refused admission does no transfer work.
-    let (id, permit) = lifecycle::reserve(storage, state).await?;
     let header = ReadFulfillmentResponse {
         frame: None,
         lix_id: request.descriptor.lix_id.clone(),
@@ -666,33 +987,73 @@ where
         continuation: None,
         outcome: ReadFulfillmentOutcome::Complete,
     };
-    let mut stage = StagedClosure::new(storage, state, header, id, permit);
+    // The detached owner task keeps the reservation/commit future alive until
+    // it receives a definite result, even if its caller drops the future.
+    // Both process capacity and durable ownership still precede HTTP work.
+    let (id, permit) = match owner {
+        Some((id, permit)) => match lifecycle::reserve_owned(storage, state, id, permit).await {
+            Ok(reserved) => reserved,
+            Err((error, permit)) => {
+                return Err(StagedFetchAttemptError {
+                    error,
+                    remote_operation_cleanup: None,
+                    permit: Some(permit),
+                });
+            }
+        },
+        None => lifecycle::reserve(storage, state).await?,
+    };
+    let mut stage = StagedClosure::new(
+        storage,
+        state,
+        header,
+        id,
+        permit,
+        Some(read_operation_owner),
+    );
+    if cancellation_requested(cancellation) {
+        return Err(stage.into_attempt_error(cancellation_error()).await);
+    }
     if let Err(error) = stage.start_heartbeat() {
-        let _ = stage.release_scratch().await;
-        return Err(error);
+        return Err(stage.into_attempt_error(error).await);
     }
     let mut page_request = request.clone();
-    *request_may_have_reached_server = true;
-    let mut page = match transport.fulfill_read(&page_request).await {
+    let mut page = match transport
+        .fulfill_read_tracked(&page_request, |event| {
+            // The first raw dispatch makes cancellation authority necessary.
+            // A canonical SESSION_GONE proves the authority rejected that
+            // attempt before execution, so discard it before recovery can
+            // fail or the replacement session can be closed.
+            stage.track_remote_operation_send(transport, request, event, cancellation)
+        })
+        .await
+    {
         Ok(page) => page,
         Err(error) => {
-            let _ = stage.release_scratch().await;
-            return Err(error);
+            return Err(stage.into_attempt_error(error).await);
         }
     };
+    if cancellation_requested(cancellation) {
+        return Err(stage.into_attempt_error(cancellation_error()).await);
+    }
     stage.header = page.clone();
     stage.header.inputs.clear();
     stage.header.frame = None;
     if page.outcome != ReadFulfillmentOutcome::Complete {
         if let Err(error) = validate_complete(request, &page) {
-            let _ = stage.release_scratch().await;
-            return Err(error);
+            return Err(stage.into_attempt_error(error).await);
         }
+        // A validated fallback response is terminal: the authority removed
+        // its pending operation. Releasing it again would create a tombstone.
+        stage.remote_operation_cleanup.take();
         stage.release_scratch().await?;
         return Ok(stage);
     }
     let result = async {
         for _ in 0..MAX_PAGES {
+            if cancellation_requested(cancellation) {
+                return Err(cancellation_error());
+            }
             validate_response(&page_request, &page)?;
             if page.closure_digest != stage.header.closure_digest
                 || page.outcome != ReadFulfillmentOutcome::Complete
@@ -707,20 +1068,32 @@ where
             } else {
                 stage.append_page(page.inputs).await?;
             }
+            if cancellation_requested(cancellation) {
+                return Err(cancellation_error());
+            }
             let Some(next) = next else {
                 stage.header.continuation = None;
                 stage.validate(request).await?;
+                if cancellation_requested(cancellation) {
+                    return Err(cancellation_error());
+                }
                 return Ok(());
             };
             page_request.continuation = Some(next);
-            page = transport.fulfill_read(&page_request).await?;
+            page = transport
+                .fulfill_read_tracked(&page_request, |event| {
+                    stage.track_remote_operation_send(transport, request, event, cancellation)
+                })
+                .await?;
+            if cancellation_requested(cancellation) {
+                return Err(cancellation_error());
+            }
         }
         Err(invalid("staged read continuation count exceeds bound"))
     }
     .await;
     if let Err(error) = result {
-        let _ = stage.release_scratch().await;
-        return Err(error);
+        return Err(stage.into_attempt_error(error).await);
     }
     Ok(stage)
 }

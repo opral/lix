@@ -75,7 +75,7 @@ impl SyncDemand {
 
 #[derive(Clone, Debug)]
 pub(super) enum SyncDemandRequest {
-    BlobManifest(crate::binary_cas::BlobId, LixError),
+    BlobManifests(Vec<crate::binary_cas::BlobId>, LixError),
     NativeObject(crate::tracked_state::NativeObjectRef, LixError),
     NativeObjects(Vec<crate::tracked_state::NativeObjectRef>, LixError),
     NativeMetadata(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
@@ -391,10 +391,13 @@ pub(super) fn native_sync_demand_request_for_error(
             error.clone(),
         )));
     }
-    if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
-        crate::binary_cas::BlobManifestRequired::from_error(error)?
+    if let Some(crate::binary_cas::BlobManifestsRequired(hashes)) =
+        crate::binary_cas::BlobManifestsRequired::from_error(error)?
     {
-        return Ok(Some(SyncDemandRequest::BlobManifest(hash, error.clone())));
+        return Ok(Some(SyncDemandRequest::BlobManifests(
+            hashes,
+            error.clone(),
+        )));
     }
     if let Some(addresses) = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
     {
@@ -442,7 +445,7 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         SyncDemandRequest::NativeObject(_, error)
         | SyncDemandRequest::NativeObjects(_, error)
         | SyncDemandRequest::NativeMetadata(_, error)
-        | SyncDemandRequest::BlobManifest(_, error) => {
+        | SyncDemandRequest::BlobManifests(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
         SyncDemandRequest::ChunksWithRead(ids, error) => sync_demand_request_for_error(&error)?
@@ -1078,7 +1081,7 @@ where
             SyncDemandRequest::NativeObject(_, _)
             | SyncDemandRequest::NativeObjects(_, _)
             | SyncDemandRequest::NativeMetadata(_, _)
-            | SyncDemandRequest::BlobManifest(_, _) => {}
+            | SyncDemandRequest::BlobManifests(_, _) => {}
             SyncDemandRequest::ReconcilePartial
             | SyncDemandRequest::PrepareOfflineEditing
             | SyncDemandRequest::Pinned(_) => {}
@@ -1128,7 +1131,7 @@ fn resolve_sync_demand_results(
             SyncDemandRequest::NativeObject(_, error)
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
-            | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
+            | SyncDemandRequest::BlobManifests(_, error) => Err(error.clone()),
             SyncDemandRequest::PrepareOfflineEditing => Err(LixError::new(
                 "LIX_SYNC_MODE_MISMATCH",
                 "offline editing preparation requires a partial replica",
@@ -1754,7 +1757,7 @@ where
         Some(SyncDemandRequest::NativeObject(_, original))
         | Some(SyncDemandRequest::NativeObjects(_, original))
         | Some(SyncDemandRequest::NativeMetadata(_, original))
-        | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
+        | Some(SyncDemandRequest::BlobManifests(_, original)) => Err(original),
         Some(SyncDemandRequest::PrepareOfflineEditing) => Err(LixError::new(
             "LIX_SYNC_MODE_MISMATCH",
             "offline editing preparation requires a partial replica",
@@ -2600,11 +2603,11 @@ mod tests {
     #[test]
     fn referenced_blob_demand_is_partial_only_and_postcommit_is_not_replayed() {
         let hash = crate::binary_cas::BlobId::from_content(b"referenced content");
-        let error = crate::binary_cas::BlobManifestRequired(hash).into_error();
+        let error = crate::binary_cas::BlobManifestsRequired(vec![hash]).into_error();
         let request = native_sync_demand_request_for_error(&error)
             .unwrap()
             .unwrap();
-        assert!(matches!(request, SyncDemandRequest::BlobManifest(id, _) if id == hash));
+        assert!(matches!(&request, SyncDemandRequest::BlobManifests(ids, _) if ids == &vec![hash]));
         assert_eq!(full_replica_demand(request).unwrap_err().code, error.code);
         assert!(sync_demand_request_for_error(&error).unwrap().is_none());
         let mut committed = error;

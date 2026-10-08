@@ -134,7 +134,7 @@ pub(crate) use storage::{
 };
 pub(crate) use storage::{
     change_locators_select_references_for_migration, decode_change_locator, encode_change_locator,
-    load_canonical_change_locator,
+    load_canonical_change_locators,
 };
 #[cfg(test)]
 pub(crate) use storage::{

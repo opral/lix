@@ -28,7 +28,7 @@
 //! | `uuid` | 16 fixed bytes, RFC 4122 field order | textual spelling parsed away | unparseable text |
 //! | `timestamptz` | 8 fixed bytes, signed UTC microseconds, big-endian | input offset converted to UTC | out-of-range RFC 3339 input |
 //! | `text` | raw UTF-8, var area | **none** (see below) | interior NUL |
-//! | `jsonb` | canonical semantic JSON, UTF-8, var area | keys sorted, integral f64 -> i64, spelling normalised | NUL in string or key, non-finite number |
+//! | `jsonb` | canonical semantic JSON, UTF-8, var area | keys sorted, exact PostgreSQL decimal normalization | NUL in string or key, numbers outside PostgreSQL precision/scale |
 //!
 //! `text` is deliberately **not** Unicode-normalised. Two normalisations of
 //! "the same" string are distinct SQL `text` values under PostgreSQL semantics
@@ -162,12 +162,9 @@ pub fn canonical_text_bytes(value: &str) -> Result<&[u8], EncodeError> {
 
 /// Canonical semantic JSON for a `jsonb` value.
 ///
-/// Mirrors `lix::sql2::udfs::common::parse_jsonb` + `serde_json::to_string`,
-/// the function the public write path already routes through: object keys
-/// sorted, NUL rejected in keys and strings, and integral non-integer numbers
-/// within +/-2^53 folded to integers so `1.0` and `1` are one value.
-/// Non-finite numbers cannot occur (JSON has no syntax for them) but the fold
-/// guards for them anyway.
+/// Uses the same object ordering, NUL checks, and exact decimal normalizer as
+/// the SQL JSONB path. Numerically equivalent spellings such as `1`, `1.0`,
+/// and `1e0` therefore have one typed-row image without passing through f64.
 pub fn canonical_jsonb_bytes(value: &Value) -> Result<Vec<u8>, EncodeError> {
     let mut normalised = value.clone();
     canonicalize_jsonb_in_place(&mut normalised)?;
@@ -196,17 +193,13 @@ pub fn canonicalize_jsonb_in_place(value: &mut Value) -> Result<(), EncodeError>
                 values.insert(key, value);
             }
         }
-        Value::Number(number) if !number.is_i64() && !number.is_u64() => {
-            if let Some(number) = number.as_f64() {
-                if !number.is_finite() {
-                    return err("jsonb cannot represent a non-finite number");
-                }
-                if number.fract() == 0.0 && number.abs() <= 9_007_199_254_740_992.0 {
-                    *value = Value::from(number as i64);
-                }
-            }
+        Value::Number(number) => {
+            *value = Value::Number(
+                crate::normalize_jsonb_number(number)
+                    .map_err(|error| EncodeError(error.to_string()))?,
+            );
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Null | Value::Bool(_) => {}
     }
     Ok(())
 }

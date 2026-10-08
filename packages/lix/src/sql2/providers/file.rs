@@ -37,7 +37,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use futures_util::{FutureExt, TryStreamExt, future::try_join_all};
+use futures_util::{FutureExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
@@ -56,8 +56,8 @@ use crate::hot_state::{
     MaterializedHotStateBatchBuilder, MaterializedHotStateRowRef,
 };
 use crate::plugin::runtime::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
-    PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PluginActorKey, PluginFileOwner, PluginRegistry,
+    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
     plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
     plugin_storage_archive_file_id,
 };
@@ -735,27 +735,14 @@ async fn try_exact_file_content_with_bounded_path_validation(
         // An uninstalled plugin can leave a durable owner behind. The
         // pathful renderer reports that state as unavailable, so it must
         // handle any owner even when the current registry is empty.
-        let owners = hot_state
-            .load_exact_batch(&HotStateExactBatchRequest {
-                rows: vec![HotStateExactRowRequest {
-                    schema_key: "lix_key_value".to_owned(),
-                    branch_id: descriptor.key.branch_id().to_owned(),
-                    row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                    file_id: Some(file_id.to_owned()),
-                }],
-                projection: plugin_control_hot_state_projection(),
-                untracked: Some(false),
-                include_tombstones: false,
-            })
-            .await?;
-        if owners.row(0).is_some_and(|owner| {
-            owner.schema_key() == "lix_key_value"
-                && owner.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
-                && owner.branch_id() == descriptor.key.branch_id()
-                && owner.file_id() == Some(file_id)
-                && !owner.global()
-                && !owner.untracked()
-        }) {
+        let owner_targets = vec![(descriptor.key.branch_id().to_owned(), file_id.to_owned())];
+        if !crate::plugin::runtime::load_plugin_owner_pages(
+            hot_state.as_ref(),
+            &owner_targets,
+        )
+        .await?
+        .is_empty()
+        {
             return Ok(None);
         }
     }
@@ -6105,10 +6092,25 @@ async fn plugin_render_context_for_lix_file_scan_cached(
     include_blob_backed_candidates: bool,
     cache_snapshot: Option<u128>,
 ) -> Result<Option<PluginRenderContext>, LixError> {
-    let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
-    if candidates.is_empty() {
+    let candidate_count = prepared
+        .file_rows
+        .values()
+        .filter(|file| {
+            plugin_file_can_have_durable_owner(file)
+                && (include_blob_backed_candidates
+                    || !prepared
+                        .blob_rows
+                        .contains_key(&file.blob_ref_key(&prepared.live_rows)))
+        })
+        .take(crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS + 1)
+        .count();
+    if candidate_count == 0 {
         return Ok(None);
     }
+    if candidate_count > crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+        return Err(crate::plugin::runtime::executable_dependency_work_bound());
+    }
+    let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
     let branches =
         load_plugin_render_branches(Arc::clone(&hot_state), request, &host, cache_snapshot).await?;
     plugin_render_context_with_branches(
@@ -6127,6 +6129,9 @@ async fn load_plugin_render_branches(
     host: &PluginRuntimeHost,
     cache_snapshot: Option<u128>,
 ) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError> {
+    if request.filter.branch_ids.len() > crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+        return Err(crate::plugin::runtime::executable_dependency_work_bound());
+    }
     let branch_ids = request
         .filter
         .branch_ids
@@ -6148,38 +6153,12 @@ async fn load_plugin_render_branches(
             // access path as dependency discovery, including the absent-row
             // case; a collection scan can require catalogs that the exact
             // lookup does not visit and restart a cold replica's waterfall.
-            let rows = hot_state
-                .load_exact_batch(&HotStateExactBatchRequest {
-                    rows: branch_ids
-                        .iter()
-                        .map(|branch_id| HotStateExactRowRequest {
-                            schema_key: "lix_key_value".to_owned(),
-                            branch_id: branch_id.clone(),
-                            row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
-                            file_id: None,
-                        })
-                        .collect(),
-                    projection: plugin_control_hot_state_projection(),
-                    untracked: Some(false),
-                    include_tombstones: false,
-                })
-                .await?;
-            let registries = branch_ids
-                .iter()
-                .enumerate()
-                .map(|(index, branch_id)| {
-                    let row = rows.row(index).filter(|row| {
-                        row.schema_key() == "lix_key_value"
-                            && row.row_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
-                            && row.file_id().is_none()
-                            && row.branch_id() == branch_id.as_str()
-                            && !row.global()
-                            && !row.untracked()
-                    });
-                    PluginRegistry::from_optional_hot_state_row(row, branch_id)
-                        .map(|registry| (branch_id.clone(), registry))
-                })
-                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+            let registry_branches = branch_ids.iter().cloned().collect::<Vec<_>>();
+            let registries = crate::plugin::runtime::load_plugin_registry_pages(
+                hot_state.as_ref(),
+                &registry_branches,
+            )
+            .await?;
             if let Some(snapshot) = cache_snapshot {
                 host.cache_plugin_registries(snapshot, &registries)?;
             }
@@ -6229,85 +6208,49 @@ async fn plugin_render_context_with_branches(
         }
     }
 
-    let owner_reads = candidate_keys_by_branch
+    let owner_targets = candidate_keys_by_branch
         .iter()
-        .map(|(branch_id, candidate_keys)| {
-            let hot_state = Arc::clone(&hot_state);
-            let branch_id = branch_id.clone();
-            let file_ids = candidate_keys.keys().cloned().collect::<BTreeSet<_>>();
-            async move {
-                let rows = hot_state
-                    .load_exact_batch(&HotStateExactBatchRequest {
-                        rows: file_ids
-                            .iter()
-                            .map(|file_id| HotStateExactRowRequest {
-                                schema_key: "lix_key_value".to_owned(),
-                                branch_id: branch_id.clone(),
-                                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                                file_id: Some(file_id.clone()),
-                            })
-                            .collect(),
-                        projection: plugin_control_hot_state_projection(),
-                        untracked: Some(false),
-                        include_tombstones: false,
-                    })
-                    .await?;
-                Ok::<_, LixError>((branch_id, file_ids, rows))
-            }
-        });
+        .flat_map(|(branch_id, candidate_keys)| {
+            candidate_keys
+                .keys()
+                .map(move |file_id| (branch_id.clone(), file_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let owner_rows: BTreeMap<
+        (String, String),
+        crate::plugin::runtime::PluginOwnerLookupRow,
+    > = crate::plugin::runtime::load_plugin_owner_pages(
+        hot_state.as_ref(),
+        &owner_targets,
+    )
+    .await?;
     let mut owners_by_file = BTreeMap::new();
     let mut owner_change_ids_by_file = BTreeMap::new();
-    let owner_rows = try_join_all(owner_reads).await?;
-    for (branch_id, file_ids, rows) in owner_rows {
-        for row in (0..rows.len()).filter_map(|index| rows.row(index)) {
-            let Some(file_id) = row.file_id() else {
-                continue;
-            };
-            if row.schema_key() != "lix_key_value"
-                || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
-                || row.branch_id() != branch_id.as_str()
-                || row.global()
-                || row.untracked()
-                || !file_ids.contains(file_id)
-            {
-                continue;
-            }
-            let owned_row = row.to_owned();
-            // KNOWN LANE GAP: this render context resolves owners through
-            // tracked-only exact requests, so untracked
-            // plugin-owned files are not rendered from rows here. They do
-            // not need to be - an untracked file's bytes round-trip through its
-            // stored content blob, which is asserted by the lane-parity tests.
-            // Extending this to both lanes means changing the reader and
-            // belongs with the read-path work, not the unskip.
-            let Some(owner) = PluginFileOwner::from_hot_state_row(&owned_row, &branch_id, false)?
-            else {
-                continue;
-            };
-            let candidate_key = candidate_keys_by_branch
-                .get(&branch_id)
-                .and_then(|candidate_keys| candidate_keys.get(file_id))
-                .expect("owner row was filtered to candidate file ids")
-                .clone();
-            let owner_change_id = row.change_id().ok_or_else(|| {
-                invalid_plugin_read_state(format!(
-                    "branch '{branch_id}' plugin owner for file id '{file_id}' is missing change_id"
-                ))
-            })?;
-            // Keep a well-formed stale owner even when its plugin is currently
-            // absent. Rendering checks the current registry, while path moves
-            // still need the old key to force reconciliation; reinstall can
-            // then resume from the durable owner.
-            if owners_by_file
-                .insert(candidate_key.clone(), owner)
-                .is_some()
-            {
-                return Err(invalid_plugin_read_state(format!(
-                    "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
-                )));
-            }
-            owner_change_ids_by_file.insert(candidate_key, owner_change_id.to_string());
+    for ((branch_id, file_id), loaded) in owner_rows {
+        let owner = loaded.owner;
+        let candidate_key = candidate_keys_by_branch
+            .get(&branch_id)
+            .and_then(|candidate_keys| candidate_keys.get(&file_id))
+            .expect("owner row was aligned to a requested candidate file")
+            .clone();
+        let owner_change_id = loaded.change_id.ok_or_else(|| {
+            invalid_plugin_read_state(format!(
+                "branch '{branch_id}' plugin owner for file id '{file_id}' is missing change_id"
+            ))
+        })?;
+        // Keep a well-formed stale owner even when its plugin is currently
+        // absent. Rendering checks the current registry, while path moves
+        // still need the old key to force reconciliation; reinstall can
+        // then resume from the durable owner.
+        if owners_by_file
+            .insert(candidate_key.clone(), owner)
+            .is_some()
+        {
+            return Err(invalid_plugin_read_state(format!(
+                "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
+            )));
         }
+        owner_change_ids_by_file.insert(candidate_key, owner_change_id);
     }
 
     if owners_by_file.is_empty() && !keep_catalog_without_owners {
@@ -6350,12 +6293,6 @@ fn plugin_unavailable_error(
         "path": path,
         "plugin_key": owner.plugin_key(),
     }))
-}
-
-fn plugin_control_hot_state_projection() -> HotStateProjection {
-    HotStateProjection {
-        columns: vec!["snapshot_content".to_string()],
-    }
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -9777,6 +9714,18 @@ mod tests {
             };
             let ordinal = builder.len();
             builder.push_owned(row);
+            let raw = typed
+                .as_deref()
+                .map(|typed| {
+                    typed
+                        .durable_payload()
+                        .map(|payload| bytes::Bytes::copy_from_slice(payload.as_ref()))
+                        .map_err(|error| {
+                            LixError::unknown(format!("invalid test typed payload: {error:?}"))
+                        })
+                })
+                .transpose()?;
+            builder.set_raw_snapshot(ordinal, raw);
             builder.set_decoded_snapshot(ordinal, typed);
         }
         Ok(builder.finish())

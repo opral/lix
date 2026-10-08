@@ -170,7 +170,7 @@ pub(super) async fn compile_component(
     let component = runtime
         .shared
         .compiled_components
-        .get_or_compile(key, || {
+        .get_or_compile(key, bytes.len(), || {
             Component::new(engine, &bytes)
                 .map_err(|error| wasm_runtime_error("failed to compile plugin component", error))
         })

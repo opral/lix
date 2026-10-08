@@ -60,6 +60,16 @@ pub trait SyncTransportBounds {}
 #[cfg(target_family = "wasm")]
 impl<T> SyncTransportBounds for T where T: ?Sized {}
 
+/// Target-appropriate bound for a one-shot callback moved with an HTTP future.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) trait SyncCallbackBounds: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send + ?Sized> SyncCallbackBounds for T {}
+#[cfg(target_family = "wasm")]
+pub(crate) trait SyncCallbackBounds {}
+#[cfg(target_family = "wasm")]
+impl<T: ?Sized> SyncCallbackBounds for T {}
+
 /// Compile-time architecture guard: synchronization policy belongs in the
 /// shared runtime/core. Only adapter modules may branch on the target.
 #[cfg(test)]

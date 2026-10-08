@@ -501,14 +501,21 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             }
             Ok(complete)
         }
-        SyncDemandRequest::BlobManifest(address, _) => {
-            super::partial_blob::manifest_is_resident(storage, state, *address).await
+        SyncDemandRequest::BlobManifests(addresses, _) => {
+            let mut resident = true;
+            for page in addresses.chunks(super::transfer::MANIFEST_PAGE_ITEMS) {
+                resident &= super::partial_blob::manifests_are_resident(storage, state, page)
+                    .await?.into_iter().all(|present| present);
+            }
+            Ok(resident)
         }
         SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
             let mut resident = true;
-            for id in ids {
-                let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
-                resident &= super::partial_blob::chunk_is_resident(storage, state, hash).await?;
+            for page in ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
+                let hashes = page.iter().map(|id| crate::binary_cas::ChunkHash::from_hex(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                resident &= super::partial_blob::chunks_are_resident(storage, state, &hashes)
+                    .await?.into_iter().all(|present| present);
             }
             Ok(resident)
         }
@@ -535,7 +542,7 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
 
 // Speculative history inputs share the exact batch path. If that attempt fails,
 // revalidate/fetch only the original required prefix before deciding query fate.
-pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient + Clone + 'static>(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
     transport: &'a HttpSyncTransport<C>,
@@ -551,7 +558,7 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
 pub(super) fn hydrate_demand_with_receipt<
     'a,
     S: Storage + Clone + Send + Sync + 'static,
-    C: RawHttpClient,
+    C: RawHttpClient + Clone + 'static,
 >(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
@@ -615,7 +622,7 @@ pub(super) fn hydrate_demand_with_receipt<
 
 async fn hydrate_current_payload_after_native_fallback<
     S: Storage + Clone + Send + Sync + 'static,
-    C: RawHttpClient,
+    C: RawHttpClient + Clone + 'static,
 >(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
@@ -659,7 +666,7 @@ async fn hydrate_current_payload_after_native_fallback<
 fn hydrate_exact_demand_with_receipt<
     'a,
     S: Storage + Clone + Send + Sync + 'static,
-    C: RawHttpClient,
+    C: RawHttpClient + Clone + 'static,
 >(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
@@ -672,7 +679,7 @@ fn hydrate_exact_demand_with_receipt<
             SyncDemandRequest::NativeObject(_, error)
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
-            | SyncDemandRequest::BlobManifest(_, error)
+            | SyncDemandRequest::BlobManifests(_, error)
             | SyncDemandRequest::ChunksWithRead(_, error) => Some(error),
             _ => None,
         };
@@ -710,9 +717,10 @@ fn hydrate_exact_demand_with_receipt<
                         .cloned()
                         .map(ReadInputAddress::Metadata)
                         .collect(),
-                    SyncDemandRequest::BlobManifest(blob, _) => {
-                        vec![ReadInputAddress::BlobManifest(*blob.as_bytes())]
-                    }
+                    SyncDemandRequest::BlobManifests(blobs, _) => blobs
+                        .iter()
+                        .map(|blob| ReadInputAddress::BlobManifest(*blob.as_bytes()))
+                        .collect(),
                     SyncDemandRequest::ChunksWithRead(ids, _) => ids
                         .iter()
                         .map(|id| {
@@ -727,56 +735,55 @@ fn hydrate_exact_demand_with_receipt<
             // (including locally derived immutable nodes). Only ask the
             // authority to supply genuinely absent inputs.
             let mut required = Vec::new();
-            for address in frontier {
-                if selected_payload_locator
-                    .as_ref()
-                    .is_some_and(|locator| address == ReadInputAddress::Metadata(locator.clone()))
-                {
-                    // The locator is an authenticated anchor for the selected
-                    // change even when an older local projection is present.
+            let mut frontier = frontier.into_iter().peekable();
+            while required.len() < 32 {
+                let Some(address) = frontier.next() else { break; };
+                if selected_payload_locator.as_ref()
+                    .is_some_and(|locator| address == ReadInputAddress::Metadata(locator.clone())) {
                     required.push(address);
                     continue;
                 }
-                let resident = match &address {
+                // Blob spans cannot inspect past the old missing-input cutoff:
+                // even an entirely missing page fits the remaining quota.
+                let remaining = 32 - required.len();
+                match &address {
+                    ReadInputAddress::BlobManifest(hash) => {
+                        let mut hashes = vec![crate::binary_cas::BlobId::from_bytes(*hash)];
+                        let mut inputs = vec![address];
+                        let cap = remaining.min(super::transfer::MANIFEST_PAGE_ITEMS);
+                        while inputs.len() < cap {
+                            let Some(ReadInputAddress::BlobManifest(hash)) = frontier.peek() else { break; };
+                            hashes.push(crate::binary_cas::BlobId::from_bytes(*hash));
+                            inputs.push(frontier.next().expect("peeked manifest input is present"));
+                        }
+                        let resident = super::partial_blob::manifests_are_resident(storage, state, &hashes).await?;
+                        required.extend(inputs.into_iter().zip(resident)
+                            .filter_map(|(input, resident)| (!resident).then_some(input)));
+                    }
+                    ReadInputAddress::BlobChunk(hash) => {
+                        let mut hashes = vec![crate::binary_cas::ChunkHash::from_bytes(*hash)];
+                        let mut inputs = vec![address];
+                        let cap = remaining.min(super::transfer::CHUNK_CONCURRENCY);
+                        while inputs.len() < cap {
+                            let Some(ReadInputAddress::BlobChunk(hash)) = frontier.peek() else { break; };
+                            hashes.push(crate::binary_cas::ChunkHash::from_bytes(*hash));
+                            inputs.push(frontier.next().expect("peeked chunk input is present"));
+                        }
+                        let resident = super::partial_blob::chunks_are_resident(storage, state, &hashes).await?;
+                        required.extend(inputs.into_iter().zip(resident)
+                            .filter_map(|(input, resident)| (!resident).then_some(input)));
+                    }
                     ReadInputAddress::Object(object) => {
-                        native_object_is_resident(storage, state, *object).await?
+                        if !native_object_is_resident(storage, state, *object).await? { required.push(address); }
                     }
                     ReadInputAddress::Metadata(metadata) => {
                         let read = storage.begin_read(Default::default()).await?;
-                        super::native_metadata::native_metadata_residency(
-                            &read,
-                            state,
-                            std::slice::from_ref(metadata),
-                        )
-                        .await?[0]
-                    }
-                    ReadInputAddress::BlobManifest(hash) => {
-                        super::partial_blob::manifest_is_resident(
-                            storage,
-                            state,
-                            crate::binary_cas::BlobId::from_bytes(*hash),
-                        )
-                        .await?
-                    }
-                    ReadInputAddress::BlobChunk(hash) => {
-                        super::partial_blob::chunk_is_resident(
-                            storage,
-                            state,
-                            crate::binary_cas::ChunkHash::from_bytes(*hash),
-                        )
-                        .await?
+                        let resident = super::native_metadata::native_metadata_residency(&read, state, std::slice::from_ref(metadata)).await?[0];
+                        if !resident { required.push(address); }
                     }
                     ReadInputAddress::ChangeRecord { .. } => {
-                        return Err(LixError::new(
-                            "LIX_READ_FULFILLMENT_INVALID",
-                            "mutable change payloads cannot be required frontier inputs",
-                        ));
-                    }
-                };
-                if !resident {
-                    required.push(address);
-                    if required.len() == 32 {
-                        break;
+                        return Err(LixError::new("LIX_READ_FULFILLMENT_INVALID",
+                            "mutable change payloads cannot be required frontier inputs"));
                     }
                 }
             }
@@ -884,47 +891,42 @@ fn hydrate_exact_demand_with_receipt<
             }
         }
         match request {
-            SyncDemandRequest::BlobManifest(address, _) => {
-                if super::partial_blob::manifest_is_resident(storage, state, address).await? {
-                    return Ok(HydratedInputs::default());
+            SyncDemandRequest::BlobManifests(addresses, _) => {
+                for page in addresses.chunks(super::transfer::MANIFEST_PAGE_ITEMS) {
+                    let resident = super::partial_blob::manifests_are_resident(storage, state, page).await?;
+                    let missing = page.iter().copied().zip(resident)
+                        .filter_map(|(address, resident)| (!resident).then_some(address))
+                        .collect::<Vec<_>>();
+                    if missing.is_empty() { continue; }
+                    let ids = missing.iter().map(|address| address.to_hex()).collect::<Vec<_>>();
+                    let manifests = transport.get_blobs(&ids).await?;
+                    if manifests.len() != missing.len()
+                        || manifests.iter().zip(&missing)
+                            .any(|(manifest, address)| manifest.blob_id != address.to_hex()) {
+                        return Err(LixError::new(LixError::CODE_INVALID_PARAM,
+                            "blob manifest response does not match the bounded request batch"));
+                    }
+                    super::partial_blob::install_manifest_pages(storage, state, &missing, &manifests).await?;
                 }
-                let ids = [address.to_hex()];
-                let manifests = transport.get_blobs(&ids).await?;
-                if manifests.len() != 1 {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "blob manifest response must contain exactly the requested blob",
-                    ));
-                }
-                super::partial_blob::install_manifest(storage, state, address, &manifests[0])
-                    .await?;
                 Ok(HydratedInputs::default())
             }
             SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
                 for page in ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
-                    let mut missing = Vec::new();
-                    for id in page {
-                        let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
-                        if !super::partial_blob::chunk_is_resident(storage, state, hash).await? {
-                            missing.push(id.clone());
-                        }
-                    }
-                    let chunks = super::transfer::fetch_chunk_page(transport, &missing).await?;
-                    for (id, bytes) in missing.into_iter().zip(chunks) {
-                        let bytes = bytes.ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_STORAGE_ERROR,
-                                "authority lacks demanded blob chunk",
-                            )
-                        })?;
-                        super::partial_blob::install_chunk(
-                            storage,
-                            state,
-                            crate::binary_cas::ChunkHash::from_hex(&id)?,
-                            &bytes,
-                        )
-                        .await?;
-                    }
+                    let hashes = page.iter().map(|id| crate::binary_cas::ChunkHash::from_hex(id))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let resident = super::partial_blob::chunks_are_resident(storage, state, &hashes).await?;
+                    let missing = page.iter().zip(hashes).zip(resident)
+                        .filter_map(|((id, hash), resident)| (!resident).then_some((id.clone(), hash)))
+                        .collect::<Vec<_>>();
+                    if missing.is_empty() { continue; }
+                    let missing_ids = missing.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                    let chunks = super::transfer::fetch_chunk_page(transport, &missing_ids).await?;
+                    let chunks = missing.into_iter().zip(chunks)
+                        .map(|((_, hash), bytes)| bytes.map(|bytes| (hash, bytes))
+                            .ok_or_else(|| LixError::new(LixError::CODE_STORAGE_ERROR,
+                                "authority lacks demanded blob chunk")))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    super::partial_blob::install_chunk_page(storage, state, chunks).await?;
                 }
                 Ok(HydratedInputs::default())
             }

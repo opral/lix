@@ -1,14 +1,40 @@
 //! Crash-safe ownership and admission for private operation scratch.
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+use futures_util::FutureExt;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 const GLOBAL_BYTES: usize = 1024 * 1024 * 1024;
 const REPOSITORY_OPERATIONS: usize = 2;
 const TTL_MS: u64 = 300_000;
 
-pub(super) struct Permit;
+pub(super) struct Permit {
+    #[cfg(test)]
+    observer: Option<Arc<AtomicUsize>>,
+}
 impl Permit {
-    fn acquire() -> Result<Self, LixError> {
+    pub(super) fn acquire() -> Result<Self, LixError> {
+        #[cfg(test)]
+        {
+            Self::acquire_inner(None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::acquire_inner()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_observed(
+        observer: Arc<AtomicUsize>,
+    ) -> Result<Self, LixError> {
+        Self::acquire_inner(Some(observer))
+    }
+
+    fn acquire_inner(
+        #[cfg(test)] observer: Option<Arc<AtomicUsize>>,
+    ) -> Result<Self, LixError> {
         RESERVED
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                 bytes
@@ -21,12 +47,23 @@ impl Permit {
                     "client scratch admission quota exceeded",
                 )
             })?;
-        Ok(Self)
+        #[cfg(test)]
+        if let Some(observer) = &observer {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Self {
+            #[cfg(test)]
+            observer,
+        })
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
         RESERVED.fetch_sub(MAX_PAYLOAD_BYTES, Ordering::AcqRel);
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -356,45 +393,111 @@ pub(super) async fn reserve<S: Storage + Clone + Send + Sync + 'static>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
 ) -> Result<(uuid::Uuid, Permit), LixError> {
-    reap_expired(storage).await?;
-    let permit = Permit::acquire()?;
     let id = uuid::Uuid::now_v7();
-    for _ in 0..16 {
-        let read = storage.begin_read(Default::default()).await?;
-        let (mut ledger, expected) = load(&read).await?;
-        let (actual, admission) =
-            super::super::super::partial_state::load_partial_replica_state(&read)
-                .await?
-                .ok_or_else(|| invalid("partial admission is absent before staging"))?;
-        if actual != *state {
-            return Err(LixError::new(
-                super::super::super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
-                "scratch admission changed",
-            ));
+    let permit = Permit::acquire()?;
+    reserve_owned(storage, state, id, permit)
+        .await
+        .map_err(|(error, _permit)| error)
+}
+
+pub(super) async fn reserve_owned<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    id: uuid::Uuid,
+    permit: Permit,
+) -> Result<(uuid::Uuid, Permit), (LixError, Permit)> {
+    match std::panic::AssertUnwindSafe(reap_expired(storage))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err((error, permit)),
+        Err(_) => return Err((invalid("scratch reaper worker panicked"), permit)),
+    }
+    let reserved = async {
+        for _ in 0..16 {
+            let read = storage.begin_read(Default::default()).await?;
+            let (mut ledger, expected) = load(&read).await?;
+            let (actual, admission) =
+                super::super::super::partial_state::load_partial_replica_state(&read)
+                    .await?
+                    .ok_or_else(|| invalid("partial admission is absent before staging"))?;
+            if actual != *state {
+                return Err(LixError::new(
+                    super::super::super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
+                    "scratch admission changed",
+                ));
+            }
+            drop(read);
+            let now = crate::telemetry::unix_time_ms();
+            if ledger.len() >= REPOSITORY_OPERATIONS {
+                return Err(LixError::new(
+                    "LIX_NATIVE_RECIPE_WORK_BOUND",
+                    "repository scratch operation quota exceeded",
+                ));
+            }
+            ledger.insert(
+                id.to_string(),
+                Owner {
+                    expires_at_ms: now.saturating_add(TTL_MS),
+                    epoch: state.epoch_id().to_owned(),
+                    reaping: false,
+                },
+            );
+            if write(storage, &ledger, expected, Some(admission)).await? {
+                return Ok(());
+            }
         }
-        drop(read);
-        let now = crate::telemetry::unix_time_ms();
-        if ledger.len() >= REPOSITORY_OPERATIONS {
-            return Err(LixError::new(
-                "LIX_NATIVE_RECIPE_WORK_BOUND",
-                "repository scratch operation quota exceeded",
-            ));
-        }
-        ledger.insert(
-            id.to_string(),
-            Owner {
-                expires_at_ms: now.saturating_add(TTL_MS),
-                epoch: state.epoch_id().to_owned(),
-                reaping: false,
-            },
-        );
-        if write(storage, &ledger, expected, Some(admission)).await? {
-            return Ok((id, permit));
+        Err(invalid(
+            "scratch admission contention exceeded retry budget",
+        ))
+    };
+    let reserved = match std::panic::AssertUnwindSafe(reserved)
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(invalid("scratch reservation worker panicked")),
+    };
+    match reserved {
+        Ok(()) => Ok((id, permit)),
+        Err(error) => {
+            // A storage adapter may report an error after its durable commit
+            // crossed the boundary. Keep both the UUID and process permit
+            // until cleanup is acknowledged or a closed/fenced adapter hands
+            // the durable record to the next exclusive owner's reaper.
+            release_until_acknowledged(storage.clone(), id).await;
+            Err((error, permit))
         }
     }
-    Err(invalid(
-        "scratch admission contention exceeded retry budget",
-    ))
+}
+
+pub(super) async fn release_until_acknowledged<S: Storage + Clone + Send + Sync + 'static>(
+    storage: StorageAdapter<S>,
+    id: uuid::Uuid,
+) -> bool {
+    // A closed/fenced adapter cannot make any further writes. Keep the durable
+    // owner record intact so the next exclusive owner can reap it, but let the
+    // process-local permit go instead of retaining quota forever.
+    let mut retry_delay_ms = 10;
+    loop {
+        let released = std::panic::AssertUnwindSafe(release(storage.clone(), id))
+            .catch_unwind()
+            .await;
+        match released {
+            Ok(Ok(())) => return true,
+            Ok(Err(error))
+                if error.code == LixError::CODE_STORAGE_CLOSED
+                    || error.code == LixError::CODE_STORAGE_FENCED =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        super::super::super::platform::sleep(std::time::Duration::from_millis(retry_delay_ms))
+            .await;
+        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(1_000);
+    }
 }
 async fn clear_frames<S: Storage + Clone + Send + Sync + 'static>(
     storage: &StorageAdapter<S>,

@@ -4768,7 +4768,7 @@ where
             let native = crate::tracked_state::NativeObjectRef::from_missing_error(&error)?
                 .is_some()
                 || crate::tracked_state::NativeMetadataRef::from_missing_error(&error)?.is_some()
-                || crate::binary_cas::BlobManifestRequired::from_error(&error)?.is_some()
+                || crate::binary_cas::BlobManifestsRequired::from_error(&error)?.is_some()
                 || error.code == "LIX_SYNC_CHUNKS_REQUIRED";
             if !native {
                 return Err(error);

@@ -275,6 +275,18 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Ok(())
     }
 
+    async fn require_referenced_content(&mut self, hashes: &[BlobId]) -> Result<(), LixError> {
+        self.require_referenced_manifests(hashes).await?;
+        let values = self.load_bytes_many(hashes).await?.into_vec();
+        if values.len() != hashes.len() || values.iter().any(Option::is_none) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "referenced content is missing",
+            ));
+        }
+        Ok(())
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
     async fn scan_hot_state_batch(
@@ -688,6 +700,23 @@ impl SqlWriteContext {
         }
     }
 
+    pub(crate) async fn require_referenced_content(
+        &self,
+        hashes: &[BlobId],
+    ) -> Result<(), LixError> {
+        let _guard = self.gate.lock().await;
+        self.ensure_context_live("require_referenced_content")?;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .require_referenced_content(hashes)
+                .await
+        }
+    }
+
     pub(crate) async fn load_bytes_many(
         &self,
         hashes: &[BlobId],
@@ -792,6 +821,9 @@ impl BlobDataReader for WriteContextBlobDataReader {
 
     async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
         self.ctx.require_referenced_manifests(hashes).await
+    }
+    async fn require_referenced_content(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        self.ctx.require_referenced_content(hashes).await
     }
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         self.ctx.load_bytes_many(hashes).await

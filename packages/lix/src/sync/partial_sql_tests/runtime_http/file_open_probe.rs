@@ -80,29 +80,39 @@ impl RawHttpClient for TimedClient {
             let server_started = Instant::now();
             let result = self.inner.send(request).await;
             let server_ms = server_started.elapsed().as_secs_f64() * 1000.;
-            let (response_bytes, inputs, blob_chunks, discovery) = result
+            let (response_bytes, inputs, blob_chunks, change_locator_ids, discovery) = result
                 .as_ref()
                 .map(|response| {
                     let json: serde_json::Value =
                         serde_json::from_slice(&response.body).unwrap_or_default();
+                    let input_values = json.get("inputs").and_then(|v| v.as_array());
                     (
                         response.body.len(),
-                        json.get("inputs")
-                            .and_then(|v| v.as_array())
-                            .map_or(0, Vec::len),
-                        json.get("inputs")
-                            .and_then(|v| v.as_array())
-                            .map_or(0, |inputs| {
-                                inputs
-                                    .iter()
-                                    .filter(|input| input["address"]["kind"] == "blob_chunk")
-                                    .count()
-                            }),
+                        input_values.map_or(0, Vec::len),
+                        input_values.map_or(0, |inputs| {
+                            inputs
+                                .iter()
+                                .filter(|input| input["address"]["kind"] == "blob_chunk")
+                                .count()
+                        }),
+                        input_values.map_or_else(Vec::new, |inputs| {
+                            inputs
+                                .iter()
+                                .filter_map(|input| {
+                                    let address = &input["address"];
+                                    (address["kind"] == "metadata"
+                                        && address["address"]["kind"] == "change_locator")
+                                        .then(|| address["address"]["changeId"].as_str())
+                                        .flatten()
+                                        .map(str::to_owned)
+                                })
+                                .collect::<Vec<_>>()
+                        }),
                         json.get("profile").cloned(),
                     )
                 })
                 .unwrap_or_default();
-            self.log.lock().unwrap().push(serde_json::json!({"operation":operation,"status":result.as_ref().map(|response| response.status).ok(),"request_bytes":request_bytes,"request_interests":request_interests,"response_bytes":response_bytes,"inputs":inputs,"blob_chunks":blob_chunks,"discovery":discovery,"server_ms":server_ms,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
+            self.log.lock().unwrap().push(serde_json::json!({"operation":operation,"status":result.as_ref().map(|response| response.status).ok(),"request_bytes":request_bytes,"request_interests":request_interests,"response_bytes":response_bytes,"inputs":inputs,"blob_chunks":blob_chunks,"change_locator_ids":change_locator_ids,"discovery":discovery,"server_ms":server_ms,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
             result
         })
     }

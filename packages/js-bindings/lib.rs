@@ -11,6 +11,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(target_family = "wasm")]
 mod browser_storage;
+#[cfg(any(target_family = "wasm", all(test, not(lix_filesystem_native))))]
+mod component_instrument;
 #[cfg(target_family = "wasm")]
 mod js_storage;
 #[cfg(all(not(target_family = "wasm"), lix_filesystem_native))]

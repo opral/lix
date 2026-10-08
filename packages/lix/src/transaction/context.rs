@@ -1604,15 +1604,22 @@ where
                 .await?;
             let mut keys = hydrated.keys.clone();
             let mut prefixes = Vec::new();
-            for blob in &hydrated.blob_manifests {
+            let staged_manifest_presence = self
+                .staged_writes
+                .has_staged_file_bytes_many(&hydrated.blob_manifests)?;
+            if staged_manifest_presence.len() != hydrated.blob_manifests.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction staged blob presence returned an invalid result cardinality",
+                ));
+            }
+            for (blob, staged) in hydrated
+                .blob_manifests
+                .iter()
+                .zip(staged_manifest_presence)
+            {
                 let manifest_key =
                     crate::storage_adapter::StorageKey(Bytes::copy_from_slice(blob.as_bytes()));
-                let staged = self
-                    .staged_writes
-                    .load_staged_file_bytes_many(&[*blob])?
-                    .into_vec()
-                    .first()
-                    .is_some_and(Option::is_some);
                 let resident = if staged {
                     true
                 } else {
@@ -1717,8 +1724,9 @@ where
                 ));
             }
         }
-        let blob =
-            crate::binary_cas::BlobManifestRequired::from_error(error)?.map(|required| required.0);
+        let blobs = crate::binary_cas::BlobManifestsRequired::from_error(error)?
+            .map(|required| required.0)
+            .unwrap_or_default();
         if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
             let ids = error
                 .details
@@ -1741,7 +1749,7 @@ where
                 keys.push((crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE, key));
             }
         }
-        if keys.is_empty() && blob.is_none() {
+        if keys.is_empty() && blobs.is_empty() {
             return Ok(false);
         }
         let read = self
@@ -1795,14 +1803,14 @@ where
             .enumerate()
             .filter_map(|(index, key)| (!omitted.contains(&index)).then_some(key))
             .collect();
-        if let Some(blob) = blob {
-            keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, blob).await?);
+        for blob in &blobs {
+            keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, *blob).await?);
         }
         // SAFETY: like opening_read, the fallback drops before the retained
         // Arc storage. It only fills exact native input misses in that read.
         let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
         self.opening_read = self.opening_read.with_hydrated_keys(read, keys);
-        if let Some(blob) = blob {
+        for blob in blobs {
             self.opening_read = self.opening_read.clone().with_hydrated_prefix(
                 crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
                 Bytes::copy_from_slice(blob.as_bytes()),
@@ -4299,9 +4307,13 @@ where
                 format!("plugin '{}' has no column-merger component", plugin.key()),
             )
         })?)?;
+        let capabilities = crate::plugin::runtime::PluginCapabilities {
+            column_merger: plugin.has_column_merger(),
+            file_projection: plugin.has_file_projection(),
+        };
         let wasm = if self
             .plugin_host
-            .cached_plugin_factory(plugin.key(), wasm_hash)?
+            .cached_plugin_factory(wasm_hash, capabilities)?
             .is_some()
         {
             None
@@ -6594,7 +6606,11 @@ where
                     format!("plugin '{}' has no executable component", entry.key()),
                 )
             })?)?;
-            let cached_factory = self.plugin_host.cached_plugin_factory(entry.key(), hash)?;
+            let capabilities = crate::plugin::runtime::PluginCapabilities {
+                column_merger: entry.has_column_merger(),
+                file_projection: entry.has_file_projection(),
+            };
+            let cached_factory = self.plugin_host.cached_plugin_factory(hash, capabilities)?;
             if let Some(factory) = cached_factory {
                 component_factories.insert(key, factory);
             } else {
@@ -13580,9 +13596,37 @@ impl BlobDataReader for TransactionBlobDataReader {
         require_transaction_blob_manifests(self.base.as_ref(), &self.staged_writes, hashes).await
     }
 
+    async fn require_referenced_content(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        require_transaction_blob_content(self.base.as_ref(), &self.staged_writes, hashes).await
+    }
+
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
     }
+}
+
+async fn require_transaction_blob_content(
+    base: &dyn BlobDataReader,
+    staged: &TransactionWriteBuffer,
+    hashes: &[BlobId],
+) -> Result<(), LixError> {
+    let hashes = crate::binary_cas::normalize_referenced_blob_hashes(hashes)?;
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let staged_presence = staged.has_staged_file_bytes_many(&hashes)?;
+    if staged_presence.len() != hashes.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "transaction staged blob presence returned an invalid result cardinality",
+        ));
+    }
+    let nonstaged = hashes
+        .into_iter()
+        .zip(staged_presence)
+        .filter_map(|(hash, staged)| (!staged).then_some(hash))
+        .collect::<Vec<_>>();
+    base.require_referenced_content(&nonstaged).await
 }
 
 async fn require_transaction_blob_manifests(
@@ -13590,11 +13634,21 @@ async fn require_transaction_blob_manifests(
     staged: &TransactionWriteBuffer,
     hashes: &[BlobId],
 ) -> Result<(), LixError> {
-    let values = staged.load_staged_file_bytes_many(hashes)?.into_vec();
+    let hashes = crate::binary_cas::normalize_referenced_blob_hashes(hashes)?;
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let staged_presence = staged.has_staged_file_bytes_many(&hashes)?;
+    if staged_presence.len() != hashes.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "transaction staged blob presence returned an invalid result cardinality",
+        ));
+    }
     let missing = hashes
         .iter()
-        .zip(values)
-        .filter_map(|(hash, bytes)| bytes.is_none().then_some(*hash))
+        .zip(staged_presence)
+        .filter_map(|(hash, staged)| (!staged).then_some(*hash))
         .collect::<Vec<_>>();
     base.require_referenced_manifests(&missing).await
 }
@@ -14381,6 +14435,16 @@ where
         );
         let base = self.binary_cas.reader(read);
         require_transaction_blob_manifests(&base, &self.staged_writes, hashes).await
+    }
+
+    async fn require_referenced_content(&mut self, hashes: &[BlobId]) -> Result<(), LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let base = self.binary_cas.reader(read);
+        require_transaction_blob_content(&base, &self.staged_writes, hashes).await
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
@@ -20133,16 +20197,16 @@ fallback={large_fallback} decoded={large_decoded}"
             .await
             .unwrap_err();
         assert_eq!(
-            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
-            Some(crate::binary_cas::BlobManifestRequired(hash))
+            crate::binary_cas::BlobManifestsRequired::from_error(&error).unwrap(),
+            Some(crate::binary_cas::BlobManifestsRequired(vec![hash]))
         );
         let error =
             require_transaction_blob_manifests(&reader, &transaction.staged_writes, &[hash])
                 .await
                 .unwrap_err();
         assert_eq!(
-            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
-            Some(crate::binary_cas::BlobManifestRequired(hash)),
+            crate::binary_cas::BlobManifestsRequired::from_error(&error).unwrap(),
+            Some(crate::binary_cas::BlobManifestsRequired(vec![hash])),
         );
     }
 
@@ -20315,8 +20379,8 @@ fallback={large_fallback} decoded={large_decoded}"
                     .await
                     .unwrap_err();
             assert_eq!(
-                crate::binary_cas::BlobManifestRequired::from_error(&manifest_demand).unwrap(),
-                Some(crate::binary_cas::BlobManifestRequired(manifest.blob_id)),
+                crate::binary_cas::BlobManifestsRequired::from_error(&manifest_demand).unwrap(),
+                Some(crate::binary_cas::BlobManifestsRequired(vec![manifest.blob_id])),
             );
             drop(reader);
 
@@ -20416,6 +20480,88 @@ fallback={large_fallback} decoded={large_decoded}"
                 serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
             assert_eq!(snapshot["value"], "prepared");
         }
+    }
+
+    #[tokio::test]
+    async fn staged_blob_readiness_checks_presence_without_loading_payloads() {
+        #[derive(Default)]
+        struct CountingBlobReader {
+            manifest_calls: std::sync::Mutex<Vec<Vec<BlobId>>>,
+            content_calls: std::sync::Mutex<Vec<Vec<BlobId>>>,
+            load_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl BlobDataReader for CountingBlobReader {
+            async fn require_referenced_manifests(
+                &self,
+                hashes: &[BlobId],
+            ) -> Result<(), LixError> {
+                self.manifest_calls.lock().unwrap().push(hashes.to_vec());
+                Ok(())
+            }
+
+            async fn require_referenced_content(
+                &self,
+                hashes: &[BlobId],
+            ) -> Result<(), LixError> {
+                self.content_calls.lock().unwrap().push(hashes.to_vec());
+                Ok(())
+            }
+
+            async fn load_bytes_many(
+                &self,
+                hashes: &[BlobId],
+            ) -> Result<BlobBytesBatch, LixError> {
+                self.load_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
+            }
+        }
+
+        let storage = Memory::new();
+        let (_, _, _, _, transaction) = open_test_transaction(&storage).await;
+        let mut staged_file = TransactionFileContent::new(
+            "staged-file".to_owned(),
+            Some("/staged.bin".to_owned()),
+            Some("staged.bin".to_owned()),
+            "ffffffff-ffff-7fff-bfff-ffffffffffff".to_owned(),
+            true,
+            true,
+            b"staged primary payload".to_vec(),
+        );
+        staged_file.add_auxiliary_payload(b"staged auxiliary payload".to_vec());
+        transaction
+            .staged_writes
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
+                mode: TransactionWriteMode::Replace,
+                rows: PreparedStateBatch::new(),
+                file_content: vec![staged_file],
+                count: 1,
+            })
+            .unwrap();
+
+        let primary = BlobId::from_content(b"staged primary payload");
+        let auxiliary = BlobId::from_content(b"staged auxiliary payload");
+        let absent = BlobId::from_content(b"not staged");
+        let reader = CountingBlobReader::default();
+        require_transaction_blob_manifests(
+            &reader,
+            &transaction.staged_writes,
+            &[primary, auxiliary, absent],
+        )
+        .await
+        .unwrap();
+        require_transaction_blob_content(
+            &reader,
+            &transaction.staged_writes,
+            &[primary, auxiliary, absent],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*reader.manifest_calls.lock().unwrap(), vec![vec![absent]]);
+        assert_eq!(*reader.content_calls.lock().unwrap(), vec![vec![absent]]);
+        assert_eq!(reader.load_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

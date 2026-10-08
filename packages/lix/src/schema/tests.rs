@@ -145,6 +145,43 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
         ]
     );
 
+    // Exercise the exact-number boundary between typed row storage and SQL
+    // JSONB parsing with nested values wider than native integer/f64 ranges.
+    let exact_payload = format!(
+        r#"{{"nested":{{"decimal":1.23456789012345678901234567890123456789,"values":[{},-0.000000000000000000000000000000000000000123456789]}},"signed":{},"unsigned":{}}}"#,
+        u128::MAX,
+        i128::MIN,
+        u128::MAX,
+    );
+    let exact_value = serde_json::from_str::<serde_json::Value>(&exact_payload).unwrap();
+    session
+        .execute(
+            "INSERT INTO acme_jsonb_probe (id, payload) VALUES ($1, $2)",
+            &[
+                Value::Text("exact-numbers".into()),
+                Value::Jsonb(exact_value.into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let exact_sql = format!("'{}'::jsonb", exact_payload.replace('\'', "''"));
+    let exact = session
+        .execute(
+            &format!(
+                "SELECT payload = {exact_sql}, payload #>> '{{nested,decimal}}' FROM acme_jsonb_probe WHERE id = 'exact-numbers'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        exact.rows()[0].values(),
+        &[
+            Value::Boolean(true),
+            Value::Text("1.23456789012345678901234567890123456789".into()),
+        ]
+    );
+
     let parameterized_exists = session
         .execute(
             "SELECT payload ? $1 FROM acme_jsonb_probe WHERE id = 'a'",

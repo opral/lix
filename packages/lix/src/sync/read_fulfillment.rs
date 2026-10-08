@@ -1752,6 +1752,20 @@ async fn discover_bounded_with_read(
         .clone();
     operation.bind_payload_spool(&payloads)?;
     let logical_spool = Arc::new(Mutex::new(spool::InputSpool::new(payloads.clone())));
+    let mut required_locator_ids = Vec::new();
+    for address in &request.required {
+        if let ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(id)) = address {
+            let commit = crate::changelog::CommitId::parse(id)
+                .map_err(|_| invalid("native metadata ID must be a canonical UUID"))?;
+            required_locator_ids.push(crate::changelog::ChangeId::new(*commit.as_uuid()));
+        }
+    }
+    let required_locators = crate::tracked_state::load_canonical_change_locators(
+        &read,
+        &required_locator_ids,
+    )
+    .await?;
+    let mut required_locators = required_locators.into_iter();
     for address in &request.required {
         if let ReadInputAddress::BlobChunk(hash) = address {
             let bytes = crate::binary_cas::load_verified_chunk(
@@ -1778,26 +1792,26 @@ async fn discover_bounded_with_read(
             address,
             ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(_))
         );
-        let value =
-            if let ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(id)) = address {
-                let commit = crate::changelog::CommitId::parse(id)
-                    .map_err(|_| invalid("native metadata ID must be a canonical UUID"))?;
-                let change = crate::changelog::ChangeId::new(*commit.as_uuid());
-                crate::tracked_state::load_canonical_change_locator(&read, change)
-                    .await?
-                    .map(|locator| {
-                        StorageProjectedValue::FullValue(Bytes::from(
-                            crate::tracked_state::encode_change_locator(locator),
-                        ))
-                    })
-            } else {
-                PointReadPlan::new(space, std::slice::from_ref(&key))
-                    .materialize(&read, Default::default())
-                    .await?
-                    .value
-                    .pop()
-                    .flatten()
-            };
+        let value = if matches!(
+            address,
+            ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(_))
+        ) {
+            required_locators
+                .next()
+                .flatten()
+                .map(|locator| {
+                    StorageProjectedValue::FullValue(Bytes::from(
+                        crate::tracked_state::encode_change_locator(locator),
+                    ))
+                })
+        } else {
+            PointReadPlan::new(space, std::slice::from_ref(&key))
+                .materialize(&read, Default::default())
+                .await?
+                .value
+                .pop()
+                .flatten()
+        };
         let Some(StorageProjectedValue::FullValue(bytes)) = value else {
             return Err(invalid("authority lacks required read input")
                 .with_details(serde_json::json!({"address":address})));

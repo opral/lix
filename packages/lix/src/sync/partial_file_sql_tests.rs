@@ -1,7 +1,7 @@
 //! Child of partial_sql_tests: authentic native demand path plus existing
 //! canonical blob transfer, starting from descriptor/bootstrap only.
 use super::*;
-use crate::binary_cas::{BlobId, BlobManifestRequired, ChunkHash};
+use crate::binary_cas::{BlobId, BlobManifestsRequired, ChunkHash};
 
 #[derive(Default, Debug)]
 struct FileFetches {
@@ -46,17 +46,19 @@ async fn execute_file_hydrating(
         {
             return Err(error);
         }
-        if let Some(BlobManifestRequired(hash)) = BlobManifestRequired::from_error(&error)? {
-            if !seen.insert(format!("manifest:{}", hash.to_hex())) {
-                return Err(error);
+        if let Some(BlobManifestsRequired(hashes)) = BlobManifestsRequired::from_error(&error)? {
+            for hash in hashes {
+                if !seen.insert(format!("manifest:{}", hash.to_hex())) {
+                    return Err(error);
+                }
+                let wire = authority
+                    .get_sync_blob_manifest(&hash.to_hex())
+                    .await?
+                    .ok_or_else(|| LixError::unknown("authority lacks referenced blob"))?;
+                let wire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+                super::super::partial_blob::install_manifest(storage, state, hash, &wire).await?;
+                fetches.manifests += 1;
             }
-            let wire = authority
-                .get_sync_blob_manifest(&hash.to_hex())
-                .await?
-                .ok_or_else(|| LixError::unknown("authority lacks referenced blob"))?;
-            let wire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
-            super::super::partial_blob::install_manifest(storage, state, hash, &wire).await?;
-            fetches.manifests += 1;
             continue;
         }
         if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {

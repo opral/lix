@@ -34,6 +34,37 @@ fn consume_history_graph_node_budget(remaining: &mut usize) -> bool {
     true
 }
 
+#[derive(Default)]
+struct ReturnedExecutableRows {
+    by_branch:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>>,
+    count: usize,
+}
+
+fn merge_returned_executable_rows(
+    destination: &mut ReturnedExecutableRows,
+    rows: &[(String, crate::tracked_state::TrackedStateKey)],
+) -> Result<(), LixError> {
+    for (branch, key) in rows {
+        if destination
+            .by_branch
+            .get(branch)
+            .is_some_and(|keys| keys.contains(key))
+        {
+            continue;
+        }
+        if destination.count >= crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+            return Err(crate::plugin::runtime::executable_dependency_work_bound());
+        }
+        destination.by_branch
+            .entry(branch.clone())
+            .or_default()
+            .insert(key.clone());
+        destination.count += 1;
+    }
+    Ok(())
+}
+
 fn path_index_request_for_interest(
     scope: &FilesystemPathIndexScope,
     branch_ids: &[String],
@@ -134,12 +165,21 @@ where
     let mut selected_head_diff_keys = std::collections::BTreeSet::<
         crate::tracked_state::TrackedStateKey,
     >::new();
+    // A live row's canonical ChangeLocator is not part of its row-PK point
+    // path. Retain only IDs from visible after-rows in the exact leased-head
+    // diff; deleted keys remain in the point frontier but prove no locator.
+    let mut selected_head_diff_change_ids =
+        std::collections::BTreeSet::<crate::changelog::ChangeId>::new();
     // The ordinary native recorder sees physical rows, but direct change
     // locators are derived from the change ID and therefore have no physical
     // row to observe. Retain the returned identities and close this logical
     // part of the graph once, after all recipes have been replayed.
     let mut returned_identities =
         std::collections::BTreeSet::<(String, crate::tracked_state::TrackedStateKey)>::new();
+    // Filesystem and foreground row interests can select disjoint plugin-owned
+    // rows. Resolve returned-row executable roots across the whole operation so
+    // a cold partial read does not reveal one missing root per selected row.
+    let mut returned_executable_rows = ReturnedExecutableRows::default();
     let mut catalog_branches = std::collections::BTreeSet::<String>::new();
     // One authority request shares this traversal ceiling across every
     // History recipe; per-recipe bounds alone would multiply graph work.
@@ -335,7 +375,7 @@ where
                     == Some(descriptor.selected_branch.branch_id.as_str())
                     && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
                     && descriptor.selected_branch.head.row_pk_index_root_id.is_some();
-                selected_head_diff_keys.extend(crate::sql2::prepare_native_diff_interest(
+                let prepared_diff = crate::sql2::prepare_native_diff_interest(
                     read.clone(),
                     relation,
                     &from,
@@ -348,7 +388,9 @@ where
                     native_diff_budget.clone(),
                     collect_selected_head_keys,
                 )
-                .await?);
+                .await?;
+                selected_head_diff_keys.extend(prepared_diff.selected_head_keys);
+                selected_head_diff_change_ids.extend(prepared_diff.visible_after_change_ids);
             }
             LogicalReadInterest::History {
                 branch_id,
@@ -522,25 +564,7 @@ where
                 candidate_catalog
                     .prepare_returned_row_catalogs(&reader, &executable_rows, None)
                     .await?;
-                if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
-                    returned_identities.extend(
-                        prepare_authority_returned_row_executables(
-                            &hot,
-                            read.clone(),
-                            dependency_blobs.as_ref(),
-                            &executable_rows,
-                            active_account_id,
-                        )
-                        .await?,
-                    );
-                } else {
-                    crate::plugin::runtime::prepare_returned_row_executables(
-                        &reader,
-                        dependency_blobs.as_ref(),
-                        &executable_rows,
-                    )
-                    .await?;
-                }
+                merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
             LogicalReadInterest::FileContent {
                 request,
@@ -611,25 +635,7 @@ where
                 candidate_catalog
                     .prepare_returned_row_catalogs(&reader, &executable_rows, None)
                     .await?;
-                if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
-                    returned_identities.extend(
-                        prepare_authority_returned_row_executables(
-                            &hot,
-                            read.clone(),
-                            dependency_blobs.as_ref(),
-                            &executable_rows,
-                            active_account_id,
-                        )
-                        .await?,
-                    );
-                } else {
-                    crate::plugin::runtime::prepare_returned_row_executables(
-                        &reader,
-                        dependency_blobs.as_ref(),
-                        &executable_rows,
-                    )
-                    .await?;
-                }
+                merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
         }
     }
@@ -657,6 +663,16 @@ where
         )
         .await?;
     }
+    if !selected_head_diff_change_ids.is_empty()
+        && let NativeReadPreparationPurpose::Authority { input_sink, .. } = &purpose
+    {
+        prepare_current_head_change_locator_inputs(
+            &read,
+            &selected_head_diff_change_ids,
+            input_sink.as_ref(),
+        )
+        .await?;
+    }
     // Foreground row reads promise the same bounded native edit inputs. Prepare
     // them against these unpublished controls before they become visible; the
     // operation-scoped context intentionally has no trusted live-epoch cache.
@@ -673,13 +689,19 @@ where
     candidate_catalog
         .prepare_returned_row_catalogs(&reader, &executable_rows, None)
         .await?;
+    merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
+    let returned_executable_rows = returned_executable_rows
+        .by_branch
+        .into_iter()
+        .flat_map(|(branch, keys)| keys.into_iter().map(move |key| (branch.clone(), key)))
+        .collect::<Vec<_>>();
     if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
         returned_identities.extend(
             prepare_authority_returned_row_executables(
                 &hot,
                 read.clone(),
                 dependency_blobs.as_ref(),
-                &executable_rows,
+                &returned_executable_rows,
                 active_account_id,
             )
             .await?,
@@ -688,7 +710,7 @@ where
         crate::plugin::runtime::prepare_returned_row_executables(
             &reader,
             dependency_blobs.as_ref(),
-            &executable_rows,
+            &returned_executable_rows,
         )
         .await?;
     }
@@ -766,6 +788,34 @@ where
         .await
 }
 
+/// Close the canonical locator metadata for visible live rows from one exact
+/// selected-head diff. This deliberately resolves only the tiny metadata
+/// address: it does not load ChangeRecord, CommitDeltaPart, or blob payloads.
+/// Direct-address authentication reads shallow commit owner metadata.
+async fn prepare_current_head_change_locator_inputs<R>(
+    read: &R,
+    change_ids: &std::collections::BTreeSet<crate::changelog::ChangeId>,
+    sink: &(dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync),
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead,
+{
+    let change_ids = change_ids.iter().copied().collect::<Vec<_>>();
+    let locators = crate::tracked_state::load_canonical_change_locators(read, &change_ids).await?;
+    for (change_id, locator) in change_ids.into_iter().zip(locators) {
+        let Some(locator) = locator else {
+            continue;
+        };
+        sink(crate::sync::read_fulfillment::ReadInput {
+            address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change_id.to_string()),
+            ),
+            bytes: crate::tracked_state::encode_change_locator(locator),
+        })?;
+    }
+    Ok(())
+}
+
 /// Complete the logical immutable dependencies of the rows selected by one
 /// operation. Most of this graph is observed by the normal storage recorder.
 /// Two cases need explicit handling here:
@@ -832,10 +882,11 @@ where
     }
 
     let mut locators = std::collections::BTreeMap::new();
-    for change_id in change_ids {
-        if let Some(locator) =
-            crate::tracked_state::load_canonical_change_locator(read, change_id).await?
-        {
+    let change_ids = change_ids.into_iter().collect::<Vec<_>>();
+    let canonical_locators =
+        crate::tracked_state::load_canonical_change_locators(read, &change_ids).await?;
+    for (change_id, locator) in change_ids.into_iter().zip(canonical_locators) {
+        if let Some(locator) = locator {
             owner_commits.insert(locator.commit_id);
             locators.insert(change_id, locator);
         }
@@ -1104,6 +1155,67 @@ async fn prepare_path_index_small_blob_inputs(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn current_head_locator_closure_emits_metadata_without_payload() {
+        let authority = crate::open_lix()
+            .with_storage(crate::Memory::new())
+            .await
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+                &[
+                    crate::Value::Text("/locator-frontier.txt".into()),
+                    crate::Value::Blob(bytes::Bytes::from_static(b"locator frontier").into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let selected = authority
+            .execute(
+                "SELECT lixcol_change_id FROM lix_file WHERE path = $1",
+                &[crate::Value::Text("/locator-frontier.txt".into())],
+            )
+            .await
+            .unwrap();
+        let change_id = crate::changelog::ChangeId::parse_lix(
+            &selected.rows()[0]
+                .get::<String>("lixcol_change_id")
+                .unwrap(),
+            "selected file change",
+        )
+        .unwrap();
+        let storage = authority.storage_adapter();
+        let read = storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_inputs = inputs.clone();
+        let sink = move |input| {
+            sink_inputs.lock().unwrap().push(input);
+            Ok(())
+        };
+
+        prepare_current_head_change_locator_inputs(
+            &read,
+            &std::collections::BTreeSet::from([change_id]),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let inputs = inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(
+            &inputs[0].address,
+            crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(id)
+            ) if id == &change_id.to_string()
+        ));
+        assert!(crate::tracked_state::decode_change_locator(change_id, &inputs[0].bytes).is_ok());
+    }
+
     #[test]
     fn history_graph_budget_is_shared_and_fail_closed() {
         let mut remaining = crate::hot_state::MAX_HISTORY_RECIPE_GRAPH_NODES;
@@ -1131,5 +1243,31 @@ mod tests {
             request.hot_state_request().filter.schema_keys,
             vec!["lix_directory_descriptor".to_owned()]
         );
+    }
+
+    #[test]
+    fn operation_executable_row_union_deduplicates_and_fails_before_growth() {
+        let key = |file_id: &str| crate::tracked_state::TrackedStateKey {
+            schema_key: "plugin_schema".to_owned(),
+            file_id: Some(file_id.to_owned()),
+            row_pk: crate::row_pk::RowPk::single(file_id),
+        };
+        let first = ("branch-a".to_owned(), key("file-a"));
+        let second = ("branch-b".to_owned(), key("file-b"));
+        let mut union = ReturnedExecutableRows::default();
+        merge_returned_executable_rows(
+            &mut union,
+            &[first.clone(), second.clone(), first.clone()],
+        )
+        .unwrap();
+        assert_eq!(union.count, 2);
+
+        union.count = crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS;
+        assert!(merge_returned_executable_rows(
+            &mut union,
+            &[("branch-c".to_owned(), key("file-c"))],
+        )
+        .is_err());
+        assert_eq!(union.count, crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS);
     }
 }

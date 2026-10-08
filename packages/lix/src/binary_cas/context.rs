@@ -153,20 +153,37 @@ where
         if !self.referenced_manifest_demands {
             return Ok(());
         }
-        let metadata = crate::binary_cas::load_metadata_many(&self.store, hashes)
+        let hashes = super::normalize_referenced_blob_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let metadata = crate::binary_cas::load_metadata_many(&self.store, &hashes)
             .await?
             .into_vec();
-        for (hash, metadata) in hashes.iter().zip(metadata) {
-            if metadata.is_none() {
-                return Err(super::BlobManifestRequired(*hash).into_error());
-            }
+        if metadata.len() != hashes.len() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "blob metadata batch returned an invalid result cardinality",
+            ));
+        }
+        let missing = hashes
+            .iter()
+            .zip(metadata)
+            .filter_map(|(hash, metadata)| metadata.is_none().then_some(*hash))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(super::BlobManifestsRequired::new(missing)?.into_error());
         }
         Ok(())
     }
 
     async fn require_referenced_content(&self, hashes: &[BlobId]) -> Result<(), LixError> {
-        self.require_referenced_manifests(hashes).await?;
-        crate::binary_cas::kv::require_referenced_content(&self.store, hashes).await
+        let hashes = super::normalize_referenced_blob_hashes(hashes)?;
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        self.require_referenced_manifests(&hashes).await?;
+        crate::binary_cas::kv::require_referenced_content(&self.store, &hashes).await
     }
 
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
@@ -203,6 +220,12 @@ where
         crate::binary_cas::kv::load_bytes_many(&self.store, hashes).await
     }
 }
+
+/*
+ * Keep the implementation block above together: content readiness validates
+ * the selected manifest closure and chunk publication markers without
+ * materializing the payload bytes.
+ */
 
 /// Binary CAS writer that avoids re-putting chunk payload rows already present
 /// in the backing store.

@@ -1,5 +1,6 @@
 //! Native endpoint-input preparation. No SQL plan or user function is replayed.
 use super::*;
+
 pub(crate) async fn prepare_native_diff_interest<R>(
     store: R,
     relation: &str,
@@ -9,12 +10,15 @@ pub(crate) async fn prepare_native_diff_interest<R>(
     projected_columns: &[String],
     native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
     collect_selected_head_keys: bool,
-) -> Result<Vec<TrackedStateKey>, crate::LixError>
+) -> Result<PreparedNativeDiffInputs, crate::LixError>
 where
     R: StorageAdapterRead + Clone,
 {
     if from == to {
-        return Ok(Vec::new());
+        return Ok(PreparedNativeDiffInputs {
+            selected_head_keys: Vec::new(),
+            visible_after_change_ids: Vec::new(),
+        });
     }
     let prepare = async {
         let from_descriptor = commit_state_descriptor(&store, from).await?;
@@ -66,6 +70,14 @@ where
         } else {
             Vec::new()
         };
+        let visible_after_change_ids = if collect_selected_head_keys {
+            diff.entries
+                .iter()
+                .filter_map(|entry| entry.visible_after().map(|row| row.change_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         match relation {
             "lix_file" => {
                 file_diff_rows(
@@ -99,7 +111,10 @@ where
                 schema_diff_rows(diff, relation, &projection, &from_global, &to_global)?;
             }
         }
-        Ok::<Vec<TrackedStateKey>, DataFusionError>(selected_head_keys)
+        Ok::<PreparedNativeDiffInputs, DataFusionError>(PreparedNativeDiffInputs {
+            selected_head_keys,
+            visible_after_change_ids,
+        })
     }
     .await;
     prepare.map_err(datafusion_error_to_lix_error)

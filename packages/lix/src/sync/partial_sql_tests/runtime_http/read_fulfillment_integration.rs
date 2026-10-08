@@ -2357,6 +2357,54 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
                 .to_owned(),
         );
     }
+    // Read the hidden blob-ref row identities directly from the exact active
+    // head. The public lix_file projection does not expose this internal row,
+    // but its live change IDs still need their canonical locator metadata in
+    // the bounded selected-head diff closure.
+    let active_head = authority_execute(
+        &server,
+        authority.lix_id(),
+        "SELECT lix_active_branch_commit_id() AS commit_id",
+        &[],
+    )
+    .await;
+    let active_head_commit_id = active_head.rows()[0]
+        .get::<String>("commit_id")
+        .unwrap()
+        .to_owned();
+    let blob_ref_keys = selected_file_ids
+        .iter()
+        .map(|file_id| crate::tracked_state::TrackedStateKey {
+            schema_key: "lix_binary_blob_ref".to_owned(),
+            file_id: Some(file_id.clone()),
+            row_pk: crate::row_pk::RowPk::uuid_from_canonical(file_id).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let authority_storage = authority.storage_adapter();
+    let authority_read = authority_storage
+        .begin_read(Default::default())
+        .await
+        .unwrap();
+    let mut tracked = crate::tracked_state::TrackedStateContext::new().reader(&authority_read);
+    let blob_ref_rows = tracked
+        .load_projected_batch_at_commit(
+            &active_head_commit_id,
+            &blob_ref_keys,
+            &crate::changelog::ChangeRecordProjection::identity_only(),
+        )
+        .await
+        .unwrap();
+    let blob_ref_change_ids = (0..blob_ref_rows.len())
+        .map(|index| {
+            let row = blob_ref_rows
+                .row(index)
+                .expect("each inserted file has a blob-ref row at the active head");
+            assert!(!row.deleted(), "new file blob-ref row is live at the head");
+            row.change_id().to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(blob_ref_change_ids.len(), selected_file_ids.len());
+    drop(authority_read);
     let exact_working_diff_sql =
         "SELECT id, diff_type FROM lix_diff('lix_file') WHERE id IN ($1, $2, $3) ORDER BY id";
     let exact_working_diff_params = selected_file_ids
@@ -2399,7 +2447,27 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     let exact_recipes = fulfillment_requests(&exact_log);
     assert_eq!(exact_recipes.len(), 1);
+    let exact_change_locator_ids = exact_recipes[0]["change_locator_ids"]
+        .as_array()
+        .expect("timed client records locator metadata addresses")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for change_id in &blob_ref_change_ids {
+        assert!(
+            exact_change_locator_ids.contains(change_id.as_str()),
+            "selected-head diff fulfillment should carry blob-ref locator {change_id}"
+        );
+    }
     assert!(only_read_fulfillment(&exact_log));
+    assert!(
+        exact_log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["operation"] != "native-metadata"),
+        "no separate native-metadata request should follow the bounded fulfillment"
+    );
     assert!(response_bytes(&exact_recipes) < 2 * 1024 * 1024);
     let selected_head_row_pk_root = exact_state
         .descriptor()

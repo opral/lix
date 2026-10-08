@@ -380,17 +380,53 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             .iter()
             .map(key)
             .collect::<Result<Vec<_>, _>>()?;
-        let requests = request
-            .objects
-            .iter()
-            .zip(&keys)
-            .map(|(address, key)| StorageGetManyRequest {
-                space: space(address),
-                keys: std::slice::from_ref(key),
-                opts: StorageGetOptions::default(),
-            })
+        let mut values = std::iter::repeat_with(|| None)
+            .take(request.objects.len())
             .collect::<Vec<_>>();
-        let values = read.get_many(&requests).await?.values;
+        let mut physical_indices = Vec::new();
+        let mut requests = Vec::new();
+        let mut locator_indices = Vec::new();
+        let mut locator_ids = Vec::new();
+        for (index, (address, key)) in request.objects.iter().zip(&keys).enumerate() {
+            if let NativeMetadataRef::ChangeLocator(id) = address {
+                let id = canonical_id(id)?;
+                locator_indices.push(index);
+                locator_ids.push(ChangeId::new(*id.as_uuid()));
+            } else {
+                physical_indices.push(index);
+                requests.push(StorageGetManyRequest {
+                    space: space(address),
+                    keys: std::slice::from_ref(key),
+                    opts: StorageGetOptions::default(),
+                });
+            }
+        }
+        if !requests.is_empty() {
+            let loaded = read.get_many(&requests).await?.values;
+            if loaded.len() != physical_indices.len() {
+                return Err(invalid("native metadata storage cardinality mismatch"));
+            }
+            for (index, value) in physical_indices.into_iter().zip(loaded) {
+                values[index] = value;
+            }
+        }
+        if !locator_ids.is_empty() {
+            let locators = crate::tracked_state::load_canonical_change_locators(
+                &read,
+                &locator_ids,
+            )
+            .await?;
+            if locators.len() != locator_indices.len() {
+                return Err(invalid("native metadata locator cardinality mismatch"));
+            }
+            for (index, locator) in locator_indices.into_iter().zip(locators) {
+                values[index] = locator.map(|locator| {
+                    StorageProjectedValue::FullValue(Bytes::from(
+                        crate::tracked_state::encode_change_locator(locator),
+                    ))
+                });
+            }
+        }
         if values.len() != request.objects.len() {
             return Err(invalid("native metadata storage cardinality mismatch"));
         }
@@ -433,24 +469,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         let mut objects = Vec::with_capacity(values.len());
         let mut total = 0usize;
         for (index, (address, value)) in request.objects.iter().zip(values).enumerate() {
-            // Direct IDs normally have no physical locator row. Resolve their
-            // authenticated native owner rather than treating that absence as
-            // unavailable metadata or trusting an address-shaped guess.
-            let value = if matches!(address, NativeMetadataRef::ChangeLocator(_)) {
-                let id = canonical_id(address.id())?;
-                crate::tracked_state::load_canonical_change_locator(
-                    &read,
-                    ChangeId::new(*id.as_uuid()),
-                )
-                .await?
-                .map(|locator| {
-                    StorageProjectedValue::FullValue(Bytes::from(
-                        crate::tracked_state::encode_change_locator(locator),
-                    ))
-                })
-            } else {
-                value
-            };
             let bytes = match value {
                 Some(StorageProjectedValue::FullValue(bytes)) => bytes,
                 Some(StorageProjectedValue::KeyOnly) => {

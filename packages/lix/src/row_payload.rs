@@ -541,13 +541,39 @@ impl TypedRow {
         stored_schema_key: &str,
         stored_row_pk: &RowPk,
     ) -> Result<Self, LixError> {
+        Self::decode_durable_payload_bounded(
+            payload,
+            stored_schema_key,
+            stored_row_pk,
+            ENGINE_ROW_PAYLOAD_MAX_BYTES,
+        )
+    }
+
+    /// Decodes a durable typed row while limiting both stored bytes and
+    /// decompressed bytes before the row codec can allocate its JSON values.
+    pub(crate) fn decode_durable_payload_bounded(
+        payload: Arc<[u8]>,
+        stored_schema_key: &str,
+        stored_row_pk: &RowPk,
+        max_payload_bytes: usize,
+    ) -> Result<Self, LixError> {
+        durable_payload_declared_decoded_len_bounded(&payload, max_payload_bytes)?;
         let decoded_engine_payload =
             if payload.first().copied() == Some(COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION) {
-                Some(decompress_engine_row_payload(&payload)?)
+                Some(decompress_engine_row_payload_bounded(
+                    &payload,
+                    max_payload_bytes,
+                )?)
             } else {
                 None
             };
         let engine_payload = decoded_engine_payload.as_deref().unwrap_or(&payload);
+        if engine_payload.len() > max_payload_bytes {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "durable typed payload exceeds its decoded byte bound",
+            ));
+        }
         let (schema_fingerprint, row_pk, row) = if engine_payload.first().copied()
             == Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION)
         {
@@ -900,7 +926,22 @@ fn compress_native_snapshot_payload(
     Ok(framed)
 }
 
-pub(crate) fn decompress_engine_row_payload(payload: &[u8]) -> Result<Arc<[u8]>, LixError> {
+/// Validate the stored and declared decoded size of a durable row without
+/// allocating or inflating it. Batch readers use this to reserve aggregate
+/// decoded-byte budgets before any member of a page is parsed.
+pub(crate) fn durable_payload_declared_decoded_len_bounded(
+    payload: &[u8],
+    max_payload_bytes: usize,
+) -> Result<usize, LixError> {
+    if payload.len() > max_payload_bytes {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "durable typed payload exceeds its byte bound",
+        ));
+    }
+    if payload.first().copied() != Some(COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION) {
+        return Ok(payload.len());
+    }
     let expected_len = u32::from_le_bytes(
         payload
             .get(1..5)
@@ -913,10 +954,39 @@ pub(crate) fn decompress_engine_row_payload(payload: &[u8]) -> Result<Arc<[u8]>,
             .try_into()
             .expect("four-byte compact payload length"),
     ) as usize;
-    if expected_len > ENGINE_ROW_PAYLOAD_MAX_BYTES {
+    if expected_len > ENGINE_ROW_PAYLOAD_MAX_BYTES || expected_len > max_payload_bytes {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "compressed engine typed payload exceeds its decoded size limit",
+            "compressed engine typed payload exceeds its decoded byte bound",
+        ));
+    }
+    Ok(expected_len)
+}
+
+pub(crate) fn decompress_engine_row_payload(payload: &[u8]) -> Result<Arc<[u8]>, LixError> {
+    decompress_engine_row_payload_bounded(payload, ENGINE_ROW_PAYLOAD_MAX_BYTES)
+}
+
+fn decompress_engine_row_payload_bounded(
+    payload: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<Arc<[u8]>, LixError> {
+    let expected_len = u32::from_le_bytes(
+        payload
+            .get(1..5)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "compressed engine typed payload is truncated",
+                )
+            })?
+            .try_into()
+            .expect("four-byte compact payload length"),
+    ) as usize;
+    if expected_len > ENGINE_ROW_PAYLOAD_MAX_BYTES || expected_len > max_decoded_bytes {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "compressed engine typed payload exceeds its decoded byte bound",
         ));
     }
     let decoded = lz4_flex::block::decompress(&payload[5..], expected_len).map_err(|error| {
@@ -1166,5 +1236,57 @@ mod tests {
         let invalid_inner = compress_durable_payload(invalid_inner)
             .expect("invalid inner payload should still frame");
         assert!(decompress_engine_row_payload(&invalid_inner).is_err());
+    }
+
+    #[test]
+    fn bounded_durable_decode_rejects_declared_expansion_before_decompression() {
+        let max_decoded_bytes = 1024usize;
+        let mut compressed = vec![COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION];
+        compressed.extend_from_slice(&((max_decoded_bytes + 1) as u32).to_le_bytes());
+        compressed.push(0);
+
+        let error = TypedRow::decode_durable_payload_bounded(
+            Arc::from(compressed),
+            "lix_key_value",
+            &RowPk::single("lix_plugin_registry_v2"),
+            max_decoded_bytes,
+        )
+        .expect_err("oversized declared output must fail before LZ4 allocation");
+
+        assert!(error.message.contains("decoded byte bound"));
+    }
+
+    #[test]
+    fn durable_declared_size_preflight_is_bounded_and_allocation_free() {
+        let max_decoded_bytes = 1024usize;
+        let mut compressed = vec![COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION];
+        compressed.extend_from_slice(&512u32.to_le_bytes());
+        compressed.push(0);
+        assert_eq!(
+            durable_payload_declared_decoded_len_bounded(&compressed, max_decoded_bytes)
+                .unwrap(),
+            512
+        );
+
+        let mut oversized = vec![COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION];
+        oversized.extend_from_slice(&((max_decoded_bytes + 1) as u32).to_le_bytes());
+        oversized.push(0);
+        assert!(
+            durable_payload_declared_decoded_len_bounded(&oversized, max_decoded_bytes)
+                .unwrap_err()
+                .message
+                .contains("decoded byte bound")
+        );
+
+        assert!(
+            durable_payload_declared_decoded_len_bounded(
+                &[COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION],
+                max_decoded_bytes,
+            )
+            .unwrap_err()
+            .message
+            .contains("truncated")
+        );
+        assert_eq!(durable_payload_declared_decoded_len_bounded(&[1, 2, 3], 3).unwrap(), 3);
     }
 }

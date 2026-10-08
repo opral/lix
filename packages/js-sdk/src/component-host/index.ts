@@ -1,10 +1,5 @@
 import { $init, generate } from "@bytecodealliance/jco-transpile/component";
-import {
-  coreMemoryCount,
-  coreTableCount,
-  instrumentCore,
-  TICK_MODULE,
-} from "./instrument.js";
+import { coreMemoryCount, coreTableCount, TICK_MODULE } from "./instrument-helpers.js";
 
 export type ComponentImports = Record<string, unknown>;
 export type ComponentLimits = {
@@ -17,6 +12,10 @@ export type ComponentInstance = {
   memoryBytes(): number;
   setDeadline(milliseconds: number): void;
 };
+export type CoreInstrumenter = (
+  bytes: Uint8Array,
+  maximumMemoryBytes: number,
+) => Uint8Array;
 
 /** Finish the component host's WASM initialization before an offline edit. */
 export async function initializeComponentCompiler(): Promise<void> {
@@ -27,6 +26,7 @@ export async function initializeComponentCompiler(): Promise<void> {
 export async function compileComponent(
   bytes: Uint8Array,
   limits: ComponentLimits,
+  instrumenter?: CoreInstrumenter,
 ): Promise<{
   instantiate(imports: ComponentImports): Promise<ComponentInstance>;
 }> {
@@ -35,6 +35,10 @@ export async function compileComponent(
       "Instruction fuel limits are unsupported by the JavaScript Component host",
     );
   await initializeComponentCompiler();
+  // Keep Binaryen out of Rust-backed browser builds. The default Node path
+  // still loads the legacy transform on demand when no callback was supplied.
+  const transform =
+    instrumenter ?? (await import("./instrument.js")).instrumentCore;
   const output = generate(bytes, {
     name: "plugin",
     instantiation: { tag: "async" },
@@ -56,7 +60,7 @@ export async function compileComponent(
   const tableCounts = new Map<WebAssembly.Module, number>();
   for (const [name, core] of cores) {
     const compiled = await WebAssembly.compile(
-      instrumentCore(
+      transform(
         core,
         Math.floor(Number(limits.maxMemoryBytes) / Math.max(1, memoryCount)),
       ) as Uint8Array<ArrayBuffer>,

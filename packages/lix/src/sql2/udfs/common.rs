@@ -5,7 +5,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::ColumnarValue;
-use serde_json::{Number, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 /// Parse and normalize the subset of PostgreSQL JSONB represented by Lix.
 /// Object order and duplicate spelling are discarded by parsing, JSON numbers
@@ -42,113 +42,13 @@ pub(crate) fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), 
             }
         }
         JsonValue::Number(number) => {
-            *value = JsonValue::Number(normalize_jsonb_number(number)?);
+            *value = JsonValue::Number(
+                lix_schema::normalize_jsonb_number(number).map_err(|error| error.to_string())?,
+            );
         }
         JsonValue::Null | JsonValue::Bool(_) => {}
     }
     Ok(())
-}
-
-fn normalize_jsonb_number(number: &Number) -> std::result::Result<Number, String> {
-    const MAX_INTEGER_DIGITS: i64 = 131_072;
-    const MAX_FRACTIONAL_DIGITS: i64 = 16_383;
-
-    let raw = number.as_str();
-    let (negative, raw) = raw
-        .strip_prefix('-')
-        .map_or((false, raw), |raw| (true, raw));
-    let exponent_index = raw.find(['e', 'E']);
-    let (mantissa, exponent) = match exponent_index {
-        Some(index) => (&raw[..index], &raw[index + 1..]),
-        None => (raw, "0"),
-    };
-    let exponent = exponent.parse::<i64>().map_err(|_| {
-        "JSONB numeric exponent is outside PostgreSQL's supported range".to_owned()
-    })?;
-    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-
-    // PostgreSQL applies NUMERIC's scale limit to the input spelling before
-    // insignificant zeroes are stripped. Check it first so values such as
-    // 1.<16,384 zeroes> cannot evade the limit by normalizing to `1`.
-    let input_scale = i64::try_from(fraction.len())
-        .ok()
-        .and_then(|scale| scale.checked_sub(exponent))
-        .ok_or_else(|| "JSONB numeric exponent is outside PostgreSQL's supported range".to_owned())?
-        .max(0);
-    if input_scale > MAX_FRACTIONAL_DIGITS {
-        return Err("JSONB number exceeds PostgreSQL numeric precision or scale limits".to_owned());
-    }
-
-    let mut digits = String::with_capacity(integer.len() + fraction.len());
-    digits.push_str(integer);
-    digits.push_str(fraction);
-
-    let leading_zeroes = digits.bytes().take_while(|digit| *digit == b'0').count();
-    if leading_zeroes == digits.len() {
-        return Ok(Number::from_string_unchecked("0".to_owned()));
-    }
-    digits.drain(..leading_zeroes);
-
-    let decimal_position = i64::try_from(integer.len())
-        .ok()
-        .and_then(|position| position.checked_add(exponent))
-        .and_then(|position| position.checked_sub(i64::try_from(leading_zeroes).ok()?))
-        .ok_or_else(|| "JSONB numeric exponent is outside PostgreSQL's supported range".to_owned())?;
-
-    let integer_digits = decimal_position.max(0);
-    let fractional_digits = i64::try_from(digits.len())
-        .ok()
-        .and_then(|length| length.checked_sub(decimal_position))
-        .ok_or_else(|| "JSONB numeric exponent is outside PostgreSQL's supported range".to_owned())?
-        .max(0);
-    if integer_digits > MAX_INTEGER_DIGITS || fractional_digits > MAX_FRACTIONAL_DIGITS {
-        return Err("JSONB number exceeds PostgreSQL numeric precision or scale limits".to_owned());
-    }
-
-    let sign_length = if negative { 1 } else { 0 };
-    let display_length = if decimal_position <= 0 {
-        sign_length + 2 + fractional_digits
-    } else {
-        sign_length + integer_digits + if fractional_digits > 0 {
-            1 + fractional_digits
-        } else {
-            0
-        }
-    };
-    let mut canonical = String::with_capacity(usize::try_from(display_length).unwrap_or_default());
-    if negative {
-        canonical.push('-');
-    }
-    if decimal_position <= 0 {
-        canonical.push_str("0.");
-        canonical.extend(std::iter::repeat('0').take((-decimal_position) as usize));
-        canonical.push_str(&digits);
-    } else if decimal_position >= i64::try_from(digits.len()).unwrap_or(i64::MAX) {
-        canonical.push_str(&digits);
-        let integer_zeroes = decimal_position - i64::try_from(digits.len()).unwrap_or(i64::MAX);
-        canonical.extend(std::iter::repeat('0').take(integer_zeroes as usize));
-    } else {
-        let split = decimal_position as usize;
-        canonical.push_str(&digits[..split]);
-        canonical.push('.');
-        canonical.push_str(&digits[split..]);
-    }
-
-    // JSONB is stored as normalized UTF8 in Lix. Strip decimal display scale
-    // so DataFusion's native equality, hash, DISTINCT, and set-operation
-    // kernels retain JSONB numeric equality (1, 1.0, and 1.00 compare equal).
-    if let Some(decimal_point) = canonical.find('.') {
-        while canonical.ends_with('0') {
-            canonical.pop();
-        }
-        if canonical.len() == decimal_point + 1 {
-            canonical.pop();
-        }
-    }
-
-    // The normalized spelling is generated from a valid JSON number and only
-    // changes its decimal point and insignificant zeroes.
-    Ok(Number::from_string_unchecked(canonical))
 }
 
 fn reject_jsonb_nul(value: &str) -> std::result::Result<(), String> {
@@ -591,7 +491,7 @@ fn json_path_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_jsonb_text;
+    use super::{JsonValue, canonical_jsonb_text};
 
     #[test]
     fn canonical_jsonb_collapses_equivalent_numeric_spellings() {
@@ -608,6 +508,21 @@ mod tests {
         assert!(canonical_jsonb_text(&format!("0.{fractional_zeroes}")).is_err());
         assert!(canonical_jsonb_text("1e-16384").is_err());
         assert_eq!(canonical_jsonb_text("1e-16383").unwrap().len(), 16_385);
+    }
+
+    #[test]
+    fn sql_and_typed_row_jsonb_share_exact_wide_number_normalization() {
+        let raw = format!(
+            r#"{{"signed":{},"unsigned":{},"decimal":1.23456789012345678901234567890123456789}}"#,
+            i128::MIN,
+            u128::MAX,
+        );
+        let sql = canonical_jsonb_text(&raw).unwrap();
+        let value: JsonValue = serde_json::from_str(&raw).unwrap();
+        let typed_row = lix_schema::value_layout::canonical_jsonb_bytes(&value).unwrap();
+        assert_eq!(sql.as_bytes(), typed_row);
+        assert!(sql.contains(&u128::MAX.to_string()));
+        assert!(sql.contains("1.23456789012345678901234567890123456789"));
     }
 
     #[test]

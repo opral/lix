@@ -976,20 +976,22 @@ async fn prepare_hydrating_with_deadline<
             hydrate_metadata(&storage, old, authority, address, &mut Fetches::default())
                 .await
                 .unwrap();
-        } else if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
-            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap()
+        } else if let Some(crate::binary_cas::BlobManifestsRequired(hashes)) =
+            crate::binary_cas::BlobManifestsRequired::from_error(&error).unwrap()
         {
-            let key = hash.to_hex();
-            assert!(seen.insert(format!("manifest:{key}")), "{error}");
-            let wire = authority
-                .get_sync_blob_manifest(&key)
-                .await
-                .unwrap()
-                .unwrap_or_else(|| panic!("authority lacks requested blob manifest {key}"));
-            let wire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
-            super::super::partial_blob::install_manifest(&storage, old, hash, &wire)
-                .await
-                .unwrap();
+            for hash in hashes {
+                let key = hash.to_hex();
+                assert!(seen.insert(format!("manifest:{key}")), "{error}");
+                let wire = authority
+                    .get_sync_blob_manifest(&key)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("authority lacks requested blob manifest {key}"));
+                let wire = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+                super::super::partial_blob::install_manifest(&storage, old, hash, &wire)
+                    .await
+                    .unwrap();
+            }
         } else if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
             let ids = error
                 .details

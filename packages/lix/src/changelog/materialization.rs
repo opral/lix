@@ -68,6 +68,7 @@ pub(crate) struct MaterializedChangePayload {
     pub(crate) snapshot_content: Option<SharedStr>,
     pub(crate) metadata: Option<SharedStr>,
     pub(crate) decoded_snapshot: Option<Arc<WasmTypedRow>>,
+    pub(crate) raw_snapshot: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +215,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
                         snapshot_content: None,
                         metadata: None,
                         decoded_snapshot: None,
+                        raw_snapshot: None,
                     },
                 )
             })
@@ -223,10 +225,20 @@ pub(crate) fn materialize_known_change_payloads_in_order(
     let mut plans = Vec::with_capacity(changes.len());
     for change in changes {
         let change_id = change.change_id;
+        let needs_decoded_snapshot = projection.snapshot_content || projection.snapshot;
+        let mut snapshot = change.snapshot;
+        let raw_snapshot = if projection.raw_snapshot {
+            if needs_decoded_snapshot {
+                snapshot.as_ref().map(|payload| Bytes::copy_from_slice(payload))
+            } else {
+                snapshot.take().map(Bytes::from)
+            }
+        } else {
+            None
+        };
         let decoded_snapshot =
-            if projection.snapshot_content || projection.snapshot || projection.raw_snapshot {
-                change
-                    .snapshot
+            if needs_decoded_snapshot {
+                snapshot
                     .map(|payload| {
                         let native_payload: Arc<[u8]> = payload.into();
                         WasmTypedRow::decode_durable_payload(
@@ -253,6 +265,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
                 None
             },
             decoded_snapshot,
+            raw_snapshot,
         ));
     }
 
@@ -260,7 +273,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
     if projection.snapshot_content {
         let rows = plans
             .iter()
-            .filter(|(_, _, _, decoded_snapshot)| decoded_snapshot.is_some())
+            .filter(|(_, _, _, decoded_snapshot, _)| decoded_snapshot.is_some())
             .count();
         crate::sql_profile::record_derived_snapshot_content_rows(rows);
     }
@@ -268,7 +281,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
     plans
         .into_iter()
         .map(
-            |(change_id, identity, metadata, decoded_snapshot)| {
+            |(change_id, identity, metadata, decoded_snapshot, raw_snapshot)| {
                 Ok((
                     change_id,
                     MaterializedChangePayload {
@@ -292,6 +305,7 @@ pub(crate) fn materialize_known_change_payloads_in_order(
                             })
                             .transpose()?,
                         decoded_snapshot,
+                        raw_snapshot,
                     },
                 ))
             },
@@ -470,5 +484,24 @@ mod tests {
         assert!(!projection.snapshot);
         assert!(!projection.snapshot_content);
         assert!(projection.requires_payload());
+    }
+
+    #[test]
+    fn raw_only_materialization_retains_payload_without_decoding_or_json_projection() {
+        let change = test_change_record();
+        let expected_raw = change
+            .snapshot
+            .as_deref()
+            .map(Bytes::copy_from_slice);
+        let (_, payload) = materialize_known_change_payloads_in_order(
+            [change].into_iter(),
+            ChangeRecordProjection::from_columns(&["raw_snapshot".to_owned()]),
+        )
+        .expect("raw-only projection should materialize")[0]
+            .clone();
+
+        assert!(payload.snapshot_content.is_none());
+        assert!(payload.decoded_snapshot.is_none());
+        assert_eq!(payload.raw_snapshot, expected_raw);
     }
 }

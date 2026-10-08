@@ -48,6 +48,15 @@ use crate::tracked_state::{
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
+pub(crate) struct PreparedNativeDiffInputs {
+    /// Every identity in the bounded endpoint diff, including removed rows.
+    /// The caller uses these only for selected-head row-PK point paths.
+    pub(crate) selected_head_keys: Vec<TrackedStateKey>,
+    /// Change IDs proven visible at the exact after endpoint. These are
+    /// metadata-only dependencies; the row-PK index is not a visibility proof.
+    pub(crate) visible_after_change_ids: Vec<crate::changelog::ChangeId>,
+}
+
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 

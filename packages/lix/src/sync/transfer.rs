@@ -1,11 +1,194 @@
 //! Shared admission and packing budgets at the transfer boundary.
 //! Operation validators retain ownership of proof, coverage and publication.
 use crate::LixError;
+use serde::Serialize;
 use std::future::Future;
+use std::ops::Range;
 
 pub(crate) const CONTENT_GROUP_ITEMS: usize = 32;
 pub(crate) const CONTENT_GROUP_BYTES: usize = 1024 * 1024;
 pub(super) const CHUNK_CONCURRENCY: usize = 6;
+pub(super) const MANIFEST_PAGE_ITEMS: usize = super::MAX_SYNC_BLOB_BATCH_ITEMS;
+pub(super) const MANIFEST_PAGE_ENCODED_BYTES: usize = CONTENT_GROUP_BYTES;
+pub(super) const MANIFEST_PAGE_DECODED_BYTES: usize = CONTENT_GROUP_BYTES;
+pub(super) const MAX_MANIFEST_SINGLETON_ENCODED_BYTES: usize = 2 * CONTENT_GROUP_BYTES;
+
+struct BoundedJsonSizeWriter {
+    written: usize,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedJsonSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self.written.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "encoded size overflow")
+        })?;
+        if next > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded transfer page exceeds its byte budget",
+            ));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Measures encoded JSON through a capped writer so rejected pages never
+/// allocate an unbounded serialized copy.
+pub(super) fn bounded_json_size<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<usize, LixError> {
+    let mut writer = BoundedJsonSizeWriter { written: 0, limit };
+    serde_json::to_writer(&mut writer, value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("serialized transfer page exceeds its {limit}-byte bound: {error}"),
+        )
+    })?;
+    Ok(writer.written)
+}
+
+fn manifest_inline_decoded_bytes(manifests: &[super::SyncBlobManifest]) -> Result<usize, LixError> {
+    manifests.iter().try_fold(0usize, |total, manifest| {
+        let Some(encoded) = manifest.inline_bytes_base64.as_deref() else {
+            return Ok(total);
+        };
+        if encoded.len() > super::blob::MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync inline blob exceeds its per-manifest byte bound",
+            ));
+        }
+        // Valid base64 is a multiple of four bytes. Use a conservative rounded
+        // estimate for malformed lengths; normal decode below reports syntax
+        // errors after page admission. Subtract legal padding so an exact
+        // decoded-byte budget does not reject one or two padded bytes.
+        let encoded_groups = encoded.len().div_ceil(4);
+        let upper_bound = encoded_groups.checked_mul(3).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync inline blob decoded size overflowed",
+            )
+        })?;
+        let padding = encoded
+            .as_bytes()
+            .iter()
+            .rev()
+            .take(2)
+            .take_while(|byte| **byte == b'=')
+            .count();
+        let decoded = upper_bound.saturating_sub(padding);
+        total.checked_add(decoded).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync inline page decoded size overflowed",
+            )
+        })
+    })
+}
+
+/// Validates one incoming manifest page against the normal group budget or
+/// the existing large, no-inline singleton inventory lane.
+pub(super) fn validate_manifest_page(
+    manifests: &[super::SyncBlobManifest],
+) -> Result<(), LixError> {
+    if manifests.len() > MANIFEST_PAGE_ITEMS {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "manifest page exceeds its item budget",
+        ));
+    }
+    let encoded = bounded_json_size(manifests, MAX_MANIFEST_SINGLETON_ENCODED_BYTES)?;
+    let decoded = manifest_inline_decoded_bytes(manifests)?;
+    if encoded <= MANIFEST_PAGE_ENCODED_BYTES && decoded <= MANIFEST_PAGE_DECODED_BYTES {
+        return Ok(());
+    }
+    if manifests.len() == 1
+        && manifests[0].inline_bytes_base64.is_none()
+        && encoded <= MAX_MANIFEST_SINGLETON_ENCODED_BYTES
+    {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "manifest page exceeds its bounded encoded or decoded byte budget",
+    ))
+}
+
+fn append_manifest_page_range(batch: &TransferBatch<usize>, pages: &mut Vec<Range<usize>>) {
+    if let (Some(start), Some(end)) = (batch.items.first(), batch.items.last()) {
+        pages.push(*start..end.saturating_add(1));
+    }
+}
+
+/// Partitions one fetched, ordered manifest slice into installable bounded
+/// pages. The returned ranges borrow no data and preserve all response slots.
+pub(super) fn partition_manifest_pages(
+    manifests: &[super::SyncBlobManifest],
+) -> Result<Vec<Range<usize>>, LixError> {
+    if manifests.len() > MANIFEST_PAGE_ITEMS {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "manifest response exceeds its item budget",
+        ));
+    }
+    let mut pages = Vec::new();
+    let mut batch = TransferBatch::<usize>::with_limits(
+        MANIFEST_PAGE_ITEMS,
+        MANIFEST_PAGE_ENCODED_BYTES,
+        MANIFEST_PAGE_DECODED_BYTES,
+    );
+
+    for (index, manifest) in manifests.iter().enumerate() {
+        let encoded = bounded_json_size(
+            manifest,
+            MAX_MANIFEST_SINGLETON_ENCODED_BYTES.saturating_sub(2),
+        )?;
+        let decoded = manifest_inline_decoded_bytes(std::slice::from_ref(manifest))?;
+        let single_encoded = encoded.saturating_add(2);
+        if single_encoded > MANIFEST_PAGE_ENCODED_BYTES || decoded > MANIFEST_PAGE_DECODED_BYTES {
+            append_manifest_page_range(&batch, &mut pages);
+            batch = TransferBatch::with_limits(
+                MANIFEST_PAGE_ITEMS,
+                MANIFEST_PAGE_ENCODED_BYTES,
+                MANIFEST_PAGE_DECODED_BYTES,
+            );
+            if manifest.inline_bytes_base64.is_some()
+                || single_encoded > MAX_MANIFEST_SINGLETON_ENCODED_BYTES
+            {
+                return Err(LixError::new(
+                    "LIX_TRANSFER_MEMBER_TOO_LARGE",
+                    "manifest requires a smaller payload lane",
+                ));
+            }
+            pages.push(index..index + 1);
+            continue;
+        }
+
+        if let Some(returned_index) = batch.push(index, encoded, decoded)? {
+            append_manifest_page_range(&batch, &mut pages);
+            batch = TransferBatch::with_limits(
+                MANIFEST_PAGE_ITEMS,
+                MANIFEST_PAGE_ENCODED_BYTES,
+                MANIFEST_PAGE_DECODED_BYTES,
+            );
+            if batch.push(returned_index, encoded, decoded)?.is_some() {
+                return Err(LixError::new(
+                    "LIX_TRANSFER_MEMBER_TOO_LARGE",
+                    "manifest does not fit an empty transfer page",
+                ));
+            }
+        }
+    }
+    append_manifest_page_range(&batch, &mut pages);
+    for page in &pages {
+        validate_manifest_page(&manifests[page.clone()])?;
+    }
+    Ok(pages)
+}
 
 #[derive(Debug)]
 pub(super) struct TransferBatch<T> {
@@ -167,9 +350,10 @@ pub(super) async fn register_inline_group<T: super::SyncTransport>(
     Ok(())
 }
 
-/// One bounded content page. Raw chunk requests have a 4 MiB body ceiling;
-/// six in flight therefore bound payload residency to 24 MiB. Validate every
-/// present member before callers handle a missing sibling or install anything.
+/// One bounded content page. The binary-CAS owner supplies the per-chunk raw
+/// payload ceiling; six in flight therefore bound payload residency to 24 MiB.
+/// Validate every present member before callers handle a missing sibling or
+/// install anything.
 pub(super) async fn fetch_chunk_page<T: super::SyncTransport>(
     transport: &T,
     ids: &[String],
@@ -183,9 +367,10 @@ pub(super) async fn fetch_chunk_page<T: super::SyncTransport>(
         .collect::<Result<Vec<_>, _>>()?;
     let values =
         futures_util::future::try_join_all(ids.iter().map(|id| transport.get_chunk(id))).await?;
+    let max_chunk_bytes = crate::binary_cas::raw_chunk_transfer_bounds().max_payload_bytes;
     for (hash, value) in hashes.iter().zip(&values) {
         if let Some(bytes) = value {
-            if bytes.len() > 4 * 1024 * 1024
+            if bytes.len() > max_chunk_bytes
                 || bytes.is_empty()
                 || crate::binary_cas::ChunkHash::from_content(bytes) != *hash
             {
@@ -219,10 +404,11 @@ pub(super) async fn upload_chunk_page<T: super::SyncTransport>(
         return Err(LixError::unknown("chunk page exceeds concurrency budget"));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let max_chunk_bytes = crate::binary_cas::raw_chunk_transfer_bounds().max_payload_bytes;
     for (id, bytes) in chunks {
         let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
         if bytes.is_empty()
-            || bytes.len() > 4 * 1024 * 1024
+            || bytes.len() > max_chunk_bytes
             || hash != crate::binary_cas::ChunkHash::from_content(bytes)
             || !seen.insert(id)
         {
@@ -279,16 +465,17 @@ pub(super) async fn register_manifest_page<T: super::SyncTransport>(
     transport: &T,
     manifests: &[super::SyncBlobManifest],
 ) -> Result<Vec<super::SyncBlobRegistration>, LixError> {
-    let encoded = serde_json::to_vec(manifests)
-        .map_err(|error| LixError::unknown(error.to_string()))?
-        .len();
+    let encoded =
+        bounded_json_size(manifests, MAX_MANIFEST_SINGLETON_ENCODED_BYTES).map_err(|_| {
+            LixError::new(
+                "LIX_TRANSFER_MEMBER_TOO_LARGE",
+                "manifest inventory exceeds its bounded transfer lane",
+            )
+        })?;
     if encoded <= CONTENT_GROUP_BYTES {
         return register_group(transport, manifests).await;
     }
-    if manifests.len() != 1
-        || encoded > 2 * CONTENT_GROUP_BYTES
-        || manifests[0].inline_bytes_base64.is_some()
-    {
+    if manifests.len() != 1 || manifests[0].inline_bytes_base64.is_some() {
         return Err(LixError::new(
             "LIX_TRANSFER_MEMBER_TOO_LARGE",
             "manifest inventory exceeds its bounded transfer lane",

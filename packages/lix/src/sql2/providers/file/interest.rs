@@ -341,6 +341,15 @@ async fn prepare_native_file_plugin_inputs(
     blob_reader: &Arc<dyn BlobDataReader>,
     prepared: &PreparedLixFileRows,
 ) -> Result<(), LixError> {
+    let file_count = prepared
+        .file_rows
+        .values()
+        .filter(|file| plugin_descriptor_key_can_have_durable_owner(&file.key))
+        .take(crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS + 1)
+        .count();
+    if file_count > crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+        return Err(crate::plugin::runtime::executable_dependency_work_bound());
+    }
     let files = prepared
         .file_rows
         .values()
@@ -350,74 +359,20 @@ async fn prepare_native_file_plugin_inputs(
     if files.is_empty() {
         return Ok(());
     }
-
-    enum PluginInputRequest {
-        Registry(String),
-        Owner { branch: String, file_id: String },
-    }
-    let mut requests = Vec::new();
-    let mut registry_slots = BTreeMap::new();
-    for branch in files
+    let branches = files
         .iter()
-        .map(|(branch, _)| branch)
+        .map(|(branch, _)| branch.clone())
         .collect::<BTreeSet<_>>()
-    {
-        let slot = requests.len();
-        requests.push(PluginInputRequest::Registry(branch.clone()));
-        registry_slots.insert(branch.clone(), slot);
-    }
-    let mut owner_slots = BTreeMap::new();
-    for (branch, file_id) in &files {
-        let slot = requests.len();
-        requests.push(PluginInputRequest::Owner {
-            branch: branch.clone(),
-            file_id: file_id.clone(),
-        });
-        owner_slots.insert((branch.clone(), file_id.clone()), slot);
-    }
-
-    let exact_rows = requests
-        .iter()
-        .map(|request| match request {
-            PluginInputRequest::Registry(branch) => HotStateExactRowRequest {
-                schema_key: "lix_key_value".to_owned(),
-                branch_id: branch.clone(),
-                row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
-                file_id: None,
-            },
-            PluginInputRequest::Owner { branch, file_id } => HotStateExactRowRequest {
-                schema_key: "lix_key_value".to_owned(),
-                branch_id: branch.clone(),
-                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                file_id: Some(file_id.clone()),
-            },
-        })
+        .into_iter()
         .collect::<Vec<_>>();
-    let rows = hot_state
-        .load_exact_batch(&HotStateExactBatchRequest {
-            rows: exact_rows,
-            projection: HotStateProjection {
-                columns: vec!["snapshot_content".to_owned()],
-            },
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-
-    let mut registries = BTreeMap::new();
-    for (branch, slot) in registry_slots {
-        let registry = PluginRegistry::from_optional_hot_state_row(rows.row(slot), &branch)?;
-        registries.insert(branch, registry);
-    }
+    let registries =
+        crate::plugin::runtime::load_plugin_registry_pages(hot_state.as_ref(), &branches).await?;
+    let owner_targets = files.iter().cloned().collect::<Vec<_>>();
+    let owners =
+        crate::plugin::runtime::load_plugin_owner_pages(hot_state.as_ref(), &owner_targets).await?;
     let mut wasm_hashes = BTreeSet::new();
-    for ((branch, file_id), slot) in owner_slots {
-        let Some(row) = rows.row(slot) else {
-            continue;
-        };
-        let Some(owner) = PluginFileOwner::from_hot_state_row(&row.to_owned(), &branch, false)?
-        else {
-            continue;
-        };
+    for ((branch, file_id), loaded) in owners {
+        let owner = loaded.owner;
         let Some(plugin) = registries
             .get(&branch)
             .and_then(|registry| registry.get(owner.plugin_key()))

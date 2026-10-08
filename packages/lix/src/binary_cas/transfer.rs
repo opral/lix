@@ -20,6 +20,23 @@ use crate::storage_adapter::{
     StoragePrecondition, StorageWriteSet,
 };
 
+// Keep this codec-owned upper bound beside the borrowed validator so readers
+// can cap the encoded storage value before decoding the chunk row.
+const MAX_RAW_CHUNK_STORAGE_OVERHEAD_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawChunkTransferBounds {
+    pub(crate) max_payload_bytes: usize,
+    pub(crate) max_encoded_value_bytes: usize,
+}
+
+pub(crate) const fn raw_chunk_transfer_bounds() -> RawChunkTransferBounds {
+    RawChunkTransferBounds {
+        max_payload_bytes: MAX_BINARY_CAS_CHUNK_BYTES,
+        max_encoded_value_bytes: MAX_BINARY_CAS_CHUNK_BYTES + MAX_RAW_CHUNK_STORAGE_OVERHEAD_BYTES,
+    }
+}
+
 /// Couples a transfer publication to the ordinary CAS reclamation fence.
 pub(crate) async fn stage_transfer_publication_fence(
     store: &(impl StorageAdapterRead + ?Sized),
@@ -304,7 +321,18 @@ pub(crate) async fn load_verified_chunk(
             "binary CAS chunk read omitted its value",
         ));
     };
-    let (codec, uncompressed_len, payload) = decode_binary_cas_chunk(&encoded)?;
+    let (_uncompressed_len, payload) = validate_raw_chunk_payload(&encoded, chunk_id)?;
+    Ok(Some(payload.to_vec()))
+}
+
+/// Validates an encoded raw chunk without copying its payload. The borrowed
+/// result lets bounded page readers authenticate several rows from one
+/// provider response while keeping the codec schema owned by binary_cas.
+pub(crate) fn validate_raw_chunk_payload(
+    encoded: &[u8],
+    chunk_id: ChunkHash,
+) -> Result<(u64, &[u8]), LixError> {
+    let (codec, uncompressed_len, payload) = decode_binary_cas_chunk(encoded)?;
     if codec != BinaryChunkCodec::Raw {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -330,7 +358,7 @@ pub(crate) async fn load_verified_chunk(
             ),
         ));
     }
-    Ok(Some(payload.to_vec()))
+    Ok((uncompressed_len, payload))
 }
 
 /// Stages one raw chunk only after verifying its declared BLAKE3 identity.
@@ -430,8 +458,13 @@ pub(crate) async fn stage_deferred_canonical_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CanonicalBlobManifest,
 ) -> Result<Vec<ChunkHash>, LixError> {
-    stage_deferred_canonical_manifests_with_chunks(store, writes, std::slice::from_ref(manifest), &[])
-        .await
+    stage_deferred_canonical_manifests_with_chunks(
+        store,
+        writes,
+        std::slice::from_ref(manifest),
+        &[],
+    )
+    .await
 }
 
 /// Stages a batch of canonical manifests and raw chunks in one write set.

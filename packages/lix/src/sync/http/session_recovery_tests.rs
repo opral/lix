@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
 struct Client {
@@ -50,6 +51,7 @@ fn fixture(responses: Vec<Result<RawHttpResponse, LixError>>) -> HttpSyncTranspo
         active_account_id: crate::SYSTEM_ACCOUNT_ID.into(),
         session: Arc::new(tokio::sync::Mutex::new(SessionState::new("old".into()))),
         baseline_lease: Default::default(),
+        read_operations: Default::default(),
     }
 }
 fn request(transport: &HttpSyncTransport<Client>) -> RawHttpRequest {
@@ -106,6 +108,68 @@ async fn failed_recovery_backs_off_without_resending_stale_session() {
         200
     );
 }
+
+#[tokio::test]
+async fn tracked_send_only_marks_raw_handoff_and_clears_proven_session_rejection() {
+    let transport = fixture(vec![
+        gone(),
+        response(
+            503,
+            serde_json::json!({"error":{"code":"UNAVAILABLE","message":"offline"}}),
+        ),
+    ]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+    let error = transport
+        .send_tracked(request(&transport), &mut move |event| {
+            callback_events.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, "UNAVAILABLE");
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &[
+            ReadSendEvent::Dispatched("old".into()),
+            ReadSendEvent::RejectedBeforeExecution
+        ]
+    );
+    let requests = transport.client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(requests[1].method, Method::GET);
+}
+
+#[tokio::test]
+async fn tracked_send_does_not_mark_failed_initial_session_recovery() {
+    let transport = fixture(vec![response(
+        503,
+        serde_json::json!({"error":{"code":"UNAVAILABLE","message":"offline"}}),
+    )]);
+    {
+        let mut session = transport.session.lock().await;
+        session.invalid = true;
+        session.retry_at = web_time::Instant::now();
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let callback_events = Arc::clone(&events);
+
+    assert!(transport
+        .send_tracked(request(&transport), &mut move |event| {
+            callback_events.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await
+        .is_err());
+
+    assert!(events.lock().unwrap().is_empty());
+    let requests = transport.client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::GET);
+}
+
 #[tokio::test]
 async fn replacement_rejected_again_is_not_retried_in_a_loop() {
     let transport = fixture(vec![gone(), handshake(crate::SYSTEM_ACCOUNT_ID), gone()]);
@@ -172,14 +236,14 @@ async fn another_gone_error_never_replays() {
 #[derive(Clone, Debug)]
 struct ConcurrentClient {
     old_requests: Arc<tokio::sync::Barrier>,
-    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+    handshakes: Arc<AtomicUsize>,
 }
 impl RawHttpClient for ConcurrentClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             if request.method == Method::GET {
                 self.handshakes
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    .fetch_add(1, Ordering::SeqCst);
                 return handshake(crate::SYSTEM_ACCOUNT_ID);
             }
             if request
@@ -207,6 +271,7 @@ async fn concurrent_stale_clones_share_one_replacement() {
         active_account_id: crate::SYSTEM_ACCOUNT_ID.into(),
         session: Arc::new(tokio::sync::Mutex::new(SessionState::new("old".into()))),
         baseline_lease: Default::default(),
+        read_operations: Default::default(),
     };
     let clone = transport.clone();
     let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -223,7 +288,7 @@ async fn concurrent_stale_clones_share_one_replacement() {
         transport
             .client
             .handshakes
-            .load(std::sync::atomic::Ordering::SeqCst),
+            .load(Ordering::SeqCst),
         1
     );
 }
@@ -232,13 +297,13 @@ async fn concurrent_stale_clones_share_one_replacement() {
 struct SlowClient {
     started: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
-    requests: Arc<std::sync::atomic::AtomicUsize>,
+    requests: Arc<AtomicUsize>,
 }
 impl RawHttpClient for SlowClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             self.requests
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                .fetch_add(1, Ordering::SeqCst);
             if request.method != Method::GET {
                 return gone();
             }
@@ -259,6 +324,7 @@ fn slow_transport() -> HttpSyncTransport<SlowClient> {
         active_account_id: crate::SYSTEM_ACCOUNT_ID.into(),
         session: Arc::new(tokio::sync::Mutex::new(SessionState::new("old".into()))),
         baseline_lease: Default::default(),
+        read_operations: Default::default(),
     }
 }
 #[tokio::test]
@@ -284,7 +350,7 @@ async fn slow_failed_handshake_backs_off_from_failure_not_start() {
         transport
             .client
             .requests
-            .load(std::sync::atomic::Ordering::SeqCst),
+            .load(Ordering::SeqCst),
         2
     );
 }
@@ -310,7 +376,7 @@ async fn cancelled_handshake_reserves_retry_backoff() {
         transport
             .client
             .requests
-            .load(std::sync::atomic::Ordering::SeqCst),
+            .load(Ordering::SeqCst),
         2
     );
 }
