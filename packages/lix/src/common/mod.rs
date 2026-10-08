@@ -1,3 +1,4 @@
+pub(crate) mod bounded_string;
 pub(crate) mod error;
 pub(crate) mod exact_batch;
 mod execution_metadata;
@@ -15,6 +16,9 @@ pub(crate) mod timestamp;
 pub(crate) mod types;
 pub(crate) mod wire;
 
+pub(crate) use bounded_string::{
+    BoundedString, deserialize_bounded_string, deserialize_optional_bounded_string,
+};
 pub use error::{ErrorOrigin, LixError};
 pub(crate) use exact_batch::{ExactBatch, ExactValue};
 #[cfg(feature = "server-protocol")]

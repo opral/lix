@@ -530,9 +530,7 @@ pub enum Value {
 }
 
 /// Stable SQL result type exposed at language and protocol boundaries.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResultColumnType {
     Null,
@@ -565,9 +563,7 @@ impl ResultColumnType {
 
 /// Opaque address of one logical row in one Lix relation and optional file
 /// scope.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct RowRef(pub(crate) String);
 
@@ -696,10 +692,8 @@ mod tests {
 
     #[test]
     fn json_canonicalization_sorts_nested_objects() {
-        let decoded = serde_json::from_str::<Json>(
-            r#"{"z":{"b":2,"a":1},"a":[{"d":4,"c":3}]}"#,
-        )
-        .expect("decodes");
+        let decoded = serde_json::from_str::<Json>(r#"{"z":{"b":2,"a":1},"a":[{"d":4,"c":3}]}"#)
+            .expect("decodes");
 
         assert_eq!(
             decoded.as_str(),
@@ -710,10 +704,8 @@ mod tests {
     #[test]
     fn json_equality_ignores_object_insertion_order() {
         let left = Json::parse(r#"{"a":1,"nested":{"b":2,"c":3}}"#).unwrap();
-        let right = serde_json::from_str::<serde_json::Value>(
-            r#"{"nested":{"c":3,"b":2},"a":1}"#,
-        )
-        .unwrap();
+        let right =
+            serde_json::from_str::<serde_json::Value>(r#"{"nested":{"c":3,"b":2},"a":1}"#).unwrap();
 
         assert_eq!(left, right);
     }

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
+use crate::common::{
+    BoundedString, deserialize_bounded_string, deserialize_optional_bounded_string,
+};
 use crate::plugin::runtime::WASM_COMPONENT_API_VERSION;
 
 pub(super) const MAX_PLUGIN_SCHEMA_KEYS: usize = 64;
@@ -18,57 +21,13 @@ thread_local! {
     pub(super) static SCHEMA_KEY_VALUES_DESERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// The visitor bounds retained strings. serde_json may decode an escaped
-// string into parser scratch before calling `visit_string`; durable row,
-// archive, and manifest input limits bound that transient parser input.
-struct BoundedPluginString<const MAX_BYTES: usize>(String);
-
-impl<'de, const MAX_BYTES: usize> Deserialize<'de> for BoundedPluginString<MAX_BYTES> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BoundedPluginStringVisitor<const MAX_BYTES: usize>;
-
-        impl<'de, const MAX_BYTES: usize> Visitor<'de> for BoundedPluginStringVisitor<MAX_BYTES> {
-            type Value = BoundedPluginString<MAX_BYTES>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "a string of at most {MAX_BYTES} bytes")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value.len() > MAX_BYTES {
-                    return Err(E::custom(format!("string exceeds {MAX_BYTES} byte limit")));
-                }
-                Ok(BoundedPluginString(value.to_owned()))
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value.len() > MAX_BYTES {
-                    return Err(E::custom(format!("string exceeds {MAX_BYTES} byte limit")));
-                }
-                Ok(BoundedPluginString(value))
-            }
-        }
-
-        deserializer.deserialize_str(BoundedPluginStringVisitor::<MAX_BYTES>)
-    }
-}
-
 pub(super) fn deserialize_bounded_plugin_string<'de, D, const MAX_BYTES: usize>(
     deserializer: D,
 ) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    BoundedPluginString::<MAX_BYTES>::deserialize(deserializer).map(|value| value.0)
+    deserialize_bounded_string::<D, MAX_BYTES>(deserializer)
 }
 
 pub(super) fn deserialize_optional_bounded_plugin_string<'de, D, const MAX_BYTES: usize>(
@@ -77,8 +36,7 @@ pub(super) fn deserialize_optional_bounded_plugin_string<'de, D, const MAX_BYTES
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<BoundedPluginString<MAX_BYTES>>::deserialize(deserializer)
-        .map(|value| value.map(|value| value.0))
+    deserialize_optional_bounded_string::<D, MAX_BYTES>(deserializer)
 }
 
 pub(super) fn deserialize_plugin_schema_keys<'de, D>(
@@ -117,7 +75,7 @@ where
                 .min(MAX_PLUGIN_SCHEMA_KEYS);
             let mut values = Vec::with_capacity(capacity);
             while values.len() < MAX_PLUGIN_SCHEMA_KEYS {
-                let Some(BoundedPluginString::<MAX_PLUGIN_SCHEMA_KEY_BYTES>(value)) =
+                let Some(BoundedString::<MAX_PLUGIN_SCHEMA_KEY_BYTES>(value)) =
                     sequence.next_element()?
                 else {
                     return Ok(values);

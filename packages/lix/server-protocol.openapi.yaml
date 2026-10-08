@@ -1464,6 +1464,7 @@ components:
         expiresAtMs: { type: integer, minimum: 1 }
     SyncPushRequest:
       type: object
+      description: The sync push endpoint accepts at most 512 combined commits and refUpdates; the per-array schema bounds below are not additive limits.
       required: [commits, refUpdates, inlineBlobs]
       properties:
         commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
@@ -1545,14 +1546,23 @@ components:
         continuation: { type: [string, "null"], maxLength: 4096 }
     SyncEvent:
       type: object
+      description: Commit and ref-update counts reflect atomic Authority transaction output. The 512-item sync push request limit does not cap these arrays; pull responses are bounded by the 64 MiB encoded response limit.
       required: [cursor, commits, refUpdates, inlineBlobs]
       properties:
         cursor: { type: integer, minimum: 1 }
-        commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
-        refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+        commits: { type: array, items: { $ref: "#/components/schemas/SyncCommit" } }
+        refUpdates: { type: array, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
         inlineBlobs:
+          description: Self-contained server-emitted blobs are at most 256 KiB and have at most one canonical chunk receipt; the aggregate pull response uses the 64 MiB response limit.
           type: array
-          items: { $ref: "#/components/schemas/SyncBlobManifest" }
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/SyncBlobManifest" }
+              - type: object
+                required: [inlineBytesBase64]
+                properties:
+                  sizeBytes: { type: integer, minimum: 0, maximum: 262144 }
+                  chunks: { type: array, maxItems: 1, items: { $ref: "#/components/schemas/SyncBlobChunk" } }
     SyncPullResponse:
       oneOf:
         - type: object
@@ -1969,7 +1979,7 @@ components:
           items: { $ref: "#/components/schemas/SyncBlobChunk" }
         inlineBytesBase64:
           type: string
-          maxLength: 87384
+          maxLength: 349528
     SyncBlobRegistration:
       type: object
       required: [missingChunkIds, complete]

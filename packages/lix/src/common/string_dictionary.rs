@@ -130,7 +130,7 @@ impl StringDictionary {
                             .expect("string dictionary arena ordinal exceeds u32")
                     }))
                 }
-            None => ordinals.extend(std::iter::repeat(arena_offset).take(other.ranges.len())),
+                None => ordinals.extend(std::iter::repeat(arena_offset).take(other.ranges.len())),
             }
             debug_assert_eq!(ordinals.len(), combined_ranges);
             self.arena_ordinals = Some(ordinals);

@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 struct Client {
@@ -156,13 +156,15 @@ async fn tracked_send_does_not_mark_failed_initial_session_recovery() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let callback_events = Arc::clone(&events);
 
-    assert!(transport
-        .send_tracked(request(&transport), &mut move |event| {
-            callback_events.lock().unwrap().push(event);
-            Ok(())
-        })
-        .await
-        .is_err());
+    assert!(
+        transport
+            .send_tracked(request(&transport), &mut move |event| {
+                callback_events.lock().unwrap().push(event);
+                Ok(())
+            })
+            .await
+            .is_err()
+    );
 
     assert!(events.lock().unwrap().is_empty());
     let requests = transport.client.requests.lock().unwrap();
@@ -242,8 +244,7 @@ impl RawHttpClient for ConcurrentClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             if request.method == Method::GET {
-                self.handshakes
-                    .fetch_add(1, Ordering::SeqCst);
+                self.handshakes.fetch_add(1, Ordering::SeqCst);
                 return handshake(crate::SYSTEM_ACCOUNT_ID);
             }
             if request
@@ -284,13 +285,7 @@ async fn concurrent_stale_clones_share_one_replacement() {
     .unwrap();
     assert_eq!(a.unwrap().status, 200);
     assert_eq!(b.unwrap().status, 200);
-    assert_eq!(
-        transport
-            .client
-            .handshakes
-            .load(Ordering::SeqCst),
-        1
-    );
+    assert_eq!(transport.client.handshakes.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -302,8 +297,7 @@ struct SlowClient {
 impl RawHttpClient for SlowClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
-            self.requests
-                .fetch_add(1, Ordering::SeqCst);
+            self.requests.fetch_add(1, Ordering::SeqCst);
             if request.method != Method::GET {
                 return gone();
             }
@@ -346,13 +340,7 @@ async fn slow_failed_handshake_backs_off_from_failure_not_start() {
             .await
             .is_err()
     );
-    assert_eq!(
-        transport
-            .client
-            .requests
-            .load(Ordering::SeqCst),
-        2
-    );
+    assert_eq!(transport.client.requests.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn cancelled_handshake_reserves_retry_backoff() {
@@ -372,11 +360,5 @@ async fn cancelled_handshake_reserves_retry_backoff() {
             .await
             .is_err()
     );
-    assert_eq!(
-        transport
-            .client
-            .requests
-            .load(Ordering::SeqCst),
-        2
-    );
+    assert_eq!(transport.client.requests.load(Ordering::SeqCst), 2);
 }

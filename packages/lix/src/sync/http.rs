@@ -7,6 +7,7 @@ use http::Method;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::platform::SyncCallbackBounds;
 use super::{
     MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SYNC_PROTOCOL_VERSION,
     SYNC_PROTOCOL_VERSION_HEADER, SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse,
@@ -15,7 +16,6 @@ use super::{
     sync_server_protocol_missing_field, validate_sync_remote_id,
 };
 use crate::LixError;
-use super::platform::SyncCallbackBounds;
 
 pub(super) const HTTP_TIMEOUT: std::time::Duration =
     SYNC_LONG_POLL_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
@@ -362,9 +362,7 @@ where
     /// Reserves session ownership before staged work is queued or its durable
     /// scratch owner is reserved. Clones of the returned guard share one
     /// active count, so a stage can transfer it through cleanup/promotion.
-    pub(crate) fn acquire_read_operation_owner(
-        &self,
-    ) -> Result<ReadOperationOwner, LixError>
+    pub(crate) fn acquire_read_operation_owner(&self) -> Result<ReadOperationOwner, LixError>
     where
         Client: Clone + 'static,
     {
@@ -1333,7 +1331,9 @@ where
                 None => format!("/sync/pull?limit={limit}"),
             };
             let request = self.request(Method::GET, &path, "pull sync repository");
-            self.send_json(request).await
+            let response = self.send(request).await?;
+            ensure_success(&response, "pull sync repository")?;
+            super::blob::decode_pull_response(&response.body, limit)
         })
     }
 
@@ -1351,7 +1351,9 @@ where
             request
                 .headers
                 .push(("prefer".to_owned(), "wait=0".to_owned()));
-            self.send_json(request).await
+            let response = self.send(request).await?;
+            ensure_success(&response, "fence sync publication")?;
+            super::blob::decode_pull_response(&response.body, limit)
         })
     }
 
@@ -1415,17 +1417,28 @@ where
         blob_ids: &'a [String],
     ) -> SyncTransportFuture<'a, Vec<SyncBlobManifest>> {
         Box::pin(async move {
+            let expected_count = blob_ids.len();
+            let response_limit = super::blob::manifest_response_body_limit(expected_count)?;
             let blob_ids = blob_ids
                 .iter()
                 .map(|blob_id| encode_query(blob_id))
                 .collect::<Vec<_>>()
                 .join(",");
-            let request = self.request(
+            let mut request = self.request(
                 Method::GET,
                 &format!("/sync/blob?blobIds={blob_ids}"),
                 "load sync blob manifests",
             );
-            self.send_json(request).await
+            request.response_limit = response_limit;
+            let response = self.send(request).await?;
+            if response.body.len() > response_limit {
+                return Err(response_too_large_limit(
+                    "load sync blob manifests",
+                    response_limit,
+                ));
+            }
+            ensure_success(&response, "load sync blob manifests")?;
+            super::blob::decode_manifest_response(&response.body, expected_count)
         })
     }
 
@@ -1789,6 +1802,142 @@ mod tests {
         .await
         .expect("matching handshake should connect");
         assert_eq!(transport.lix_id(), "01936f4e-7b6c-7c3d-8f9a-123456789abc");
+    }
+
+    #[derive(Clone, Debug)]
+    struct ManifestReplyClient {
+        requests: Arc<Mutex<Vec<RawHttpRequest>>>,
+        manifest_body: Vec<u8>,
+    }
+
+    impl RawHttpClient for ManifestReplyClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                let is_handshake = request.operation == "open sync session";
+                self.requests.lock().unwrap().push(request);
+                let body = if is_handshake {
+                    serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode handshake")
+                } else {
+                    self.manifest_body.clone()
+                };
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn get_blobs_uses_the_bounded_decoder_and_request_derived_body_limit() {
+        let manifest = format!(
+            r#"{{"blobId":"{}","sizeBytes":0,"chunks":[]}}"#,
+            "0".repeat(64)
+        );
+        // The second row is deliberately not a manifest. The bounded visitor
+        // must stop at the one requested slot and report cardinality, rather
+        // than materializing/deserializing the extra row as a typed manifest.
+        let body = format!(r#"[{manifest},{{"blobId":null}}]"#).into_bytes();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = HttpSyncTransport::connect_with(
+            ManifestReplyClient {
+                requests: Arc::clone(&requests),
+                manifest_body: body,
+            },
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+
+        let requested = vec!["0".repeat(64)];
+        let error = transport
+            .get_blobs(&requested)
+            .await
+            .expect_err("an extra authority manifest must be rejected in the HTTP layer");
+        assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("exactly 1 sync blob manifests"));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].response_limit,
+            crate::sync::blob::manifest_response_body_limit(1).unwrap()
+        );
+        assert!(requests[1].response_limit < crate::sync::MAX_SYNC_PULL_RESPONSE_BYTES);
+    }
+
+    #[derive(Clone, Debug)]
+    struct PullReplyClient {
+        requests: Arc<Mutex<Vec<RawHttpRequest>>>,
+        pull_body: Vec<u8>,
+    }
+
+    impl RawHttpClient for PullReplyClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                let is_handshake = request.operation == "open sync session";
+                self.requests.lock().unwrap().push(request);
+                let body = if is_handshake {
+                    serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode handshake")
+                } else {
+                    self.pull_body.clone()
+                };
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_http_boundary_uses_bounded_inline_manifest_visitor() {
+        let oversized_inline =
+            "A".repeat(crate::sync::blob::MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 + 1);
+        let body = format!(
+            r#"{{"kind":"delta","cursor":1,"events":[{{"cursor":1,"commits":[],"refUpdates":[],"inlineBlobs":[{{"blobId":"{}","sizeBytes":0,"chunks":[],"inlineBytesBase64":"{oversized_inline}"}}]}}]}}"#,
+            "0".repeat(64),
+        )
+        .into_bytes();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = HttpSyncTransport::connect_with(
+            PullReplyClient {
+                requests: Arc::clone(&requests),
+                pull_body: body,
+            },
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+
+        let error = transport
+            .pull(Some(0), 1)
+            .await
+            .expect_err("an oversized event inline string must fail at the HTTP boundary");
+        assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("349528 byte limit"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].response_limit,
+            crate::sync::MAX_SYNC_PULL_RESPONSE_BYTES
+        );
     }
 
     #[derive(Debug)]

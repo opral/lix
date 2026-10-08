@@ -1,6 +1,8 @@
 //! Lazy binary-CAS sync outside the live commit/ref cursor.
 
 use base64::Engine as _;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use std::fmt;
 
 use crate::binary_cas::{
     BlobChunkReceipt, BlobId, CanonicalBlobChunk, CanonicalBlobManifest, ChunkHash,
@@ -9,6 +11,7 @@ use crate::binary_cas::{
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk,
 };
+use crate::common::BoundedString;
 use crate::storage_adapter::{Storage, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
 use crate::{Lix, LixError};
 
@@ -16,6 +19,876 @@ use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
 
 const MAX_SYNC_BLOB_CHUNKS: usize = 16_384;
 pub(super) const MAX_INLINE_SYNC_BLOB_BYTES: usize = 256 * 1024;
+const MAX_SYNC_BLOB_ID_BYTES: usize = 64;
+// The smallest server-produced inline manifest is the empty blob: a canonical
+// 64-byte lowercase-hex id, sizeBytes=0, no chunk receipts, and empty inline
+// base64.
+// Count budgets below use this minimum only after the inline visitor enforces
+// that exact known-field shape.
+const MIN_INLINE_MANIFEST_JSON_BYTES: usize = 126;
+
+/// Maximum JSON array size for `expected_count` manifests using the existing
+/// 2 MiB per-manifest registration bound plus array punctuation. A full
+/// 16-item response stays just over 32 MiB, below the shared 64 MiB cap.
+pub(super) fn manifest_response_body_limit(expected_count: usize) -> Result<usize, LixError> {
+    if expected_count == 0 || expected_count > super::MAX_SYNC_BLOB_BATCH_ITEMS {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync blob request exceeds its manifest response count bound",
+        ));
+    }
+    super::transfer::MAX_MANIFEST_SINGLETON_ENCODED_BYTES
+        .checked_mul(expected_count)
+        .and_then(|bytes| {
+            expected_count
+                .checked_add(1)
+                .and_then(|array_overhead| bytes.checked_add(array_overhead))
+        })
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync blob manifest response byte bound overflowed",
+            )
+        })
+}
+
+/// Decodes an authority manifest response while enforcing the request and
+/// schema cardinality bounds before allocating owned response rows. The HTTP
+/// request caps the whole body with `manifest_response_body_limit`; serde_json
+/// may still use parser scratch for escaped strings, bounded by that body cap.
+pub(super) fn decode_manifest_response(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<Vec<SyncBlobManifest>, LixError> {
+    manifest_response_body_limit(expected_count)?;
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let manifests = ManifestResponseSeed { expected_count }
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("decode bounded sync blob manifest response: {error}"),
+            )
+        })?;
+    deserializer.end().map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("decode bounded sync blob manifest response: {error}"),
+        )
+    })?;
+    Ok(manifests)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum PullResponseField {
+    Kind,
+    Cursor,
+    LixId,
+    DefaultBranchId,
+    Branches,
+    Events,
+    #[serde(other)]
+    Other,
+}
+
+struct PullResponseSeed {
+    max_events: usize,
+    manifest_budget: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for PullResponseSeed {
+    type Value = super::SyncRepositoryPullResponse;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PullResponseVisitor(self))
+    }
+}
+
+struct PullResponseVisitor(PullResponseSeed);
+
+impl<'de> Visitor<'de> for PullResponseVisitor {
+    type Value = super::SyncRepositoryPullResponse;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sync pull response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut kind = None;
+        let mut cursor = None;
+        let mut lix_id = None;
+        let mut default_branch_id = None;
+        let mut branches = None;
+        let mut events = None;
+        while let Some(field) = map.next_key::<PullResponseField>()? {
+            match field {
+                PullResponseField::Kind => {
+                    if kind.is_some() {
+                        return Err(serde::de::Error::duplicate_field("kind"));
+                    }
+                    kind = Some(map.next_value::<BoundedString<16>>()?.0);
+                }
+                PullResponseField::Cursor => {
+                    if cursor.is_some() {
+                        return Err(serde::de::Error::duplicate_field("cursor"));
+                    }
+                    cursor = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                PullResponseField::LixId => {
+                    if lix_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("lixId"));
+                    }
+                    lix_id = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                PullResponseField::DefaultBranchId => {
+                    if default_branch_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("defaultBranchId"));
+                    }
+                    default_branch_id = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                PullResponseField::Branches => {
+                    if branches.is_some() {
+                        return Err(serde::de::Error::duplicate_field("branches"));
+                    }
+                    branches = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                PullResponseField::Events => {
+                    if events.is_some() {
+                        return Err(serde::de::Error::duplicate_field("events"));
+                    }
+                    events = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                }
+                PullResponseField::Other => {
+                    let _: &serde_json::value::RawValue = map.next_value()?;
+                }
+            }
+        }
+
+        let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+        let cursor = cursor.ok_or_else(|| serde::de::Error::missing_field("cursor"))?;
+        match kind.as_str() {
+            "snapshot" => Ok(super::SyncRepositoryPullResponse::Snapshot {
+                cursor: decode_raw_value(cursor, "decode bounded sync pull cursor")
+                    .map_err(serde::de::Error::custom)?,
+                lix_id: decode_raw_value::<BoundedString<64>>(
+                    lix_id.ok_or_else(|| serde::de::Error::missing_field("lixId"))?,
+                    "decode bounded sync pull lixId",
+                )
+                .map_err(serde::de::Error::custom)?
+                .0,
+                default_branch_id: decode_raw_value::<BoundedString<64>>(
+                    default_branch_id
+                        .ok_or_else(|| serde::de::Error::missing_field("defaultBranchId"))?,
+                    "decode bounded sync pull defaultBranchId",
+                )
+                .map_err(serde::de::Error::custom)?
+                .0,
+                branches: decode_raw_seed(
+                    branches.ok_or_else(|| serde::de::Error::missing_field("branches"))?,
+                    BoundedVecSeed::<super::SyncBranchHead>::unbounded("sync snapshot branches"),
+                    "decode bounded sync snapshot branches",
+                )
+                .map_err(serde::de::Error::custom)?,
+            }),
+            "delta" => Ok(super::SyncRepositoryPullResponse::Delta {
+                cursor: decode_raw_value(cursor, "decode bounded sync pull cursor")
+                    .map_err(serde::de::Error::custom)?,
+                events: decode_raw_seed(
+                    events.ok_or_else(|| serde::de::Error::missing_field("events"))?,
+                    EventsSeed {
+                        max_events: self.0.max_events,
+                        manifest_budget: self.0.manifest_budget,
+                    },
+                    "decode bounded sync pull events",
+                )
+                .map_err(serde::de::Error::custom)?,
+            }),
+            _ => Err(serde::de::Error::unknown_variant(
+                &kind,
+                &["snapshot", "delta"],
+            )),
+        }
+    }
+}
+
+fn decode_raw_value<T>(
+    raw: &serde_json::value::RawValue,
+    context: &'static str,
+) -> Result<T, LixError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(raw.get())
+        .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, format!("{context}: {error}")))
+}
+
+fn decode_raw_seed<'de, Seed>(
+    raw: &'de serde_json::value::RawValue,
+    seed: Seed,
+    context: &'static str,
+) -> Result<Seed::Value, LixError>
+where
+    Seed: DeserializeSeed<'de>,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    let value = seed.deserialize(&mut deserializer).map_err(|error| {
+        LixError::new(LixError::CODE_INVALID_PARAM, format!("{context}: {error}"))
+    })?;
+    deserializer.end().map_err(|error| {
+        LixError::new(LixError::CODE_INVALID_PARAM, format!("{context}: {error}"))
+    })?;
+    Ok(value)
+}
+
+struct BoundedVecSeed<T> {
+    max_items: Option<usize>,
+    label: &'static str,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> BoundedVecSeed<T> {
+    fn unbounded(label: &'static str) -> Self {
+        Self {
+            max_items: None,
+            label,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'de, T> DeserializeSeed<'de> for BoundedVecSeed<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedVecVisitor {
+            max_items: self.max_items,
+            label: self.label,
+            marker: std::marker::PhantomData,
+        })
+    }
+}
+
+struct BoundedVecVisitor<T> {
+    max_items: Option<usize>,
+    label: &'static str,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.max_items {
+            Some(max_items) => write!(formatter, "at most {max_items} {}", self.label),
+            None => write!(formatter, "a bounded list of {}", self.label),
+        }
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        // Do not trust SeqAccess::size_hint: wire cardinality is the only
+        // source of growth for lists whose protocol has no count limit.
+        let mut values = Vec::new();
+        loop {
+            if self.max_items.is_some_and(|limit| values.len() == limit) {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "{} exceeds its item limit",
+                        self.label
+                    )));
+                }
+                break;
+            }
+            let Some(value) = sequence.next_element::<T>()? else {
+                break;
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+struct EventsSeed {
+    max_events: usize,
+    manifest_budget: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for EventsSeed {
+    type Value = Vec<super::SyncEvent>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(EventsVisitor(self))
+    }
+}
+
+struct EventsVisitor(EventsSeed);
+
+impl<'de> Visitor<'de> for EventsVisitor {
+    type Value = Vec<super::SyncEvent>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {} sync events", self.0.max_events)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut events = Vec::with_capacity(self.0.max_events);
+        let mut remaining_manifests = self.0.manifest_budget;
+        loop {
+            if events.len() == self.0.max_events {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "sync pull response exceeds the requested event count",
+                    ));
+                }
+                break;
+            }
+            let Some((event, consumed)) = sequence.next_element_seed(EventSeed {
+                manifest_budget: remaining_manifests,
+            })?
+            else {
+                break;
+            };
+            remaining_manifests -= consumed;
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum EventField {
+    Cursor,
+    Commits,
+    RefUpdates,
+    InlineBlobs,
+    #[serde(other)]
+    Other,
+}
+
+struct EventSeed {
+    manifest_budget: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for EventSeed {
+    type Value = (super::SyncEvent, usize);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(EventVisitor {
+            manifest_budget: self.manifest_budget,
+        })
+    }
+}
+
+struct EventVisitor {
+    manifest_budget: usize,
+}
+
+impl<'de> Visitor<'de> for EventVisitor {
+    type Value = (super::SyncEvent, usize);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sync event")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut cursor = None;
+        let mut commits = None;
+        let mut ref_updates = None;
+        let mut inline_blobs = None;
+        while let Some(field) = map.next_key::<EventField>()? {
+            match field {
+                EventField::Cursor => {
+                    if cursor.is_some() {
+                        return Err(serde::de::Error::duplicate_field("cursor"));
+                    }
+                    cursor = Some(map.next_value::<u64>()?);
+                }
+                EventField::Commits => {
+                    if commits.is_some() {
+                        return Err(serde::de::Error::duplicate_field("commits"));
+                    }
+                    commits = Some(map.next_value::<Vec<super::SyncCommit>>()?);
+                }
+                EventField::RefUpdates => {
+                    if ref_updates.is_some() {
+                        return Err(serde::de::Error::duplicate_field("refUpdates"));
+                    }
+                    ref_updates = Some(map.next_value::<Vec<super::protocol::SyncRefUpdate>>()?);
+                }
+                EventField::InlineBlobs => {
+                    if inline_blobs.is_some() {
+                        return Err(serde::de::Error::duplicate_field("inlineBlobs"));
+                    }
+                    inline_blobs = Some(map.next_value_seed(InlineManifestsSeed {
+                        manifest_budget: self.manifest_budget,
+                    })?);
+                }
+                EventField::Other => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        let (inline_blobs, consumed) =
+            inline_blobs.ok_or_else(|| serde::de::Error::missing_field("inlineBlobs"))?;
+        Ok((
+            super::SyncEvent {
+                cursor: cursor.ok_or_else(|| serde::de::Error::missing_field("cursor"))?,
+                commits: commits.ok_or_else(|| serde::de::Error::missing_field("commits"))?,
+                ref_updates: ref_updates
+                    .ok_or_else(|| serde::de::Error::missing_field("refUpdates"))?,
+                inline_blobs,
+            },
+            consumed,
+        ))
+    }
+}
+
+struct InlineManifestsSeed {
+    manifest_budget: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for InlineManifestsSeed {
+    type Value = (Vec<SyncBlobManifest>, usize);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(InlineManifestsVisitor {
+            manifest_budget: self.manifest_budget,
+        })
+    }
+}
+
+struct InlineManifestsVisitor {
+    manifest_budget: usize,
+}
+
+impl<'de> Visitor<'de> for InlineManifestsVisitor {
+    type Value = (Vec<SyncBlobManifest>, usize);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "at most {} server-bounded inline sync blob manifests",
+            self.manifest_budget
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut manifests = Vec::new();
+        loop {
+            if manifests.len() == self.manifest_budget {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "sync pull inline manifests exceed their response-derived item budget",
+                    ));
+                }
+                break;
+            }
+            let Some(manifest) = sequence.next_element_seed(ManifestSeed::pull_inline())? else {
+                break;
+            };
+            manifests.push(manifest);
+        }
+        let consumed = manifests.len();
+        Ok((manifests, consumed))
+    }
+}
+
+fn has_canonical_sync_blob_id_format(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Decodes a pull response with request-derived event cardinality and a
+/// response-body-derived aggregate budget for inline manifests. The current
+/// authority caps pull responses at 64 MiB and emits at most `limit` events;
+/// each inline manifest has a 64-byte lowercase-hex id, inline data, and no
+/// more than one receipt. Commits and ref updates retain their existing
+/// producer cardinality and are bounded here by the 64 MiB encoded response
+/// limit; this decoder does not claim that all retained DTO allocations are
+/// bounded by their encoded size. The inline-field limits cap retained inline
+/// ownership; serde may use parser scratch for escaped strings, bounded by the
+/// whole response body.
+pub(super) fn decode_pull_response(
+    bytes: &[u8],
+    max_events: usize,
+) -> Result<super::SyncRepositoryPullResponse, LixError> {
+    if bytes.len() > super::MAX_SYNC_PULL_RESPONSE_BYTES {
+        return Err(super::http::response_too_large("pull sync repository"));
+    }
+    if max_events == 0 || max_events > super::MAX_SYNC_REQUEST_ITEMS {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync pull event count exceeds its request bound",
+        ));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let response = PullResponseSeed {
+        max_events,
+        manifest_budget: bytes.len() / MIN_INLINE_MANIFEST_JSON_BYTES,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("decode bounded sync pull response: {error}"),
+        )
+    })?;
+    deserializer.end().map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("decode bounded sync pull response: {error}"),
+        )
+    })?;
+    Ok(response)
+}
+
+struct ManifestResponseSeed {
+    expected_count: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestResponseSeed {
+    type Value = Vec<SyncBlobManifest>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ManifestResponseVisitor {
+            expected_count: self.expected_count,
+        })
+    }
+}
+
+struct ManifestResponseVisitor {
+    expected_count: usize,
+}
+
+impl<'de> Visitor<'de> for ManifestResponseVisitor {
+    type Value = Vec<SyncBlobManifest>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exactly {} sync blob manifests",
+            self.expected_count
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        // The request is already capped at 16 IDs, so this reservation cannot
+        // be driven by untrusted JSON's array length or size hint.
+        let mut manifests = Vec::with_capacity(self.expected_count);
+        loop {
+            if manifests.len() == self.expected_count {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(
+                        self.expected_count.saturating_add(1),
+                        &self,
+                    ));
+                }
+                break;
+            }
+            let Some(manifest) = sequence.next_element_seed(ManifestSeed::wire())? else {
+                break;
+            };
+            manifests.push(manifest);
+        }
+        if manifests.len() != self.expected_count {
+            return Err(serde::de::Error::invalid_length(manifests.len(), &self));
+        }
+        Ok(manifests)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum ManifestField {
+    BlobId,
+    SizeBytes,
+    Chunks,
+    InlineBytesBase64,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Copy)]
+struct ManifestSeed {
+    max_chunks: usize,
+    require_inline: bool,
+    require_canonical_blob_id: bool,
+}
+
+impl ManifestSeed {
+    const fn wire() -> Self {
+        Self {
+            max_chunks: MAX_SYNC_BLOB_CHUNKS,
+            require_inline: false,
+            require_canonical_blob_id: false,
+        }
+    }
+
+    const fn pull_inline() -> Self {
+        Self {
+            max_chunks: 1,
+            require_inline: true,
+            require_canonical_blob_id: true,
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestSeed {
+    type Value = SyncBlobManifest;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ManifestVisitor(self))
+    }
+}
+
+struct ManifestVisitor(ManifestSeed);
+
+impl<'de> Visitor<'de> for ManifestVisitor {
+    type Value = SyncBlobManifest;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sync blob manifest")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut blob_id = None;
+        let mut size_bytes = None;
+        let mut chunks = None;
+        let mut inline_bytes_base64 = None;
+        let mut inline_was_present = false;
+        while let Some(field) = map.next_key::<ManifestField>()? {
+            match field {
+                ManifestField::BlobId => {
+                    if blob_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("blobId"));
+                    }
+                    blob_id = Some(map.next_value::<BoundedString<MAX_SYNC_BLOB_ID_BYTES>>()?.0);
+                }
+                ManifestField::SizeBytes => {
+                    if size_bytes.is_some() {
+                        return Err(serde::de::Error::duplicate_field("sizeBytes"));
+                    }
+                    size_bytes = Some(map.next_value::<u64>()?);
+                }
+                ManifestField::Chunks => {
+                    if chunks.is_some() {
+                        return Err(serde::de::Error::duplicate_field("chunks"));
+                    }
+                    chunks = Some(map.next_value_seed(ChunkListSeed {
+                        max_chunks: self.0.max_chunks,
+                    })?);
+                }
+                ManifestField::InlineBytesBase64 => {
+                    if inline_was_present {
+                        return Err(serde::de::Error::duplicate_field("inlineBytesBase64"));
+                    }
+                    inline_was_present = true;
+                    inline_bytes_base64 =
+                        map.next_value::<Option<
+                            BoundedString<{ MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 }>,
+                        >>()?
+                        .map(|value| value.0);
+                }
+                ManifestField::Other => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        let blob_id = blob_id.ok_or_else(|| serde::de::Error::missing_field("blobId"))?;
+        let size_bytes = size_bytes.ok_or_else(|| serde::de::Error::missing_field("sizeBytes"))?;
+        let chunks = chunks.ok_or_else(|| serde::de::Error::missing_field("chunks"))?;
+        if self.0.require_canonical_blob_id && !has_canonical_sync_blob_id_format(&blob_id) {
+            return Err(serde::de::Error::custom(
+                "inline sync blob id must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        if self.0.require_inline {
+            if inline_bytes_base64.is_none() {
+                return Err(serde::de::Error::custom(
+                    "inline sync blob manifest requires inlineBytesBase64",
+                ));
+            }
+            if size_bytes > MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+                return Err(serde::de::Error::custom(
+                    "inline sync blob exceeds its 256 KiB decoded byte limit",
+                ));
+            }
+        }
+        Ok(SyncBlobManifest {
+            blob_id,
+            size_bytes,
+            chunks,
+            inline_bytes_base64,
+        })
+    }
+}
+
+struct ChunkListSeed {
+    max_chunks: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ChunkListSeed {
+    type Value = Vec<SyncBlobChunk>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ChunkListVisitor {
+            max_chunks: self.max_chunks,
+        })
+    }
+}
+
+struct ChunkListVisitor {
+    max_chunks: usize,
+}
+
+impl<'de> Visitor<'de> for ChunkListVisitor {
+    type Value = Vec<SyncBlobChunk>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {} sync blob chunks", self.max_chunks)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut chunks = Vec::new();
+        loop {
+            if chunks.len() == self.max_chunks {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(
+                        self.max_chunks.saturating_add(1),
+                        &self,
+                    ));
+                }
+                break;
+            }
+            let Some(chunk) = sequence.next_element_seed(ChunkSeed)? else {
+                break;
+            };
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum ChunkField {
+    ChunkId,
+    SizeBytes,
+    #[serde(other)]
+    Other,
+}
+
+struct ChunkSeed;
+
+impl<'de> DeserializeSeed<'de> for ChunkSeed {
+    type Value = SyncBlobChunk;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ChunkVisitor)
+    }
+}
+
+struct ChunkVisitor;
+
+impl<'de> Visitor<'de> for ChunkVisitor {
+    type Value = SyncBlobChunk;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sync blob chunk receipt")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut chunk_id = None;
+        let mut size_bytes = None;
+        while let Some(field) = map.next_key::<ChunkField>()? {
+            match field {
+                ChunkField::ChunkId => {
+                    if chunk_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("chunkId"));
+                    }
+                    chunk_id = Some(map.next_value::<BoundedString<MAX_SYNC_BLOB_ID_BYTES>>()?.0);
+                }
+                ChunkField::SizeBytes => {
+                    if size_bytes.is_some() {
+                        return Err(serde::de::Error::duplicate_field("sizeBytes"));
+                    }
+                    size_bytes = Some(map.next_value::<u64>()?);
+                }
+                ChunkField::Other => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        Ok(SyncBlobChunk {
+            chunk_id: chunk_id.ok_or_else(|| serde::de::Error::missing_field("chunkId"))?,
+            size_bytes: size_bytes.ok_or_else(|| serde::de::Error::missing_field("sizeBytes"))?,
+        })
+    }
+}
 
 pub(crate) fn validate_manifest_group(wires: &[SyncBlobManifest]) -> Result<(), LixError> {
     if wires.is_empty()
@@ -771,6 +1644,259 @@ mod tests {
             inline_bytes_base64: inline_bytes
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
         }
+    }
+
+    fn manifest_response_with_chunks(chunk_count: usize) -> Vec<u8> {
+        let chunk = format!(
+            r#"{{"chunkId":"{}","sizeBytes":1}}"#,
+            "0".repeat(MAX_SYNC_BLOB_ID_BYTES)
+        );
+        let chunks = std::iter::repeat(chunk.as_str())
+            .take(chunk_count)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"[{{"blobId":"{}","sizeBytes":{chunk_count},"chunks":[{chunks}]}}]"#,
+            "1".repeat(MAX_SYNC_BLOB_ID_BYTES),
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn bounded_manifest_response_requires_exact_request_cardinality() {
+        assert_eq!(
+            manifest_response_body_limit(1).unwrap(),
+            crate::sync::transfer::MAX_MANIFEST_SINGLETON_ENCODED_BYTES + 2
+        );
+        assert_eq!(
+            manifest_response_body_limit(crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS).unwrap(),
+            crate::sync::transfer::MAX_MANIFEST_SINGLETON_ENCODED_BYTES
+                * crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS
+                + crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS
+                + 1
+        );
+        let valid = format!(
+            r#"{{"blobId":"{}","sizeBytes":0,"chunks":[]}}"#,
+            "0".repeat(MAX_SYNC_BLOB_ID_BYTES)
+        );
+        let too_many = format!(r#"[{valid},{{"blobId":null}}]"#);
+        let error = decode_manifest_response(too_many.as_bytes(), 1)
+            .expect_err("extra manifests must be rejected at the request bound");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("exactly 1 sync blob manifests"));
+
+        let error = decode_manifest_response(format!("[{valid}]").as_bytes(), 2)
+            .expect_err("an omitted requested manifest must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("exactly 2 sync blob manifests"));
+
+        let maximum_batch = format!(
+            "[{}]",
+            std::iter::repeat(valid.as_str())
+                .take(crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            decode_manifest_response(
+                maximum_batch.as_bytes(),
+                crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS,
+            )
+            .expect("the complete documented request batch remains accepted")
+            .len(),
+            crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS
+        );
+
+        for invalid_count in [0, crate::sync::MAX_SYNC_BLOB_BATCH_ITEMS + 1] {
+            let error = decode_manifest_response(b"[]", invalid_count)
+                .expect_err("out-of-contract request sizes must fail before parsing");
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        }
+    }
+
+    #[test]
+    fn bounded_manifest_response_accepts_maximum_receipts_and_rejects_one_more() {
+        let maximum =
+            decode_manifest_response(&manifest_response_with_chunks(MAX_SYNC_BLOB_CHUNKS), 1)
+                .expect("the full documented receipt inventory remains accepted");
+        assert_eq!(maximum[0].chunks.len(), MAX_SYNC_BLOB_CHUNKS);
+
+        let mut maximum_known_fields =
+            String::from_utf8(manifest_response_with_chunks(MAX_SYNC_BLOB_CHUNKS)).unwrap();
+        let max_inline =
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_INLINE_SYNC_BLOB_BYTES]);
+        let inline_field = format!(",\"inlineBytesBase64\":\"{max_inline}\"");
+        let insert_at = maximum_known_fields.len() - 2;
+        maximum_known_fields.insert_str(insert_at, &inline_field);
+        assert!(
+            maximum_known_fields.len() <= manifest_response_body_limit(1).unwrap(),
+            "all maximum known fields fit the one-manifest response budget"
+        );
+        let decoded = decode_manifest_response(maximum_known_fields.as_bytes(), 1)
+            .expect("maximum independently accepted receipt and inline fields remain decodable");
+        assert_eq!(decoded[0].chunks.len(), MAX_SYNC_BLOB_CHUNKS);
+        assert_eq!(
+            decoded[0].inline_bytes_base64.as_ref().unwrap().len(),
+            max_inline.len()
+        );
+
+        let error =
+            decode_manifest_response(&manifest_response_with_chunks(MAX_SYNC_BLOB_CHUNKS + 1), 1)
+                .expect_err("the first receipt above the schema limit must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("at most 16384 sync blob chunks"));
+    }
+
+    #[test]
+    fn bounded_manifest_response_checks_string_lengths_before_owning_them() {
+        let valid_chunk_id = "a".repeat(MAX_SYNC_BLOB_ID_BYTES);
+        let valid = format!(
+            r#"[{{"blobId":"{}","sizeBytes":1,"chunks":[{{"chunkId":"{valid_chunk_id}","sizeBytes":1}}]}}]"#,
+            "b".repeat(MAX_SYNC_BLOB_ID_BYTES)
+        );
+        assert_eq!(
+            decode_manifest_response(valid.as_bytes(), 1)
+                .expect("64-byte wire identities are accepted")[0]
+                .chunks[0]
+                .chunk_id
+                .len(),
+            MAX_SYNC_BLOB_ID_BYTES
+        );
+
+        let invalid = format!(
+            r#"[{{"blobId":"{}","sizeBytes":1,"chunks":[{{"chunkId":"{}","sizeBytes":1}}]}}]"#,
+            "b".repeat(MAX_SYNC_BLOB_ID_BYTES),
+            "a".repeat(MAX_SYNC_BLOB_ID_BYTES + 1),
+        );
+        let error = decode_manifest_response(invalid.as_bytes(), 1)
+            .expect_err("oversized chunk identities must be rejected during decoding");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("64 byte limit"));
+
+        let max_inline =
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_INLINE_SYNC_BLOB_BYTES]);
+        let inline_wire = format!(
+            r#"[{{"blobId":"{}","sizeBytes":0,"chunks":[],"inlineBytesBase64":"{max_inline}"}}]"#,
+            "c".repeat(MAX_SYNC_BLOB_ID_BYTES),
+        );
+        assert_eq!(
+            decode_manifest_response(inline_wire.as_bytes(), 1)
+                .expect("the existing 256 KiB decoded inline limit remains accepted")[0]
+                .inline_bytes_base64
+                .as_ref()
+                .expect("inline value should survive bounded decoding")
+                .len(),
+            max_inline.len()
+        );
+
+        let oversized_inline = "A".repeat(MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 + 1);
+        let inline_wire = format!(
+            r#"[{{"blobId":"{}","sizeBytes":0,"chunks":[],"inlineBytesBase64":"{oversized_inline}"}}]"#,
+            "c".repeat(MAX_SYNC_BLOB_ID_BYTES),
+        );
+        let error = decode_manifest_response(inline_wire.as_bytes(), 1)
+            .expect_err("inline strings above the existing encoded cap must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("349528 byte limit"));
+    }
+
+    #[test]
+    fn bounded_pull_response_caps_events_and_inline_manifest_shape() {
+        let minimum_inline = SyncBlobManifest {
+            blob_id: "0".repeat(64),
+            size_bytes: 0,
+            chunks: Vec::new(),
+            inline_bytes_base64: Some(String::new()),
+        };
+        assert_eq!(
+            serde_json::to_vec(&minimum_inline).unwrap().len(),
+            MIN_INLINE_MANIFEST_JSON_BYTES,
+            "the response-derived manifest count uses the accepted wire minimum"
+        );
+
+        let empty_event = r#"{"cursor":1,"commits":[],"refUpdates":[],"inlineBlobs":[]}"#;
+        let maximum = format!(
+            r#"{{"kind":"delta","cursor":512,"events":[{}]}}"#,
+            std::iter::repeat(empty_event)
+                .take(crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let decoded =
+            decode_pull_response(&maximum.into_bytes(), crate::sync::MAX_SYNC_REQUEST_ITEMS)
+                .expect("the requested maximum delta page remains accepted");
+        let crate::sync::SyncRepositoryPullResponse::Delta { events, .. } = decoded else {
+            panic!("expected a delta response")
+        };
+        assert_eq!(events.len(), crate::sync::MAX_SYNC_REQUEST_ITEMS);
+
+        let one_event = format!("[{empty_event}]");
+        let response = format!(r#"{{"kind":"delta","cursor":1,"events":{one_event}}}"#);
+        let too_many_events =
+            response.replace(&one_event, &format!("[{empty_event},{empty_event}]"));
+        let error = decode_pull_response(too_many_events.as_bytes(), 1)
+            .expect_err("a pull cannot return more events than its requested limit");
+        assert!(error.message.contains("requested event count"));
+
+        let chunk = format!(r#"{{"chunkId":"{}","sizeBytes":1}}"#, "1".repeat(64));
+        let too_many_chunks = format!(
+            r#"{{"kind":"delta","cursor":1,"events":[{{"cursor":1,"commits":[],"refUpdates":[],"inlineBlobs":[{{"blobId":"{}","sizeBytes":2,"chunks":[{chunk},{chunk}],"inlineBytesBase64":"AQI="}}]}}]}}"#,
+            "0".repeat(64),
+        );
+        let error = decode_pull_response(too_many_chunks.as_bytes(), 1)
+            .expect_err("inline manifests use the server's one-receipt lane");
+        assert!(error.message.contains("at most 1 sync blob chunks"));
+
+        let max_inline =
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_INLINE_SYNC_BLOB_BYTES]);
+        let maximum_inline = format!(
+            r#"{{"kind":"delta","cursor":1,"events":[{{"cursor":1,"commits":[],"refUpdates":[],"inlineBlobs":[{{"blobId":"{}","sizeBytes":{},"chunks":[],"inlineBytesBase64":"{max_inline}"}}]}}]}}"#,
+            "0".repeat(64),
+            MAX_INLINE_SYNC_BLOB_BYTES,
+        );
+        decode_pull_response(maximum_inline.as_bytes(), 1)
+            .expect("the existing 256 KiB inline payload acceptance remains intact");
+    }
+
+    #[test]
+    fn bounded_pull_response_preserves_large_atomic_ref_update_event() {
+        let ref_updates = (0..513)
+            .map(|index| crate::sync::protocol::SyncRefUpdate {
+                branch_id: format!("01920000-0000-7000-8000-{index:012x}"),
+                author_id: Some(crate::ANONYMOUS_ACCOUNT_ID.to_owned()),
+                ref_change_id: Some(format!("01920000-0000-7001-8000-{index:012x}")),
+                expected_ref_change_id: None,
+                expected_head_commit_id: None,
+                expected_checkpoint_commit_id: None,
+                head_commit_id: Some("01920000-0000-7002-8000-000000000001".to_owned()),
+                checkpoint_commit_id: Some("01920000-0000-7002-8000-000000000001".to_owned()),
+            })
+            .collect();
+        let response = crate::sync::SyncRepositoryPullResponse::Delta {
+            cursor: 1,
+            events: vec![crate::sync::SyncEvent {
+                cursor: 1,
+                commits: Vec::new(),
+                ref_updates,
+                inline_blobs: Vec::new(),
+            }],
+        };
+        let wire = serde_json::to_vec(&response).expect("encode valid 513-ref event");
+
+        let decoded = decode_pull_response(&wire, 1)
+            .expect("one atomic event may contain more than 512 ref updates");
+        let crate::sync::SyncRepositoryPullResponse::Delta { events, .. } = decoded else {
+            panic!("expected a delta response")
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ref_updates.len(), 513);
+        assert!(events[0].ref_updates.iter().all(|update| {
+            update.branch_id.starts_with("01920000-0000-7000-8000-")
+                && update
+                    .ref_change_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("01920000-0000-7001-8000-"))
+        }));
     }
 
     #[tokio::test]
