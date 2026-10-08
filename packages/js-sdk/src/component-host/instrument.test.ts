@@ -48,6 +48,62 @@ test("interrupts recursive calls without loops", () => {
   expect(ticks).toBe(10);
 });
 
+test.each([
+  [
+    "an if with an omitted false child",
+    `(module
+      (func (export "run")
+        (if (i32.const 1)
+          (then (drop (loop $forever (result i32) (br $forever)))))))`,
+  ],
+  [
+    "a call_indirect target",
+    `(module
+      (type $sig (func (result i32)))
+      (table 1 funcref)
+      (func $callee (type $sig) (i32.const 7))
+      (elem (i32.const 0) $callee)
+      (func (export "run") (result i32)
+        (call_indirect (type $sig)
+          (loop $forever (result i32) (br $forever)))))`,
+  ],
+  [
+    "a call_indirect operand",
+    `(module
+      (type $sig (func (param i32) (result i32)))
+      (table 1 funcref)
+      (func $callee (type $sig) (param i32) (result i32) (local.get 0))
+      (elem (i32.const 0) $callee)
+      (func (export "run") (result i32)
+        (call_indirect (type $sig)
+          (loop $forever (result i32) (br $forever))
+          (i32.const 0))))`,
+  ],
+  [
+    "a memory.copy source",
+    `(module
+      (memory 1)
+      (func (export "run") (result i32)
+        (memory.copy (i32.const 0)
+          (loop $forever (result i32) (br $forever))
+          (i32.const 0))
+        (i32.const 0)))`,
+  ],
+])("instruments nested loops under %s", (_case, wat) => {
+  const module = compile(wat);
+  let ticks = 0;
+  const instance = new WebAssembly.Instance(module, {
+    [TICK_MODULE]: {
+      tick() {
+        if (++ticks === 2) throw new Error("deadline");
+      },
+    },
+  });
+
+  expect(() => (instance.exports.run as Function)()).toThrow("deadline");
+  expect(ticks).toBe(2);
+});
+
 test("caps memory.grow even when the guest declares no maximum", () => {
   const module = compile(
     '(module (memory (export "memory") 1) (func (export "grow") (result i32) (memory.grow (i32.const 1))))',
@@ -110,4 +166,20 @@ test("caps table.grow to the native host table element limit", () => {
   });
   expect((instance.exports.grow as Function)()).toBe(-1);
   expect((instance.exports.table as WebAssembly.Table).length).toBe(1);
+});
+
+test("rejects SIMD instructions outside the supported core ISA", () => {
+  const module = binaryen.parseText("(module)");
+  try {
+    module.setFeatures(binaryen.Features.All);
+    const vector = module.i32x4.splat(module.local.get(0, binaryen.i32));
+    const lane = module.i32x4.extract_lane(vector, 0);
+    module.addFunction("unsupported_simd", binaryen.i32, binaryen.i32, [], lane);
+
+    expect(() => instrumentCore(module.emitBinary(), 65536)).toThrow(
+      "Unsupported component instruction",
+    );
+  } finally {
+    module.dispose();
+  }
 });
