@@ -78,3 +78,30 @@ for (const status of [204, 205, 304]) {
     }
   });
 }
+
+for (const reasonName of ["TimeoutError", "AbortError"] as const) {
+  test(`${reasonName} during a response body retains its retry policy`, async () => {
+    for (const native of [false, true]) {
+      const controller = new AbortController();
+      let pulling!: () => void;
+      const ready = new Promise<void>(resolve => { pulling = resolve; });
+      const fetcher = async () => new Response(new ReadableStream({
+        pull(stream) {
+          pulling();
+          controller.signal.addEventListener("abort", () => stream.error(controller.signal.reason), {once: true});
+          return new Promise<void>(() => {});
+        },
+      }));
+      if (native) vi.stubGlobal("fetch", fetcher);
+      try {
+        const response = fetchTransport(native ? undefined : fetcher)({...request, init: {signal: controller.signal}});
+        const checked = expect(response).rejects.toMatchObject({
+          code: reasonName === "TimeoutError" ? "LIX_TRANSPORT_NETWORK" : "LIX_TRANSPORT_ABORTED",
+        });
+        await ready;
+        controller.abort(new DOMException("private reason", reasonName));
+        await checked;
+      } finally {vi.unstubAllGlobals();}
+    }
+  });
+}

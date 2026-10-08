@@ -1,0 +1,47 @@
+{
+  "columns": [
+    {
+      "name": "value",
+      "type": "jsonb"
+    }
+  ],
+  "rows": [
+    [
+      {
+        "kind": "jsonb",
+        "value": {
+          "generation": "a23b0eb70e4b9b009c497f0ec01256375248bee44351ead6438e228333913488",
+          "plugin_count": 1,
+          "plugins": [
+            {
+              "api_version": "2",
+              "archive_blob_hash": "4057b2e0f00fb4152028b88ea5bcdafdbcb597cc43eeb3094c0f706bbf8f007a",
+              "archive_file_id": "6367bef9-a1a4-5d97-89be-c8dbc017eb3f",
+              "archive_path": "/.lix/plugins/plugin_markdown.lixplugin",
+              "capabilities": {
+                "column_merger": true,
+                "file_projection": true
+              },
+              "content": "text",
+              "create_schema_keys": [
+                "markdown_node"
+              ],
+              "entry": "plugin.wasm",
+              "key": "plugin_markdown",
+              "manifest_json": "{\"entry\":\"plugin.wasm\",\"file_match\":{\"case_insensitive\":true,\"content\":\"text\",\"path_glob\":\"*.{md,markdown}\"},\"key\":\"plugin_markdown\",\"schemas\":[\"schema/markdown_node.json\"]}",
+              "path_glob": "*.{md,markdown}",
+              "runtime": "wasm-component",
+              "schema_keys": [
+                "markdown_node"
+              ],
+              "wasm_blob_hash": "7e01ac40a06cdeda8f375136fa68adaaeb9e8a8549f0b5c9dad04a22bed770a3"
+            }
+          ],
+          "version": 6
+        }
+      }
+    ]
+  ],
+  "rowsAffected": 0,
+  "notices": []
+}

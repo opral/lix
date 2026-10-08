@@ -1,54 +1,306 @@
 import binaryen from "binaryen";
+import { TICK_MODULE } from "./instrument-helpers.js";
+export { coreMemoryCount, coreTableCount, TICK_MODULE } from "./instrument-helpers.js";
 
-export const TICK_MODULE = "lix:runtime/deadline";
+type ExpressionRef = binaryen.ExpressionRef;
 
-/** Fields containing child expressions for the supported, non-GC core ISA. */
-const fields: Record<string, string[]> = {
-  Block: ["children"],
-  If: ["condition", "ifTrue", "ifFalse"],
-  Loop: ["body"],
-  Break: ["condition", "value"],
-  Switch: ["condition", "value"],
-  Call: ["operands"],
-  CallIndirect: ["target", "operands"],
-  LocalGet: [],
-  LocalSet: ["value"],
-  GlobalGet: [],
-  GlobalSet: ["value"],
-  TableGet: ["index"],
-  TableSet: ["index", "value"],
-  TableSize: [],
-  TableGrow: ["value", "delta"],
-  Load: ["ptr"],
-  Store: ["ptr", "value"],
-  Const: [],
-  Unary: ["value"],
-  Binary: ["left", "right"],
-  Select: ["ifTrue", "ifFalse", "condition"],
-  Drop: ["value"],
-  Return: ["value"],
-  Nop: [],
-  Unreachable: [],
-  MemorySize: [],
-  MemoryGrow: ["delta"],
-  MemoryInit: ["dest", "offset", "size"],
-  DataDrop: [],
-  MemoryCopy: ["dest", "source", "size"],
-  MemoryFill: ["dest", "value", "size"],
-  RefNull: [],
-  RefFunc: [],
-  RefIs: ["value"],
-  RefAs: ["value"],
-  RefEq: ["left", "right"],
-  TupleMake: ["operands"],
-  TupleExtract: ["tuple"],
+/**
+ * Binaryen 130 exposes these typed expression getters at runtime but omits
+ * them from its TypeScript declarations. Keep the cast narrow so changes to
+ * the visitor remain checked against the getter surface we actually use.
+ */
+type BinaryenChildGetters = {
+  Block: {
+    getNumChildren(expression: ExpressionRef): number;
+    getChildAt(expression: ExpressionRef, index: number): ExpressionRef;
+  };
+  If: {
+    getCondition(expression: ExpressionRef): ExpressionRef;
+    getIfTrue(expression: ExpressionRef): ExpressionRef;
+    getIfFalse(expression: ExpressionRef): ExpressionRef;
+  };
+  Break: {
+    getCondition(expression: ExpressionRef): ExpressionRef;
+    getValue(expression: ExpressionRef): ExpressionRef;
+  };
+  Switch: {
+    getCondition(expression: ExpressionRef): ExpressionRef;
+    getValue(expression: ExpressionRef): ExpressionRef;
+  };
+  Call: {
+    getNumOperands(expression: ExpressionRef): number;
+    getOperandAt(expression: ExpressionRef, index: number): ExpressionRef;
+  };
+  CallIndirect: {
+    getTarget(expression: ExpressionRef): ExpressionRef;
+    getNumOperands(expression: ExpressionRef): number;
+    getOperandAt(expression: ExpressionRef, index: number): ExpressionRef;
+  };
+  LocalSet: { getValue(expression: ExpressionRef): ExpressionRef };
+  GlobalSet: { getValue(expression: ExpressionRef): ExpressionRef };
+  TableGet: { getIndex(expression: ExpressionRef): ExpressionRef };
+  TableSet: {
+    getIndex(expression: ExpressionRef): ExpressionRef;
+    getValue(expression: ExpressionRef): ExpressionRef;
+  };
+  TableGrow: {
+    getValue(expression: ExpressionRef): ExpressionRef;
+    getDelta(expression: ExpressionRef): ExpressionRef;
+  };
+  Load: { getPtr(expression: ExpressionRef): ExpressionRef };
+  Store: {
+    getPtr(expression: ExpressionRef): ExpressionRef;
+    getValue(expression: ExpressionRef): ExpressionRef;
+  };
+  Unary: { getValue(expression: ExpressionRef): ExpressionRef };
+  Binary: {
+    getLeft(expression: ExpressionRef): ExpressionRef;
+    getRight(expression: ExpressionRef): ExpressionRef;
+  };
+  Select: {
+    getIfTrue(expression: ExpressionRef): ExpressionRef;
+    getIfFalse(expression: ExpressionRef): ExpressionRef;
+    getCondition(expression: ExpressionRef): ExpressionRef;
+  };
+  Drop: { getValue(expression: ExpressionRef): ExpressionRef };
+  Return: { getValue(expression: ExpressionRef): ExpressionRef };
+  Loop: { getBody(expression: ExpressionRef): ExpressionRef };
+  MemoryGrow: { getDelta(expression: ExpressionRef): ExpressionRef };
+  MemoryInit: {
+    getDest(expression: ExpressionRef): ExpressionRef;
+    getOffset(expression: ExpressionRef): ExpressionRef;
+    getSize(expression: ExpressionRef): ExpressionRef;
+  };
+  MemoryCopy: {
+    getDest(expression: ExpressionRef): ExpressionRef;
+    getSource(expression: ExpressionRef): ExpressionRef;
+    getSize(expression: ExpressionRef): ExpressionRef;
+  };
+  MemoryFill: {
+    getDest(expression: ExpressionRef): ExpressionRef;
+    getValue(expression: ExpressionRef): ExpressionRef;
+    getSize(expression: ExpressionRef): ExpressionRef;
+  };
+  RefAs: { getValue(expression: ExpressionRef): ExpressionRef };
+  RefEq: {
+    getLeft(expression: ExpressionRef): ExpressionRef;
+    getRight(expression: ExpressionRef): ExpressionRef;
+  };
+  TupleMake: {
+    getNumOperands(expression: ExpressionRef): number;
+    getOperandAt(expression: ExpressionRef, index: number): ExpressionRef;
+  };
+  TupleExtract: { getTuple(expression: ExpressionRef): ExpressionRef };
 };
-const childFields = new Map<number, string[]>(
-  Object.entries(fields).map(([name, keys]) => [
-    (binaryen as any)[`${name}Id`],
-    keys,
-  ]),
-);
+
+const expressionApi = binaryen as unknown as BinaryenChildGetters;
+
+/**
+ * Visit child expressions with Binaryen's typed getters. `getExpressionInfo`
+ * builds a metadata object for every visited node and materializes strings for
+ * labels/names that instrumentation never uses. A component can contain
+ * hundreds of thousands of expressions, so avoid that per-expression
+ * metadata allocation.
+ */
+function appendExpressionChildren(
+  expressionId: number,
+  expression: number,
+  pending: number[],
+): void {
+  switch (expressionId) {
+    case binaryen.BlockId: {
+      const count = expressionApi.Block.getNumChildren(expression);
+      for (let index = 0; index < count; index++) {
+        const child = expressionApi.Block.getChildAt(expression, index);
+        if (child) pending.push(child);
+      }
+      return;
+    }
+    case binaryen.IfId: {
+      const condition = expressionApi.If.getCondition(expression);
+      const ifTrue = expressionApi.If.getIfTrue(expression);
+      const ifFalse = expressionApi.If.getIfFalse(expression);
+      if (condition) pending.push(condition);
+      if (ifTrue) pending.push(ifTrue);
+      if (ifFalse) pending.push(ifFalse);
+      return;
+    }
+    case binaryen.BreakId: {
+      const condition = expressionApi.Break.getCondition(expression);
+      const value = expressionApi.Break.getValue(expression);
+      if (condition) pending.push(condition);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.SwitchId: {
+      const condition = expressionApi.Switch.getCondition(expression);
+      const value = expressionApi.Switch.getValue(expression);
+      if (condition) pending.push(condition);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.CallId: {
+      const count = expressionApi.Call.getNumOperands(expression);
+      for (let index = 0; index < count; index++) {
+        const operand = expressionApi.Call.getOperandAt(expression, index);
+        if (operand) pending.push(operand);
+      }
+      return;
+    }
+    case binaryen.CallIndirectId: {
+      const target = expressionApi.CallIndirect.getTarget(expression);
+      if (target) pending.push(target);
+      const count = expressionApi.CallIndirect.getNumOperands(expression);
+      for (let index = 0; index < count; index++) {
+        const operand = expressionApi.CallIndirect.getOperandAt(expression, index);
+        if (operand) pending.push(operand);
+      }
+      return;
+    }
+    case binaryen.LocalSetId: {
+      const value = expressionApi.LocalSet.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.GlobalSetId: {
+      const value = expressionApi.GlobalSet.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.TableGetId: {
+      const index = expressionApi.TableGet.getIndex(expression);
+      if (index) pending.push(index);
+      return;
+    }
+    case binaryen.TableSetId: {
+      const index = expressionApi.TableSet.getIndex(expression);
+      const value = expressionApi.TableSet.getValue(expression);
+      if (index) pending.push(index);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.TableGrowId: {
+      const value = expressionApi.TableGrow.getValue(expression);
+      const delta = expressionApi.TableGrow.getDelta(expression);
+      if (value) pending.push(value);
+      if (delta) pending.push(delta);
+      return;
+    }
+    case binaryen.LoadId: {
+      const ptr = expressionApi.Load.getPtr(expression);
+      if (ptr) pending.push(ptr);
+      return;
+    }
+    case binaryen.StoreId: {
+      const ptr = expressionApi.Store.getPtr(expression);
+      const value = expressionApi.Store.getValue(expression);
+      if (ptr) pending.push(ptr);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.UnaryId: {
+      const value = expressionApi.Unary.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.BinaryId: {
+      const left = expressionApi.Binary.getLeft(expression);
+      const right = expressionApi.Binary.getRight(expression);
+      if (left) pending.push(left);
+      if (right) pending.push(right);
+      return;
+    }
+    case binaryen.SelectId: {
+      const ifTrue = expressionApi.Select.getIfTrue(expression);
+      const ifFalse = expressionApi.Select.getIfFalse(expression);
+      const condition = expressionApi.Select.getCondition(expression);
+      if (ifTrue) pending.push(ifTrue);
+      if (ifFalse) pending.push(ifFalse);
+      if (condition) pending.push(condition);
+      return;
+    }
+    case binaryen.DropId: {
+      const value = expressionApi.Drop.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.ReturnId: {
+      const value = expressionApi.Return.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.MemoryGrowId: {
+      const delta = expressionApi.MemoryGrow.getDelta(expression);
+      if (delta) pending.push(delta);
+      return;
+    }
+    case binaryen.MemoryInitId: {
+      const dest = expressionApi.MemoryInit.getDest(expression);
+      const offset = expressionApi.MemoryInit.getOffset(expression);
+      const size = expressionApi.MemoryInit.getSize(expression);
+      if (dest) pending.push(dest);
+      if (offset) pending.push(offset);
+      if (size) pending.push(size);
+      return;
+    }
+    case binaryen.MemoryCopyId: {
+      const dest = expressionApi.MemoryCopy.getDest(expression);
+      const source = expressionApi.MemoryCopy.getSource(expression);
+      const size = expressionApi.MemoryCopy.getSize(expression);
+      if (dest) pending.push(dest);
+      if (source) pending.push(source);
+      if (size) pending.push(size);
+      return;
+    }
+    case binaryen.MemoryFillId: {
+      const dest = expressionApi.MemoryFill.getDest(expression);
+      const value = expressionApi.MemoryFill.getValue(expression);
+      const size = expressionApi.MemoryFill.getSize(expression);
+      if (dest) pending.push(dest);
+      if (value) pending.push(value);
+      if (size) pending.push(size);
+      return;
+    }
+    case binaryen.RefAsId: {
+      const value = expressionApi.RefAs.getValue(expression);
+      if (value) pending.push(value);
+      return;
+    }
+    case binaryen.RefEqId: {
+      const left = expressionApi.RefEq.getLeft(expression);
+      const right = expressionApi.RefEq.getRight(expression);
+      if (left) pending.push(left);
+      if (right) pending.push(right);
+      return;
+    }
+    case binaryen.TupleMakeId: {
+      const count = expressionApi.TupleMake.getNumOperands(expression);
+      for (let index = 0; index < count; index++) {
+        const operand = expressionApi.TupleMake.getOperandAt(expression, index);
+        if (operand) pending.push(operand);
+      }
+      return;
+    }
+    case binaryen.TupleExtractId: {
+      const tuple = expressionApi.TupleExtract.getTuple(expression);
+      if (tuple) pending.push(tuple);
+      return;
+    }
+    case binaryen.LocalGetId:
+    case binaryen.GlobalGetId:
+    case binaryen.TableSizeId:
+    case binaryen.ConstId:
+    case binaryen.NopId:
+    case binaryen.UnreachableId:
+    case binaryen.MemorySizeId:
+    case binaryen.DataDropId:
+    case binaryen.RefNullId:
+    case binaryen.RefFuncId:
+      return;
+    default:
+      throw new Error(`Unsupported component instruction ${expressionId}`);
+  }
+}
 
 /** Add checks on every cycle (function/loop entry) and cap memory before compilation. */
 export function instrumentCore(
@@ -96,29 +348,19 @@ export function instrumentCore(
       while (pending.length) {
         const expression = pending.pop()!;
         const expressionId = binaryen.getExpressionId(expression);
-        if (!childFields.has(expressionId))
-          throw new Error(`Unsupported component instruction ${expressionId}`);
-        if (childFields.get(expressionId)!.length === 0) continue;
-        const info = binaryen.getExpressionInfo(
-          expression,
-        ) as unknown as Record<string, any>;
-        const keys = childFields.get(info.id);
-        if (!keys)
-          throw new Error(`Unsupported component instruction ${info.id}`);
-        for (const key of keys) {
-          const value = info[key];
-          if (Array.isArray(value)) pending.push(...value.filter(Boolean));
-          else if (value) pending.push(value);
-        }
-        if (info.id === binaryen.LoopId) {
+        if (expressionId === binaryen.LoopId) {
+          const loopBody = expressionApi.Loop.getBody(expression);
+          if (loopBody) pending.push(loopBody);
           (binaryen as any)._BinaryenLoopSetBody(
             expression,
             module.block(
               null,
-              [check(), info.body],
-              binaryen.getExpressionType(info.body),
+              [check(), loopBody],
+              binaryen.getExpressionType(loopBody),
             ),
           );
+        } else {
+          appendExpressionChildren(expressionId, expression, pending);
         }
       }
       (binaryen as any)._BinaryenFunctionSetBody(
@@ -258,32 +500,4 @@ function exposeMemory(bytes: Uint8Array, hasMemory: boolean): Uint8Array {
   result.set(bytes);
   result.set([7, ...encode(payload.length), ...payload], bytes.length);
   return result;
-}
-
-/** Count defined memories to apportion the component's aggregate ceiling. */
-export function coreMemoryCount(bytes: Uint8Array): number {
-  return coreSectionCount(bytes, 5);
-}
-export function coreTableCount(bytes: Uint8Array): number {
-  return coreSectionCount(bytes, 4);
-}
-function coreSectionCount(bytes: Uint8Array, section: number): number {
-  let offset = 8;
-  const read = () => {
-    let value = 0;
-    for (let shift = 0; shift < 35; shift += 7) {
-      const byte = bytes[offset++];
-      if (byte === undefined) throw new Error("Truncated Wasm integer");
-      value += (byte & 127) * 2 ** shift;
-      if (!(byte & 128)) return value;
-    }
-    throw new Error("Invalid Wasm integer");
-  };
-  while (offset < bytes.length) {
-    const id = bytes[offset++];
-    const size = read();
-    if (id === section) return read();
-    offset += size;
-  }
-  return 0;
 }

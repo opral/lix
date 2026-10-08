@@ -116,6 +116,7 @@ fn admission_bytes(
                 .checked_add(row.file_id().map_or(0, str::len))?
                 .checked_add(row.row_pk().estimated_heap_bytes())?
                 .checked_add(row.snapshot_content().map_or(0, |value| value.len()))?
+                .checked_add(row.raw_snapshot().map_or(0, |value| value.len()))?
                 .checked_add(row.metadata().map_or(0, |value| value.len()))?;
             if let Some(typed) = row.decoded_snapshot() {
                 bytes = bytes

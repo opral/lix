@@ -55,6 +55,7 @@ pub(crate) const READ_TABLE_FUNCTION_NAMES: &[&str] = &[
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
+    exact_id_file_content_interest, lix_file_content_scan_request,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
     execute_exact_lix_file_read, execute_exact_lix_file_root_listing,
     execute_exact_lix_file_size_batch_read,

@@ -9,6 +9,7 @@ import type {
 	LixStorageProvider,
 	LixStorageRead,
 	LixStorageReadOptions,
+	LixStorageReadBudget,
 	LixStorageScanOrder,
 	LixStorageScanSource,
 	LixStorageSpace,
@@ -250,13 +251,42 @@ export class OpfsStorageClient implements LixStorageProvider {
 		generation: number,
 		ownerEpoch: string,
 		sessionToken?: string,
+		budget?: LixStorageReadBudget,
 	) {
 		this.#assertSession(sessionToken);
 		return this.#rpc(
 			"readMany",
-			{ requests, generation, ownerEpoch, sessionToken },
+			{ requests, generation, ownerEpoch, sessionToken, budget },
 			true,
 		) as Promise<Array<LixStorageProjectedValue | null>>;
+	}
+
+	readManyPrefix(
+		requests: LixStorageGetManyRequest[],
+		generation: number,
+		ownerEpoch: string,
+		sessionToken: string | undefined,
+		offset: number,
+		maxSlots: number,
+		budget: LixStorageReadBudget,
+	) {
+		this.#assertSession(sessionToken);
+		return this.#rpc(
+			"readManyPrefix",
+			{
+				requests,
+				generation,
+				ownerEpoch,
+				sessionToken,
+				offset,
+				maxSlots,
+				budget,
+			},
+			true,
+		) as Promise<{
+			values: Array<LixStorageProjectedValue | null>;
+			nextOffset: number | null;
+		}>;
 	}
 
 	scanPage(payload: OpfsScanPagePayload) {
@@ -393,6 +423,36 @@ class RemoteRead implements LixStorageRead {
 			this.sessionToken,
 		);
 	}
+	getManyBounded(
+		requests: LixStorageGetManyRequest[],
+		budget: LixStorageReadBudget,
+	) {
+		return this.client.readMany(
+			requests,
+			this.generation,
+			this.ownerEpoch,
+			this.sessionToken,
+			budget,
+		);
+	}
+
+	getManyBoundedPrefix(
+		requests: LixStorageGetManyRequest[],
+		offset: number,
+		maxSlots: number,
+		budget: LixStorageReadBudget,
+	) {
+		return this.client.readManyPrefix(
+			requests,
+			this.generation,
+			this.ownerEpoch,
+			this.sessionToken,
+			offset,
+			maxSlots,
+			budget,
+		);
+	}
+
 	beginScan(
 		space: LixStorageSpace,
 		range: LixStorageKeyRange,
@@ -429,6 +489,26 @@ class RemoteScan implements LixStorageScanSource {
 			order: LixStorageScanOrder;
 		},
 	) {}
+	nextPageBounded(limitRows: number, budget: LixStorageReadBudget) {
+		return this.client
+			.scanPage({
+				space: this.space,
+				range: this.range,
+				after: this.#after,
+				limit: limitRows,
+				order: this.options.order,
+				projection: this.options.projection,
+				generation: this.generation,
+				ownerEpoch: this.ownerEpoch,
+				sessionToken: this.sessionToken,
+				budget,
+			})
+			.then((page) => {
+				if (page.entries.length) this.#after = page.entries.at(-1)!.key;
+				return page;
+			});
+	}
+
 	nextPage(limitRows: number) {
 		return this.client
 			.scanPage({

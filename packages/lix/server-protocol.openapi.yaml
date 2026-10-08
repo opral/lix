@@ -641,6 +641,37 @@ paths:
           description: Missing chunks to upload, or confirmation that the blob is complete.
           content: { application/json: { schema: { $ref: "#/components/schemas/SyncBlobRegistration" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/blobs:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ReplicaId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
+    post:
+      operationId: syncRegisterBlobs
+      description: Registers a bounded group with at most 32 manifests and 1 MiB encoded or decoded inline payload. All members validate before durable admission.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 32
+              items: { $ref: "#/components/schemas/SyncBlobManifest" }
+      responses:
+        "200":
+          description: Ordered missing-chunk registrations; complete verified members are committed together.
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                maxItems: 32
+                items: { $ref: "#/components/schemas/SyncBlobRegistration" }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/chunk:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -976,7 +1007,7 @@ components:
       in: header
       required: true
       description: Exact SQL protocol version. Missing or incompatible versions are rejected before session creation or writes; upgrade the client.
-      schema: { type: integer, const: 9 }
+      schema: { type: integer, const: 12 }
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -1003,7 +1034,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 28 }
+      schema: { type: integer, const: 32 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1061,7 +1092,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 28 }
+        syncProtocolVersion: { type: integer, const: 32 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1433,6 +1464,7 @@ components:
         expiresAtMs: { type: integer, minimum: 1 }
     SyncPushRequest:
       type: object
+      description: The sync push endpoint accepts at most 512 combined commits and refUpdates; the per-array schema bounds below are not additive limits.
       required: [commits, refUpdates, inlineBlobs]
       properties:
         commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
@@ -1514,14 +1546,23 @@ components:
         continuation: { type: [string, "null"], maxLength: 4096 }
     SyncEvent:
       type: object
+      description: Commit and ref-update counts reflect atomic Authority transaction output. The 512-item sync push request limit does not cap these arrays; pull responses are bounded by the 64 MiB encoded response limit.
       required: [cursor, commits, refUpdates, inlineBlobs]
       properties:
         cursor: { type: integer, minimum: 1 }
-        commits: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncCommit" } }
-        refUpdates: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
+        commits: { type: array, items: { $ref: "#/components/schemas/SyncCommit" } }
+        refUpdates: { type: array, items: { $ref: "#/components/schemas/SyncRefUpdate" } }
         inlineBlobs:
+          description: Self-contained server-emitted blobs are at most 256 KiB and have at most one canonical chunk receipt; the aggregate pull response uses the 64 MiB response limit.
           type: array
-          items: { $ref: "#/components/schemas/SyncBlobManifest" }
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/SyncBlobManifest" }
+              - type: object
+                required: [inlineBytesBase64]
+                properties:
+                  sizeBytes: { type: integer, minimum: 0, maximum: 262144 }
+                  chunks: { type: array, maxItems: 1, items: { $ref: "#/components/schemas/SyncBlobChunk" } }
     SyncPullResponse:
       oneOf:
         - type: object
@@ -1567,12 +1608,19 @@ components:
     NativeMetadataWalkRequest:
       type: object
       additionalProperties: false
-      required: [epochId, anchor, maxCommits, includeStateHeaders]
+      required: [epochId, anchor, maxCommits, includeStateHeaders, selection, stops, minimumGeneration, requireStateHeader]
       properties:
         epochId: { type: string, format: uuid }
         anchor: { type: string, format: uuid }
         maxCommits: { type: integer, minimum: 1, maximum: 16 }
         includeStateHeaders: { type: boolean }
+        selection: { type: string, enum: [history, causal, incorporation, jumpSpine] }
+        stops:
+          type: array
+          maxItems: 2
+          items: { type: string, format: uuid }
+        minimumGeneration: { type: [integer, "null"], minimum: 0 }
+        requireStateHeader: { type: boolean }
     NativeMetadataResponse:
       type: object
       required: [lixId, epochId, objects]
@@ -1616,8 +1664,11 @@ components:
     ReadFulfillmentRequest:
       type: object
       additionalProperties: false
-      required: [epochId, descriptor, interests, required]
+      required: [operationId, release, operationExpiresAtMs, epochId, descriptor, interests, required, continuation]
       properties:
+        operationId: { type: string, format: uuid, description: Client-generated stable identity for one immutable read attempt and its retries. }
+        release: { type: boolean, description: Cancel this operation with a null continuation cursor. Successful operations retire when their terminal response is constructed; neither disposition grants coverage. }
+        operationExpiresAtMs: { type: integer, format: int64, minimum: 1, description: Fixed server-issued lease expiry captured when this operation is created. Retries and renewals cannot extend it. }
         epochId: { type: string, format: uuid }
         descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }
         interests:
@@ -1642,9 +1693,11 @@ components:
     ReadContinuation:
       type: object
       additionalProperties: false
-      required: [nextInput, closureDigest]
+      required: [nextInput, nextOffset, spoolId, closureDigest]
       properties:
-        nextInput: { type: integer, minimum: 1, maximum: 16383 }
+        nextInput: { type: integer, minimum: 0, maximum: 16383 }
+        nextOffset: { type: integer, minimum: 0, maximum: 67108863, description: Exact progress within a framed member; input zero requires a positive offset. }
+        spoolId: { type: string, format: uuid, description: Opaque sealed operation bound to account, repository, lease, epoch, descriptor roots and recipe digest. Expiry requires restarting the operation. }
         closureDigest: { type: string, minLength: 64, maxLength: 64 }
     LogicalReadInterest:
       type: object
@@ -1706,24 +1759,37 @@ components:
       required: [address, bytes]
       properties:
         address: { $ref: "#/components/schemas/ReadInputAddress" }
-        bytes: { type: string, format: byte, maxLength: 89478488, description: One typed native dependency, at most 64 MiB decoded. }
+        bytes: { type: string, format: byte, maxLength: 5592408, description: One complete typed native dependency, at most 4 MiB decoded; larger members use ReadInputFrame. }
+    ReadInputFrame:
+      type: object
+      additionalProperties: false
+      required: [address, totalBytes, offset, digest, bytes]
+      properties:
+        address: { $ref: "#/components/schemas/ReadInputAddress" }
+        totalBytes: { type: integer, minimum: 4194305, maximum: 67108864 }
+        offset: { type: integer, minimum: 0, maximum: 67108863 }
+        digest: { $ref: "#/components/schemas/NativeDigest" }
+        bytes: { type: string, format: byte, maxLength: 5592408, description: Nonempty range of at most 4 MiB decoded bytes. }
     DiscoveryProfile:
       type: object
       additionalProperties: false
-      required: [storageCalls, storageBytes, payloadBytes]
+      required: [storageCalls, storageKeys, peakProviderBytes, storageBytes, payloadBytes]
       properties:
+        storageKeys: { type: integer, minimum: 0, description: Observed physical key and row count. }
+        peakProviderBytes: { type: integer, minimum: 0, description: Largest materialized provider response in decoded bytes. }
         storageCalls: { type: integer, minimum: 0, description: Storage calls admitted by the work limit; a rejected next call is excluded. }
         storageBytes: { type: integer, minimum: 0, description: Observed storage bytes including a final input that crosses the work limit. }
         payloadBytes: { type: integer, minimum: 0 }
     ReadFulfillmentResponse:
       type: object
       additionalProperties: false
-      required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation, outcome]
+      required: [lixId, epochId, requestDigest, inputs, frame, profile, closureDigest, continuation, outcome]
       allOf:
         - if: { properties: { outcome: { enum: [native_fallback, operation_fallback] } } }
           then:
             properties:
               inputs: { type: array, maxItems: 0 }
+              frame: { type: "null" }
               continuation: { type: "null" }
       properties:
         lixId: { type: string, format: uuid }
@@ -1736,8 +1802,12 @@ components:
         inputs:
           type: array
           maxItems: 16384
-          description: One page of the typed dependency closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB unless it contains one 64 MiB input.
+          description: One page of the typed dependency closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB. A framed page has empty inputs; whole-member validation precedes publication.
           items: { $ref: "#/components/schemas/ReadInput" }
+        frame:
+          oneOf:
+            - { $ref: "#/components/schemas/ReadInputFrame" }
+            - { type: "null" }
         profile: { $ref: "#/components/schemas/DiscoveryProfile" }
         closureDigest: { type: string, minLength: 64, maxLength: 64 }
         continuation:
@@ -1909,7 +1979,7 @@ components:
           items: { $ref: "#/components/schemas/SyncBlobChunk" }
         inlineBytesBase64:
           type: string
-          maxLength: 87384
+          maxLength: 349528
     SyncBlobRegistration:
       type: object
       required: [missingChunkIds, complete]

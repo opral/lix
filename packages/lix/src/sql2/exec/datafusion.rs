@@ -499,8 +499,7 @@ fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
-        scan.source =
-            provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
+        scan.source = provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
         Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
     })
     .map(|transformed| transformed.data)
@@ -1221,16 +1220,15 @@ async fn try_execute_deferred_bound_row_returning(
     ) {
         return Ok(None);
     }
-    let Some((capture_plan, capture)) =
-        bound_returning_image_capture_plan(
-            session,
-            plan,
-            table_schema,
-            target_name,
-            returning,
-            params,
-        )
-            .await?
+    let Some((capture_plan, capture)) = bound_returning_image_capture_plan(
+        session,
+        plan,
+        table_schema,
+        target_name,
+        returning,
+        params,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1519,8 +1517,7 @@ async fn execute_datafusion_write_logical_plan_inner(
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
             let input =
-                insert_input_plan(&session, Arc::clone(&table_schema), plan, params)
-                    .await?;
+                insert_input_plan(&session, Arc::clone(&table_schema), plan, params).await?;
             if plan.bound.branch_scope == BranchScope::Empty {
                 return sql_write_empty_returning_result(
                     &session,
@@ -2873,7 +2870,8 @@ async fn datafusion_plan_from_sql_with_params(
 ) -> Result<(LogicalPlan, usize), LixError> {
     let mut statement = crate::sql2::parse::parse_statement(sql)?;
     bind_table_function_parameters(&mut statement, params)?;
-    let parameter_count = expected_positional_parameter_count(&statement_parameter_names(&statement)?)?;
+    let parameter_count =
+        expected_positional_parameter_count(&statement_parameter_names(&statement)?)?;
     let plan = create_logical_plan_from_statement(session, statement, params).await?;
     Ok((plan, parameter_count))
 }
@@ -3053,14 +3051,12 @@ async fn deferred_returning_image_columns(
     for name in optimized_returning_source_columns(&plan, &input_table_name)? {
         if table_schema.field_with_name(&name).is_ok() {
             images.insert(default_image, name);
-        } else if let Some((column, _)) = old_aliases
-            .iter()
-            .find(|(_, alias)| alias.as_str() == name)
+        } else if let Some((column, _)) =
+            old_aliases.iter().find(|(_, alias)| alias.as_str() == name)
         {
             images.insert(ReturningImage::Old, column.clone());
-        } else if let Some((column, _)) = new_aliases
-            .iter()
-            .find(|(_, alias)| alias.as_str() == name)
+        } else if let Some((column, _)) =
+            new_aliases.iter().find(|(_, alias)| alias.as_str() == name)
         {
             images.insert(ReturningImage::New, column.clone());
         }
@@ -3819,7 +3815,14 @@ fn scalar_from_bound_literal(literal: &BoundLiteral) -> Result<ScalarValue, LixE
             |value| ScalarValue::UInt64(Some(value)),
         ),
         BoundLiteral::Text(value) => ScalarValue::Utf8(Some(value.clone())),
-        BoundLiteral::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
+        BoundLiteral::Json(value) => ScalarValue::Utf8(Some(
+            crate::sql2::udfs::common::jsonb_equality_key_value(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("invalid JSONB SQL equality key: {error}"),
+                )
+            })?,
+        )),
     })
 }
 
@@ -4704,10 +4707,8 @@ where
 
 fn text_value(value: &str, kind: TextKind) -> Value {
     match kind {
-        // The write boundary canonicalizes every JSON payload before it reaches
-        // storage, and the projection decoder copies those bytes into Arrow
-        // verbatim. Re-parsing here only rebuilt a DOM that was immediately
-        // re-serialized, so the bytes are retained directly instead.
+        // JSONB values entering SQL use the exact numeric equality-key form;
+        // retaining it here avoids rebuilding a DOM at the result boundary.
         TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
         TextKind::RowRef => Value::RowRef(crate::RowRef(value.to_owned())),
         TextKind::Text => Value::Text(value.to_owned()),

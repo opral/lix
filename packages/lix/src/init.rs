@@ -122,9 +122,11 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// this format cannot decode the new packed value tail.
 /// v86 adds epoch-scoped negative coverage for native checkpoint conversation
 /// metadata. No packed history row changes arity.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 86;
+/// v87 admits private, expiring read-operation staging outside semantic snapshots.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 87;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v86";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v87";
+pub(crate) const REPOSITORY_PROTOCOL_V86: &[u8] = b"tracked-default-branch.v86";
 pub(crate) const REPOSITORY_PROTOCOL_V85: &[u8] = b"tracked-default-branch.v85";
 pub(crate) const REPOSITORY_PROTOCOL_V84: &[u8] = b"tracked-default-branch.v84";
 pub(crate) const REPOSITORY_PROTOCOL_V83: &[u8] = b"tracked-default-branch.v83";
@@ -135,6 +137,8 @@ pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v87-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V86: &[u8] =
     b"tracked-default-branch.v86-partial-replica.v1";
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V85: &[u8] =
     b"tracked-default-branch.v85-partial-replica.v1";
@@ -1688,11 +1692,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v86"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 86 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v87"),
-            RepositoryProtocolStatus::TooNew { found_version: 87 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v88"),
+            RepositoryProtocolStatus::TooNew { found_version: 88 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

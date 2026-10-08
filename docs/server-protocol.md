@@ -29,7 +29,7 @@ The `lix` crate contains a reusable Rust handler and this repository ships a [re
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                                                                                                                                                                                                                                                                                      |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                                                                                                                                                                                                                                                                                    |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`                                                                                                                                                                                                                                                                                  |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,replica/replace,pull,history,checkpoints,descriptor,read-fulfillment,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}` |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,replica/replace,pull,history,checkpoints,descriptor,read-fulfillment,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,blobs,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}` |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`                                                                                                                                                                                                                                                                                       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                                                                                                                                                                                                                                                                                  |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                                                                                                                                                                                                                                                                                       |
@@ -53,7 +53,7 @@ These lifecycle operations are part of Lix interoperability, alongside SQL and s
 
 The protocol does not read bearer tokens, cookies, API keys, or certificates. It receives an already-trusted principal in process and never derives identity from request headers.
 
-Protocol requests except snapshot download require exactly one `lix-server-protocol-version: 11` header. Missing, duplicate, malformed, or older versions return `426 LIX_PROTOCOL_VERSION_MISMATCH` before opening a session or executing SQL. Clients must upgrade together with the checkpoint metadata and SQL API changes.
+Protocol requests except snapshot download require exactly one `lix-server-protocol-version: 12` header. Missing, duplicate, malformed, or older versions return `426 LIX_PROTOCOL_VERSION_MISMATCH` before opening a session or executing SQL. Clients must upgrade together with the checkpoint metadata and SQL API changes.
 
 On session creation it ensures the Lix account exists, pins the session to it, and scopes mutation idempotency to that principal. A session reused through a different principal returns `403`. Clients cannot select `activeAccountId` during the handshake.
 
@@ -93,7 +93,7 @@ Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected part
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are 64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 26` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. Version 25 added typed canonical change payloads to descriptor-scoped exact-row read-fulfillment closures. Version 26 requires the nullable `checkpointConversationId` member in commit bodies and headers and adds graph-bound native metadata envelopes that distinguish an explicit NULL from unavailable metadata. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
+All sync routes require exactly one `lix-sync-protocol-version: 32` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. Version 31 added client-known read operation identities, fixed lease validity, cursorless cancellation, and terminal-page retirement. Version 30 added sealed operation continuations, bounded within-member frames, and explicit read-operation release; version 29 added bounded metadata selection and grouped manifests. Older live peers are rejected. Stored native attempts and supported physical-format migrations retain their exact identities. Version 25 added typed canonical change payloads to descriptor-scoped exact-row read-fulfillment closures. Version 26 requires the nullable `checkpointConversationId` member in commit bodies and headers and adds graph-bound native metadata envelopes that distinguish an explicit NULL from unavailable metadata. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
 
 Bootstrap installs checkpoint headers alongside current branch heads and working bases. Historical checkpoint state remains deferred until an explicit history or snapshot read requests it; bootstrap does not scan every checkpoint state or fetch its binary content.
 
@@ -120,17 +120,52 @@ Partial merge receipts use the authority head at admission as the first parent, 
   baseline lease and returns verified immutable dependencies for local query
   evaluation, including pending client edits. Recipes are bounded to 512 KiB and
   4,096 interests; closures to 256 MiB and 16,384 inputs. Pages carry up to 4 MiB
-  of payload except a single input may be up to 64 MiB. Continuations bind the
-  next input to the closure digest. Clients validate the complete closure before
-  atomic, admission-fenced installation. Historical diffs retain their specialized
-  discovery path. Protocol 19 peers are rejected without a compatibility fallback.
+  of decoded payload. Larger canonical inputs use bounded frames carrying their
+  address, total length, offset, and whole-member digest; codecs have a separate
+  64 MiB member limit. Continuations bind exact input/offset progress to the
+  closure digest and opaque `spoolId`. The native authority seals one snapshot
+  into an operation spool; later pages recheck account, repository, epoch,
+  descriptor/request digest and lease without rediscovering the closure.
+  In-flight admission permits 16 operations globally and 4 per repository/account.
+  Spools expire within two minutes and the lease; payload disk is capped at
+  512 MiB per operation and 1 GiB per process, with a 4 MiB address index.
+  Egress/replays consume a maximum of three times the operation byte/page budget.
+  The client chooses `operationId` before sending the first request and fixes
+  `operationExpiresAtMs` to the server-issued lease expiry. A continuation names
+  that same immutable operation. `release: true` without a continuation cancels
+  work by that client-known identity. When constructing the terminal page, the
+  authority atomically retires the sealed spool before returning the response;
+  successful reads require no separate cleanup acknowledgement. A bounded
+  fixed-expiry identity makes later retries return `LIX_READ_FULFILLMENT_RESTART`.
+  One-page reads retain no spool or completed marker and can be recomputed.
+  Clients allow at most three attempts: one same-ID network retry and one
+  fresh-ID restart, preserving the leased basis and fixed expiry. Expired or
+  missing process-local spools also return `LIX_READ_FULFILLMENT_RESTART`. Under
+  admission or byte pressure, the authority may retire an inactive sealed spool
+  early and return that same restart response; active handlers and pending
+  discovery remain protected. A healthy client between pages can also need a
+  restart when concurrent operations exceed the bounded cache. Multi-worker
+  deployments need affinity or shared scratch. Browser authorities
+  have an explicit 8 MiB scratch cap.
+  Clients reserve private physical scratch before receiving pages (two operations
+  per repository, 256 MiB each, and 1 GiB per process). A durable ownership ledger
+  expires after five minutes; later admissions reap abandoned/old-epoch frames.
+  Clients validate the complete closure before bounded admission-fenced CAS
+  promotion; no scratch page grants coverage. A validated fallback releases its
+  empty scratch owner and permit before returning its outcome, so nested
+  current-payload recovery can obtain bounded admission. Abrupt cancellation uses bounded
+  expiry when a release cannot arrive. Bounded fixed historical metadata diffs
+  whose endpoints prove on the leased selected-branch first-parent lane use this
+  read-fulfillment path. Captured diffs that can name private pending client
+  commits retain specialized discovery.
   See [Partial-read discovery](./partial-read-discovery.md) for bounds and isolation.
 - `POST /sync/native-objects`, `/sync/native-object-range`, and
   `/sync/native-metadata` fetch explicitly typed native inputs. They require `lix-native-baseline-lease`, checked against the authenticated account in the same storage snapshot as the native read. Request JSON is capped at 16 KiB; object/range payloads are capped at 1 MiB and metadata payloads at 256 KiB.
-- `POST /sync/native-metadata-walk` fetches up to 16 first-parent commits
-  with optional headers under the same baseline lease. The response is bounded to 32 records and 256 KiB of decoded metadata. Unavailable optional ancestors truncate the walk; required inputs still fail normally.
+- `POST /sync/native-metadata-walk` fetches up to 16 addressed commits selected by history, causal, incorporation or jump-spine policy
+  with optional headers under the same baseline lease. The required anchor/header, stop IDs and causal generation floor are explicit. Selection supplies independently validated inputs; the client decides proof completion. Speculative missing/corrupt records are omitted and become errors only when subsequently required. The response is bounded to 32 records and 256 KiB of decoded metadata. Unavailable optional ancestors truncate the walk; required inputs still fail normally.
 - Native metadata responses may include a bounded dependency bundle containing
   the locator owner's header and catalog. Clients validate ownership, hashes, and admission before atomically installing the bundle. Missing or corrupt optional companions are omitted; required object failures remain errors.
+- `POST /sync/blobs` registers at most 32 manifests within 1 MiB encoded request and decoded inline content bounds. It validates the entire group before durable installation, deduplicates shared chunk keys, and returns ordered missing-chunk registrations. Missing content precedes retained-body and reference publication.
 - `POST /sync/baseline-lease/renew` accepts `{leaseId}` and extends an unexpired
   lease without changing its account or roots. Expired leases cannot be resurrected. Cold requests return `LIX_PARTIAL_BASELINE_EXPIRED` (HTTP 410); clients preserve pending edits and explicitly reconcile a new baseline.
 - Shared blob/chunk GET routes validate a supplied baseline lease in the same
@@ -180,3 +215,19 @@ The reference server also exposes an **internal host operation**, separate from 
 `create-new` initializes fresh physical storage and durably publishes the requested ID using the lifecycle catalog. It refuses uncatalogued physical storage at that ID. `adopt-existing` verifies existing repository metadata and canonical branch heads/working baselines, applies supported format migrations, and publishes the existing storage in the catalog without replacing its data. Missing or incomplete storage fails adoption. Both operations may be retried; an already-live catalog entry is returned unchanged, and deleted repositories are never recreated.
 
 Before rolling out the lifecycle catalog to an existing host, quiesce old writers and explicitly adopt **all** legacy repository IDs, including public and demo repositories. Opening SlateDB may fence another writer and adoption may migrate the storage format. Authenticated UI provisioning alone is not a migration for anonymously accessed repositories. Preserve failed adoption cases for operator investigation; never fall back from adoption failure to creating an empty repository. New control-plane rows and demo fixtures must explicitly provision their storage before exposing links that require it.
+
+### Transfer and durable repository identity
+
+Sync 31 requires bounded dependency selection, grouped content registration, client-known operation identities and sealed read-operation framing. Clients and authorities use the same protocol cutover; old live clients are not supported by this cutover. Normal manifests use `POST /sync/blobs`. A single non-inline manifest whose receipt inventory exceeds 1 MiB uses `POST /sync/blob`, with an explicit 2 MiB client ceiling; its content still transfers through bounded chunk pages. This lane preserves the 16,384-receipt native manifest limit. An explicit intermediary `413` may split an ordinary group. An ambiguous response does not authorize changing a prepared publication attempt.
+
+Format 87 admits private expiring read-operation scratch, excluded from semantic snapshots and copied epoch data. Its 86→87 migration starts scratch empty and rewrites no authored rows. Transfer scheduling preserves durable publication identities:
+
+| Durable value | Preserved identity and migration rule |
+| --- | --- |
+| Physical repository formats 72–86 | Execute the registered storage migration chain into a hidden epoch before activation. Source storage remains readable until the destination is validated and published. |
+| Partial merge state version 5 | Preserve attempt, request, prepared wave, acknowledged tip and accepted receipt. Content grouping cannot change the frozen native body or acknowledgement coordinates. |
+| Partial push state version 2 | Preserve the prepared native publication tuple and confirmation frontier across retries and reopen. |
+| Pending conversion journal version 2 | Preserve the source bank, source pin, manifest digest, prepared/accepted tips and receipt. The journal stays outside disposable epoch banks and retains its 4 KiB bound. |
+| Authority request and receipt retention | Preserve canonical serialized merge request bytes and their digest, including omitted redundant optional fields. A transfer optimization cannot rewrite an accepted attempt. |
+
+The migration obligation concerns old physical repositories and recoverable durable attempts. Transfer scheduling and selection fields are ephemeral wire state.

@@ -18,6 +18,7 @@ import { restoreSnapshot } from "./snapshot-restore.js";
 import {
 	createHosted,
 	deleteHosted,
+	instrumentComponentCore,
 	openJsStorage,
 	openJsStorageFromSnapshot,
 	openMemory,
@@ -62,7 +63,9 @@ export async function openLixBinding(
 	const compilerInitializeStartedAt = profileNow();
 	await initializeComponentCompiler();
 	hostProfile.componentCompiler.initializeMs = profileElapsed(compilerInitializeStartedAt);
-	const componentDispatch = createComponentDispatch(compileComponent);
+	const componentDispatch = createComponentDispatch((bytes, limits) =>
+		compileComponent(bytes, limits, instrumentComponentCore),
+	);
 	switch (storage.kind) {
 		case "memory": {
 			const nativeOpenStartedAt = profileNow();

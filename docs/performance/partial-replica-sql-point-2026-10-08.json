@@ -1,0 +1,115 @@
+{
+  "qualification": "Diagnostic latency measurements: concurrent builds were active; transfer dependency ordering and byte/reopen equality verified. Repeat under a quiet host before making broad no-regression claims.",
+  "results": {
+    "0": {
+      "control": {
+        "cases": 2,
+        "medianPhaseTimingsMs": {
+          "open": 901.0499999523163,
+          "initialFiniteSync": 0.0,
+          "coldSelectedSql": 677.8500000238419,
+          "residentRepeatSql": 12.949999988079071,
+          "reopenOpen": 35.14999997615814,
+          "reopenRead": 92.5,
+          "reopenAndRead": 127.64999997615814
+        },
+        "coldTransferCounts": [
+          2,
+          2
+        ],
+        "allReopenBytesEqual": true
+      },
+      "candidate": {
+        "cases": 2,
+        "medianPhaseTimingsMs": {
+          "open": 885.7499999403954,
+          "initialFiniteSync": 0.050000011920928955,
+          "coldSelectedSql": 518.0500000119209,
+          "residentRepeatSql": 15.099999964237213,
+          "reopenOpen": 35.749999940395355,
+          "reopenRead": 87.94999998807907,
+          "reopenAndRead": 123.69999992847443
+        },
+        "coldTransferCounts": [
+          1,
+          1
+        ],
+        "allReopenBytesEqual": true
+      }
+    },
+    "100": {
+      "control": {
+        "cases": 3,
+        "medianPhaseTimingsMs": {
+          "open": 803.5999999046326,
+          "initialFiniteSync": 0.10000002384185791,
+          "coldSelectedSql": 798,
+          "residentRepeatSql": 14.399999976158142,
+          "reopenOpen": 35.800000071525574,
+          "reopenRead": 86.10000002384186,
+          "reopenAndRead": 121.89999997615814
+        },
+        "coldTransferCounts": [
+          2,
+          2,
+          2
+        ],
+        "allReopenBytesEqual": true
+      },
+      "candidate": {
+        "cases": 3,
+        "medianPhaseTimingsMs": {
+          "open": 1001.2999999523163,
+          "initialFiniteSync": 0,
+          "coldSelectedSql": 633.7000000476837,
+          "residentRepeatSql": 13.399999976158142,
+          "reopenOpen": 35.89999997615814,
+          "reopenRead": 91.29999995231628,
+          "reopenAndRead": 126.70000004768372
+        },
+        "coldTransferCounts": [
+          1,
+          1,
+          1
+        ],
+        "allReopenBytesEqual": true
+      }
+    },
+    "500": {
+      "control": {
+        "cases": 2,
+        "medianPhaseTimingsMs": {
+          "open": 832.4000000357628,
+          "initialFiniteSync": 0.04999995231628418,
+          "coldSelectedSql": 1596.6500000357628,
+          "residentRepeatSql": 12.900000035762787,
+          "reopenOpen": 37.55000001192093,
+          "reopenRead": 89.39999997615814,
+          "reopenAndRead": 126.94999998807907
+        },
+        "coldTransferCounts": [
+          2,
+          2
+        ],
+        "allReopenBytesEqual": true
+      },
+      "candidate": {
+        "cases": 2,
+        "medianPhaseTimingsMs": {
+          "open": 814.0999999642372,
+          "initialFiniteSync": 0.050000011920928955,
+          "coldSelectedSql": 1047.300000011921,
+          "residentRepeatSql": 13.449999988079071,
+          "reopenOpen": 36.84999996423721,
+          "reopenRead": 87.19999998807907,
+          "reopenAndRead": 124.04999995231628
+        },
+        "coldTransferCounts": [
+          1,
+          1
+        ],
+        "allReopenBytesEqual": true
+      }
+    }
+  }
+}

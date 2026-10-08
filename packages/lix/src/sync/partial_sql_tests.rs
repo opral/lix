@@ -220,45 +220,47 @@ pub(super) async fn execute_hydrating<
             hydrate_metadata(storage, state, authority, address, fetches).await?;
             continue;
         }
-        if error.code == "LIX_PARTIAL_BLOB_MANIFEST_REQUIRED" {
-            let demand = crate::binary_cas::BlobManifestRequired::from_error(&error)?
-                .expect("manifest demand code carries a blob ID");
-            let blob_id = demand.0.to_hex();
-            if !seen.insert(format!("manifest:{blob_id}")) {
-                return Err(LixError::new(
-                    "LIX_PARTIAL_SQL_NO_PROGRESS",
-                    format!("manifest hydration did not resolve {blob_id}: {error}"),
-                ));
-            }
-            let wire = authority
-                .get_sync_blob_manifest(&blob_id)
-                .await?
-                .expect("authority has the demanded blob manifest");
-            let manifest = super::blob::decode_manifest(&wire)?;
-            let read = storage.begin_read(Default::default()).await?;
-            let mut writes = storage.new_write_set();
-            crate::binary_cas::stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
-                .await?;
-            let mut preconditions = Vec::new();
-            crate::binary_cas::stage_transfer_publication_fence(
-                &read,
-                &mut writes,
-                &mut preconditions,
-            )
-            .await?;
-            drop(read);
-            storage
-                .commit_partial_replica_write_set(
-                    super::partial_replica_write_capability(),
-                    writes,
-                    StorageWriteOptions {
-                        preconditions,
-                        await_durable: true,
-                        ..Default::default()
-                    },
+        if let Some(crate::binary_cas::BlobManifestsRequired(blob_ids)) =
+            crate::binary_cas::BlobManifestsRequired::from_error(&error)?
+        {
+            for blob_id in blob_ids {
+                let blob_id = blob_id.to_hex();
+                if !seen.insert(format!("manifest:{blob_id}")) {
+                    return Err(LixError::new(
+                        "LIX_PARTIAL_SQL_NO_PROGRESS",
+                        format!("manifest hydration did not resolve {blob_id}: {error}"),
+                    ));
+                }
+                let wire = authority
+                    .get_sync_blob_manifest(&blob_id)
+                    .await?
+                    .expect("authority has the demanded blob manifest");
+                let manifest = super::blob::decode_manifest(&wire)?;
+                let read = storage.begin_read(Default::default()).await?;
+                let mut writes = storage.new_write_set();
+                crate::binary_cas::stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                    .await?;
+                let mut preconditions = Vec::new();
+                crate::binary_cas::stage_transfer_publication_fence(
+                    &read,
+                    &mut writes,
+                    &mut preconditions,
                 )
                 .await?;
-            fetches.blob_manifest_ids.insert(blob_id);
+                drop(read);
+                storage
+                    .commit_partial_replica_write_set(
+                        super::partial_replica_write_capability(),
+                        writes,
+                        StorageWriteOptions {
+                            preconditions,
+                            await_durable: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                fetches.blob_manifest_ids.insert(blob_id);
+            }
             continue;
         }
         if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {

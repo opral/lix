@@ -5,6 +5,7 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecordProjection, ChangelogContext, ChangelogReader,
@@ -25,6 +26,7 @@ struct MaterializedTrackedStateDescriptor {
     snapshot_content: Option<SharedStr>,
     metadata: Option<SharedStr>,
     decoded_snapshot: Option<Arc<WasmTypedRow>>,
+    raw_snapshot: Option<Bytes>,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -187,6 +189,10 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
 
     pub(crate) fn decoded_snapshot(self) -> Option<&'a Arc<WasmTypedRow>> {
         self.descriptor().decoded_snapshot.as_ref()
+    }
+
+    pub(crate) fn raw_snapshot(self) -> Option<&'a Bytes> {
+        self.descriptor().raw_snapshot.as_ref()
     }
 
     pub(crate) fn deleted(self) -> bool {
@@ -364,6 +370,7 @@ impl MaterializedTrackedStateBatchBuilder {
             snapshot_content,
             metadata,
             decoded_snapshot: None,
+            raw_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -391,6 +398,7 @@ impl MaterializedTrackedStateBatchBuilder {
             snapshot_content,
             metadata,
             decoded_snapshot: None,
+            raw_snapshot: None,
             deleted: value.deleted(),
             created_at: value.created_at(),
             updated_at: value.updated_at(),
@@ -409,6 +417,10 @@ impl MaterializedTrackedStateBatchBuilder {
 
     fn set_decoded_snapshot(&mut self, ordinal: usize, snapshot: Option<Arc<WasmTypedRow>>) {
         self.rows[ordinal].decoded_snapshot = snapshot;
+    }
+
+    fn set_raw_snapshot(&mut self, ordinal: usize, snapshot: Option<Bytes>) {
+        self.rows[ordinal].raw_snapshot = snapshot;
     }
 }
 
@@ -570,8 +582,8 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata, snapshot) = if value.deleted {
-            (None, None, None)
+        let (snapshot_content, metadata, snapshot, raw_snapshot) = if value.deleted {
+            (None, None, None, None)
         } else {
             shared_payload_fields(
                 &payloads,
@@ -587,6 +599,7 @@ where
         let ordinal = rows.rows.len();
         rows.push(key, value, snapshot_content, metadata);
         rows.set_decoded_snapshot(ordinal, snapshot);
+        rows.set_raw_snapshot(ordinal, raw_snapshot);
     }
     Ok(rows.finish())
 }
@@ -628,14 +641,15 @@ where
     .await?;
 
     for (key, value) in entries {
-        let (snapshot_content, metadata, snapshot) = if value.deleted {
-            (None, None, None)
+        let (snapshot_content, metadata, snapshot, raw_snapshot) = if value.deleted {
+            (None, None, None, None)
         } else {
             shared_payload_fields(&payloads, key, value.change_id, value.commit_id)?
         };
         let ordinal = rows.rows.len();
         rows.push_ref(key, value, snapshot_content, metadata);
         rows.set_decoded_snapshot(ordinal, snapshot);
+        rows.set_raw_snapshot(ordinal, raw_snapshot);
     }
     Ok(rows.finish())
 }
@@ -655,6 +669,7 @@ fn shared_payload_fields(
         Option<SharedStr>,
         Option<SharedStr>,
         Option<Arc<WasmTypedRow>>,
+        Option<Bytes>,
     ),
     LixError,
 > {
@@ -692,6 +707,7 @@ fn shared_payload_fields(
         payload.snapshot_content.clone(),
         payload.metadata.clone(),
         payload.decoded_snapshot.clone(),
+        payload.raw_snapshot.clone(),
     ))
 }
 
@@ -883,7 +899,7 @@ mod tests {
         );
 
         let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
-            bytes::Bytes::from_static(&[1, 2, 3])
+            Bytes::from_static(&[1, 2, 3])
         )])
         .expect("one byte string is a valid row primary key");
         assert!(
@@ -923,7 +939,7 @@ mod tests {
         );
 
         let bytes_pk = RowPk::from_components(smallvec::smallvec![RowPkComponent::Bytes(
-            bytes::Bytes::from_static(&[1, 2, 3])
+            Bytes::from_static(&[1, 2, 3])
         )])
         .expect("one byte string is a valid row primary key");
         assert!(
@@ -1280,6 +1296,7 @@ mod tests {
             snapshot_content: Some(snapshot.clone()),
             metadata: None,
             decoded_snapshot: None,
+            raw_snapshot: None,
         };
         (
             change_id,

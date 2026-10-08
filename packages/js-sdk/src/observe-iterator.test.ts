@@ -82,6 +82,49 @@ test("abort before binding setup completes ends iteration and releases late bind
 	await lix.close();
 });
 
+test("a pre-aborted signal does not create a worker observer request", async () => {
+	const observe = vi.fn(async () => ({ next: vi.fn(), close: vi.fn() }));
+	const lix = new Lix({
+		observe,
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	const controller = new AbortController();
+	controller.abort();
+	const events = lix.observe("SELECT 1", [], { signal: controller.signal });
+	expect(observe).not.toHaveBeenCalled();
+	expect(await events.next()).toEqual({ done: true, value: undefined });
+	await lix.close();
+});
+
+test("iterator return aborts a pending binding observer registration", async () => {
+	let registrationSignal: AbortSignal | undefined;
+	const observe = vi.fn(
+		(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) => {
+			registrationSignal = options?.signal;
+			return new Promise<ObserveEventsBinding>((_resolve, reject) => {
+				registrationSignal?.addEventListener(
+					"abort",
+					() => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+					{ once: true },
+				);
+			});
+		},
+	);
+	const lix = new Lix({
+		observe,
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	const events = lix.observe("SELECT 1");
+	const pending = events.next();
+	await vi.waitFor(() => expect(observe).toHaveBeenCalledOnce());
+	await events.return?.();
+	expect(registrationSignal?.aborted).toBe(true);
+	expect(await pending).toEqual({ done: true, value: undefined });
+	await lix.close();
+});
+
 test("terminal errors reject once and clean up", async () => {
 	const failure = new Error("observation failed");
 	const f = fixture(

@@ -16,6 +16,7 @@ export type {
 	LixStorageRead,
 	LixStorageReadEntry,
 	LixStorageReadOptions,
+	LixStorageReadBudget,
 	LixStorageScanOrder,
 	LixStorageScanSource,
 	LixStorageSpace,

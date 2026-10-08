@@ -91,6 +91,36 @@ impl StorageRead for BrowserRead {
         }
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: lix::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        match self {
+            Self::Memory(read) => read.get_many_bounded(requests, budget).await,
+            Self::Js(read) => read.get_many_bounded(requests, budget).await,
+        }
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> Result<lix::storage::GetManyPrefixResult, StorageError> {
+        match self {
+            Self::Memory(read) => {
+                read.get_many_bounded_prefix(requests, offset, max_slots, budget)
+                    .await
+            }
+            Self::Js(read) => {
+                read.get_many_bounded_prefix(requests, offset, max_slots, budget)
+                    .await
+            }
+        }
+    }
+
     async fn begin_scan(
         &self,
         space: StorageSpace,

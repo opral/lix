@@ -11,7 +11,10 @@ pub(crate) fn snapshot_spaces() -> impl Iterator<Item = StorageSpace> {
     crate::storage_spaces::ALL_STORAGE_SPACES
         .iter()
         .copied()
-        .filter(|space| space.id != REPOSITORY_EPOCH_SPACE.id)
+        .filter(|space| {
+            space.id != REPOSITORY_EPOCH_SPACE.id
+                && space.id != crate::sync::READ_OPERATION_SCRATCH_SPACE.id
+        })
 }
 
 pub(crate) fn snapshot_space(space_id: u32) -> Option<StorageSpace> {

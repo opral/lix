@@ -5,7 +5,9 @@
 
 use http::Method;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::platform::SyncCallbackBounds;
 use super::{
     MAX_SYNC_PULL_RESPONSE_BYTES, SYNC_LONG_POLL_TIMEOUT, SYNC_PROTOCOL_VERSION,
     SYNC_PROTOCOL_VERSION_HEADER, SyncBlobManifest, SyncBlobRegistration, SyncHistoryResponse,
@@ -19,6 +21,43 @@ pub(super) const HTTP_TIMEOUT: std::time::Duration =
     SYNC_LONG_POLL_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
 pub(super) const SYNC_TRANSPORT_ERROR_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT";
 const SESSION_HEADER: &str = "lix-session-id";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadSendEvent {
+    Dispatched(String),
+    RejectedBeforeExecution,
+}
+
+/// Type-erased owner held by staged fulfillment until remote cleanup or
+/// successful promotion has completed. Its concrete Drop implementation is
+/// transport-specific, while the storage-side staged closure is not.
+pub(crate) trait ReadOperationOwnerMarker: SyncTransportBounds {}
+impl<T: SyncTransportBounds> ReadOperationOwnerMarker for T {}
+
+#[derive(Clone)]
+pub(crate) struct ReadOperationOwner {
+    _inner: std::sync::Arc<dyn ReadOperationOwnerMarker>,
+}
+
+#[derive(Debug)]
+struct ReadOperationLifecycle {
+    active: AtomicUsize,
+    close_requested: AtomicBool,
+    close_started: AtomicBool,
+    close_completion: tokio::sync::watch::Sender<Option<Result<(), LixError>>>,
+}
+
+impl Default for ReadOperationLifecycle {
+    fn default() -> Self {
+        let (close_completion, _) = tokio::sync::watch::channel(None);
+        Self {
+            active: AtomicUsize::new(0),
+            close_requested: AtomicBool::new(false),
+            close_started: AtomicBool::new(false),
+            close_completion,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RawHttpRequest {
@@ -162,6 +201,22 @@ pub(crate) struct HttpSyncTransport<Client> {
     session: std::sync::Arc<tokio::sync::Mutex<SessionState>>,
     active_account_id: String,
     baseline_lease: std::sync::Arc<parking_lot::Mutex<Option<crate::gc::NativeBaselineLease>>>,
+    read_operations: std::sync::Arc<ReadOperationLifecycle>,
+}
+
+struct TransportReadOperationOwner<Client: RawHttpClient + Clone + 'static> {
+    transport: HttpSyncTransport<Client>,
+    lifecycle: std::sync::Arc<ReadOperationLifecycle>,
+}
+
+impl<Client: RawHttpClient + Clone + 'static> Drop for TransportReadOperationOwner<Client> {
+    fn drop(&mut self) {
+        if self.lifecycle.active.fetch_sub(1, Ordering::SeqCst) == 1
+            && self.lifecycle.close_requested.load(Ordering::SeqCst)
+        {
+            self.transport.schedule_deferred_close();
+        }
+    }
 }
 
 impl<Client> HttpSyncTransport<Client>
@@ -225,12 +280,19 @@ where
             ))),
             active_account_id: handshake.active_account_id,
             baseline_lease: Default::default(),
+            read_operations: Default::default(),
         })
     }
 
     async fn session_id(&self) -> Result<String, LixError> {
+        if self.read_operations.close_requested.load(Ordering::SeqCst) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closing",
+            ));
+        }
         let mut session = self.session.lock().await;
-        if session.closed {
+        if session.closed || self.read_operations.close_requested.load(Ordering::SeqCst) {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
                 "sync session is closed",
@@ -297,6 +359,146 @@ where
         }
     }
 
+    /// Reserves session ownership before staged work is queued or its durable
+    /// scratch owner is reserved. Clones of the returned guard share one
+    /// active count, so a stage can transfer it through cleanup/promotion.
+    pub(crate) fn acquire_read_operation_owner(&self) -> Result<ReadOperationOwner, LixError>
+    where
+        Client: Clone + 'static,
+    {
+        let lifecycle = &self.read_operations;
+        if lifecycle.close_requested.load(Ordering::SeqCst) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closing",
+            ));
+        }
+        lifecycle.active.fetch_add(1, Ordering::SeqCst);
+        if lifecycle.close_requested.load(Ordering::SeqCst) {
+            if lifecycle.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.schedule_deferred_close();
+            }
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closing",
+            ));
+        }
+        let owner = TransportReadOperationOwner {
+            transport: self.clone(),
+            lifecycle: lifecycle.clone(),
+        };
+        Ok(ReadOperationOwner {
+            _inner: std::sync::Arc::new(owner),
+        })
+    }
+
+    fn schedule_deferred_close(&self)
+    where
+        Client: Clone + 'static,
+    {
+        if self.read_operations.active.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        if self
+            .read_operations
+            .close_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.read_operations.close_completion.send_replace(None);
+        let transport = self.clone();
+        let completion = self.read_operations.close_completion.clone();
+        if let Err(error) = crate::background_task::spawn_runtime_compatible(
+            "sync-session-deferred-close",
+            move || async move {
+                let result = transport.finish_close_session().await;
+                completion.send_replace(Some(result));
+            },
+        ) {
+            self.read_operations
+                .close_completion
+                .send_replace(Some(Err(error)));
+        }
+    }
+
+    async fn wait_for_close_completion(&self) -> Result<(), LixError> {
+        let mut completion = self.read_operations.close_completion.subscribe();
+        loop {
+            if let Some(result) = completion.borrow_and_update().clone() {
+                return result;
+            }
+            completion.changed().await.map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "sync session close completion was dropped",
+                )
+            })?;
+        }
+    }
+
+    async fn finish_close_session(&self) -> Result<(), LixError> {
+        // Closing never creates a replacement session. Serialize with recovery
+        // so a concurrent close cannot leak a replacement it already created.
+        let mut session = self.session.lock().await;
+        session.closed = true;
+        if session.invalid {
+            return Ok(());
+        }
+        session.invalid = true;
+        let mut request = self.request(Method::DELETE, "/session", "close sync session");
+        request
+            .headers
+            .push((SESSION_HEADER.to_owned(), session.id.clone()));
+        let response = self.client.send(request).await?;
+        if session_gone(&response) {
+            return Ok(());
+        }
+        ensure_success(&response, "close sync session")
+    }
+
+    /// Completes a staged operation using the exact session that accepted its
+    /// first raw request. This cleanup path never opens or recovers a session,
+    /// including after close has been requested.
+    pub(crate) fn release_read_operation<'a>(
+        &'a self,
+        fulfillment: &'a super::read_fulfillment::ReadFulfillmentRequest,
+        session_id: &'a str,
+    ) -> SyncTransportFuture<'a, super::read_fulfillment::ReadFulfillmentResponse> {
+        Box::pin(async move {
+            fulfillment.validate(&self.lix_id)?;
+            self.require_bound_native_lease()?;
+            if session_id.is_empty() || session_id.len() > 4096 {
+                return Err(LixError::new(
+                    super::SYNC_PROTOCOL_MISMATCH_CODE,
+                    "staged operation cleanup has an invalid session capability",
+                ));
+            }
+            let mut request = self.request(
+                Method::POST,
+                "/sync/read-fulfillment",
+                "release native read operation",
+            );
+            request.response_limit = super::read_fulfillment::MAX_RESPONSE_BYTES;
+            request.headers.push(json_content_type());
+            request
+                .headers
+                .push((SESSION_HEADER.to_owned(), session_id.to_owned()));
+            request.body = Some(json_body(fulfillment, "encode read fulfillment release")?);
+            let response = self.client.send(request).await?;
+            if response.body.len() > super::read_fulfillment::MAX_RESPONSE_BYTES {
+                return Err(response_too_large_limit(
+                    "release native read operation",
+                    super::read_fulfillment::MAX_RESPONSE_BYTES,
+                ));
+            }
+            let response = decode_response(response, "release native read operation")?;
+            super::read_fulfillment::validate_response(fulfillment, &response)?;
+            Ok(response)
+        })
+    }
+
     async fn invalidate_session(&self, id: &str, response: &RawHttpResponse) {
         let mut session = self.session.lock().await;
         if session.id == id {
@@ -305,14 +507,33 @@ where
         }
     }
 
-    async fn send(&self, mut request: RawHttpRequest) -> Result<RawHttpResponse, LixError> {
+    async fn send(&self, request: RawHttpRequest) -> Result<RawHttpResponse, LixError> {
+        self.send_tracked(request, &mut |_| Ok(())).await
+    }
+
+    async fn send_tracked<F>(
+        &self,
+        mut request: RawHttpRequest,
+        track_send: &mut F,
+    ) -> Result<RawHttpResponse, LixError>
+    where
+        F: FnMut(ReadSendEvent) -> Result<(), LixError> + SyncCallbackBounds,
+    {
         let id = self.session_id().await?;
         request
             .headers
             .push((SESSION_HEADER.to_owned(), id.clone()));
         // Only a canonical SESSION_GONE proves the server rejected the request
         // before execution. Never replay writes on ambiguous transport failures.
-        let response = self.client.send(request.clone()).await?;
+        if self.read_operations.close_requested.load(Ordering::SeqCst) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closing",
+            ));
+        }
+        let response = self.client.send(request.clone());
+        track_send(ReadSendEvent::Dispatched(id.clone()))?;
+        let response = response.await?;
         if !session_gone(&response) {
             if (200..300).contains(&response.status) {
                 let mut session = self.session.lock().await;
@@ -323,6 +544,7 @@ where
             }
             return Ok(response);
         }
+        track_send(ReadSendEvent::RejectedBeforeExecution)?;
         self.invalidate_session(&id, &response).await;
         let replacement = self.session_id().await?;
         request
@@ -331,7 +553,15 @@ where
         request
             .headers
             .push((SESSION_HEADER.to_owned(), replacement.clone()));
-        let response = self.client.send(request).await?;
+        if self.read_operations.close_requested.load(Ordering::SeqCst) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closing",
+            ));
+        }
+        let response = self.client.send(request);
+        track_send(ReadSendEvent::Dispatched(replacement.clone()))?;
+        let response = response.await?;
         if session_gone(&response) {
             self.invalidate_session(&replacement, &response).await;
         }
@@ -682,24 +912,18 @@ where
         Ok(())
     }
 
-    pub(crate) async fn close_session(&self) -> Result<(), LixError> {
-        // Closing never creates a replacement session, including after a failed
-        // recovery. Serialize with recovery so a concurrent close cannot leak it.
-        let mut session = self.session.lock().await;
-        session.closed = true;
-        if session.invalid {
-            return Ok(());
-        }
-        session.invalid = true;
-        let mut request = self.request(Method::DELETE, "/session", "close sync session");
-        request
-            .headers
-            .push((SESSION_HEADER.to_owned(), session.id.clone()));
-        let response = self.client.send(request).await?;
-        if session_gone(&response) {
-            return Ok(());
-        }
-        ensure_success(&response, "close sync session")
+    pub(crate) async fn close_session(&self) -> Result<(), LixError>
+    where
+        Client: Clone + 'static,
+    {
+        self.read_operations
+            .close_requested
+            .store(true, Ordering::SeqCst);
+        // The caller's shutdown boundary supplies the time limit. This future
+        // awaits cleanup so browser bridges keep their transport usable, while
+        // the independent shared driver survives cancellation by that caller.
+        self.schedule_deferred_close();
+        self.wait_for_close_completion().await
     }
 
     pub(super) fn is_reserved_header(name: &str) -> bool {
@@ -891,10 +1115,19 @@ where
         })
     }
 
-    pub(crate) fn fulfill_read<'a>(
+    /// Issues a read fulfillment with callbacks for raw handoff and definitive
+    /// session rejection. Callers that own remote-operation cleanup use it to
+    /// avoid releasing an operation that was never sent, while clearing
+    /// cleanup authority when the server proves a request was rejected before
+    /// execution.
+    pub(crate) fn fulfill_read_tracked<'a, F>(
         &'a self,
         fulfillment: &'a super::read_fulfillment::ReadFulfillmentRequest,
-    ) -> SyncTransportFuture<'a, super::read_fulfillment::ReadFulfillmentResponse> {
+        mut track_send: F,
+    ) -> SyncTransportFuture<'a, super::read_fulfillment::ReadFulfillmentResponse>
+    where
+        F: FnMut(ReadSendEvent) -> Result<(), LixError> + SyncCallbackBounds + 'a,
+    {
         Box::pin(async move {
             fulfillment.validate(&self.lix_id)?;
             self.require_bound_native_lease()?;
@@ -906,7 +1139,7 @@ where
             request.response_limit = super::read_fulfillment::MAX_RESPONSE_BYTES;
             request.headers.push(json_content_type());
             request.body = Some(json_body(fulfillment, "encode read fulfillment")?);
-            let response = self.send(request).await?;
+            let response = self.send_tracked(request, &mut track_send).await?;
             if response.body.len() > super::read_fulfillment::MAX_RESPONSE_BYTES {
                 return Err(response_too_large_limit(
                     "fulfill native read",
@@ -1098,7 +1331,9 @@ where
                 None => format!("/sync/pull?limit={limit}"),
             };
             let request = self.request(Method::GET, &path, "pull sync repository");
-            self.send_json(request).await
+            let response = self.send(request).await?;
+            ensure_success(&response, "pull sync repository")?;
+            super::blob::decode_pull_response(&response.body, limit)
         })
     }
 
@@ -1116,7 +1351,9 @@ where
             request
                 .headers
                 .push(("prefer".to_owned(), "wait=0".to_owned()));
-            self.send_json(request).await
+            let response = self.send(request).await?;
+            ensure_success(&response, "fence sync publication")?;
+            super::blob::decode_pull_response(&response.body, limit)
         })
     }
 
@@ -1180,17 +1417,28 @@ where
         blob_ids: &'a [String],
     ) -> SyncTransportFuture<'a, Vec<SyncBlobManifest>> {
         Box::pin(async move {
+            let expected_count = blob_ids.len();
+            let response_limit = super::blob::manifest_response_body_limit(expected_count)?;
             let blob_ids = blob_ids
                 .iter()
                 .map(|blob_id| encode_query(blob_id))
                 .collect::<Vec<_>>()
                 .join(",");
-            let request = self.request(
+            let mut request = self.request(
                 Method::GET,
                 &format!("/sync/blob?blobIds={blob_ids}"),
                 "load sync blob manifests",
             );
-            self.send_json(request).await
+            request.response_limit = response_limit;
+            let response = self.send(request).await?;
+            if response.body.len() > response_limit {
+                return Err(response_too_large_limit(
+                    "load sync blob manifests",
+                    response_limit,
+                ));
+            }
+            ensure_success(&response, "load sync blob manifests")?;
+            super::blob::decode_manifest_response(&response.body, expected_count)
         })
     }
 
@@ -1201,9 +1449,51 @@ where
         Box::pin(async move {
             let mut request =
                 self.request(Method::POST, "/sync/blob", "register sync blob manifest");
+            super::blob::validate_sync_blob_manifest(manifest)?;
+            request.response_limit = super::transfer::MAX_MANIFEST_SINGLETON_ENCODED_BYTES;
             request.headers.push(json_content_type());
-            request.body = Some(json_body(manifest, "encode sync blob manifest")?);
+            let body = json_body(manifest, "encode sync blob manifest")?;
+            if body.len() > super::transfer::MAX_MANIFEST_SINGLETON_ENCODED_BYTES {
+                return Err(LixError::new(
+                    "LIX_TRANSFER_MEMBER_TOO_LARGE",
+                    "manifest inventory exceeds its bounded transfer lane",
+                ));
+            }
+            request.body = Some(body);
             self.send_json(request).await
+        })
+    }
+
+    fn register_blobs<'a>(
+        &'a self,
+        manifests: &'a [SyncBlobManifest],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobRegistration>> {
+        Box::pin(async move {
+            super::blob::validate_manifest_group(manifests)?;
+            let mut request = self.request(Method::POST, "/sync/blobs", "register sync blob group");
+            request.response_limit = super::transfer::CONTENT_GROUP_BYTES;
+            request.headers.push(json_content_type());
+            request.body = Some(json_body(&manifests, "encode sync blob group")?);
+            let registrations: Vec<SyncBlobRegistration> = self.send_json(request).await?;
+            if registrations.len() != manifests.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "blob group response cardinality differs",
+                ));
+            }
+            for (manifest, registration) in manifests.iter().zip(&registrations) {
+                if registration
+                    .missing_chunk_ids
+                    .iter()
+                    .any(|id| !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id))
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "authority requested an unrelated grouped upload chunk",
+                    ));
+                }
+            }
+            Ok(registrations)
         })
     }
 
@@ -1514,6 +1804,142 @@ mod tests {
         assert_eq!(transport.lix_id(), "01936f4e-7b6c-7c3d-8f9a-123456789abc");
     }
 
+    #[derive(Clone, Debug)]
+    struct ManifestReplyClient {
+        requests: Arc<Mutex<Vec<RawHttpRequest>>>,
+        manifest_body: Vec<u8>,
+    }
+
+    impl RawHttpClient for ManifestReplyClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                let is_handshake = request.operation == "open sync session";
+                self.requests.lock().unwrap().push(request);
+                let body = if is_handshake {
+                    serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode handshake")
+                } else {
+                    self.manifest_body.clone()
+                };
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn get_blobs_uses_the_bounded_decoder_and_request_derived_body_limit() {
+        let manifest = format!(
+            r#"{{"blobId":"{}","sizeBytes":0,"chunks":[]}}"#,
+            "0".repeat(64)
+        );
+        // The second row is deliberately not a manifest. The bounded visitor
+        // must stop at the one requested slot and report cardinality, rather
+        // than materializing/deserializing the extra row as a typed manifest.
+        let body = format!(r#"[{manifest},{{"blobId":null}}]"#).into_bytes();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = HttpSyncTransport::connect_with(
+            ManifestReplyClient {
+                requests: Arc::clone(&requests),
+                manifest_body: body,
+            },
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+
+        let requested = vec!["0".repeat(64)];
+        let error = transport
+            .get_blobs(&requested)
+            .await
+            .expect_err("an extra authority manifest must be rejected in the HTTP layer");
+        assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("exactly 1 sync blob manifests"));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].response_limit,
+            crate::sync::blob::manifest_response_body_limit(1).unwrap()
+        );
+        assert!(requests[1].response_limit < crate::sync::MAX_SYNC_PULL_RESPONSE_BYTES);
+    }
+
+    #[derive(Clone, Debug)]
+    struct PullReplyClient {
+        requests: Arc<Mutex<Vec<RawHttpRequest>>>,
+        pull_body: Vec<u8>,
+    }
+
+    impl RawHttpClient for PullReplyClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                let is_handshake = request.operation == "open sync session";
+                self.requests.lock().unwrap().push(request);
+                let body = if is_handshake {
+                    serde_json::to_vec(&serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": "01936f4e-7b6c-7c3d-8f9a-123456789abc",
+                        "sessionId": "session-from-server",
+                        "activeAccountId": crate::SYSTEM_ACCOUNT_ID,
+                    }))
+                    .expect("encode handshake")
+                } else {
+                    self.pull_body.clone()
+                };
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    body,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_http_boundary_uses_bounded_inline_manifest_visitor() {
+        let oversized_inline =
+            "A".repeat(crate::sync::blob::MAX_INLINE_SYNC_BLOB_BYTES.div_ceil(3) * 4 + 1);
+        let body = format!(
+            r#"{{"kind":"delta","cursor":1,"events":[{{"cursor":1,"commits":[],"refUpdates":[],"inlineBlobs":[{{"blobId":"{}","sizeBytes":0,"chunks":[],"inlineBytesBase64":"{oversized_inline}"}}]}}]}}"#,
+            "0".repeat(64),
+        )
+        .into_bytes();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let transport = HttpSyncTransport::connect_with(
+            PullReplyClient {
+                requests: Arc::clone(&requests),
+                pull_body: body,
+            },
+            "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        )
+        .await
+        .expect("matching handshake should connect");
+
+        let error = transport
+            .pull(Some(0), 1)
+            .await
+            .expect_err("an oversized event inline string must fail at the HTTP boundary");
+        assert_eq!(error.code, crate::LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("349528 byte limit"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].response_limit,
+            crate::sync::MAX_SYNC_PULL_RESPONSE_BYTES
+        );
+    }
+
     #[derive(Debug)]
     struct MigratingOpenClient {
         outcomes: Arc<Mutex<std::collections::VecDeque<(u16, &'static str)>>>,
@@ -1670,6 +2096,7 @@ mod tests {
                 )
                 .lease,
             ))),
+            read_operations: Default::default(),
         }
     }
 

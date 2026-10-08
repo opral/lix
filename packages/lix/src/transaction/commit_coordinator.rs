@@ -374,15 +374,14 @@ where
             }
             let commit_and_notify = async {
                 let outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
-                // A grouped wave may publish individually. Its first successful
-                // member can be a no-op; inspect every result before notifying.
+                // A grouped wave may publish individually. Select its final
+                // accepted visible revision; private and no-op members do not
+                // invalidate observer queries.
                 if let Some(outcome) = outcomes
                     .iter()
+                    .rev()
                     .filter_map(|result| result.as_ref().ok())
-                    .find(|outcome| {
-                        outcome.storage_stats.staged_puts > 0
-                            || outcome.storage_stats.staged_deletes > 0
-                    })
+                    .find(|outcome| outcome.storage_stats.observable_revision.is_some())
                 {
                     let notify = ActiveTelemetrySpan::start_current(
                         &TRANSACTION_NOTIFY,

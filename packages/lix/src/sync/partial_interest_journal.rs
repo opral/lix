@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub(crate) const PARTIAL_READ_INTEREST_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const PARTIAL_READ_INTEREST_SPACE: StorageSpace = StorageSpace::declare_private(
     StorageSpaceId(0x0007_001b),
     "sync.partial_read_interests.v1",
     ValueSemantics::Mutable,

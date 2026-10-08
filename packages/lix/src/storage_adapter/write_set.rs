@@ -296,6 +296,91 @@ impl StorageWriteSet {
                 .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
+    /// Whether lowering this write set changes any observable logical space.
+    ///
+    /// This inspects the actual mutation lanes rather than summary stats:
+    /// exclusive range deletes and storage-native deferred puts are writes
+    /// even when they do not contribute ordinary staged put/delete counts.
+    /// A mixed private/observable batch remains observable.
+    pub(crate) fn has_observable_mutations(&self) -> bool {
+        self.groups.iter().any(|group| {
+            group.space.visibility == crate::storage::StorageSpaceVisibility::Observable
+                && (!group.puts.is_empty() || !group.deletes.is_empty())
+        }) || self.exclusive_range_deletes.iter().any(|(space, _)| {
+            space.visibility == crate::storage::StorageSpaceVisibility::Observable
+        }) || self.deferred_final_puts.iter().any(|source| {
+            source.put_count() > 0
+                && source.target_spaces().iter().any(|space| {
+                    space.visibility == crate::storage::StorageSpaceVisibility::Observable
+                })
+        })
+    }
+
+    /// Whether lowering will submit at least one storage mutation.
+    pub(crate) fn has_storage_mutations(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| !group.puts.is_empty() || !group.deletes.is_empty())
+            || !self.exclusive_range_deletes.is_empty()
+            || self
+                .deferred_final_puts
+                .iter()
+                .any(|source| source.put_count() > 0)
+    }
+
+    /// Whether every staged mutation is exactly one of the native dependency
+    /// puts covered by a validated availability capability. This deliberately
+    /// rejects every other mutation lane, including deletions, ranges,
+    /// deferred sources, and unrelated puts, before observer visibility can be
+    /// preserved.
+    pub(crate) fn is_exact_native_dependency_availability(
+        &self,
+        capability: &crate::sync::NativeDependencyAvailabilityCapability,
+    ) -> bool {
+        let allowed = capability.entries();
+        if allowed.is_empty()
+            || allowed.len() > crate::sync::NativeDependencyAvailabilityCapability::MAX_ENTRIES
+            || !self.exclusive_range_deletes.is_empty()
+            || !self.deferred_final_puts.is_empty()
+        {
+            return false;
+        }
+
+        let staged_put_count = self.groups.iter().fold(0usize, |count, group| {
+            count.saturating_add(group.puts.len())
+        });
+        if staged_put_count != allowed.len()
+            || self.groups.iter().any(|group| {
+                group.puts.is_empty()
+                    || !group.deletes.is_empty()
+                    || !group.conflicting_declarations.is_empty()
+            })
+        {
+            return false;
+        }
+
+        let mut matched = vec![false; allowed.len()];
+        for group in &self.groups {
+            for put in &group.puts {
+                let key = group.key_bytes(put.key);
+                let value = group.value_bytes(put.value);
+                let Some((index, entry)) = allowed
+                    .iter()
+                    .enumerate()
+                    .find(|(_, entry)| entry.space == group.space && entry.key.as_ref() == key)
+                else {
+                    return false;
+                };
+                if matched[index] || *blake3::hash(value).as_bytes() != entry.value_hash {
+                    return false;
+                }
+                matched[index] = true;
+            }
+        }
+
+        matched.into_iter().all(|was_matched| was_matched)
+    }
+
     pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
@@ -315,7 +400,7 @@ impl StorageWriteSet {
     ///
     /// Sixteen bytes per mutation covers a space prefix, record tag, and
     /// length prefixes for current backends. The fixed tail covers the batch
-    /// header and the mutation-revision record appended by the adapter.
+    /// header and both possible revision records appended by the adapter.
     pub(crate) fn backend_batch_capacity_hint_bytes(&self) -> usize {
         let ordinary = self.groups.iter().fold(64_usize, |total, group| {
             let puts = group.puts.iter().fold(0_usize, |bytes, put| {
@@ -651,6 +736,21 @@ impl StorageWriteSet {
         Some(Bytes::copy_from_slice(group.value_bytes(put.value)))
     }
 
+    /// Borrows an exact ordinary staged put without copying its payload.
+    /// Native dependency admission uses this only after transport or range
+    /// validation, then hashes the bytes before creating its narrow intent.
+    pub(crate) fn staged_value_ref(&self, space: StorageSpace, key: &[u8]) -> Option<&[u8]> {
+        let group = self
+            .group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))?;
+        let put = group
+            .puts
+            .iter()
+            .find(|put| group.key_bytes(put.key) == key)?;
+        Some(group.value_bytes(put.value))
+    }
+
     /// Takes an owned snapshot of ordinary puts in one storage lane for an
     /// async read-your-writes planner. The owned bytes keep the planner's
     /// future `Send` without requiring `StorageWriteSet` to be `Sync`.
@@ -858,11 +958,16 @@ impl StorageWriteSet {
             .get(&space.id)
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
-            || self.exclusive_range_deletes.iter().any(|(candidate, _)| *candidate == space)
+            || self
+                .exclusive_range_deletes
+                .iter()
+                .any(|(candidate, _)| *candidate == space)
     }
 
     pub(crate) fn has_range_delete_in_space(&self, space: StorageSpace) -> bool {
-        self.exclusive_range_deletes.iter().any(|(candidate, _)| *candidate == space)
+        self.exclusive_range_deletes
+            .iter()
+            .any(|(candidate, _)| *candidate == space)
     }
 
     pub(crate) fn has_deletions_in_space(&self, space: StorageSpace) -> bool {
@@ -883,7 +988,12 @@ impl StorageWriteSet {
         self.group_index
             .get(&space.id)
             .and_then(|index| self.groups.get(*index))
-            .is_some_and(|group| group.deletes.iter().any(|item| group.key_bytes(*item) == key))
+            .is_some_and(|group| {
+                group
+                    .deletes
+                    .iter()
+                    .any(|item| group.key_bytes(*item) == key)
+            })
     }
 
     /// Keys this write set already declares in `space`.
@@ -1104,17 +1214,33 @@ impl StorageWriteSet {
     where
         StorageImpl: Storage,
     {
+        let has_storage_mutations = self.has_storage_mutations();
+        let has_observable_mutations = self.has_observable_mutations();
         let mut write = storage
             .begin_write(opts)
             .await
             .map_err(StorageWriteSetError::Storage)?;
-        let stats = match self.lower_into(&mut write).await {
+        let mut stats = match self.lower_into(&mut write).await {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = write.rollback().await;
                 return Err(error);
             }
         };
+        if has_storage_mutations {
+            match crate::storage_adapter::stage_storage_revisions(
+                &mut write,
+                has_observable_mutations,
+            )
+            .await
+            {
+                Ok(revision) => stats.observable_revision = revision,
+                Err(error) => {
+                    let _ = write.rollback().await;
+                    return Err(StorageWriteSetError::Storage(error));
+                }
+            }
+        }
         let result = write
             .commit()
             .await
@@ -1462,12 +1588,33 @@ fn order_stats_enabled() -> bool {
 mod tests {
     use bytes::Bytes;
 
+    use super::{DeferredFinalPutPage, DeferredFinalPutSource};
     use crate::storage::{
         BufferRange, CommitResult, EncodedMutationBatch, EncodedMutationBatchError, EncodedPut,
         Key, KeyRange, Memory, PutBatch, SpaceId, StorageError, StorageWrite, StoredValue,
         WriteOptions,
     };
     use crate::storage_adapter::{StorageSpace, StorageWriteSet, StorageWriteSetError};
+
+    #[tokio::test]
+    async fn direct_commit_rotates_physical_but_not_observable_revision_for_private_space() {
+        let memory = Memory::new();
+        let adapter = crate::storage_adapter::StorageAdapter::new(memory.clone());
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            key("recipe"),
+            value("query recipe"),
+        );
+
+        writes
+            .commit(&memory, WriteOptions::default())
+            .await
+            .expect("direct write-set commit");
+
+        assert!(adapter.load_mutation_revision().await.unwrap().is_some());
+        assert_eq!(adapter.load_observable_revision().await.unwrap(), None);
+    }
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -1481,6 +1628,45 @@ mod tests {
 
     fn space() -> StorageSpace {
         StorageSpace::mutable(SpaceId(1), "test.space")
+    }
+
+    struct OneDeferredPutSource {
+        space: StorageSpace,
+        emitted: bool,
+    }
+
+    impl DeferredFinalPutSource for OneDeferredPutSource {
+        fn target_spaces(&self) -> &[StorageSpace] {
+            std::slice::from_ref(&self.space)
+        }
+
+        fn put_count(&self) -> u64 {
+            1
+        }
+
+        fn written_bytes(&self) -> u64 {
+            5
+        }
+
+        fn backend_capacity_hint_bytes(&self) -> usize {
+            32
+        }
+
+        fn next_page(&mut self) -> Option<DeferredFinalPutPage> {
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            Some(DeferredFinalPutPage {
+                space: self.space,
+                entries: PutBatch {
+                    entries: vec![crate::storage::PutEntry {
+                        key: key("deferred"),
+                        value: value("value"),
+                    }],
+                },
+            })
+        }
     }
 
     #[derive(Default)]
@@ -1572,8 +1758,43 @@ mod tests {
 
         assert_eq!(stats.put_batches, 1);
         assert_eq!(stats.delete_batches, 1);
-        assert_eq!(commit.stats.put_entries, 2);
+        assert_eq!(
+            commit.stats.put_entries, 4,
+            "two adapter revision tokens share the caller's atomic commit"
+        );
         assert_eq!(commit.stats.deleted_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_final_puts_rotate_observable_revision_by_target_space() {
+        let storage = crate::storage_adapter::StorageAdapter::new(Memory::new());
+        let private = crate::sync::PARTIAL_READ_INTEREST_SPACE;
+        let mut private_writes = StorageWriteSet::new();
+        private_writes
+            .stage_deferred_final_put_source(Box::new(OneDeferredPutSource {
+                space: private,
+                emitted: false,
+            }))
+            .unwrap();
+        storage
+            .commit_write_set(private_writes, WriteOptions::default())
+            .await
+            .expect("deferred private put");
+        assert!(storage.load_mutation_revision().await.unwrap().is_some());
+        assert_eq!(storage.load_observable_revision().await.unwrap(), None);
+
+        let mut visible_writes = StorageWriteSet::new();
+        visible_writes
+            .stage_deferred_final_put_source(Box::new(OneDeferredPutSource {
+                space: space(),
+                emitted: false,
+            }))
+            .unwrap();
+        storage
+            .commit_write_set(visible_writes, WriteOptions::default())
+            .await
+            .expect("deferred visible put");
+        assert!(storage.load_observable_revision().await.unwrap().is_some());
     }
 
     #[test]

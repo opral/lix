@@ -4604,11 +4604,18 @@ pub(super) fn row_system_column_array(
         "file_id" => {
             Arc::new(StringArray::from_iter(rows.iter().map(|row| row.file_id()))) as ArrayRef
         }
-        "metadata" => Arc::new(StringArray::from_iter(rows.iter().map(|row| {
-            row.metadata()
-                .map(AsRef::<str>::as_ref)
-                .map(crate::serialize_row_metadata)
-        }))) as ArrayRef,
+        "metadata" => {
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.metadata()
+                        .map(AsRef::<str>::as_ref)
+                        .map(jsonb_sql_equality_key)
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StringArray::from(values)) as ArrayRef
+        }
         "created_at" => Arc::new(StringArray::from_iter(
             rows.iter().map(|row| Some(row.created_at().to_string())),
         )) as ArrayRef,
@@ -4828,7 +4835,9 @@ pub(super) fn row_json_text_value(
         (SchemaColumnType::String, Some(JsonValue::String(value))) => Some(value.clone()),
         (SchemaColumnType::String, Some(other)) => Some(json_to_string(other)?),
         (SchemaColumnType::RowRef, Some(JsonValue::String(value))) => Some(value.clone()),
-        (SchemaColumnType::Jsonb, Some(other)) => Some(json_to_string(other)?),
+        (SchemaColumnType::Jsonb, Some(other)) => {
+            Some(jsonb_sql_equality_key(&json_to_string(other)?)?)
+        }
         _ => None,
     })
 }
@@ -4851,6 +4860,12 @@ pub(super) fn row_f64_value(
 
 fn json_to_string(value: &JsonValue) -> Result<String> {
     Ok(crate::common::Json::from(value).to_string())
+}
+
+fn jsonb_sql_equality_key(value: &str) -> Result<String> {
+    crate::common::metadata_sql_equality_key(value).map_err(|error| {
+        DataFusionError::Execution(format!("invalid JSONB SQL equality key: {error}"))
+    })
 }
 
 #[cfg(test)]
@@ -5719,37 +5734,35 @@ mod tests {
             r#"{"body":"staged winner"}"#
         );
         {
-        let requests = reader.requests.lock().expect("request lock");
-        assert!(
-            requests.len() > 2,
-            "short pages should expand the next read"
-        );
-        assert_eq!(requests[0].filter.row_pks.len(), 3);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE)
-        );
-        // The last chunk contains only the remaining keys and can be shorter
-        // than the preceding chunk, even though the adaptive target grows.
-        assert!(
-            requests[..requests.len() - 1]
-                .windows(2)
-                .all(|pair| { pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len() })
-        );
-        assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.filter.row_pks.len())
-                .sum::<usize>(),
-            candidates.len()
-        );
-        assert!(requests.iter().all(|request| request.limit.is_none()));
-        assert!(
-            requests
-                .iter()
-                .all(|request| { request.filter.file_ids == vec![crate::NullableKeyFilter::Null] })
-        );
+            let requests = reader.requests.lock().expect("request lock");
+            assert!(
+                requests.len() > 2,
+                "short pages should expand the next read"
+            );
+            assert_eq!(requests[0].filter.row_pks.len(), 3);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE)
+            );
+            // The last chunk contains only the remaining keys and can be shorter
+            // than the preceding chunk, even though the adaptive target grows.
+            assert!(
+                requests[..requests.len() - 1]
+                    .windows(2)
+                    .all(|pair| { pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len() })
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.filter.row_pks.len())
+                    .sum::<usize>(),
+                candidates.len()
+            );
+            assert!(requests.iter().all(|request| request.limit.is_none()));
+            assert!(requests.iter().all(|request| {
+                request.filter.file_ids == vec![crate::NullableKeyFilter::Null]
+            }));
         }
 
         let insufficient = recheck_unordered_limit_candidates(
@@ -5999,7 +6012,10 @@ mod tests {
             .expect("plan the zero-column count scan");
         assert_eq!(
             datafusion::physical_plan::statistics::StatisticsContext::new()
-                .compute(scan.as_ref(), &datafusion::physical_plan::statistics::StatisticsArgs::new())
+                .compute(
+                    scan.as_ref(),
+                    &datafusion::physical_plan::statistics::StatisticsArgs::new()
+                )
                 .expect("count scan statistics should be available")
                 .num_rows,
             Precision::Exact(7)

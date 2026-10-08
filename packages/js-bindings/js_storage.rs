@@ -66,6 +66,22 @@ extern "C" {
     #[wasm_bindgen(method, js_name = getMany)]
     fn get_many(this: &JsStorageReadHandle, requests: JsValue) -> js_sys::Promise;
 
+    #[wasm_bindgen(method, js_name = getManyBounded)]
+    fn get_many_bounded(
+        this: &JsStorageReadHandle,
+        requests: JsValue,
+        budget: JsValue,
+    ) -> js_sys::Promise;
+
+    #[wasm_bindgen(method, js_name = getManyBoundedPrefix)]
+    fn get_many_bounded_prefix(
+        this: &JsStorageReadHandle,
+        requests: JsValue,
+        offset: usize,
+        max_slots: usize,
+        budget: JsValue,
+    ) -> js_sys::Promise;
+
     #[wasm_bindgen(method, js_name = beginScan)]
     fn begin_scan(
         this: &JsStorageReadHandle,
@@ -79,6 +95,13 @@ extern "C" {
 
     #[wasm_bindgen(method, js_name = nextPage)]
     fn next_page(this: &JsStorageScanHandle, limit_rows: usize) -> js_sys::Promise;
+
+    #[wasm_bindgen(method, js_name = nextPageBounded)]
+    fn next_page_bounded(
+        this: &JsStorageScanHandle,
+        limit_rows: usize,
+        budget: JsValue,
+    ) -> js_sys::Promise;
 
     #[derive(Clone)]
     type JsStorageWriteHandle;
@@ -216,6 +239,21 @@ struct GetManyRequestDto {
     space: StorageSpaceDto,
     keys: Vec<ByteDto>,
     options: GetOptionsDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadBudgetDto {
+    max_result_bytes: usize,
+    max_single_value_bytes: usize,
+}
+impl From<lix::storage::ReadBudget> for ReadBudgetDto {
+    fn from(value: lix::storage::ReadBudget) -> Self {
+        Self {
+            max_result_bytes: value.max_result_bytes,
+            max_single_value_bytes: value.max_single_value_bytes,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -522,6 +560,108 @@ impl StorageRead for JsStorageRead {
         ))
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: lix::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        let expected_values = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>();
+        let requests = requests
+            .iter()
+            .map(|request| GetManyRequestDto {
+                space: storage_space_dto(request.space),
+                keys: request
+                    .keys
+                    .iter()
+                    .map(|key| ByteDto(key.0.to_vec()))
+                    .collect(),
+                options: GetOptionsDto {
+                    projection: projection_name(request.opts.projection),
+                },
+            })
+            .collect::<Vec<_>>();
+        let requests = to_js(&requests, "get-many requests")?;
+        let values = SendJsFuture(JsFuture::from(self.handle.0.get_many_bounded(
+            requests,
+            to_js(&ReadBudgetDto::from(budget), "read budget")?,
+        )))
+        .await
+        .map_err(storage_error)?;
+        let values: Vec<Option<ProjectedValueDto>> = from_js(values, "get-many result")?;
+        if values.len() != expected_values {
+            return Err(StorageError::Corruption(format!(
+                "JS storage get-many returned {} values for {expected_values} requested keys",
+                values.len()
+            )));
+        }
+        let result = GetManyResult::new(
+            values
+                .into_iter()
+                .map(|value| value.map(projected_value))
+                .collect(),
+        );
+        budget.validate_result(&result.values)?;
+        Ok(result)
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> Result<lix::storage::GetManyPrefixResult, StorageError> {
+        let (window, total) = lix::storage::bounded_prefix_requests(requests, offset, max_slots)?;
+        let requests = window
+            .iter()
+            .map(|request| GetManyRequestDto {
+                space: storage_space_dto(request.space),
+                keys: request
+                    .keys
+                    .iter()
+                    .map(|key| ByteDto(key.0.to_vec()))
+                    .collect(),
+                options: GetOptionsDto {
+                    projection: projection_name(request.opts.projection),
+                },
+            })
+            .collect::<Vec<_>>();
+        let value = SendJsFuture(JsFuture::from(self.handle.0.get_many_bounded_prefix(
+            to_js(&requests, "prefix requests")?,
+            0,
+            max_slots,
+            to_js(&ReadBudgetDto::from(budget), "prefix budget")?,
+        )))
+        .await
+        .map_err(storage_error)?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            values: Vec<Option<ProjectedValueDto>>,
+            next_offset: Option<usize>,
+        }
+        let page: Page = from_js(value, "point prefix")?;
+        let window_slots = window
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>();
+        if page.values.len() > window_slots
+            || page.next_offset != (page.values.len() < window_slots).then_some(page.values.len())
+        {
+            return Err(StorageError::InvalidCursor);
+        }
+        let values = page
+            .values
+            .into_iter()
+            .map(|value| value.map(projected_value))
+            .collect::<Vec<_>>();
+        budget.validate_result(&values)?;
+        lix::storage::GetManyPrefixResult::new(values, offset, total)
+    }
+
     async fn begin_scan(
         &self,
         space: StorageSpace,
@@ -565,6 +705,31 @@ impl StorageScanSource for JsStorageScanSource {
             let page = SendJsFuture(JsFuture::from(self.handle.0.next_page(limit_rows)))
                 .await
                 .map_err(storage_error)?;
+            let page: ScanChunkDto = from_js(page, "scan page")?;
+            Ok(ScanChunk::new(
+                page.entries
+                    .into_iter()
+                    .map(|entry| ReadEntry {
+                        key: Key(Bytes::from(entry.key)),
+                        value: projected_value(entry.value),
+                    })
+                    .collect(),
+                page.has_more,
+            ))
+        })
+    }
+    fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let page = SendJsFuture(JsFuture::from(self.handle.0.next_page_bounded(
+                limit_rows,
+                to_js(&ReadBudgetDto::from(budget), "scan budget")?,
+            )))
+            .await
+            .map_err(storage_error)?;
             let page: ScanChunkDto = from_js(page, "scan page")?;
             Ok(ScanChunk::new(
                 page.entries
@@ -810,6 +975,12 @@ fn storage_error(error: JsValue) -> StorageError {
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "JavaScript storage operation failed".to_string());
     match code.as_deref() {
+        Some("LIX_STORAGE_READ_BUDGET_EXCEEDED") => {
+            StorageError::ReadBudgetExceeded { singleton: false }
+        }
+        Some("LIX_STORAGE_SINGLE_VALUE_BUDGET_EXCEEDED") => {
+            StorageError::ReadBudgetExceeded { singleton: true }
+        }
         Some("LIX_STORAGE_INVALID_KEY") => StorageError::InvalidKey,
         Some("LIX_STORAGE_INVALID_CURSOR") => StorageError::InvalidCursor,
         Some("LIX_STORAGE_READ_EXPIRED") => StorageError::ReadExpired,

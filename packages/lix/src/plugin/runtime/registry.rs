@@ -7,18 +7,20 @@
 //! scan.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use globset::{GlobSet, GlobSetBuilder};
 use lru::LruCache;
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchHeadControl;
 use crate::changelog::{ChangeRecordProjection, CommitId};
-use crate::hot_state::MaterializedHotStateRow;
+use crate::hot_state::{MaterializedHotStateRow, MaterializedHotStateRowRef};
 use crate::row_pk::RowPk;
 use crate::tracked_state::{
     MaterializedTrackedStateRowRef, TrackedStateFilter, TrackedStateReadColumns,
@@ -37,12 +39,26 @@ use super::{InstalledPlugin, PluginCapabilities};
 pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v2";
 pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
+pub(crate) const MAX_PLUGIN_REGISTRY_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PLUGIN_REGISTRY_DURABLE_ROW_BYTES: usize = 16 * 1024 * 1024;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 6;
 const PLUGIN_FILE_OWNER_FORMAT_VERSION: u32 = 2;
+const MAX_PLUGIN_OWNER_SCHEMA_KEYS: usize = super::manifest::MAX_PLUGIN_SCHEMA_KEYS;
+const MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES: usize = super::manifest::MAX_PLUGIN_SCHEMA_KEY_BYTES;
+const MAX_PLUGIN_ARCHIVE_FILE_ID_BYTES: usize = 36;
+const MAX_PLUGIN_ARCHIVE_PATH_BYTES: usize = 152;
+const MAX_PLUGIN_API_VERSION_BYTES: usize = 16;
+const MAX_PLUGIN_MANIFEST_STRING_BYTES: usize = super::manifest::MAX_PLUGIN_MANIFEST_BYTES;
+pub(crate) const MAX_PLUGIN_OWNER_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static REGISTRY_ENTRY_DESERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Install-time data used to construct one canonical registry entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,20 +87,31 @@ pub(crate) struct PluginRegistryEntryInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginRegistryEntry {
+    #[serde(deserialize_with = "deserialize_registry_key")]
     key: String,
     runtime: PluginRuntime,
+    #[serde(deserialize_with = "deserialize_api_version")]
     api_version: String,
     capabilities: PluginCapabilities,
+    #[serde(default, deserialize_with = "deserialize_optional_path_glob")]
     path_glob: Option<String>,
     #[serde(deserialize_with = "deserialize_required_content")]
     content: Option<PluginContentMatcher>,
+    #[serde(default, deserialize_with = "deserialize_optional_plugin_entry")]
     entry: Option<String>,
+    #[serde(deserialize_with = "super::manifest::deserialize_plugin_schema_keys")]
     schema_keys: Vec<String>,
+    #[serde(deserialize_with = "super::manifest::deserialize_plugin_schema_keys")]
     create_schema_keys: Vec<String>,
+    #[serde(deserialize_with = "deserialize_manifest_json")]
     manifest_json: String,
+    #[serde(deserialize_with = "deserialize_archive_file_id")]
     archive_file_id: String,
+    #[serde(deserialize_with = "deserialize_archive_path")]
     archive_path: String,
+    #[serde(deserialize_with = "deserialize_archive_hash")]
     archive_blob_hash: String,
+    #[serde(default, deserialize_with = "deserialize_optional_wasm_hash")]
     wasm_blob_hash: Option<String>,
 }
 
@@ -97,8 +124,163 @@ where
     Option::<PluginContentMatcher>::deserialize(deserializer)
 }
 
+fn deserialize_registry_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, 128>(deserializer)
+}
+
+fn deserialize_api_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, MAX_PLUGIN_API_VERSION_BYTES>(
+        deserializer,
+    )
+}
+
+fn deserialize_optional_path_glob<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_optional_bounded_plugin_string::<D, 1024>(deserializer)
+}
+
+fn deserialize_optional_plugin_entry<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_optional_bounded_plugin_string::<D, 512>(deserializer)
+}
+
+fn deserialize_manifest_json<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, MAX_PLUGIN_MANIFEST_STRING_BYTES>(
+        deserializer,
+    )
+}
+
+fn deserialize_archive_file_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, MAX_PLUGIN_ARCHIVE_FILE_ID_BYTES>(
+        deserializer,
+    )
+}
+
+fn deserialize_archive_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, MAX_PLUGIN_ARCHIVE_PATH_BYTES>(
+        deserializer,
+    )
+}
+
+fn deserialize_archive_hash<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, 64>(deserializer)
+}
+
+fn deserialize_optional_wasm_hash<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_optional_bounded_plugin_string::<D, 64>(deserializer)
+}
+
+fn validate_registry_entry_limits(
+    key: &str,
+    api_version: &str,
+    path_glob: Option<&str>,
+    entry: Option<&str>,
+    schema_keys: &[String],
+    create_schema_keys: &[String],
+    manifest_json: &str,
+    archive_file_id: &str,
+    archive_path: &str,
+    archive_blob_hash: &str,
+    wasm_blob_hash: Option<&str>,
+) -> Result<(), LixError> {
+    for (field, value, max_bytes) in [
+        ("key", key, 128),
+        ("api_version", api_version, MAX_PLUGIN_API_VERSION_BYTES),
+        (
+            "path_glob",
+            path_glob.unwrap_or_default(),
+            if path_glob.is_some() { 1024 } else { 0 },
+        ),
+        (
+            "entry",
+            entry.unwrap_or_default(),
+            if entry.is_some() { 512 } else { 0 },
+        ),
+        (
+            "manifest_json",
+            manifest_json,
+            MAX_PLUGIN_MANIFEST_STRING_BYTES,
+        ),
+        (
+            "archive_file_id",
+            archive_file_id,
+            MAX_PLUGIN_ARCHIVE_FILE_ID_BYTES,
+        ),
+        ("archive_path", archive_path, MAX_PLUGIN_ARCHIVE_PATH_BYTES),
+        ("archive_blob_hash", archive_blob_hash, 64),
+        (
+            "wasm_blob_hash",
+            wasm_blob_hash.unwrap_or_default(),
+            if wasm_blob_hash.is_some() { 64 } else { 0 },
+        ),
+    ] {
+        if value.len() > max_bytes {
+            return Err(invalid_registry(format!(
+                "plugin {field} exceeds its {max_bytes}-byte bound"
+            )));
+        }
+    }
+    for (field, keys) in [
+        ("schema_keys", schema_keys),
+        ("create_schema_keys", create_schema_keys),
+    ] {
+        if keys.len() > MAX_PLUGIN_OWNER_SCHEMA_KEYS {
+            return Err(invalid_registry(format!(
+                "plugin {field} exceeds its {MAX_PLUGIN_OWNER_SCHEMA_KEYS}-item bound"
+            )));
+        }
+        if keys
+            .iter()
+            .any(|key| key.len() > MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES)
+        {
+            return Err(invalid_registry(format!(
+                "plugin {field} contains a key exceeding its {MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES}-byte bound"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl PluginRegistryEntry {
     pub(crate) fn new(input: PluginRegistryEntryInput) -> Result<Self, LixError> {
+        validate_registry_entry_limits(
+            &input.key,
+            &input.api_version,
+            input.path_glob.as_deref(),
+            input.entry.as_deref(),
+            &input.schema_keys,
+            &input.create_schema_keys,
+            &input.manifest_json,
+            &input.archive_file_id,
+            &input.archive_path,
+            &input.archive_blob_hash,
+            input.wasm_blob_hash.as_deref(),
+        )?;
         let manifest_json =
             canonicalize_json_text(&input.manifest_json, "plugin registry manifest_json")?;
         parse_plugin_manifest_json(&manifest_json)?;
@@ -255,8 +437,72 @@ pub(crate) struct PluginRegistry {
 struct PluginRegistryWire {
     version: u32,
     plugin_count: u32,
+    #[serde(deserialize_with = "deserialize_registry_generation")]
     generation: String,
+    #[serde(deserialize_with = "deserialize_registry_entries")]
     plugins: Vec<PluginRegistryEntry>,
+}
+
+fn deserialize_registry_generation<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    super::manifest::deserialize_bounded_plugin_string::<D, 64>(deserializer)
+}
+
+fn deserialize_registry_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PluginRegistryEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RegistryEntriesVisitor;
+
+    impl<'de> Visitor<'de> for RegistryEntriesVisitor {
+        type Value = Vec<PluginRegistryEntry>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_PLUGIN_REGISTRY_ENTRIES} plugin entries"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(length) = sequence
+                .size_hint()
+                .filter(|length| *length > MAX_PLUGIN_REGISTRY_ENTRIES)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "plugin entry count {length} exceeds {MAX_PLUGIN_REGISTRY_ENTRIES}"
+                )));
+            }
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or_default()
+                .min(MAX_PLUGIN_REGISTRY_ENTRIES);
+            let mut entries = Vec::with_capacity(capacity);
+            while entries.len() < MAX_PLUGIN_REGISTRY_ENTRIES {
+                let Some(entry) = sequence.next_element()? else {
+                    return Ok(entries);
+                };
+                #[cfg(test)]
+                REGISTRY_ENTRY_DESERIALIZATIONS.with(|count| count.set(count.get() + 1));
+                entries.push(entry);
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "plugin entry count exceeds {MAX_PLUGIN_REGISTRY_ENTRIES}"
+                )));
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(RegistryEntriesVisitor)
 }
 
 #[derive(Serialize)]
@@ -389,9 +635,18 @@ impl PluginRegistry {
         let Some(value) = value else {
             return Ok(Self::empty());
         };
-        let wire: PluginRegistryWire = serde_json::from_value(value.clone()).map_err(|error| {
+        let wire = PluginRegistryWire::deserialize(value).map_err(|error| {
             invalid_registry(format!("registry payload has an invalid shape: {error}"))
         })?;
+        Self::from_wire(wire)
+    }
+
+    fn from_jsonb_value(value: &lix_schema::Jsonb) -> Result<Self, LixError> {
+        let wire = value
+            .deserialize_into::<PluginRegistryWire>()
+            .map_err(|error| {
+                invalid_registry(format!("registry payload has an invalid shape: {error}"))
+            })?;
         Self::from_wire(wire)
     }
 
@@ -405,7 +660,7 @@ impl PluginRegistry {
     }
 
     pub(crate) fn from_optional_hot_state_row(
-        row: Option<crate::hot_state::MaterializedHotStateRowRef<'_>>,
+        row: Option<MaterializedHotStateRowRef<'_>>,
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let Some(row) = row else {
@@ -416,6 +671,31 @@ impl PluginRegistry {
         validate_hot_state_identity_ref(row, PLUGIN_REGISTRY_KEY, None, branch_id, false)?;
         if row.deleted() {
             return Ok(Self::empty());
+        }
+        let snapshot_bytes = row
+            .snapshot_content()
+            .map(|snapshot| snapshot.as_str().len())
+            .or_else(|| row.raw_snapshot().map(|snapshot| snapshot.len()))
+            .unwrap_or(0);
+        if snapshot_bytes > MAX_PLUGIN_REGISTRY_SNAPSHOT_BYTES {
+            return Err(invalid_registry(
+                "plugin registry snapshot exceeds its byte bound",
+            ));
+        }
+        if let Some(raw) = row.raw_snapshot() {
+            if raw.len() > MAX_PLUGIN_REGISTRY_DURABLE_ROW_BYTES {
+                return Err(invalid_registry(
+                    "plugin registry durable row exceeds its byte bound",
+                ));
+            }
+            let typed = crate::plugin::runtime::WasmTypedRow::decode_durable_payload_bounded(
+                Arc::from(raw.as_ref()),
+                KEY_VALUE_SCHEMA_KEY,
+                row.row_pk(),
+                MAX_PLUGIN_REGISTRY_DURABLE_ROW_BYTES,
+            )
+            .map(Arc::new)?;
+            return Self::from_typed_key_value_row(&typed, PLUGIN_REGISTRY_KEY);
         }
         // Staged mutations retain native durable bytes without necessarily
         // caching a decoded serving view. This is still typed input.
@@ -438,14 +718,14 @@ impl PluginRegistry {
             }
         }
         let value = match row.row.get("value") {
-            Some(lix_schema::Value::Jsonb(value)) => value.as_value(),
+            Some(lix_schema::Value::Jsonb(value)) => value,
             _ => {
                 return Err(invalid_registry(
                     "typed plugin registry row has no JSONB value",
                 ));
             }
         };
-        Self::from_optional_value(Some(value))
+        Self::from_jsonb_value(value)
     }
 
     pub(crate) fn to_value(&self) -> Result<JsonValue, LixError> {
@@ -653,7 +933,9 @@ pub(crate) struct PluginFileOwner {
 #[serde(deny_unknown_fields)]
 struct PluginFileOwnerValue {
     version: u32,
+    #[serde(deserialize_with = "deserialize_registry_key")]
     plugin_key: String,
+    #[serde(deserialize_with = "super::manifest::deserialize_plugin_schema_keys")]
     schema_keys: Vec<String>,
 }
 
@@ -663,6 +945,7 @@ impl PluginFileOwner {
         plugin_key: impl Into<String>,
         mut schema_keys: Vec<String>,
     ) -> Result<Self, LixError> {
+        validate_plugin_owner_schema_keys(&schema_keys)?;
         schema_keys.sort();
         let owner = Self {
             file_id: file_id.into(),
@@ -716,7 +999,68 @@ impl PluginFileOwner {
         if row.deleted {
             return Ok(None);
         }
+        if row
+            .snapshot_content
+            .as_deref()
+            .is_none_or(|raw| raw.len() > MAX_PLUGIN_OWNER_SNAPSHOT_BYTES)
+        {
+            return Err(invalid_registry(
+                "plugin owner snapshot is missing or exceeds its byte bound",
+            ));
+        }
         let snapshot = parse_snapshot_content(row, "plugin owner")?;
+        Self::from_snapshot(file_id, &snapshot).map(Some)
+    }
+
+    pub(crate) fn from_hot_state_row_ref(
+        row: MaterializedHotStateRowRef<'_>,
+        branch_id: &str,
+        untracked: bool,
+    ) -> Result<Option<Self>, LixError> {
+        let file_id = row.file_id().ok_or_else(|| {
+            invalid_registry("plugin owner row is missing its file_id storage identity")
+        })?;
+        validate_hot_state_identity_ref(
+            row,
+            PLUGIN_OWNER_KEY,
+            Some(file_id),
+            branch_id,
+            untracked,
+        )?;
+        if row.deleted() {
+            return Ok(None);
+        }
+        if let Some(raw) = row.raw_snapshot() {
+            if raw.len() > MAX_PLUGIN_OWNER_SNAPSHOT_BYTES {
+                return Err(invalid_registry(
+                    "plugin owner durable row exceeds its byte bound",
+                ));
+            }
+            let typed = crate::plugin::runtime::WasmTypedRow::decode_durable_payload_bounded(
+                Arc::from(raw.as_ref()),
+                KEY_VALUE_SCHEMA_KEY,
+                row.row_pk(),
+                MAX_PLUGIN_OWNER_SNAPSHOT_BYTES,
+            )
+            .map_err(|error| {
+                invalid_registry(format!("plugin owner typed row is invalid: {error}"))
+            })?;
+            return Self::from_typed_row(file_id, &typed).map(Some);
+        }
+        let raw = row
+            .snapshot_content()
+            .ok_or_else(|| {
+                invalid_registry("plugin owner live-state row is missing snapshot_content")
+            })?
+            .as_str();
+        if raw.len() > MAX_PLUGIN_OWNER_SNAPSHOT_BYTES {
+            return Err(invalid_registry(
+                "plugin owner snapshot exceeds its byte bound",
+            ));
+        }
+        let snapshot = serde_json::from_str(raw).map_err(|error| {
+            invalid_registry(format!("plugin owner snapshot is invalid JSON: {error}"))
+        })?;
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 
@@ -738,10 +1082,13 @@ impl PluginFileOwner {
         if let Some(typed) = row.decoded_snapshot.as_deref() {
             return Self::from_typed_row(file_id, typed).map(Some);
         }
-        let snapshot = serde_json::from_str(
-            row.snapshot_content.as_deref().expect("checked above"),
-        )
-        .map_err(|error| {
+        let raw = row.snapshot_content.as_deref().expect("checked above");
+        if raw.len() > MAX_PLUGIN_OWNER_SNAPSHOT_BYTES {
+            return Err(invalid_registry(
+                "plugin owner snapshot exceeds its byte bound",
+            ));
+        }
+        let snapshot = serde_json::from_str(raw).map_err(|error| {
             invalid_registry(format!(
                 "tracked plugin owner snapshot is invalid JSON: {error}"
             ))
@@ -777,12 +1124,12 @@ impl PluginFileOwner {
     ) -> Result<Self, LixError> {
         let file_id = file_id.into();
         let value = decode_key_value_snapshot(snapshot, PLUGIN_OWNER_KEY)?;
-        let owner_value: PluginFileOwnerValue =
-            serde_json::from_value(value.clone()).map_err(|error| {
-                invalid_registry(format!(
-                    "plugin owner payload has an invalid shape: {error}"
-                ))
-            })?;
+        validate_plugin_owner_value_bound(value)?;
+        let owner_value = PluginFileOwnerValue::deserialize(value).map_err(|error| {
+            invalid_registry(format!(
+                "plugin owner payload has an invalid shape: {error}"
+            ))
+        })?;
         if owner_value.version != PLUGIN_FILE_OWNER_FORMAT_VERSION {
             return Err(invalid_registry(format!(
                 "plugin owner version {} is unsupported; expected {PLUGIN_FILE_OWNER_FORMAT_VERSION}",
@@ -801,16 +1148,25 @@ impl PluginFileOwner {
             _ => return Err(invalid_registry("typed plugin owner row has the wrong key")),
         }
         let value = match row.row.get("value") {
-            Some(lix_schema::Value::Jsonb(value)) => value.as_value().clone(),
+            Some(lix_schema::Value::Jsonb(value)) => value,
             _ => {
                 return Err(invalid_registry(
                     "typed plugin owner row has no JSONB value",
                 ));
             }
         };
-        let owner_value: PluginFileOwnerValue = serde_json::from_value(value).map_err(|error| {
-            invalid_registry(format!("typed plugin owner value is invalid: {error}"))
-        })?;
+        Self::from_jsonb_value(file_id, value)
+    }
+
+    fn from_jsonb_value(
+        file_id: impl Into<String>,
+        value: &lix_schema::Jsonb,
+    ) -> Result<Self, LixError> {
+        let owner_value = value
+            .deserialize_into::<PluginFileOwnerValue>()
+            .map_err(|error| {
+                invalid_registry(format!("typed plugin owner value is invalid: {error}"))
+            })?;
         if owner_value.version != PLUGIN_FILE_OWNER_FORMAT_VERSION {
             return Err(invalid_registry(format!(
                 "plugin owner version {} is unsupported; expected {PLUGIN_FILE_OWNER_FORMAT_VERSION}",
@@ -1085,6 +1441,19 @@ impl PluginCatalogCache {
 }
 
 fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
+    validate_registry_entry_limits(
+        &entry.key,
+        &entry.api_version,
+        entry.path_glob.as_deref(),
+        entry.entry.as_deref(),
+        &entry.schema_keys,
+        &entry.create_schema_keys,
+        &entry.manifest_json,
+        &entry.archive_file_id,
+        &entry.archive_path,
+        &entry.archive_blob_hash,
+        entry.wasm_blob_hash.as_deref(),
+    )?;
     if !valid_plugin_key(&entry.key) {
         return Err(invalid_registry(format!(
             "plugin key '{}' is invalid",
@@ -1380,7 +1749,7 @@ fn validate_hot_state_identity(
 }
 
 fn validate_hot_state_identity_ref(
-    row: crate::hot_state::MaterializedHotStateRowRef<'_>,
+    row: MaterializedHotStateRowRef<'_>,
     key: &str,
     expected_file_id: Option<&str>,
     branch_id: &str,
@@ -1423,6 +1792,63 @@ fn parse_snapshot_content(
     })?;
     serde_json::from_str(raw)
         .map_err(|error| invalid_registry(format!("{kind} snapshot is invalid JSON: {error}")))
+}
+
+fn validate_plugin_owner_value_bound(value: &JsonValue) -> Result<(), LixError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid_registry("plugin owner payload has an invalid shape"))?;
+    if object.len() != 3
+        || !object.contains_key("version")
+        || !object.contains_key("plugin_key")
+        || !object.contains_key("schema_keys")
+    {
+        return Err(invalid_registry(
+            "plugin owner payload has an invalid shape",
+        ));
+    }
+    if object
+        .get("plugin_key")
+        .and_then(JsonValue::as_str)
+        .is_none_or(|key| key.len() > 128)
+    {
+        return Err(invalid_registry("plugin owner key exceeds its byte bound"));
+    }
+    let schema_keys = object
+        .get("schema_keys")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| invalid_registry("plugin owner schema_keys has an invalid shape"))?;
+    if schema_keys.is_empty() || schema_keys.len() > MAX_PLUGIN_OWNER_SCHEMA_KEYS {
+        return Err(invalid_registry(
+            "plugin owner schema_keys exceeds its item bound",
+        ));
+    }
+    if schema_keys.iter().any(|key| {
+        key.as_str()
+            .is_none_or(|key| key.is_empty() || key.len() > MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES)
+    }) {
+        return Err(invalid_registry(
+            "plugin owner schema key is missing or exceeds its byte bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_owner_schema_keys(schema_keys: &[String]) -> Result<(), LixError> {
+    if schema_keys.is_empty() || schema_keys.len() > MAX_PLUGIN_OWNER_SCHEMA_KEYS {
+        return Err(invalid_registry(
+            "plugin owner schema_keys exceeds its item bound",
+        ));
+    }
+    if schema_keys
+        .iter()
+        .any(|key| key.is_empty() || key.len() > MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES)
+    {
+        return Err(invalid_registry(
+            "plugin owner schema key is missing or exceeds its byte bound",
+        ));
+    }
+    Ok(())
 }
 
 fn glob_specificity_rank(glob: &str) -> (u8, i32) {
@@ -1492,6 +1918,45 @@ mod tests {
 
     fn entry(key: &str, path_glob: &str, hash_byte: char) -> PluginRegistryEntry {
         entry_with_content(key, path_glob, None, hash_byte)
+    }
+
+    fn entry_with_full_schema_set(key: &str, hash_byte: char) -> PluginRegistryEntry {
+        let schema_keys = (0..MAX_PLUGIN_OWNER_SCHEMA_KEYS)
+            .map(|index| {
+                let prefix = format!("{key}/schema/{index:02}/");
+                format!(
+                    "{prefix}{}",
+                    "s".repeat(MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES - prefix.len())
+                )
+            })
+            .collect::<Vec<_>>();
+        let manifest_json = serde_json::json!({
+            "key": key,
+            "file_match": { "path_glob": "*.json" },
+            "entry": "plugin.wasm",
+            "schemas": &schema_keys,
+        })
+        .to_string();
+        PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: key.to_owned(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "2.0.0".to_owned(),
+            capabilities: PluginCapabilities {
+                column_merger: true,
+                file_projection: true,
+            },
+            path_glob: Some("*.json".to_owned()),
+            content: None,
+            entry: Some("plugin.wasm".to_owned()),
+            schema_keys: schema_keys.clone(),
+            create_schema_keys: schema_keys,
+            manifest_json,
+            archive_file_id: plugin_storage_archive_file_id(key),
+            archive_path: plugin_storage_archive_path(key),
+            archive_blob_hash: hash(hash_byte),
+            wasm_blob_hash: Some(hash(hash_byte)),
+        })
+        .expect("max-schema test registry entry should be valid")
     }
 
     fn entry_with_content(
@@ -1681,6 +2146,279 @@ mod tests {
         assert_eq!(decoded, first);
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RegistryProfileMode {
+        All,
+        Dom,
+        Direct,
+        Binary,
+    }
+
+    fn registry_profile_mode() -> RegistryProfileMode {
+        match std::env::var("LIX_REGISTRY_PROFILE_MODE").as_deref() {
+            Ok("dom") => RegistryProfileMode::Dom,
+            Ok("direct") => RegistryProfileMode::Direct,
+            Ok("binary") => RegistryProfileMode::Binary,
+            Ok("all") | Err(_) => RegistryProfileMode::All,
+            Ok(value) => panic!(
+                "LIX_REGISTRY_PROFILE_MODE must be all, dom, direct, or binary; got {value:?}"
+            ),
+        }
+    }
+
+    fn registry_profile_iterations(default: usize) -> usize {
+        let iterations = std::env::var("LIX_REGISTRY_PROFILE_ITERATIONS")
+            .map(|value| {
+                value.parse::<usize>().unwrap_or_else(|error| {
+                    panic!("LIX_REGISTRY_PROFILE_ITERATIONS must be a positive integer: {error}")
+                })
+            })
+            .unwrap_or(default);
+        assert!(iterations > 0, "profile iterations must be positive");
+        iterations
+    }
+
+    fn registry_profile_runs(selected: RegistryProfileMode, phase: RegistryProfileMode) -> bool {
+        selected == RegistryProfileMode::All || selected == phase
+    }
+
+    #[test]
+    fn registry_dom_clone_and_typed_jsonb_decode_profile() {
+        let registry = PluginRegistry::new(
+            (0..MAX_PLUGIN_REGISTRY_ENTRIES)
+                .map(|index| {
+                    let key = format!("plugin_{index:03}");
+                    entry_with_full_schema_set(&key, 'a')
+                })
+                .collect(),
+        )
+        .expect("maximum-sized profile registry should be valid");
+        let value = registry.to_value().unwrap();
+        let canonical_bytes = canonical_json(&value).into_bytes();
+        let canonical_jsonb =
+            lix_schema::Jsonb::from_canonical_text_vec(canonical_bytes.clone()).unwrap();
+        let value_jsonb = lix_schema::Jsonb::from_value(value.clone());
+        let binary = value_jsonb.binary().unwrap().into_owned();
+        let binary_jsonb = lix_schema::Jsonb::from_binary(binary.into()).unwrap();
+
+        let selected = registry_profile_mode();
+        let iterations = registry_profile_iterations(3);
+
+        if registry_profile_runs(selected, RegistryProfileMode::Dom) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                let wire = serde_json::from_value::<PluginRegistryWire>(value.clone()).unwrap();
+                assert_eq!(PluginRegistry::from_wire(wire).unwrap(), registry);
+            }
+            eprintln!(
+                "registry decode profile: mode=dom, entries={}, canonical_bytes={}, iterations={iterations}, elapsed={:?}",
+                registry.plugins.len(),
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+
+        if registry_profile_runs(selected, RegistryProfileMode::Direct) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                assert_eq!(
+                    PluginRegistry::from_jsonb_value(&canonical_jsonb).unwrap(),
+                    registry
+                );
+            }
+            eprintln!(
+                "registry decode profile: mode=direct, entries={}, canonical_bytes={}, iterations={iterations}, elapsed={:?}",
+                registry.plugins.len(),
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+
+        if registry_profile_runs(selected, RegistryProfileMode::Binary) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                assert_eq!(
+                    PluginRegistry::from_jsonb_value(&binary_jsonb).unwrap(),
+                    registry
+                );
+            }
+            eprintln!(
+                "registry decode profile: mode=binary, entries={}, canonical_bytes={}, iterations={iterations}, elapsed={:?}",
+                registry.plugins.len(),
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+    }
+
+    #[test]
+    fn captured_markdown_registry_wire_decodes_with_exact_generation() {
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("testdata/actual-markdown-registry-wire.json"))
+                .unwrap();
+        let value = fixture
+            .pointer("/rows/0/0/value")
+            .expect("captured query result should contain a JSONB registry value");
+        let expected = PluginRegistry::from_optional_value(Some(value)).unwrap();
+        assert_eq!(
+            expected.generation(),
+            "a23b0eb70e4b9b009c497f0ec01256375248bee44351ead6438e228333913488"
+        );
+
+        let canonical_bytes = canonical_json(value).into_bytes();
+        let canonical_jsonb =
+            lix_schema::Jsonb::from_canonical_text_vec(canonical_bytes.clone()).unwrap();
+        let value_jsonb = lix_schema::Jsonb::from_value(value.clone());
+        let binary_jsonb =
+            lix_schema::Jsonb::from_binary(value_jsonb.binary().unwrap().into_owned().into())
+                .unwrap();
+
+        let selected = registry_profile_mode();
+        let iterations = registry_profile_iterations(200);
+
+        if registry_profile_runs(selected, RegistryProfileMode::Dom) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                let wire = serde_json::from_value::<PluginRegistryWire>(value.clone()).unwrap();
+                assert_eq!(PluginRegistry::from_wire(wire).unwrap(), expected);
+            }
+            eprintln!(
+                "captured Markdown registry profile: mode=dom, wire_bytes=1534, value_bytes={}, iterations={iterations}, elapsed={:?}",
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+
+        if registry_profile_runs(selected, RegistryProfileMode::Direct) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                assert_eq!(
+                    PluginRegistry::from_jsonb_value(&canonical_jsonb).unwrap(),
+                    expected
+                );
+            }
+            eprintln!(
+                "captured Markdown registry profile: mode=direct, wire_bytes=1534, value_bytes={}, iterations={iterations}, elapsed={:?}",
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+
+        if registry_profile_runs(selected, RegistryProfileMode::Binary) {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                assert_eq!(
+                    PluginRegistry::from_jsonb_value(&binary_jsonb).unwrap(),
+                    expected
+                );
+            }
+            eprintln!(
+                "captured Markdown registry profile: mode=binary, wire_bytes=1534, value_bytes={}, iterations={iterations}, elapsed={:?}",
+                canonical_bytes.len(),
+                started.elapsed(),
+            );
+        }
+    }
+
+    #[test]
+    fn registry_visitors_cap_plugin_and_schema_materialization() {
+        let template = serde_json::to_value(entry("plugin_a", "*.json", 'a')).unwrap();
+        let mut oversized_registry = json!({
+            "version": PLUGIN_REGISTRY_FORMAT_VERSION,
+            "plugin_count": MAX_PLUGIN_REGISTRY_ENTRIES + 1,
+            "generation": hash('a'),
+            "plugins": vec![template.clone(); MAX_PLUGIN_REGISTRY_ENTRIES + 1],
+        });
+        oversized_registry["plugins"][MAX_PLUGIN_REGISTRY_ENTRIES] = json!({
+            "unparsed_oversized_entry_sentinel": true,
+        });
+        let encoded = serde_json::to_string(&oversized_registry).unwrap();
+        REGISTRY_ENTRY_DESERIALIZATIONS.with(|count| count.set(0));
+        let error = serde_json::from_str::<PluginRegistryWire>(&encoded)
+            .expect_err("129th entry should be rejected by the bounded visitor");
+        assert!(error.to_string().contains("exceeds 128"), "{error}");
+        REGISTRY_ENTRY_DESERIALIZATIONS.with(|count| {
+            assert!(count.get() <= MAX_PLUGIN_REGISTRY_ENTRIES);
+        });
+
+        let mut oversized_schemas = template.clone();
+        oversized_schemas["schema_keys"] = json!(
+            (0..=MAX_PLUGIN_OWNER_SCHEMA_KEYS)
+                .map(|index| format!("schema_{index}"))
+                .collect::<Vec<_>>()
+        );
+        let encoded = serde_json::to_string(&oversized_schemas).unwrap();
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(0));
+        let error = serde_json::from_str::<PluginRegistryEntry>(&encoded)
+            .expect_err("65th registry schema key should be rejected");
+        assert!(error.to_string().contains("schema key count"), "{error}");
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| {
+            assert!(count.get() <= MAX_PLUGIN_OWNER_SCHEMA_KEYS);
+        });
+
+        let mut oversized_schema_string = template;
+        oversized_schema_string["schema_keys"] =
+            json!(["s".repeat(MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES + 1)]);
+        let encoded = serde_json::to_string(&oversized_schema_string).unwrap();
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(0));
+        let error = serde_json::from_str::<PluginRegistryEntry>(&encoded)
+            .expect_err("oversized registry schema key should be rejected");
+        assert!(error.to_string().contains("512 byte limit"), "{error}");
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED
+            .with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn registry_entry_rejects_oversized_scalar_and_manifest_strings() {
+        let template = serde_json::to_value(entry("plugin_a", "*.json", 'a')).unwrap();
+
+        let mut oversized_key = template.clone();
+        oversized_key["key"] = json!("k".repeat(129));
+        let encoded = serde_json::to_string(&oversized_key).unwrap();
+        let error = serde_json::from_str::<PluginRegistryEntry>(&encoded)
+            .expect_err("registry key over 128 bytes should be rejected");
+        assert!(error.to_string().contains("128 byte limit"), "{error}");
+
+        let mut oversized_manifest = template;
+        oversized_manifest["manifest_json"] =
+            json!("m".repeat(MAX_PLUGIN_MANIFEST_STRING_BYTES + 1));
+        let encoded = serde_json::to_string(&oversized_manifest).unwrap();
+        let error = serde_json::from_str::<PluginRegistryEntry>(&encoded)
+            .expect_err("manifest_json over its byte bound should be rejected");
+        assert!(error.to_string().contains("65536 byte limit"), "{error}");
+    }
+
+    #[test]
+    fn typed_owner_jsonb_decode_is_lazy_and_bounded() {
+        let owner_value = json!({
+            "version": PLUGIN_FILE_OWNER_FORMAT_VERSION,
+            "plugin_key": "plugin_a",
+            "schema_keys": ["plugin_a_meta", "plugin_a_note"],
+        });
+        let bytes = canonical_json(&owner_value).into_bytes();
+        let jsonb = lix_schema::Jsonb::from_canonical_text_vec(bytes).unwrap();
+        let before = format!("{jsonb:?}");
+        let owner = PluginFileOwner::from_jsonb_value("file_a", &jsonb).unwrap();
+        assert_eq!(owner.plugin_key(), "plugin_a");
+        assert_eq!(owner.schema_keys(), ["plugin_a_meta", "plugin_a_note"]);
+        assert_eq!(format!("{jsonb:?}"), before);
+
+        let oversized = json!({
+            "version": PLUGIN_FILE_OWNER_FORMAT_VERSION,
+            "plugin_key": "plugin_a",
+            "schema_keys": (0..=MAX_PLUGIN_OWNER_SCHEMA_KEYS)
+                .map(|index| format!("schema_{index}"))
+                .collect::<Vec<_>>(),
+        });
+        let bytes = canonical_json(&oversized).into_bytes();
+        let jsonb = lix_schema::Jsonb::from_canonical_text_vec(bytes).unwrap();
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(0));
+        assert!(PluginFileOwner::from_jsonb_value("file_a", &jsonb).is_err());
+        super::super::manifest::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| {
+            assert!(count.get() <= MAX_PLUGIN_OWNER_SCHEMA_KEYS);
+        });
+    }
+
     #[test]
     fn upsert_and_remove_change_generation_deterministically() {
         let empty = PluginRegistry::empty();
@@ -1799,6 +2537,34 @@ mod tests {
         assert_eq!(
             registry_row.row_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_REGISTRY_KEY
+        );
+    }
+
+    #[test]
+    fn owner_schema_bounds_match_plugin_manifest_limits_before_decode_copy() {
+        let too_many = json!({
+            "version": PLUGIN_FILE_OWNER_FORMAT_VERSION,
+            "plugin_key": "plugin_a",
+            "schema_keys": (0..=MAX_PLUGIN_OWNER_SCHEMA_KEYS)
+                .map(|index| format!("schema_{index}"))
+                .collect::<Vec<_>>(),
+        });
+        assert!(validate_plugin_owner_value_bound(&too_many).is_err());
+
+        let too_long = json!({
+            "version": PLUGIN_FILE_OWNER_FORMAT_VERSION,
+            "plugin_key": "plugin_a",
+            "schema_keys": ["s".repeat(MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES + 1)],
+        });
+        assert!(validate_plugin_owner_value_bound(&too_long).is_err());
+
+        assert!(
+            PluginFileOwner::new(
+                "file",
+                "plugin_a",
+                vec!["s".repeat(MAX_PLUGIN_OWNER_SCHEMA_KEY_BYTES + 1)],
+            )
+            .is_err()
         );
     }
 

@@ -1,6 +1,11 @@
 /// <reference lib="webworker" />
 import { RepositorySession } from "./repository-session.js";
-import type { WorkerConnection, WorkerResponse } from "./protocol.js";
+import {
+	isSessionCloseTransportResponse,
+	isSessionCloseTransportResult,
+	type WorkerConnection,
+	type WorkerResponse,
+} from "./protocol.js";
 import { deserializeWorkerError } from "./protocol.js";
 import {
 	OPEN_TIMEOUT_MS,
@@ -10,7 +15,44 @@ import {
 } from "./repository-protocol.js";
 
 // One candidate per repository per document, retained by all local SDK handles.
-const hubs = new Map<string, { worker: Worker; references: number; buildId?: string }>();
+type RepositoryHub = {
+	worker: Worker;
+	references: number;
+	buildId?: string;
+	failure?: Error;
+	failures: Set<(error: Error) => void>;
+};
+const hubs = new Map<string, RepositoryHub>();
+// Keep only a successfully retired realm warm; it owns no repository or storage.
+let idleWorker: Worker | undefined;
+let idleWarm = false;
+let idleFailure: (() => void) | undefined;
+function takeIdleWorker(): Worker | undefined {
+	const worker = idleWorker;
+	if (worker && idleFailure) {
+		worker.removeEventListener("error", idleFailure);
+		worker.removeEventListener("messageerror", idleFailure);
+	}
+	idleWorker = undefined;
+	idleFailure = undefined;
+	return worker;
+}
+function cacheIdleWorker(worker: Worker, runtimeWarm: boolean): void {
+	// Standby candidates never initialize the compiler. Do not let their later
+	// retirement evict the realm whose expensive runtime is already ready.
+	if (idleWorker && idleWarm && !runtimeWarm) {
+		worker.terminate();
+		return;
+	}
+	takeIdleWorker()?.terminate();
+	idleWorker = worker;
+	idleWarm = runtimeWarm;
+	idleFailure = () => {
+		if (idleWorker === worker) takeIdleWorker()?.terminate();
+	};
+	worker.addEventListener("error", idleFailure);
+	worker.addEventListener("messageerror", idleFailure);
+}
 export function createRepositoryConnection(key: string): WorkerConnection {
 	if (!navigator.locks || typeof BroadcastChannel === "undefined") {
 		throw repositoryError(
@@ -21,23 +63,57 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 	const channelName = `lix:repository-rpc:v1:${key}`;
 	let hub = hubs.get(key);
 	if (!hub) {
-		const worker = new Worker(
+		const worker = takeIdleWorker() ?? new Worker(
 			new URL("./entry.repository.browser.js", import.meta.url),
 			{
 				type: "module",
 				name: "lix-repository-owner",
 			},
 		);
-		hub = { worker, references: 0 };
+		let token = crypto.randomUUID();
+		hub = { worker, references: 0, failures: new Set() };
 		hubs.set(key, hub);
 		const created = hub;
-		worker.addEventListener("message", (event) => {
+		const invalidate = (error: Error) => {
+			created.failure ??= error;
+			if (hubs.get(key) === created) hubs.delete(key);
+			worker.terminate();
+			for (const fail of created.failures) fail(created.failure);
+		};
+		const onWorkerError = (event: ErrorEvent) => invalidate(repositoryError("LIX_WORKER_FAILED", event.message));
+		const onMessageError = () => invalidate(repositoryError("LIX_WORKER_FAILED", "Repository worker message could not be decoded"));
+		const onWorkerMessage = (event: MessageEvent) => {
+			if (event.data?.token !== token) return;
 			if (event.data?.kind === "build" && typeof event.data.buildId === "string")
 				created.buildId = event.data.buildId;
-			if (event.data?.kind === "retired" && hubs.get(key) === created)
-				hubs.delete(key);
-		});
-		worker.postMessage({ kind: "start", key, channelName });
+			if (event.data?.kind === "failure") {
+				invalidate(repositoryError("LIX_WORKER_FAILED", event.data.message));
+				return;
+			}
+			if (event.data?.kind === "retired") {
+				if (created.references > 0) {
+					if (event.data.reusable !== true || created.failure) {
+						invalidate(repositoryError("LIX_WORKER_FAILED", "Repository worker cleanup failed during reopen"));
+						return;
+					}
+					// A local reopen can race the last remote session's retirement.
+					// Restart only after cleanup, in the same warmed realm.
+					token = crypto.randomUUID();
+					worker.postMessage({ kind: "start", key, channelName, token });
+					return;
+				}
+				worker.removeEventListener("message", onWorkerMessage);
+				worker.removeEventListener("error", onWorkerError);
+				worker.removeEventListener("messageerror", onMessageError);
+				if (hubs.get(key) === created) hubs.delete(key);
+				if (event.data.reusable === true && !created.failure) cacheIdleWorker(worker, event.data.runtimeWarm === true);
+				else worker.terminate();
+			}
+		};
+		worker.addEventListener("message", onWorkerMessage);
+		worker.addEventListener("error", onWorkerError);
+		worker.addEventListener("messageerror", onMessageError);
+		worker.postMessage({ kind: "start", key, channelName, token });
 	}
 	const retained = hub;
 	retained.references++;
@@ -48,6 +124,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 	let release!: () => void;
 	let leased = false,
 		closed = false,
+		closing = false,
 		connected = false;
 	let generation: string | undefined, nonce: string | undefined;
 	let lastSeen = Date.now();
@@ -105,9 +182,8 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 			),
 		OPEN_TIMEOUT_MS,
 	);
-	const workerError = (event: ErrorEvent) =>
-		fail(repositoryError("LIX_WORKER_FAILED", event.message));
-	retained.worker.addEventListener("error", workerError);
+	retained.failures.add(fail);
+	if (retained.failure) queueMicrotask(() => fail(retained.failure!));
 	void navigator.locks
 		.request(lease, async () => {
 			leased = true;
@@ -126,6 +202,14 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 				finishClose?.(
 					message.error ? deserializeWorkerError(message.error) : undefined,
 				);
+			else if (
+				closing &&
+				message.kind === "output" &&
+				message.client === client &&
+				message.generation === generation &&
+				isSessionCloseTransportResponse(message.message)
+			)
+				session.receive(message.message);
 			return;
 		}
 		if (failure) return;
@@ -185,7 +269,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 	};
 	return {
 		postMessage(message) {
-			if (closed || failure)
+			if ((closed && !(closing && isSessionCloseTransportResult(message))) || failure)
 				throw (
 					failure ??
 					repositoryError("LIX_ERROR_CLOSED", "Repository connection closed")
@@ -204,9 +288,9 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		terminate() {
 			return (termination ??= (async () => {
 				closed = true;
+				closing = true;
 				clearInterval(poll);
 				clearTimeout(deadline);
-				session.close();
 				try {
 					if (connected && generation && !failure)
 						await new Promise<void>((resolve, reject) => {
@@ -228,13 +312,15 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 							release();
 						});
 				} finally {
+					closing = false;
+					session.close();
 					release();
 					channel.close();
-					retained.worker.removeEventListener("error", workerError);
+					retained.failures.delete(fail);
 					if (--retained.references === 0) {
-						// Remaining remote sessions retain the owner until their hosts close.
+						// Remote sessions can still retain this host. Keep its hub until
+						// retirement so a same-key reopen retains or restarts this realm.
 						retained.worker.postMessage({ kind: "release" });
-						if (hubs.get(key) === retained) hubs.delete(key);
 					}
 				}
 			})());

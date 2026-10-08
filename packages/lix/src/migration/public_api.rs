@@ -386,7 +386,7 @@ where
 }
 
 /// Domain-separated digest of every logical persisted record except the format
-/// marker and mutation revision. Derived index changes are projected through
+/// marker and adapter-owned revision tokens. Derived index changes are projected through
 /// source-derived bounded migration plans.
 /// Includes pending operations, blobs, history, and all deduplication receipts.
 pub(super) async fn content_digest<S>(storage: &S) -> Result<String, LixError>
@@ -439,8 +439,10 @@ where
                 {
                     continue;
                 }
-                if *space == crate::storage_adapter::REVISION_SPACE && entry.key.0.as_ref() == b"m"
-                {
+                if crate::storage_adapter::is_non_content_revision_key(
+                    space.id.0,
+                    entry.key.0.as_ref(),
+                ) {
                     continue;
                 }
                 let StorageProjectedValue::FullValue(value) = entry.value else {
@@ -488,7 +490,10 @@ fn digest_record(digest: &mut blake3::Hasher, space: u32, key: &[u8], value: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
+    use crate::storage_adapter::{
+        PutBatch, PutEntry, REVISION_KEY_OBSERVABLE, REVISION_SPACE, StorageAdapter, StorageValue,
+        StorageWrite, revision_key,
+    };
 
     async fn expected_v86_digest<S>(storage: &S) -> String
     where
@@ -516,6 +521,145 @@ mod tests {
             .unwrap();
         read.finish().unwrap();
         content_digest_with_plan(storage, Some(plan)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn content_witness_ignores_revision_and_private_scratch_bookkeeping() {
+        let storage = StorageAdapter::new(crate::Memory::new());
+        let before = content_digest_with_adapter(&storage, None).await.unwrap();
+
+        let mut bookkeeping = storage
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        bookkeeping
+            .put_many(
+                REVISION_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: revision_key(REVISION_KEY_OBSERVABLE),
+                        value: StorageValue {
+                            bytes: Bytes::from_static(b"observer-token-a"),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        bookkeeping.commit().await.unwrap();
+
+        let mut scratch = storage.new_write_set();
+        scratch.put(
+            crate::sync::READ_OPERATION_SCRATCH_SPACE,
+            b"operation".as_slice(),
+            b"temporary page".as_slice(),
+        );
+        storage
+            .commit_write_set(scratch, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            content_digest_with_adapter(&storage, None).await.unwrap(),
+            before,
+            "revision tokens and private staging bytes are not repository content"
+        );
+
+        let mut retained_interests = storage.new_write_set();
+        retained_interests.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            b"retained-recipe".as_slice(),
+            b"durable recovery scope".as_slice(),
+        );
+        storage
+            .commit_write_set(retained_interests, Default::default())
+            .await
+            .unwrap();
+        let before_semantic = content_digest_with_adapter(&storage, None).await.unwrap();
+        assert_ne!(
+            before_semantic, before,
+            "private observer visibility must not exclude durable read interests from migration"
+        );
+
+        let mut semantic = storage.new_write_set();
+        semantic.put(
+            crate::hot_state::ROW_SPACE,
+            b"semantic".as_slice(),
+            b"user value".as_slice(),
+        );
+        storage
+            .commit_write_set(semantic, Default::default())
+            .await
+            .unwrap();
+        assert_ne!(
+            content_digest_with_adapter(&storage, None).await.unwrap(),
+            before_semantic,
+            "semantic rows remain covered by the migration witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_without_observable_token_reopens_and_initializes_on_visible_write() {
+        let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
+        let initial = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        initial
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('legacy-content','preserved')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let repository_id = initial.lix_id().to_owned();
+        initial.close().await.unwrap();
+
+        super::super::epoch::stage_v80_repository_for_test(&storage, false)
+            .await
+            .unwrap();
+        let migration = migrate_repository(storage.clone()).await.unwrap();
+        assert!(migration.semantic_preservation_verified);
+
+        // Model an older physical repository: the new observer singleton is
+        // absent while all existing repository content and epoch controls stay
+        // intact.
+        let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        assert!(adapter.load_observable_revision().await.unwrap().is_some());
+        let mut remove_new_token = adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        remove_new_token
+            .delete_many(REVISION_SPACE, &[revision_key(REVISION_KEY_OBSERVABLE)])
+            .await
+            .unwrap();
+        remove_new_token.commit().await.unwrap();
+        assert_eq!(adapter.load_observable_revision().await.unwrap(), None);
+
+        let reopened = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(reopened.lix_id(), repository_id);
+        assert_eq!(
+            adapter.load_observable_revision().await.unwrap(),
+            None,
+            "opening old storage must tolerate an absent observable token"
+        );
+        reopened
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('observable-token-upgrade','visible')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            adapter.load_observable_revision().await.unwrap().is_some(),
+            "the first visible write initializes the absent token atomically"
+        );
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -42,8 +42,8 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
         let enabled = Arc::new(AtomicBool::new(false));
         let client = ExpiringClient {
-            server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), fresh_descriptors: Arc::default(),
-            live_updates: Some(enabled.clone()),
+            server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), object_fetches: Arc::default(), fresh_descriptors: Arc::default(),
+            live_updates: Some(enabled.clone()), first_demand_barrier: None,
         };
         let unavailable = Arc::new(AtomicBool::new(true));
         let transport = HttpSyncTransport::connect_with(FailingDescriptorClient {

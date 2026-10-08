@@ -33,6 +33,54 @@ export type WorkerSyncFetchRequest = {
     response: HttpResponsePolicy;
 };
 
+/** The only network operation permitted after a repository client starts closing. */
+export function isSessionCloseRequest(request: {
+	url: string;
+	method?: string;
+	headers?: HeadersInit;
+	init?: { method?: string; headers?: HeadersInit };
+	}, authorityUrl?: string | URL): boolean {
+	const method = request.init?.method ?? request.method;
+	const headers = request.init?.headers ?? request.headers;
+	if ((method ?? "GET").toUpperCase() !== "DELETE") return false;
+	try {
+		const url = new URL(request.url);
+		const sessionId = new Headers(headers).get("lix-session-id");
+		const sessionPath = /^\/lix\/v1\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/session\/?$/;
+		const sessionMatch = sessionPath.exec(url.pathname);
+		if (!sessionMatch || url.search || url.hash || url.username || url.password || !sessionId?.trim()) return false;
+		if (authorityUrl !== undefined) {
+			const authority = new URL(authorityUrl.toString());
+			const authorityMatch = /^\/lix\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(authority.pathname);
+			if (
+				!authorityMatch || authority.search || authority.hash || authority.username || authority.password ||
+				url.origin !== authority.origin || sessionMatch[1] !== authorityMatch[1]
+			) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Notifications needed to finish an already-started remote session close. */
+export function isSessionCloseTransportResponse(
+	message: WorkerResponse,
+): boolean {
+	return "kind" in message && (
+		message.kind === "sync.headers" ||
+		(message.kind === "sync.fetch" && isSessionCloseRequest(message.request))
+	);
+}
+
+/** Acknowledgments for teardown-only transport callbacks. */
+export function isSessionCloseTransportResult(message: WorkerInput): boolean {
+	return !("id" in message) && (
+		message.kind === "sync.headers.result" ||
+		message.kind === "sync.fetch.result"
+	);
+}
+
 type WorkerSyncFetchResponseHead = {
 	status: number;
 	statusText: string;
@@ -134,6 +182,7 @@ export type WorkerOperation =
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
+	| { kind: "observe.cancel"; requestId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
 			kind: "sync.headers.result";
@@ -201,6 +250,8 @@ export type WorkerResponse =
 			context?: { branchId: string; accountId: string };
 	  }
 	| { id: number; ok: false; error: SerializedWorkerError }
+	| { kind: "request.started"; id: number }
+	| { kind: "request.queued"; id: number }
 	| { kind: "telemetry"; request: Uint8Array }
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number; transportScope?: number }

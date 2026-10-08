@@ -16,9 +16,28 @@ use crate::binary_cas::{
     BlobWriteReceipt, ChunkHash,
 };
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StoragePrecondition, StorageWriteSet,
+    PointReadPlan, ReadBudget, StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest,
+    StorageGetOptions, StorageKey, StoragePrecondition, StorageProjectedValue, StorageWriteSet,
 };
+
+// Keep this codec-owned upper bound beside the borrowed validator so readers
+// can cap the encoded storage value before decoding the chunk row.
+const MAX_RAW_CHUNK_STORAGE_OVERHEAD_BYTES: usize = 64;
+const VERIFIED_RAW_CHUNK_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const VERIFIED_RAW_CHUNK_PAGE_SLOTS: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawChunkTransferBounds {
+    pub(crate) max_payload_bytes: usize,
+    pub(crate) max_encoded_value_bytes: usize,
+}
+
+pub(crate) const fn raw_chunk_transfer_bounds() -> RawChunkTransferBounds {
+    RawChunkTransferBounds {
+        max_payload_bytes: MAX_BINARY_CAS_CHUNK_BYTES,
+        max_encoded_value_bytes: MAX_BINARY_CAS_CHUNK_BYTES + MAX_RAW_CHUNK_STORAGE_OVERHEAD_BYTES,
+    }
+}
 
 /// Couples a transfer publication to the ordinary CAS reclamation fence.
 pub(crate) async fn stage_transfer_publication_fence(
@@ -291,20 +310,123 @@ pub(crate) async fn load_verified_chunk(
     store: &(impl StorageAdapterRead + ?Sized),
     chunk_id: ChunkHash,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let keys = [StorageKey(Bytes::copy_from_slice(chunk_id.as_bytes()))];
-    let result = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    let Some(value) = result.value.into_iter().next().flatten() else {
-        return Ok(None);
-    };
-    let crate::storage_adapter::StorageProjectedValue::FullValue(encoded) = value else {
+    let mut payload = None;
+    visit_verified_raw_chunks(store, &[chunk_id], |_, _, bytes| {
+        payload = bytes.map(|bytes| bytes.to_vec());
+        Ok(())
+    })
+    .await?;
+    Ok(payload)
+}
+
+/// Visits requested canonical raw chunks in byte-bounded ordered pages.
+///
+/// Missing slots are passed to the visitor as `None` so callers can preserve
+/// their own missing-input error. Every present value is size-admitted before
+/// the provider call, then validated without copying its raw payload. A whole
+/// page is validated before any payload from that page reaches the visitor.
+pub(crate) async fn visit_verified_raw_chunks<F>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    chunk_ids: &[ChunkHash],
+    mut visitor: F,
+) -> Result<(), LixError>
+where
+    F: FnMut(usize, ChunkHash, Option<&[u8]>) -> Result<(), LixError>,
+{
+    if chunk_ids.len() > VERIFIED_RAW_CHUNK_PAGE_SLOTS {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "binary CAS chunk read omitted its value",
+            "verified raw chunk batch exceeds its slot bound",
         ));
+    }
+    if chunk_ids.is_empty() {
+        return Ok(());
+    }
+
+    let keys = chunk_ids
+        .iter()
+        .map(|chunk_id| StorageKey(Bytes::copy_from_slice(chunk_id.as_bytes())))
+        .collect::<Vec<_>>();
+    let requests = [StorageGetManyRequest {
+        space: BINARY_CAS_CHUNK_SPACE,
+        keys: &keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let raw_bounds = raw_chunk_transfer_bounds();
+    let budget = ReadBudget {
+        max_result_bytes: VERIFIED_RAW_CHUNK_PAGE_BYTES,
+        max_single_value_bytes: raw_bounds.max_encoded_value_bytes,
     };
-    let (codec, uncompressed_len, payload) = decode_binary_cas_chunk(&encoded)?;
+    let total = keys.len();
+    let mut offset = 0usize;
+    while offset < total {
+        let page = store
+            .get_many_bounded_prefix(
+                &requests,
+                offset,
+                VERIFIED_RAW_CHUNK_PAGE_SLOTS,
+                budget,
+            )
+            .await?;
+        let count = page.values.len();
+        let next = offset
+            .checked_add(count)
+            .ok_or(crate::storage_adapter::StorageError::InvalidCursor)?;
+        if count == 0
+            || count > VERIFIED_RAW_CHUNK_PAGE_SLOTS
+            || count > crate::storage_adapter::MAX_SCAN_PAGE_ROWS
+            || next > total
+            || page.next_offset != (next < total).then_some(next)
+        {
+            return Err(crate::storage_adapter::StorageError::InvalidCursor.into());
+        }
+        budget.validate_result(&page.values)?;
+
+        let mut validated = Vec::with_capacity(count);
+        for (page_index, value) in page.values.iter().enumerate() {
+            let index = offset
+                .checked_add(page_index)
+                .ok_or(crate::storage_adapter::StorageError::InvalidCursor)?;
+            let chunk_id = *chunk_ids
+                .get(index)
+                .ok_or(crate::storage_adapter::StorageError::InvalidCursor)?;
+            let payload = match value {
+                None => None,
+                Some(StorageProjectedValue::FullValue(encoded)) => {
+                    if encoded.len() > raw_bounds.max_encoded_value_bytes {
+                        return Err(crate::storage_adapter::StorageError::ReadBudgetExceeded {
+                            singleton: true,
+                        }
+                        .into());
+                    }
+                    let (_, payload) = validate_raw_chunk_payload(encoded, chunk_id)?;
+                    Some(payload)
+                }
+                Some(StorageProjectedValue::KeyOnly) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "binary CAS chunk read omitted its value",
+                    ));
+                }
+            };
+            validated.push((index, chunk_id, payload));
+        }
+        for (index, chunk_id, payload) in validated {
+            visitor(index, chunk_id, payload)?;
+        }
+        offset = next;
+    }
+    Ok(())
+}
+
+/// Validates an encoded raw chunk without copying its payload. The borrowed
+/// result lets bounded page readers authenticate several rows from one
+/// provider response while keeping the codec schema owned by binary_cas.
+pub(crate) fn validate_raw_chunk_payload(
+    encoded: &[u8],
+    chunk_id: ChunkHash,
+) -> Result<(u64, &[u8]), LixError> {
+    let (codec, uncompressed_len, payload) = decode_binary_cas_chunk(encoded)?;
     if codec != BinaryChunkCodec::Raw {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -330,7 +452,7 @@ pub(crate) async fn load_verified_chunk(
             ),
         ));
     }
-    Ok(Some(payload.to_vec()))
+    Ok((uncompressed_len, payload))
 }
 
 /// Stages one raw chunk only after verifying its declared BLAKE3 identity.
@@ -430,8 +552,13 @@ pub(crate) async fn stage_deferred_canonical_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CanonicalBlobManifest,
 ) -> Result<Vec<ChunkHash>, LixError> {
-    stage_deferred_canonical_manifests_with_chunks(store, writes, std::slice::from_ref(manifest), &[])
-        .await
+    stage_deferred_canonical_manifests_with_chunks(
+        store,
+        writes,
+        std::slice::from_ref(manifest),
+        &[],
+    )
+    .await
 }
 
 /// Stages a batch of canonical manifests and raw chunks in one write set.
@@ -707,9 +834,65 @@ fn noncanonical_manifest_error() -> LixError {
 mod tests {
     use super::*;
     use crate::binary_cas::codec::{
-        BinaryCasManifest, StorageBinaryCasDeltaBaseLayout, StorageBinaryCasDeltaSegment,
+        BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
+        StorageBinaryCasDeltaSegment, encode_binary_cas_chunk,
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    struct DelayedChunkPrefixRead<R> {
+        read: R,
+        started: Arc<Notify>,
+        resume: Arc<Notify>,
+        calls: Arc<Mutex<Vec<(usize, usize, ReadBudget)>>>,
+    }
+    impl<R: StorageAdapterRead> StorageAdapterRead for DelayedChunkPrefixRead<R> {
+        async fn get_many(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+        ) -> Result<
+            crate::storage_adapter::StorageGetManyResult,
+            crate::storage_adapter::StorageError,
+        > {
+            self.read.get_many(requests).await
+        }
+
+        async fn get_many_bounded_prefix(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+            offset: usize,
+            max_slots: usize,
+            budget: ReadBudget,
+        ) -> Result<crate::storage_adapter::GetManyPrefixResult, crate::storage_adapter::StorageError>
+        {
+            let delay = {
+                let mut calls = self.calls.lock().expect("page calls lock");
+                let delay = calls.is_empty();
+                calls.push((offset, max_slots, budget));
+                delay
+            };
+            if delay {
+                self.started.notify_one();
+                self.resume.notified().await;
+            }
+            self.read
+                .get_many_bounded_prefix(requests, offset, max_slots, budget)
+                .await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: crate::storage_adapter::StorageSpace,
+            range: crate::storage_adapter::StorageKeyRange,
+            opts: crate::storage_adapter::StorageBeginScanOptions,
+        ) -> Result<
+            crate::storage_adapter::StorageScanCursor<'_>,
+            crate::storage_adapter::StorageError,
+        > {
+            self.read.begin_scan(space, range, opts).await
+        }
+    }
 
     struct PayloadReadCounter<R> {
         read: R,
@@ -718,7 +901,7 @@ mod tests {
     impl<R: StorageAdapterRead> StorageAdapterRead for PayloadReadCounter<R> {
         async fn get_many(
             &self,
-            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+            requests: &[StorageGetManyRequest<'_>],
         ) -> Result<
             crate::storage_adapter::StorageGetManyResult,
             crate::storage_adapter::StorageError,
@@ -797,6 +980,183 @@ mod tests {
             chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
         }
         bytes
+    }
+
+    async fn commit_raw_chunk_at(
+        storage: &StorageAdapter<Memory>,
+        chunk_id: ChunkHash,
+        encoded: Vec<u8>,
+    ) {
+        let mut writes = storage.new_write_set();
+        writes.put(
+            BINARY_CAS_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(chunk_id.as_bytes())),
+            encoded,
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fixture raw chunk should commit");
+    }
+
+    #[tokio::test]
+    async fn verified_raw_chunk_visitor_waits_for_and_preserves_bounded_pages() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payloads = (1..=10u8)
+            .map(|marker| vec![marker; 1024 * 1024])
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let mut hashes = Vec::new();
+        for payload in &payloads {
+            let hash = ChunkHash::from_content(payload);
+            stage_verified_raw_chunk(&mut writes, hash, payload).unwrap();
+            hashes.push(hash);
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let requested = hashes.iter().rev().copied().collect::<Vec<_>>();
+        let expected = requested.clone();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let delayed = DelayedChunkPrefixRead {
+            read,
+            started: started.clone(),
+            resume: resume.clone(),
+            calls: calls.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let mut visited = Vec::new();
+            visit_verified_raw_chunks(&delayed, &requested, |index, hash, payload| {
+                let payload = payload.ok_or_else(|| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "fixture chunk is missing")
+                })?;
+                visited.push((index, hash, payload.len(), payload[0]));
+                Ok(())
+            })
+            .await?;
+            Ok::<_, LixError>(visited)
+        });
+        started.notified().await;
+        assert!(!task.is_finished(), "visitor must await the delayed provider page");
+        resume.notify_one();
+        let visited = task.await.unwrap().unwrap();
+        assert_eq!(visited.len(), expected.len());
+        for (index, (seen_index, seen_hash, len, first_byte)) in
+            visited.iter().copied().enumerate()
+        {
+            assert_eq!(seen_index, index);
+            assert_eq!(seen_hash, expected[index]);
+            assert_eq!(len, 1024 * 1024);
+            assert_eq!(first_byte, u8::try_from(expected.len() - index).unwrap());
+        }
+        let calls = calls.lock().unwrap();
+        assert!(calls.len() > 1, "the input must cross a bounded page boundary");
+        assert_eq!(calls[0].0, 0);
+        assert!(calls.iter().all(|(_, max_slots, budget)| {
+            *max_slots == VERIFIED_RAW_CHUNK_PAGE_SLOTS
+                && budget.max_result_bytes == VERIFIED_RAW_CHUNK_PAGE_BYTES
+                && budget.max_single_value_bytes
+                    == raw_chunk_transfer_bounds().max_encoded_value_bytes
+        }));
+    }
+
+    #[tokio::test]
+    async fn verified_raw_chunk_visitor_preserves_missing_slots() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = b"present chunk".to_vec();
+        let present = ChunkHash::from_content(&payload);
+        let missing = ChunkHash::from_content(b"absent chunk");
+        let mut writes = storage.new_write_set();
+        stage_verified_raw_chunk(&mut writes, present, &payload).unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut seen = Vec::new();
+        visit_verified_raw_chunks(&read, &[present, missing], |index, hash, bytes| {
+            seen.push((index, hash, bytes.map(|bytes| bytes.to_vec())));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], (0, present, Some(payload)));
+        assert_eq!(seen[1], (1, missing, None));
+    }
+
+    #[tokio::test]
+    async fn verified_raw_chunk_visitor_rejects_corruption_before_visiting_that_page() {
+        let storage = StorageAdapter::new(Memory::new());
+        let valid_payload = b"valid chunk before corruption";
+        let valid_hash = ChunkHash::from_content(valid_payload);
+        let expected_hash = ChunkHash::from_content(b"declared expected payload");
+        let encoded = encode_binary_cas_chunk(
+            BinaryChunkCodec::Raw,
+            b"different payload".len() as u64,
+            b"different payload",
+        );
+        let mut writes = storage.new_write_set();
+        stage_verified_raw_chunk(&mut writes, valid_hash, valid_payload).unwrap();
+        writes.put(
+            BINARY_CAS_CHUNK_SPACE,
+            StorageKey(Bytes::copy_from_slice(expected_hash.as_bytes())),
+            encoded,
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fixture chunks should commit");
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut visited = 0usize;
+        let error = visit_verified_raw_chunks(&read, &[valid_hash, expected_hash], |_, _, _| {
+            visited += 1;
+            Ok(())
+        })
+        .await
+        .expect_err("a raw chunk stored under the wrong digest must fail");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert_eq!(
+            visited, 0,
+            "valid prefixes of a corrupt page must not reach its visitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_raw_chunk_visitor_enforces_encoded_value_budget_before_callback() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payload = vec![
+            91u8;
+            raw_chunk_transfer_bounds()
+                .max_encoded_value_bytes
+                .saturating_add(1)
+        ];
+        let chunk_id = ChunkHash::from_content(&payload);
+        let encoded = encode_binary_cas_chunk(
+            BinaryChunkCodec::Raw,
+            payload.len() as u64,
+            &payload,
+        );
+        commit_raw_chunk_at(&storage, chunk_id, encoded).await;
+        let read = storage.begin_read(StorageReadOptions::default()).await.unwrap();
+        let mut visited = 0usize;
+        let error = visit_verified_raw_chunks(&read, &[chunk_id], |_, _, _| {
+            visited += 1;
+            Ok(())
+        })
+        .await
+        .expect_err("oversized encoded rows must be rejected by the read budget");
+        assert_eq!(error.code, "LIX_NATIVE_RECIPE_WORK_BOUND");
+        assert_eq!(
+            error.details.as_ref().and_then(|details| details.get("singleton")),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(visited, 0);
     }
 
     async fn stage_chunks(

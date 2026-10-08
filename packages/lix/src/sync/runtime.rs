@@ -75,7 +75,7 @@ impl SyncDemand {
 
 #[derive(Clone, Debug)]
 pub(super) enum SyncDemandRequest {
-    BlobManifest(crate::binary_cas::BlobId, LixError),
+    BlobManifests(Vec<crate::binary_cas::BlobId>, LixError),
     NativeObject(crate::tracked_state::NativeObjectRef, LixError),
     NativeObjects(Vec<crate::tracked_state::NativeObjectRef>, LixError),
     NativeMetadata(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
@@ -383,8 +383,7 @@ pub(super) fn native_sync_demand_request_for_error(
     if error.automatic_retry_is_forbidden() {
         return Ok(None);
     }
-    if let Some(locator) =
-        crate::sync::read_fulfillment::selected_change_payload_locator(error)
+    if let Some(locator) = crate::sync::read_fulfillment::selected_change_payload_locator(error)
         && crate::sync::read_fulfillment::interests_for_error(error)?.is_some()
     {
         return Ok(Some(SyncDemandRequest::NativeMetadata(
@@ -392,10 +391,13 @@ pub(super) fn native_sync_demand_request_for_error(
             error.clone(),
         )));
     }
-    if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
-        crate::binary_cas::BlobManifestRequired::from_error(error)?
+    if let Some(crate::binary_cas::BlobManifestsRequired(hashes)) =
+        crate::binary_cas::BlobManifestsRequired::from_error(error)?
     {
-        return Ok(Some(SyncDemandRequest::BlobManifest(hash, error.clone())));
+        return Ok(Some(SyncDemandRequest::BlobManifests(
+            hashes,
+            error.clone(),
+        )));
     }
     if let Some(addresses) = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
     {
@@ -443,7 +445,7 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         SyncDemandRequest::NativeObject(_, error)
         | SyncDemandRequest::NativeObjects(_, error)
         | SyncDemandRequest::NativeMetadata(_, error)
-        | SyncDemandRequest::BlobManifest(_, error) => {
+        | SyncDemandRequest::BlobManifests(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
         SyncDemandRequest::ChunksWithRead(ids, error) => sync_demand_request_for_error(&error)?
@@ -1079,7 +1081,7 @@ where
             SyncDemandRequest::NativeObject(_, _)
             | SyncDemandRequest::NativeObjects(_, _)
             | SyncDemandRequest::NativeMetadata(_, _)
-            | SyncDemandRequest::BlobManifest(_, _) => {}
+            | SyncDemandRequest::BlobManifests(_, _) => {}
             SyncDemandRequest::ReconcilePartial
             | SyncDemandRequest::PrepareOfflineEditing
             | SyncDemandRequest::Pinned(_) => {}
@@ -1129,7 +1131,7 @@ fn resolve_sync_demand_results(
             SyncDemandRequest::NativeObject(_, error)
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
-            | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
+            | SyncDemandRequest::BlobManifests(_, error) => Err(error.clone()),
             SyncDemandRequest::PrepareOfflineEditing => Err(LixError::new(
                 "LIX_SYNC_MODE_MISMATCH",
                 "offline editing preparation requires a partial replica",
@@ -1698,16 +1700,20 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
-    for chunk_id in chunk_ids {
-        super::validate_blake3_id(&chunk_id, "sync demanded chunk id")?;
-        if lix.get_sync_chunk(&chunk_id).await?.is_some() {
-            continue;
+    let chunk_ids = chunk_ids.into_iter().collect::<Vec<_>>();
+    for page in chunk_ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
+        let mut missing = Vec::new();
+        for id in page {
+            super::validate_blake3_id(id, "sync demanded chunk id")?;
+            if lix.get_sync_chunk(id).await?.is_none() {
+                missing.push(id.clone());
+            }
         }
-        let bytes = transport
-            .get_chunk(&chunk_id)
-            .await?
-            .ok_or_else(|| missing_chunk_error(&chunk_id, "demand", "remote read"))?;
-        lix.put_sync_chunk(&chunk_id, &bytes).await?;
+        let values = super::transfer::fetch_chunk_page(transport, &missing).await?;
+        for (id, value) in missing.iter().zip(values) {
+            let bytes = value.ok_or_else(|| missing_chunk_error(id, "demand", "remote read"))?;
+            lix.put_sync_chunk(id, &bytes).await?;
+        }
     }
     Ok(())
 }
@@ -1751,7 +1757,7 @@ where
         Some(SyncDemandRequest::NativeObject(_, original))
         | Some(SyncDemandRequest::NativeObjects(_, original))
         | Some(SyncDemandRequest::NativeMetadata(_, original))
-        | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
+        | Some(SyncDemandRequest::BlobManifests(_, original)) => Err(original),
         Some(SyncDemandRequest::PrepareOfflineEditing) => Err(LixError::new(
             "LIX_SYNC_MODE_MISMATCH",
             "offline editing preparation requires a partial replica",
@@ -1788,41 +1794,70 @@ where
         .iter()
         .map(|manifest| manifest.blob_id.as_str())
         .collect::<BTreeSet<_>>();
-    for blob_id in super::repository::sync_commit_blob_ids(&request.commits)? {
-        if inline_blob_ids.contains(blob_id.as_str()) {
-            continue;
-        }
-        let manifest = lix.get_sync_blob_manifest(&blob_id).await?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("local push references missing sync blob '{blob_id}'"),
-            )
-        })?;
-        let mut registration = transport.register_blob(&manifest).await?;
-        for chunk_id in registration
-            .missing_chunk_ids
-            .iter()
-            .collect::<BTreeSet<_>>()
-        {
-            let bytes = lix
-                .get_sync_chunk(chunk_id)
-                .await?
-                .ok_or_else(|| missing_chunk_error(chunk_id, &blob_id, "local push"))?;
-            transport.put_chunk(chunk_id, &bytes).await?;
-        }
-        if !registration.missing_chunk_ids.is_empty() {
-            registration = transport.register_blob(&manifest).await?;
-        }
-        if !registration.missing_chunk_ids.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "sync blob '{blob_id}' remained incomplete after uploading requested chunks"
-                ),
-            ));
+    let storage = lix.storage_adapter();
+    let begin_read = || async {
+        storage
+            .begin_read(Default::default())
+            .await
+            .map_err(LixError::from)
+    };
+    let mut canonical_group = super::transfer::TransferBatch::new();
+    let mut inline_group = super::transfer::TransferBatch::new();
+    let ids = super::repository::sync_commit_blob_ids(&request.commits)?
+        .into_iter()
+        .filter(|id| !inline_blob_ids.contains(id.as_str()))
+        .map(|id| crate::binary_cas::BlobId::from_hex(&id))
+        .collect::<Result<Vec<_>, _>>()?;
+    for ids in ids.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+        let read = begin_read().await?;
+        let metadata = crate::binary_cas::load_metadata_many(&read, ids)
+            .await?
+            .into_vec();
+        drop(read);
+        for (id, metadata) in ids.iter().zip(metadata) {
+            let metadata = metadata.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("local push references missing sync blob '{}'", id.to_hex()),
+                )
+            })?;
+            let read = begin_read().await?;
+            if metadata.size_bytes <= super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
+                let chunks = crate::binary_cas::load_canonical_blob_chunks(&read, *id)
+                    .await?
+                    .ok_or_else(|| LixError::unknown("local push blob content is missing"))?;
+                let manifest = super::blob::encode_manifest(*id, &chunks)?;
+                drop(read);
+                let encoded = serde_json::to_vec(&manifest)
+                    .map_err(|error| LixError::unknown(error.to_string()))?
+                    .len();
+                let decoded = manifest.size_bytes as usize;
+                if let Some(manifest) = inline_group.push(manifest, encoded, decoded)? {
+                    super::transfer::register_inline_group(transport, &inline_group).await?;
+                    inline_group = super::transfer::TransferBatch::new();
+                    if inline_group.push(manifest, encoded, decoded)?.is_some() {
+                        return Err(LixError::unknown("single inline upload member did not fit"));
+                    }
+                }
+            } else {
+                let canonical =
+                    crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
+                drop(read);
+                super::transfer::pack_canonical_plan(
+                    transport,
+                    &mut canonical_group,
+                    super::transfer::CanonicalUploadPlan {
+                        metadata,
+                        canonical,
+                    },
+                    &begin_read,
+                )
+                .await?;
+            }
         }
     }
-    Ok(())
+    super::transfer::upload_canonical_page(transport, &canonical_group.items, &begin_read).await?;
+    super::transfer::register_inline_group(transport, &inline_group).await
 }
 
 async fn push_with_inline_fallback<StorageImpl, Transport>(
@@ -2321,6 +2356,19 @@ mod tests {
             })
         }
 
+        fn register_blobs<'a>(
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
+
         fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
@@ -2408,6 +2456,19 @@ mod tests {
                     .iter()
                     .filter_map(|blob_id| self.manifests.get(blob_id).cloned())
                     .collect())
+            })
+        }
+
+        fn register_blobs<'a>(
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
             })
         }
 
@@ -2542,11 +2603,11 @@ mod tests {
     #[test]
     fn referenced_blob_demand_is_partial_only_and_postcommit_is_not_replayed() {
         let hash = crate::binary_cas::BlobId::from_content(b"referenced content");
-        let error = crate::binary_cas::BlobManifestRequired(hash).into_error();
+        let error = crate::binary_cas::BlobManifestsRequired(vec![hash]).into_error();
         let request = native_sync_demand_request_for_error(&error)
             .unwrap()
             .unwrap();
-        assert!(matches!(request, SyncDemandRequest::BlobManifest(id, _) if id == hash));
+        assert!(matches!(&request, SyncDemandRequest::BlobManifests(ids, _) if ids == &vec![hash]));
         assert_eq!(full_replica_demand(request).unwrap_err().code, error.code);
         assert!(sync_demand_request_for_error(&error).unwrap().is_none());
         let mut committed = error;
@@ -2712,6 +2773,19 @@ mod tests {
             Box::pin(async { Err(LixError::unknown("unused capped-pull blob get")) })
         }
 
+        fn register_blobs<'a>(
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
+        }
+
         fn register_blob<'a>(
             &'a self,
             _manifest: &'a super::super::SyncBlobManifest,
@@ -2830,6 +2904,19 @@ mod tests {
             _blob_ids: &'a [String],
         ) -> super::super::SyncTransportFuture<'a, Vec<super::super::SyncBlobManifest>> {
             Box::pin(async { Err(LixError::unknown("unused paged-snapshot blob get")) })
+        }
+
+        fn register_blobs<'a>(
+            &'a self,
+            manifests: &'a [crate::sync::SyncBlobManifest],
+        ) -> crate::sync::SyncTransportFuture<'a, Vec<crate::sync::SyncBlobRegistration>> {
+            Box::pin(async move {
+                let mut results = Vec::new();
+                for manifest in manifests {
+                    results.push(self.register_blob(manifest).await?);
+                }
+                Ok(results)
+            })
         }
 
         fn register_blob<'a>(

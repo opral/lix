@@ -59,6 +59,43 @@ where
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TransferFault {
+    Registration,
+    Chunk,
+    Completion,
+    PinPush,
+}
+
+#[inline(never)]
+fn run_transfer_fault(fault: TransferFault) -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
+    Box::pin(run_pending_native_conversion_inner(
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(fault),
+    ))
+}
+
+#[tokio::test]
+async fn large_full_conversion_recovers_lost_group_registration() {
+    run_transfer_fault(TransferFault::Registration).await;
+}
+#[tokio::test]
+async fn large_full_conversion_recovers_lost_chunk_commit() {
+    run_transfer_fault(TransferFault::Chunk).await;
+}
+#[tokio::test]
+async fn large_full_conversion_recovers_lost_completion_registration() {
+    run_transfer_fault(TransferFault::Completion).await;
+}
+#[tokio::test]
+async fn large_full_conversion_recovers_lost_native_pin_push() {
+    run_transfer_fault(TransferFault::PinPush).await;
+}
+
 // The test runtime must hold only a pointer to this large end-to-end scenario.
 // Constructing it in the async test body keeps an additional scenario-sized
 // temporary on that body's poll frame even when Box::pin is used inline.
@@ -76,6 +113,7 @@ fn run_pending_native_conversion(
         with_cleanup_loss,
         with_new_branch,
         browser_fixture,
+        None,
     ))
 }
 
@@ -85,6 +123,7 @@ async fn run_pending_native_conversion_inner(
     with_cleanup_loss: bool,
     with_new_branch: bool,
     browser_fixture: bool,
+    transfer_fault: Option<TransferFault>,
 ) {
     let authority_memory = crate::Memory::new();
     let authority = crate::open_lix()
@@ -163,7 +202,14 @@ async fn run_pending_native_conversion_inner(
         .unwrap();
     if with_files {
         local
-            .upsert_file_content("/local.bin", vec![8, 9, 10])
+            .upsert_file_content(
+                "/local.bin",
+                if transfer_fault.is_some() {
+                    vec![43u8; 65 * 1024 * 1024]
+                } else {
+                    vec![8, 9, 10]
+                },
+            )
             .await
             .unwrap();
         local
@@ -288,6 +334,10 @@ async fn run_pending_native_conversion_inner(
     let losses = lost_branches.clone();
     let lost_cleanup = Arc::new(AtomicBool::new(false));
     let cleanup_loss = lost_cleanup.clone();
+    let transfer_lost = Arc::new(AtomicBool::new(false));
+    let transfer_loss = transfer_lost.clone();
+    let pin_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pin_digests = pin_requests.clone();
     let global_before = Arc::new(AtomicBool::new(false));
     let global_after = Arc::new(AtomicBool::new(false));
     let thread = std::thread::spawn(move || {
@@ -303,6 +353,8 @@ async fn run_pending_native_conversion_inner(
             // Accepted sockets inherit nonblocking mode on Darwin.
             stream.set_nonblocking(false).unwrap();
             let server = server.clone();
+            let transfer_loss = transfer_loss.clone();
+            let pin_digests = pin_digests.clone();
             let global_before = global_before.clone();
             let global_after = global_after.clone();
             let lost_reply = lost_reply.clone();
@@ -338,6 +390,12 @@ async fn run_pending_native_conversion_inner(
                 assert!(length <= 64 * 1024 * 1024);
                 let mut bytes = vec![0; length];
                 stream.read_exact(&mut bytes).unwrap();
+                if transfer_fault.is_some() && path.ends_with("/sync/push") {
+                    pin_digests
+                        .lock()
+                        .unwrap()
+                        .push(*blake3::hash(&bytes).as_bytes());
+                }
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -427,6 +485,31 @@ async fn run_pending_native_conversion_inner(
                     }
                     (status, body)
                 });
+                let lose_transfer = match transfer_fault {
+                    Some(TransferFault::Registration) => {
+                        method == "POST" && path.ends_with("/sync/blobs")
+                    }
+                    Some(TransferFault::Chunk) => method == "PUT" && path.contains("/sync/chunk"),
+                    Some(TransferFault::Completion)
+                        if method == "POST" && path.ends_with("/sync/blobs") =>
+                    {
+                        serde_json::from_slice::<Vec<crate::sync::SyncBlobRegistration>>(&body)
+                            .is_ok_and(|registrations| {
+                                !registrations.is_empty()
+                                    && registrations.iter().all(|r| r.missing_chunk_ids.is_empty())
+                            })
+                    }
+                    Some(TransferFault::PinPush) => {
+                        method == "POST" && path.ends_with("/sync/push")
+                    }
+                    _ => false,
+                };
+                if status.is_success()
+                    && lose_transfer
+                    && !transfer_loss.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
                 if with_cleanup_loss
                     && path.ends_with("/sync/migration/cleanup")
                     && status.is_success()
@@ -542,12 +625,46 @@ async fn run_pending_native_conversion_inner(
         thread.join().unwrap();
         return;
     }
-    let first = convert_fixture_replica(
+    let mut first = convert_fixture_replica(
         local_storage.clone(),
         options.clone(),
         with_new_branch.then_some(requested_branch.as_str()),
     )
     .await;
+    let interrupted_journal = if first.is_err() && transfer_fault.is_some() {
+        assert!(
+            transfer_lost.load(Ordering::SeqCst),
+            "failure must be the injected transfer ACK loss: {first:?}"
+        );
+        let owned = crate::storage_adapter::StorageSession::acquire(local_storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(load_pointer(&owned).await.unwrap().unwrap().1, original);
+        let PointerState::Active { bank, .. } = decode_pointer(&original).unwrap() else {
+            panic!("source epoch missing")
+        };
+        let (journal, _) = load_pending_conversion_journal(
+            &owned,
+            &bank_code(bank),
+            &repository,
+            crate::ANONYMOUS_ACCOUNT_ID,
+            &requested_branch,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(journal.prepared_tip.is_some());
+        assert!(journal.receipt.is_none());
+        assert!(journal.native_source_pin.is_some());
+        drop(owned);
+        first = convert_fixture_replica(local_storage.clone(), options.clone(), None).await;
+        Some(journal)
+    } else {
+        None
+    };
+    if transfer_fault.is_some() {
+        assert!(transfer_lost.load(Ordering::SeqCst));
+    }
     assert!(
         first.is_ok(),
         "normal conversion must recover its lost merge ACK: {first:?}"
@@ -631,17 +748,61 @@ async fn run_pending_native_conversion_inner(
     assert!(rows.contains("L"));
     assert!(rows.contains("R"));
     if with_files {
-        assert_eq!(
-            authority
-                .read_file_content("/local.bin", None)
-                .await
-                .unwrap()
-                .unwrap()
-                .content()
-                .as_bytes()
-                .as_ref(),
-            &[8, 9, 10]
-        );
+        if transfer_fault.is_some() {
+            for start in (0..65 * 1024 * 1024u64).step_by(8 * 1024 * 1024) {
+                let end = (start + 8 * 1024 * 1024).min(65 * 1024 * 1024);
+                let content = authority
+                    .read_file_content("/local.bin", Some(start..end))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    content.content().as_ref(),
+                    vec![43u8; (end - start) as usize]
+                );
+            }
+            let (journal, _) = load_pending_conversion_journal(
+                &owned,
+                &bank_code(bank),
+                &repository,
+                crate::ANONYMOUS_ACCOUNT_ID,
+                &requested_branch,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(journal.receipt.is_some());
+            assert_eq!(journal.accepted_tip, local_head);
+            assert!(journal.prepared_tip.is_none());
+            if let Some(interrupted) = interrupted_journal {
+                assert_eq!(journal.source_bank, interrupted.source_bank);
+                assert_eq!(journal.manifest_digest, interrupted.manifest_digest);
+                assert_eq!(journal.native_source_pin, interrupted.native_source_pin);
+                assert_eq!(
+                    serde_json::to_vec(&journal.request).unwrap(),
+                    serde_json::to_vec(&interrupted.request).unwrap()
+                );
+            }
+            if matches!(transfer_fault, Some(TransferFault::PinPush)) {
+                let requests = pin_requests.lock().unwrap();
+                assert!(requests.len() >= 2);
+                assert_eq!(
+                    requests[0], requests[1],
+                    "native pin publication tuple must replay byte-for-byte"
+                );
+            }
+        } else {
+            assert_eq!(
+                authority
+                    .read_file_content("/local.bin", None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content()
+                    .as_ref(),
+                &[8, 9, 10]
+            );
+        }
         assert_eq!(
             authority
                 .read_file_content("/remote.bin", None)

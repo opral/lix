@@ -17,7 +17,8 @@ pub use amendment::validate_amendment;
 pub use ddl::to_postgres_ddl;
 pub use error::{Error, ErrorKind};
 pub use jsonb::{
-    Jsonb, JsonbError, binary_to_json_string, validate_binary, validate_canonical_json_text,
+    Jsonb, JsonbError, append_jsonb_equality_key, binary_to_json_string, jsonb_equality_key,
+    normalize_jsonb_number, validate_binary, validate_canonical_json_text,
     validated_binary_to_json_string,
 };
 pub use model::{

@@ -23,6 +23,7 @@ mod actor;
 pub(crate) use actor::tests::{failing_publication_for_test, pending_publication_for_test};
 mod archive;
 pub(crate) mod arena;
+mod compile_cache;
 mod component;
 mod create_context;
 mod incremental;
@@ -65,7 +66,8 @@ pub(crate) use manifest::{
 };
 pub(crate) use materializer::plugin_state_hot_state_projection;
 pub(crate) use registry::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
+    CompiledPluginCatalog, MAX_PLUGIN_OWNER_SNAPSHOT_BYTES, MAX_PLUGIN_REGISTRY_DURABLE_ROW_BYTES,
+    MAX_PLUGIN_REGISTRY_SNAPSHOT_BYTES, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginCatalogCache,
     PluginFileOwner, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
     collect_gc_wasm_blob_roots, load_plugin_registry_at_commit,
 };
@@ -124,5 +126,7 @@ pub(crate) use install::recovery_test_plugin_archive;
 
 mod read_dependencies;
 pub(crate) use read_dependencies::{
-    prepare_executable_blobs, prepare_file_content_state, prepare_returned_row_executables,
+    MAX_EXECUTABLE_OWNER_ROWS, PluginOwnerLookupRow, executable_dependency_work_bound,
+    load_plugin_owner_pages, load_plugin_registry_pages, prepare_executable_blobs,
+    prepare_file_content_state, prepare_returned_row_executables,
 };

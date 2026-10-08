@@ -320,7 +320,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Memory, StorageSpaceRole, ValueIntegrity, ValueSemantics};
+    use crate::storage::{
+        Memory, StorageSpaceRole, StorageSpaceVisibility, ValueIntegrity, ValueSemantics,
+    };
     use crate::storage_adapter::{PointReadPlan, StorageAdapter, StorageGetOptions, StorageKey};
 
     fn logical_space(id: u32) -> StorageSpace {
@@ -330,6 +332,7 @@ mod tests {
             value_semantics: ValueSemantics::Mutable,
             value_integrity: ValueIntegrity::BackendVerified,
             role: StorageSpaceRole::Authoritative,
+            visibility: StorageSpaceVisibility::Observable,
         }
     }
 

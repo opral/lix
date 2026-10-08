@@ -108,6 +108,8 @@ pub const SYNC_CHECKPOINT_SOURCE_SPACE: StorageSpace = crate::sync::SYNC_CHECKPO
 pub const SYNC_UPLOAD_GENERATION_SPACE: StorageSpace = crate::sync::SYNC_UPLOAD_GENERATION_SPACE;
 pub const SYNC_UPLOAD_PROOF_SPACE: StorageSpace = crate::sync::SYNC_UPLOAD_PROOF_SPACE;
 pub const PARTIAL_REPLICA_STATE_SPACE: StorageSpace = crate::sync::PARTIAL_REPLICA_STATE_SPACE;
+/// Private operation scratch; excluded from semantic snapshot exports.
+pub const READ_OPERATION_SCRATCH_SPACE: StorageSpace = crate::sync::READ_OPERATION_SCRATCH_SPACE;
 pub const PARTIAL_SERVING_SPACE: StorageSpace = crate::sync::partial_serving::PARTIAL_SERVING_SPACE;
 pub const PARTIAL_BRANCH_PUSH_SPACE: StorageSpace = crate::sync::PARTIAL_BRANCH_PUSH_SPACE;
 pub const PARTIAL_BRANCH_MERGE_SPACE: StorageSpace = crate::sync::PARTIAL_BRANCH_MERGE_SPACE;
@@ -201,6 +203,7 @@ mod tests {
         PARTIAL_GLOBAL_MERGE_SPACE,
         SYNC_REPLICA_RETIREMENT_SPACE,
         PARTIAL_SERVING_SPACE,
+        READ_OPERATION_SCRATCH_SPACE,
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
         COMMIT_RETIREMENT_INTENT_SPACE,

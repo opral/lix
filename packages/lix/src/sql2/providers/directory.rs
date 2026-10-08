@@ -2011,7 +2011,26 @@ where
             "lixcol_updated_at" => Arc::new(StringArray::from(updated_ats.clone())),
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
             "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
-            "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
+            "lixcol_metadata" => {
+                let metadata_keys = metadata_values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_deref()
+                            .map(crate::common::metadata_sql_equality_key)
+                            .transpose()
+                            .map_err(|error| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "invalid lix_directory metadata JSONB equality key: {error}"
+                                    ),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Arc::new(StringArray::from(metadata_keys))
+            }
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",

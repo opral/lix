@@ -320,6 +320,7 @@ mod tests {
             .unwrap();
         let adapter = StorageAdapter::new(storage.clone());
         let revision = adapter.load_mutation_revision().await.unwrap();
+        assert_eq!(adapter.load_observable_revision().await.unwrap(), None);
         publish(
             &adapter,
             revision,
@@ -329,6 +330,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            adapter.load_observable_revision().await.unwrap().is_some(),
+            "atomic migration publication advances the observer token"
+        );
 
         let read = storage.begin_read(ReadOptions::default()).await.unwrap();
         let immutable_keys = [Key(Bytes::from_static(b"same-key"))];
@@ -380,6 +385,7 @@ mod tests {
         seed.commit().await.unwrap();
         let adapter = StorageAdapter::new(storage.clone());
         let stale_revision = adapter.load_mutation_revision().await.unwrap();
+        let observable_before_concurrent_write = adapter.load_observable_revision().await.unwrap();
 
         let mut concurrent = adapter.new_write_set();
         concurrent.put(REPOSITORY_PROTOCOL_SPACE, &b"unrelated"[..], &b"write"[..]);
@@ -387,6 +393,11 @@ mod tests {
             .commit_write_set(concurrent, WriteOptions::default())
             .await
             .unwrap();
+        let observable_after_concurrent_write = adapter.load_observable_revision().await.unwrap();
+        assert_ne!(
+            observable_after_concurrent_write, observable_before_concurrent_write,
+            "a concurrent visible write advances the observer token"
+        );
 
         let error = publish(
             &adapter,
@@ -398,6 +409,11 @@ mod tests {
         .await
         .expect_err("stale migration must be fenced");
         assert!(error.to_string().contains("precondition failed"));
+        assert_eq!(
+            adapter.load_observable_revision().await.unwrap(),
+            observable_after_concurrent_write,
+            "a stale publication must not rotate the observer token"
+        );
         assert_eq!(
             crate::migration::inspect_lix(&storage).await.unwrap(),
             crate::migration::MigrationStatus::Required {

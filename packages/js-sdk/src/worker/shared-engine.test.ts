@@ -60,6 +60,122 @@ test("concurrent clients share one root and independent local sessions", async (
   expect(f.rootClose).toHaveBeenCalledTimes(1);
 });
 
+test("final detach keeps its transport only for the exact session DELETE", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+  let transport!: SyncServerBindingOptions;
+  let disconnected = false;
+  let owner!: SharedEngineOwner;
+  const sent: string[] = [];
+  const root = {
+    activeAccountId: async () => "account-a",
+    openAnotherSession: async () => ({ close: async () => {} }) as unknown as LixBinding,
+    close: async () => {
+      const close = await transport.transport!({
+        url: `https://example.test/lix/v1/${repositoryId}/session`,
+        init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+        response: { mode: "buffered", maxBytes: 128 },
+      });
+      expect(close.status).toBe(204);
+      await expect(transport.transport!({
+        url: `https://example.test/lix/v1/${repositoryId}/sync/pull`,
+        init: { method: "POST" },
+        response: { mode: "buffered", maxBytes: 128 },
+      })).rejects.toMatchObject({ code: "LIX_TRANSPORT_UNAVAILABLE" });
+    },
+  } as unknown as LixBinding;
+  const client: SharedEngineClient = {
+    server: {
+      url: `https://example.test/lix/${repositoryId}`,
+      headers: [["authorization", "token"]],
+      teardownHeaders: async () => [["authorization", "token"]],
+      transport: async ({ url, init }) => {
+        sent.push(`${init?.method}:${url}`);
+        return new Response(null, { status: 204 });
+      },
+    },
+    isDisconnected: () => disconnected,
+    verifyIdentity: async () => ({
+      authorityUrl: `https://example.test/lix/${repositoryId}`,
+      accountId: "account-a",
+      headers: [["authorization", "token"]],
+    }),
+  };
+  owner = new SharedEngineOwner(async (server) => {
+    transport = server;
+    return root;
+  });
+  await owner.attach(client);
+  disconnected = true;
+  await owner.detach(client);
+  expect(sent).toEqual([`DELETE:https://example.test/lix/v1/${repositoryId}/session`]);
+  expect(owner.lifecycleState).toBe("closed");
+});
+
+test("failed final root close retains the owner fence", async () => {
+  const closeError = new Error("close did not finish");
+  const root = {
+    activeAccountId: async () => "account-a",
+    openAnotherSession: async () => ({ close: async () => {} }) as unknown as LixBinding,
+    close: async () => { throw closeError; },
+  } as unknown as LixBinding;
+  const owner = new SharedEngineOwner(async () => root);
+  const client = {
+    server: { url: "https://example.test/lix/v1/repo-a", headers: [] },
+    verifyIdentity: async () => ({
+      authorityUrl: "https://example.test/lix/v1/repo-a",
+      accountId: "account-a",
+      headers: [],
+    }),
+  } satisfies SharedEngineClient;
+  await owner.attach(client);
+  await expect(owner.detach(client)).rejects.toBe(closeError);
+  expect(owner.lifecycleState).toBe("closing");
+  await expect(owner.attach({
+    ...client,
+    verifyIdentity: async () => ({ authorityUrl: client.server.url, accountId: "account-a", headers: [] }),
+  })).rejects.toMatchObject({ code: "LIX_OWNER_CLOSE_FAILED" });
+});
+
+test("failed initial admission retains its authenticated transport through root cleanup", async () => {
+  const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+  let transport!: SyncServerBindingOptions;
+  const sent: string[] = [];
+  const root = {
+    activeAccountId: async () => "unexpected-account",
+    openAnotherSession: async () => ({ close: async () => {} }) as unknown as LixBinding,
+    close: async () => {
+      await transport.transport!({
+        url: `https://example.test/lix/v1/${repositoryId}/session`,
+        init: { method: "DELETE", headers: [["lix-session-id", "session-a"]] },
+        response: { mode: "buffered", maxBytes: 128 },
+      });
+    },
+  } as unknown as LixBinding;
+  const owner = new SharedEngineOwner(async (server) => {
+    transport = server;
+    return root;
+  });
+  const client: SharedEngineClient = {
+    server: {
+      url: `https://example.test/lix/${repositoryId}`,
+      headers: [["authorization", "token"]],
+      teardownHeaders: async () => [["authorization", "token"]],
+      transport: async ({ init }) => {
+        sent.push(init?.method ?? "GET");
+        return new Response(null, { status: 204 });
+      },
+    },
+    verifyIdentity: async () => ({
+      authorityUrl: `https://example.test/lix/${repositoryId}`,
+      accountId: "account-a",
+      headers: [["authorization", "token"]],
+    }),
+  };
+  await expect(owner.attach(client)).rejects.toMatchObject({ code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH" });
+  expect(sent).toEqual(["DELETE"]);
+  expect(owner.lifecycleState).toBe("closed");
+});
+
 test("a different authenticated account cannot receive a session or replace transport", async () => {
   const f = fixture();
   const a = f.client();

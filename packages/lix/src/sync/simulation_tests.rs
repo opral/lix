@@ -201,6 +201,16 @@ impl SyncTransport for AuthorityTransport {
         })
     }
 
+    fn register_blobs<'a>(
+        &'a self,
+        manifests: &'a [SyncBlobManifest],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobRegistration>> {
+        Box::pin(async move {
+            self.check_connected()?;
+            self.authority.register_sync_blob_manifests(manifests).await
+        })
+    }
+
     fn register_blob<'a>(
         &'a self,
         manifest: &'a SyncBlobManifest,

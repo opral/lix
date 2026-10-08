@@ -46,6 +46,70 @@ where
     Ok(result)
 }
 
+/// Collect one bounded exact codec input from byte-admitted provider pages.
+/// The aggregate codec budget is separate from the provider-page budget:
+/// callers that can consume pages directly should use the prefix API instead.
+/// Ordering and missing slots are checked at this shared adapter boundary.
+pub(crate) async fn collect_bounded_point_pages<R: StorageAdapterRead + ?Sized>(
+    read: &R,
+    requests: &[GetManyRequest<'_>],
+    page_budget: crate::storage::ReadBudget,
+    max_codec_bytes: usize,
+    max_slots: usize,
+) -> Result<(GetManyResult, usize, usize), StorageError> {
+    let total = requests.iter().try_fold(0usize, |count, request| {
+        count
+            .checked_add(request.keys.len())
+            .ok_or(StorageError::InvalidKey)
+    })?;
+    let mut values = Vec::new();
+    let mut offset = 0usize;
+    let mut retained = 0usize;
+    let mut peak = 0usize;
+    let mut pages = 0usize;
+    while offset < total {
+        let remaining = max_codec_bytes
+            .checked_sub(retained)
+            .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?;
+        let budget = crate::storage::ReadBudget {
+            max_result_bytes: page_budget.max_result_bytes.min(remaining),
+            max_single_value_bytes: page_budget.max_single_value_bytes.min(remaining),
+        };
+        let page =
+            Box::pin(read.get_many_bounded_prefix(requests, offset, max_slots, budget)).await?;
+        let count = page.values.len();
+        let next = offset
+            .checked_add(count)
+            .ok_or(StorageError::InvalidCursor)?;
+        if count == 0
+            || count > max_slots.min(crate::storage::MAX_SCAN_PAGE_ROWS)
+            || next > total
+            || page.next_offset != (next < total).then_some(next)
+        {
+            return Err(StorageError::InvalidCursor);
+        }
+        budget.validate_result(&page.values)?;
+        let bytes = page
+            .values
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                ProjectedValue::FullValue(bytes) => bytes.len(),
+                ProjectedValue::KeyOnly => 0,
+            })
+            .sum::<usize>();
+        retained = retained
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= max_codec_bytes)
+            .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?;
+        peak = peak.max(bytes);
+        pages += 1;
+        values.extend(page.values);
+        offset = next;
+    }
+    Ok((GetManyResult::new(values), peak, pages))
+}
+
 #[derive(Clone, Debug)]
 pub struct PointReadPlan {
     pub space: StorageSpace,

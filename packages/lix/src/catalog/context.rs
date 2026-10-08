@@ -707,6 +707,52 @@ mod tests {
         assert_eq!(reader.scan_count(), 4);
     }
 
+    #[tokio::test]
+    async fn returned_row_catalog_preparation_scans_unique_branches_and_rejects_bad_schema() {
+        let mut first = registered_schema_row("first_union_schema");
+        first.branch_id = Arc::from("branch-a");
+        first.global = false;
+        let mut second = registered_schema_row("second_union_schema");
+        second.branch_id = Arc::from("branch-b");
+        second.global = false;
+        let key = |schema_key: &str| crate::tracked_state::TrackedStateKey {
+            schema_key: schema_key.to_owned(),
+            file_id: None,
+            row_pk: crate::row_pk::RowPk::single(schema_key),
+        };
+        let rows = vec![
+            ("branch-a".to_owned(), key("first_union_schema")),
+            ("branch-a".to_owned(), key("first_union_schema")),
+            ("branch-b".to_owned(), key("second_union_schema")),
+        ];
+        let reader = RowsHotStateReader::new(vec![first.clone(), second.clone()]);
+        CatalogContext::new()
+            .prepare_returned_row_catalogs(&reader, &rows, None)
+            .await
+            .expect("valid catalogs for the union should prepare");
+        assert_eq!(
+            reader.scan_count(),
+            6,
+            "each unique branch needs one SQL catalog (two scopes) and one tracked catalog scan"
+        );
+
+        let mut malformed: JsonValue =
+            serde_json::from_str(second.snapshot_content.as_deref().unwrap()).unwrap();
+        malformed["value"]["key"] = json!("different_schema_key");
+        second.snapshot_content = Some(malformed.to_string().into());
+        let reader = RowsHotStateReader::new(vec![first, second]);
+        let error = CatalogContext::new()
+            .prepare_returned_row_catalogs(&reader, &rows, None)
+            .await
+            .expect_err("a malformed returned-branch schema must fail preparation");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(
+            reader.scan_count(),
+            5,
+            "the malformed second branch is rejected after its SQL catalog scans"
+        );
+    }
+
     #[test]
     fn compiled_catalog_cache_shares_snapshots_for_equal_facts() {
         let context = CatalogContext::new();

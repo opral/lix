@@ -90,6 +90,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::PARTIAL_GLOBAL_MERGE_SPACE,
     crate::sync::SYNC_REPLICA_RETIREMENT_SPACE,
     crate::sync::partial_serving::PARTIAL_SERVING_SPACE,
+    crate::sync::READ_OPERATION_SCRATCH_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -153,9 +154,9 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
 /// with its original descriptor so snapshots written before that retirement
 /// can still be decoded and migrated. Space ids are never reused.
 ///
-/// New active logical spaces must be added here as well; the registry tests
-/// enforce that relationship. The epoch-control space is deliberately absent
-/// because snapshots publish their own fresh epoch at restore time.
+/// Semantic spaces are retained permanently. Epoch controls and private
+/// expiring operation scratch are excluded: snapshots create a fresh epoch
+/// and contain no in-flight reads or publication coverage.
 pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     RETIRED_JSON_SPACE,
     crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
@@ -305,6 +306,22 @@ pub(crate) const fn may_declare(id: StorageSpaceId, semantics: ValueSemantics) -
     true
 }
 
+/// Visibility is intrinsic registry metadata and must follow a checked use
+/// of a registered id. Unregistered test/adapter spaces default observable.
+pub(crate) const fn registered_visibility(
+    id: StorageSpaceId,
+) -> crate::storage::StorageSpaceVisibility {
+    let mut index = 0;
+    while index < ALL_STORAGE_SPACES.len() {
+        let space = ALL_STORAGE_SPACES[index];
+        if space.id.0 == id.0 {
+            return space.visibility;
+        }
+        index += 1;
+    }
+    crate::storage::StorageSpaceVisibility::Observable
+}
+
 /// `ValueSemantics` derives `PartialEq`, which is not usable in const context.
 const fn same_semantics(left: ValueSemantics, right: ValueSemantics) -> bool {
     matches!(
@@ -405,6 +422,24 @@ mod tests {
              BLAKE3-256 digest from its key on EVERY full-value read, in release builds too. If \
              the new space really does that, add it here deliberately; otherwise use \
              StorageSpace::declare and keep the backend's checksum."
+        );
+    }
+
+    #[test]
+    fn only_operation_scratch_and_read_interest_journal_are_private() {
+        let private = ALL_STORAGE_SPACES
+            .iter()
+            .filter(|space| space.visibility == crate::storage::StorageSpaceVisibility::Private)
+            .map(|space| (space.id.0, space.name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            private,
+            vec![
+                (0x0007_001b, "sync.partial_read_interests.v1"),
+                (0x0007_0024, "sync.read_operation_scratch.v1"),
+            ],
+            "all new spaces must be observable unless they explicitly opt into private work"
         );
     }
 
@@ -822,9 +857,9 @@ mod tests {
 
     /// Every `StorageSpace` constructor call in one source file.
     ///
-    /// `declare` and `declare_content_addressed` state a pairing and carry
+    /// `declare`, `declare_private` and `declare_content_addressed` state a pairing and carry
     /// their semantics as a third argument; `mutable` and `immutable` carry it
-    /// in the name. All four are collected, so the scan can both find the
+    /// in the name. All five are collected, so the scan can both find the
     /// registry's own declarations and check every use against them.
     ///
     /// **Every constructor must be listed here.** These names are matched as
@@ -842,6 +877,7 @@ mod tests {
         ("StorageSpace::mutable(", Some(ValueSemantics::Mutable)),
         ("StorageSpace::immutable(", Some(ValueSemantics::Immutable)),
         ("StorageSpace::declare(", None),
+        ("StorageSpace::declare_private(", None),
         ("StorageSpace::declare_content_addressed(", None),
     ];
 

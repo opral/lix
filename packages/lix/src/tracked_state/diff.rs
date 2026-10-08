@@ -1660,7 +1660,6 @@ impl TrackedStateDiffEntry {
         self.before.as_ref().filter(|row| !row.deleted)
     }
 
-    #[cfg(test)]
     pub(crate) fn visible_after(&self) -> Option<&TrackedStateDiffRow> {
         self.after.as_ref().filter(|row| !row.deleted)
     }

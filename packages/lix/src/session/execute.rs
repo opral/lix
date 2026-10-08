@@ -291,10 +291,7 @@ impl ExecuteResult {
     /// Rebase only the directly projected new-image change-ID cells whose
     /// provenance was retained by SQL binding. The remap is derived during
     /// this same commit's materialization; no post-commit SQL read is needed.
-    pub(crate) fn remap_direct_new_change_ids(
-        mut self,
-        remap: &BTreeMap<String, String>,
-    ) -> Self {
+    pub(crate) fn remap_direct_new_change_ids(mut self, remap: &BTreeMap<String, String>) -> Self {
         if self.direct_new_change_id_columns.is_empty() || remap.is_empty() {
             self.direct_new_change_id_columns.clear();
             return self;
@@ -1192,7 +1189,10 @@ where
         &self,
         sql: &str,
     ) -> Result<ExecutionDisposition, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql).map_err(sql2::binding_rejection)?;
+        let statement = self
+            .sql_planning_cache
+            .parse_statement(sql)
+            .map_err(sql2::binding_rejection)?;
         execution_disposition(&statement).map_err(sql2::binding_rejection)
     }
 
@@ -1210,10 +1210,12 @@ where
             let parsed = self
                 .sql_planning_cache
                 .parse_statement(&statement.sql)
-                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?;
-            if execution_disposition(&parsed)
-                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?
-                == ExecutionDisposition::Durable
+                .map_err(|error| {
+                    with_batch_statement_index(sql2::binding_rejection(error), statement_index)
+                })?;
+            if execution_disposition(&parsed).map_err(|error| {
+                with_batch_statement_index(sql2::binding_rejection(error), statement_index)
+            })? == ExecutionDisposition::Durable
             {
                 return Ok(ExecutionDisposition::Durable);
             }
@@ -3453,12 +3455,8 @@ where
         .await?;
         drop(read_session);
         drop(ctx);
-        if let Some((
-            data_column_index,
-            size_column_indices,
-            file_id_column_index,
-            projection,
-        )) = late_file_projection
+        if let Some((data_column_index, size_column_indices, file_id_column_index, projection)) =
+            late_file_projection
         {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(read_hot.reader(read_store.clone()));
@@ -4006,7 +4004,11 @@ async fn hydrate_lix_file_bounded_content_result(
 
     let selected_paths = paths
         .iter()
-        .filter(|path| size_by_path.get(*path).is_some_and(|size| *size <= max_size))
+        .filter(|path| {
+            size_by_path
+                .get(*path)
+                .is_some_and(|size| *size <= max_size)
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut content_by_path = BTreeMap::new();
@@ -4434,6 +4436,14 @@ pub(crate) fn seed_foreground_filesystem_interest(
     let Some(capture) = capture else {
         return Ok(());
     };
+    if let Some(read) = sql2::exact_file_content_id_read(statement, params) {
+        register_seeded_exact_id_file_content_interest(
+            capture,
+            active_branch_id,
+            &read,
+        )?;
+        return Ok(());
+    }
     let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
         return Ok(());
     };
@@ -4487,6 +4497,28 @@ pub(crate) fn seed_foreground_filesystem_interest(
         content,
         None,
     )
+}
+
+fn register_seeded_exact_id_file_content_interest(
+    capture: &crate::hot_state::ReadInterestRegistry,
+    active_branch_id: &str,
+    read: &sql2::ExactFileContentIdRead,
+) -> Result<(), LixError> {
+    let branch_ids = vec![active_branch_id.to_owned()];
+    let scope = crate::filesystem::FilesystemPathIndexRequest::new(branch_ids.clone())
+        .with_scope(crate::filesystem::FilesystemPathIndexScope::FileIds(vec![
+            read.file_id.clone(),
+        ]))
+        .scope;
+    capture.register(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+        scope,
+        branch_ids: branch_ids.clone(),
+        include_blob_refs: true,
+        cache_small_blob_data: false,
+    })?;
+    let request = sql2::lix_file_content_scan_request(&branch_ids, read.include_metadata);
+    capture.register(sql2::exact_id_file_content_interest(&request, &read.file_id))?;
+    Ok(())
 }
 
 fn register_seeded_file_interest(
@@ -4768,7 +4800,7 @@ where
             let native = crate::tracked_state::NativeObjectRef::from_missing_error(&error)?
                 .is_some()
                 || crate::tracked_state::NativeMetadataRef::from_missing_error(&error)?.is_some()
-                || crate::binary_cas::BlobManifestRequired::from_error(&error)?.is_some()
+                || crate::binary_cas::BlobManifestsRequired::from_error(&error)?.is_some()
                 || error.code == "LIX_SYNC_CHUNKS_REQUIRED";
             if !native {
                 return Err(error);
@@ -6223,6 +6255,206 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn metadata_sql_keys_ignore_object_order_and_legacy_float_spelling() {
+        let session = open_session().await;
+        let legacy_ryu = r#"{"z":1,"n":-1.23456789e-40,"x":1e3,"a":true}"#;
+        let exact_decimal = format!(
+            r#"{{"a":true,"n":-0.{}123456789,"x":1000,"z":1}}"#,
+            "0".repeat(39)
+        );
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_key_value (key, value, lixcol_metadata) VALUES \
+                     ('metadata-key-a', 'value', '{legacy_ryu}'), \
+                     ('metadata-key-b', 'value', '{exact_decimal}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        for (path, metadata) in [
+            ("/metadata-sql-key-a.md", legacy_ryu),
+            ("/metadata-sql-key-b.md", exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (path, content, lixcol_metadata) \
+                         VALUES ($1, $2, '{metadata}')"
+                    ),
+                    &[
+                        Value::Text(path.to_string()),
+                        Value::Blob(b"x".to_vec().into()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        for (path, metadata) in [
+            ("/metadata-sql-key/a", legacy_ryu),
+            ("/metadata-sql-key/b", exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_directory (path, lixcol_metadata) \
+                         VALUES ('{path}', '{metadata}')"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
+        let branch_a = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-0000000000c1".to_string()),
+                name: "metadata-key-a".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let branch_b = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-0000000000c2".to_string()),
+                name: "metadata-key-b".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        for (branch_id, metadata) in [
+            (branch_a.id.as_str(), legacy_ryu),
+            (branch_b.id.as_str(), exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_branch SET lixcol_metadata = '{metadata}' WHERE id = '{branch_id}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
+        for (table, scope) in [
+            (
+                "lix_key_value",
+                "key IN ('metadata-key-a', 'metadata-key-b')",
+            ),
+            (
+                "lix_file",
+                "path IN ('/metadata-sql-key-a.md', '/metadata-sql-key-b.md')",
+            ),
+            (
+                "lix_directory",
+                "path IN ('/metadata-sql-key/a', '/metadata-sql-key/b')",
+            ),
+            (
+                "lix_branch",
+                "id IN ('01920000-0000-7000-8000-0000000000c1', \
+                       '01920000-0000-7000-8000-0000000000c2')",
+            ),
+        ] {
+            for literal in [legacy_ryu, exact_decimal.as_str()] {
+                let equality = session
+                    .execute(
+                        &format!(
+                            "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                             AND lixcol_metadata = '{literal}'::jsonb"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    equality.rows()[0].get::<i64>("matches").unwrap(),
+                    2,
+                    "{table} = {literal}"
+                );
+            }
+
+            let in_list = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IN ('{exact_decimal}'::jsonb, '{{}}'::jsonb)"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                in_list.rows()[0].get::<i64>("matches").unwrap(),
+                2,
+                "{table} IN"
+            );
+
+            let parameterized = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IN ($1, $2)"
+                    ),
+                    &[
+                        Value::Jsonb(crate::Json::parse(legacy_ryu).unwrap()),
+                        Value::Jsonb(crate::Json::parse(&exact_decimal).unwrap()),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                parameterized.rows()[0].get::<i64>("matches").unwrap(),
+                2,
+                "{table} parameterized IN"
+            );
+
+            let groups = session
+                .execute(
+                    &format!(
+                        "SELECT lixcol_metadata FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IS NOT NULL GROUP BY lixcol_metadata"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(groups.rows().len(), 1, "{table} GROUP BY");
+        }
+
+        let maximum_scale_exact = format!("0.{}1", "0".repeat(16_382));
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                 VALUES ('metadata-max-scale', 'value', '{\"x\":1e-16383}')",
+                &[],
+            )
+            .await
+            .unwrap();
+        for literal in [
+            r#"{"x":1e-16383}"#.to_owned(),
+            format!(r#"{{"x":{maximum_scale_exact}}}"#),
+        ] {
+            let result = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM lix_key_value \
+                         WHERE key = 'metadata-max-scale' \
+                         AND lixcol_metadata = '{literal}'::jsonb"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.rows()[0].get::<i64>("matches").unwrap(), 1);
+        }
+    }
+
     async fn active_head(session: &SessionContext<Memory>) -> String {
         session
             .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
@@ -7657,6 +7889,262 @@ mod tests {
                 "unexpected fast-path match for {sql}"
             );
         }
+    }
+
+    #[test]
+    fn exact_file_content_id_interest_accepts_only_positive_integer_bound_limits() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        let statement = sql2::parse_statement(
+            "SELECT id, path, lixcol_metadata, content \
+             FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        let params = [Value::Text(file_id.clone()), Value::Integer(1)];
+        assert_eq!(
+            sql2::exact_file_content_id_read(&statement, &params),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: true,
+            })
+        );
+        assert_eq!(
+            exact_filesystem_read_route(&statement, &params),
+            None,
+            "a dependency seed must not redirect execution from DataFusion"
+        );
+        assert_eq!(
+            exact_filesystem_read_interest_route(&statement, &params),
+            Some(ExactFilesystemRead::Point(
+                ExactLixFileReadSelector::Id(file_id.clone()),
+                ExactLixFileReadColumn::Content,
+            ))
+        );
+        let content_only = sql2::parse_statement(
+            "SELECT content FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &content_only,
+                &[Value::Text(file_id.clone()), Value::Integer(1)]
+            ),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: false,
+            }),
+            "unprojected metadata must stay out of the storage projection"
+        );
+
+        for invalid_limit in [
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Real(1.0),
+            Value::Text("1".to_string()),
+            Value::Null,
+        ] {
+            let invalid_params = [Value::Text(file_id.clone()), invalid_limit];
+            assert_eq!(
+                sql2::exact_file_content_id_read(&statement, &invalid_params),
+                None,
+                "nonpositive or noninteger bound limits must not seed"
+            );
+            assert_eq!(
+                exact_filesystem_read_interest_route(&statement, &invalid_params),
+                None,
+                "invalid parameter limits must not reach an older point route"
+            );
+        }
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &statement,
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Integer(1),
+                    Value::Text("unused".to_string()),
+                ]
+            ),
+            None,
+            "unused bound parameters must not broaden the seed"
+        );
+
+        for (sql, bound) in [
+            (
+                "SELECT content FROM lix_file WHERE id = $1 LIMIT $2 OFFSET 0",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1 AND name = 'x' LIMIT $2",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file WHERE path = $1 LIMIT $2",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file JOIN lix_directory ON true \
+                 WHERE lix_file.id = $1 LIMIT $2",
+                Value::Integer(1),
+            ),
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                sql2::exact_file_content_id_read(
+                    &statement,
+                    &[Value::Text(file_id.clone()), bound]
+                ),
+                None,
+                "unsupported query shape must not seed: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_file_content_preflight_does_not_widen_size_or_substring_projections() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        for sql in [
+            "SELECT OCTET_LENGTH(content), lixcol_metadata \
+             FROM lix_file WHERE id = $1",
+            "SELECT SUBSTRING(content FROM 1 FOR 4) AS preview \
+             FROM lix_file WHERE id = $1",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            let params = [Value::Text(file_id.clone())];
+            assert_eq!(sql2::exact_file_content_id_read(&statement, &params), None);
+            assert!(sql2::exact_file_content_id_uses_nonfull_content(
+                &statement, &params
+            ));
+            assert_eq!(
+                exact_filesystem_read_route(&statement, &params),
+                None,
+                "computed content projections must retain the DataFusion/provider path"
+            );
+            assert_eq!(
+                exact_filesystem_read_interest_route(&statement, &params),
+                None,
+                "preflight must not request the complete file blob"
+            );
+
+            let capture = crate::hot_state::ReadInterestRegistry::new(16, 64 * 1024);
+            seed_foreground_filesystem_interest(
+                Some(&capture),
+                "01920000-0000-7000-8000-0000000000b1",
+                &statement,
+                &params,
+            )
+            .unwrap();
+            assert!(
+                capture
+                    .snapshot()
+                    .unwrap()
+                    .interests
+                    .iter()
+                    .all(|interest| !matches!(
+                        interest.as_ref(),
+                        crate::hot_state::LogicalReadInterest::FileContent { .. }
+                    )),
+                "size and range projections must not seed a full-content recipe"
+            );
+        }
+
+        let parameterized_substring = sql2::parse_statement(
+            "SELECT SUBSTRING(content FROM $2 FOR $3) AS preview \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        let substring_params = [
+            Value::Text(file_id.clone()),
+            Value::Integer(2),
+            Value::Integer(4),
+        ];
+        assert_eq!(
+            sql2::exact_file_content_id_read(&parameterized_substring, &substring_params),
+            None,
+            "projection parameters cannot widen the direct full-content seed"
+        );
+        assert!(sql2::exact_file_content_id_uses_nonfull_content(
+            &parameterized_substring,
+            &substring_params
+        ));
+        assert_eq!(
+            exact_filesystem_read_interest_route(&parameterized_substring, &substring_params),
+            None,
+            "parameterized range reads must not fall through to the broad point seed"
+        );
+
+        let aliased_direct_content = sql2::parse_statement(
+            "SELECT lix_file.content AS body, lixcol_metadata AS meta \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &aliased_direct_content,
+                &[Value::Text(file_id.clone())]
+            ),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: true,
+            }),
+            "aliases around direct source columns still require the full blob"
+        );
+
+        let with_computed_and_direct = sql2::parse_statement(
+            "SELECT OCTET_LENGTH(content), content \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        assert!(sql2::exact_file_content_id_read(
+            &with_computed_and_direct,
+            &[Value::Text(file_id)]
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn exact_file_content_seed_captures_matching_projection_without_provider_io() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let statement = sql2::parse_statement(
+            "SELECT id, path, lixcol_metadata, content \
+             FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        let capture = crate::hot_state::ReadInterestRegistry::new(16, 64 * 1024);
+        seed_foreground_filesystem_interest(
+            Some(&capture),
+            branch_id,
+            &statement,
+            &[Value::Text(file_id.clone()), Value::Integer(1)],
+        )
+        .expect("preflight should record the recipe without performing I/O");
+
+        let snapshot = capture.snapshot().expect("recipe snapshot should succeed");
+        assert!(snapshot.interests.iter().any(|interest| matches!(
+            interest.as_ref(),
+            crate::hot_state::LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::FileIds(ids),
+                branch_ids,
+                include_blob_refs: true,
+                cache_small_blob_data: false,
+            } if ids == &[file_id.clone()] && branch_ids == &[branch_id.to_string()]
+        )));
+        let file_content = snapshot
+            .interests
+            .iter()
+            .filter_map(|interest| match interest.as_ref() {
+                crate::hot_state::LogicalReadInterest::FileContent { .. } => Some(interest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_content.len(), 1);
+        assert_eq!(
+            file_content[0].as_ref(),
+            &sql2::exact_id_file_content_interest(
+                &sql2::lix_file_content_scan_request(&[branch_id.to_string()], true),
+                &file_id,
+            ),
+            "the seed must use the shared provider recipe and metadata projection"
+        );
     }
 
     #[tokio::test]

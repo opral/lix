@@ -1,6 +1,7 @@
 //! Conformance harness for storage implementations.
 
 mod baseline;
+mod bounded;
 mod factory;
 #[cfg(test)]
 mod failure_tests;
@@ -97,6 +98,7 @@ mod tests {
                 "baseline::full_value_and_key_only_are_core",
                 "baseline::full_value_preserves_opaque_bytes",
                 "baseline::immutable_identity_is_idempotent_and_write_once",
+                "bounded::exact_results_and_ordered_prefixes",
                 "model::deterministic_history_matches_reference_model",
             ]
         );

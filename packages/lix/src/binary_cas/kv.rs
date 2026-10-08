@@ -17,8 +17,8 @@ use crate::binary_cas::{
 use crate::storage_adapter::StoragePrefix;
 use crate::storage_adapter::{
     PointReadPlan, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
-    REVISION_SPACE, StorageAdapterRead, StorageSpace, StorageWriteSet, ValueSemantics,
-    load_revision, load_revisions, revision_key,
+    REVISION_SPACE, StorageAdapterRead, StorageGetManyRequest, StorageSpace, StorageWriteSet,
+    ValueSemantics, load_revision, load_revisions, revision_key,
 };
 use crate::storage_adapter::{
     StorageBeginScanOptions, StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange,
@@ -1177,6 +1177,145 @@ pub(crate) async fn load_metadata_many(
         hashes.iter().map(|hash| manifest_key(*hash)).collect(),
     )
     .await?;
+    Ok(BlobMetadataBatch::new(decode_metadata_rows(rows, hashes)?))
+}
+
+/// Loads manifest metadata from one coherent read handle using byte-admitted
+/// exact point pages. Provider limits apply before full row values are
+/// returned; each page is decoded before the next is fetched, so raw row
+/// retention stays within `budget.max_result_bytes`. Total source rows are
+/// capped at `hashes.len() * budget.max_single_value_bytes`; decoded rows are
+/// retained only as compact metadata. Decoding and physical layout validation
+/// use the same path as `load_metadata_many`. Duplicate request keys are
+/// fetched once and expanded back into caller order.
+pub(crate) async fn load_metadata_many_bounded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hashes: &[BlobId],
+    budget: crate::storage_adapter::ReadBudget,
+) -> Result<BlobMetadataBatch, LixError> {
+    if hashes.is_empty() {
+        return Ok(BlobMetadataBatch::new(Vec::new()));
+    }
+    let max_aggregate_bytes = budget
+        .max_single_value_bytes
+        .checked_mul(hashes.len())
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS bounded metadata aggregate budget overflowed",
+            )
+        })?;
+    let keys = hashes
+        .iter()
+        .map(|hash| StorageKey(Bytes::from(manifest_key(*hash))))
+        .collect::<Vec<StorageKey>>();
+    let plan = PointReadPlan::new(BINARY_CAS_MANIFEST_SPACE, &keys);
+    let requests = [StorageGetManyRequest {
+        space: BINARY_CAS_MANIFEST_SPACE,
+        keys: &plan.logical_unique_keys,
+        opts: StorageGetOptions::default(),
+    }];
+    let requested_to_unique = plan.requested_to_unique.to_vec();
+    let mut unique_hashes = vec![None; plan.logical_unique_keys.len()];
+    for (hash, unique_index) in hashes.iter().copied().zip(&requested_to_unique) {
+        unique_hashes[*unique_index].get_or_insert(hash);
+    }
+    let unique_hashes = unique_hashes
+        .into_iter()
+        .map(|hash| {
+            hash.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS bounded metadata key has no request slot",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let total = plan.logical_unique_keys.len();
+    let mut unique_entries = Vec::with_capacity(total);
+    let mut offset = 0usize;
+    let mut aggregate_bytes = 0usize;
+    while offset < total {
+        let max_slots = (total - offset).min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS);
+        let page =
+            Box::pin(store.get_many_bounded_prefix(&requests, offset, max_slots, budget)).await?;
+        let count = page.values.len();
+        let next = offset.checked_add(count).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "binary CAS bounded metadata page offset overflowed",
+            )
+        })?;
+        if count == 0
+            || count > max_slots
+            || next > total
+            || page.next_offset != (next < total).then_some(next)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "binary CAS bounded metadata page returned invalid slots",
+            ));
+        }
+        budget.validate_result(&page.values)?;
+        let page_bytes = page
+            .values
+            .iter()
+            .flatten()
+            .try_fold(0usize, |sum, value| {
+                let bytes = match value {
+                    StorageProjectedValue::FullValue(bytes) => bytes.len(),
+                    StorageProjectedValue::KeyOnly => 0,
+                };
+                sum.checked_add(bytes).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "binary CAS bounded metadata page byte count overflowed",
+                    )
+                })
+            })?;
+        aggregate_bytes = aggregate_bytes
+            .checked_add(page_bytes)
+            .filter(|bytes| *bytes <= max_aggregate_bytes)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS bounded metadata exceeded its aggregate byte limit",
+                )
+            })?;
+        let rows = page
+            .values
+            .into_iter()
+            .map(|value| match value {
+                None => Ok(None),
+                Some(StorageProjectedValue::FullValue(bytes)) => Ok(Some(bytes)),
+                Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS bounded metadata page omitted a requested value",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        unique_entries.extend(decode_metadata_rows(rows, &unique_hashes[offset..next])?);
+        offset = next;
+    }
+    let entries = requested_to_unique
+        .into_iter()
+        .map(|unique_index| {
+            unique_entries.get(unique_index).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "binary CAS bounded metadata slot is outside its unique rows",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BlobMetadataBatch::new(entries))
+}
+
+fn decode_metadata_rows(
+    rows: Vec<Option<Bytes>>,
+    hashes: &[BlobId],
+) -> Result<Vec<Option<BlobMetadata>>, LixError> {
     if rows.len() != hashes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -1198,7 +1337,7 @@ pub(crate) async fn load_metadata_many(
             .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(BlobMetadataBatch::new(entries))
+    Ok(entries)
 }
 
 pub(crate) async fn load_bytes_many(
@@ -1973,6 +2112,50 @@ pub(crate) async fn require_referenced_content(
     store: &(impl StorageAdapterRead + ?Sized),
     hashes: &[BlobId],
 ) -> Result<(), LixError> {
+    if hashes.len() > crate::binary_cas::MAX_REFERENCED_BLOB_HASHES {
+        return Err(crate::binary_cas::work_bound_error());
+    }
+    // A flat-delta root also depends on its full base manifest. Discover that
+    // one-level closure in one bounded batch before validating layouts. Partial
+    // replicas can then hydrate all absent bases together instead of turning
+    // the first missing base into a generic storage error.
+    let root_metadata = load_metadata_many(store, hashes).await?.into_vec();
+    if root_metadata.len() != hashes.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "blob dependency metadata batch returned an invalid result cardinality",
+        ));
+    }
+    let base_ids = root_metadata
+        .iter()
+        .flatten()
+        .filter_map(|metadata| match &metadata.layout {
+            BlobLayout::Delta {
+                base_blob_hash, ..
+            } => Some(*base_blob_hash),
+            BlobLayout::Empty | BlobLayout::SingleChunk { .. } | BlobLayout::Chunked { .. } => {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let base_metadata = load_metadata_many(store, &base_ids).await?.into_vec();
+    if base_metadata.len() != base_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_STORAGE_ERROR,
+            "blob delta base metadata batch returned an invalid result cardinality",
+        ));
+    }
+    let missing_bases = base_ids
+        .iter()
+        .zip(base_metadata)
+        .filter_map(|(hash, metadata)| metadata.is_none().then_some(*hash))
+        .collect::<Vec<_>>();
+    if !missing_bases.is_empty() {
+        return Err(crate::binary_cas::BlobManifestsRequired::new(missing_bases)?.into_error());
+    }
+
     let mut blobs = BTreeSet::new();
     let mut chunks = BTreeMap::new();
     let mut sizes = BTreeMap::new();
@@ -3357,7 +3540,7 @@ mod tests {
     {
         async fn get_many(
             &self,
-            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+            requests: &[StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, StorageError> {
             for request in requests {
                 if request.space == BINARY_CAS_MANIFEST_SPACE {
@@ -3684,6 +3867,65 @@ mod tests {
             .await
             .unwrap();
         assert!(load_bytes_many(&read, &[base_blob]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn referenced_delta_batch_demands_all_missing_base_manifests() {
+        let storage = StorageAdapter::new(Memory::new());
+        let roots = [
+            (b"first base".as_slice(), b"first base!".as_slice()),
+            (b"second base".as_slice(), b"second base!".as_slice()),
+        ];
+        let mut writes = storage.new_write_set();
+        let mut expected_bases = Vec::new();
+        let mut deltas = Vec::new();
+        for (base, output) in roots {
+            let chunk = ChunkHash::from_content(base);
+            let base_blob = BlobId::from_single_chunk(chunk);
+            let delta = BlobId::from_content(output);
+            expected_bases.push(base_blob);
+            deltas.push(delta);
+            stage_manifest(
+                &mut writes,
+                delta,
+                &BinaryCasManifest::Delta {
+                    size_bytes: output.len() as u64,
+                    base_blob_hash: base_blob.into_bytes(),
+                    base_size_bytes: base.len() as u64,
+                    base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                        chunk_hash: chunk.into_bytes(),
+                    },
+                    segments: vec![
+                        StorageBinaryCasDeltaSegment::Copy {
+                            offset: 0,
+                            length: base.len() as u64,
+                        },
+                        StorageBinaryCasDeltaSegment::Insert {
+                            bytes: b"!".to_vec(),
+                        },
+                    ],
+                },
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        expected_bases.sort_unstable();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = require_referenced_content(&read, &deltas)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::binary_cas::BlobManifestsRequired::from_error(&error)
+                .unwrap()
+                .unwrap()
+                .0,
+            expected_bases
+        );
     }
 
     #[tokio::test]

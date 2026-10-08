@@ -181,6 +181,9 @@ impl SqlValue {
                 a == b || (a.is_nan() && b.is_nan() && a.to_bits() == b.to_bits())
             }
             (Self::Timestamptz(a), Self::Timestamptz(b)) => a == b,
+            (Self::Json(a), Self::Json(b)) => {
+                lix_schema::Jsonb::from_value(a.clone()) == lix_schema::Jsonb::from_value(b.clone())
+            }
             (Self::RowRef(a), Self::RowRef(b)) => a == b,
             (Self::Blob(a), Self::Blob(b)) => a == b,
             _ => return None,
@@ -356,10 +359,22 @@ pub(crate) fn validate_assignment_types(
     Ok(())
 }
 
-/// Physical parameter conversion uses the same JSONB normalization as SQL casts.
+/// Physical JSONB parameters use the same compact comparison key as SQL casts.
 pub(crate) fn public_scalar(
     value: &crate::Value,
 ) -> Result<datafusion::common::ScalarValue, LixError> {
+    if let crate::Value::Jsonb(value) = value {
+        // `Json` retains compact, recursively sorted engine JSON. Key it
+        // directly so each bound JSON parameter does not round-trip through a
+        // serde_json DOM before DataFusion builds the scalar.
+        let key = lix_schema::jsonb_equality_key(value.as_str()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("invalid JSONB SQL equality key: {error}"),
+            )
+        })?;
+        return Ok(datafusion::common::ScalarValue::Utf8(Some(key)));
+    }
     Ok(SqlValue::from_public(value)?.scalar())
 }
 

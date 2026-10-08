@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,7 +10,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lix::LixError;
 use lix::{plugin::runtime::WasmRuntime, wasm::WasmLimits};
-use lru::LruCache;
 use wasmtime::component::Component;
 #[cfg(test)]
 use wasmtime::component::Linker;
@@ -20,6 +17,8 @@ use wasmtime::{
     Cache, CacheConfig, Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
 };
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+use super::compile_cache::{BoundedCompileCache, CompileCacheLimits};
 
 mod component_backend;
 mod component_runtime;
@@ -202,70 +201,40 @@ impl CompiledComponentKey {
     }
 }
 
-type InFlightCompilation = Arc<tokio::sync::OnceCell<Result<Component, LixError>>>;
-
-struct CompiledComponentCacheState {
-    ready: LruCache<CompiledComponentKey, Component>,
-    in_flight: HashMap<CompiledComponentKey, InFlightCompilation>,
-}
-
 struct CompiledComponentCache {
-    state: Mutex<CompiledComponentCacheState>,
+    cache: BoundedCompileCache<CompiledComponentKey, Component>,
 }
 
 impl CompiledComponentCache {
     fn new(capacity: usize) -> Self {
-        let capacity =
-            NonZeroUsize::new(capacity).expect("component cache capacity must be nonzero");
+        let limits = CompileCacheLimits {
+            ready_entries: capacity,
+            ..CompileCacheLimits::ENGINE
+        };
         Self {
-            state: Mutex::new(CompiledComponentCacheState {
-                ready: LruCache::new(capacity),
-                in_flight: HashMap::new(),
-            }),
+            cache: BoundedCompileCache::new(limits),
         }
     }
 
     async fn get_or_compile(
         &self,
         key: CompiledComponentKey,
-        compile: impl FnOnce() -> Result<Component, LixError>,
+        source_bytes: usize,
+        compile: impl FnOnce() -> Result<Component, LixError> + Send,
     ) -> Result<Component, LixError> {
-        let in_flight = {
-            let mut state = self.lock()?;
-            if let Some(component) = state.ready.get(&key) {
-                return Ok(component.clone());
-            }
-            state
-                .in_flight
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-                .clone()
-        };
-
-        // Component::new is synchronous, but same-key waiters yield instead of
-        // occupying additional executor threads while the initializer runs.
-        let result = in_flight.get_or_init(|| async { compile() }).await.clone();
-        let mut state = self.lock()?;
-        let owns_entry = state
-            .in_flight
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, &in_flight));
-        if owns_entry {
-            state.in_flight.remove(&key);
-            if let Ok(component) = &result {
-                state.ready.put(key, component.clone());
-            }
-        }
-        result
+        self.cache
+            .get_or_compile(
+                key,
+                u64::try_from(source_bytes).unwrap_or(u64::MAX),
+                0,
+                move || async move { compile() },
+            )
+            .await
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, CompiledComponentCacheState>, LixError> {
-        self.state.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "compiled WASM component cache lock poisoned",
-            )
-        })
+    #[cfg(test)]
+    fn snapshot(&self) -> super::compile_cache::CompileCacheSnapshot {
+        self.cache.snapshot()
     }
 }
 
@@ -645,7 +614,7 @@ mod tests {
                         .expect("test runtime should initialize");
                     start.wait();
                     runtime
-                        .block_on(cache.get_or_compile(key, || {
+                        .block_on(cache.get_or_compile(key, b"same component".len(), || {
                             calls.fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(50));
                             Ok(component)
@@ -659,6 +628,59 @@ mod tests {
             handle.join().expect("cache worker should not panic");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compiled_component_cache_bounds_native_source_admission() {
+        let cache = Arc::new(CompiledComponentCache::new(1));
+        let first_key = CompiledComponentKey::new(CompileProfile::Plain, b"large source");
+        let second_key = CompiledComponentKey::new(CompileProfile::Plain, b"other source");
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let first_cache = Arc::clone(&cache);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let component = empty_component();
+        let first = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test runtime should initialize");
+            runtime.block_on(first_cache.get_or_compile(
+                first_key,
+                // This is an accounting estimate; the test keeps its actual
+                // component input tiny and allocates no 64 MiB buffer.
+                CompileCacheLimits::ENGINE.max_in_flight_source_bytes as usize,
+                move || {
+                    first_entered.store(true, Ordering::Release);
+                    while !first_release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    Ok(component)
+                },
+            ))
+        });
+        while !entered.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should initialize");
+        let extra_compile_calls = AtomicUsize::new(0);
+        let error = match runtime.block_on(cache.get_or_compile(second_key, 1, || {
+            extra_compile_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(empty_component())
+        })) {
+            Err(error) => error,
+            Ok(_) => panic!("native cache must reject source bytes beyond its flight budget"),
+        };
+        release.store(true, Ordering::Release);
+        first
+            .join()
+            .expect("blocked native compile worker should not panic")
+            .expect("first native component should compile");
+        assert_eq!(error.code, LixError::CODE_PLUGIN_RESOURCE_LIMIT);
+        assert_eq!(extra_compile_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -679,7 +701,7 @@ mod tests {
                         .build()
                         .expect("test runtime should initialize");
                     start.wait();
-                    runtime.block_on(cache.get_or_compile(key, || {
+                    runtime.block_on(cache.get_or_compile(key, b"invalid component".len(), || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         while !release.load(Ordering::Acquire) {
                             std::thread::yield_now();
@@ -694,16 +716,10 @@ mod tests {
             .collect::<Vec<_>>();
         start.wait();
 
-        // Wait until both workers hold the same in-flight cell before letting
-        // the initializer fail. The map and both workers each own one Arc.
+        // Wait until both workers hold the same bounded flight before letting
+        // the initializer fail.
         loop {
-            let waiter_joined = cache
-                .lock()
-                .expect("cache lock should be healthy")
-                .in_flight
-                .get(&key)
-                .is_some_and(|in_flight| Arc::strong_count(in_flight) >= 3);
-            if waiter_joined {
+            if cache.snapshot().in_flight_callers == 2 {
                 break;
             }
             std::thread::yield_now();
@@ -723,7 +739,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime should initialize");
-        let retry = runtime.block_on(cache.get_or_compile(key, || {
+        let retry = runtime.block_on(cache.get_or_compile(key, b"invalid component".len(), || {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -742,7 +758,7 @@ mod tests {
         let failures = AtomicUsize::new(0);
         for _ in 0..2 {
             let result = cache
-                .get_or_compile(failed_key, || {
+                .get_or_compile(failed_key, b"invalid".len(), || {
                     failures.fetch_add(1, Ordering::SeqCst);
                     Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -758,8 +774,12 @@ mod tests {
         let second_key = CompiledComponentKey::new(CompileProfile::Plain, b"second");
         let compiles = AtomicUsize::new(0);
         for key in [first_key, second_key, first_key] {
+            let source_bytes = match key {
+                k if k == first_key => b"first".len(),
+                _ => b"second".len(),
+            };
             cache
-                .get_or_compile(key, || {
+                .get_or_compile(key, source_bytes, || {
                     compiles.fetch_add(1, Ordering::SeqCst);
                     Ok(component.clone())
                 })

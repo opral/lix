@@ -290,6 +290,8 @@ enum RequestBodyPolicy {
     Json,
     NativeObjects,
     ReadFulfillment,
+    ContentGroup,
+    ManifestInventory,
     Binary,
     Chunk,
 }
@@ -342,7 +344,8 @@ protocol_routes! {
    SyncHistory => ("GET", "/sync/history", None),
    SyncCheckpoints => ("GET", "/sync/checkpoints", None),
    SyncGetBlobs => ("GET", "/sync/blob", None),
-   SyncRegisterBlob => ("POST", "/sync/blob", Json),
+   SyncRegisterBlob => ("POST", "/sync/blob", ManifestInventory),
+   SyncRegisterBlobs => ("POST", "/sync/blobs", ContentGroup),
    SyncGetChunk => ("GET", "/sync/chunk", None),
    SyncPutChunk => ("PUT", "/sync/chunk", Chunk),
    BeginTransaction => ("POST", "/transaction/begin", None),
@@ -2149,7 +2152,9 @@ where
         match body_policy {
             RequestBodyPolicy::Json
             | RequestBodyPolicy::NativeObjects
-            | RequestBodyPolicy::ReadFulfillment => {
+            | RequestBodyPolicy::ReadFulfillment
+            | RequestBodyPolicy::ContentGroup
+            | RequestBodyPolicy::ManifestInventory => {
                 if let Err(error) = require_json_content_type(&parts.headers) {
                     return error.into_response();
                 }
@@ -2168,6 +2173,12 @@ where
                 }
                 RequestBodyPolicy::ReadFulfillment => MAX_READ_FULFILLMENT_REQUEST_BYTES
                     .min(self.inner.options.max_request_body_bytes),
+                RequestBodyPolicy::ContentGroup => {
+                    (1024 * 1024).min(self.inner.options.max_request_body_bytes)
+                }
+                RequestBodyPolicy::ManifestInventory => {
+                    (2 * 1024 * 1024).min(self.inner.options.max_request_body_bytes)
+                }
                 RequestBodyPolicy::Chunk => {
                     MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
                 }
@@ -2519,6 +2530,24 @@ where
                     .into_response();
                 }
                 result_response(sync_register_blob(lease, json_request!(SyncBlobManifest)).await)
+            }
+            Some(ProtocolRoute::SyncRegisterBlobs) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "blob group registration does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                let manifests = json_request!(Vec<SyncBlobManifest>).0;
+                result_response(
+                    lease
+                        .run_durable(move |lix| async move {
+                            lix.register_sync_blob_manifests(&manifests).await
+                        })
+                        .await
+                        .map(Json)
+                        .map_err(ApiError::from),
+                )
             }
             Some(ProtocolRoute::SyncGetChunk) => {
                 let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
@@ -3727,14 +3756,10 @@ where
     }
     let manifests = lease
         .run_cancellable_read(move |lix| async move {
-            let mut manifests = Vec::with_capacity(blob_ids.len());
-            for blob_id in blob_ids {
-                let manifest = match &baseline_id {
-                    Some(id) => lix.get_sync_blob_manifest_leased(&blob_id, id).await?,
-                    None => lix.get_sync_blob_manifest(&blob_id).await?,
-                };
-                manifests.push((blob_id, manifest));
-            }
+            let manifests = lix
+                .get_sync_blob_manifests_leased(&blob_ids, baseline_id.as_deref())
+                .await?;
+            let manifests = blob_ids.into_iter().zip(manifests).collect::<Vec<_>>();
             Ok(manifests)
         })
         .await?;
@@ -5863,7 +5888,9 @@ struct MultiplexObserveEventResponse<'a> {
 }
 
 fn valid_replica_identity(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 512 && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    !value.is_empty()
+        && value.len() <= 512
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
@@ -6212,6 +6239,7 @@ mod tests {
                 ("GET", "/lix/v1/{lix_id}/sync/checkpoints") => "syncCheckpointInventory",
                 ("GET", "/lix/v1/{lix_id}/sync/blob") => "syncGetBlobs",
                 ("POST", "/lix/v1/{lix_id}/sync/blob") => "syncRegisterBlob",
+                ("POST", "/lix/v1/{lix_id}/sync/blobs") => "syncRegisterBlobs",
                 ("GET", "/lix/v1/{lix_id}/sync/chunk") => "syncGetChunk",
                 ("PUT", "/lix/v1/{lix_id}/sync/chunk") => "syncPutChunk",
                 ("POST", "/lix/v1/{lix_id}/transaction/begin") => "beginTransaction",
@@ -6257,7 +6285,10 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            25,
+            ProtocolRoute::ALL
+                .iter()
+                .filter(|route| route.path().starts_with("/lix/v1/sync/"))
+                .count(),
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
@@ -6275,6 +6306,7 @@ mod tests {
             "syncCheckpointInventory",
             "syncGetBlobs",
             "syncRegisterBlob",
+            "syncRegisterBlobs",
             "syncGetChunk",
             "syncPutChunk",
         ] {
@@ -6585,9 +6617,9 @@ mod tests {
         assert_eq!(io.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!is_terminal_storage_response(&io));
 
-        let corruption = ApiError::from(LixError::from(
-            StorageError::Corruption("segment hash mismatch".to_string()),
-        ))
+        let corruption = ApiError::from(LixError::from(StorageError::Corruption(
+            "segment hash mismatch".to_string(),
+        )))
         .into_response();
         assert_eq!(corruption.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!is_terminal_storage_response(&corruption));
@@ -9527,11 +9559,25 @@ mod tests {
                 json!({"replicaId":"old", "replacementId":invalid}),
                 json!({"replicaId":invalid, "replacementId":"new"}),
             ] {
-                let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(body)).await;
+                let response = request(
+                    &app.router,
+                    "POST",
+                    "/lix/v1/sync/replica/replace",
+                    Some(&session),
+                    Some(body),
+                )
+                .await;
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             }
         }
-        let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(json!({"replicaId":"old", "replacementId":"usable"}))).await;
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"usable"})),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_json(response).await["replicaId"], "usable");
     }
@@ -10183,6 +10229,10 @@ mod tests {
             "anchor": envelope["descriptor"]["selectedBranch"]["head"]["commitId"],
             "maxCommits": 3,
             "includeStateHeaders": false,
+            "selection": "history",
+            "stops": [],
+            "minimumGeneration": null,
+            "requireStateHeader": false,
         });
         let path = "/lix/v1/sync/native-metadata-walk";
         let missing = request_with_headers(
@@ -10277,6 +10327,9 @@ mod tests {
         let descriptor = envelope["descriptor"].clone();
         let commit = descriptor["selectedBranch"]["head"]["commitId"].clone();
         let body = json!({
+            "operationId": uuid::Uuid::now_v7().to_string(),
+            "release": false,
+            "operationExpiresAtMs": crate::telemetry::unix_time_ms() + 60_000,
             "epochId": uuid::Uuid::now_v7().to_string(),
             "descriptor": descriptor,
             "interests": [{
@@ -10290,7 +10343,7 @@ mod tests {
                 "kind": "metadata",
                 "address": {"kind": "commit_graph_record", "commitId": commit}
             }],
-            "continuation": {"nextInput": 1, "closureDigest": "0000000000000000000000000000000000000000000000000000000000000000"}
+            "continuation": {"nextInput": 1, "nextOffset": 0, "spoolId": uuid::Uuid::now_v7().to_string(), "closureDigest": "0000000000000000000000000000000000000000000000000000000000000000"}
         });
         let missing = request_with_headers(
             &app.router,

@@ -2,7 +2,10 @@ mod chunking;
 mod codec;
 mod context;
 mod demand;
-pub(crate) use demand::BlobManifestRequired;
+pub(crate) use demand::{
+    BlobManifestsRequired, MAX_REFERENCED_BLOB_HASHES, normalize_referenced_blob_hashes,
+    work_bound_error,
+};
 mod kv;
 pub(crate) mod metrics;
 #[cfg(test)]
@@ -13,26 +16,27 @@ mod types;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use chunking::CHUNK_ANCHOR_BYTES;
-pub(crate) use codec::{BinaryCasManifest, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk};
 #[cfg(all(feature = "storage-benches", test))]
 pub(crate) use codec::encode_binary_cas_manifest;
-#[cfg(feature = "storage-benches")]
 pub(crate) use codec::{
-    StorageBinaryCasDeltaBaseLayout, decode_binary_cas_chunk,
+    BinaryCasManifest, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
 };
+#[cfg(feature = "storage-benches")]
+pub(crate) use codec::{StorageBinaryCasDeltaBaseLayout, decode_binary_cas_chunk};
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::{
     BINARY_CAS_CHUNK_DEMAND_SPACE, BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE,
     BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
 };
-pub(crate) use kv::{load_bytes_many, load_metadata_many};
+pub(crate) use kv::{load_bytes_many, load_metadata_many, load_metadata_many_bounded};
 pub(crate) use transfer::{
-    CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_anchor,
-    load_canonical_blob_chunks, load_streaming_canonical_manifest, load_verified_chunk,
-    stage_deferred_canonical_manifest, stage_deferred_canonical_manifests_with_chunks,
-    stage_transfer_publication_fence,
+    CanonicalBlobChunk, CanonicalBlobManifest, RawChunkTransferBounds, chunk_presence_many,
+    load_canonical_blob_anchor, load_canonical_blob_chunks, load_streaming_canonical_manifest,
+    load_verified_chunk, raw_chunk_transfer_bounds, stage_deferred_canonical_manifest,
+    stage_deferred_canonical_manifests_with_chunks, stage_transfer_publication_fence,
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
-    stage_verified_raw_chunk, validate_manifest_receipts,
+    stage_verified_raw_chunk, validate_manifest_receipts, validate_raw_chunk_payload,
+    visit_verified_raw_chunks,
 };
 pub(crate) use types::{
     BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
@@ -116,8 +120,17 @@ pub(crate) async fn stage_cas_reclamation_fence(
 pub(crate) async fn hydrated_manifest_input_keys(
     read: &impl crate::storage_adapter::StorageAdapterRead,
     blob: BlobId,
-) -> Result<Vec<(crate::storage_adapter::StorageSpace, crate::storage_adapter::StorageKey)>, crate::LixError> {
-    use crate::storage_adapter::{StorageGetManyRequest as GetManyRequest, StorageKey as Key, StorageProjectedValue as ProjectedValue};
+) -> Result<
+    Vec<(
+        crate::storage_adapter::StorageSpace,
+        crate::storage_adapter::StorageKey,
+    )>,
+    crate::LixError,
+> {
+    use crate::storage_adapter::{
+        StorageGetManyRequest as GetManyRequest, StorageKey as Key,
+        StorageProjectedValue as ProjectedValue,
+    };
     let key = Key(bytes::Bytes::copy_from_slice(blob.as_bytes()));
     let result = read
         .get_many(&[GetManyRequest {

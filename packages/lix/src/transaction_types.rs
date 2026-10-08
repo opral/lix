@@ -21,6 +21,7 @@ use crate::row_state::CertifiedCurrentStatePredecessor;
 use crate::tracked_state::OrderedAddressableCommitDeltaStage;
 use bytes::Bytes;
 use lix_schema::Jsonb;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -256,9 +257,7 @@ impl TransactionJson {
     pub(crate) fn normalized(&self) -> &str {
         match &self.storage {
             TransactionJsonStorage::Decoded { value, normalized } => normalized
-                .get_or_init(|| {
-                    crate::Json::from(value.as_ref()).to_string().into()
-                })
+                .get_or_init(|| crate::Json::from(value.as_ref()).to_string().into())
                 .as_ref(),
             TransactionJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),
             TransactionJsonStorage::CanonicalShared { normalized, .. } => normalized.as_str(),
@@ -2691,6 +2690,53 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         }
     }
 
+    /// Serializes one decoded value with recursively sorted object keys while
+    /// writing directly into the bounded batch arena. `serde_json` can be
+    /// built with `preserve_order` through workspace feature unification, so
+    /// serializing `Value` directly would make these shared bytes depend on
+    /// insertion order and would falsely certify them as canonical.
+    struct CanonicalJsonValue<'a>(&'a JsonValue);
+
+    impl Serialize for CanonicalJsonValue<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match self.0 {
+                JsonValue::Null => serializer.serialize_unit(),
+                JsonValue::Bool(value) => serializer.serialize_bool(*value),
+                JsonValue::Number(value) => value.serialize(serializer),
+                JsonValue::String(value) => serializer.serialize_str(value),
+                JsonValue::Array(values) => {
+                    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                    for value in values {
+                        sequence.serialize_element(&CanonicalJsonValue(value))?;
+                    }
+                    sequence.end()
+                }
+                JsonValue::Object(values) => {
+                    let mut object = serializer.serialize_map(Some(values.len()))?;
+                    let sorted = values
+                        .keys()
+                        .zip(values.keys().skip(1))
+                        .all(|(left, right)| left < right);
+                    if sorted {
+                        for (key, value) in values {
+                            object.serialize_entry(key, &CanonicalJsonValue(value))?;
+                        }
+                    } else {
+                        let mut entries = values.iter().collect::<Vec<_>>();
+                        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                        for (key, value) in entries {
+                            object.serialize_entry(key, &CanonicalJsonValue(value))?;
+                        }
+                    }
+                    object.end()
+                }
+            }
+        }
+    }
+
     let mut slots = slots.into_iter().collect::<Vec<_>>();
     let decoded_count = slots
         .iter()
@@ -2780,17 +2826,19 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
                 .append(cached.as_bytes())
                 .map_err(|failure| canonical_json_arena_error(context, failure))?;
         } else {
-            serde_json::to_writer(&mut normalized, value.as_value()).map_err(|error| {
-                normalized.failure().map_or_else(
-                    || {
-                        LixError::new(
-                            LixError::CODE_UNKNOWN,
-                            format!("{context} failed to serialize normalized JSON: {error}"),
-                        )
-                    },
-                    |failure| canonical_json_arena_error(context, failure),
-                )
-            })?;
+            serde_json::to_writer(&mut normalized, &CanonicalJsonValue(value.as_value())).map_err(
+                |error| {
+                    normalized.failure().map_or_else(
+                        || {
+                            LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!("{context} failed to serialize normalized JSON: {error}"),
+                            )
+                        },
+                        |failure| canonical_json_arena_error(context, failure),
+                    )
+                },
+            )?;
         }
         let end = u32::try_from(normalized.len()).map_err(|_| {
             LixError::new(
@@ -4394,8 +4442,9 @@ impl Eq for PreparedStateRowRef<'_> {}
 
 pub(crate) fn materialize_jsonb_shared(value: &Jsonb) -> SharedStr {
     SharedStr::from(
-        serde_json::to_string(value.as_value())
-            .expect("validated prepared metadata must serialize"),
+        value
+            .to_json_string()
+            .expect("validated prepared metadata must render as canonical JSON"),
     )
 }
 
@@ -5265,10 +5314,11 @@ mod tests {
     fn decoded_sql_rows_canonicalize_into_one_exact_batch_arena() {
         let mut rows = vec![
             Some(TransactionJson::from_value_for_test(
-                serde_json::json!({"id": "a", "value": "first"}),
+                serde_json::from_str(r#"{"value":"first","nested":{"z":1,"a":2},"id":"a"}"#)
+                    .unwrap(),
             )),
             Some(TransactionJson::from_value_for_test(
-                serde_json::json!({"id": "b", "value": "second"}),
+                serde_json::from_str(r#"{"value":"second","id":"b"}"#).unwrap(),
             )),
         ];
 
@@ -5284,6 +5334,32 @@ mod tests {
         };
         assert!(first.shares_buffer_with(second));
         assert_eq!(first.retained_buffer_len(), first.len() + second.len());
+        assert_eq!(
+            first.as_str(),
+            r#"{"id":"a","nested":{"a":2,"z":1},"value":"first"}"#
+        );
+        assert_eq!(second.as_str(), r#"{"id":"b","value":"second"}"#);
+    }
+
+    #[test]
+    fn materialized_jsonb_metadata_uses_sorted_keys_and_preserves_legacy_number_rendering() {
+        let value = Jsonb::from_value(
+            serde_json::from_str(r#"{"z":1,"n":-1.23456789e-40,"nested":{"y":2,"a":3},"a":true}"#)
+                .unwrap(),
+        );
+
+        let materialized = materialize_jsonb_shared(&value);
+        assert_eq!(
+            materialized.as_str(),
+            r#"{"a":true,"n":-1.23456789e-40,"nested":{"a":3,"y":2},"z":1}"#
+        );
+        assert_eq!(
+            crate::common::metadata_sql_equality_key(materialized.as_str()).unwrap(),
+            crate::common::metadata_sql_equality_key(
+                r#"{"a":true,"n":-0.000000000000000000000000000000000000000123456789,"nested":{"a":3,"y":2},"z":1}"#
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -3357,6 +3357,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "libc",
  "lix",
  "lix-storage-filesystem",
  "lix-storage-slatedb",
@@ -3461,6 +3462,8 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-encoder 0.247.0",
+ "wasmparser 0.247.0",
 ]
 
 [[package]]

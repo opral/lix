@@ -109,6 +109,7 @@ pub(crate) const TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE: StorageSpace = Sto
 // use the same width so a part boundary never needs a second geometry.
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 pub(crate) const COMMIT_DELTA_PART_READ_BATCH_MAX: usize = 8;
+const CANONICAL_CHANGE_LOCATOR_MAX_IDS: usize = 16_384;
 // Scan pages are bounded by row count, not bytes. Keep authority hydration
 // bounded as well when a page contains large authenticated directories.
 const COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS: usize = 64;
@@ -5280,6 +5281,21 @@ pub(crate) async fn load_published_commit_state_manifest(
         .map(|manifest| PublishedCommitStateManifest { manifest }))
 }
 
+/// Decode header-only topology without rereading a record already transferred.
+pub(crate) fn decode_published_commit_state_topology(
+    commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<PublishedCommitStateTopology, LixError> {
+    let header = decode_stored_commit_state_manifest(bytes)?;
+    if header.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "topology header does not match its commit address",
+        ));
+    }
+    Ok(PublishedCommitStateTopology { header })
+}
+
 /// Loads only the authenticated immutable authority header needed by commit
 /// topology, branch lifecycle, and scoped-root inheritance.
 pub(crate) async fn load_published_commit_state_topology(
@@ -7964,6 +7980,160 @@ async fn load_change_locator_by_id(
         return Ok(None);
     };
     decode_change_locator(change_id, &locator).map(Some)
+}
+
+/// Resolve canonical locator metadata without reading or validating the
+/// associated ChangeRecord or CommitDeltaPart payload. Direct coordinates are
+/// authorized by the authenticated mutation inventory's ownership bit; holes,
+/// selected-source aliases, and unsupported layouts use the explicit locator
+/// index. The result remains aligned to the caller's IDs, including duplicates.
+pub(crate) async fn load_canonical_change_locators(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_ids: &[crate::changelog::ChangeId],
+) -> Result<Vec<Option<CommitDeltaChangeLocator>>, LixError> {
+    if change_ids.len() > CANONICAL_CHANGE_LOCATOR_MAX_IDS {
+        return Err(LixError::new(
+            "LIX_NATIVE_RECIPE_WORK_BOUND",
+            "canonical change-locator lookup exceeds the bounded ID limit",
+        ));
+    }
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut input_indices = BTreeMap::<crate::changelog::ChangeId, Vec<usize>>::new();
+    for (index, &change_id) in change_ids.iter().enumerate() {
+        input_indices.entry(change_id).or_default().push(index);
+    }
+
+    let mut direct_by_owner = BTreeMap::<CommitId, Vec<CommitDeltaChangeLocator>>::new();
+    let mut explicit_ids = BTreeSet::new();
+    for &change_id in input_indices.keys() {
+        if let Some(locator) = direct_change_locator(change_id) {
+            direct_by_owner
+                .entry(locator.commit_id)
+                .or_default()
+                .push(locator);
+        } else {
+            explicit_ids.insert(change_id);
+        }
+    }
+
+    let mut resolved = BTreeMap::<
+        crate::changelog::ChangeId,
+        CommitDeltaChangeLocator,
+    >::new();
+    let owner_ids = direct_by_owner.keys().copied().collect::<Vec<_>>();
+    for owner_batch in owner_ids.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
+        let states = load_point_replay_commit_states(store, owner_batch).await?;
+        if states.len() != owner_batch.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state locator owner batch returned the wrong cardinality",
+            ));
+        }
+        for (&owner, state) in owner_batch.iter().zip(states) {
+            let Some(state) = state else {
+                explicit_ids.extend(
+                    direct_by_owner[&owner]
+                        .iter()
+                        .map(|locator| locator.change_id),
+                );
+                continue;
+            };
+            // Selected-source commits name authored owners through the
+            // explicit locator index. Unsupported directory layouts do too;
+            // neither condition is evidence that the encoded coordinate is
+            // owned by this commit.
+            let layout_supports_direct_ownership = match state
+                .mutation_directory_root
+                .as_ref()
+                .map(|root| root.layout)
+            {
+                Some(
+                    super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+                    | super::mutation_directory::LAYOUT_COMPACT_REPLACEMENT
+                    | super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY,
+                ) => true,
+                None => !state.mutations.direct_part_row_counts.is_empty(),
+                Some(_) => false,
+            };
+            if state.mutations.selected_source_commit_id().is_some()
+                || !layout_supports_direct_ownership
+            {
+                explicit_ids.extend(
+                    direct_by_owner[&owner]
+                        .iter()
+                        .map(|locator| locator.change_id),
+                );
+                continue;
+            }
+            let authority = match classify_direct_change_authority(Some(Arc::clone(&state)))? {
+                DirectChangeAuthority::Candidate(authority) => authority,
+                DirectChangeAuthority::NotOwned(_) => {
+                    explicit_ids.extend(
+                        direct_by_owner[&owner]
+                            .iter()
+                            .map(|locator| locator.change_id),
+                    );
+                    continue;
+                }
+            };
+            for &locator in &direct_by_owner[&owner] {
+                if authority.mutations.direct_coordinate_owned(
+                    locator.segment_index as usize,
+                    locator.ordinal,
+                ) == Some(true)
+                {
+                    resolved.insert(locator.change_id, locator);
+                } else {
+                    explicit_ids.insert(locator.change_id);
+                }
+            }
+        }
+    }
+
+    let explicit_ids = explicit_ids.into_iter().collect::<Vec<_>>();
+    for id_batch in explicit_ids.chunks(COMMIT_STATE_SCAN_AUTHORITY_BATCH_ROWS) {
+        let keys = id_batch
+            .iter()
+            .map(|change_id| StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())))
+            .collect::<Vec<_>>();
+        let values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value;
+        if values.len() != id_batch.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state explicit locator batch returned the wrong cardinality",
+            ));
+        }
+        for (&change_id, value) in id_batch.iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let bytes = match value {
+                StorageProjectedValue::FullValue(bytes) => bytes,
+                StorageProjectedValue::KeyOnly => {
+                    return Err(LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "tracked_state explicit change locator read omitted its value",
+                    ));
+                }
+            };
+            resolved.insert(change_id, decode_change_locator(change_id, &bytes)?);
+        }
+    }
+
+    let mut output = vec![None; change_ids.len()];
+    for (change_id, indices) in input_indices {
+        let locator = resolved.get(&change_id).copied();
+        for index in indices {
+            output[index] = locator;
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10783,10 +10953,41 @@ pub(crate) async fn load_authoritative_live_change_records(
             change_ids: &change_ids,
         })
         .await?;
+    resolve_authoritative_live_change_records(
+        store,
+        requests,
+        standalone
+            .into_iter()
+            .map(|(id, record)| (*id, record))
+            .collect(),
+    )
+    .await
+}
+
+/// Canonical authority selection after one admitted standalone payload page.
+/// The caller owns page admission and drains the resolved records before
+/// advancing. Keep identity, lifetime, and physical-owner precedence shared
+/// with exact callers.
+pub(crate) async fn resolve_authoritative_live_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[AuthoritativeLiveChangeRequest],
+    standalone: Vec<(
+        crate::changelog::ChangeId,
+        Option<crate::changelog::ChangeRecord>,
+    )>,
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if standalone.len() != requests.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "standalone page lost request cardinality",
+        ));
+    }
     let standalone_status = standalone
         .iter()
         .zip(requests)
-        .map(|((_, record), request)| authoritative_live_payload_candidate_status(request, record))
+        .map(|((_, record), request)| {
+            authoritative_live_payload_candidate_status(request, record.as_ref())
+        })
         .collect::<Vec<_>>();
     let mut records = vec![None; requests.len()];
     let mut fallback_indices = Vec::new();
@@ -10796,7 +10997,7 @@ pub(crate) async fn load_authoritative_live_change_records(
         .zip(records.iter_mut())
         .enumerate()
     {
-        if *change_id != request.change_id {
+        if change_id != request.change_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "standalone change batch lost request order",
@@ -21410,6 +21611,68 @@ mod tests {
         segment_requests: std::sync::Arc<AtomicUsize>,
     }
 
+    #[derive(Default)]
+    struct LocatorReadCounts {
+        delta_segment_keys: AtomicUsize,
+        change_record_keys: AtomicUsize,
+        blob_chunk_keys: AtomicUsize,
+        explicit_locator_keys: AtomicUsize,
+    }
+
+    struct LocatorCountingRead<R> {
+        inner: R,
+        counts: std::sync::Arc<LocatorReadCounts>,
+    }
+
+    impl<R> crate::storage_adapter::StorageAdapterRead for LocatorCountingRead<R>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        fn requires_physical_reads(&self) -> bool {
+            self.inner.requires_physical_reads()
+        }
+
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<
+            Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
+        > + Send {
+            for request in requests {
+                let counter = if request.space == TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE {
+                    Some(&self.counts.delta_segment_keys)
+                } else if request.space == crate::changelog::CHANGE_SPACE {
+                    Some(&self.counts.change_record_keys)
+                } else if request.space == crate::binary_cas::BINARY_CAS_CHUNK_SPACE {
+                    Some(&self.counts.blob_chunk_keys)
+                } else if request.space == super::TRACKED_STATE_CHANGE_LOCATOR_SPACE {
+                    Some(&self.counts.explicit_locator_keys)
+                } else {
+                    None
+                };
+                if let Some(counter) = counter {
+                    counter.fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::BeginScanOptions,
+        ) -> impl Future<
+            Output = Result<crate::storage::ScanCursor<'_>, crate::storage::StorageError>,
+        > + Send {
+            self.inner.begin_scan(space, range, opts)
+        }
+    }
+
     impl<R> crate::storage_adapter::StorageAdapterRead for SegmentCountingRead<R>
     where
         R: crate::storage_adapter::StorageAdapterRead,
@@ -24256,18 +24519,70 @@ mod tests {
                 .expect("locator absence should read")
                 .is_none()
         );
-        let loaded = load_change_record_by_id(&read, change_id)
+        let locator_counts = std::sync::Arc::new(LocatorReadCounts::default());
+        let counted_read = LocatorCountingRead {
+            inner: read,
+            counts: std::sync::Arc::clone(&locator_counts),
+        };
+        let resolved = super::load_canonical_change_locators(
+            &counted_read,
+            &[change_id, change_id],
+        )
+        .await
+        .expect("metadata lookup should resolve duplicate direct IDs");
+        assert_eq!(resolved, vec![Some(direct), Some(direct)]);
+        assert_eq!(
+            locator_counts
+                .delta_segment_keys
+                .load(Ordering::Relaxed),
+            0,
+            "metadata resolution must not read commit-delta payloads"
+        );
+        assert_eq!(
+            locator_counts
+                .change_record_keys
+                .load(Ordering::Relaxed),
+            0,
+            "metadata resolution must not read standalone ChangeRecords"
+        );
+        assert_eq!(
+            locator_counts.blob_chunk_keys.load(Ordering::Relaxed),
+            0,
+            "metadata resolution must not read blob chunks"
+        );
+        assert_eq!(
+            locator_counts
+                .explicit_locator_keys
+                .load(Ordering::Relaxed),
+            0,
+            "authenticated direct ownership should avoid fallback locator reads"
+        );
+        let loaded = load_change_record_by_id(&counted_read, change_id)
             .await
             .expect("direct address should read")
             .expect("direct address should resolve");
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
         assert_eq!(loaded.row_pk, fixtures[source_index].row_pk);
-        let batch = super::load_change_records_by_ids(&read, &[change_id])
+        let batch = super::load_change_records_by_ids(&counted_read, &[change_id])
             .await
             .expect("direct address batch should read");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], loaded);
+    }
+
+    #[tokio::test]
+    async fn canonical_change_locator_batch_rejects_work_above_its_id_bound() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("empty metadata read should open");
+        let change_ids = vec![ChangeId::default(); super::CANONICAL_CHANGE_LOCATOR_MAX_IDS + 1];
+        let error = super::load_canonical_change_locators(&read, &change_ids)
+            .await
+            .expect_err("oversized lookup must fail before building its work maps");
+        assert_eq!(error.code, "LIX_NATIVE_RECIPE_WORK_BOUND");
     }
 
     #[tokio::test]
@@ -24463,8 +24778,31 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("imported direct row read should open");
+            let locator_counts = std::sync::Arc::new(LocatorReadCounts::default());
+            let counted_read = LocatorCountingRead {
+                inner: read,
+                counts: std::sync::Arc::clone(&locator_counts),
+            };
+            let change_ids = fixtures
+                .iter()
+                .map(|fixture| fixture.change_id)
+                .collect::<Vec<_>>();
+            let locators = super::load_canonical_change_locators(&counted_read, &change_ids)
+                .await
+                .expect("metadata resolver should handle imported addressable IDs");
+            assert_eq!(locators.len(), fixtures.len());
+            assert!(locators.iter().all(Option::is_some));
+            if selected_source.is_some() {
+                assert_eq!(
+                    locator_counts
+                        .explicit_locator_keys
+                        .load(Ordering::Relaxed),
+                    fixtures.len(),
+                    "selected-source aliases use their explicit canonical locator entries"
+                );
+            }
             for fixture in &fixtures {
-                let loaded = load_change_record_by_id(&read, fixture.change_id)
+                let loaded = load_change_record_by_id(&counted_read, fixture.change_id)
                     .await
                     .expect("imported change should load")
                     .expect("imported change should resolve by its v68 identity");
@@ -24518,6 +24856,14 @@ mod tests {
             .expect("explicit collision should stage");
         assert_eq!(explicit.locators.len(), 1);
         stage_change_locators(&mut writes, &explicit.locators);
+        let malformed_id = ChangeId::new(uuid::Uuid::from_u128(
+            0x0193_0000_0000_7000_8000_0000_0000_0001,
+        ));
+        writes.put(
+            super::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            StorageKey(Bytes::copy_from_slice(malformed_id.as_uuid().as_bytes())),
+            &[0xff][..],
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -24535,25 +24881,83 @@ mod tests {
                     .expect("direct locator absence should read")
                     .is_none()
             );
-            let loaded = load_change_record_by_id(&read, change_id)
+        }
+        let missing_id = ChangeId::new(uuid::Uuid::from_u128(
+            0x0194_0000_0000_7000_8000_0000_0000_0001,
+        ));
+        let locator_counts = std::sync::Arc::new(LocatorReadCounts::default());
+        let counted_read = LocatorCountingRead {
+            inner: read,
+            counts: std::sync::Arc::clone(&locator_counts),
+        };
+        let resolved = super::load_canonical_change_locators(
+            &counted_read,
+            &[
+                mixed.assigned_change_ids[0],
+                hole_change_id,
+                hole_change_id,
+                missing_id,
+            ],
+        )
+        .await
+        .expect("direct owners, explicit holes, and absent IDs should preserve alignment");
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(
+            resolved[0],
+            Some(
+                super::direct_change_locator(mixed.assigned_change_ids[0])
+                    .expect("authored row has a direct address")
+            )
+        );
+        let explicit_hole = resolved[1].expect("hole should use its explicit locator");
+        assert_eq!(explicit_hole.commit_id, explicit_commit);
+        assert_eq!(resolved[2], Some(explicit_hole));
+        assert_eq!(resolved[3], None, "missing explicit metadata stays absent");
+        assert_eq!(
+            locator_counts.explicit_locator_keys.load(Ordering::Relaxed),
+            2,
+            "duplicate holes are resolved by one explicit point-read slot"
+        );
+        assert!(
+            super::load_canonical_change_locators(&counted_read, &[malformed_id])
+                .await
+                .is_err(),
+            "malformed explicit locator metadata must fail closed"
+        );
+        assert_eq!(
+            locator_counts
+                .delta_segment_keys
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            locator_counts
+                .change_record_keys
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(locator_counts.blob_chunk_keys.load(Ordering::Relaxed), 0);
+        for index in [0, 2] {
+            let change_id = mixed.assigned_change_ids[index];
+            let loaded = load_change_record_by_id(&counted_read, change_id)
                 .await
                 .expect("mixed direct row should read")
                 .expect("mixed direct row should resolve");
             assert_eq!(loaded.row_pk, fixtures[index].row_pk);
         }
 
-        let authored = load_change_record_by_id(&read, fixtures[1].change_id)
+        let authored = load_change_record_by_id(&counted_read, fixtures[1].change_id)
             .await
             .expect("mixed authored row should read")
             .expect("mixed authored row should resolve through its locator");
         assert_eq!(authored.row_pk, fixtures[1].row_pk);
-        let collision = load_change_record_by_id(&read, hole_change_id)
+        let collision = load_change_record_by_id(&counted_read, hole_change_id)
             .await
             .expect("direct-shaped authored hole should dispatch")
             .expect("explicit collision should resolve through its locator");
         assert_eq!(collision.row_pk, explicit_fixture.row_pk);
         assert_eq!(
-            super::load_canonical_change_locator(&read, hole_change_id)
+            super::load_canonical_change_locator(&counted_read, hole_change_id)
                 .await
                 .expect("collision locator should read")
                 .expect("collision should retain explicit locator authority")

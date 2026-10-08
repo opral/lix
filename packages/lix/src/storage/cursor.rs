@@ -15,6 +15,17 @@ pub trait StorageScanSource: Send {
         &mut self,
         limit_rows: usize,
     ) -> Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>>;
+    fn next_page_bounded(
+        &mut self,
+        _limit_rows: usize,
+        _budget: crate::storage::ReadBudget,
+    ) -> Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async {
+            Err(StorageError::Unsupported(
+                crate::storage::Capability::BoundedReads,
+            ))
+        })
+    }
 }
 
 /// One storage-owned range cursor tied to the read view that created it.
@@ -102,6 +113,45 @@ impl<'a> ScanCursor<'a> {
         self.finished = !has_more;
         self.poisoned = false;
         Ok(ScanChunk::new(entries, has_more))
+    }
+
+    /// Advances one ordered prefix whose owned value bytes fit the call-wide
+    /// budget. A separately admitted codec singleton may exceed the ordinary
+    /// page budget; an over-cap first member is a typed error, never empty+more.
+    pub async fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> Result<ScanChunk, StorageError> {
+        if self.poisoned {
+            return Err(StorageError::InvalidCursor);
+        }
+        if self.finished || limit_rows == 0 {
+            self.finished = true;
+            return Ok(ScanChunk::new(Vec::new(), false));
+        }
+        let page_size = limit_rows.min(crate::storage::MAX_SCAN_PAGE_ROWS);
+        self.poisoned = true;
+        let (entries, more) = self
+            .source
+            .next_page_bounded(page_size, budget)
+            .await?
+            .into_parts();
+        if entries.len() > page_size
+            || (more && entries.is_empty())
+            || !self.valid_entries(&entries)
+        {
+            return Err(StorageError::InvalidCursor);
+        }
+        let values = entries
+            .iter()
+            .map(|entry| Some(entry.value.clone()))
+            .collect::<Vec<_>>();
+        budget.validate_result(&values)?;
+        self.last_key = entries.last().map(|entry| entry.key.clone());
+        self.finished = !more;
+        self.poisoned = false;
+        Ok(ScanChunk::new(entries, more))
     }
 
     /// Yields the next chunk of rows, or `None` once the range is drained.

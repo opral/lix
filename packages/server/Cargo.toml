@@ -22,6 +22,7 @@ fs2 = "0.4.3"
 futures-util = { version = "0.3.31", features = ["io"] }
 http = "1.4.0"
 http-body = "1.0.1"
+libc = "0.2"
 lix_sdk = { package = "lix", path = "../lix", default-features = false, features = ["default_wasm_runtime", "server-protocol", "offline-migration"] }
 lix_slatedb_storage = { package = "lix-storage-slatedb", path = "../storage-slatedb" }
 mimalloc.workspace = true

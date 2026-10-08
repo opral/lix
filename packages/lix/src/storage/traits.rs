@@ -76,13 +76,16 @@ pub trait Storage: Send + Sync {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send;
 
-    /// Opens a watch for committed changes to the underlying storage.
+    /// Opens a watch for physical commits to the underlying storage.
     ///
-    /// The watch covers changes regardless of which engine, process, tab, or
-    /// replica applied them. It is an invalidation signal, not a change log:
-    /// notifications may be coalesced or spurious, and callers inspect the
-    /// result by opening a fresh read view. Implementations must establish the
-    /// watch without a registration gap that could permanently miss a change.
+    /// The watch covers commits regardless of which engine, process, tab, or
+    /// replica applied them, including private journal and scratch writes. It
+    /// is a physical wake-up signal, not a logical change log: notifications
+    /// may be coalesced or spurious, and engine observers compare their
+    /// observable revision before rerunning a query. Raw backend writes do not
+    /// advance that engine-owned revision and are not a supported logical
+    /// repository mutation path. Implementations must establish the watch
+    /// without a registration gap that could permanently miss a commit.
     fn watch_for_changes(
         &self,
     ) -> impl Future<Output = Result<StorageChangeWatch, StorageError>> + Send {
@@ -115,6 +118,31 @@ pub trait StorageRead: Send + Sync {
     /// The returned cursor is ephemeral and cannot outlive this read handle.
     /// It advances source state bound to this view and must never acquire a
     /// replacement read view as pages advance.
+    /// Returns the exact ordered point result or refuses before constructing
+    /// an oversized response. Unsupported adapters fail closed; ordinary
+    /// unbounded reads never provide an implicit compatibility path.
+    fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        let _ = (requests, budget);
+        async { Err(StorageError::Unsupported(Capability::BoundedReads)) }
+    }
+
+    /// Returns one byte-admitted prefix without changing exact point-read semantics.
+    fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> impl Future<Output = Result<crate::storage::GetManyPrefixResult, StorageError>> + Send
+    {
+        let _ = (requests, offset, max_slots, budget);
+        async { Err(StorageError::Unsupported(Capability::BoundedReads)) }
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,

@@ -48,6 +48,15 @@ use crate::tracked_state::{
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
+pub(crate) struct PreparedNativeDiffInputs {
+    /// Every identity in the bounded endpoint diff, including removed rows.
+    /// The caller uses these only for selected-head row-PK point paths.
+    pub(crate) selected_head_keys: Vec<TrackedStateKey>,
+    /// Change IDs proven visible at the exact after endpoint. These are
+    /// metadata-only dependencies; the row-PK index is not a visibility proof.
+    pub(crate) visible_after_change_ids: Vec<crate::changelog::ChangeId>,
+}
+
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -387,8 +396,10 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
             None,
+            false,
         )
         .await
+        .map(|_| ())
     }
 }
 
@@ -2627,7 +2638,20 @@ fn values_array(field: &Field, values: &[Option<lix_schema::Value>]) -> Result<A
                     Some(lix_schema::Value::Text(value)) => Ok(Some(value.clone())),
                     Some(lix_schema::Value::Uuid(value)) => Ok(Some(value.to_string())),
                     Some(lix_schema::Value::Jsonb(value)) if field_is_json(field) => {
-                        Ok(Some(value.as_value().to_string()))
+                        let text = value.to_json_string().map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "lix_diff column '{}' could not render JSONB: {error}",
+                                field.name()
+                            ))
+                        })?;
+                        lix_schema::jsonb_equality_key(&text)
+                            .map(Some)
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "lix_diff column '{}' has an invalid JSONB equality key: {error}",
+                                    field.name()
+                                ))
+                            })
                     }
                     _ => Err(DataFusionError::Execution(format!(
                         "lix_diff column '{}' expected text",

@@ -96,6 +96,13 @@ pub trait SyncTransport: SyncTransportBounds {
         manifest: &'a SyncBlobManifest,
     ) -> SyncTransportFuture<'a, SyncBlobRegistration>;
 
+    /// Registers a bounded dependency group. Responses correspond exactly to
+    /// request order; every requested chunk must belong to that manifest.
+    fn register_blobs<'a>(
+        &'a self,
+        manifests: &'a [SyncBlobManifest],
+    ) -> SyncTransportFuture<'a, Vec<SyncBlobRegistration>>;
+
     /// Loads one raw BLAKE3-addressed chunk, if present.
     fn get_chunk<'a>(&'a self, chunk_id: &'a str) -> SyncTransportFuture<'a, Option<Vec<u8>>>;
 

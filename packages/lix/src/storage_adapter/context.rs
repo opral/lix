@@ -17,8 +17,8 @@ use crate::storage_adapter::{
 use super::epoch::{EpochBank, EpochRouting, EpochStorageWrite};
 
 use super::spaces::{
-    REVISION_KEY_MUTATION, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, load_revision,
-    revision_key,
+    REVISION_KEY_MUTATION, REVISION_KEY_OBSERVABLE, REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE,
+    load_revision, revision_key,
 };
 
 /// One authoring role per engine and its clones; changing role replaces the
@@ -37,6 +37,14 @@ enum ReplicaWriteAdmission {
     Ordinary,
     FullInstaller,
     PartialInstaller,
+}
+
+#[derive(Clone, Copy)]
+enum ObservableRevisionIntent<'a> {
+    ClassifyWriteSet,
+    NativeDependencyAvailability(
+        &'a crate::sync::NativeDependencyAvailabilityCapability,
+    ),
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +265,8 @@ where
         writes: StorageWriteSet,
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageWriteSetError> {
+        let has_storage_mutations = writes.has_storage_mutations();
+        let has_observable_mutations = writes.has_observable_mutations();
         let mut write = self
             .begin_migration_write(opts)
             .await
@@ -264,6 +274,12 @@ where
         if let Err(error) = writes.lower_into(&mut write).await {
             let _ = write.rollback().await;
             return Err(error);
+        }
+        if has_storage_mutations
+            && let Err(error) = stage_storage_revisions(&mut write, has_observable_mutations).await
+        {
+            let _ = write.rollback().await;
+            return Err(StorageWriteSetError::Storage(error));
         }
         write.commit().await.map_err(StorageWriteSetError::Storage)
     }
@@ -312,6 +328,7 @@ where
                 write_set,
                 opts,
                 ReplicaWriteAdmission::FullInstaller,
+                ObservableRevisionIntent::ClassifyWriteSet,
             )
             .await?;
         prepared
@@ -329,6 +346,7 @@ where
             write_set,
             opts,
             ReplicaWriteAdmission::Ordinary,
+            ObservableRevisionIntent::ClassifyWriteSet,
         )
         .await
     }
@@ -343,6 +361,26 @@ where
             write_set,
             opts,
             ReplicaWriteAdmission::PartialInstaller,
+            ObservableRevisionIntent::ClassifyWriteSet,
+        )
+        .await?
+        .commit()
+        .await
+        .map_err(StorageWriteSetError::Storage)
+    }
+
+    pub(crate) async fn commit_partial_native_dependency_availability_write_set(
+        &self,
+        _partial_capability: crate::sync::PartialReplicaWriteCapability,
+        availability: crate::sync::NativeDependencyAvailabilityCapability,
+        write_set: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
+        self.prepare_write_set_with_replica_capability(
+            write_set,
+            opts,
+            ReplicaWriteAdmission::PartialInstaller,
+            ObservableRevisionIntent::NativeDependencyAvailability(&availability),
         )
         .await?
         .commit()
@@ -355,7 +393,17 @@ where
         mut write_set: StorageWriteSet,
         mut opts: WriteOptions,
         admission: ReplicaWriteAdmission,
+        observable_intent: ObservableRevisionIntent<'_>,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
+        if let ObservableRevisionIntent::NativeDependencyAvailability(capability) =
+            observable_intent
+        {
+            require_native_dependency_availability_guards(&write_set, &opts, capability)?;
+            // A validated dependency install is acknowledged only after its
+            // object bytes and the exact partial-replica epoch guard are
+            // durable together.
+            opts.await_durable = true;
+        }
         let writer_mode = self.replica_writer.load(Ordering::Acquire);
         let may_write_full = admission == ReplicaWriteAdmission::FullInstaller
             || (admission == ReplicaWriteAdmission::Ordinary
@@ -385,11 +433,9 @@ where
             )));
         }
         if may_write_partial {
-            let graph_guards = crate::sync::partial_serving::commit_graph_guards(
-                &write_set,
-                &opts.preconditions,
-            )
-            .map_err(StorageWriteSetError::Admission)?;
+            let graph_guards =
+                crate::sync::partial_serving::commit_graph_guards(&write_set, &opts.preconditions)
+                    .map_err(StorageWriteSetError::Admission)?;
             opts.preconditions.extend(graph_guards);
         }
         if !may_write_partial {
@@ -406,6 +452,7 @@ where
                 key: crate::sync::partial_replica_state_key(),
             });
         }
+        let mut write_set_domain_prepared = false;
         if (may_write_partial
             || write_set.has_mutations_in_space(crate::sync::PARTIAL_REPLICA_STATE_SPACE))
             && crate::sync::partial_serving::has_coordinate_mutations(&write_set)
@@ -414,16 +461,27 @@ where
                 .begin_read(ReadOptions::default())
                 .await
                 .map_err(StorageWriteSetError::Storage)?;
-            let (prepared, guards) = crate::sync::partial_serving::prepare_write(
-                &read,
-                write_set,
-                false,
-            )
-            .await
-            .map_err(StorageWriteSetError::Admission)?;
+            let (prepared, guards) =
+                crate::sync::partial_serving::prepare_write(&read, write_set, false)
+                    .await
+                    .map_err(StorageWriteSetError::Admission)?;
             write_set = prepared;
             opts.preconditions.extend(guards);
+            write_set_domain_prepared = true;
         }
+        if write_set_domain_prepared
+            && let ObservableRevisionIntent::NativeDependencyAvailability(capability) =
+                observable_intent
+        {
+            // Domain preparation is allowed to add guards, never extra writes
+            // under a dependency-only visibility intent.
+            require_native_dependency_availability_guards(&write_set, &opts, capability)?;
+        }
+        let has_storage_mutations = write_set.has_storage_mutations();
+        let has_observable_mutations = match observable_intent {
+            ObservableRevisionIntent::ClassifyWriteSet => write_set.has_observable_mutations(),
+            ObservableRevisionIntent::NativeDependencyAvailability(_) => false,
+        };
         if self.authority_writer.load(Ordering::Acquire) {
             opts.preconditions.push(Precondition::KeyValueEquals {
                 space: crate::sync::SYNC_AUTHORITY_STATE_SPACE,
@@ -459,13 +517,14 @@ where
         let mut write =
             EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         let lowered = async {
-            let stats = write_set.lower_into(&mut write).await?;
-            if stats.staged_puts > 0 || stats.staged_deletes > 0 {
-                // The adapter's own mutation token is not a caller mutation,
-                // so it stays out of the write set (and out of the returned
-                // stats). It now lands in the shared revision space, next to
-                // every other revision the same commit rotated.
-                stage_mutation_revision(&mut write)
+            let mut stats = write_set.lower_into(&mut write).await?;
+            if has_storage_mutations {
+                // Adapter tokens are not caller mutations and stay out of the
+                // returned stats. The physical token remains unconditional;
+                // the observer token is staged in the same revision batch
+                // only when this write set touched an observable space.
+                stats.observable_revision =
+                    stage_storage_revisions(&mut write, has_observable_mutations)
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -489,6 +548,11 @@ where
     pub(crate) async fn load_mutation_revision(&self) -> Result<Option<Bytes>, StorageError> {
         let read = self.begin_read(ReadOptions::default()).await?;
         Self::load_mutation_revision_from_read(&read).await
+    }
+
+    pub(crate) async fn load_observable_revision(&self) -> Result<Option<Bytes>, StorageError> {
+        let read = self.begin_read(ReadOptions::default()).await?;
+        Self::load_observable_revision_from_read(&read).await
     }
 
     pub(crate) fn tracked_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
@@ -536,6 +600,15 @@ where
         load_revision(read, REVISION_KEY_MUTATION).await
     }
 
+    pub(crate) async fn load_observable_revision_from_read<R>(
+        read: &R,
+    ) -> Result<Option<Bytes>, StorageError>
+    where
+        R: StorageAdapterRead + ?Sized,
+    {
+        load_revision(read, REVISION_KEY_OBSERVABLE).await
+    }
+
     pub(crate) async fn load_tracked_mutation_revision_from_read<R>(
         read: &R,
     ) -> Result<Option<Bytes>, StorageError>
@@ -553,9 +626,7 @@ where
     ) -> Result<CommitResult, StorageError> {
         let mut opts = opts;
         if !self.routing.is_migration_writer() {
-            if self.replica_writer.load(Ordering::Acquire)
-                == ReplicaWriterMode::Partial as u8
-            {
+            if self.replica_writer.load(Ordering::Acquire) == ReplicaWriterMode::Partial as u8 {
                 return Err(StorageError::Corruption(
                     "partial replica range deletion requires a checked atomic write set".into(),
                 ));
@@ -564,9 +635,7 @@ where
                 space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
                 key: crate::sync::partial_replica_state_key(),
             });
-            if self.replica_writer.load(Ordering::Acquire)
-                != ReplicaWriterMode::Full as u8
-            {
+            if self.replica_writer.load(Ordering::Acquire) != ReplicaWriterMode::Full as u8 {
                 opts.preconditions.push(Precondition::KeyAbsent {
                     space: crate::sync::SYNC_REPLICA_STATE_SPACE,
                     key: crate::sync::replica_state_key(),
@@ -579,6 +648,15 @@ where
         let mut write =
             EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);
         if let Err(error) = write.delete_range(space, range).await {
+            let _ = write.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = stage_storage_revisions(
+            &mut write,
+            space.visibility == crate::storage::StorageSpaceVisibility::Observable,
+        )
+        .await
+        {
             let _ = write.rollback().await;
             return Err(error);
         }
@@ -611,23 +689,90 @@ where
     }
 }
 
+fn require_native_dependency_availability_guards(
+    write_set: &StorageWriteSet,
+    opts: &WriteOptions,
+    capability: &crate::sync::NativeDependencyAvailabilityCapability,
+) -> Result<(), StorageWriteSetError> {
+    let invalid = || {
+        StorageWriteSetError::Admission(crate::LixError::new(
+            "LIX_NATIVE_DEPENDENCY_AVAILABILITY_INVALID",
+            "dependency availability intent does not match its validated native objects and partial epoch guards",
+        ))
+    };
+
+    if !write_set.is_exact_native_dependency_availability(capability) {
+        return Err(invalid());
+    }
+
+    let state_key = crate::sync::partial_replica_state_key();
+    let expected_state = capability.partial_replica_state();
+    if !opts.preconditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Precondition::KeyValueEquals {
+                space,
+                key,
+                expected,
+            } if *space == crate::sync::PARTIAL_REPLICA_STATE_SPACE
+                && key == &state_key
+                && expected == expected_state
+        )
+    }) {
+        return Err(invalid());
+    }
+
+    if capability.entries().iter().any(|entry| {
+        !opts.preconditions.iter().any(|condition| {
+            matches!(
+                condition,
+                Precondition::KeyAbsent { space, key }
+                    if *space == entry.space && key.0.as_ref() == entry.key.as_ref()
+            )
+        })
+    }) {
+        return Err(invalid());
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn stage_mutation_revision<W>(write: &mut W) -> Result<(), StorageError>
 where
     W: StorageWrite,
 {
-    write
-        .put_many(
-            REVISION_SPACE,
-            PutBatch {
-                entries: vec![PutEntry {
-                    key: revision_key(REVISION_KEY_MUTATION),
-                    value: StoredValue {
-                        bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
-                    },
-                }],
+    // Remaining low-level callers are visible migration/publication paths.
+    // Private work uses the canonical write-set classifier above instead.
+    stage_storage_revisions(write, true).await.map(|_| ())
+}
+
+/// Stages the physical mutation token and, for canonical visible changes, the
+/// observer token in one revision-space batch. Raw `Storage::begin_write`
+/// callers bypass this engine-owned logical mutation boundary.
+pub(crate) async fn stage_storage_revisions<W>(
+    write: &mut W,
+    observable: bool,
+) -> Result<Option<[u8; 16]>, StorageError>
+where
+    W: StorageWrite,
+{
+    let mut entries = vec![PutEntry {
+        key: revision_key(REVISION_KEY_MUTATION),
+        value: StoredValue {
+            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+        },
+    }];
+    let observable_revision = observable.then(|| *uuid::Uuid::now_v7().as_bytes());
+    if let Some(revision) = observable_revision {
+        entries.push(PutEntry {
+            key: revision_key(REVISION_KEY_OBSERVABLE),
+            value: StoredValue {
+                bytes: Bytes::copy_from_slice(&revision),
             },
-        )
-        .await
+        });
+    }
+    write.put_many(REVISION_SPACE, PutBatch { entries }).await?;
+    Ok(observable_revision)
 }
 
 pub(crate) async fn load_repository_mutation_revision<R>(
@@ -777,8 +922,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::storage::{
-        GetOptions, Key, Memory, ProjectedValue, ReadOptions, SpaceId, StorageWrite, StoredValue,
-        WriteOptions,
+        GetOptions, Key, KeyRange, Memory, Precondition, ProjectedValue, ReadOptions, SpaceId,
+        StorageError, StorageWrite, StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{PointReadPlan, StorageAdapter, StorageSpace};
 
@@ -798,7 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn replica_write_admission_never_crosses_receipt_ownership() {
-        use super::{ReplicaWriteAdmission, ReplicaWriterMode};
+        use super::{ObservableRevisionIntent, ReplicaWriteAdmission, ReplicaWriterMode};
         for full_receipt in [false, true] {
             for partial_receipt in [false, true] {
                 for writer_mode in [
@@ -847,6 +992,7 @@ mod tests {
                                 writes,
                                 WriteOptions::default(),
                                 admission,
+                                ObservableRevisionIntent::ClassifyWriteSet,
                             )
                             .await
                         {
@@ -928,5 +1074,176 @@ mod tests {
                 .expect("latest revision"),
             revision
         );
+    }
+
+    #[tokio::test]
+    async fn observable_revision_separates_private_and_visible_commits() {
+        let storage = StorageAdapter::new(Memory::new());
+        let private_space = crate::sync::PARTIAL_READ_INTEREST_SPACE;
+
+        assert_eq!(storage.load_mutation_revision().await.unwrap(), None);
+        assert_eq!(storage.load_observable_revision().await.unwrap(), None);
+
+        let mut private = storage.new_write_set();
+        private.put(private_space, key("recipe"), value("query recipe"));
+        let (_, private_stats) = storage
+            .commit_write_set(private, WriteOptions::default())
+            .await
+            .expect("private journal commit");
+        assert_eq!(private_stats.observable_revision, None);
+        let physical_after_private = storage.load_mutation_revision().await.unwrap();
+        assert!(
+            physical_after_private.is_some(),
+            "private writes still rotate m"
+        );
+        assert_eq!(
+            storage.load_observable_revision().await.unwrap(),
+            None,
+            "the first private write must preserve an absent observable token"
+        );
+
+        let mut visible = storage.new_write_set();
+        visible.put(space(), key("visible"), value("result"));
+        let (_, visible_stats) = storage
+            .commit_write_set(visible, WriteOptions::default())
+            .await
+            .expect("visible commit");
+        let physical_after_visible = storage.load_mutation_revision().await.unwrap();
+        let observable_after_visible = storage.load_observable_revision().await.unwrap();
+        assert_ne!(physical_after_visible, physical_after_private);
+        assert!(observable_after_visible.is_some());
+        let expected_observable_revision: [u8; 16] = observable_after_visible
+            .as_deref()
+            .expect("visible revision exists")
+            .try_into()
+            .expect("observable revision is a 16-byte UUID");
+        assert_eq!(
+            visible_stats.observable_revision,
+            Some(expected_observable_revision),
+            "returned stats carry the exact token staged by the accepted commit"
+        );
+
+        let mut mixed = storage.new_write_set();
+        mixed.put(private_space, key("recipe-2"), value("another recipe"));
+        mixed.put(space(), key("visible-2"), value("another result"));
+        storage
+            .commit_write_set(mixed, WriteOptions::default())
+            .await
+            .expect("mixed commit");
+        assert_ne!(
+            storage.load_observable_revision().await.unwrap(),
+            observable_after_visible,
+            "a mixed private/visible commit remains observable"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_visible_cas_does_not_advance_observable_revision() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut seed = storage.new_write_set();
+        seed.put(space(), key("seed"), value("seed"));
+        storage
+            .commit_write_set(seed, WriteOptions::default())
+            .await
+            .expect("seed visible token");
+        let before = storage.load_observable_revision().await.unwrap();
+
+        let mut writes = storage.new_write_set();
+        writes.put(space(), key("candidate"), value("must roll back"));
+        let error = storage
+            .commit_write_set(
+                writes,
+                WriteOptions {
+                    preconditions: vec![Precondition::KeyValueEquals {
+                        space: space(),
+                        key: key("absent"),
+                        expected: Bytes::from_static(b"not present"),
+                    }],
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("failed CAS must roll back the visible write and revision");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+        assert_eq!(storage.load_observable_revision().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_second_adapter_observes_the_external_visible_revision() {
+        let memory = Memory::new();
+        let observer_adapter = StorageAdapter::new(memory.clone());
+        let writer_adapter = StorageAdapter::new(memory);
+        let before = observer_adapter.load_observable_revision().await.unwrap();
+
+        let mut writes = writer_adapter.new_write_set();
+        writes.put(space(), key("external"), value("from another adapter"));
+        writer_adapter
+            .commit_write_set(writes, WriteOptions::default())
+            .await
+            .expect("external adapter commit");
+
+        assert_ne!(
+            observer_adapter.load_observable_revision().await.unwrap(),
+            before,
+            "the observable token is durable shared storage state"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_only_write_sets_rotate_revision_tokens_by_space_visibility() {
+        let storage = StorageAdapter::new(Memory::new());
+        let all = KeyRange {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Unbounded,
+        };
+        let mut private_range = storage.new_write_set();
+        private_range
+            .delete_range_exclusive(crate::sync::PARTIAL_READ_INTEREST_SPACE, all.clone())
+            .unwrap();
+        storage
+            .commit_write_set(private_range, WriteOptions::default())
+            .await
+            .expect("private range delete");
+        assert!(storage.load_mutation_revision().await.unwrap().is_some());
+        assert_eq!(storage.load_observable_revision().await.unwrap(), None);
+
+        let mut visible_range = storage.new_write_set();
+        visible_range.delete_range_exclusive(space(), all).unwrap();
+        storage
+            .commit_write_set(visible_range, WriteOptions::default())
+            .await
+            .expect("visible range delete");
+        assert!(storage.load_observable_revision().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_range_deletes_rotate_revision_tokens_by_space_visibility() {
+        let storage = StorageAdapter::new(Memory::new());
+        let all = KeyRange {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Unbounded,
+        };
+
+        storage
+            .delete_range(
+                crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                all.clone(),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("direct private range delete");
+        assert!(storage.load_mutation_revision().await.unwrap().is_some());
+        assert_eq!(storage.load_observable_revision().await.unwrap(), None);
+
+        storage
+            .delete_range(space(), all, WriteOptions::default())
+            .await
+            .expect("direct visible range delete");
+        assert!(storage.load_observable_revision().await.unwrap().is_some());
     }
 }

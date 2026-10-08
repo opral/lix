@@ -75,4 +75,10 @@ pub struct StorageWriteSetStats {
     pub delete_batches: u64,
     pub storage_calls: u64,
     pub written_bytes: u64,
+    /// The exact observable revision staged by this commit, if any.
+    ///
+    /// This is set by the adapter when it adds the observer token and is
+    /// returned to callers only after the storage commit succeeds. Private
+    /// write sets and no-op commits leave it unset.
+    pub observable_revision: Option<[u8; 16]>,
 }

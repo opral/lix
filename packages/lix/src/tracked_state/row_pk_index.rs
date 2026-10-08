@@ -469,6 +469,35 @@ pub(crate) async fn prepare_row_pk_index_mutation_inputs(
         .await
 }
 
+/// Prepare only the addressed row-PK index paths for a bounded exact identity
+/// set. Read fulfillment uses this frontier for selected current-head diff
+/// identities; unlike mutation preparation, it does not expand to predecessor
+/// or successor leaves.
+pub(crate) async fn prepare_row_pk_index_point_inputs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &TrackedStateRootId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let encoded = keys
+        .iter()
+        .map(|key| {
+            encode_row_pk_index_key(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            })
+            .map(bytes::Bytes::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    super::tree::TrackedStateTree::new()
+        .get_many_encoded(store, root, &encoded)
+        .await?;
+    Ok(())
+}
+
 /// Prepare the secondary identity paths used when publishing selected changes
 /// against an existing checkpoint. This reads no primary snapshot or inventory.
 pub(crate) async fn prepare_row_pk_mutation_inputs_at_commit(

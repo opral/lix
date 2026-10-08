@@ -466,10 +466,11 @@ async fn install_validated<S: Storage + Clone + Send + Sync + 'static>(
             return Ok(());
         }
         let mut writes = storage.new_write_set();
+        let mut install_addresses = Vec::new();
         let mut preconditions = vec![StoragePrecondition::KeyValueEquals {
             space: PARTIAL_REPLICA_STATE_SPACE,
             key: partial_replica_state_key(),
-            expected: raw,
+            expected: raw.clone(),
         }];
         for (address, present) in missing.iter().zip(present) {
             if present {
@@ -486,16 +487,24 @@ async fn install_validated<S: Storage + Clone + Send + Sync + 'static>(
                 })?;
             writes.put_content_addressed_batch(
                 address.space(),
-                [(key.clone(), StorageValue { bytes })],
+                [(key.clone(), StorageValue { bytes: bytes.clone() })],
             );
+            install_addresses.push(*address);
             preconditions.push(StoragePrecondition::KeyAbsent {
                 space: address.space(),
                 key,
             });
         }
+        let availability =
+            super::super::native_object::validated_native_dependency_availability_from_staged(
+                &install_addresses,
+                &writes,
+                raw,
+            )?;
         match storage
-            .commit_partial_replica_write_set(
+            .commit_partial_native_dependency_availability_write_set(
                 super::super::partial_replica_write_capability(),
+                availability,
                 writes,
                 StorageWriteOptions {
                     preconditions,

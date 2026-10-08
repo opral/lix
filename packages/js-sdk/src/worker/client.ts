@@ -1,4 +1,12 @@
 import { operationDeadline, lostOperationError } from "./request-lifecycle.js";
+import {
+	WORKER_CLIENT_MAX_CONTROL_PENDING,
+	WORKER_CLIENT_MAX_ORDINARY_PENDING,
+	WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING,
+	WORKER_CLIENT_MAX_PENDING,
+	WORKER_OPERATION_QUEUE_WAIT_MS,
+	workerQueueFullError,
+} from "./operation-scheduler.js";
 import { emitOpenProgress } from "../open-progress.js";
 import { fetchTransport, type HttpTransport } from "../http-transport.js";
 import {
@@ -23,6 +31,7 @@ import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isSessionCloseRequest,
 	type WorkerConnection,
 	type WorkerNotification,
 	type WorkerOperation,
@@ -36,6 +45,10 @@ type SyncServerRuntimeOptions = LixServerOptions & {
 
 type PendingRequest = {
 	operation: WorkerOperation;
+	category: "ordinary" | "observer-close" | "control";
+	timer?: ReturnType<typeof setTimeout>;
+	abortSignal?: AbortSignal;
+	abortListener?: () => void;
 	resolve(value: unknown): void;
 	reject(error: unknown): void;
 };
@@ -43,6 +56,7 @@ type PendingRequest = {
 type RequestWorker = <T>(
 	operation: WorkerOperation,
 	telemetryParent?: TelemetryParentContext,
+	signal?: AbortSignal,
 ) => Promise<T>;
 type NotifyWorker = (notification: WorkerNotification) => void;
 
@@ -50,6 +64,21 @@ const MAX_IDLE_WORKERS = 1;
 // The common serial reopen path retains one worker so its prepared plugin cache
 // survives close(). Concurrent opens still receive isolated workers.
 const idleWorkers: LixWorkerClient[] = [];
+
+function workerOperationCategory(
+	operation: WorkerOperation,
+): PendingRequest["category"] {
+	if (operation.kind === "observe.close") return "observer-close";
+	if (
+		operation.kind === "close" ||
+		operation.kind === "exportSnapshot.cancel" ||
+		operation.kind === "transaction.commit" ||
+		operation.kind === "transaction.rollback" ||
+		operation.kind === "openSnapshot.finish"
+	)
+		return "control";
+	return "ordinary";
+}
 
 export async function openLixWorker(
 	storage: LixStorageConfig,
@@ -125,6 +154,24 @@ export async function pumpSnapshotToWorker(
 		(value) => ({ kind: "open-complete", value }) as const,
 		(error: unknown) => ({ kind: "open-error", error }) as const,
 	);
+	const waitForSnapshotRequest = async (request: Promise<unknown>): Promise<boolean> => {
+		const requestCompletion = request.then(
+			(value) => ({ kind: "request-complete", value }) as const,
+			(error: unknown) => ({ kind: "request-error", error }) as const,
+		);
+		const outcome = await Promise.race([requestCompletion, openCompletion]);
+		if (outcome.kind === "open-error") throw outcome.error;
+		if (outcome.kind === "open-complete") {
+			// A successful open normally consumes through EOF. If it completed early,
+			// stop the producer and wait for the in-flight write's host-side cleanup.
+			await reader.cancel().catch(() => undefined);
+			client.notify({ kind: "openSnapshot.cancel", snapshotId });
+			await requestCompletion;
+			return false;
+		}
+		if (outcome.kind === "request-error") throw outcome.error;
+		return true;
+	};
 	try {
 		while (true) {
 			const outcome = await Promise.race([
@@ -152,14 +199,16 @@ export async function pumpSnapshotToWorker(
 				throw new TypeError("snapshot stream chunks must be Uint8Array values");
 			}
 			for (const chunk of ownedSnapshotRestoreChunks(read.value)) {
-				await client.request({
+				if (!(await waitForSnapshotRequest(client.request({
 					kind: "openSnapshot.write",
 					snapshotId,
 					chunk,
-				});
+				})))) return;
 			}
 		}
-		await client.request({ kind: "openSnapshot.finish", snapshotId });
+		if (!(await waitForSnapshotRequest(
+			client.request({ kind: "openSnapshot.finish", snapshotId }),
+		))) return;
 	} catch (error) {
 		await reader.cancel(error).catch(() => undefined);
 		client.notify({ kind: "openSnapshot.cancel", snapshotId });
@@ -278,10 +327,11 @@ export function wrapTelemetryParentBinding(
 				return async (
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
+					options?: Parameters<LixBinding["observe"]>[2],
 				) => {
 					const initialParent = prepareOperation();
 					return wrapTelemetryParentObserve(
-						await target.observe(sql, params),
+						await target.observe(sql, params, options),
 						parentContext,
 						initialParent,
 					);
@@ -414,9 +464,9 @@ export function workerBinding(
 	sessionId: number,
 ): LixBinding {
 	let closed = false;
-	const request: RequestWorker = (operation, telemetryParent) => {
+	const request: RequestWorker = (operation, telemetryParent, signal) => {
 		if (closed) return Promise.reject(workerClosedError());
-		return client.request(operation, sessionId, telemetryParent);
+		return client.request(operation, sessionId, telemetryParent, signal);
 	};
 	const notify: NotifyWorker = (notification) => {
 		if (!closed) client.notify(notification);
@@ -437,11 +487,12 @@ export function workerBinding(
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
 			request({ kind: "executeBatch", statements, options }),
-		observe: async (sql, params) => {
+		observe: async (sql, params, options) => {
 			const initialParent = client.currentTelemetryParent();
 			const observeId = await request<number>(
 				{ kind: "observe", sql, params },
 				initialParent,
+				options?.signal,
 			);
 			return workerObserveBinding(
 				request,
@@ -550,8 +601,8 @@ function workerObserveBinding(
 }
 
 async function releaseWorker(client: LixWorkerClient): Promise<void> {
-	client.endLease();
 	if (client.reusable && !client.isDisposed && idleWorkers.length < MAX_IDLE_WORKERS) {
+		client.endLease();
 		idleWorkers.push(client);
 		return;
 	}
@@ -563,6 +614,7 @@ export class LixWorkerClient {
 	private nextSnapshotInputId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
 	private disposed = false;
+	private terminating = false;
 	private leased = false;
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
@@ -583,6 +635,8 @@ export class LixWorkerClient {
 		number,
 		ReadableStreamDefaultReader<Uint8Array> | undefined
 	>();
+	private readonly teardownHeaderRequests = new Set<number>();
+	private readonly teardownSessionRequests = new Set<number>();
 
 	constructor(
 		private readonly connection: WorkerConnection = createWorkerConnection(),
@@ -623,6 +677,13 @@ export class LixWorkerClient {
 		this.syncServer = undefined;
 		this.onProgress = undefined;
 		this.openReport = undefined;
+		this.abortSyncFetches();
+		this.teardownHeaderRequests.clear();
+		this.teardownSessionRequests.clear();
+		onDisposed?.();
+	}
+
+	private abortSyncFetches(): void {
 		for (const controller of this.syncFetchControllers.values())
 			controller.abort();
 		this.syncFetchControllers.clear();
@@ -630,7 +691,6 @@ export class LixWorkerClient {
 			void reader?.cancel().catch(() => undefined);
 		}
 		this.syncFetchStreams.clear();
-		onDisposed?.();
 	}
 
 	currentTelemetryParent(): TelemetryParentContext | undefined {
@@ -641,43 +701,58 @@ export class LixWorkerClient {
 		operation: WorkerOperation,
 		sessionId = 0,
 		telemetryParent?: TelemetryParentContext,
+		signal?: AbortSignal,
 	): Promise<T> {
+		if (signal?.aborted) return Promise.reject(observerRegistrationCancelledError());
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
+		}
+		const category = workerOperationCategory(operation);
+		let controlPending = 0;
+		let observerClosePending = 0;
+		let ordinaryPending = 0;
+		for (const pending of this.pending.values()) {
+			if (pending.category === "control") controlPending++;
+			else if (pending.category === "observer-close") observerClosePending++;
+			else ordinaryPending++;
+		}
+		if (
+			this.pending.size >= WORKER_CLIENT_MAX_PENDING ||
+			(category === "control" && controlPending >= WORKER_CLIENT_MAX_CONTROL_PENDING) ||
+			(category === "observer-close" &&
+				observerClosePending >= WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING) ||
+			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING)
+		) {
+			return Promise.reject(workerQueueFullError());
 		}
 		const id = this.nextRequestId++;
 		if (this.pending.size === 0) this.connection.ref();
 		return new Promise<T>((resolve, reject) => {
-			const milliseconds = operationDeadline(operation);
-			const timer =
-				milliseconds === undefined
-					? undefined
-					: setTimeout(() => {
-							this.handleFatal(
-								Object.assign(
-									new Error(
-										`Lix ${operation.kind} did not settle within ${milliseconds}ms`,
-									),
-									{
-										code:
-											operation.kind === "open"
-												? "LIX_OPEN_TIMEOUT"
-												: "LIX_OPERATION_TIMEOUT",
-									},
-								),
-							);
-						}, milliseconds);
-			this.pending.set(id, {
+			const pendingRequest: PendingRequest = {
 				operation,
+				category,
+				abortSignal: signal,
 				resolve: (value) => {
-					clearTimeout(timer);
+					this.cleanupPendingRequest(pendingRequest);
 					resolve(value as T);
 				},
 				reject: (error) => {
-					clearTimeout(timer);
+					this.cleanupPendingRequest(pendingRequest);
 					reject(error);
 				},
-			});
+			};
+			this.pending.set(id, pendingRequest);
+			pendingRequest.timer = setTimeout(() => {
+				if (!this.pending.has(id)) return;
+				this.handleFatal(
+					Object.assign(
+						new Error(
+							`Lix worker did not acknowledge request receipt within ${WORKER_OPERATION_QUEUE_WAIT_MS}ms`,
+						),
+						{ code: "LIX_WORKER_START_TIMEOUT" },
+					),
+				);
+			}, WORKER_OPERATION_QUEUE_WAIT_MS);
 			try {
 				this.connection.postMessage({
 					id,
@@ -691,26 +766,53 @@ export class LixWorkerClient {
 				if (this.pending.size === 0) this.connection.unref();
 				pending?.reject(error);
 			}
+			if (this.pending.has(id) && signal && operation.kind === "observe") {
+				pendingRequest.abortListener = () => {
+					// Keep the request pending until the host/repository settles it. If
+					// registration already completed remotely, the cancel notification
+					// carries the same request ID so the host can close that iterator.
+					if (this.pending.has(id))
+						this.notify({ kind: "observe.cancel", requestId: id });
+				};
+				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
+				if (signal.aborted) pendingRequest.abortListener();
+			}
 		});
 	}
 
 	notify(notification: WorkerNotification): void {
-		if (this.disposed || !this.leased) return;
+		if (!this.leased) return;
+		const teardownId = "requestId" in notification ? notification.requestId : undefined;
+		const teardownResult = this.terminating && teardownId !== undefined && (
+			(notification.kind === "sync.headers.result" && this.teardownHeaderRequests.has(teardownId)) ||
+			(notification.kind === "sync.fetch.result" && this.teardownSessionRequests.has(teardownId))
+		);
+		if (this.disposed && !teardownResult) return;
 		try {
 			this.connection.postMessage(notification);
 		} catch {
 			// A best-effort finalizer/close notification can race worker shutdown.
+		} finally {
+			if (teardownResult && teardownId !== undefined) {
+				this.teardownHeaderRequests.delete(teardownId);
+				this.teardownSessionRequests.delete(teardownId);
+			}
 		}
 	}
 
 	async terminate(): Promise<void> {
 		if (this.disposed) return;
+		this.terminating = true;
 		this.disposed = true;
 		this.rejectPending(workerClosedError());
+		this.abortSyncFetches();
 		try {
 			await this.connection.terminate();
 		} finally {
 			this.endLease();
+			this.terminating = false;
+			this.teardownHeaderRequests.clear();
+			this.teardownSessionRequests.clear();
 		}
 	}
 
@@ -730,7 +832,43 @@ export class LixWorkerClient {
 	private handleWorkerEvent(
 		message: Extract<WorkerResponse, { kind: string }>,
 	): void {
+		if (this.disposed && !this.terminating) return;
+		if (
+			this.terminating &&
+			message.kind !== "sync.headers" &&
+			message.kind !== "sync.fetch" &&
+			message.kind !== "sync.fetch.cancel"
+		) return;
 		switch (message.kind) {
+			case "request.started": {
+				const pending = this.pending.get(message.id);
+				if (!pending) break;
+				this.clearPendingTimer(pending);
+				const milliseconds = operationDeadline(pending.operation);
+				if (milliseconds !== undefined) {
+					pending.timer = setTimeout(() => {
+						this.handleFatal(
+							Object.assign(
+								new Error(
+									`Lix ${pending.operation.kind} did not settle within ${milliseconds}ms`,
+								),
+								{
+									code:
+									pending.operation.kind === "open"
+										? "LIX_OPEN_TIMEOUT"
+										: "LIX_OPERATION_TIMEOUT",
+								},
+							),
+						);
+					}, milliseconds);
+				}
+				break;
+			}
+			case "request.queued": {
+				const pending = this.pending.get(message.id);
+				if (pending) this.clearPendingTimer(pending);
+				break;
+			}
 			case "telemetry":
 				try {
 					this.telemetry?.onExport(message.request);
@@ -746,9 +884,17 @@ export class LixWorkerClient {
 				}
 				break;
 			case "sync.headers":
+				if (this.terminating) this.teardownHeaderRequests.add(message.requestId);
 				void this.resolveSyncHeaders(message.requestId, message.transportScope);
 				break;
 			case "sync.fetch":
+				if (this.terminating) {
+					const server = message.transportScope === undefined
+						? this.syncServer
+						: this.scopedServers.get(message.transportScope);
+					if (!server || !isSessionCloseRequest(message.request, server.url)) break;
+					this.teardownSessionRequests.add(message.requestId);
+				}
 				void this.resolveSyncFetch(message.requestId, message.request, message.transportScope);
 				break;
 			case "sync.fetch.stream.pull":
@@ -927,6 +1073,19 @@ export class LixWorkerClient {
 		this.pending.clear();
 		this.connection.unref();
 	}
+
+	private clearPendingTimer(pending: PendingRequest): void {
+		if (pending.timer !== undefined) clearTimeout(pending.timer);
+		pending.timer = undefined;
+	}
+
+	private cleanupPendingRequest(pending: PendingRequest): void {
+		this.clearPendingTimer(pending);
+		if (pending.abortSignal && pending.abortListener)
+			pending.abortSignal.removeEventListener("abort", pending.abortListener);
+		pending.abortSignal = undefined;
+		pending.abortListener = undefined;
+	}
 }
 
 function isSyncResponseTooLarge(error: unknown): boolean {
@@ -941,6 +1100,13 @@ function workerClosedError(): Error & { code: string } {
 	const error = new Error("Lix worker is closed") as Error & { code: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+function observerRegistrationCancelledError(): Error & { code: string } {
+	const error = new Error("Observer registration was cancelled") as Error & { code: string };
+	error.name = "AbortError";
+	error.code = "LIX_OBSERVER_CANCELLED";
 	return error;
 }
 

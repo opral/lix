@@ -81,6 +81,22 @@ try {
 	for (const name of (process.env.LIX_TEST_BROWSERS ?? "chromium").split(",")) {
 		const browser = await { chromium, webkit }[name].launch();
 		const context = await browser.newContext();
+		await context.addInitScript(() => {
+			window.ownerWorkers = 0;
+			window.retiredOwners = 0;
+			const OriginalWorker = Worker;
+			window.Worker = class extends OriginalWorker {
+				constructor(url, options) {
+					super(url, options);
+					if (options?.name === "lix-repository-owner") {
+						window.ownerWorkers++;
+						this.addEventListener("message", event => {
+							if (event.data?.kind === "retired") window.retiredOwners++;
+						});
+					}
+				}
+			};
+		});
 		// A broken idle observation must fail CI rather than wait forever.
 		let timedOut = false;
 		const deadline = setTimeout(() => {
@@ -127,6 +143,22 @@ try {
 			await a.evaluate(() => api.close());
 			assert.equal(await b.evaluate(() => api.read("shared")), "durable");
 			await b.evaluate(() => api.close());
+			await Promise.all([a, b].map(page => page.waitForFunction(() => window.retiredOwners > 0)));
+			const workerCount = await a.evaluate(() => window.ownerWorkers);
+			// Reuse the compiler realm across physical repositories, without keeping
+			// either ownership locks or previous repository state alive while idle.
+			for (let index = 0; index < 8; index++) {
+				const name = index % 2 === 0 ? storageName : `${storageName}-other`;
+				const retired = await a.evaluate(() => window.retiredOwners);
+				const idleLocks = await a.evaluate(() => navigator.locks.query());
+				assert.ok(![...idleLocks.held, ...idleLocks.pending].some(lock =>
+					lock.name.startsWith("lix:repository-owner:") || lock.name.startsWith("lix:opfs-sqlite:")));
+				await a.evaluate(name => api.open(name), name);
+				assert.equal(await a.evaluate(() => api.read("shared")), index % 2 === 0 ? "durable" : undefined);
+				await a.evaluate(() => api.close());
+				await a.waitForFunction(previous => window.retiredOwners > previous, retired);
+				assert.equal(await a.evaluate(() => window.ownerWorkers), workerCount);
+			}
 			await a.close();
 			await b.close();
 			for (let i = 0; i < 5; i++) {
@@ -184,7 +216,9 @@ try {
 					"observations",
 					"transaction rollback",
 					"remote session survives local close",
-					"five warm reopens",
+					"five durable reopens in new tabs",
+			"bounded runtime reuse across repository names",
+			"idle repository and storage lock release",
 					"owner loss restores session and observation",
 					"writes and live updates after recovery",
 					"child branch context survives recovery",

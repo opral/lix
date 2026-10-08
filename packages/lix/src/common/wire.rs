@@ -5,19 +5,35 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WireValue {
-    Null { value: () },
-    Bool { value: bool },
-    Int { value: i64 },
+    Null {
+        value: (),
+    },
+    Bool {
+        value: bool,
+    },
+    Int {
+        value: i64,
+    },
     Float {
         #[serde(deserialize_with = "deserialize_wire_float")]
         value: f64,
     },
-    Text { value: String },
-    Jsonb { value: Json },
+    Text {
+        value: String,
+    },
+    Jsonb {
+        value: Json,
+    },
     #[serde(rename = "row_ref")]
-    RowRef { value: String },
-    Timestamptz { value: String },
-    Blob { base64: String },
+    RowRef {
+        value: String,
+    },
+    Timestamptz {
+        value: String,
+    },
+    Blob {
+        base64: String,
+    },
 }
 
 /// Reads a JSON float through `Number` so serde_json's `arbitrary_precision`
@@ -99,8 +115,9 @@ impl WireValue {
             }
             Self::Text { value } => Ok(Value::Text(value)),
             Self::Jsonb { value } => Ok(Value::Jsonb(value)),
-            Self::RowRef { value } => crate::row_ref::decode_str(&value)
-                .map(|_| Value::RowRef(crate::RowRef(value))),
+            Self::RowRef { value } => {
+                crate::row_ref::decode_str(&value).map(|_| Value::RowRef(crate::RowRef(value)))
+            }
             Self::Timestamptz { value } => parse_timestamptz(&value).map(Value::Timestamptz),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD

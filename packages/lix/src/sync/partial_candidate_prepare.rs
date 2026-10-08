@@ -29,6 +29,71 @@ struct CandidateScanSource<'a> {
     base_done: bool,
     descending: bool,
 }
+impl CandidateScanSource<'_> {
+    async fn page(
+        &mut self,
+        limit_rows: usize,
+        budget: crate::storage_adapter::ReadBudget,
+    ) -> Result<crate::storage_adapter::StorageScanChunk, StorageError> {
+        let mut result = Vec::with_capacity(limit_rows.min(64));
+        let mut bytes = 0usize;
+        while result.len() < limit_rows {
+            if self.base_rows.is_empty() && !self.base_done {
+                let (rows, more) = if budget == crate::storage_adapter::ReadBudget::UNBOUNDED {
+                    self.base.next_page(64).await?
+                } else {
+                    self.base.next_page_bounded(64, budget).await?
+                }
+                .into_parts();
+                self.base_rows.extend(rows);
+                self.base_done = !more;
+            }
+            let (take_staged, shadowed) = match (self.base_rows.front(), self.staged.front()) {
+                (None, None) => break,
+                (Some(_), None) => (false, false),
+                (None, Some(_)) => (true, false),
+                (Some(base), Some(staged)) => {
+                    let order = base.key.0.cmp(&staged.key.0);
+                    (
+                        order.is_eq()
+                            || if self.descending {
+                                order.is_lt()
+                            } else {
+                                order.is_gt()
+                            },
+                        order.is_eq(),
+                    )
+                }
+            };
+            let row = if take_staged {
+                self.staged.front().unwrap()
+            } else {
+                self.base_rows.front().unwrap()
+            };
+            let len = match &row.value {
+                ProjectedValue::FullValue(value) => value.len(),
+                ProjectedValue::KeyOnly => 0,
+            };
+            if !result.is_empty() && bytes.saturating_add(len) > budget.max_result_bytes {
+                break;
+            }
+            bytes = budget.admit_value(len, bytes, result.is_empty())?;
+            if shadowed {
+                self.base_rows.pop_front();
+            }
+            result.push(if take_staged {
+                self.staged.pop_front().unwrap()
+            } else {
+                self.base_rows.pop_front().unwrap()
+            });
+            if bytes >= budget.max_result_bytes {
+                break;
+            }
+        }
+        let more = !self.base_done || !self.base_rows.is_empty() || !self.staged.is_empty();
+        Ok(crate::storage_adapter::StorageScanChunk::new(result, more))
+    }
+}
 impl crate::storage_adapter::StorageScanSource for CandidateScanSource<'_> {
     fn next_page(
         &mut self,
@@ -40,38 +105,23 @@ impl crate::storage_adapter::StorageScanSource for CandidateScanSource<'_> {
                 + '_,
         >,
     > {
-        Box::pin(async move {
-            let mut result = Vec::with_capacity(limit_rows.min(64));
-            while result.len() < limit_rows {
-                if self.base_rows.is_empty() && !self.base_done {
-                    let (rows, more) = self.base.next_page(64).await?.into_parts();
-                    self.base_rows.extend(rows);
-                    self.base_done = !more;
-                }
-                match (self.base_rows.front(), self.staged.front()) {
-                    (None, None) => break,
-                    (Some(_), None) => result.push(self.base_rows.pop_front().unwrap()),
-                    (None, Some(_)) => result.push(self.staged.pop_front().unwrap()),
-                    (Some(base), Some(staged)) => {
-                        let order = base.key.0.cmp(&staged.key.0);
-                        if order.is_eq() {
-                            self.base_rows.pop_front();
-                            result.push(self.staged.pop_front().unwrap());
-                        } else if (order.is_lt() && !self.descending)
-                            || (order.is_gt() && self.descending)
-                        {
-                            result.push(self.base_rows.pop_front().unwrap());
-                        } else {
-                            result.push(self.staged.pop_front().unwrap());
-                        }
-                    }
-                }
-            }
-            let more = !self.base_done || !self.base_rows.is_empty() || !self.staged.is_empty();
-            Ok(crate::storage_adapter::StorageScanChunk::new(result, more))
-        })
+        Box::pin(self.page(limit_rows, crate::storage_adapter::ReadBudget::UNBOUNDED))
+    }
+    fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: crate::storage_adapter::ReadBudget,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<crate::storage_adapter::StorageScanChunk, StorageError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.page(limit_rows, budget))
     }
 }
+
 fn in_candidate_range(key: &[u8], range: &KeyRange) -> bool {
     use std::ops::Bound;
     let lower = match &range.lower {
@@ -116,6 +166,108 @@ impl<R: StorageAdapterRead> StorageAdapterRead for CandidateRead<R> {
         }
         Ok(loaded)
     }
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage_adapter::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        let count = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>();
+        let mut staged_bytes = 0;
+        let mut missing = Vec::new();
+        for request in requests {
+            let mut keys = Vec::new();
+            for key in request.keys {
+                if let Some(bytes) = self.staged.staged_value(request.space, &key.0) {
+                    if request.opts.projection == CoreProjection::FullValue {
+                        staged_bytes = budget.admit_value(bytes.len(), staged_bytes, count == 1)?;
+                    }
+                } else {
+                    keys.push(key.clone());
+                }
+            }
+            missing.push(keys);
+        }
+        let base_requests = requests
+            .iter()
+            .zip(&missing)
+            .filter(|(_, keys)| !keys.is_empty())
+            .map(|(request, keys)| GetManyRequest {
+                space: request.space,
+                keys,
+                opts: request.opts.clone(),
+            })
+            .collect::<Vec<_>>();
+        let remaining = budget.max_result_bytes.saturating_sub(staged_bytes);
+        let base_budget = crate::storage_adapter::ReadBudget {
+            max_result_bytes: remaining,
+            max_single_value_bytes: if count == 1 {
+                budget.max_single_value_bytes
+            } else {
+                budget.max_single_value_bytes.min(remaining)
+            },
+        };
+        let loaded = if base_requests.is_empty() {
+            GetManyResult::new(Vec::new())
+        } else {
+            self.base
+                .get_many_bounded(&base_requests, base_budget)
+                .await?
+        };
+        let mut loaded = loaded.values.into_iter();
+        let mut values = Vec::with_capacity(count);
+        for request in requests {
+            for key in request.keys {
+                values.push(
+                    if let Some(bytes) = self.staged.staged_value(request.space, &key.0) {
+                        Some(match request.opts.projection {
+                            CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                            CoreProjection::FullValue => ProjectedValue::FullValue(bytes),
+                        })
+                    } else {
+                        loaded.next().ok_or_else(|| {
+                            StorageError::Corruption(
+                                "candidate bounded read cardinality mismatch".into(),
+                            )
+                        })?
+                    },
+                );
+            }
+        }
+        if loaded.next().is_some() {
+            return Err(StorageError::Corruption(
+                "candidate bounded read cardinality mismatch".into(),
+            ));
+        }
+        budget.validate_result(&values)?;
+        Ok(GetManyResult::new(values))
+    }
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage_adapter::ReadBudget,
+    ) -> Result<crate::storage_adapter::GetManyPrefixResult, StorageError> {
+        // Canonical payload pages use the pinned base. Candidate control puts
+        // are handled by exact reads; never silently drop a staged value.
+        if requests.iter().any(|request| {
+            request
+                .keys
+                .iter()
+                .any(|key| self.staged.staged_value(request.space, &key.0).is_some())
+        }) {
+            return Err(StorageError::Unsupported(
+                crate::storage_adapter::StorageCapability::BoundedReads,
+            ));
+        }
+        self.base
+            .get_many_bounded_prefix(requests, offset, max_slots, budget)
+            .await
+    }
+
     async fn begin_scan(
         &self,
         space: StorageSpace,

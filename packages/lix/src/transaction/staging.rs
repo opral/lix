@@ -3186,6 +3186,67 @@ impl TransactionWriteBuffer {
         ))
     }
 
+    /// Tests transaction-local file visibility without copying the staged
+    /// payloads. The identity lookup deliberately mirrors
+    /// `load_staged_file_bytes_many`, including auxiliary payload aliases.
+    pub(crate) fn has_staged_file_bytes_many(
+        &self,
+        hashes: &[BlobId],
+    ) -> Result<Vec<bool>, LixError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file_content_guard = self.file_content_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut requested = hashes
+            .iter()
+            .copied()
+            .map(|hash| (hash, false))
+            .collect::<BTreeMap<BlobId, bool>>();
+        let mut remaining = requested.len();
+        'writes: for write in file_content_guard.iter() {
+            let Some(data) = write.inline_data() else {
+                // Prepared CAS content is already durable. Preserve the
+                // fallback behavior of the byte-loading lookup.
+                continue;
+            };
+            let hash = write
+                .blob_hash()
+                .unwrap_or_else(|| BlobId::from_content(data));
+            if let Some(present) = requested.get_mut(&hash)
+                && !*present
+            {
+                *present = true;
+                remaining -= 1;
+                if remaining == 0 {
+                    break 'writes;
+                }
+            }
+            for payload in write.auxiliary_payloads() {
+                let hash = payload
+                    .hash()
+                    .unwrap_or_else(|| BlobId::from_content(payload.bytes()));
+                if let Some(present) = requested.get_mut(&hash)
+                    && !*present
+                {
+                    *present = true;
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break 'writes;
+                    }
+                }
+            }
+        }
+        Ok(hashes
+            .iter()
+            .map(|hash| requested.get(hash).copied().unwrap_or(false))
+            .collect())
+    }
+
     /// Stages one prepared write batch into this transaction.
     ///
     /// Frontends hand a `RawWriteBatch` to `Transaction`; normalization

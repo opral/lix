@@ -190,7 +190,7 @@ datafusion = { version = "55.1.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
-# Keep unlocked consumers on the allocator API used by musli 0.0.149.
+# Keep the exact core version compatible with musli 0.0.149 allocator traits.
 # musli-core 0.1.9 changed that API without a compatible musli release in this range.
 musli-core = { version = "=0.1.4", default-features = false }
 sha2 = "0.10"
@@ -249,10 +249,11 @@ wit-parser = "0.247"
 wit-bindgen-rust = "0.57"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+tempfile = "3"
 futures-timer = "3"
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 [target.'cfg(all(target_family = "wasm", not(all(target_os = "wasi", target_env = "p2"))))'.dependencies]

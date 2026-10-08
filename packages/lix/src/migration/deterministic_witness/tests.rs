@@ -144,6 +144,9 @@ async fn v78_backfill_preserves_native_rows_history_and_controls() {
     super::super::api::migrate_v86_marker(&adapter)
         .await
         .unwrap();
+    super::super::api::migrate_v87_marker(&adapter)
+        .await
+        .unwrap();
     let engine =
         crate::engine::Engine::new_with_adapter(adapter, crate::engine::EngineOptions::new())
             .await

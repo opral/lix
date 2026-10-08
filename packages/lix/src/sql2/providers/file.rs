@@ -12,8 +12,9 @@
 
 mod interest;
 pub(crate) use interest::{
-    prepare_native_file_content_inputs, prepare_native_file_content_interest,
-    prepare_native_file_metadata_interest,
+    exact_id_file_content_interest, lix_file_content_projection,
+    lix_file_content_scan_request, prepare_native_file_content_inputs,
+    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
 };
 pub(super) use interest::{retain_metadata, retain_selected_batch, retain_selected_entries};
 
@@ -37,7 +38,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use futures_util::{FutureExt, TryStreamExt, future::try_join_all};
+use futures_util::{FutureExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
@@ -45,8 +46,8 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
-    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    FilesystemPathKind, FilesystemPathSelection, read_path_index_rows,
+    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
+    FilesystemPathSelection, read_path_index_rows,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::MaterializedHotStateRow;
@@ -56,10 +57,9 @@ use crate::hot_state::{
     MaterializedHotStateBatchBuilder, MaterializedHotStateRowRef,
 };
 use crate::plugin::runtime::{
-    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
-    PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
-    plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PluginActorKey, PluginFileOwner, PluginRegistry,
+    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path, plugin_archive_delete_origin,
+    plugin_archive_file_id_matches, plugin_key_from_archive_path, plugin_storage_archive_file_id,
 };
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{
@@ -76,10 +76,7 @@ use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 use crate::transaction_types::{RawWriteBatch, TransactionJson};
-use crate::{
-    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
-    serialize_row_metadata,
-};
+use crate::{GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -733,27 +730,11 @@ async fn try_exact_file_content_with_bounded_path_validation(
         // An uninstalled plugin can leave a durable owner behind. The
         // pathful renderer reports that state as unavailable, so it must
         // handle any owner even when the current registry is empty.
-        let owners = hot_state
-            .load_exact_batch(&HotStateExactBatchRequest {
-                rows: vec![HotStateExactRowRequest {
-                    schema_key: "lix_key_value".to_owned(),
-                    branch_id: descriptor.key.branch_id().to_owned(),
-                    row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                    file_id: Some(file_id.to_owned()),
-                }],
-                projection: plugin_control_hot_state_projection(),
-                untracked: Some(false),
-                include_tombstones: false,
-            })
-            .await?;
-        if owners.row(0).is_some_and(|owner| {
-            owner.schema_key() == "lix_key_value"
-                && owner.row_pk().as_single_string().ok() == Some(PLUGIN_OWNER_KEY)
-                && owner.branch_id() == descriptor.key.branch_id()
-                && owner.file_id() == Some(file_id)
-                && !owner.global()
-                && !owner.untracked()
-        }) {
+        let owner_targets = vec![(descriptor.key.branch_id().to_owned(), file_id.to_owned())];
+        if !crate::plugin::runtime::load_plugin_owner_pages(hot_state.as_ref(), &owner_targets)
+            .await?
+            .is_empty()
+        {
             return Ok(None);
         }
     }
@@ -763,7 +744,10 @@ async fn try_exact_file_content_with_bounded_path_validation(
     if data.len() != 1 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("blob reader returned {} values for 1 requested hashes", data.len()),
+            format!(
+                "blob reader returned {} values for 1 requested hashes",
+                data.len()
+            ),
         ));
     }
     let data = data.pop().flatten().unwrap_or_default();
@@ -870,8 +854,7 @@ pub(crate) async fn execute_exact_lix_file_read(
     }
     if column == ExactLixFileReadColumn::Content
         && let ExactLixFileReadSelector::Id(file_id) = selector
-        && filesystem_path_index
-            .prefer_direct_exact_content(&request.filter.branch_ids, file_id)
+        && filesystem_path_index.prefer_direct_exact_content(&request.filter.branch_ids, file_id)
         && let Some(result) = try_exact_file_content_with_bounded_path_validation(
             &hot_state,
             &blob_reader,
@@ -883,8 +866,7 @@ pub(crate) async fn execute_exact_lix_file_read(
         )
         .await?
     {
-        filesystem_path_index
-            .record_direct_exact_content(&request.filter.branch_ids, file_id);
+        filesystem_path_index.record_direct_exact_content(&request.filter.branch_ids, file_id);
         return Ok(result);
     }
     let index = filesystem_path_index
@@ -1436,6 +1418,36 @@ impl TableSpec for LixFileSpec {
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
+        // The operation-level AST recognizer has already proved this is a
+        // simple exact-ID content read (one table, one equality, no joins or
+        // extra predicates). Mirror its shared recipe before the first path
+        // index I/O. Other provider scans retain their existing post-selection
+        // declaration, since a provider cannot see enclosing SQL joins or
+        // offsets on its own.
+        let mut predeclared_file_content = false;
+        if needs_data && filters.len() == 1
+            && let Some(file_id) = exact_file_id_equality_filter(&filters)
+            && let FileIdConstraint::Ids(ids) = &target_file_ids
+            && ids.len() == 1
+            && ids.contains(&file_id)
+            && use_path_index
+            && let Some(registry) = self.hot_state.read_interest_registry()
+        {
+            let interest = exact_id_file_content_interest(&request, &file_id);
+            let snapshot = registry
+                .snapshot()
+                .map_err(lix_error_to_datafusion_error)?;
+            if snapshot
+                .interests
+                .iter()
+                .any(|candidate| candidate.as_ref() == &interest)
+            {
+                registry
+                    .register(interest)
+                    .map_err(lix_error_to_datafusion_error)?;
+                predeclared_file_content = true;
+            }
+        }
         // An exact-ID projection limited to id/path needs only those rows and
         // their ancestry. Reuse the scoped path validator, but avoid creating
         // the persistent lookup maps needed by general path selection. Keep
@@ -1448,10 +1460,10 @@ impl TableSpec for LixFileSpec {
             needs_blob_rows,
             needs_file_timestamps,
         ) && matches!(&target_file_ids, FileIdConstraint::Ids(ids)
-            if ids.len() == 1 && self.filesystem_path_index.prefer_direct_exact_path(
-                &request.filter.branch_ids,
-                ids.iter().next().expect("one exact file ID"),
-            )) {
+        if ids.len() == 1 && self.filesystem_path_index.prefer_direct_exact_path(
+            &request.filter.branch_ids,
+            ids.iter().next().expect("one exact file ID"),
+        )) {
             let FileIdConstraint::Ids(file_ids) = &target_file_ids else {
                 unreachable!("bounded ID path projection requires exact file IDs")
             };
@@ -1551,7 +1563,7 @@ impl TableSpec for LixFileSpec {
                 Some(matches)
             }
         };
-        if needs_data {
+        if needs_data && !predeclared_file_content {
             interest::retain_content(
                 self.hot_state.as_ref(),
                 &request,
@@ -5424,8 +5436,13 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_metadata" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| entry.metadata())
-                    .collect::<Vec<_>>(),
+                    .map(|entry| {
+                        entry
+                            .metadata()
+                            .map(file_jsonb_sql_equality_key)
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?,
             )),
             other => {
                 return Err(LixError::new(
@@ -5670,7 +5687,10 @@ async fn lix_file_record_batch_from_prepared(
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
             untracked: live.untracked(),
-            metadata: live.metadata().map(|value| serialize_row_metadata(value)),
+            metadata: live
+                .metadata()
+                .map(|value| file_jsonb_sql_equality_key(value.as_str()))
+                .transpose()?,
         });
     }
 
@@ -6143,10 +6163,25 @@ async fn plugin_render_context_for_lix_file_scan_cached(
     include_blob_backed_candidates: bool,
     cache_snapshot: Option<u128>,
 ) -> Result<Option<PluginRenderContext>, LixError> {
-    let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
-    if candidates.is_empty() {
+    let candidate_count = prepared
+        .file_rows
+        .values()
+        .filter(|file| {
+            plugin_file_can_have_durable_owner(file)
+                && (include_blob_backed_candidates
+                    || !prepared
+                        .blob_rows
+                        .contains_key(&file.blob_ref_key(&prepared.live_rows)))
+        })
+        .take(crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS + 1)
+        .count();
+    if candidate_count == 0 {
         return Ok(None);
     }
+    if candidate_count > crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+        return Err(crate::plugin::runtime::executable_dependency_work_bound());
+    }
+    let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
     let branches =
         load_plugin_render_branches(Arc::clone(&hot_state), request, &host, cache_snapshot).await?;
     plugin_render_context_with_branches(
@@ -6165,6 +6200,9 @@ async fn load_plugin_render_branches(
     host: &PluginRuntimeHost,
     cache_snapshot: Option<u128>,
 ) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError> {
+    if request.filter.branch_ids.len() > crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+        return Err(crate::plugin::runtime::executable_dependency_work_bound());
+    }
     let branch_ids = request
         .filter
         .branch_ids
@@ -6186,38 +6224,12 @@ async fn load_plugin_render_branches(
             // access path as dependency discovery, including the absent-row
             // case; a collection scan can require catalogs that the exact
             // lookup does not visit and restart a cold replica's waterfall.
-            let rows = hot_state
-                .load_exact_batch(&HotStateExactBatchRequest {
-                    rows: branch_ids
-                        .iter()
-                        .map(|branch_id| HotStateExactRowRequest {
-                            schema_key: "lix_key_value".to_owned(),
-                            branch_id: branch_id.clone(),
-                            row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
-                            file_id: None,
-                        })
-                        .collect(),
-                    projection: plugin_control_hot_state_projection(),
-                    untracked: Some(false),
-                    include_tombstones: false,
-                })
-                .await?;
-            let registries = branch_ids
-                .iter()
-                .enumerate()
-                .map(|(index, branch_id)| {
-                    let row = rows.row(index).filter(|row| {
-                        row.schema_key() == "lix_key_value"
-                            && row.row_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
-                            && row.file_id().is_none()
-                            && row.branch_id() == branch_id.as_str()
-                            && !row.global()
-                            && !row.untracked()
-                    });
-                    PluginRegistry::from_optional_hot_state_row(row, branch_id)
-                        .map(|registry| (branch_id.clone(), registry))
-                })
-                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+            let registry_branches = branch_ids.iter().cloned().collect::<Vec<_>>();
+            let registries = crate::plugin::runtime::load_plugin_registry_pages(
+                hot_state.as_ref(),
+                &registry_branches,
+            )
+            .await?;
             if let Some(snapshot) = cache_snapshot {
                 host.cache_plugin_registries(snapshot, &registries)?;
             }
@@ -6267,85 +6279,43 @@ async fn plugin_render_context_with_branches(
         }
     }
 
-    let owner_reads = candidate_keys_by_branch
+    let owner_targets = candidate_keys_by_branch
         .iter()
-        .map(|(branch_id, candidate_keys)| {
-            let hot_state = Arc::clone(&hot_state);
-            let branch_id = branch_id.clone();
-            let file_ids = candidate_keys.keys().cloned().collect::<BTreeSet<_>>();
-            async move {
-                let rows = hot_state
-                    .load_exact_batch(&HotStateExactBatchRequest {
-                        rows: file_ids
-                            .iter()
-                            .map(|file_id| HotStateExactRowRequest {
-                                schema_key: "lix_key_value".to_owned(),
-                                branch_id: branch_id.clone(),
-                                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
-                                file_id: Some(file_id.clone()),
-                            })
-                            .collect(),
-                        projection: plugin_control_hot_state_projection(),
-                        untracked: Some(false),
-                        include_tombstones: false,
-                    })
-                    .await?;
-                Ok::<_, LixError>((branch_id, file_ids, rows))
-            }
-        });
+        .flat_map(|(branch_id, candidate_keys)| {
+            candidate_keys
+                .keys()
+                .map(move |file_id| (branch_id.clone(), file_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let owner_rows: BTreeMap<(String, String), crate::plugin::runtime::PluginOwnerLookupRow> =
+        crate::plugin::runtime::load_plugin_owner_pages(hot_state.as_ref(), &owner_targets).await?;
     let mut owners_by_file = BTreeMap::new();
     let mut owner_change_ids_by_file = BTreeMap::new();
-    let owner_rows = try_join_all(owner_reads).await?;
-    for (branch_id, file_ids, rows) in owner_rows {
-        for row in (0..rows.len()).filter_map(|index| rows.row(index)) {
-            let Some(file_id) = row.file_id() else {
-                continue;
-            };
-            if row.schema_key() != "lix_key_value"
-                || row.row_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
-                || row.branch_id() != branch_id.as_str()
-                || row.global()
-                || row.untracked()
-                || !file_ids.contains(file_id)
-            {
-                continue;
-            }
-            let owned_row = row.to_owned();
-            // KNOWN LANE GAP: this render context resolves owners through
-            // tracked-only exact requests, so untracked
-            // plugin-owned files are not rendered from rows here. They do
-            // not need to be - an untracked file's bytes round-trip through its
-            // stored content blob, which is asserted by the lane-parity tests.
-            // Extending this to both lanes means changing the reader and
-            // belongs with the read-path work, not the unskip.
-            let Some(owner) = PluginFileOwner::from_hot_state_row(&owned_row, &branch_id, false)?
-            else {
-                continue;
-            };
-            let candidate_key = candidate_keys_by_branch
-                .get(&branch_id)
-                .and_then(|candidate_keys| candidate_keys.get(file_id))
-                .expect("owner row was filtered to candidate file ids")
-                .clone();
-            let owner_change_id = row.change_id().ok_or_else(|| {
-                invalid_plugin_read_state(format!(
-                    "branch '{branch_id}' plugin owner for file id '{file_id}' is missing change_id"
-                ))
-            })?;
-            // Keep a well-formed stale owner even when its plugin is currently
-            // absent. Rendering checks the current registry, while path moves
-            // still need the old key to force reconciliation; reinstall can
-            // then resume from the durable owner.
-            if owners_by_file
-                .insert(candidate_key.clone(), owner)
-                .is_some()
-            {
-                return Err(invalid_plugin_read_state(format!(
-                    "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
-                )));
-            }
-            owner_change_ids_by_file.insert(candidate_key, owner_change_id.to_string());
+    for ((branch_id, file_id), loaded) in owner_rows {
+        let owner = loaded.owner;
+        let candidate_key = candidate_keys_by_branch
+            .get(&branch_id)
+            .and_then(|candidate_keys| candidate_keys.get(&file_id))
+            .expect("owner row was aligned to a requested candidate file")
+            .clone();
+        let owner_change_id = loaded.change_id.ok_or_else(|| {
+            invalid_plugin_read_state(format!(
+                "branch '{branch_id}' plugin owner for file id '{file_id}' is missing change_id"
+            ))
+        })?;
+        // Keep a well-formed stale owner even when its plugin is currently
+        // absent. Rendering checks the current registry, while path moves
+        // still need the old key to force reconciliation; reinstall can
+        // then resume from the durable owner.
+        if owners_by_file
+            .insert(candidate_key.clone(), owner)
+            .is_some()
+        {
+            return Err(invalid_plugin_read_state(format!(
+                "branch '{branch_id}' returned duplicate plugin owners for file id '{file_id}'"
+            )));
         }
+        owner_change_ids_by_file.insert(candidate_key, owner_change_id);
     }
 
     if owners_by_file.is_empty() && !keep_catalog_without_owners {
@@ -6388,12 +6358,6 @@ fn plugin_unavailable_error(
         "path": path,
         "plugin_key": owner.plugin_key(),
     }))
-}
-
-fn plugin_control_hot_state_projection() -> HotStateProjection {
-    HotStateProjection {
-        columns: vec!["snapshot_content".to_string()],
-    }
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -6548,15 +6512,10 @@ fn lix_file_hot_state_projection(projected_schema: Option<&Schema>) -> HotStateP
     let Some(schema) = projected_schema else {
         return HotStateProjection::default();
     };
-    let mut columns = vec!["snapshot_content".to_string()];
-    if schema
+    lix_file_content_projection(schema
         .fields()
         .iter()
-        .any(|field| field.name() == "lixcol_metadata")
-    {
-        columns.push("metadata".to_string());
-    }
-    HotStateProjection { columns }
+        .any(|field| field.name() == "lixcol_metadata"))
 }
 
 async fn scan_lix_file_live_batch(
@@ -6758,6 +6717,23 @@ impl FileIdConstraint {
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
     exact_string_column_constraint_from_filters(filters, "id")
+}
+
+fn exact_file_id_equality_filter(filters: &[Expr]) -> Option<String> {
+    let [Expr::BinaryExpr(expression)] = filters else {
+        return None;
+    };
+    if expression.op != Operator::Eq {
+        return None;
+    }
+    string_column_literal_filter(expression.left.as_ref(), expression.right.as_ref(), "id")
+        .or_else(|| {
+            string_column_literal_filter(
+                expression.right.as_ref(),
+                expression.left.as_ref(),
+                "id",
+            )
+        })
 }
 
 fn exact_plugin_archive_delete_target_from_filters(filters: &[Expr]) -> Result<Option<String>> {
@@ -7562,6 +7538,15 @@ pub(super) fn lix_file_schema() -> SchemaRef {
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
+}
+
+fn file_jsonb_sql_equality_key(value: &str) -> Result<String, LixError> {
+    crate::common::metadata_sql_equality_key(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("invalid lix_file metadata JSONB equality key: {error}"),
+        )
+    })
 }
 
 fn file_id_row_pk(file_id: &str) -> Result<RowPk, LixError> {
@@ -9742,21 +9727,42 @@ mod tests {
         let parent = crate::hot_state::ReadInterestRegistry::new(64, 64 * 1024);
         for _ in 0..2 {
             let capture = crate::hot_state::ReadInterestRegistry::capture(parent.clone());
+            let statement = crate::sql2::parse_statement(
+                "SELECT content, lixcol_metadata FROM lix_file WHERE id = $1",
+            )
+            .expect("point query should parse");
+            crate::session::seed_foreground_filesystem_interest(
+                Some(&capture),
+                branch,
+                &statement,
+                &[Value::Text(target.to_string())],
+            )
+            .expect("point query should seed before provider planning");
+            let expected_interest = super::exact_id_file_content_interest(
+                &super::lix_file_content_scan_request(&[branch.to_string()], true),
+                target,
+            );
+            let path_index_requests = Arc::new(AtomicUsize::new(0));
             let spec = LixFileSpec::active_branch(
                 branch,
                 Arc::new(CapturingIndexedHotReader {
                     registry: capture.clone(),
                 }),
-                Arc::new(StaticFilesystemPathIndexReader {
+                Arc::new(PreseedCheckingFilesystemPathIndexReader {
                     index: index.clone(),
-                    request_count: Arc::new(AtomicUsize::new(0)),
+                    registry: capture.clone(),
+                    expected: expected_interest.clone(),
+                    request_count: path_index_requests.clone(),
                 }),
                 Arc::new(TestBranchRefReader),
                 Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])),
                 PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
                 test_functions(),
             );
-            let projection = vec![spec.schema().index_of("content").unwrap()];
+            let projection = vec![
+                spec.schema().index_of("content").unwrap(),
+                spec.schema().index_of("lixcol_metadata").unwrap(),
+            ];
             let planned = spec
                 .plan_scan(
                     Some(&projection),
@@ -9768,7 +9774,24 @@ mod tests {
                 .unwrap();
             let batch = planned.source.load_single_batch().await.unwrap();
             assert_eq!(batch.num_rows(), 1);
+            assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
             let captured = capture.snapshot().unwrap();
+            let content_interests = captured
+                .interests
+                .iter()
+                .filter(|interest| {
+                    matches!(
+                        interest.as_ref(),
+                        crate::hot_state::LogicalReadInterest::FileContent { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                content_interests.len(),
+                1,
+                "the provider declaration should deduplicate with its preflight seed"
+            );
+            assert_eq!(content_interests[0].as_ref(), &expected_interest);
             let rows = captured
                 .interests
                 .iter()
@@ -9822,6 +9845,18 @@ mod tests {
             };
             let ordinal = builder.len();
             builder.push_owned(row);
+            let raw = typed
+                .as_deref()
+                .map(|typed| {
+                    typed
+                        .durable_payload()
+                        .map(|payload| bytes::Bytes::copy_from_slice(payload.as_ref()))
+                        .map_err(|error| {
+                            LixError::unknown(format!("invalid test typed payload: {error:?}"))
+                        })
+                })
+                .transpose()?;
+            builder.set_raw_snapshot(ordinal, raw);
             builder.set_decoded_snapshot(ordinal, typed);
         }
         Ok(builder.finish())
@@ -9992,6 +10027,35 @@ mod tests {
     struct StaticFilesystemPathIndexReader {
         index: Arc<FilesystemPathIndex>,
         request_count: Arc<AtomicUsize>,
+    }
+
+    struct PreseedCheckingFilesystemPathIndexReader {
+        index: Arc<FilesystemPathIndex>,
+        registry: Arc<crate::hot_state::ReadInterestRegistry>,
+        expected: crate::hot_state::LogicalReadInterest,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FilesystemPathIndexReader for PreseedCheckingFilesystemPathIndexReader {
+        async fn path_index(
+            &self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            let snapshot = self
+                .registry
+                .snapshot()
+                .expect("operation seed should be captured before path-index I/O");
+            assert!(
+                snapshot
+                    .interests
+                    .iter()
+                    .any(|interest| interest.as_ref() == &self.expected),
+                "exact-ID content recipe must be present before path-index I/O"
+            );
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.index))
+        }
     }
 
     #[async_trait]
@@ -11185,14 +11249,27 @@ mod tests {
                 .unwrap()
                 .clone(),
         ]));
-        let blob_reader = Arc::new(StaticBlobReader::from_blobs([bytes])) as Arc<dyn BlobDataReader>;
+        let blob_reader =
+            Arc::new(StaticBlobReader::from_blobs([bytes])) as Arc<dyn BlobDataReader>;
         let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
-        let ordinary = Arc::new(ExactContentHotStateReader { rows: rows.clone() })
-            as Arc<dyn HotStateReader>;
+        let ordinary =
+            Arc::new(ExactContentHotStateReader { rows: rows.clone() }) as Arc<dyn HotStateReader>;
         let direct = super::try_exact_file_content_with_bounded_path_validation(
-            &ordinary, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().expect("ordinary content takes direct route");
-        assert_eq!(direct.rows, vec![vec![Value::Blob(b"ordinary file bytes".to_vec().into())]]);
+            &ordinary,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("ordinary content takes direct route");
+        assert_eq!(
+            direct.rows,
+            vec![vec![Value::Blob(b"ordinary file bytes".to_vec().into())]]
+        );
 
         let mut owned_rows = rows;
         owned_rows.push(live_plugin_owner_row(
@@ -11201,21 +11278,51 @@ mod tests {
             "uninstalled_plugin",
             vec!["plugin_note".to_owned()],
         ));
-        let stale_owner = Arc::new(ExactContentHotStateReader { rows: owned_rows })
-            as Arc<dyn HotStateReader>;
-        assert!(super::try_exact_file_content_with_bounded_path_validation(
-            &stale_owner, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().is_none(), "stale owner must reach pathful unavailable error");
+        let stale_owner =
+            Arc::new(ExactContentHotStateReader { rows: owned_rows }) as Arc<dyn HotStateReader>;
+        assert!(
+            super::try_exact_file_content_with_bounded_path_validation(
+                &stale_owner,
+                &blob_reader,
+                &host,
+                &request,
+                &schema,
+                id,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale owner must reach pathful unavailable error"
+        );
         let raw = super::try_exact_file_content_with_bounded_path_validation(
-            &stale_owner, &blob_reader, &host, &request, &schema, id, false,
-        ).await.unwrap().expect("without a view collector the blob-backed route returns raw content");
+            &stale_owner,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("without a view collector the blob-backed route returns raw content");
         assert_eq!(raw.rows, direct.rows);
 
-        let missing = Arc::new(ExactContentHotStateReader { rows: Vec::new() })
-            as Arc<dyn HotStateReader>;
+        let missing =
+            Arc::new(ExactContentHotStateReader { rows: Vec::new() }) as Arc<dyn HotStateReader>;
         let empty = super::try_exact_file_content_with_bounded_path_validation(
-            &missing, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().expect("an authoritative exact-ID miss has no fallback work");
+            &missing,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("an authoritative exact-ID miss has no fallback work");
         assert!(empty.rows.is_empty());
 
         let other_branch = "01920000-0000-7000-8000-0000000000b2";
@@ -11236,10 +11343,25 @@ mod tests {
             ],
         }) as Arc<dyn HotStateReader>;
         let mut both_branches = request.clone();
-        both_branches.filter.branch_ids.push(other_branch.to_owned());
-        assert!(super::try_exact_file_content_with_bounded_path_validation(
-            &ambiguous, &blob_reader, &host, &both_branches, &schema, id, true,
-        ).await.unwrap().is_none(), "ambiguous file lanes retain indexed winner selection");
+        both_branches
+            .filter
+            .branch_ids
+            .push(other_branch.to_owned());
+        assert!(
+            super::try_exact_file_content_with_bounded_path_validation(
+                &ambiguous,
+                &blob_reader,
+                &host,
+                &both_branches,
+                &schema,
+                id,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "ambiguous file lanes retain indexed winner selection"
+        );
 
         let missing_directory = "01920000-0000-7000-8000-000000000999";
         let broken = Arc::new(ExactContentHotStateReader {
@@ -11247,14 +11369,24 @@ mod tests {
                 live_file_row(
                     id,
                     branch,
-                    &format!(r#"{{"id":"{id}","directory_id":"{missing_directory}","name":"note.txt"}}"#),
+                    &format!(
+                        r#"{{"id":"{id}","directory_id":"{missing_directory}","name":"note.txt"}}"#
+                    ),
                 ),
                 live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
             ],
         }) as Arc<dyn HotStateReader>;
         let error = super::try_exact_file_content_with_bounded_path_validation(
-            &broken, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap_err();
+            &broken,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 

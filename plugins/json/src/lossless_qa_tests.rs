@@ -26,6 +26,9 @@ fn lossless_qa_adversarial_lexemes_and_layout() {
         "1E+03",
         "-123456789012345678901234567890",
         "1e-9999",
+        "1e9999",
+        "-1e9999",
+        "1.23456789012345678901234567890123456789",
         r#""\u0061\/\b\f\n\r\t\\\"""#,
         r#""\ud83d\ude00""#,
         "\"é中😀\"",
@@ -117,8 +120,8 @@ fn lossless_qa_generated_nested_documents_and_replacements() {
 }
 
 #[test]
-fn lossless_qa_unrepresentable_numbers_fail_row_export() {
-    for source in ["1e9999", "-1e9999"] {
+fn lossless_qa_numbers_outside_jsonb_limits_fail_row_export() {
+    for source in ["1e131072", "-1e131072", "1e-16384"] {
         let (document, _) =
             Document::open_fresh_file(source.as_bytes().to_vec(), None, IdNamespace([7; 16]))
                 .unwrap();
@@ -235,6 +238,9 @@ fn lossless_qa_native_warm_and_cold_numeric_lexical_edits() {
         let mut old_number = "1.00";
         for number in [
             "1e-9999",
+            "1e9999",
+            "-1e9999",
+            "1.23456789012345678901234567890123456789",
             "18446744073709551616",
             "0.123456789012345678901234567890",
             "-0",
@@ -329,7 +335,7 @@ fn lossless_qa_duplicate_occurrence_gap_survives_cached_reopen() {
 fn lossless_qa_unicode_and_host_scalar_boundaries() {
     use super::{JsonPlugin, sdk};
     use sdk::testing::{Harness, Snapshot};
-    for source in [r#""\ud800""#, r#""\udfff""#, r#""\u0000""#, "1e9999"] {
+    for source in [r#""\ud800""#, r#""\udfff""#, r#""\u0000""#, "1e131072"] {
         let result = Harness::<JsonPlugin>::default().parse(
             &Snapshot {
                 file_id: "boundary".into(),

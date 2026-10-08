@@ -9,7 +9,7 @@ use datafusion::logical_expr::{
 
 use crate::sql2::result_metadata::json_field;
 
-use super::common::{canonical_jsonb_text, scalar_inputs, text_like_value};
+use super::common::{canonical_jsonb_equality_key, scalar_inputs, text_like_value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LixJsonb(Signature);
@@ -21,7 +21,7 @@ impl LixJsonb {
 }
 
 impl ScalarUDFImpl for LixJsonb {
-        fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         "__lix_jsonb"
     }
     fn signature(&self) -> &Signature {
@@ -44,7 +44,7 @@ impl ScalarUDFImpl for LixJsonb {
         for row in 0..arrays[0].len() {
             output.push(match text_like_value(arrays[0].as_ref(), row)? {
                 None => None,
-                Some(raw) => Some(canonical_jsonb_text(&raw).map_err(|error| {
+                Some(raw) => Some(canonical_jsonb_equality_key(&raw).map_err(|error| {
                     DataFusionError::Execution(format!("invalid JSONB value: {error}"))
                 })?),
             });

@@ -12,6 +12,23 @@ use crate::{Lix, LixError, Memory, open_lix};
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use futures_util::FutureExt as _;
+
+#[derive(Default)]
+struct FirstDemandBarrier {
+    claimed: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl FirstDemandBarrier {
+    async fn hold_once(&self) {
+        if !self.claimed.swap(true, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ExpiringClient {
@@ -20,12 +37,21 @@ struct ExpiringClient {
     expire: Arc<AtomicBool>,
     lose_session: Arc<AtomicBool>,
     fetches: Arc<AtomicUsize>,
+    object_fetches: Arc<AtomicUsize>,
     fresh_descriptors: Arc<AtomicUsize>,
     live_updates: Option<Arc<AtomicBool>>,
+    first_demand_barrier: Option<Arc<FirstDemandBarrier>>,
 }
 impl RawHttpClient for ExpiringClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
+            if request.url.contains("/sync/native-")
+                || request.url.ends_with("/sync/read-fulfillment")
+            {
+                if let Some(barrier) = &self.first_demand_barrier {
+                    barrier.hold_once().await;
+                }
+            }
             if self.lose_session.swap(false, Ordering::SeqCst) {
                 let session = request
                     .headers
@@ -70,6 +96,11 @@ impl RawHttpClient for ExpiringClient {
                 || request.url.ends_with("/sync/read-fulfillment")
             {
                 self.fetches.fetch_add(1, Ordering::SeqCst);
+                if request.url.ends_with("/sync/native-objects")
+                    || request.url.ends_with("/sync/native-object-range")
+                {
+                    self.object_fetches.fetch_add(1, Ordering::SeqCst);
+                }
                 if self.expire.load(Ordering::SeqCst)
                     && request.headers.iter().any(|(k, v)| {
                         k == "lix-native-baseline-lease" && v == &*self.lease.lock().unwrap()
@@ -180,7 +211,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         authority.execute("INSERT INTO lix_key_value(key,value) VALUES('edit','before')", &[]).await.unwrap();
         authority.upsert_file_content("/cold.bin", if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else { b"cold contents".to_vec() }).await.unwrap();
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
-        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), fresh_descriptors: Arc::default(), live_updates: None };
+        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), object_fetches: Arc::default(), fresh_descriptors: Arc::default(), live_updates: None, first_demand_barrier: None };
         let transport = HttpSyncTransport::connect_with(client.clone(), &format!("https://example.test/lix/{}", authority.lix_id())).await.unwrap();
         let wrapper = transport.partial_replica_descriptor(None).await.unwrap();
         let old = Arc::new(PartialReplicaState::from_leased(
@@ -299,6 +330,225 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         let (result, ()) = futures_util::join!(Box::pin(worker), Box::pin(caller));
         result.unwrap();
     })).await.expect("transparent recovery completes");
+}
+
+#[tokio::test]
+async fn partial_observe_waits_for_demand_then_ignores_same_epoch_availability() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let backing = Memory::new();
+        let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+        authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value(key,value) VALUES('observe-target','before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority
+            .upsert_file_content("/observe-unrelated.txt", b"unrelated".to_vec())
+            .await
+            .unwrap();
+        let server = open_lix()
+            .with_storage(backing)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let barrier = Arc::new(FirstDemandBarrier::default());
+        let client = ExpiringClient {
+            server,
+            lease: Arc::default(),
+            expire: Arc::default(),
+            lose_session: Arc::default(),
+            fetches: Arc::default(),
+            object_fetches: Arc::default(),
+            fresh_descriptors: Arc::default(),
+            live_updates: None,
+            first_demand_barrier: Some(barrier.clone()),
+        };
+        let transport = HttpSyncTransport::connect_with(
+            client.clone(),
+            &format!("https://example.test/lix/{}", authority.lix_id()),
+        )
+        .await
+        .unwrap();
+        let descriptor = transport.partial_replica_descriptor(None).await.unwrap();
+        let state = Arc::new(
+            PartialReplicaState::from_leased(
+                transport.protocol_url().into(),
+                authority.active_account_id().into(),
+                uuid::Uuid::now_v7().to_string(),
+                descriptor.wire,
+            )
+            .unwrap(),
+        );
+        *client.lease.lock().unwrap() = state.baseline_lease().lease_id.clone();
+
+        let storage = StorageAdapter::new(Memory::new()).with_session().await.unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let preconditions = crate::sync::partial_bootstrap::stage_partial_bootstrap(
+            &read,
+            &mut writes,
+            &state,
+        )
+        .unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (engine, session) = Engine::new_partial_replica(
+            storage.clone(),
+            EngineOptions::new(),
+            &state,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(engine);
+        engine
+            .sync_mode()
+            .admit_partial_replica(state.clone(), crate::sync::partial_replica_write_capability());
+        storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
+        let object_transport = transport.clone();
+        let (shutdown, shutdown_rx) =
+            tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let lix = Lix::from_partial_engine_for_test(engine.clone(), session.clone(), sender.clone());
+        let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            state.clone(),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine.clone()),
+        );
+
+        let caller = async {
+            let sql = "SELECT value FROM lix_key_value WHERE key='observe-target'";
+            let authority_before = authority_sql(&client.server, authority.lix_id(), None, sql).await;
+            let mut events = session
+                .observe(sql, &[])
+                .unwrap()
+                .with_sync_demand_sender(Some(sender.clone()));
+            let mut initial = Box::pin(events.next());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                async {
+                    tokio::select! {
+                        result = initial.as_mut() => panic!("observe returned before the held dependency response: {result:?}"),
+                        _ = barrier.entered.notified() => {}
+                    }
+                },
+            )
+            .await
+            .expect("observe should issue a foreground dependency demand");
+            assert!(
+                initial.as_mut().now_or_never().is_none(),
+                "ObserveEvents must not return a successful partial query result while its first dependency response is held"
+            );
+            barrier.release.notify_one();
+            let first = initial.await.unwrap().expect("first complete result is delivered");
+            assert_eq!(first.sequence, 0);
+            assert_eq!(first.rows, authority_before, "initial event equals authority SQL rows");
+
+            let unrelated_sql = "SELECT path FROM lix_file WHERE path='/observe-unrelated.txt'";
+            let authority_unrelated =
+                authority_sql(&client.server, authority.lix_id(), None, unrelated_sql).await;
+            let objects_before = client.object_fetches.load(Ordering::SeqCst);
+            let mut retry = crate::sync::SyncDemandRetry::default();
+            let mut unrelated = None;
+            let mut hydrated_unrelated_object = false;
+            for _ in 0..64 {
+                match session.execute(unrelated_sql, &[]).await {
+                    Ok(rows) => {
+                        unrelated = Some(rows);
+                        break;
+                    }
+                    Err(error) => {
+                        if let Some(address) =
+                            crate::tracked_state::NativeObjectRef::from_missing_error(&error)
+                                .unwrap()
+                        {
+                            // Prior missing metadata/blob/read-fulfillment work may
+                            // legitimately publish logical state. This proof covers
+                            // only the exact immutable native-object installation.
+                            let observable_before = storage.load_observable_revision().await.unwrap();
+                            crate::sync::partial_hydration::hydrate_native_object(
+                                &storage,
+                                &state,
+                                address,
+                                64 * 1024 * 1024,
+                                |range| {
+                                    let transport = object_transport.clone();
+                                    async move { transport.native_object_range(&range).await }
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(storage.load_observable_revision().await.unwrap(), observable_before,
+                                "a validated same-epoch native object install preserves observer visibility");
+                            hydrated_unrelated_object = true;
+                        } else {
+                            retry
+                                .hydrate_for_retry(Some(&sender), error)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+            let unrelated = unrelated.expect("unrelated cold query resolves through native hydration");
+            assert_eq!(unrelated, authority_unrelated);
+            assert!(
+                hydrated_unrelated_object,
+                "the unrelated query must install a second native object"
+            );
+            assert!(
+                client.object_fetches.load(Ordering::SeqCst) > objects_before,
+                "the typed native-object range endpoint must serve the unrelated object"
+            );
+            assert_eq!(
+                engine.sync_mode().partial_admission().unwrap().epoch_id(),
+                state.epoch_id(),
+                "same-epoch availability must not publish a new logical epoch"
+            );
+            let mut after_availability = Box::pin(events.next());
+            assert!(
+                after_availability.as_mut().now_or_never().is_none(),
+                "same-epoch dependency availability must not emit an observer event"
+            );
+            let update = "UPDATE lix_key_value SET value='after' WHERE key='observe-target'";
+            lix.execute(update, &[]).await.unwrap();
+            authority_sql(&client.server, authority.lix_id(), None, update).await;
+            let authority_after = authority_sql(&client.server, authority.lix_id(), None, sql).await;
+            let visible = after_availability
+                .await
+                .expect("visible SQL publication wakes the established observer")
+                .expect("observer remains open");
+            assert_eq!(visible.sequence, first.sequence + 1, "private hydration did not consume an event sequence");
+            assert_eq!(visible.rows, authority_after, "visible event equals authority SQL rows");
+            shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+        };
+        let (result, ()) = futures_util::join!(worker, caller);
+        result.unwrap();
+    })
+    .await
+    .expect("partial SQL observer and demand worker complete");
 }
 
 #[tokio::test]

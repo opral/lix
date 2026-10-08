@@ -20,6 +20,9 @@ enum NativeReadPreparationPurpose {
     },
     Authority {
         blob_capture: Arc<crate::sync::read_fulfillment::BlobReadCapture>,
+        input_sink: Arc<
+            dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync,
+        >,
     },
 }
 
@@ -29,6 +32,37 @@ fn consume_history_graph_node_budget(remaining: &mut usize) -> bool {
     }
     *remaining -= 1;
     true
+}
+
+#[derive(Default)]
+struct ReturnedExecutableRows {
+    by_branch:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>>,
+    count: usize,
+}
+
+fn merge_returned_executable_rows(
+    destination: &mut ReturnedExecutableRows,
+    rows: &[(String, crate::tracked_state::TrackedStateKey)],
+) -> Result<(), LixError> {
+    for (branch, key) in rows {
+        if destination
+            .by_branch
+            .get(branch)
+            .is_some_and(|keys| keys.contains(key))
+        {
+            continue;
+        }
+        if destination.count >= crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
+            return Err(crate::plugin::runtime::executable_dependency_work_bound());
+        }
+        destination.by_branch
+            .entry(branch.clone())
+            .or_default()
+            .insert(key.clone());
+        destination.count += 1;
+    }
+    Ok(())
 }
 
 fn path_index_request_for_interest(
@@ -77,6 +111,9 @@ pub(crate) async fn prepare_native_read_interests_authority<R>(
     active_account_id: &str,
     hot: HotStateContext,
     blob_capture: Arc<crate::sync::read_fulfillment::BlobReadCapture>,
+    input_sink: Arc<
+        dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync,
+    >,
 ) -> Result<Vec<crate::sync::read_fulfillment::ReadInput>, LixError>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -87,7 +124,10 @@ where
         interests,
         active_account_id,
         hot,
-        NativeReadPreparationPurpose::Authority { blob_capture },
+        NativeReadPreparationPurpose::Authority {
+            blob_capture,
+            input_sink,
+        },
     )
     .await
 }
@@ -111,7 +151,7 @@ where
     let candidate_catalog = crate::catalog::CatalogContext::new();
     let dependency_blobs: Arc<dyn crate::binary_cas::BlobDataReader> = match &purpose {
         NativeReadPreparationPurpose::Candidate { .. } => Arc::new(blob.reader(read.clone())),
-        NativeReadPreparationPurpose::Authority { blob_capture } => {
+        NativeReadPreparationPurpose::Authority { blob_capture, .. } => {
             blob_capture.wrap(blob.reader(read.clone()))
         }
     };
@@ -119,12 +159,27 @@ where
         String,
         std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>,
     >::new();
+    // Diff identities are prepared separately from the exact mutation
+    // frontier: they need only their selected-head point paths, never mutation
+    // predecessor or successor expansion.
+    let mut selected_head_diff_keys = std::collections::BTreeSet::<
+        crate::tracked_state::TrackedStateKey,
+    >::new();
+    // A live row's canonical ChangeLocator is not part of its row-PK point
+    // path. Retain only IDs from visible after-rows in the exact leased-head
+    // diff; deleted keys remain in the point frontier but prove no locator.
+    let mut selected_head_diff_change_ids =
+        std::collections::BTreeSet::<crate::changelog::ChangeId>::new();
     // The ordinary native recorder sees physical rows, but direct change
     // locators are derived from the change ID and therefore have no physical
     // row to observe. Retain the returned identities and close this logical
     // part of the graph once, after all recipes have been replayed.
     let mut returned_identities =
         std::collections::BTreeSet::<(String, crate::tracked_state::TrackedStateKey)>::new();
+    // Filesystem and foreground row interests can select disjoint plugin-owned
+    // rows. Resolve returned-row executable roots across the whole operation so
+    // a cold partial read does not reveal one missing root per selected row.
+    let mut returned_executable_rows = ReturnedExecutableRows::default();
     let mut catalog_branches = std::collections::BTreeSet::<String>::new();
     // One authority request shares this traversal ceiling across every
     // History recipe; per-recipe bounds alone would multiply graph work.
@@ -142,16 +197,44 @@ where
             .iter()
             .map(|interest| interest.as_ref().clone())
             .collect::<Vec<_>>();
-        super::working_diff_recipe::validate_working_diff_recipes(
+        super::working_diff_recipe::validate_bounded_diff_recipes(
             &recipes,
             &descriptor.selected_branch.branch_id,
         )?;
-        super::working_diff_recipe::prove_selected_branch_checkpoint_ancestry(
-            read.clone(),
-            descriptor,
-            &mut history_graph_nodes_remaining,
-        )
-        .await?;
+        let mut working_diff_ancestry_proved = false;
+        for recipe in &recipes {
+            let LogicalReadInterest::Diff { from, to, .. } = recipe else {
+                continue;
+            };
+            match (from, to) {
+                (
+                    crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                    crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                ) if !working_diff_ancestry_proved => {
+                    super::working_diff_recipe::prove_selected_branch_checkpoint_ancestry(
+                        read.clone(),
+                        descriptor,
+                        &mut history_graph_nodes_remaining,
+                    )
+                    .await?;
+                    working_diff_ancestry_proved = true;
+                }
+                (
+                    crate::hot_state::DiffInterestEndpoint::Fixed(from),
+                    crate::hot_state::DiffInterestEndpoint::Fixed(to),
+                ) => {
+                    super::working_diff_recipe::prove_selected_branch_fixed_diff_ancestry(
+                        read.clone(),
+                        &descriptor.selected_branch.head.commit_id,
+                        from,
+                        to,
+                        &mut history_graph_nodes_remaining,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
     }
 
     for interest in &interests.interests {
@@ -265,6 +348,16 @@ where
                 projected_columns,
                 limit: _,
             } => {
+                // Candidate warming remains limited to moving working diffs.
+                // Fixed historical spans are closed only for the exact
+                // foreground operation that asks for them.
+                if matches!(&purpose, NativeReadPreparationPurpose::Candidate { .. })
+                    && !super::working_diff_recipe::is_supported_working_diff_recipe(
+                        interest.as_ref(),
+                    )
+                {
+                    continue;
+                }
                 let from = super::partial_candidate_prepare::endpoint(
                     descriptor,
                     branch_id.as_deref(),
@@ -275,7 +368,14 @@ where
                     branch_id.as_deref(),
                     to,
                 )?;
-                crate::sql2::prepare_native_diff_interest(
+                let collect_selected_head_keys = matches!(
+                    &purpose,
+                    NativeReadPreparationPurpose::Authority { .. }
+                ) && branch_id.as_deref()
+                    == Some(descriptor.selected_branch.branch_id.as_str())
+                    && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
+                    && descriptor.selected_branch.head.row_pk_index_root_id.is_some();
+                let prepared_diff = crate::sql2::prepare_native_diff_interest(
                     read.clone(),
                     relation,
                     &from,
@@ -286,8 +386,11 @@ where
                     },
                     projected_columns,
                     native_diff_budget.clone(),
+                    collect_selected_head_keys,
                 )
                 .await?;
+                selected_head_diff_keys.extend(prepared_diff.selected_head_keys);
+                selected_head_diff_change_ids.extend(prepared_diff.visible_after_change_ids);
             }
             LogicalReadInterest::History {
                 branch_id,
@@ -412,6 +515,7 @@ where
                             &request,
                             projected_columns,
                             native_diff_budget.clone(),
+                            false,
                         )
                         .await?;
                     }
@@ -457,28 +561,7 @@ where
                     .await?;
                 returned_identities.extend(executable_rows.iter().cloned());
                 catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
-                if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
-                    returned_identities.extend(
-                        prepare_authority_returned_row_executables(
-                            &hot,
-                            read.clone(),
-                            dependency_blobs.as_ref(),
-                            &executable_rows,
-                            active_account_id,
-                        )
-                        .await?,
-                    );
-                } else {
-                    crate::plugin::runtime::prepare_returned_row_executables(
-                        &reader,
-                        dependency_blobs.as_ref(),
-                        &executable_rows,
-                    )
-                    .await?;
-                }
+                merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
             LogicalReadInterest::FileContent {
                 request,
@@ -523,7 +606,7 @@ where
                         )
                         .await?;
                     }
-                    NativeReadPreparationPurpose::Authority { .. } => {
+                    NativeReadPreparationPurpose::Authority { blob_capture, .. } => {
                         crate::sql2::prepare_native_file_content_inputs(
                             Arc::new(replay_hot.reader(read.clone())),
                             filesystem_path_index,
@@ -535,6 +618,7 @@ where
                             *indexed,
                             path_predicate,
                             *byte_range,
+                            &|blob, range| blob_capture.record(blob, range.is_none(), range),
                         )
                         .await?;
                     }
@@ -545,28 +629,7 @@ where
                     .await?;
                 returned_identities.extend(executable_rows.iter().cloned());
                 catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
-                if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
-                    returned_identities.extend(
-                        prepare_authority_returned_row_executables(
-                            &hot,
-                            read.clone(),
-                            dependency_blobs.as_ref(),
-                            &executable_rows,
-                            active_account_id,
-                        )
-                        .await?,
-                    );
-                } else {
-                    crate::plugin::runtime::prepare_returned_row_executables(
-                        &reader,
-                        dependency_blobs.as_ref(),
-                        &executable_rows,
-                    )
-                    .await?;
-                }
+                merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
         }
     }
@@ -584,6 +647,26 @@ where
         )
         .await?;
     }
+    if !selected_head_diff_keys.is_empty()
+        && let Some(root) = descriptor.selected_branch.head.row_pk_index_root_id
+    {
+        crate::tracked_state::prepare_row_pk_index_point_inputs(
+            &read,
+            &crate::tracked_state::TrackedStateRootId::new(root),
+            &selected_head_diff_keys.into_iter().collect::<Vec<_>>(),
+        )
+        .await?;
+    }
+    if !selected_head_diff_change_ids.is_empty()
+        && let NativeReadPreparationPurpose::Authority { input_sink, .. } = &purpose
+    {
+        prepare_current_head_change_locator_inputs(
+            &read,
+            &selected_head_diff_change_ids,
+            input_sink.as_ref(),
+        )
+        .await?;
+    }
     // Foreground row reads promise the same bounded native edit inputs. Prepare
     // them against these unpublished controls before they become visible; the
     // operation-scoped context intentionally has no trusted live-epoch cache.
@@ -597,8 +680,14 @@ where
         .await?;
     returned_identities.extend(executable_rows.iter().cloned());
     catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
+    merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
+    let returned_executable_rows = returned_executable_rows
+        .by_branch
+        .into_iter()
+        .flat_map(|(branch, keys)| keys.into_iter().map(move |key| (branch.clone(), key)))
+        .collect::<Vec<_>>();
     candidate_catalog
-        .prepare_returned_row_catalogs(&reader, &executable_rows, None)
+        .prepare_returned_row_catalogs(&reader, &returned_executable_rows, None)
         .await?;
     if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
         returned_identities.extend(
@@ -606,7 +695,7 @@ where
                 &hot,
                 read.clone(),
                 dependency_blobs.as_ref(),
-                &executable_rows,
+                &returned_executable_rows,
                 active_account_id,
             )
             .await?,
@@ -615,7 +704,7 @@ where
         crate::plugin::runtime::prepare_returned_row_executables(
             &reader,
             dependency_blobs.as_ref(),
-            &executable_rows,
+            &returned_executable_rows,
         )
         .await?;
     }
@@ -640,8 +729,29 @@ where
     }
     match purpose {
         NativeReadPreparationPurpose::Candidate { .. } => Ok(Vec::new()),
-        NativeReadPreparationPurpose::Authority { .. } => {
-            prepare_canonical_returned_row_inputs(&read, &hot, &returned_identities).await
+        NativeReadPreparationPurpose::Authority { input_sink, .. } => {
+            // Known identities cross the native/provider boundary in bounded
+            // groups. Emit each completed group immediately into the shared
+            // operation sink rather than retaining all selected payloads.
+            let mut pending = std::collections::BTreeSet::new();
+            for identity in returned_identities {
+                pending.insert(identity);
+                if pending.len() == 32 {
+                    prepare_canonical_returned_row_inputs(
+                        &read,
+                        &hot,
+                        &pending,
+                        input_sink.as_ref(),
+                    )
+                    .await?;
+                    pending.clear();
+                }
+            }
+            if !pending.is_empty() {
+                prepare_canonical_returned_row_inputs(&read, &hot, &pending, input_sink.as_ref())
+                    .await?;
+            }
+            Ok(Vec::new())
         }
     }
 }
@@ -672,6 +782,34 @@ where
         .await
 }
 
+/// Close the canonical locator metadata for visible live rows from one exact
+/// selected-head diff. This deliberately resolves only the tiny metadata
+/// address: it does not load ChangeRecord, CommitDeltaPart, or blob payloads.
+/// Direct-address authentication reads shallow commit owner metadata.
+async fn prepare_current_head_change_locator_inputs<R>(
+    read: &R,
+    change_ids: &std::collections::BTreeSet<crate::changelog::ChangeId>,
+    sink: &(dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync),
+) -> Result<(), LixError>
+where
+    R: StorageAdapterRead,
+{
+    let change_ids = change_ids.iter().copied().collect::<Vec<_>>();
+    let locators = crate::tracked_state::load_canonical_change_locators(read, &change_ids).await?;
+    for (change_id, locator) in change_ids.into_iter().zip(locators) {
+        let Some(locator) = locator else {
+            continue;
+        };
+        sink(crate::sync::read_fulfillment::ReadInput {
+            address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change_id.to_string()),
+            ),
+            bytes: crate::tracked_state::encode_change_locator(locator),
+        })?;
+    }
+    Ok(())
+}
+
 /// Complete the logical immutable dependencies of the rows selected by one
 /// operation. Most of this graph is observed by the normal storage recorder.
 /// Two cases need explicit handling here:
@@ -688,12 +826,13 @@ async fn prepare_canonical_returned_row_inputs<R>(
     read: &R,
     hot: &HotStateContext,
     identities: &std::collections::BTreeSet<(String, crate::tracked_state::TrackedStateKey)>,
-) -> Result<Vec<crate::sync::read_fulfillment::ReadInput>, LixError>
+    sink: &(dyn Fn(crate::sync::read_fulfillment::ReadInput) -> Result<(), LixError> + Send + Sync),
+) -> Result<(), LixError>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     if identities.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let rows = identities
         .iter()
@@ -711,7 +850,11 @@ where
         .load_exact_batch(&crate::hot_state::HotStateExactBatchRequest {
             rows,
             projection: crate::hot_state::HotStateProjection {
-                columns: vec!["snapshot_content".to_owned()],
+                columns: vec![
+                    "change_id".to_owned(),
+                    "commit_id".to_owned(),
+                    "updated_at".to_owned(),
+                ],
             },
             untracked: Some(false),
             include_tombstones: false,
@@ -733,10 +876,11 @@ where
     }
 
     let mut locators = std::collections::BTreeMap::new();
-    for change_id in change_ids {
-        if let Some(locator) =
-            crate::tracked_state::load_canonical_change_locator(read, change_id).await?
-        {
+    let change_ids = change_ids.into_iter().collect::<Vec<_>>();
+    let canonical_locators =
+        crate::tracked_state::load_canonical_change_locators(read, &change_ids).await?;
+    for (change_id, locator) in change_ids.into_iter().zip(canonical_locators) {
+        if let Some(locator) = locator {
             owner_commits.insert(locator.commit_id);
             locators.insert(change_id, locator);
         }
@@ -833,9 +977,72 @@ where
     // payload is preferred, while an absent or stale projection can fall back
     // to the exact physical owner selected by the locator. In either case the
     // resolver enforces row identity and lifetime before producing wire data.
-    let resolved_payloads = crate::tracked_state::load_authoritative_live_change_records(
-        read,
-        &payload_requests
+    // Fetch only the admitted ordered standalone prefix. The authority policy
+    // resolves this page before its encoded records enter the operation sink;
+    // no operation-wide decoded or encoded payload vector survives a page.
+    let keys = payload_requests
+        .iter()
+        .map(|(_, request)| {
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+                request.change_id.as_uuid().as_bytes(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let point_requests = [crate::storage_adapter::StorageGetManyRequest {
+        space: crate::changelog::CHANGE_SPACE,
+        keys: &keys,
+        opts: Default::default(),
+    }];
+    let mut offset = 0;
+    while offset < payload_requests.len() {
+        let page = read
+            .get_many_bounded_prefix(
+                &point_requests,
+                offset,
+                32,
+                crate::storage_adapter::ReadBudget {
+                    max_result_bytes: 8 * 1024 * 1024,
+                    max_single_value_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .await?;
+        let count = page.values.len();
+        let next = offset.checked_add(count).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "selected payload page overflow",
+            )
+        })?;
+        if count == 0
+            || next > payload_requests.len()
+            || page.next_offset != (next < payload_requests.len()).then_some(next)
+        {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "selected payload page changed request positions",
+            ));
+        }
+        let selected = &payload_requests[offset..next];
+        let standalone = selected
+            .iter()
+            .zip(page.values)
+            .map(|((_, request), value)| {
+                let record = match value {
+                    Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => Some(
+                        crate::changelog::decode_change_record(&bytes, request.change_id)?,
+                    ),
+                    None => None,
+                    Some(crate::storage_adapter::StorageProjectedValue::KeyOnly) => {
+                        return Err(LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "selected payload page omitted full value",
+                        ));
+                    }
+                };
+                Ok((request.change_id, record))
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let authority_requests = selected
             .iter()
             .map(
                 |(_, request)| crate::tracked_state::AuthoritativeLiveChangeRequest {
@@ -845,40 +1052,40 @@ where
                     updated_at: request.updated_at,
                 },
             )
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let mut payload_inputs = Vec::with_capacity(resolved_payloads.len());
-    for ((branch_id, request), record) in payload_requests.into_iter().zip(resolved_payloads) {
-        let bytes = crate::changelog::encode_change_record(&record)?;
-        payload_inputs.push(crate::sync::read_fulfillment::ReadInput {
-            address: crate::sync::read_fulfillment::ReadInputAddress::ChangeRecord {
-                change_id: request.change_id.to_string(),
-                source_commit_id: request.source_commit_id.to_string(),
-                branch_id,
-                schema_key: request.key.schema_key,
-                file_id: request.key.file_id,
-                row_pk: request.key.row_pk,
-                updated_at: request.updated_at.to_string(),
-                payload_digest: *blake3::hash(&bytes).as_bytes(),
-            },
-            bytes,
-        });
-    }
-
-    let mut inputs = locators
-        .into_iter()
-        .map(
-            |(change_id, locator)| crate::sync::read_fulfillment::ReadInput {
-                address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
-                    NativeMetadataRef::ChangeLocator(change_id.to_string()),
-                ),
-                bytes: crate::tracked_state::encode_change_locator(locator),
-            },
+            .collect::<Vec<_>>();
+        let resolved = crate::tracked_state::resolve_authoritative_live_change_records(
+            read,
+            &authority_requests,
+            standalone,
         )
-        .collect::<Vec<_>>();
-    inputs.extend(payload_inputs);
-    Ok(inputs)
+        .await?;
+        for ((branch_id, request), record) in selected.iter().zip(resolved) {
+            let bytes = crate::changelog::encode_change_record(&record)?;
+            sink(crate::sync::read_fulfillment::ReadInput {
+                address: crate::sync::read_fulfillment::ReadInputAddress::ChangeRecord {
+                    change_id: request.change_id.to_string(),
+                    source_commit_id: request.source_commit_id.to_string(),
+                    branch_id: branch_id.clone(),
+                    schema_key: request.key.schema_key.clone(),
+                    file_id: request.key.file_id.clone(),
+                    row_pk: request.key.row_pk.clone(),
+                    updated_at: request.updated_at.to_string(),
+                    payload_digest: *blake3::hash(&bytes).as_bytes(),
+                },
+                bytes,
+            })?;
+        }
+        offset = next;
+    }
+    for (change_id, locator) in locators {
+        sink(crate::sync::read_fulfillment::ReadInput {
+            address: crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(change_id.to_string()),
+            ),
+            bytes: crate::tracked_state::encode_change_locator(locator),
+        })?;
+    }
+    Ok(())
 }
 
 /// Reproduce the path-index eager-blob policy while routing the actual CAS
@@ -928,9 +1135,12 @@ async fn prepare_path_index_small_blob_inputs(
         hashes.insert(crate::binary_cas::BlobId::from_hex(&snapshot.blob_hash)?);
     }
     if !hashes.is_empty() {
-        blobs
-            .load_bytes_many(&hashes.into_iter().collect::<Vec<_>>())
-            .await?;
+        // Known payloads are small but their aggregate can exceed a transfer
+        // page. Release every bounded provider result before the next batch.
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        for group in hashes.chunks(super::transfer::CONTENT_GROUP_ITEMS) {
+            blobs.load_bytes_many(group).await?;
+        }
     }
     Ok(())
 }
@@ -938,6 +1148,67 @@ async fn prepare_path_index_small_blob_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn current_head_locator_closure_emits_metadata_without_payload() {
+        let authority = crate::open_lix()
+            .with_storage(crate::Memory::new())
+            .await
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
+                &[
+                    crate::Value::Text("/locator-frontier.txt".into()),
+                    crate::Value::Blob(bytes::Bytes::from_static(b"locator frontier").into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let selected = authority
+            .execute(
+                "SELECT lixcol_change_id FROM lix_file WHERE path = $1",
+                &[crate::Value::Text("/locator-frontier.txt".into())],
+            )
+            .await
+            .unwrap();
+        let change_id = crate::changelog::ChangeId::parse_lix(
+            &selected.rows()[0]
+                .get::<String>("lixcol_change_id")
+                .unwrap(),
+            "selected file change",
+        )
+        .unwrap();
+        let storage = authority.storage_adapter();
+        let read = storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_inputs = inputs.clone();
+        let sink = move |input| {
+            sink_inputs.lock().unwrap().push(input);
+            Ok(())
+        };
+
+        prepare_current_head_change_locator_inputs(
+            &read,
+            &std::collections::BTreeSet::from([change_id]),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let inputs = inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(
+            &inputs[0].address,
+            crate::sync::read_fulfillment::ReadInputAddress::Metadata(
+                NativeMetadataRef::ChangeLocator(id)
+            ) if id == &change_id.to_string()
+        ));
+        assert!(crate::tracked_state::decode_change_locator(change_id, &inputs[0].bytes).is_ok());
+    }
 
     #[test]
     fn history_graph_budget_is_shared_and_fail_closed() {
@@ -966,5 +1237,31 @@ mod tests {
             request.hot_state_request().filter.schema_keys,
             vec!["lix_directory_descriptor".to_owned()]
         );
+    }
+
+    #[test]
+    fn operation_executable_row_union_deduplicates_and_fails_before_growth() {
+        let key = |file_id: &str| crate::tracked_state::TrackedStateKey {
+            schema_key: "plugin_schema".to_owned(),
+            file_id: Some(file_id.to_owned()),
+            row_pk: crate::row_pk::RowPk::single(file_id),
+        };
+        let first = ("branch-a".to_owned(), key("file-a"));
+        let second = ("branch-b".to_owned(), key("file-b"));
+        let mut union = ReturnedExecutableRows::default();
+        merge_returned_executable_rows(
+            &mut union,
+            &[first.clone(), second.clone(), first.clone()],
+        )
+        .unwrap();
+        assert_eq!(union.count, 2);
+
+        union.count = crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS;
+        assert!(merge_returned_executable_rows(
+            &mut union,
+            &[("branch-c".to_owned(), key("file-c"))],
+        )
+        .is_err());
+        assert_eq!(union.count, crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS);
     }
 }

@@ -91,6 +91,152 @@ test("worker observation keeps its creation parent for only the first frame", as
 	await third;
 });
 
+test("aborting worker observer setup sends cancellation and keeps its request until settlement", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	const binding = workerBinding(client, new BindingLease(() => undefined), 0);
+	const controller = new AbortController();
+	const opening = binding.observe("SELECT 1", [], { signal: controller.signal });
+	let settled = false;
+	void opening.then(
+		() => (settled = true),
+		() => (settled = true),
+	);
+	const registration = transport.sent.at(-1);
+	if (!registration || !("id" in registration))
+		throw new Error("expected observer registration");
+	controller.abort();
+	await Promise.resolve();
+	expect(settled).toBe(false);
+	expect(transport.sent).toContainEqual({
+		kind: "observe.cancel",
+		requestId: registration.id,
+	});
+	transport.emit({
+		id: registration.id,
+		ok: false,
+		error: { name: "AbortError", message: "Observer registration was cancelled", code: "LIX_OBSERVER_CANCELLED" },
+	});
+	await expect(opening).rejects.toMatchObject({ code: "LIX_OBSERVER_CANCELLED" });
+	await client.terminate();
+});
+
+test("worker termination preserves only the remote session-close fetch until disconnect acknowledgment", async () => {
+	const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+	const sent: WorkerInput[] = [];
+	let receive!: (message: WorkerResponse) => void;
+	let fetchCount = 0;
+	const connection: WorkerConnection = {
+		postMessage(message) { sent.push(message); },
+		onMessage(listener) { receive = listener; },
+		onFatal() {},
+		ref() {},
+		unref() {},
+		async terminate() {
+			receive({ kind: "sync.fetch", requestId: 41, request: {
+				url: `https://example.test/lix/v1/${repositoryId}/sync/pull`,
+				method: "POST",
+				headers: [],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			receive({ kind: "sync.fetch", requestId: 42, request: {
+				url: `https://example.test/lix/v1/${repositoryId}/session`,
+				method: "DELETE",
+				headers: [["lix-session-id", "session-a"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+				kind: "sync.fetch.result",
+				requestId: 42,
+				result: { ok: true, response: expect.objectContaining({ status: 204 }) },
+			})));
+		},
+	};
+	const client = new LixWorkerClient(connection, false);
+	client.beginLease(undefined, undefined, {
+		url: `https://example.test/lix/${repositoryId}`,
+		headers: [],
+		transport: async ({ url, init }) => {
+			fetchCount++;
+			expect(init?.method).toBe("DELETE");
+			expect(url).toBe(`https://example.test/lix/v1/${repositoryId}/session`);
+			return new Response(null, { status: 204 });
+		},
+	});
+	await client.terminate();
+	expect(fetchCount).toBe(1);
+	expect(client.isDisposed).toBe(true);
+	expect(sent.filter((message) => "kind" in message && message.kind === "sync.fetch.result")).toHaveLength(1);
+	receive({ kind: "sync.fetch", requestId: 43, request: {
+		url: `https://example.test/lix/v1/${repositoryId}/session`,
+		method: "DELETE",
+		headers: [["lix-session-id", "session-a"]],
+		response: { mode: "buffered", maxBytes: 128 },
+	} });
+	expect(fetchCount).toBe(1);
+});
+
+test("worker termination routes only a scoped recovery session DELETE through its server", async () => {
+	const primaryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+	const recoveryId = "01936f4e-7b6c-7c3d-8f9a-abcdefabcdef";
+	const sent: WorkerInput[] = [];
+	let receive!: (message: WorkerResponse) => void;
+	let activeScope: number | undefined;
+	let primaryFetches = 0;
+	let scopedFetches = 0;
+	const connection: WorkerConnection = {
+		postMessage(message) { sent.push(message); },
+		onMessage(listener) { receive = listener; },
+		onFatal() {},
+		ref() {},
+		unref() {},
+		async terminate() {
+			receive({ kind: "sync.fetch", requestId: 51, transportScope: 999, request: {
+				url: `https://recovery.test/lix/v1/${recoveryId}/session`,
+				method: "DELETE",
+				headers: [["lix-session-id", "session-b"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			receive({ kind: "sync.fetch", requestId: 52, transportScope: activeScope, request: {
+				url: `https://recovery.test/lix/v1/${recoveryId}/session`,
+				method: "DELETE",
+				headers: [["lix-session-id", "session-b"]],
+				response: { mode: "buffered", maxBytes: 128 },
+			} });
+			await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+				kind: "sync.fetch.result",
+				requestId: 52,
+				result: { ok: true, response: expect.objectContaining({ status: 204 }) },
+			})));
+		},
+	};
+	const client = new LixWorkerClient(connection, false);
+	client.beginLease(undefined, undefined, {
+		url: `https://primary.test/lix/${primaryId}`,
+		headers: [],
+		transport: async () => {
+			primaryFetches++;
+			return new Response(null, { status: 204 });
+		},
+	});
+	await client.withRecoveryServer({
+		url: `https://recovery.test/lix/${recoveryId}`,
+		headers: [],
+		transport: async ({ init }) => {
+			scopedFetches++;
+			expect(init?.method).toBe("DELETE");
+			return new Response(null, { status: 204 });
+		},
+	}, async (scope) => {
+		activeScope = scope;
+		await client.terminate();
+	});
+	expect(primaryFetches).toBe(0);
+	expect(scopedFetches).toBe(1);
+	expect(sent.filter((message) => "kind" in message && message.kind === "sync.fetch.result")).toHaveLength(1);
+});
+
 test("failed close terminates the worker before releasing its binding", async () => {
 	const termination = deferred<void>();
 	const events: string[] = [];
@@ -324,6 +470,57 @@ test("worker open rejection interrupts a stalled source tail", async () => {
 				"kind" in message &&
 				message.kind === "openSnapshot.cancel" &&
 				message.snapshotId === 91,
+		),
+	).toBe(true);
+	await client.terminate();
+});
+
+test("worker open rejection interrupts a backpressured snapshot write", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	let canceled = false;
+	const source = new ReadableStream<Uint8Array>(
+		{
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("snapshot chunk"));
+			},
+			cancel() {
+				canceled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const open = deferred<unknown>();
+	const pumping = pumpSnapshotToWorker(
+		client,
+		source.getReader(),
+		92,
+		open.promise,
+	);
+	await vi.waitFor(() => {
+		expect(
+			transport.sent.some(
+				(message) =>
+					"id" in message &&
+					message.operation.kind === "openSnapshot.write",
+			),
+		).toBe(true);
+	});
+	const semanticError = Object.assign(new Error("snapshot open was rejected"), {
+		name: "LixError",
+		code: "LIX_WORKER_QUEUE_TIMEOUT",
+	});
+	open.reject(semanticError);
+
+	await expect(pumping).rejects.toBe(semanticError);
+	expect(canceled).toBe(true);
+	expect(
+		transport.sent.some(
+			(message) =>
+				"kind" in message &&
+				message.kind === "openSnapshot.cancel" &&
+				message.snapshotId === 92,
 		),
 	).toBe(true);
 	await client.terminate();
@@ -711,6 +908,7 @@ test("an unanswered open rejects within its budget and disposes its connection",
 		const failure = expect(opening).rejects.toMatchObject({
 			code: "LIX_OPEN_TIMEOUT",
 		});
+		transport.emit({ kind: "request.started", id: 1 });
 		await vi.advanceTimersByTimeAsync(30_000);
 		await failure;
 		expect(transport.terminateCount()).toBe(1);
@@ -721,6 +919,55 @@ test("an unanswered open rejects within its budget and disposes its connection",
 		).rejects.toMatchObject({
 			code: "LIX_ERROR_CLOSED",
 		});
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("an unstarted queued request stays recoverable until admission returns an error", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const pending = client.request({ kind: "activeBranchId" });
+		const failure = expect(pending).rejects.toMatchObject({
+			code: "LIX_WORKER_QUEUE_TIMEOUT",
+		});
+		transport.emit({ kind: "request.queued", id: 1 });
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(transport.terminateCount()).toBe(0);
+		expect(client.isDisposed).toBe(false);
+		transport.emit({
+			id: 1,
+			ok: false,
+			error: {
+				name: "Error",
+				message: "Worker operation waited too long to start",
+				code: "LIX_WORKER_QUEUE_TIMEOUT",
+			},
+		});
+		await failure;
+		expect(transport.terminateCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a worker that never acknowledges request receipt is terminated", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const pending = client.request({ kind: "activeBranchId" });
+		const failure = expect(pending).rejects.toMatchObject({
+			code: "LIX_WORKER_START_TIMEOUT",
+		});
+		await vi.advanceTimersByTimeAsync(30_000);
+		await failure;
+		expect(transport.terminateCount()).toBe(1);
+		expect(client.isDisposed).toBe(true);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -740,6 +987,7 @@ test("lost execute acknowledgement rejects as unknown outcome without replaying"
 		const failure = expect(pending).rejects.toMatchObject({
 			code: "LIX_WRITE_OUTCOME_UNKNOWN",
 		});
+		transport.emit({ kind: "request.started", id: 1 });
 		await vi.advanceTimersByTimeAsync(60_000);
 		await failure;
 		expect(transport.sent).toHaveLength(1);
@@ -747,4 +995,41 @@ test("lost execute acknowledgement rejects as unknown outcome without replaying"
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+test("observer and lifecycle cleanup keep bounded client admission when ordinary work is full", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection, false);
+	client.beginLease();
+	const ordinary: Promise<unknown>[] = [];
+	for (let index = 0; index < 120; index++) {
+		ordinary.push(
+			client.request({ kind: "execute", sql: "SELECT 1", params: [] }),
+		);
+	}
+	const observerCloses: Promise<unknown>[] = [];
+	for (let observeId = 1; observeId <= 32; observeId++) {
+		observerCloses.push(client.request({ kind: "observe.close", observeId }));
+	}
+	const lifecycle: Promise<unknown>[] = [];
+	for (let transactionId = 1; transactionId <= 7; transactionId++) {
+		lifecycle.push(client.request({ kind: "transaction.rollback", transactionId }));
+	}
+	const sessionClose = client.request({ kind: "close" });
+	expect(transport.sent).toHaveLength(160);
+	await expect(
+		client.request({ kind: "execute", sql: "SELECT 2", params: [] }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+	await expect(
+		client.request({ kind: "observe.close", observeId: 33 }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+	await expect(
+		client.request({ kind: "transaction.rollback", transactionId: 8 }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+
+	for (const request of transport.sent) {
+		if ("id" in request)
+			transport.emit({ id: request.id, ok: true, value: undefined });
+	}
+	await Promise.all([...ordinary, ...observerCloses, ...lifecycle, sessionClose]);
 });

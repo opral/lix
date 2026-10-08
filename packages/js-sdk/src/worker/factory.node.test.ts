@@ -71,6 +71,7 @@ const connection = createWorkerConnection();
 const opened = new Promise((resolve, reject) => {
 	connection.onFatal(reject);
 	connection.onMessage((message) => {
+		if ("kind" in message) return;
 		if (message.id !== 1) return;
 		if (message.ok) resolve();
 		else reject(new Error(message.error.message));

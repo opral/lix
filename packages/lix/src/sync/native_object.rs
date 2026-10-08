@@ -32,6 +32,68 @@ pub(crate) struct NativeObject {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// A storage-only visibility intent minted inside the native-object module
+/// after staged bytes pass native address validation. Storage independently
+/// matches the final write set and required epoch CAS.
+pub(crate) struct NativeDependencyAvailabilityCapability {
+    entries: Vec<NativeDependencyAvailabilityEntry>,
+    partial_replica_state: Bytes,
+}
+
+pub(crate) struct NativeDependencyAvailabilityEntry {
+    pub(crate) space: crate::storage_adapter::StorageSpace,
+    pub(crate) key: Bytes,
+    pub(crate) value_hash: [u8; 32],
+}
+
+impl NativeDependencyAvailabilityCapability {
+    pub(crate) const MAX_ENTRIES: usize = NativeObjectRef::MAX_MISSING_BATCH;
+
+    pub(crate) fn entries(&self) -> &[NativeDependencyAvailabilityEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn partial_replica_state(&self) -> &Bytes {
+        &self.partial_replica_state
+    }
+}
+
+/// Mint the internal visibility intent after the staged values have passed
+/// native address validation. The caller must have obtained those bytes from a
+/// validated response or completed range assembly; storage independently
+/// checks the exact final mutation set and epoch guard.
+pub(in crate::sync) fn validated_native_dependency_availability_from_staged(
+    requested: &[NativeObjectRef],
+    writes: &StorageWriteSet,
+    partial_replica_state: Bytes,
+) -> Result<NativeDependencyAvailabilityCapability, LixError> {
+    validate_request(requested)?;
+    if partial_replica_state.is_empty() {
+        return Err(invalid("partial replica state guard is empty"));
+    }
+
+    let entries = requested
+        .iter()
+        .map(|address| {
+            let key = address.storage_key();
+            let bytes = writes
+                .staged_value_ref(address.space(), &key)
+                .ok_or_else(|| invalid("validated native staging omitted an object"))?;
+            address.validate(bytes)?;
+            Ok(NativeDependencyAvailabilityEntry {
+                space: address.space(),
+                key: Bytes::from(key),
+                value_hash: *blake3::hash(bytes).as_bytes(),
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+
+    Ok(NativeDependencyAvailabilityCapability {
+        entries,
+        partial_replica_state,
+    })
+}
+
 pub(super) mod base64_bytes {
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};

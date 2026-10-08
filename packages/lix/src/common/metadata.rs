@@ -30,3 +30,15 @@ pub(crate) fn validate_row_metadata(
 pub(crate) fn serialize_row_metadata(metadata: &str) -> String {
     metadata.to_owned()
 }
+
+/// Returns the SQL comparison key for canonical JSONB metadata text.
+///
+/// Callers must pass the compact, recursively key-sorted rendering produced
+/// by the JSONB renderer or `Json` canonicalizer. The key preserves that
+/// rendering while normalizing equivalent exact-number spellings, so SQL
+/// string comparisons and hashes agree without changing stored JSONB bytes.
+pub(crate) fn metadata_sql_equality_key(
+    canonical_metadata: &str,
+) -> Result<String, lix_schema::JsonbError> {
+    lix_schema::jsonb_equality_key(canonical_metadata)
+}

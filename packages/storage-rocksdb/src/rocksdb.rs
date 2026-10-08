@@ -445,6 +445,81 @@ impl StorageRead for RocksDBRead<'_> {
         }
     }
 
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: lix::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        let singleton = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>()
+            == 1;
+        let mut bytes = 0;
+        for request in requests {
+            if request.opts.projection != CoreProjection::FullValue {
+                continue;
+            }
+            let cf = column_family(self.db, request.space);
+            let mut iterator = self
+                .snapshot
+                .raw_iterator_cf_opt(cf, value_read_options(request.space));
+            for key in request.keys {
+                let physical = physical_key(request.space.id, key);
+                iterator.seek(physical.0.as_ref());
+                iterator.status().map_err(rocksdb_error)?;
+                if iterator.key() == Some(physical.0.as_ref()) {
+                    let value = iterator.value().ok_or_else(|| {
+                        StorageError::Corruption("bounded point key has no value".into())
+                    })?;
+                    bytes = budget.admit_value(value.len(), bytes, singleton)?;
+                }
+            }
+        }
+        self.get_many(requests).await
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> Result<lix::storage::GetManyPrefixResult, StorageError> {
+        let (window, total) = lix::storage::bounded_prefix_requests(requests, offset, max_slots)?;
+        let mut lengths = Vec::new();
+        for request in &window {
+            let mut iterator = self.snapshot.raw_iterator_cf_opt(
+                column_family(self.db, request.space),
+                value_read_options(request.space),
+            );
+            for key in request.keys {
+                let len = if request.opts.projection == CoreProjection::KeyOnly {
+                    0
+                } else {
+                    let physical = physical_key(request.space.id, key);
+                    iterator.seek(physical.0.as_ref());
+                    iterator.status().map_err(rocksdb_error)?;
+                    if iterator.key() == Some(physical.0.as_ref()) {
+                        iterator
+                            .value()
+                            .ok_or_else(|| {
+                                StorageError::Corruption("bounded prefix key has no value".into())
+                            })?
+                            .len()
+                    } else {
+                        0
+                    }
+                };
+                lengths.push(len);
+            }
+        }
+        let count = budget.admitted_prefix(lengths)?;
+        let (admitted, _) = lix::storage::bounded_prefix_requests(&window, 0, count.max(1))?;
+        let values = self.get_many_bounded(&admitted, budget).await?.values;
+        lix::storage::GetManyPrefixResult::new(values, offset, total)
+    }
+
     fn begin_scan(
         &self,
         space: StorageSpace,
@@ -603,6 +678,60 @@ impl StorageScanSource for RocksDBScanSource<'_> {
                 .key()
                 .is_some_and(|key| self.bounds.before_upper(key));
             Ok(ScanChunk::new(entries, has_more))
+        })
+    }
+    fn next_page_bounded(
+        &mut self,
+        limit_rows: usize,
+        budget: lix::storage::ReadBudget,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ScanChunk, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut entries = Vec::new();
+            let mut bytes = 0usize;
+            while entries.len() < limit_rows {
+                let Some(encoded_key) = self.iterator.key() else {
+                    break;
+                };
+                if !self.bounds.after_lower(encoded_key) {
+                    self.iterator.next();
+                    continue;
+                }
+                if !self.bounds.before_upper(encoded_key) {
+                    break;
+                }
+                let value = if self.projection == CoreProjection::FullValue {
+                    Some(self.iterator.value().ok_or_else(|| {
+                        StorageError::Corruption("bounded scan key has no value".into())
+                    })?)
+                } else {
+                    None
+                };
+                let len = value.map_or(0, |value| value.len());
+                if len > budget.max_single_value_bytes {
+                    return Err(StorageError::ReadBudgetExceeded { singleton: true });
+                }
+                if !entries.is_empty() && bytes.saturating_add(len) > budget.max_result_bytes {
+                    break;
+                }
+                bytes = budget.admit_value(len, bytes, entries.is_empty())?;
+                let key = Key(self.keys.take(scan_key_payload(self.space, encoded_key)?));
+                entries.push(ReadEntry {
+                    key,
+                    value: value.map_or(ProjectedValue::KeyOnly, |value| {
+                        ProjectedValue::FullValue(Bytes::copy_from_slice(value))
+                    }),
+                });
+                self.iterator.next();
+                if bytes >= budget.max_result_bytes {
+                    break;
+                }
+            }
+            self.iterator.status().map_err(rocksdb_error)?;
+            let more = self
+                .iterator
+                .key()
+                .is_some_and(|key| self.bounds.before_upper(key));
+            Ok(ScanChunk::new(entries, more))
         })
     }
 }

@@ -3599,14 +3599,14 @@ fn push_root_current_base_row(
         branch_id,
     );
     rows.set_decoded_snapshot(ordinal, row.decoded_snapshot().cloned());
-    if let Some(snapshot) = row.decoded_snapshot() {
-        rows.set_raw_snapshot(
-            ordinal,
-            Some(Bytes::from_owner(snapshot.durable_payload().expect(
+    let raw_snapshot = row.raw_snapshot().cloned().or_else(|| {
+        row.decoded_snapshot().map(|snapshot| {
+            Bytes::from_owner(snapshot.durable_payload().expect(
                 "materialized root row retains its validated durable payload",
-            ))),
-        );
-    }
+            ))
+        })
+    });
+    rows.set_raw_snapshot(ordinal, raw_snapshot);
     rows.set_durable_predecessor(
         ordinal,
         CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
@@ -4660,7 +4660,7 @@ async fn load_packed_current_base_exact(
         }
         let row_index = rows.len();
         let decoded_snapshot =
-            if projection.snapshot_content || projection.snapshot || projection.raw_snapshot {
+            if projection.snapshot_content || projection.snapshot {
                 change_record
                     .snapshot
                     .as_deref()

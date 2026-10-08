@@ -11,6 +11,10 @@ pub(super) enum PreparedDescriptor {
     NoChange,
     /// Durable bookkeeping advanced while native serving controls stayed local.
     LocalProgress,
+    /// A fresh authenticated descriptor proved every pending upload still has
+    /// its exact expected authority ref version. Keep its frozen body and retry
+    /// under this newly acquired lease.
+    RetryUpload(crate::gc::NativeBaselineLease),
     Ready(super::partial_publication::PreparedPartialPublication),
 }
 

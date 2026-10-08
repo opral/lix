@@ -1,11 +1,124 @@
 use std::collections::BTreeSet;
+use std::fmt;
 
 use globset::{Glob, GlobBuilder, GlobMatcher};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
+use crate::common::{
+    BoundedString, deserialize_bounded_string, deserialize_optional_bounded_string,
+};
 use crate::plugin::runtime::WASM_COMPONENT_API_VERSION;
+
+pub(super) const MAX_PLUGIN_SCHEMA_KEYS: usize = 64;
+pub(super) const MAX_PLUGIN_SCHEMA_KEY_BYTES: usize = 512;
+pub(super) const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static SCHEMA_KEY_VALUES_DESERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn deserialize_bounded_plugin_string<'de, D, const MAX_BYTES: usize>(
+    deserializer: D,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<D, MAX_BYTES>(deserializer)
+}
+
+pub(super) fn deserialize_optional_bounded_plugin_string<'de, D, const MAX_BYTES: usize>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_bounded_string::<D, MAX_BYTES>(deserializer)
+}
+
+pub(super) fn deserialize_plugin_schema_keys<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SchemaKeysVisitor;
+
+    impl<'de> Visitor<'de> for SchemaKeysVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_PLUGIN_SCHEMA_KEYS} schema keys of at most {MAX_PLUGIN_SCHEMA_KEY_BYTES} bytes each"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(length) = sequence
+                .size_hint()
+                .filter(|length| *length > MAX_PLUGIN_SCHEMA_KEYS)
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "schema key count {length} exceeds {MAX_PLUGIN_SCHEMA_KEYS}"
+                )));
+            }
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or_default()
+                .min(MAX_PLUGIN_SCHEMA_KEYS);
+            let mut values = Vec::with_capacity(capacity);
+            while values.len() < MAX_PLUGIN_SCHEMA_KEYS {
+                let Some(BoundedString::<MAX_PLUGIN_SCHEMA_KEY_BYTES>(value)) =
+                    sequence.next_element()?
+                else {
+                    return Ok(values);
+                };
+                #[cfg(test)]
+                SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(count.get() + 1));
+                values.push(value);
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "schema key count exceeds {MAX_PLUGIN_SCHEMA_KEYS}"
+                )));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer
+        .deserialize_seq(SchemaKeysVisitor)
+        .map_err(|error| serde::de::Error::custom(format!("schemas/schema_keys: {error}")))
+}
+
+fn deserialize_plugin_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_plugin_string::<D, 128>(deserializer)
+}
+
+fn deserialize_plugin_path_glob<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_plugin_string::<D, 1024>(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("path_glob: {error}")))
+}
+
+fn deserialize_plugin_entry<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_bounded_plugin_string::<D, 512>(deserializer)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -16,17 +129,24 @@ pub enum PluginRuntime {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
+    #[serde(deserialize_with = "deserialize_plugin_key")]
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_match: Option<PluginMatch>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_plugin_entry"
+    )]
     pub entry: Option<String>,
+    #[serde(deserialize_with = "deserialize_plugin_schema_keys")]
     pub schemas: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginMatch {
+    #[serde(deserialize_with = "deserialize_plugin_path_glob")]
     pub path_glob: String,
     #[serde(default)]
     pub case_insensitive: bool,
@@ -88,6 +208,11 @@ pub struct ValidatedPluginManifest {
 }
 
 pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
+    if raw.len() > MAX_PLUGIN_MANIFEST_BYTES {
+        return invalid_manifest(&format!(
+            "manifest JSON exceeds its {MAX_PLUGIN_MANIFEST_BYTES}-byte bound"
+        ));
+    }
     let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
@@ -96,7 +221,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
     })?;
 
     let manifest: PluginManifest =
-        serde_json::from_value(manifest_json.clone()).map_err(|error| {
+        PluginManifest::deserialize(&manifest_json).map_err(|error| {
             LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!("Invalid plugin manifest: {error}"),
@@ -188,12 +313,12 @@ fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<(), LixError> {
     if manifest.file_match.is_some() && manifest.entry.is_none() {
         return invalid_manifest("file_match requires entry");
     }
-    if !(1..=64).contains(&manifest.schemas.len()) {
+    if !(1..=MAX_PLUGIN_SCHEMA_KEYS).contains(&manifest.schemas.len()) {
         return invalid_manifest("schemas must contain between 1 and 64 entries");
     }
     let mut schemas = BTreeSet::new();
     for schema in &manifest.schemas {
-        if !(1..=512).contains(&schema.len()) {
+        if !(1..=MAX_PLUGIN_SCHEMA_KEY_BYTES).contains(&schema.len()) {
             return invalid_manifest("each schemas entry must contain between 1 and 512 bytes");
         }
         if !schemas.insert(schema) {
@@ -502,6 +627,44 @@ mod tests {
 
         assert_eq!(err.code, LixError::CODE_INVALID_PLUGIN);
         assert!(err.message.contains("detect_changes"));
+    }
+
+    #[test]
+    fn schema_deserializer_bounds_count_and_string_materialization() {
+        let oversized_list = serde_json::json!({
+            "key": "plugin_test",
+            "schemas": (0..=super::MAX_PLUGIN_SCHEMA_KEYS)
+                .map(|index| format!("schema_{index}"))
+                .collect::<Vec<_>>(),
+        });
+        let encoded = serde_json::to_string(&oversized_list).unwrap();
+        super::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(0));
+        let error = serde_json::from_str::<super::PluginManifest>(&encoded)
+            .expect_err("65 schema values should exceed the visitor bound");
+        assert!(error.to_string().contains("schema key count"));
+        super::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| {
+            assert!(count.get() <= super::MAX_PLUGIN_SCHEMA_KEYS);
+        });
+
+        let oversized_string = serde_json::json!({
+            "key": "plugin_test",
+            "schemas": ["s".repeat(super::MAX_PLUGIN_SCHEMA_KEY_BYTES + 1)],
+        });
+        let encoded = serde_json::to_string(&oversized_string).unwrap();
+        super::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| count.set(0));
+        let error = serde_json::from_str::<super::PluginManifest>(&encoded)
+            .expect_err("oversized schema string should be rejected");
+        assert!(error.to_string().contains("512 byte limit"));
+        super::SCHEMA_KEY_VALUES_DESERIALIZED.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn manifest_parser_rejects_input_over_the_archive_bound() {
+        let oversized = " ".repeat(super::MAX_PLUGIN_MANIFEST_BYTES + 1);
+        let error = parse_plugin_manifest_json(&oversized)
+            .expect_err("oversized manifest input should fail before JSON parsing");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("65536-byte bound"));
     }
 
     fn manifest_with(path_glob: &str, schemas: &[String]) -> String {

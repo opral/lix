@@ -10,6 +10,7 @@ import {
 } from "./shared-admission.js";
 import { DurableLocalAdmission } from "./durable-local-admission.js";
 import { startWorkerHost } from "./host.js";
+import { WorkerOperationScheduler } from "./operation-scheduler.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
 import type { LixOpenReport } from "../types.js";
 import type { SyncServerBindingOptions } from "../binding-types.js";
@@ -17,7 +18,17 @@ import {
 	serializeWorkerError,
 	type WorkerInput,
 	type WorkerResponse,
+	type SerializedWorkerError,
 } from "./protocol.js";
+
+export type RepositoryHostOutput = WorkerResponse | {
+	kind: "repository.disconnected";
+	error?: SerializedWorkerError;
+};
+export type RepositoryHostConnection = {
+	receive(message: WorkerInput): void;
+	disconnect(): Promise<void>;
+};
 
 export function createRepositoryHost() {
 	let owner: SharedEngineOwner | undefined;
@@ -28,11 +39,13 @@ export function createRepositoryHost() {
 	const admitted = new SharedAdmissionCache();
 	let rootIdentity: AdmissionIdentity | undefined;
 	let localRoot: Promise<import("../binding-types.js").LixBinding> | undefined;
+	const operationScheduler = new WorkerOperationScheduler();
 
 	return {
-		connect(port: MessagePort) {
+		connect(send: (message: RepositoryHostOutput) => void): RepositoryHostConnection {
 			let client: SharedEngineClient | undefined;
 			let disconnected = false;
+			let disconnecting: Promise<void> | undefined;
 			let input: ((message: WorkerInput) => void) | undefined;
 			const prepareClient = async (
 				...args: Parameters<typeof openLixBinding>
@@ -51,6 +64,10 @@ export function createRepositoryHost() {
 					raw.headerProvider ? await raw.headerProvider() : raw.headers;
 				let verifiedKey: string | undefined;
 				let verifiedGeneration: number | undefined;
+				let teardownCredential: {
+					identity: AdmissionIdentity;
+					headers: [string, string][];
+				} | undefined;
 				let candidateIdentity: AdmissionIdentity | undefined;
 				let candidateHeaders: [string, string][] | undefined;
 				let candidateOnline = false;
@@ -104,6 +121,11 @@ export function createRepositoryHost() {
 						const code = (error as { code?: string })?.code;
 						if (code === "LIX_ADMISSION_AUTH_REJECTED") {
 							if (
+								teardownCredential &&
+								sharedCredentialKey(raw.url, teardownCredential.headers) ===
+									sharedCredentialKey(raw.url, headers)
+							) teardownCredential = undefined;
+							if (
 								candidateHeaders &&
 								sharedCredentialKey(raw.url, candidateHeaders) ===
 									sharedCredentialKey(raw.url, headers)
@@ -137,6 +159,12 @@ export function createRepositoryHost() {
 					if (result.online) {
 						verifiedKey = sharedCredentialKey(raw.url, headers);
 						verifiedGeneration = credentialGeneration;
+						if (!rootIdentity || sameAdmission(result.identity, rootIdentity)) {
+							teardownCredential = {
+								identity: result.identity,
+								headers: headers.map(([name, value]) => [name, value]),
+							};
+						}
 					}
 					candidateCredentialGeneration = credentialGeneration;
 					candidateGeneration++;
@@ -147,6 +175,19 @@ export function createRepositoryHost() {
 				};
 				const routed: SyncServerBindingOptions = {
 					...raw,
+					teardownHeaders: async () => {
+						const credential = teardownCredential;
+						if (
+							!credential ||
+							(rootIdentity && !sameAdmission(credential.identity, rootIdentity))
+						) {
+							throw new HttpTransportError(
+								"LIX_TRANSPORT_UNAVAILABLE",
+								"No previously admitted credentials are available for session teardown",
+							);
+						}
+						return credential.headers.map(([name, value]) => [name, value]);
+					},
 					transport: async (request) => {
 						try {
 							const response = await transport(request);
@@ -199,6 +240,10 @@ export function createRepositoryHost() {
 						const rejectedKey = sharedCredentialKey(raw.url, headers);
 						if (verifiedKey === rejectedKey) verifiedKey = undefined;
 						if (
+							teardownCredential &&
+							sharedCredentialKey(raw.url, teardownCredential.headers) === rejectedKey
+						) teardownCredential = undefined;
+						if (
 							candidateHeaders &&
 							sharedCredentialKey(raw.url, candidateHeaders) === rejectedKey
 						) {
@@ -207,6 +252,9 @@ export function createRepositoryHost() {
 						}
 						admitted.remove(raw.url, headers);
 						await localAdmission.remove(headers).catch(() => undefined);
+					},
+					clearTeardownCredentials: () => {
+						teardownCredential = undefined;
 					},
 					commitIdentity: async () => {
 						if (!candidateIdentity)
@@ -248,7 +296,7 @@ export function createRepositoryHost() {
 			};
 			const controller = startWorkerHost(
 				{
-					postMessage: (message: WorkerResponse) => port.postMessage(message),
+					postMessage: (message: WorkerResponse) => send(message),
 					onMessage: (listener) => {
 						input = listener;
 					},
@@ -325,41 +373,45 @@ export function createRepositoryHost() {
 					);
 				},
 				true,
+				operationScheduler,
 			);
 			const disconnect = async () => {
-				if (disconnected) return;
 				disconnected = true;
-				if (client) owner?.deactivate(client);
 				let failure: unknown;
+				let detachAttempted = false;
 				try {
-					await controller.close();
+					await controller.close(async () => {
+						if (client) {
+							detachAttempted = true;
+							await owner?.detach(client);
+						}
+					});
 				} catch (error) {
 					failure = error;
 				}
-				try {
-					if (client) await owner?.detach(client);
-				} catch (error) {
-					failure ??= error;
+				if (client && !detachAttempted) {
+					try {
+						await owner?.detach(client);
+					} catch (error) {
+						failure ??= error;
+					}
 				}
 				try {
-					port.postMessage({
+					send({
 						kind: "repository.disconnected",
 						error:
 							failure === undefined ? undefined : serializeWorkerError(failure),
 					});
 				} finally {
-					port.close();
+					input = undefined;
 				}
 			};
-			port.onmessage = (event) => {
-				const message = event.data;
-				if (message?.kind === "repository.disconnect") {
-					void disconnect();
-					return;
-				}
-				input?.(message as WorkerInput);
+			// The router and engine host live in the same worker. Keep their
+			// call boundary direct; cross-context transport is owned by the router.
+			return {
+				receive(message) { input?.(message); },
+				disconnect() { return disconnecting ??= disconnect(); },
 			};
-			port.start();
 		},
 		async close() {
 			if (localRoot) await (await localRoot).close();

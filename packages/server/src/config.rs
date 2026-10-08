@@ -7,6 +7,12 @@ const DEFAULT_CACHE_DIR: &str = "/tmp/lix-server-slatedb-cache";
 const DEFAULT_DISK_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_BLOCK_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_METADATA_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+// SlateDB's file-handle cache is per runtime, while RLIMIT_NOFILE is per
+// process. Keep at most half of the process soft limit in the retained cache
+// and cap that share so high-limit hosts do not silently restore SlateDB's
+// large per-runtime default. The other half remains available for S3 sockets,
+// active I/O handles, Tokio/runtime descriptors, and server files.
+const MAX_RETAINED_CACHE_FILE_HANDLES: usize = 512;
 // Each retained Lix owns an independent SlateDB runtime and in-memory cache
 // allocation.
 // Keep a useful single-operator working set warm. Cache byte budgets are split
@@ -48,6 +54,7 @@ pub(crate) struct SlateDBCacheConfig {
     pub(crate) max_disk_cache_bytes: usize,
     pub(crate) block_cache_bytes: u64,
     pub(crate) metadata_cache_bytes: u64,
+    pub(crate) max_open_file_handles_per_lix: usize,
 }
 
 impl Config {
@@ -83,7 +90,7 @@ impl Config {
             region: env::var("S3_REGION").unwrap_or_else(|_| "auto".to_string()),
             prefix: storage_prefix()?,
             allow_http: boolean_env("S3_ALLOW_HTTP", false)?,
-            cache: SlateDBCacheConfig::from_env()?,
+            cache: SlateDBCacheConfig::from_env(max_open_lixes)?,
         };
 
         Ok(Self {
@@ -131,7 +138,7 @@ fn boolean_env(name: &str, default: bool) -> Result<bool> {
 }
 
 impl SlateDBCacheConfig {
-    fn from_env() -> Result<Self> {
+    fn from_env(max_open_lixes: usize) -> Result<Self> {
         let root_folder =
             env::var("SLATEDB_CACHE_DIR").unwrap_or_else(|_| DEFAULT_CACHE_DIR.to_string());
         if root_folder.trim().is_empty() {
@@ -141,6 +148,9 @@ impl SlateDBCacheConfig {
             positive_u64_env("SLATEDB_CACHE_MAX_BYTES", DEFAULT_DISK_CACHE_BYTES)?;
         let max_disk_cache_bytes = usize::try_from(disk_cache_bytes)
             .context("SLATEDB_CACHE_MAX_BYTES does not fit this platform")?;
+        let soft_file_limit = soft_open_file_limit()?;
+        let max_open_file_handles_per_lix =
+            per_lix_cache_file_handles(max_open_lixes, soft_file_limit)?;
 
         Ok(Self {
             root_folder: PathBuf::from(root_folder),
@@ -153,8 +163,46 @@ impl SlateDBCacheConfig {
                 "SLATEDB_METADATA_CACHE_BYTES",
                 DEFAULT_METADATA_CACHE_BYTES,
             )?,
+            max_open_file_handles_per_lix,
         })
     }
+}
+
+fn cache_file_handle_budget(soft_file_limit: usize) -> usize {
+    (soft_file_limit / 2).min(MAX_RETAINED_CACHE_FILE_HANDLES)
+}
+
+fn per_lix_cache_file_handles(max_open_lixes: usize, soft_file_limit: usize) -> Result<usize> {
+    if max_open_lixes == 0 {
+        bail!("LIX_SERVER_MAX_OPEN_LIXS must be greater than zero");
+    }
+    let budget = cache_file_handle_budget(soft_file_limit);
+    if max_open_lixes > budget {
+        bail!(
+            "LIX_SERVER_MAX_OPEN_LIXS ({max_open_lixes}) exceeds the process SlateDB cache file-handle budget ({budget})"
+        );
+    }
+    Ok(budget / max_open_lixes)
+}
+
+#[cfg(unix)]
+fn soft_open_file_limit() -> Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit initializes the supplied rlimit on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read RLIMIT_NOFILE");
+    }
+    Ok(usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
+}
+
+#[cfg(not(unix))]
+fn soft_open_file_limit() -> Result<usize> {
+    // The server's supported production targets are Unix. Keep other targets
+    // conservative rather than inheriting SlateDB's per-runtime default.
+    Ok(1024)
 }
 
 fn positive_u64_env(name: &str, default: u64) -> Result<u64> {
@@ -227,7 +275,24 @@ mod tests {
         assert_eq!(config.storage.region, "auto");
         assert_eq!(config.storage.prefix, "");
         assert!(!config.storage.allow_http);
+        assert_eq!(
+            config.storage.cache.max_open_file_handles_per_lix,
+            per_lix_cache_file_handles(32, soft_open_file_limit().unwrap()).unwrap()
+        );
         clear_server_env();
+    }
+
+    #[test]
+    fn cache_file_handle_budget_preserves_process_headroom_and_scales_with_runtime_cap() {
+        let budget = cache_file_handle_budget(1024);
+        let per_runtime = per_lix_cache_file_handles(32, 1024).unwrap();
+
+        assert_eq!(budget, 512);
+        assert_eq!(per_runtime, 16);
+        assert!(per_runtime * 32 <= budget);
+        assert_eq!(per_lix_cache_file_handles(7, 1024).unwrap(), 73);
+        assert!(per_lix_cache_file_handles(513, 1024).is_err());
+        assert!(per_lix_cache_file_handles(0, 1024).is_err());
     }
 
     #[test]
@@ -368,6 +433,11 @@ mod tests {
                 max_disk_cache_bytes: 1024,
                 block_cache_bytes: 256,
                 metadata_cache_bytes: 64,
+                max_open_file_handles_per_lix: per_lix_cache_file_handles(
+                    32,
+                    soft_open_file_limit().unwrap(),
+                )
+                .unwrap(),
             }
         );
         clear_server_env();
