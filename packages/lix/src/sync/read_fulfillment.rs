@@ -5325,6 +5325,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_authority_endpoint_rejects_untracked_catalog_identity_recipe() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![LogicalReadInterest::Scan {
+                request: crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["lix_registered_schema".to_owned()],
+                        branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                        file_ids: vec![crate::NullableKeyFilter::Null],
+                        untracked: Some(false),
+                        ..Default::default()
+                    },
+                    projection: crate::hot_state::HotStateProjection {
+                        columns: vec!["row_pk".to_owned()],
+                    },
+                    ..Default::default()
+                },
+                domain: InterestDomain::Untracked,
+            }],
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::CommitGraphRecord(
+                    leased.descriptor.selected_branch.head.commit_id.clone(),
+                ),
+            )],
+            continuation: None,
+        };
+        let error = authority
+            .read_sync_fulfillment(&request, &leased.lease.lease_id)
+            .await
+            .expect_err("catalog identity scans must remain tracked-only");
+        assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_continuation_rejects_replay_skips_and_closure_changes() {
         let (mut request, mut response) = fixture().await;
         request.continuation = Some(ReadContinuation {
@@ -5958,6 +6005,29 @@ mod tests {
             .leased_partial_replica_descriptor(None)
             .await
             .unwrap();
+        let file_content_interest = LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".to_owned(),
+                        "lix_binary_blob_ref".to_owned(),
+                        "lix_directory_descriptor".to_owned(),
+                    ],
+                    branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                    ..Default::default()
+                },
+                projection: crate::hot_state::HotStateProjection {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            file_ids: Some(vec![file_id.clone()]),
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate: crate::hot_state::FilePathInterest::All,
+            byte_range: None,
+        };
         let request = ReadFulfillmentRequest {
             operation_id: uuid::Uuid::now_v7().to_string(),
             release: false,
@@ -5965,29 +6035,7 @@ mod tests {
             epoch_id: uuid::Uuid::now_v7().to_string(),
             descriptor: leased.descriptor.clone(),
             interests: vec![
-                LogicalReadInterest::FileContent {
-                    request: crate::hot_state::HotStateScanRequest {
-                        filter: crate::hot_state::HotStateFilter {
-                            schema_keys: vec![
-                                "lix_file_descriptor".to_owned(),
-                                "lix_binary_blob_ref".to_owned(),
-                                "lix_directory_descriptor".to_owned(),
-                            ],
-                            branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
-                            ..Default::default()
-                        },
-                        projection: crate::hot_state::HotStateProjection {
-                            columns: vec!["snapshot_content".to_owned()],
-                        },
-                        limit: None,
-                    },
-                    file_ids: Some(vec![file_id.clone()]),
-                    directory_ids: None,
-                    root_directory: false,
-                    indexed: true,
-                    path_predicate: crate::hot_state::FilePathInterest::All,
-                    byte_range: None,
-                },
+                file_content_interest.clone(),
                 LogicalReadInterest::FilesystemPaths {
                     scope: crate::filesystem::FilesystemPathIndexScope::FileIds(vec![
                         file_id.clone(),
@@ -5995,6 +6043,31 @@ mod tests {
                     branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
                     include_blob_refs: true,
                     cache_small_blob_data: false,
+                },
+                // A second recipe for the same file must merge with the first
+                // before catalog preparation. The global account scan adds a
+                // distinct returned-row branch to the same authority closure.
+                file_content_interest,
+                LogicalReadInterest::Scan {
+                    request: crate::hot_state::HotStateScanRequest {
+                        filter: crate::hot_state::HotStateFilter {
+                            schema_keys: vec!["lix_account".to_owned()],
+                            row_pks: vec![crate::row_pk::RowPk::uuid_from_canonical(
+                                crate::SYSTEM_ACCOUNT_ID,
+                            )
+                            .unwrap()],
+                            branch_ids: vec![leased.descriptor.global_branch.branch_id.clone()],
+                            file_ids: vec![crate::NullableKeyFilter::Null],
+                            untracked: Some(false),
+                            global: Some(true),
+                            ..Default::default()
+                        },
+                        projection: crate::hot_state::HotStateProjection {
+                            columns: vec!["snapshot_content".to_owned()],
+                        },
+                        ..Default::default()
+                    },
+                    domain: InterestDomain::Tracked,
                 },
             ],
             required: vec![
@@ -6012,6 +6085,7 @@ mod tests {
             .await
             .unwrap();
         assert!(response.inputs.iter().any(|input| matches!(&input.address, ReadInputAddress::ChangeRecord { schema_key, .. } if schema_key == "lix_file_descriptor" || schema_key == "lix_binary_blob_ref")), "the test must exercise a selected mutable payload");
+        assert!(response.inputs.iter().any(|input| matches!(&input.address, ReadInputAddress::ChangeRecord { branch_id, schema_key, row_pk, .. } if branch_id == &leased.descriptor.global_branch.branch_id && schema_key == "lix_account" && row_pk == &crate::row_pk::RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID).unwrap())), "the same response must close a global-branch returned row");
         let response: ReadFulfillmentResponse =
             serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
         validate_complete(&request, &response).unwrap();

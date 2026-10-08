@@ -561,9 +561,6 @@ where
                     .await?;
                 returned_identities.extend(executable_rows.iter().cloned());
                 catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
                 merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
             LogicalReadInterest::FileContent {
@@ -632,9 +629,6 @@ where
                     .await?;
                 returned_identities.extend(executable_rows.iter().cloned());
                 catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
                 merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
             }
         }
@@ -686,15 +680,15 @@ where
         .await?;
     returned_identities.extend(executable_rows.iter().cloned());
     catalog_branches.extend(executable_rows.iter().map(|(branch, _)| branch.clone()));
-    candidate_catalog
-        .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-        .await?;
     merge_returned_executable_rows(&mut returned_executable_rows, &executable_rows)?;
     let returned_executable_rows = returned_executable_rows
         .by_branch
         .into_iter()
         .flat_map(|(branch, keys)| keys.into_iter().map(move |key| (branch.clone(), key)))
         .collect::<Vec<_>>();
+    candidate_catalog
+        .prepare_returned_row_catalogs(&reader, &returned_executable_rows, None)
+        .await?;
     if matches!(&purpose, NativeReadPreparationPurpose::Authority { .. }) {
         returned_identities.extend(
             prepare_authority_returned_row_executables(
