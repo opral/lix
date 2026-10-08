@@ -18,6 +18,26 @@ Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and ope
 | `uuidv7()`                              | uuid        | Generate a UUIDv7 value.                                                          |
 | `CURRENT_TIMESTAMP`                     | timestamptz | Transaction-start instant at microsecond precision.                               |
 
+## Hashing and binary encoding
+
+`sha256(value)` returns a binary SHA-256 digest of text or bytes.
+`encode(bytes, 'hex')` converts bytes to lowercase hexadecimal text:
+
+```sql
+SELECT encode(sha256(content), 'hex') AS content_sha256
+FROM lix_file
+WHERE path = $1;
+```
+
+Hash `content` directly to verify binary files as well as text. The query reads
+and hashes the complete file on demand, returning only its checksum.
+
+DataFusion's cryptographic and encoding functions are enabled, including
+`digest(value, 'sha256')`, `digest(value, 'blake3')`, `encode`, and `decode`.
+`sha256` and `digest` return binary values; `encode` returns text. SQL NULL inputs
+propagate as NULL. See the [DataFusion function reference](https://datafusion.apache.org/user-guide/sql/scalar_functions.html#hashing-functions)
+for other supported algorithms and encoding formats.
+
 ## Row references
 
 `lix_row_ref` always takes the relation name, its file scope, and the typed

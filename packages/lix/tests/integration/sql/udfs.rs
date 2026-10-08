@@ -502,3 +502,62 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(sql_content_checksums_hash_exact_bytes, |sim| async move {
+    use sha2::{Digest, Sha256};
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let mut cases = vec![
+        (
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        ),
+        (
+            b"abc".to_vec(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
+        ),
+        (
+            "aé—".as_bytes().to_vec(),
+            "8b9acaeec91cfb9a6149d92775090703d1019fb5599aec57386f86e7f7f55bd4".to_owned(),
+        ),
+        (
+            vec![0, 255, 128, 10, 13, 1],
+            "486611a654b4ff12fc79f5aef10611737fe1553f36753152ab83d4a79bd05cc7".to_owned(),
+        ),
+    ];
+    // Exceeds the maximum 4 MiB CAS chunk size.
+    let large = (0..5 * 1024 * 1024)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected = format!("{:x}", Sha256::digest(&large));
+    cases.push((large, expected));
+    for (bytes, expected) in cases {
+        session.execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/checksum.bin', $1) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
+                &[Value::Blob(bytes.clone().into())],
+            ).await.unwrap();
+        let result = session.execute(
+                "SELECT encode(sha256(content), 'hex') AS content_sha256, encode(digest(content, 'sha256'), 'hex') AS digest_sha256, decode(encode(content, 'base64'), 'base64') AS roundtrip FROM lix_file WHERE path = $1",
+                &[Value::Text("/checksum.bin".into())],
+            ).await.unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].get::<String>("content_sha256").unwrap(),
+            expected
+        );
+        assert_eq!(
+            result.rows()[0].get::<String>("digest_sha256").unwrap(),
+            expected
+        );
+        assert_eq!(result.rows()[0].values()[2], Value::Blob(bytes.into()));
+    }
+    let scalar = session.execute(
+            "SELECT encode(sha256('abc'), 'hex') AS checksum, encode(sha256(CAST(NULL AS BYTEA)), 'hex') AS null_checksum",
+            &[],
+        ).await.unwrap();
+    assert_eq!(
+        scalar.rows()[0].get::<String>("checksum").unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(scalar.rows()[0].values()[1], Value::Null);
+});

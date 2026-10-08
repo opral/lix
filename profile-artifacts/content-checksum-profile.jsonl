@@ -1,0 +1,16 @@
+{"backend":"rocksdb","query":"content_read","file_bytes":46080,"samples":20,"median_ms":0.111479,"p95_ms":0.2725,"result_value_bytes":46080}
+{"backend":"rocksdb","query":"sha256_hex","file_bytes":46080,"samples":20,"median_ms":0.328854,"p95_ms":0.7977909999999999,"result_value_bytes":64}
+{"backend":"rocksdb","query":"content_read","file_bytes":1048576,"samples":20,"median_ms":0.7821875,"p95_ms":1.236167,"result_value_bytes":1048576}
+{"backend":"rocksdb","query":"sha256_hex","file_bytes":1048576,"samples":20,"median_ms":1.6123540000000003,"p95_ms":2.266333,"result_value_bytes":64}
+{"backend":"rocksdb","query":"content_read","file_bytes":16777216,"samples":20,"median_ms":10.561416999999999,"p95_ms":11.751667000000001,"result_value_bytes":16777216}
+{"backend":"rocksdb","query":"sha256_hex","file_bytes":16777216,"samples":20,"median_ms":16.3522085,"p95_ms":20.962875,"result_value_bytes":64}
+{"backend":"rocksdb","query":"content_read","file_bytes":66060288,"samples":20,"median_ms":40.489354000000006,"p95_ms":52.060500000000005,"result_value_bytes":66060288}
+{"backend":"rocksdb","query":"sha256_hex","file_bytes":66060288,"samples":20,"median_ms":64.339437,"p95_ms":70.313,"result_value_bytes":64}
+{"backend":"memory","query":"content_read","file_bytes":46080,"samples":20,"median_ms":0.0686255,"p95_ms":0.16325,"result_value_bytes":46080}
+{"backend":"memory","query":"sha256_hex","file_bytes":46080,"samples":20,"median_ms":0.28079149999999997,"p95_ms":0.670459,"result_value_bytes":64}
+{"backend":"memory","query":"content_read","file_bytes":1048576,"samples":20,"median_ms":0.6776249999999999,"p95_ms":0.97125,"result_value_bytes":1048576}
+{"backend":"memory","query":"sha256_hex","file_bytes":1048576,"samples":20,"median_ms":1.5952085,"p95_ms":1.953041,"result_value_bytes":64}
+{"backend":"memory","query":"content_read","file_bytes":16777216,"samples":20,"median_ms":8.395771,"p95_ms":9.806042,"result_value_bytes":16777216}
+{"backend":"memory","query":"sha256_hex","file_bytes":16777216,"samples":20,"median_ms":13.9407915,"p95_ms":15.587667,"result_value_bytes":64}
+{"backend":"memory","query":"content_read","file_bytes":66060288,"samples":20,"median_ms":30.611875,"p95_ms":32.515542,"result_value_bytes":66060288}
+{"backend":"memory","query":"sha256_hex","file_bytes":66060288,"samples":20,"median_ms":50.2710625,"p95_ms":53.308082999999996,"result_value_bytes":64}
