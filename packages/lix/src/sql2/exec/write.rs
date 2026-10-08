@@ -539,8 +539,14 @@ async fn execute_write_logical_plan_with_mode_inner(
         ));
     }
 
-    let result =
-        super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
+    // Keep the larger DataFusion future out of this dispatcher future's state machine;
+    // only the fallback allocates it.
+    let result = Box::pin(super::datafusion::execute_datafusion_write_logical_plan(
+        ctx,
+        &write_plan,
+        params,
+    ))
+    .await?;
     Ok((result, WriteExecutorPath::DataFusion))
 }
 
