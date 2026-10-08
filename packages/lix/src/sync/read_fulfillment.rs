@@ -1766,24 +1766,27 @@ async fn discover_bounded_with_read(
     )
     .await?;
     let mut required_locators = required_locators.into_iter();
-    for address in &request.required {
-        if let ReadInputAddress::BlobChunk(hash) = address {
-            let bytes = crate::binary_cas::load_verified_chunk(
-                &read,
-                crate::binary_cas::ChunkHash::from_bytes(*hash),
-            )
-            .await?
-            .ok_or_else(|| invalid("authority lacks required chunk"))?;
-            address.validate(&bytes)?;
-            logical_spool
-                .lock()
-                .map_err(|_| invalid("logical spool poisoned"))?
-                .append(ReadInput {
-                    address: address.clone(),
-                    bytes,
-                })?;
+    let mut required_index = 0usize;
+    while required_index < request.required.len() {
+        if matches!(
+            &request.required[required_index],
+            ReadInputAddress::BlobChunk(_)
+        ) {
+            let run_start = required_index;
+            while required_index < request.required.len()
+                && matches!(
+                    &request.required[required_index],
+                    ReadInputAddress::BlobChunk(_)
+                )
+            {
+                required_index += 1;
+            }
+            let addresses = &request.required[run_start..required_index];
+            append_required_blob_chunk_run(&read, addresses, &logical_spool).await?;
             continue;
         }
+        let address = &request.required[required_index];
+        required_index += 1;
         let (space, key) = address.coordinate()?;
         // Change locators are logical metadata addresses. Directly authored
         // changes intentionally have no locator row at this key; use the same
@@ -2004,6 +2007,60 @@ async fn discover_bounded_with_read(
     )?;
     validate_response(request, &response)?;
     Ok(response)
+}
+
+async fn append_required_blob_chunk_run(
+    read: &impl StorageAdapterRead,
+    addresses: &[ReadInputAddress],
+    logical_spool: &Arc<Mutex<spool::InputSpool>>,
+) -> Result<(), LixError> {
+    if addresses.is_empty() || addresses.len() > 32 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "required blob chunk run exceeds its validated bounds",
+        ));
+    }
+    let chunk_ids = addresses
+        .iter()
+        .map(|address| match address {
+            ReadInputAddress::BlobChunk(hash) => {
+                Ok(crate::binary_cas::ChunkHash::from_bytes(*hash))
+            }
+            _ => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "required blob chunk run contains another input kind",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let logical_spool = logical_spool.clone();
+    crate::binary_cas::visit_verified_raw_chunks(read, &chunk_ids, |index, chunk_id, payload| {
+        let address = addresses.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "verified chunk visitor returned an invalid request index",
+            )
+        })?;
+        let ReadInputAddress::BlobChunk(expected_hash) = address else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "verified chunk visitor crossed a required-input boundary",
+            ));
+        };
+        if expected_hash != chunk_id.as_bytes() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "verified chunk visitor changed request ordering",
+            ));
+        }
+        let Some(payload) = payload else {
+            return Err(invalid("authority lacks required chunk"));
+        };
+        logical_spool
+            .lock()
+            .map_err(|_| invalid("logical spool poisoned"))?
+            .append_borrowed(address.clone(), payload)
+    })
+    .await
 }
 
 fn input_digest(
@@ -6885,6 +6942,104 @@ mod tests {
         assert!(demand.is_none(), "resident chunk retained a demand marker");
         authority.close().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn required_chunk_page_keeps_order_and_fails_without_a_closure_on_missing_input() {
+        let storage = StorageAdapter::new(Memory::new());
+        let payloads = [b"first required chunk".as_slice(), b"second required chunk"];
+        let hashes = payloads
+            .iter()
+            .map(|payload| crate::binary_cas::ChunkHash::from_content(payload))
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        for (hash, payload) in hashes.iter().copied().zip(payloads) {
+            crate::binary_cas::stage_verified_raw_chunk(&mut writes, hash, payload).unwrap();
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+
+        let ordered_addresses = hashes
+            .iter()
+            .rev()
+            .map(|hash| ReadInputAddress::BlobChunk(*hash.as_bytes()))
+            .collect::<Vec<_>>();
+        let payload_store = Arc::new(Mutex::new(spool::PayloadSpool::default()));
+        let ordered_spool = Arc::new(Mutex::new(spool::InputSpool::new(payload_store)));
+        append_required_blob_chunk_run(&read, &ordered_addresses, &ordered_spool)
+            .await
+            .unwrap();
+        let ordered_spool = ordered_spool.lock().unwrap();
+        assert_eq!(ordered_spool.inputs.len(), 2);
+        for (index, expected_hash) in hashes.iter().rev().enumerate() {
+            let input = ordered_spool.read(index).unwrap();
+            assert_eq!(
+                input.address,
+                ReadInputAddress::BlobChunk(*expected_hash.as_bytes())
+            );
+            assert_eq!(input.bytes, payloads[1 - index]);
+        }
+        drop(ordered_spool);
+
+        let missing_hash = crate::binary_cas::ChunkHash::from_content(b"missing required chunk");
+        let missing_addresses = vec![
+            ReadInputAddress::BlobChunk(*hashes[0].as_bytes()),
+            ReadInputAddress::BlobChunk(*missing_hash.as_bytes()),
+            ReadInputAddress::BlobChunk(*hashes[1].as_bytes()),
+        ];
+        let failed_payload_store = Arc::new(Mutex::new(spool::PayloadSpool::default()));
+        let failed_spool = Arc::new(Mutex::new(spool::InputSpool::new(failed_payload_store)));
+        let error = append_required_blob_chunk_run(&read, &missing_addresses, &failed_spool)
+            .await
+            .expect_err("a missing required chunk must prevent closure completion");
+        assert_eq!(error.message, "authority lacks required chunk");
+        assert_eq!(
+            failed_spool.lock().unwrap().inputs.len(),
+            1,
+            "only the prefix before the missing required item can enter the private spool"
+        );
+        drop(failed_spool);
+    }
+
+    #[tokio::test]
+    async fn fulfillment_endpoint_returns_no_closure_for_a_missing_required_chunk() {
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let missing = crate::binary_cas::ChunkHash::from_content(b"absent required chunk");
+        let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: leased.descriptor.clone(),
+            interests: vec![LogicalReadInterest::FilesystemMetadata {
+                directory: false,
+                branch_ids: vec![leased.descriptor.selected_branch.branch_id.clone()],
+                file_ids: None,
+                directory_ids: None,
+                root_directory: false,
+                path_predicate: crate::hot_state::FilePathInterest::All,
+            }],
+            required: vec![ReadInputAddress::BlobChunk(*missing.as_bytes())],
+            continuation: None,
+        };
+
+        let error = authority
+            .read_sync_fulfillment(&request, &leased.lease.lease_id)
+            .await
+            .expect_err("a missing required chunk must not produce a closure response");
+        assert_eq!(error.message, "authority lacks required chunk");
+        authority.close().await.unwrap();
+    }
+
 }
 
 #[cfg(test)]

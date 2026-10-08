@@ -243,13 +243,23 @@ impl InputSpool {
         }
     }
     pub(super) fn append(&mut self, input: ReadInput) -> Result<(), LixError> {
-        input.address.validate(&input.bytes)?;
-        let coordinate = input.address.coordinate()?;
+        let ReadInput { address, bytes } = input;
+        self.append_borrowed(address, &bytes)
+    }
+    /// Appends a validated input from a borrowed provider page without first
+    /// copying its payload into a ReadInput allocation.
+    pub(super) fn append_borrowed(
+        &mut self,
+        address: ReadInputAddress,
+        bytes: &[u8],
+    ) -> Result<(), LixError> {
+        address.validate(bytes)?;
+        let coordinate = address.coordinate()?;
         if let Some(&index) = self.coordinates.get(&coordinate) {
             let existing = &self.inputs[index];
-            if existing.address != input.address
-                || existing.payload.len != input.bytes.len()
-                || existing.payload.digest != *blake3::hash(&input.bytes).as_bytes()
+            if existing.address != address
+                || existing.payload.len != bytes.len()
+                || existing.payload.digest != *blake3::hash(bytes).as_bytes()
             {
                 return Err(invalid(
                     "operation spool repeats a coordinate with different input",
@@ -257,13 +267,13 @@ impl InputSpool {
             }
             return Ok(());
         }
-        let index_bytes = serde_json::to_vec(&input.address)
+        let index_bytes = serde_json::to_vec(&address)
             .map_err(|_| invalid("invalid spool address"))?
             .len()
             .saturating_add(coordinate.1.0.len())
             .saturating_add(128);
         if self.inputs.len() >= super::MAX_RECORDS
-            || self.payload_bytes.saturating_add(input.bytes.len()) > MAX_PAYLOAD_BYTES
+            || self.payload_bytes.saturating_add(bytes.len()) > MAX_PAYLOAD_BYTES
             || self.index_bytes.saturating_add(index_bytes) > 4 * 1024 * 1024
         {
             return Err(LixError::new(
@@ -275,12 +285,12 @@ impl InputSpool {
             .payloads
             .lock()
             .map_err(|_| invalid("operation spool poisoned"))?
-            .append(&input.bytes)?;
+            .append(bytes)?;
         self.coordinates.insert(coordinate, self.inputs.len());
         self.payload_bytes += payload.len;
         self.index_bytes += index_bytes;
         self.inputs.push(IndexedInput {
-            address: input.address,
+            address,
             payload,
         });
         Ok(())
