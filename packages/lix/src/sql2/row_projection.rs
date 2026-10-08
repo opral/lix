@@ -1370,6 +1370,55 @@ impl VariableWidthProjection {
         Ok(())
     }
 
+    fn push_jsonb_key(&mut self, value: &str) -> Result<(), LixError> {
+        let row_start = self.values.len();
+        if let Err(error) = lix_schema::append_jsonb_equality_key(&mut self.values, value) {
+            self.values.truncate(row_start);
+            return Err(jsonb_key_error(error));
+        }
+        let end = match i32::try_from(self.values.len()) {
+            Ok(end) => end,
+            Err(_) => {
+                self.values.truncate(row_start);
+                return Err(projected_utf8_offset_error());
+            }
+        };
+        self.offsets.push(end);
+        self.valid.push(true);
+        Ok(())
+    }
+
+    fn replace_last_jsonb_key(&mut self, value: &str) -> Result<(), LixError> {
+        let row_start = usize::try_from(
+            *self
+                .offsets
+                .get(self.offsets.len().saturating_sub(2))
+                .expect("projection sink must start the row first"),
+        )
+        .expect("Arrow UTF-8 offset is nonnegative");
+        self.values.truncate(row_start);
+        if let Err(error) = lix_schema::append_jsonb_equality_key(&mut self.values, value) {
+            self.values.truncate(row_start);
+            return Err(jsonb_key_error(error));
+        }
+        let end = match i32::try_from(self.values.len()) {
+            Ok(end) => end,
+            Err(_) => {
+                self.values.truncate(row_start);
+                return Err(projected_utf8_offset_error());
+            }
+        };
+        *self
+            .offsets
+            .last_mut()
+            .expect("projection sink must start the row first") = end;
+        *self
+            .valid
+            .last_mut()
+            .expect("projection sink must start the row first") = true;
+        Ok(())
+    }
+
     fn into_array(self) -> StringArray {
         StringArray::new(
             OffsetBuffer::new(ScalarBuffer::from(self.offsets)),
@@ -1377,6 +1426,20 @@ impl VariableWidthProjection {
             Some(NullBuffer::from(self.valid)),
         )
     }
+}
+
+fn jsonb_key_error(error: lix_schema::JsonbError) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("cannot project JSONB SQL equality key: {error}"),
+    )
+}
+
+fn projected_utf8_offset_error() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "projected UTF-8 values exceed Arrow's i32 offset range",
+    )
 }
 
 impl RowProjectionColumn {
@@ -1422,8 +1485,11 @@ impl RowProjectionColumn {
                 values.replace_last(value.as_deref())?;
             }
             Self::Jsonb(values) if field.column_type == SchemaColumnType::Jsonb => {
-                let value = raw_json_text(raw);
-                values.replace_last(value.as_deref())?;
+                if raw.get().trim() == "null" {
+                    values.replace_last(None)?;
+                } else {
+                    values.replace_last_jsonb_key(raw.get())?;
+                }
             }
             Self::Integer(values) if field.column_type == SchemaColumnType::Integer => {
                 let value = parse_json_value(raw)?;
@@ -1508,8 +1574,7 @@ impl RowProjectionColumn {
                 values.replace_last(Some(value.as_str()))?;
             }
             (Self::Jsonb(values), crate::Value::Jsonb(value)) => {
-                let value = value.to_string();
-                values.replace_last(Some(&value))?;
+                values.replace_last_jsonb_key(value.as_str())?;
             }
             (Self::Integer(values), crate::Value::Integer(value)) => {
                 *values
@@ -1580,9 +1645,7 @@ impl RowProjectionColumn {
                 values.replace_last(Some(&value))?;
             }
             (Self::Jsonb(values), BorrowedNativeValue::Jsonb(value)) => {
-                // The typed-wire reader has already validated canonical JSON
-                // text and UTF-8, so Arrow can copy the borrowed string directly.
-                values.replace_last(Some(value))?;
+                values.replace_last_jsonb_key(value)?;
             }
             (Self::Integer(values), BorrowedNativeValue::Int8(value)) => {
                 *values.last_mut().expect("projection row was started") = Some(value);
@@ -1632,7 +1695,7 @@ impl RowProjectionColumn {
                 values.push(Some(&value))?;
             }
             (Self::Jsonb(values), BorrowedNativeValue::Jsonb(value)) => {
-                values.push(Some(value))?;
+                values.push_jsonb_key(value)?;
             }
             (Self::Integer(values), BorrowedNativeValue::Int8(value)) => {
                 values.push(Some(value));

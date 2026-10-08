@@ -673,7 +673,23 @@ static LIX_BRANCH_COLS: ColumnTable<BranchRow> = ColumnTable {
         ("hidden", Col::Bool(|row| Some(row.hidden))),
         (
             "lixcol_metadata",
-            Col::Utf8(|row| row.metadata.as_ref().map(TransactionJson::normalized)),
+            Col::Utf8Fallible(|row| {
+                row.metadata
+                    .as_ref()
+                    .map(|metadata| {
+                        crate::common::metadata_sql_equality_key(metadata.normalized()).map_err(
+                            |error| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "invalid lix_branch metadata JSONB equality key: {error}"
+                                    ),
+                                )
+                            },
+                        )
+                    })
+                    .transpose()
+            }),
         ),
         (
             "commit_id",

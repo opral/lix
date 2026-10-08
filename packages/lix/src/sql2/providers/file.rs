@@ -45,8 +45,8 @@ use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
-    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    FilesystemPathKind, FilesystemPathSelection, read_path_index_rows,
+    FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
+    FilesystemPathSelection, read_path_index_rows,
 };
 use crate::functions::FunctionProviderHandle;
 use crate::hot_state::MaterializedHotStateRow;
@@ -57,9 +57,8 @@ use crate::hot_state::{
 };
 use crate::plugin::runtime::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PluginActorKey, PluginFileOwner, PluginRegistry,
-    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
-    plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id,
+    PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path, plugin_archive_delete_origin,
+    plugin_archive_file_id_matches, plugin_key_from_archive_path, plugin_storage_archive_file_id,
 };
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{
@@ -76,10 +75,7 @@ use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 use crate::transaction_types::{RawWriteBatch, TransactionJson};
-use crate::{
-    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
-    serialize_row_metadata,
-};
+use crate::{GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -625,9 +621,7 @@ impl LixFileSpec {
 
 /// Restrict a hydration index to canonical IDs when every candidate is valid.
 /// Invalid values disable this optional optimization and keep path lookup intact.
-fn canonical_file_ids_for_path_index(
-    file_ids: Option<&BTreeSet<String>>,
-) -> Option<Vec<String>> {
+fn canonical_file_ids_for_path_index(file_ids: Option<&BTreeSet<String>>) -> Option<Vec<String>> {
     let file_ids = file_ids?;
     file_ids
         .iter()
@@ -736,12 +730,9 @@ async fn try_exact_file_content_with_bounded_path_validation(
         // pathful renderer reports that state as unavailable, so it must
         // handle any owner even when the current registry is empty.
         let owner_targets = vec![(descriptor.key.branch_id().to_owned(), file_id.to_owned())];
-        if !crate::plugin::runtime::load_plugin_owner_pages(
-            hot_state.as_ref(),
-            &owner_targets,
-        )
-        .await?
-        .is_empty()
+        if !crate::plugin::runtime::load_plugin_owner_pages(hot_state.as_ref(), &owner_targets)
+            .await?
+            .is_empty()
         {
             return Ok(None);
         }
@@ -752,7 +743,10 @@ async fn try_exact_file_content_with_bounded_path_validation(
     if data.len() != 1 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("blob reader returned {} values for 1 requested hashes", data.len()),
+            format!(
+                "blob reader returned {} values for 1 requested hashes",
+                data.len()
+            ),
         ));
     }
     let data = data.pop().flatten().unwrap_or_default();
@@ -859,8 +853,7 @@ pub(crate) async fn execute_exact_lix_file_read(
     }
     if column == ExactLixFileReadColumn::Content
         && let ExactLixFileReadSelector::Id(file_id) = selector
-        && filesystem_path_index
-            .prefer_direct_exact_content(&request.filter.branch_ids, file_id)
+        && filesystem_path_index.prefer_direct_exact_content(&request.filter.branch_ids, file_id)
         && let Some(result) = try_exact_file_content_with_bounded_path_validation(
             &hot_state,
             &blob_reader,
@@ -872,8 +865,7 @@ pub(crate) async fn execute_exact_lix_file_read(
         )
         .await?
     {
-        filesystem_path_index
-            .record_direct_exact_content(&request.filter.branch_ids, file_id);
+        filesystem_path_index.record_direct_exact_content(&request.filter.branch_ids, file_id);
         return Ok(result);
     }
     let index = filesystem_path_index
@@ -1052,7 +1044,9 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     interest::retain_content(
         hot_state.as_ref(),
         &request,
-        &file_ids.map_or(FileIdConstraint::All, |ids| FileIdConstraint::Ids(ids.clone())),
+        &file_ids.map_or(FileIdConstraint::All, |ids| {
+            FileIdConstraint::Ids(ids.clone())
+        }),
         &FileIdConstraint::All,
         false,
         &FilePathPredicate::In(paths.clone()),
@@ -1435,10 +1429,10 @@ impl TableSpec for LixFileSpec {
             needs_blob_rows,
             needs_file_timestamps,
         ) && matches!(&target_file_ids, FileIdConstraint::Ids(ids)
-            if ids.len() == 1 && self.filesystem_path_index.prefer_direct_exact_path(
-                &request.filter.branch_ids,
-                ids.iter().next().expect("one exact file ID"),
-            )) {
+        if ids.len() == 1 && self.filesystem_path_index.prefer_direct_exact_path(
+            &request.filter.branch_ids,
+            ids.iter().next().expect("one exact file ID"),
+        )) {
             let FileIdConstraint::Ids(file_ids) = &target_file_ids else {
                 unreachable!("bounded ID path projection requires exact file IDs")
             };
@@ -5373,8 +5367,13 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_metadata" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| entry.metadata())
-                    .collect::<Vec<_>>(),
+                    .map(|entry| {
+                        entry
+                            .metadata()
+                            .map(file_jsonb_sql_equality_key)
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?,
             )),
             other => {
                 return Err(LixError::new(
@@ -5619,7 +5618,10 @@ async fn lix_file_record_batch_from_prepared(
             updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
             untracked: live.untracked(),
-            metadata: live.metadata().map(|value| serialize_row_metadata(value)),
+            metadata: live
+                .metadata()
+                .map(|value| file_jsonb_sql_equality_key(value.as_str()))
+                .transpose()?,
         });
     }
 
@@ -6216,14 +6218,8 @@ async fn plugin_render_context_with_branches(
                 .map(move |file_id| (branch_id.clone(), file_id.clone()))
         })
         .collect::<Vec<_>>();
-    let owner_rows: BTreeMap<
-        (String, String),
-        crate::plugin::runtime::PluginOwnerLookupRow,
-    > = crate::plugin::runtime::load_plugin_owner_pages(
-        hot_state.as_ref(),
-        &owner_targets,
-    )
-    .await?;
+    let owner_rows: BTreeMap<(String, String), crate::plugin::runtime::PluginOwnerLookupRow> =
+        crate::plugin::runtime::load_plugin_owner_pages(hot_state.as_ref(), &owner_targets).await?;
     let mut owners_by_file = BTreeMap::new();
     let mut owner_change_ids_by_file = BTreeMap::new();
     for ((branch_id, file_id), loaded) in owner_rows {
@@ -7463,6 +7459,15 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
 
+fn file_jsonb_sql_equality_key(value: &str) -> Result<String, LixError> {
+    crate::common::metadata_sql_equality_key(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("invalid lix_file metadata JSONB equality key: {error}"),
+        )
+    })
+}
+
 fn file_id_row_pk(file_id: &str) -> Result<RowPk, LixError> {
     RowPk::uuid_from_canonical(file_id).map_err(|error| {
         LixError::new(
@@ -8465,12 +8470,14 @@ mod tests {
         assert_eq!(batch, indexed_batch, "direct and indexed rows must agree");
         assert_eq!(indexed_requests.load(Ordering::SeqCst), 1);
 
-        let missing_filters = vec![eq_filter(
-            "id",
-            "01920000-0000-7000-8000-0000000000ff",
-        )];
+        let missing_filters = vec![eq_filter("id", "01920000-0000-7000-8000-0000000000ff")];
         let direct_missing = spec
-            .plan_scan(Some(&projection), &missing_filters, None, &ExecutionProps::new())
+            .plan_scan(
+                Some(&projection),
+                &missing_filters,
+                None,
+                &ExecutionProps::new(),
+            )
             .await
             .expect("direct missing-ID projection should plan")
             .source
@@ -8478,7 +8485,12 @@ mod tests {
             .await
             .expect("direct missing-ID projection should load");
         let indexed_missing = indexed_spec
-            .plan_scan(Some(&projection), &missing_filters, None, &ExecutionProps::new())
+            .plan_scan(
+                Some(&projection),
+                &missing_filters,
+                None,
+                &ExecutionProps::new(),
+            )
             .await
             .expect("indexed missing-ID projection should plan")
             .source
@@ -9804,16 +9816,21 @@ mod tests {
                 .lock()
                 .expect("live-state request mutex should not be poisoned")
                 .push(request.clone());
-            typed_fixture_batch(self.rows.iter().filter(|row| {
-                request.filter.file_ids.is_empty()
-                    || request.filter.file_ids.iter().any(|file_id| match file_id {
-                        NullableKeyFilter::Any => true,
-                        NullableKeyFilter::Null => row.file_id.is_none(),
-                        NullableKeyFilter::Value(file_id) => {
-                            row.file_id.as_deref() == Some(file_id.as_str())
-                        }
+            typed_fixture_batch(
+                self.rows
+                    .iter()
+                    .filter(|row| {
+                        request.filter.file_ids.is_empty()
+                            || request.filter.file_ids.iter().any(|file_id| match file_id {
+                                NullableKeyFilter::Any => true,
+                                NullableKeyFilter::Null => row.file_id.is_none(),
+                                NullableKeyFilter::Value(file_id) => {
+                                    row.file_id.as_deref() == Some(file_id.as_str())
+                                }
+                            })
                     })
-            }).cloned())
+                    .cloned(),
+            )
         }
 
         async fn load_exact_batch(
@@ -11084,14 +11101,27 @@ mod tests {
                 .unwrap()
                 .clone(),
         ]));
-        let blob_reader = Arc::new(StaticBlobReader::from_blobs([bytes])) as Arc<dyn BlobDataReader>;
+        let blob_reader =
+            Arc::new(StaticBlobReader::from_blobs([bytes])) as Arc<dyn BlobDataReader>;
         let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
-        let ordinary = Arc::new(ExactContentHotStateReader { rows: rows.clone() })
-            as Arc<dyn HotStateReader>;
+        let ordinary =
+            Arc::new(ExactContentHotStateReader { rows: rows.clone() }) as Arc<dyn HotStateReader>;
         let direct = super::try_exact_file_content_with_bounded_path_validation(
-            &ordinary, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().expect("ordinary content takes direct route");
-        assert_eq!(direct.rows, vec![vec![Value::Blob(b"ordinary file bytes".to_vec().into())]]);
+            &ordinary,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("ordinary content takes direct route");
+        assert_eq!(
+            direct.rows,
+            vec![vec![Value::Blob(b"ordinary file bytes".to_vec().into())]]
+        );
 
         let mut owned_rows = rows;
         owned_rows.push(live_plugin_owner_row(
@@ -11100,37 +11130,90 @@ mod tests {
             "uninstalled_plugin",
             vec!["plugin_note".to_owned()],
         ));
-        let stale_owner = Arc::new(ExactContentHotStateReader { rows: owned_rows })
-            as Arc<dyn HotStateReader>;
-        assert!(super::try_exact_file_content_with_bounded_path_validation(
-            &stale_owner, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().is_none(), "stale owner must reach pathful unavailable error");
+        let stale_owner =
+            Arc::new(ExactContentHotStateReader { rows: owned_rows }) as Arc<dyn HotStateReader>;
+        assert!(
+            super::try_exact_file_content_with_bounded_path_validation(
+                &stale_owner,
+                &blob_reader,
+                &host,
+                &request,
+                &schema,
+                id,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale owner must reach pathful unavailable error"
+        );
         let raw = super::try_exact_file_content_with_bounded_path_validation(
-            &stale_owner, &blob_reader, &host, &request, &schema, id, false,
-        ).await.unwrap().expect("without a view collector the blob-backed route returns raw content");
+            &stale_owner,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("without a view collector the blob-backed route returns raw content");
         assert_eq!(raw.rows, direct.rows);
 
-        let missing = Arc::new(ExactContentHotStateReader { rows: Vec::new() })
-            as Arc<dyn HotStateReader>;
+        let missing =
+            Arc::new(ExactContentHotStateReader { rows: Vec::new() }) as Arc<dyn HotStateReader>;
         let empty = super::try_exact_file_content_with_bounded_path_validation(
-            &missing, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap().expect("an authoritative exact-ID miss has no fallback work");
+            &missing,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("an authoritative exact-ID miss has no fallback work");
         assert!(empty.rows.is_empty());
 
         let other_branch = "01920000-0000-7000-8000-0000000000b2";
         let ambiguous = Arc::new(ExactContentHotStateReader {
             rows: vec![
-                live_file_row(id, branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_file_row(
+                    id,
+                    branch,
+                    &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#),
+                ),
                 live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
-                live_file_row(id, other_branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_file_row(
+                    id,
+                    other_branch,
+                    &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#),
+                ),
                 live_blob_ref_row(id, other_branch, id, &hash.to_hex(), 19),
             ],
         }) as Arc<dyn HotStateReader>;
         let mut both_branches = request.clone();
-        both_branches.filter.branch_ids.push(other_branch.to_owned());
-        assert!(super::try_exact_file_content_with_bounded_path_validation(
-            &ambiguous, &blob_reader, &host, &both_branches, &schema, id, true,
-        ).await.unwrap().is_none(), "ambiguous file lanes retain indexed winner selection");
+        both_branches
+            .filter
+            .branch_ids
+            .push(other_branch.to_owned());
+        assert!(
+            super::try_exact_file_content_with_bounded_path_validation(
+                &ambiguous,
+                &blob_reader,
+                &host,
+                &both_branches,
+                &schema,
+                id,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "ambiguous file lanes retain indexed winner selection"
+        );
 
         let missing_directory = "01920000-0000-7000-8000-000000000999";
         let broken = Arc::new(ExactContentHotStateReader {
@@ -11138,14 +11221,24 @@ mod tests {
                 live_file_row(
                     id,
                     branch,
-                    &format!(r#"{{"id":"{id}","directory_id":"{missing_directory}","name":"note.txt"}}"#),
+                    &format!(
+                        r#"{{"id":"{id}","directory_id":"{missing_directory}","name":"note.txt"}}"#
+                    ),
                 ),
                 live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
             ],
         }) as Arc<dyn HotStateReader>;
         let error = super::try_exact_file_content_with_bounded_path_validation(
-            &broken, &blob_reader, &host, &request, &schema, id, true,
-        ).await.unwrap_err();
+            &broken,
+            &blob_reader,
+            &host,
+            &request,
+            &schema,
+            id,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 

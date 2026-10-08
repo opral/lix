@@ -11,6 +11,7 @@ const MAX_INTEGER_DIGITS: i64 = 131_072;
 const MAX_FRACTIONAL_DIGITS: i64 = 16_383;
 const MAX_EXACT_NUMBER_BYTES: usize =
     MAX_INTEGER_DIGITS as usize + MAX_FRACTIONAL_DIGITS as usize + 2;
+const MAX_NUMBER_TOKEN_BYTES: usize = MAX_EXACT_NUMBER_BYTES + 21;
 
 /// Normalizes a JSON number to Lix's exact PostgreSQL JSONB decimal spelling.
 ///
@@ -22,7 +23,23 @@ const MAX_EXACT_NUMBER_BYTES: usize =
 pub fn normalize_jsonb_number(
     number: &serde_json::Number,
 ) -> Result<serde_json::Number, JsonbError> {
-    let raw = number.as_str();
+    normalize_jsonb_number_with_limit(number, MAX_EXACT_NUMBER_BYTES)
+}
+
+struct JsonbNumberParts<'a> {
+    negative: bool,
+    integer: &'a str,
+    fraction: &'a str,
+    input_digits_len: usize,
+    leading_zeroes: usize,
+    decimal_position: i64,
+    display_length: usize,
+    normalized_length: usize,
+    coefficient_len: usize,
+    zero: bool,
+}
+
+fn parse_jsonb_number_parts(raw: &str) -> Result<JsonbNumberParts<'_>, JsonbError> {
     let (negative, raw) = raw
         .strip_prefix('-')
         .map_or((false, raw), |raw| (true, raw));
@@ -31,10 +48,28 @@ pub fn normalize_jsonb_number(
         Some(index) => (&raw[..index], &raw[index + 1..]),
         None => (raw, "0"),
     };
+    if exponent_index.is_some() {
+        let exponent_digits = exponent
+            .strip_prefix('+')
+            .or_else(|| exponent.strip_prefix('-'))
+            .unwrap_or(exponent);
+        if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(JsonbError("invalid canonical JSON number"));
+        }
+    }
     let exponent = exponent.parse::<i64>().map_err(|_| {
         JsonbError("JSONB numeric exponent is outside PostgreSQL's supported range")
     })?;
     let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if integer.is_empty()
+        || (integer.len() > 1 && integer.starts_with('0'))
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || (mantissa.contains('.')
+            && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())))
+    {
+        return Err(JsonbError("invalid canonical JSON number"));
+    }
 
     // PostgreSQL applies NUMERIC's scale limit to the input spelling before
     // insignificant zeroes are stripped.
@@ -51,15 +86,28 @@ pub fn normalize_jsonb_number(
         ));
     }
 
-    let mut digits = String::with_capacity(integer.len() + fraction.len());
-    digits.push_str(integer);
-    digits.push_str(fraction);
-
-    let leading_zeroes = digits.bytes().take_while(|digit| *digit == b'0').count();
-    if leading_zeroes == digits.len() {
-        return Ok(serde_json::Number::from_string_unchecked("0".to_owned()));
+    let input_digits_len = integer.len().checked_add(fraction.len()).ok_or(JsonbError(
+        "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+    ))?;
+    let leading_zeroes = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .take_while(|digit| *digit == b'0')
+        .count();
+    if leading_zeroes == input_digits_len {
+        return Ok(JsonbNumberParts {
+            negative,
+            integer,
+            fraction,
+            input_digits_len,
+            leading_zeroes,
+            decimal_position: 0,
+            display_length: 1,
+            normalized_length: 1,
+            coefficient_len: 0,
+            zero: true,
+        });
     }
-    digits.drain(..leading_zeroes);
 
     let decimal_position = i64::try_from(integer.len())
         .ok()
@@ -70,7 +118,8 @@ pub fn normalize_jsonb_number(
         ))?;
 
     let integer_digits = decimal_position.max(0);
-    let fractional_digits = i64::try_from(digits.len())
+    let significant_digits_len = input_digits_len - leading_zeroes;
+    let fractional_digits = i64::try_from(significant_digits_len)
         .ok()
         .and_then(|length| length.checked_sub(decimal_position))
         .ok_or(JsonbError(
@@ -83,32 +132,103 @@ pub fn normalize_jsonb_number(
         ));
     }
 
-    let sign_length = if negative { 1 } else { 0 };
+    let sign_length: usize = usize::from(negative);
+    let integer_digits_usize = usize::try_from(integer_digits).map_err(|_| {
+        JsonbError("JSONB number exceeds PostgreSQL numeric precision or scale limits")
+    })?;
+    let fractional_digits_usize = usize::try_from(fractional_digits).map_err(|_| {
+        JsonbError("JSONB number exceeds PostgreSQL numeric precision or scale limits")
+    })?;
     let display_length = if decimal_position <= 0 {
-        sign_length + 2 + fractional_digits
+        sign_length
+            .checked_add(2)
+            .and_then(|length| length.checked_add(fractional_digits_usize))
     } else {
         sign_length
-            + integer_digits
-            + if fractional_digits > 0 {
-                1 + fractional_digits
-            } else {
-                0
-            }
+            .checked_add(integer_digits_usize)
+            .and_then(|length| {
+                if fractional_digits > 0 {
+                    length.checked_add(1)?.checked_add(fractional_digits_usize)
+                } else {
+                    Some(length)
+                }
+            })
+    }
+    .ok_or(JsonbError(
+        "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+    ))?;
+    let trailing_fractional_zeroes = if fractional_digits > 0 {
+        fraction
+            .bytes()
+            .rev()
+            .chain(integer.bytes().rev())
+            .take_while(|digit| *digit == b'0')
+            .count()
+            .min(fractional_digits_usize)
+    } else {
+        0
     };
-    let mut canonical = String::with_capacity(usize::try_from(display_length).unwrap_or_default());
-    if negative {
+    let normalized_length = display_length
+        .checked_sub(trailing_fractional_zeroes)
+        .and_then(|length| {
+            (trailing_fractional_zeroes != fractional_digits_usize)
+                .then_some(length)
+                .or_else(|| length.checked_sub(1))
+        })
+        .ok_or(JsonbError(
+            "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+        ))?;
+    let trailing_zeroes = fraction
+        .bytes()
+        .rev()
+        .chain(integer.bytes().rev())
+        .take_while(|digit| *digit == b'0')
+        .count();
+
+    Ok(JsonbNumberParts {
+        negative,
+        integer,
+        fraction,
+        input_digits_len,
+        leading_zeroes,
+        decimal_position,
+        display_length,
+        normalized_length,
+        coefficient_len: significant_digits_len.saturating_sub(trailing_zeroes),
+        zero: false,
+    })
+}
+
+fn normalize_jsonb_number_with_limit(
+    number: &serde_json::Number,
+    max_output_bytes: usize,
+) -> Result<serde_json::Number, JsonbError> {
+    let parts = parse_jsonb_number_parts(number.as_str())?;
+    if parts.zero {
+        return Ok(serde_json::Number::from_string_unchecked("0".to_owned()));
+    }
+    if parts.normalized_length > max_output_bytes {
+        return Err(JsonbError("JSONB SQL equality key is too large"));
+    }
+    let mut digits = String::with_capacity(parts.input_digits_len);
+    digits.push_str(parts.integer);
+    digits.push_str(parts.fraction);
+    digits.drain(..parts.leading_zeroes);
+    let mut canonical = String::with_capacity(parts.display_length);
+    if parts.negative {
         canonical.push('-');
     }
-    if decimal_position <= 0 {
+    if parts.decimal_position <= 0 {
         canonical.push_str("0.");
-        canonical.extend(std::iter::repeat('0').take((-decimal_position) as usize));
+        canonical.extend(std::iter::repeat('0').take((-parts.decimal_position) as usize));
         canonical.push_str(&digits);
-    } else if decimal_position >= i64::try_from(digits.len()).unwrap_or(i64::MAX) {
+    } else if parts.decimal_position >= i64::try_from(digits.len()).unwrap_or(i64::MAX) {
         canonical.push_str(&digits);
-        let integer_zeroes = decimal_position - i64::try_from(digits.len()).unwrap_or(i64::MAX);
+        let integer_zeroes =
+            parts.decimal_position - i64::try_from(digits.len()).unwrap_or(i64::MAX);
         canonical.extend(std::iter::repeat('0').take(integer_zeroes as usize));
     } else {
-        let split = decimal_position as usize;
+        let split = parts.decimal_position as usize;
         canonical.push_str(&digits[..split]);
         canonical.push('.');
         canonical.push_str(&digits[split..]);
@@ -129,6 +249,473 @@ pub fn normalize_jsonb_number(
         ));
     }
     Ok(serde_json::Number::from_string_unchecked(canonical))
+}
+
+/// Appends the semantic SQL comparison key for canonical JSON text.
+///
+/// JSONB's storage renderer retains legacy Ryu spellings for tag-5 floats so
+/// old typed rows keep their byte identity. SQL comparison and hash operations
+/// need one spelling for each exact numeric value, so this bounded lexical
+/// pass rewrites only number tokens and leaves strings and object layout
+/// untouched. Callers must supply compact, valid JSON with canonical object
+/// key order; normal SQL casts establish that form before reaching this API.
+/// On failure, `output` is left unchanged.
+#[doc(hidden)]
+pub fn append_jsonb_equality_key(
+    output: &mut Vec<u8>,
+    canonical_json: &str,
+) -> Result<(), JsonbError> {
+    let input = canonical_json.as_bytes();
+    if input.len() > MAX_RENDERED_BYTES {
+        return Err(JsonbError("JSONB SQL equality key is too large"));
+    }
+    let output_start = output.len();
+    let mut offset = 0;
+    let mut span_start = 0;
+    let mut depth = 0usize;
+    let result = (|| {
+        while offset < input.len() {
+            match input[offset] {
+                b'"' => {
+                    let start = offset;
+                    offset = canonical_string_end(input, offset)
+                        .ok_or(JsonbError("invalid canonical JSON string"))?;
+                    if canonical_string_has_nul(&input[start..offset]) {
+                        return Err(JsonbError(
+                            "PostgreSQL JSONB does not support the Unicode NUL escape (\\u0000)",
+                        ));
+                    }
+                }
+                byte if is_json_number_start(byte) => {
+                    let end = json_number_end(input, offset);
+                    let token = &input[offset..end];
+                    // Most stored exact numbers already use a shortest plain
+                    // spelling. Keep them inside the current input span so a
+                    // whole array/object is copied in one bulk append instead
+                    // of parsing and appending once per number.
+                    if !is_canonical_shortest_plain_number(token) {
+                        append_equality_key_bytes(
+                            output,
+                            &input[span_start..offset],
+                            output_start,
+                        )?;
+                        append_jsonb_number_equality_key(output, token, output_start)?;
+                        span_start = end;
+                    }
+                    offset = end;
+                }
+                b'[' | b'{' => {
+                    depth = depth
+                        .checked_add(1)
+                        .filter(|depth| *depth <= MAX_DEPTH)
+                        .ok_or(JsonbError("JSONB nesting is too deep"))?;
+                    offset += 1;
+                }
+                b']' | b'}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or(JsonbError("invalid canonical JSON structure"))?;
+                    offset += 1;
+                }
+                _ => offset += 1,
+            }
+        }
+        if depth != 0 {
+            return Err(JsonbError("invalid canonical JSON structure"));
+        }
+        append_equality_key_bytes(output, &input[span_start..], output_start)
+    })();
+    if result.is_err() {
+        output.truncate(output_start);
+    }
+    result
+}
+
+/// Recognizes plain decimal tokens that are already the deterministic SQL
+/// key spelling. The token is validated while scanning it; exponent forms,
+/// zero aliases, trailing-zero aliases, and plain zero-fraction spellings
+/// that lose to scientific notation fall through to the exact formatter.
+fn is_canonical_shortest_plain_number(token: &[u8]) -> bool {
+    if token.len() > MAX_NUMBER_TOKEN_BYTES {
+        return false;
+    }
+    let (negative, digits) = token
+        .strip_prefix(b"-")
+        .map_or((false, token), |digits| (true, digits));
+    if digits.is_empty() {
+        return false;
+    }
+
+    let mut decimal_point = None;
+    let mut first_fraction_nonzero = None;
+    for (index, byte) in digits.iter().copied().enumerate() {
+        match byte {
+            b'0'..=b'9' => {
+                if let Some(point) = decimal_point
+                    && index > point
+                    && first_fraction_nonzero.is_none()
+                    && byte != b'0'
+                {
+                    first_fraction_nonzero = Some(index - point - 1);
+                }
+            }
+            b'.' if decimal_point.is_none() => decimal_point = Some(index),
+            // Exponents and malformed numeric syntax use the checked slow
+            // path, which retains the PostgreSQL range/error behavior.
+            _ => return false,
+        }
+    }
+
+    let integer_end = decimal_point.unwrap_or(digits.len());
+    let integer = &digits[..integer_end];
+    let fraction = decimal_point.map_or(&[][..], |point| &digits[point + 1..]);
+    if integer.is_empty()
+        || (decimal_point.is_some() && fraction.is_empty())
+        || (integer.len() > 1 && integer[0] == b'0')
+        || fraction.len() > MAX_FRACTIONAL_DIGITS as usize
+    {
+        return false;
+    }
+
+    let integer_is_zero = integer == b"0";
+    if !integer_is_zero && integer.len() > MAX_INTEGER_DIGITS as usize {
+        return false;
+    }
+
+    if !integer_is_zero {
+        if fraction.last().or_else(|| integer.last()) == Some(&b'0') {
+            return false;
+        }
+        // With a nonzero integer part and no trailing coefficient zero, a
+        // scientific spelling keeps every digit and adds an exponent, so
+        // plain notation is always shorter.
+        return true;
+    }
+    if fraction.is_empty() {
+        // Positive zero is already canonical; negative zero is rewritten to
+        // the single JSONB zero spelling.
+        return !negative;
+    }
+    let Some(first_nonzero) = first_fraction_nonzero else {
+        return false;
+    };
+
+    // For 0.xxx, compare the plain spelling with its scientific candidate.
+    // Ties retain plain form. This avoids the decimal-position/expanded-form
+    // work for common values such as 0.1 and 0.01.
+    let coefficient_len = fraction.len() - first_nonzero;
+    let exponent = -i64::try_from(first_nonzero + 1).unwrap_or(i64::MAX);
+    let scientific_len = usize::from(negative)
+        .checked_add(coefficient_len)
+        .and_then(|length| length.checked_add(usize::from(coefficient_len > 1)))
+        .and_then(|length| length.checked_add(1)) // e
+        .and_then(|length| length.checked_add(i64_decimal_len(exponent)));
+    scientific_len.is_some_and(|length| token.len() <= length)
+}
+
+fn append_jsonb_number_equality_key(
+    output: &mut Vec<u8>,
+    token: &[u8],
+    output_start: usize,
+) -> Result<(), JsonbError> {
+    if token.len() > MAX_NUMBER_TOKEN_BYTES {
+        return Err(JsonbError(
+            "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+        ));
+    }
+    let raw =
+        std::str::from_utf8(token).map_err(|_| JsonbError("invalid canonical JSON number"))?;
+    let parts = parse_jsonb_number_parts(raw)?;
+    if parts.zero {
+        return append_equality_key_bytes(output, b"0", output_start);
+    }
+
+    let sign_length = usize::from(parts.negative);
+    let coefficient_len = parts.coefficient_len;
+    let decimal_position = parts.decimal_position;
+    let plain_length = if decimal_position <= 0 {
+        sign_length
+            .checked_add(2)
+            .and_then(|length| {
+                length.checked_add(usize::try_from(decimal_position.checked_neg()?).ok()?)
+            })
+            .and_then(|length| length.checked_add(coefficient_len))
+    } else if decimal_position >= i64::try_from(coefficient_len).unwrap_or(i64::MAX) {
+        usize::try_from(decimal_position)
+            .ok()
+            .and_then(|position| sign_length.checked_add(position))
+    } else {
+        sign_length
+            .checked_add(coefficient_len)
+            .and_then(|length| length.checked_add(1))
+    }
+    .ok_or(JsonbError(
+        "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+    ))?;
+    let scientific_exponent = decimal_position.checked_sub(1).ok_or(JsonbError(
+        "JSONB numeric exponent is outside PostgreSQL's supported range",
+    ))?;
+    let scientific_length = sign_length
+        .checked_add(coefficient_len)
+        .and_then(|length| length.checked_add(usize::from(coefficient_len > 1)))
+        .and_then(|length| length.checked_add(1)) // e
+        .and_then(|length| length.checked_add(i64_decimal_len(scientific_exponent)))
+        .ok_or(JsonbError(
+            "JSONB number exceeds PostgreSQL numeric precision or scale limits",
+        ))?;
+    let use_scientific = scientific_length < plain_length;
+    let key_length = if use_scientific {
+        scientific_length
+    } else {
+        plain_length
+    };
+
+    let used = output
+        .len()
+        .checked_sub(output_start)
+        .ok_or(JsonbError("JSONB SQL equality key is too large"))?;
+    let new_length = used
+        .checked_add(key_length)
+        .ok_or(JsonbError("JSONB SQL equality key is too large"))?;
+    if new_length > MAX_RENDERED_BYTES {
+        return Err(JsonbError("JSONB SQL equality key is too large"));
+    }
+
+    if (use_scientific && canonical_scientific_token_matches(token, &parts, scientific_exponent))
+        || (!use_scientific && canonical_plain_token_matches(token, &parts))
+    {
+        return append_equality_key_bytes(output, token, output_start);
+    }
+
+    output
+        .try_reserve(key_length)
+        .map_err(|_| JsonbError("JSONB SQL equality key is too large"))?;
+    if use_scientific {
+        append_compact_scientific_number(output, &parts, scientific_exponent);
+    } else {
+        append_compact_plain_number(output, &parts);
+    }
+    Ok(())
+}
+
+fn canonical_plain_token_matches(token: &[u8], parts: &JsonbNumberParts<'_>) -> bool {
+    if token.contains(&b'e') || token.contains(&b'E') {
+        return false;
+    }
+    if parts.fraction.ends_with('0') {
+        return false;
+    }
+    // Without an exponent, valid JSON's integer/fraction spelling is already
+    // the normalized plain decimal unless fractional zeroes or signed zero
+    // need rewriting.
+    !parts.zero
+}
+
+fn canonical_scientific_token_matches(
+    token: &[u8],
+    parts: &JsonbNumberParts<'_>,
+    scientific_exponent: i64,
+) -> bool {
+    if !token.contains(&b'e') || token.contains(&b'E') {
+        return false;
+    }
+    let Some(exponent_index) = token.iter().position(|byte| *byte == b'e') else {
+        return false;
+    };
+    let mut mantissa = &token[..exponent_index];
+    if parts.negative {
+        let Some(unsigned) = mantissa.strip_prefix(b"-") else {
+            return false;
+        };
+        mantissa = unsigned;
+    }
+    let Some(exponent_text) = token.get(exponent_index + 1..) else {
+        return false;
+    };
+    if !i64_matches_ascii(scientific_exponent, exponent_text) {
+        return false;
+    }
+    let mut expected = parts
+        .integer
+        .bytes()
+        .chain(parts.fraction.bytes())
+        .skip(parts.leading_zeroes)
+        .take(parts.coefficient_len);
+    let Some(first) = expected.next() else {
+        return false;
+    };
+    if mantissa.first() != Some(&first) {
+        return false;
+    }
+    let mut offset = 1;
+    if parts.coefficient_len > 1 {
+        if mantissa.get(offset) != Some(&b'.') {
+            return false;
+        }
+        offset += 1;
+        for digit in expected {
+            if mantissa.get(offset) != Some(&digit) {
+                return false;
+            }
+            offset += 1;
+        }
+    }
+    offset == mantissa.len()
+}
+
+fn i64_decimal_len(value: i64) -> usize {
+    let mut magnitude = value.unsigned_abs();
+    let mut length = usize::from(value < 0);
+    loop {
+        length += 1;
+        magnitude /= 10;
+        if magnitude == 0 {
+            return length;
+        }
+    }
+}
+
+fn i64_matches_ascii(value: i64, bytes: &[u8]) -> bool {
+    let mut buffer = [0u8; 20];
+    let mut offset = buffer.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        offset -= 1;
+        buffer[offset] = b'0' + u8::try_from(magnitude % 10).unwrap_or(0);
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        offset -= 1;
+        buffer[offset] = b'-';
+    }
+    &buffer[offset..] == bytes
+}
+
+fn append_compact_plain_number(output: &mut Vec<u8>, parts: &JsonbNumberParts<'_>) {
+    if parts.negative {
+        output.push(b'-');
+    }
+    let mut digits = parts
+        .integer
+        .bytes()
+        .chain(parts.fraction.bytes())
+        .skip(parts.leading_zeroes)
+        .take(parts.coefficient_len);
+    if parts.decimal_position <= 0 {
+        output.extend_from_slice(b"0.");
+        let zeroes = usize::try_from(parts.decimal_position.saturating_abs()).unwrap_or(0);
+        output.resize(output.len() + zeroes, b'0');
+        output.extend(digits);
+    } else if parts.decimal_position >= i64::try_from(parts.coefficient_len).unwrap_or(i64::MAX) {
+        output.extend(digits);
+        let zeroes = usize::try_from(parts.decimal_position)
+            .unwrap_or(0)
+            .saturating_sub(parts.coefficient_len);
+        output.resize(output.len() + zeroes, b'0');
+    } else {
+        let integer_digits = usize::try_from(parts.decimal_position).unwrap_or(0);
+        output.extend(digits.by_ref().take(integer_digits));
+        output.push(b'.');
+        output.extend(digits);
+    }
+}
+
+fn append_compact_scientific_number(
+    output: &mut Vec<u8>,
+    parts: &JsonbNumberParts<'_>,
+    exponent: i64,
+) {
+    if parts.negative {
+        output.push(b'-');
+    }
+    let mut digits = parts
+        .integer
+        .bytes()
+        .chain(parts.fraction.bytes())
+        .skip(parts.leading_zeroes)
+        .take(parts.coefficient_len);
+    if let Some(first) = digits.next() {
+        output.push(first);
+    }
+    if parts.coefficient_len > 1 {
+        output.push(b'.');
+        output.extend(digits);
+    }
+    output.push(b'e');
+    append_i64_ascii(output, exponent);
+}
+
+fn append_i64_ascii(output: &mut Vec<u8>, value: i64) {
+    let mut buffer = [0u8; 20];
+    let mut offset = buffer.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        offset -= 1;
+        buffer[offset] = b'0' + u8::try_from(magnitude % 10).unwrap_or(0);
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        offset -= 1;
+        buffer[offset] = b'-';
+    }
+    output.extend_from_slice(&buffer[offset..]);
+}
+
+fn canonical_string_has_nul(string: &[u8]) -> bool {
+    let mut offset = 1;
+    while offset + 1 < string.len() {
+        if string[offset] != b'\\' {
+            offset += 1;
+            continue;
+        }
+        match string.get(offset + 1) {
+            Some(b'u') => {
+                if string.get(offset + 2..offset + 6) == Some(b"0000") {
+                    return true;
+                }
+                offset += 6;
+            }
+            Some(_) => offset += 2,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Returns the semantic SQL comparison key for canonical JSON text.
+#[doc(hidden)]
+pub fn jsonb_equality_key(canonical_json: &str) -> Result<String, JsonbError> {
+    let mut output = Vec::new();
+    append_jsonb_equality_key(&mut output, canonical_json)?;
+    // Copied spans are whole slices of the valid UTF-8 input, and normalized
+    // number tokens contain ASCII only.
+    Ok(unsafe { String::from_utf8_unchecked(output) })
+}
+
+fn append_equality_key_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    output_start: usize,
+) -> Result<(), JsonbError> {
+    let output_len = output
+        .len()
+        .checked_sub(output_start)
+        .and_then(|length| length.checked_add(bytes.len()))
+        .ok_or(JsonbError("JSONB SQL equality key is too large"))?;
+    if output_len > MAX_RENDERED_BYTES {
+        return Err(JsonbError("JSONB SQL equality key is too large"));
+    }
+    output
+        .try_reserve(bytes.len())
+        .map_err(|_| JsonbError("JSONB SQL equality key is too large"))?;
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// A native JSONB value.
@@ -3779,6 +4366,125 @@ mod tests {
         assert_ne!(
             Jsonb::from_value(different_decimal),
             Jsonb::from_value(exact_decimal)
+        );
+    }
+
+    #[test]
+    fn sql_equality_key_unifies_legacy_float_spelling_and_exact_decimal() {
+        let legacy = r#"{"values":[-1.23456789e-40,"-1.23456789e-40"]}"#;
+        let exact =
+            r#"{"values":[-0.000000000000000000000000000000000000000123456789,"-1.23456789e-40"]}"#;
+        let adjacent =
+            r#"{"values":[-0.000000000000000000000000000000000000000123456788,"-1.23456789e-40"]}"#;
+
+        assert_eq!(
+            jsonb_equality_key(legacy).unwrap(),
+            jsonb_equality_key(exact).unwrap()
+        );
+        assert_ne!(
+            jsonb_equality_key(exact).unwrap(),
+            jsonb_equality_key(adjacent).unwrap()
+        );
+        assert_eq!(
+            jsonb_equality_key(legacy).unwrap(),
+            r#"{"values":[-1.23456789e-40,"-1.23456789e-40"]}"#
+        );
+    }
+
+    #[test]
+    fn sql_equality_key_copies_canonical_numbers_and_normalizes_aliases() {
+        assert_eq!(
+            jsonb_equality_key(r#"{"values":[42,42.0,4.2e1,-0,0.000,"42.0"]}"#).unwrap(),
+            r#"{"values":[42,42,42,0,0,"42.0"]}"#
+        );
+        assert_eq!(
+            jsonb_equality_key("[1000,1e3,100,1e2,0.0001,1e-4]").unwrap(),
+            "[1e3,1e3,100,100,1e-4,1e-4]"
+        );
+    }
+
+    #[test]
+    fn sql_equality_key_keeps_legacy_subnormal_arrays_compact() {
+        let legacy_subnormal =
+            Jsonb::from_value(serde_json::from_str::<JsonValue>("1e-323").unwrap());
+        assert_eq!(legacy_subnormal.binary().unwrap().as_ref()[0], 5);
+        let number = serde_json::Number::from_f64(1e-323).unwrap();
+        let values = (0..500_000)
+            .map(|_| JsonValue::Number(number.clone()))
+            .collect();
+        let mut object = serde_json::Map::new();
+        object.insert("n".to_owned(), JsonValue::Array(values));
+        let legacy_array = Jsonb::from_value(JsonValue::Object(object));
+
+        let binary = legacy_array.binary().unwrap();
+        assert!(binary.len() <= MAX_BYTES);
+        let rendered = legacy_array.to_json_string().unwrap();
+        let key = jsonb_equality_key(&rendered).unwrap();
+        assert_eq!(key, rendered);
+    }
+
+    #[test]
+    fn sql_equality_key_unifies_compact_scientific_and_exact_subnormal_spelling() {
+        let decimal = format!("0.{}1", "0".repeat(322));
+
+        assert_eq!(
+            jsonb_equality_key("1e-323").unwrap(),
+            jsonb_equality_key(&decimal).unwrap()
+        );
+    }
+
+    #[test]
+    fn sql_equality_key_does_not_rewrite_legacy_jsonb_rendering() {
+        let value = Jsonb::from_value(serde_json::from_str("-1.23456789e-40").unwrap());
+
+        assert_eq!(value.binary().unwrap().as_ref()[0], 5);
+        assert_eq!(value.to_json_string().unwrap(), "-1.23456789e-40");
+        assert_eq!(
+            jsonb_equality_key(&value.to_json_string().unwrap()).unwrap(),
+            "-1.23456789e-40"
+        );
+        assert_eq!(value.to_json_string().unwrap(), "-1.23456789e-40");
+    }
+
+    #[test]
+    fn sql_equality_key_rejects_jsonb_nul_escapes() {
+        assert_eq!(
+            jsonb_equality_key(r#"{"key":"\u0000"}"#).unwrap_err(),
+            JsonbError("PostgreSQL JSONB does not support the Unicode NUL escape (\\u0000)")
+        );
+    }
+
+    #[test]
+    fn sql_equality_key_is_bounded_by_jsonb_depth() {
+        let too_deep = format!(
+            "{}0{}",
+            "[".repeat(MAX_DEPTH + 1),
+            "]".repeat(MAX_DEPTH + 1)
+        );
+        assert_eq!(
+            jsonb_equality_key(&too_deep).unwrap_err(),
+            JsonbError("JSONB nesting is too deep")
+        );
+
+        let mut output = b"prefix:".to_vec();
+        let malformed_after_expansion = format!(
+            "[1e1,{}0{}]",
+            "[".repeat(MAX_DEPTH + 1),
+            "]".repeat(MAX_DEPTH + 1)
+        );
+        assert_eq!(
+            append_jsonb_equality_key(&mut output, &malformed_after_expansion).unwrap_err(),
+            JsonbError("JSONB nesting is too deep")
+        );
+        assert_eq!(output, b"prefix:");
+    }
+
+    #[test]
+    fn sql_number_normalization_checks_remaining_budget_before_expansion() {
+        let number = serde_json::from_str::<serde_json::Number>("1e-100").unwrap();
+        assert_eq!(
+            normalize_jsonb_number_with_limit(&number, 10).unwrap_err(),
+            JsonbError("JSONB SQL equality key is too large")
         );
     }
 }

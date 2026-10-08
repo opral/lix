@@ -41,8 +41,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, TableFactor,
-    Statement as SqlStatement, Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart,
+    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 #[cfg(any(feature = "storage-benches", test))]
 use futures_util::TryStreamExt;
@@ -497,8 +498,7 @@ fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
-        scan.source =
-            provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
+        scan.source = provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
         Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
     })
     .map(|transformed| transformed.data)
@@ -1219,16 +1219,15 @@ async fn try_execute_deferred_bound_row_returning(
     ) {
         return Ok(None);
     }
-    let Some((capture_plan, capture)) =
-        bound_returning_image_capture_plan(
-            session,
-            plan,
-            table_schema,
-            target_name,
-            returning,
-            params,
-        )
-            .await?
+    let Some((capture_plan, capture)) = bound_returning_image_capture_plan(
+        session,
+        plan,
+        table_schema,
+        target_name,
+        returning,
+        params,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1507,8 +1506,7 @@ async fn execute_datafusion_write_logical_plan_inner(
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
             let input =
-                insert_input_plan(&session, Arc::clone(&table_schema), plan, params)
-                    .await?;
+                insert_input_plan(&session, Arc::clone(&table_schema), plan, params).await?;
             if plan.bound.branch_scope == BranchScope::Empty {
                 return sql_write_empty_returning_result(
                     &session,
@@ -1531,11 +1529,9 @@ async fn execute_datafusion_write_logical_plan_inner(
                     .validate_upsert_target(&input, &target_columns)
                     .await
                     .map_err(datafusion_error_to_lix_error)?;
-                let proposed_batches = crate::sql2::runtime::stream_input_plan(
-                    Arc::clone(&input),
-                    session.task_ctx(),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                let proposed_batches =
+                    crate::sql2::runtime::stream_input_plan(Arc::clone(&input), session.task_ctx())
+                        .map_err(datafusion_error_to_lix_error)?;
                 let action = match &conflict.action {
                     crate::sql2::bind::write::BoundConflictAction::DoNothing => {
                         crate::sql2::providers::UpsertAction::DoNothing
@@ -1941,8 +1937,7 @@ async fn datafusion_returning_projection(
     let logical_plan = state
         .optimize(&logical_plan)
         .map_err(datafusion_error_to_lix_error)?;
-    let read_source_columns =
-        optimized_returning_source_columns(&logical_plan, INPUT_TABLE_NAME)?;
+    let read_source_columns = optimized_returning_source_columns(&logical_plan, INPUT_TABLE_NAME)?;
     if let Some(unavailable) = read_source_columns
         .difference(&available_source_columns)
         .next()
@@ -2236,9 +2231,8 @@ async fn insert_values_input_plan(
             })
             .collect::<Vec<_>>(),
     ));
-    let df_schema = Arc::new(
-        DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
-    );
+    let df_schema =
+        Arc::new(DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?);
     let rows = values
         .rows
         .iter()
@@ -2555,9 +2549,9 @@ pub(crate) fn write_read_dependencies(
         | ProviderSelection::OnlyWithVisibleSchemas { names, .. } => names
             .iter()
             .any(|name| crate::sql2::providers::READ_TABLE_FUNCTION_NAMES.contains(&name.as_str())),
-        ProviderSelection::All | ProviderSelection::AllWithHistory(_) => statements
-            .iter()
-            .any(statement_uses_read_table_functions),
+        ProviderSelection::All | ProviderSelection::AllWithHistory(_) => {
+            statements.iter().any(statement_uses_read_table_functions)
+        }
     };
 
     let selection = match source {
@@ -2598,24 +2592,22 @@ fn returning_expression_needs_provider_discovery(expression: &SqlExpr) -> bool {
 
         fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
             if let SqlExpr::Function(function) = expression
-                && crate::sql2::parse::object_name_is_public_function(
-                    &function.name,
-                    "lix_row_ref",
-                )
+                && crate::sql2::parse::object_name_is_public_function(&function.name, "lix_row_ref")
             {
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
         }
 
-        fn pre_visit_table_factor(&mut self, _table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        fn pre_visit_table_factor(
+            &mut self,
+            _table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
             ControlFlow::Break(())
         }
     }
 
-    expression
-        .visit(&mut ProviderDependencyVisitor)
-        .is_break()
+    expression.visit(&mut ProviderDependencyVisitor).is_break()
 }
 
 fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool {
@@ -2624,7 +2616,10 @@ fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool 
     impl Visitor for ReadTableFunctionVisitor {
         type Break = ();
 
-        fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
             let TableFactor::Table {
                 name,
                 args: Some(_),
@@ -2635,9 +2630,7 @@ fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool 
             };
             if crate::sql2::providers::READ_TABLE_FUNCTION_NAMES
                 .iter()
-                .any(|function| {
-                    crate::sql2::parse::object_name_is_public_function(name, function)
-                })
+                .any(|function| crate::sql2::parse::object_name_is_public_function(name, function))
             {
                 ControlFlow::Break(())
             } else {
@@ -2807,7 +2800,8 @@ async fn datafusion_plan_from_sql_with_params(
 ) -> Result<(LogicalPlan, usize), LixError> {
     let mut statement = crate::sql2::parse::parse_statement(sql)?;
     bind_table_function_parameters(&mut statement, params)?;
-    let parameter_count = expected_positional_parameter_count(&statement_parameter_names(&statement)?)?;
+    let parameter_count =
+        expected_positional_parameter_count(&statement_parameter_names(&statement)?)?;
     let plan = create_logical_plan_from_statement(session, statement, params).await?;
     Ok((plan, parameter_count))
 }
@@ -2987,14 +2981,12 @@ async fn deferred_returning_image_columns(
     for name in optimized_returning_source_columns(&plan, &input_table_name)? {
         if table_schema.field_with_name(&name).is_ok() {
             images.insert(default_image, name);
-        } else if let Some((column, _)) = old_aliases
-            .iter()
-            .find(|(_, alias)| alias.as_str() == name)
+        } else if let Some((column, _)) =
+            old_aliases.iter().find(|(_, alias)| alias.as_str() == name)
         {
             images.insert(ReturningImage::Old, column.clone());
-        } else if let Some((column, _)) = new_aliases
-            .iter()
-            .find(|(_, alias)| alias.as_str() == name)
+        } else if let Some((column, _)) =
+            new_aliases.iter().find(|(_, alias)| alias.as_str() == name)
         {
             images.insert(ReturningImage::New, column.clone());
         }
@@ -3242,13 +3234,7 @@ fn datafusion_conflict_assignments(
     schema: &Schema,
     assignments: &[crate::sql2::bind::write::BoundAssignment],
     params: &[Value],
-) -> Result<
-    Vec<(
-        String,
-        Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-    )>,
-    LixError,
-> {
+) -> Result<Vec<(String, Arc<dyn datafusion::physical_expr::PhysicalExpr>)>, LixError> {
     let mut fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -3595,7 +3581,14 @@ fn scalar_from_bound_literal(literal: &BoundLiteral) -> Result<ScalarValue, LixE
             |value| ScalarValue::UInt64(Some(value)),
         ),
         BoundLiteral::Text(value) => ScalarValue::Utf8(Some(value.clone())),
-        BoundLiteral::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
+        BoundLiteral::Json(value) => ScalarValue::Utf8(Some(
+            crate::sql2::udfs::common::jsonb_equality_key_value(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("invalid JSONB SQL equality key: {error}"),
+                )
+            })?,
+        )),
     })
 }
 
@@ -3628,12 +3621,12 @@ fn bound_write_requires_datafusion(plan: &LogicalWritePlan) -> bool {
     (matches!(plan.bound.op, BoundWriteOp::Insert)
         && matches!(plan.bound.input, BoundWriteInput::Query { .. }))
         || (matches!(plan.bound.op, BoundWriteOp::Update)
-        && (plan
-            .bound
-            .assignments
-            .iter()
-            .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
-            || bound_predicate_requires_datafusion(&plan.bound.predicate)))
+            && (plan
+                .bound
+                .assignments
+                .iter()
+                .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
+                || bound_predicate_requires_datafusion(&plan.bound.predicate)))
         || plan.bound.returning.as_ref().is_some_and(|returning| {
             returning.items.iter().any(|item| {
                 item.expr
@@ -4479,10 +4472,8 @@ where
 
 fn text_value(value: &str, kind: TextKind) -> Value {
     match kind {
-        // The write boundary canonicalizes every JSON payload before it reaches
-        // storage, and the projection decoder copies those bytes into Arrow
-        // verbatim. Re-parsing here only rebuilt a DOM that was immediately
-        // re-serialized, so the bytes are retained directly instead.
+        // JSONB values entering SQL use the exact numeric equality-key form;
+        // retaining it here avoids rebuilding a DOM at the result boundary.
         TextKind::Jsonb => Value::Jsonb(crate::Json::from_canonical_text(value)),
         TextKind::RowRef => Value::RowRef(crate::RowRef(value.to_owned())),
         TextKind::Text => Value::Text(value.to_owned()),
@@ -5399,12 +5390,9 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
-                &planning_session.state(),
-                &plan.plan,
-                &table_name,
-            )
-            .unwrap();
+            let (selection, needs_read_table_functions, relation_names) =
+                write_read_dependencies(&planning_session.state(), &plan.plan, &table_name)
+                    .unwrap();
             assert!(!needs_read_table_functions, "{sql}");
             assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0), "{sql}");
 
@@ -5453,12 +5441,9 @@ mod tests {
         let table_name =
             write_target_table_name(&insert_select.plan).expect("target should resolve");
         let planning_session = ctx.datafusion_session();
-        let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
-            &planning_session.state(),
-            &insert_select.plan,
-            &table_name,
-        )
-        .unwrap();
+        let (selection, needs_read_table_functions, relation_names) =
+            write_read_dependencies(&planning_session.state(), &insert_select.plan, &table_name)
+                .unwrap();
         assert!(!needs_read_table_functions);
         assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0));
 
@@ -5513,10 +5498,7 @@ mod tests {
                 "INSERT INTO lix_file(id, path) \
                  SELECT id, to_path FROM lix_diff('lix_file')",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_diff".to_string(),
-                        "lix_file".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_diff".to_string(), "lix_file".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
             ),
@@ -5544,30 +5526,36 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (actual, _, relation_names) = write_read_dependencies(
-                &planning_session.state(),
-                &plan.plan,
-                &table_name,
-            )
-            .unwrap();
+            let (actual, _, relation_names) =
+                write_read_dependencies(&planning_session.state(), &plan.plan, &table_name)
+                    .unwrap();
             assert_eq!(actual, expected, "{sql}");
             if sql.contains("FROM lix_file") {
-                assert!(relation_names
-                    .as_ref()
-                    .is_some_and(|names| names.contains("lix_file")), "{sql}");
+                assert!(
+                    relation_names
+                        .as_ref()
+                        .is_some_and(|names| names.contains("lix_file")),
+                    "{sql}"
+                );
             }
             if sql.contains("FROM lix_change") {
-                assert!(relation_names
-                    .as_ref()
-                    .is_some_and(|names| names.contains("lix_change")), "{sql}");
+                assert!(
+                    relation_names
+                        .as_ref()
+                        .is_some_and(|names| names.contains("lix_change")),
+                    "{sql}"
+                );
             }
             if sql.contains("information_schema") {
-                assert!(crate::sql2::providers::write_read_relation_selection(
-                    &ctx.public_catalog().unwrap(),
-                    &actual,
-                    relation_names.as_ref(),
-                )
-                .is_empty(), "{sql}");
+                assert!(
+                    crate::sql2::providers::write_read_relation_selection(
+                        &ctx.public_catalog().unwrap(),
+                        &actual,
+                        relation_names.as_ref(),
+                    )
+                    .is_empty(),
+                    "{sql}"
+                );
             }
         }
     }
@@ -5579,10 +5567,7 @@ mod tests {
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
                  RETURNING (SELECT value FROM lix_key_value WHERE key = 'returning-probe') AS related_value",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_file".to_string(),
-                        "lix_key_value".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_file".to_string(), "lix_key_value".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
                 false,
@@ -5602,10 +5587,7 @@ mod tests {
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
                  RETURNING (SELECT COUNT(*) FROM lix_change) AS change_count",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_change".to_string(),
-                        "lix_file".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_change".to_string(), "lix_file".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
                 false,
@@ -5779,7 +5761,9 @@ mod tests {
                     WriteExecutorMode::ForceDataFusion,
                 )
                 .await
-                .unwrap_or_else(|error| panic!("write with RETURNING should execute: {sql}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("write with RETURNING should execute: {sql}: {error}")
+                });
 
             assert_eq!(path, WriteExecutorPath::DataFusion, "{sql}");
             let returning = result.returning.expect("RETURNING result should exist");

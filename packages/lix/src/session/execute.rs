@@ -291,10 +291,7 @@ impl ExecuteResult {
     /// Rebase only the directly projected new-image change-ID cells whose
     /// provenance was retained by SQL binding. The remap is derived during
     /// this same commit's materialization; no post-commit SQL read is needed.
-    pub(crate) fn remap_direct_new_change_ids(
-        mut self,
-        remap: &BTreeMap<String, String>,
-    ) -> Self {
+    pub(crate) fn remap_direct_new_change_ids(mut self, remap: &BTreeMap<String, String>) -> Self {
         if self.direct_new_change_id_columns.is_empty() || remap.is_empty() {
             self.direct_new_change_id_columns.clear();
             return self;
@@ -1192,7 +1189,10 @@ where
         &self,
         sql: &str,
     ) -> Result<ExecutionDisposition, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql).map_err(sql2::binding_rejection)?;
+        let statement = self
+            .sql_planning_cache
+            .parse_statement(sql)
+            .map_err(sql2::binding_rejection)?;
         execution_disposition(&statement).map_err(sql2::binding_rejection)
     }
 
@@ -1210,10 +1210,12 @@ where
             let parsed = self
                 .sql_planning_cache
                 .parse_statement(&statement.sql)
-                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?;
-            if execution_disposition(&parsed)
-                .map_err(|error| with_batch_statement_index(sql2::binding_rejection(error), statement_index))?
-                == ExecutionDisposition::Durable
+                .map_err(|error| {
+                    with_batch_statement_index(sql2::binding_rejection(error), statement_index)
+                })?;
+            if execution_disposition(&parsed).map_err(|error| {
+                with_batch_statement_index(sql2::binding_rejection(error), statement_index)
+            })? == ExecutionDisposition::Durable
             {
                 return Ok(ExecutionDisposition::Durable);
             }
@@ -3453,12 +3455,8 @@ where
         .await?;
         drop(read_session);
         drop(ctx);
-        if let Some((
-            data_column_index,
-            size_column_indices,
-            file_id_column_index,
-            projection,
-        )) = late_file_projection
+        if let Some((data_column_index, size_column_indices, file_id_column_index, projection)) =
+            late_file_projection
         {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(read_hot.reader(read_store.clone()));
@@ -4006,7 +4004,11 @@ async fn hydrate_lix_file_bounded_content_result(
 
     let selected_paths = paths
         .iter()
-        .filter(|path| size_by_path.get(*path).is_some_and(|size| *size <= max_size))
+        .filter(|path| {
+            size_by_path
+                .get(*path)
+                .is_some_and(|size| *size <= max_size)
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut content_by_path = BTreeMap::new();
@@ -6220,6 +6222,206 @@ mod tests {
                 &Value::Null
             };
             assert_eq!(row.value("lixcol_metadata").unwrap(), expected, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_sql_keys_ignore_object_order_and_legacy_float_spelling() {
+        let session = open_session().await;
+        let legacy_ryu = r#"{"z":1,"n":-1.23456789e-40,"x":1e3,"a":true}"#;
+        let exact_decimal = format!(
+            r#"{{"a":true,"n":-0.{}123456789,"x":1000,"z":1}}"#,
+            "0".repeat(39)
+        );
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_key_value (key, value, lixcol_metadata) VALUES \
+                     ('metadata-key-a', 'value', '{legacy_ryu}'), \
+                     ('metadata-key-b', 'value', '{exact_decimal}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        for (path, metadata) in [
+            ("/metadata-sql-key-a.md", legacy_ryu),
+            ("/metadata-sql-key-b.md", exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (path, content, lixcol_metadata) \
+                         VALUES ($1, $2, '{metadata}')"
+                    ),
+                    &[
+                        Value::Text(path.to_string()),
+                        Value::Blob(b"x".to_vec().into()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        for (path, metadata) in [
+            ("/metadata-sql-key/a", legacy_ryu),
+            ("/metadata-sql-key/b", exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_directory (path, lixcol_metadata) \
+                         VALUES ('{path}', '{metadata}')"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
+        let branch_a = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-0000000000c1".to_string()),
+                name: "metadata-key-a".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let branch_b = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01920000-0000-7000-8000-0000000000c2".to_string()),
+                name: "metadata-key-b".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        for (branch_id, metadata) in [
+            (branch_a.id.as_str(), legacy_ryu),
+            (branch_b.id.as_str(), exact_decimal.as_str()),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "UPDATE lix_branch SET lixcol_metadata = '{metadata}' WHERE id = '{branch_id}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+
+        for (table, scope) in [
+            (
+                "lix_key_value",
+                "key IN ('metadata-key-a', 'metadata-key-b')",
+            ),
+            (
+                "lix_file",
+                "path IN ('/metadata-sql-key-a.md', '/metadata-sql-key-b.md')",
+            ),
+            (
+                "lix_directory",
+                "path IN ('/metadata-sql-key/a', '/metadata-sql-key/b')",
+            ),
+            (
+                "lix_branch",
+                "id IN ('01920000-0000-7000-8000-0000000000c1', \
+                       '01920000-0000-7000-8000-0000000000c2')",
+            ),
+        ] {
+            for literal in [legacy_ryu, exact_decimal.as_str()] {
+                let equality = session
+                    .execute(
+                        &format!(
+                            "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                             AND lixcol_metadata = '{literal}'::jsonb"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    equality.rows()[0].get::<i64>("matches").unwrap(),
+                    2,
+                    "{table} = {literal}"
+                );
+            }
+
+            let in_list = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IN ('{exact_decimal}'::jsonb, '{{}}'::jsonb)"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                in_list.rows()[0].get::<i64>("matches").unwrap(),
+                2,
+                "{table} IN"
+            );
+
+            let parameterized = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IN ($1, $2)"
+                    ),
+                    &[
+                        Value::Jsonb(crate::Json::parse(legacy_ryu).unwrap()),
+                        Value::Jsonb(crate::Json::parse(&exact_decimal).unwrap()),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                parameterized.rows()[0].get::<i64>("matches").unwrap(),
+                2,
+                "{table} parameterized IN"
+            );
+
+            let groups = session
+                .execute(
+                    &format!(
+                        "SELECT lixcol_metadata FROM {table} WHERE {scope} \
+                         AND lixcol_metadata IS NOT NULL GROUP BY lixcol_metadata"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(groups.rows().len(), 1, "{table} GROUP BY");
+        }
+
+        let maximum_scale_exact = format!("0.{}1", "0".repeat(16_382));
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                 VALUES ('metadata-max-scale', 'value', '{\"x\":1e-16383}')",
+                &[],
+            )
+            .await
+            .unwrap();
+        for literal in [
+            r#"{"x":1e-16383}"#.to_owned(),
+            format!(r#"{{"x":{maximum_scale_exact}}}"#),
+        ] {
+            let result = session
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) AS matches FROM lix_key_value \
+                         WHERE key = 'metadata-max-scale' \
+                         AND lixcol_metadata = '{literal}'::jsonb"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.rows()[0].get::<i64>("matches").unwrap(), 1);
         }
     }
 

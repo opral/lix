@@ -5,11 +5,11 @@ pub(crate) mod identity;
 pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
-pub(crate) mod read_retry;
 mod read_budget;
-pub(crate) use read_budget::{ReadResultBudget, with_read_deadline};
+pub(crate) mod read_retry;
 #[cfg(test)]
 pub(crate) use read_budget::{MAX_READ_RESULT_BYTES, MAX_READ_RESULT_ROWS};
+pub(crate) use read_budget::{ReadResultBudget, with_read_deadline};
 pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;
 pub(crate) mod types;
@@ -17,9 +17,11 @@ pub(crate) mod wire;
 
 pub use error::{ErrorOrigin, LixError};
 pub(crate) use exact_batch::{ExactBatch, ExactValue};
-pub use execution_metadata::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
 #[cfg(feature = "server-protocol")]
 pub(crate) use execution_metadata::VerifiedRequestBlob;
+pub use execution_metadata::{
+    ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance,
+};
 pub use identity::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, FileId};
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
 pub(crate) use json_pointer::format_json_pointer;
@@ -28,7 +30,8 @@ pub(crate) use json_pointer::parse_json_pointer;
 pub use lix_path::{LixPath, validate_lix_path_segment};
 pub(crate) use lix_path::{compose_directory_path, compose_file_path};
 pub(crate) use metadata::{
-    parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
+    metadata_sql_equality_key, parse_row_metadata_value, serialize_row_metadata,
+    validate_row_metadata,
 };
 pub(crate) use read_retry::ExpiredReadRetryState;
 pub(crate) use string_dictionary::{

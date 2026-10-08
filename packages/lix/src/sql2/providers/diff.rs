@@ -2638,7 +2638,20 @@ fn values_array(field: &Field, values: &[Option<lix_schema::Value>]) -> Result<A
                     Some(lix_schema::Value::Text(value)) => Ok(Some(value.clone())),
                     Some(lix_schema::Value::Uuid(value)) => Ok(Some(value.to_string())),
                     Some(lix_schema::Value::Jsonb(value)) if field_is_json(field) => {
-                        Ok(Some(value.as_value().to_string()))
+                        let text = value.to_json_string().map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "lix_diff column '{}' could not render JSONB: {error}",
+                                field.name()
+                            ))
+                        })?;
+                        lix_schema::jsonb_equality_key(&text)
+                            .map(Some)
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "lix_diff column '{}' has an invalid JSONB equality key: {error}",
+                                    field.name()
+                                ))
+                            })
                     }
                     _ => Err(DataFusionError::Execution(format!(
                         "lix_diff column '{}' expected text",

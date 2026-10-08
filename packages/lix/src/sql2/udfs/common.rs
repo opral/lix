@@ -21,6 +21,51 @@ pub(crate) fn canonical_jsonb_text(raw: &str) -> std::result::Result<String, Str
     serde_json::to_string(&parse_jsonb(raw)?).map_err(|error| error.to_string())
 }
 
+/// Returns the canonical JSONB comparison key without expanding scientific
+/// numeric tokens into large decimal strings.
+///
+/// This is for SQL equality operands. Storage and public JSON serialization
+/// continue to use `canonical_jsonb_text`, which preserves their established
+/// number rendering contract.
+pub(crate) fn canonical_jsonb_equality_key(raw: &str) -> std::result::Result<String, String> {
+    let mut value = serde_json::from_str::<JsonValue>(raw).map_err(|error| error.to_string())?;
+    sort_jsonb_keys_and_reject_nul(&mut value)?;
+    let compact = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    lix_schema::jsonb_equality_key(&compact).map_err(|error| error.to_string())
+}
+
+/// Returns an equality key from a decoded JSON value without parsing its
+/// serialized form back into a second DOM. Bound SQL literals arrive here as
+/// values already parsed by the binder, but still need recursive key sorting
+/// and PostgreSQL JSONB's NUL rejection.
+pub(crate) fn jsonb_equality_key_value(value: &JsonValue) -> std::result::Result<String, String> {
+    let mut value = value.clone();
+    sort_jsonb_keys_and_reject_nul(&mut value)?;
+    let compact = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    lix_schema::jsonb_equality_key(&compact).map_err(|error| error.to_string())
+}
+
+fn sort_jsonb_keys_and_reject_nul(value: &mut JsonValue) -> std::result::Result<(), String> {
+    match value {
+        JsonValue::String(value) => reject_jsonb_nul(value),
+        JsonValue::Array(values) => {
+            for value in values {
+                sort_jsonb_keys_and_reject_nul(value)?;
+            }
+            Ok(())
+        }
+        JsonValue::Object(values) => {
+            values.sort_keys();
+            for (key, value) in values.iter_mut() {
+                reject_jsonb_nul(key)?;
+                sort_jsonb_keys_and_reject_nul(value)?;
+            }
+            Ok(())
+        }
+        JsonValue::Number(_) | JsonValue::Null | JsonValue::Bool(_) => Ok(()),
+    }
+}
+
 pub(crate) fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
     match value {
         JsonValue::String(value) => reject_jsonb_nul(value)?,
@@ -341,7 +386,10 @@ fn postgres_text_array_path(value: &str) -> Result<Vec<Option<String>>> {
     let mut elements = Vec::new();
     let mut chars = inner.chars().peekable();
     loop {
-        while chars.peek().is_some_and(|character| character.is_whitespace()) {
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
             chars.next();
         }
         let mut element = String::new();
@@ -370,7 +418,10 @@ fn postgres_text_array_path(value: &str) -> Result<Vec<Option<String>>> {
             if !closed {
                 return Err(malformed_postgres_text_array(value));
             }
-            while chars.peek().is_some_and(|character| character.is_whitespace()) {
+            while chars
+                .peek()
+                .is_some_and(|character| character.is_whitespace())
+            {
                 chars.next();
             }
         } else {
@@ -409,11 +460,13 @@ fn postgres_text_array_path(value: &str) -> Result<Vec<Option<String>>> {
         if !quoted && element.is_empty() {
             return Err(malformed_postgres_text_array(value));
         }
-        elements.push(if !quoted && !escaped && element.eq_ignore_ascii_case("NULL") {
-            None
-        } else {
-            Some(element)
-        });
+        elements.push(
+            if !quoted && !escaped && element.eq_ignore_ascii_case("NULL") {
+                None
+            } else {
+                Some(element)
+            },
+        );
 
         match chars.next() {
             Some(',') => {
@@ -430,7 +483,9 @@ fn postgres_text_array_path(value: &str) -> Result<Vec<Option<String>>> {
 }
 
 fn malformed_postgres_text_array(value: &str) -> DataFusionError {
-    DataFusionError::Execution(format!("malformed PostgreSQL text-array JSONB path '{value}'"))
+    DataFusionError::Execution(format!(
+        "malformed PostgreSQL text-array JSONB path '{value}'"
+    ))
 }
 
 fn json_path_segment(
@@ -491,7 +546,9 @@ fn json_path_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonValue, canonical_jsonb_text};
+    use super::{
+        JsonValue, canonical_jsonb_equality_key, canonical_jsonb_text, jsonb_equality_key_value,
+    };
 
     #[test]
     fn canonical_jsonb_collapses_equivalent_numeric_spellings() {
@@ -499,6 +556,33 @@ mod tests {
         assert_eq!(canonical_jsonb_text("[42.0]").unwrap(), "[42]");
         assert_eq!(canonical_jsonb_text("[4.2e1]").unwrap(), "[42]");
         assert_eq!(canonical_jsonb_text("[ 42 ]").unwrap(), "[42]");
+    }
+
+    #[test]
+    fn canonical_jsonb_sql_key_sorts_objects_and_keeps_wide_exponents_compact() {
+        let exact = format!(r#"{{"n":0.{}1,"z":1}}"#, "0".repeat(322));
+
+        assert_eq!(
+            canonical_jsonb_equality_key(r#"{"z":1,"n":1e-323}"#).unwrap(),
+            canonical_jsonb_equality_key(&exact).unwrap()
+        );
+        assert_eq!(
+            canonical_jsonb_equality_key(r#"{"n":1e3,"z":1}"#).unwrap(),
+            r#"{"n":1e3,"z":1}"#
+        );
+        assert_eq!(
+            canonical_jsonb_equality_key("1e-16383").unwrap(),
+            "1e-16383"
+        );
+    }
+
+    #[test]
+    fn decoded_jsonb_literal_key_sorts_without_reparsing_a_dom() {
+        let value = serde_json::from_str::<JsonValue>(r#"{"z":1,"a":1000}"#).unwrap();
+        assert_eq!(
+            jsonb_equality_key_value(&value).unwrap(),
+            r#"{"a":1e3,"z":1}"#
+        );
     }
 
     #[test]

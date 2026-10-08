@@ -154,21 +154,30 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
         u128::MAX,
     );
     let exact_value = serde_json::from_str::<serde_json::Value>(&exact_payload).unwrap();
+    let legacy_render = lix_schema::Jsonb::from_value(exact_value.clone())
+        .to_json_string()
+        .unwrap();
+    assert!(legacy_render.contains("-1.23456789e-40"));
     session
         .execute(
             "INSERT INTO acme_jsonb_probe (id, payload) VALUES ($1, $2)",
             &[
                 Value::Text("exact-numbers".into()),
-                Value::Jsonb(exact_value.into()),
+                Value::Jsonb(exact_value.clone().into()),
             ],
         )
         .await
         .unwrap();
     let exact_sql = format!("'{}'::jsonb", exact_payload.replace('\'', "''"));
+    let adjacent_payload = exact_payload.replace(
+        "-0.000000000000000000000000000000000000000123456789",
+        "-0.000000000000000000000000000000000000000123456788",
+    );
+    let adjacent_sql = format!("'{}'::jsonb", adjacent_payload.replace('\'', "''"));
     let exact = session
         .execute(
             &format!(
-                "SELECT payload = {exact_sql}, payload #>> '{{nested,decimal}}' FROM acme_jsonb_probe WHERE id = 'exact-numbers'"
+                "SELECT payload = {exact_sql}, payload IN ({exact_sql}), payload IS NOT DISTINCT FROM {exact_sql}, payload IS DISTINCT FROM {exact_sql}, payload = {adjacent_sql}, payload #>> '{{nested,decimal}}' FROM acme_jsonb_probe WHERE id = 'exact-numbers'"
             ),
             &[],
         )
@@ -178,8 +187,91 @@ async fn postgresql_jsonb_syntax_registers_queries_and_updates_rows() {
         exact.rows()[0].values(),
         &[
             Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
             Value::Text("1.23456789012345678901234567890123456789".into()),
         ]
+    );
+
+    let parameterized_jsonb_equality = session
+        .execute(
+            "SELECT payload = $1, payload IN ($1) FROM acme_jsonb_probe WHERE id = 'exact-numbers'",
+            &[Value::Jsonb(exact_value.clone().into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        parameterized_jsonb_equality.rows()[0].values(),
+        &[Value::Boolean(true), Value::Boolean(true)]
+    );
+
+    let grouped = session
+        .execute(
+            &format!(
+                "SELECT count(*) FROM (SELECT payload AS value FROM acme_jsonb_probe WHERE id = 'exact-numbers' UNION ALL SELECT {exact_sql}) AS jsonb_values GROUP BY value"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(grouped.rows().len(), 1);
+    assert_eq!(grouped.rows()[0].values(), &[Value::Integer(2)]);
+
+    let count_distinct = session
+        .execute(
+            &format!(
+                "SELECT count(DISTINCT value) FROM (SELECT payload AS value FROM acme_jsonb_probe WHERE id = 'exact-numbers' UNION ALL SELECT {exact_sql}) AS jsonb_values"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_distinct.rows()[0].values(), &[Value::Integer(1)]);
+
+    let set_distinct = session
+        .execute(
+            &format!(
+                "SELECT payload FROM acme_jsonb_probe WHERE id = 'exact-numbers' UNION SELECT {exact_sql}"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(set_distinct.rows().len(), 1);
+
+    let array_equality = session
+        .execute(
+            &format!(
+                "SELECT cardinality(array_distinct(ARRAY[payload, {exact_sql}])), array_position(ARRAY[payload], {exact_sql}), cardinality(array_union(ARRAY[payload], ARRAY[{exact_sql}])), array_has_any(ARRAY[payload], ARRAY[{exact_sql}]) FROM acme_jsonb_probe WHERE id = 'exact-numbers'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        array_equality.rows()[0].values(),
+        &[
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Boolean(true),
+        ]
+    );
+
+    let bound_update = session
+        .execute(
+            &format!(
+                "UPDATE acme_jsonb_probe SET payload = payload WHERE id = 'exact-numbers' AND payload = {exact_sql} RETURNING id"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bound_update.rows()[0].values(),
+        &[Value::Text("exact-numbers".into())]
     );
 
     let parameterized_exists = session

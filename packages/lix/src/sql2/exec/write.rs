@@ -11,8 +11,8 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::common::ExecuteStatementMetadata;
-use crate::sql2::bind::write::BoundWriteOp;
 use crate::sql2::SqlWriteExecutionContext;
+use crate::sql2::bind::write::BoundWriteOp;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
 
@@ -266,7 +266,14 @@ impl ParameterKind {
             (Self::Integer, Value::Integer(value)) => Ok(ScalarValue::Int64(Some(*value))),
             (Self::Real, Value::Real(value)) => Ok(ScalarValue::Float64(Some(*value))),
             (Self::Text, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value.clone()))),
-            (Self::Jsonb, Value::Jsonb(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+            (Self::Jsonb, Value::Jsonb(value)) => lix_schema::jsonb_equality_key(value.as_str())
+                .map(|value| ScalarValue::Utf8(Some(value)))
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("invalid JSONB SQL equality key: {error}"),
+                    )
+                }),
             (Self::RowRef, Value::RowRef(value)) => {
                 Ok(ScalarValue::Utf8(Some(value.as_str().to_owned())))
             }
