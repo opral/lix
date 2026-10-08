@@ -1,5 +1,9 @@
 # Repository sync
 
+The current wire contract uses sync protocol 32 and server protocol 12.
+Repository physical format is 87. Upgrade the SDK and authority together;
+older physical repositories use the migrations described below.
+
 Lix synchronizes its native repository facts rather than maintaining a second
 row protocol:
 
@@ -143,7 +147,7 @@ checkpoint preserves the current authority checkpoint; an explicit local checkpo
 change retains its incoming precedence. Equal checkpoint overrides are omitted
 canonically, preserving existing immutable request digests. The owned persisted
 journal migration upgrades older records without resetting pending edits. These
-endpoints require sync protocol 14/server protocol 8; upgrade SDK and server together.
+endpoints require matching SDK and server protocol revisions.
 
 Partial replicas discover progress through the leased `GET /sync/descriptor`
 long poll. Discovery carries no read recipes and performs no optional prefetch.
@@ -161,8 +165,8 @@ known failure; it does not guarantee that there are no unseen remote writes.
 Small-file publication includes canonical content in the existing `inlineBlobs`
 push (up to 256 KiB per blob and a 1 MiB combined request); larger uploads retain
 the existing chunk path. Authoritative row/plugin merge semantics are unchanged.
-Sync protocol 17 removes `/sync/update` and requires SDK and server to upgrade
-together. Repository format remains 81; retained data and recipes remain readable.
+The former `/sync/update` endpoint was removed in sync protocol 17. Current
+clients use the leased descriptor path and matching authority revision.
 
 ### Lost HTTP sessions
 

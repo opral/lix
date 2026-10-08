@@ -7065,17 +7065,18 @@ mod tests {
         append_required_blob_chunk_run(&read, &ordered_addresses, &ordered_spool)
             .await
             .unwrap();
-        let ordered_spool = ordered_spool.lock().unwrap();
-        assert_eq!(ordered_spool.inputs.len(), 2);
-        for (index, expected_hash) in hashes.iter().rev().enumerate() {
-            let input = ordered_spool.read(index).unwrap();
-            assert_eq!(
-                input.address,
-                ReadInputAddress::BlobChunk(*expected_hash.as_bytes())
-            );
-            assert_eq!(input.bytes, payloads[1 - index]);
+        {
+            let ordered_spool = ordered_spool.lock().unwrap();
+            assert_eq!(ordered_spool.inputs.len(), 2);
+            for (index, expected_hash) in hashes.iter().rev().enumerate() {
+                let input = ordered_spool.read(index).unwrap();
+                assert_eq!(
+                    input.address,
+                    ReadInputAddress::BlobChunk(*expected_hash.as_bytes())
+                );
+                assert_eq!(input.bytes, payloads[1 - index]);
+            }
         }
-        drop(ordered_spool);
 
         let missing_hash = crate::binary_cas::ChunkHash::from_content(b"missing required chunk");
         let missing_addresses = vec![
