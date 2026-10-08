@@ -20,7 +20,9 @@ mod file;
 mod mainline;
 pub(crate) use mainline::relation_history_schema;
 #[cfg(test)]
-pub(crate) use mainline::{take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work};
+pub(crate) use mainline::{
+    take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work,
+};
 pub(crate) fn log_schema() -> datafusion::arrow::datatypes::SchemaRef {
     mainline::metadata_schema(false)
 }
@@ -64,7 +66,7 @@ pub(crate) use schema::{
     execute_exact_schema_batch_read, execute_exact_schema_point_read,
     revalidate_schema_amended_rows,
 };
-pub(crate) use spec::{DmlReturning, SpecWriteTarget, WriteTargetRegistry};
+pub(crate) use spec::{DmlBatchSelection, DmlReturning, SpecWriteTarget, WriteTargetRegistry};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 
 pub(crate) async fn register_read<C>(
@@ -117,7 +119,9 @@ where
         names: relation_names,
         history_relations: BTreeSet::new(),
     };
-    let branch_ref = Arc::new(super::branch_ref::CachingBranchRefReader::new(ctx.branch_ref()));
+    let branch_ref = Arc::new(super::branch_ref::CachingBranchRefReader::new(
+        ctx.branch_ref(),
+    ));
     register_read_from_catalog(
         session,
         ctx,

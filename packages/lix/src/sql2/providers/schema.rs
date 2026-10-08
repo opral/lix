@@ -1014,11 +1014,6 @@ impl TableSpec for SchemaSpec {
                 "delete lix_registered_schema is not supported",
             )));
         }
-        if !filters.iter().any(contains_like_filter) {
-            return not_impl_err!(
-                "raw DataFusion DELETE is disabled; use the sql2 bound write pipeline"
-            );
-        }
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
         let source = row_source(
@@ -1807,16 +1802,6 @@ fn row_columnar_scalar_precision(
         None => return Precision::Absent,
     };
     Precision::Exact(value)
-}
-
-fn contains_like_filter(expr: &Expr) -> bool {
-    match expr {
-        Expr::Like(_) => true,
-        Expr::BinaryExpr(binary) => {
-            contains_like_filter(&binary.left) || contains_like_filter(&binary.right)
-        }
-        _ => false,
-    }
 }
 
 #[derive(Clone, Copy)]

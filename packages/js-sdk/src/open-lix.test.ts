@@ -1638,26 +1638,47 @@ test("fs storage on-demand sync does not create directories for missing imports"
 	await lix.close();
 });
 
-test("fs storage on-demand sync propagates deletion of imported files", async () => {
+test("fs storage on-demand sync propagates deletion on a default-sized Rust stack", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(filePath, "local");
-
-	const storage = new FilesystemStorage({
-		path: dir,
-		syncAllFiles: false,
-	});
-	const lix = await openLix({ storage });
-	await storage.importPaths(["note.md"]);
-
-	expect(await readFile(lix, "/note.md")).toBeDefined();
-
-	unlinkSync(filePath);
-	await waitFor(async () => await readFile(lix, "/note.md"), undefined);
-
-	await lix.close();
-});
+	const sdkUrl = pathToFileURL(join(process.cwd(), "dist/index.js")).href;
+	const filesystemUrl = new URL(
+		"../../storage-filesystem/dist/index.js",
+		import.meta.url,
+	).href;
+	const script = `
+		import { openLix } from ${JSON.stringify(sdkUrl)};
+		import { FilesystemStorage } from ${JSON.stringify(filesystemUrl)};
+		import { unlinkSync } from "node:fs";
+		import { setTimeout } from "node:timers/promises";
+		const storage = new FilesystemStorage({ path: ${JSON.stringify(dir)}, syncAllFiles: false });
+		const lix = await openLix({ storage });
+		try {
+			await storage.importPaths(["note.md"]);
+			const read = async () => (await lix.execute("SELECT id FROM lix_file WHERE path = $1", ["/note.md"])).rows;
+			if ((await read()).length !== 1) throw new Error("file was not imported");
+			unlinkSync(${JSON.stringify(filePath)});
+			for (let attempt = 0; (await read()).length > 0; attempt++) {
+				if (attempt === 100) throw new Error("file deletion was not reconciled");
+				await setTimeout(20);
+			}
+		} finally {
+			await lix.close();
+		}
+	`;
+	try {
+		await expect(
+			promisify(execFile)(process.execPath, ["--input-type=module", "--eval", script], {
+				env: { ...process.env, RUST_MIN_STACK: "2097152" },
+				timeout: 8_000,
+			}),
+		).resolves.toBeDefined();
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 10_000);
 
 test("fs storage on-demand sync does not delete excluded files through parent directories", async () => {
 	const dir = tempFsDir();

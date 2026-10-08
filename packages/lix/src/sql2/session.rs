@@ -4,8 +4,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, TableFactor, Visit, Visitor};
 use std::collections::BTreeSet;
-use std::ops::Deref;
 use std::ops::ControlFlow;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -229,38 +229,36 @@ pub(crate) async fn build_write_session_with_options(
         &provider_selection,
         relation_names.as_ref(),
     );
-    let source_statement = match &plan.bound.input {
+    let mut source_statements = match &plan.bound.input {
         super::bind::write::BoundWriteInput::Query { query, .. } => {
-            Some(DataFusionStatement::Statement(Box::new(
+            vec![DataFusionStatement::Statement(Box::new(
                 datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
-            )))
+            ))]
         }
-        _ => None,
+        _ => Vec::new(),
     };
+    if let Some(statement) =
+        super::exec::datafusion::write_predicate_selection_statement(plan, &table_name)?
+    {
+        source_statements.push(statement);
+    }
     let returning_expressions = plan
         .bound
         .returning
         .iter()
         .flat_map(|returning| returning.items.iter())
         .filter_map(|item| item.sql_expr.as_ref());
-    let needs_root_commit_id = source_statement
-        .as_ref()
-        .is_some_and(|statement| {
-            statement_uses_execution_function(statement, "lix_root_commit_id")
-        })
+    let needs_root_commit_id = source_statements
+        .iter()
+        .any(|statement| statement_uses_execution_function(statement, "lix_root_commit_id"))
         || returning_expressions
             .clone()
             .any(|expression| expression_uses_execution_function(expression, "lix_root_commit_id"));
-    let needs_working_diff_checkpoint_commit_id = source_statement
-        .as_ref()
-        .is_some_and(|statement| {
+    let needs_working_diff_checkpoint_commit_id =
+        source_statements.iter().any(|statement| {
             statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
-        })
-        || returning_expressions.clone().any(|expression| {
-            expression_uses_execution_function(
-                expression,
-                "lix_working_diff_checkpoint_commit_id",
-            )
+        }) || returning_expressions.clone().any(|expression| {
+            expression_uses_execution_function(expression, "lix_working_diff_checkpoint_commit_id")
         });
     let read_requirements = SqlWriteReadRequirements {
         needs_read_table_functions,

@@ -93,6 +93,9 @@ pub(crate) fn take_certified_single_path_value_replacements() -> usize {
 }
 
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
+    if plan.bound.predicate_fallback.is_some() {
+        return false;
+    }
     match &plan.bound.target {
         BoundWriteTarget::Row(_) => bound_public_write_shape_supported(plan),
         BoundWriteTarget::File(surface) => {
@@ -478,6 +481,9 @@ async fn try_execute_row_update_batch(
     plan: &LogicalWritePlan,
     parameter_batch: RowInsertParameterBatch<'_>,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    if plan.bound.predicate_fallback.is_some() {
+        return Ok(None);
+    }
     if let Some(results) =
         try_execute_direct_path_value_replacement_batch(ctx, plan, parameter_batch).await?
     {
@@ -1791,6 +1797,9 @@ pub(crate) async fn try_execute_bound_public_write(
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
 ) -> Result<BoundPublicWriteExecution, LixError> {
+    if plan.bound.predicate_fallback.is_some() {
+        return Ok(BoundPublicWriteExecution::Unsupported);
+    }
     match &plan.bound.target {
         BoundWriteTarget::Row(surface) if bound_public_write_shape_supported(plan) => {
             execute_row_write(ctx, plan, surface, params)
@@ -2311,6 +2320,7 @@ mod active_branch_commit_id_reference_tests {
                 op: BoundWriteOp::Update,
                 input: BoundWriteInput::None,
                 predicate,
+                predicate_fallback: None,
                 assignments: vec![BoundAssignment {
                     column: BoundColumnRef {
                         image: None,
@@ -6697,6 +6707,9 @@ fn bound_predicate_references_change_id(
 }
 
 fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
+    if plan.bound.predicate_fallback.is_some() {
+        return false;
+    }
     let input_supported = match (&plan.bound.op, &plan.bound.input) {
         (BoundWriteOp::Insert, BoundWriteInput::Values(values)) => values
             .rows

@@ -625,9 +625,7 @@ impl LixFileSpec {
 
 /// Restrict a hydration index to canonical IDs when every candidate is valid.
 /// Invalid values disable this optional optimization and keep path lookup intact.
-fn canonical_file_ids_for_path_index(
-    file_ids: Option<&BTreeSet<String>>,
-) -> Option<Vec<String>> {
+fn canonical_file_ids_for_path_index(file_ids: Option<&BTreeSet<String>>) -> Option<Vec<String>> {
     let file_ids = file_ids?;
     file_ids
         .iter()
@@ -1065,7 +1063,9 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     interest::retain_content(
         hot_state.as_ref(),
         &request,
-        &file_ids.map_or(FileIdConstraint::All, |ids| FileIdConstraint::Ids(ids.clone())),
+        &file_ids.map_or(FileIdConstraint::All, |ids| {
+            FileIdConstraint::Ids(ids.clone())
+        }),
         &FileIdConstraint::All,
         false,
         &FilePathPredicate::In(paths.clone()),
@@ -1912,7 +1912,8 @@ impl TableSpec for LixFileSpec {
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
-            || options.returning_columns.contains("content");
+            || options.returning_columns.contains("content")
+            || options.required_columns.contains("content");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = resolve_provider_branch_ids(
@@ -1991,7 +1992,24 @@ impl TableSpec for LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
-        self.plan_update_with_post_image(write_ctx, assignments, filters, None)
+        self.plan_update_with_post_image(
+            write_ctx,
+            assignments,
+            filters,
+            None,
+            DmlPlanOptions::default(),
+        )
+        .await
+    }
+
+    async fn plan_update_with_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, None, options)
             .await
     }
 
@@ -2002,7 +2020,25 @@ impl TableSpec for LixFileSpec {
         filters: &[Expr],
         returning: DmlReturning,
     ) -> Result<PlannedDml> {
-        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
+        self.plan_update_with_post_image(
+            write_ctx,
+            assignments,
+            filters,
+            Some(returning),
+            DmlPlanOptions::default(),
+        )
+        .await
+    }
+
+    async fn plan_update_with_returning_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+        options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning), options)
             .await
     }
 }
@@ -2014,10 +2050,12 @@ impl LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: Option<DmlReturning>,
+        options: DmlPlanOptions,
     ) -> Result<PlannedDml> {
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
+            || options.required_columns.contains("content")
             || assignments.iter().any(|(column_name, expr)| {
                 column_name == "path" || physical_expr_contains_column(expr, "content")
             })
@@ -8528,12 +8566,14 @@ mod tests {
         assert_eq!(batch, indexed_batch, "direct and indexed rows must agree");
         assert_eq!(indexed_requests.load(Ordering::SeqCst), 1);
 
-        let missing_filters = vec![eq_filter(
-            "id",
-            "01920000-0000-7000-8000-0000000000ff",
-        )];
+        let missing_filters = vec![eq_filter("id", "01920000-0000-7000-8000-0000000000ff")];
         let direct_missing = spec
-            .plan_scan(Some(&projection), &missing_filters, None, &ExecutionProps::new())
+            .plan_scan(
+                Some(&projection),
+                &missing_filters,
+                None,
+                &ExecutionProps::new(),
+            )
             .await
             .expect("direct missing-ID projection should plan")
             .source
@@ -8541,7 +8581,12 @@ mod tests {
             .await
             .expect("direct missing-ID projection should load");
         let indexed_missing = indexed_spec
-            .plan_scan(Some(&projection), &missing_filters, None, &ExecutionProps::new())
+            .plan_scan(
+                Some(&projection),
+                &missing_filters,
+                None,
+                &ExecutionProps::new(),
+            )
             .await
             .expect("indexed missing-ID projection should plan")
             .source
@@ -9855,16 +9900,21 @@ mod tests {
                 .lock()
                 .expect("live-state request mutex should not be poisoned")
                 .push(request.clone());
-            typed_fixture_batch(self.rows.iter().filter(|row| {
-                request.filter.file_ids.is_empty()
-                    || request.filter.file_ids.iter().any(|file_id| match file_id {
-                        NullableKeyFilter::Any => true,
-                        NullableKeyFilter::Null => row.file_id.is_none(),
-                        NullableKeyFilter::Value(file_id) => {
-                            row.file_id.as_deref() == Some(file_id.as_str())
-                        }
+            typed_fixture_batch(
+                self.rows
+                    .iter()
+                    .filter(|row| {
+                        request.filter.file_ids.is_empty()
+                            || request.filter.file_ids.iter().any(|file_id| match file_id {
+                                NullableKeyFilter::Any => true,
+                                NullableKeyFilter::Null => row.file_id.is_none(),
+                                NullableKeyFilter::Value(file_id) => {
+                                    row.file_id.as_deref() == Some(file_id.as_str())
+                                }
+                            })
                     })
-            }).cloned())
+                    .cloned(),
+            )
         }
 
         async fn load_exact_batch(
@@ -11171,9 +11221,17 @@ mod tests {
         let other_branch = "01920000-0000-7000-8000-0000000000b2";
         let ambiguous = Arc::new(ExactContentHotStateReader {
             rows: vec![
-                live_file_row(id, branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_file_row(
+                    id,
+                    branch,
+                    &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#),
+                ),
                 live_blob_ref_row(id, branch, id, &hash.to_hex(), 19),
-                live_file_row(id, other_branch, &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#)),
+                live_file_row(
+                    id,
+                    other_branch,
+                    &format!(r#"{{"id":"{id}","directory_id":null,"name":"note.txt"}}"#),
+                ),
                 live_blob_ref_row(id, other_branch, id, &hash.to_hex(), 19),
             ],
         }) as Arc<dyn HotStateReader>;

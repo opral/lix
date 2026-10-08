@@ -8,7 +8,12 @@ use super::write::BoundWriteOp;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundTable {
+    /// The catalog surface name, kept separate from a DML target alias so
+    /// bound columns continue to identify the actual writable surface.
     pub(crate) name: String,
+    /// The SQL range variable visible in expressions, when the target is
+    /// aliased. SQL aliases hide the original table name in that scope.
+    pub(crate) qualifier: Option<String>,
     pub(crate) surface: PublicSurfaceContract,
 }
 
@@ -39,6 +44,7 @@ pub(crate) fn bind_public_table(
     let surface = catalog.require_surface(&table_name)?.clone();
     Ok(BoundTable {
         name: table_name,
+        qualifier: None,
         surface,
     })
 }

@@ -41,8 +41,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, TableFactor,
-    Statement as SqlStatement, Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart,
+    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 #[cfg(any(feature = "storage-benches", test))]
 use futures_util::TryStreamExt;
@@ -62,6 +63,7 @@ use crate::sql2::logical_value_compatibility::{
     validate_lix_expr_compatibility, validate_lix_value_compatibility,
 };
 use crate::sql2::logical_value_metadata::{expr_lix_value_kind, propagate_lix_value_metadata};
+use crate::sql2::providers::DmlBatchSelection;
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
     LIX_VALUE_TYPE_JSONB, LIX_VALUE_TYPE_METADATA_KEY, LIX_VALUE_TYPE_ROW_REF, field_is_json,
@@ -1357,7 +1359,10 @@ async fn bound_returning_image_capture_plan(
 
     let width = items.len();
     let mut capture_plan = plan.clone();
-    capture_plan.bound.returning = Some(BoundReturning { items });
+    capture_plan.bound.returning = Some(BoundReturning {
+        items,
+        target_alias: returning.target_alias.clone(),
+    });
     Ok(Some((
         capture_plan,
         BoundReturningImageCapture {
@@ -1482,6 +1487,13 @@ async fn execute_datafusion_write_logical_plan_inner(
         matches!(plan.bound.op, BoundWriteOp::Delete),
     )
     .await?;
+    let predicate_selection = datafusion_write_predicate_selection(&session, plan, params);
+    let predicate_required_columns = plan
+        .bound
+        .predicate_fallback
+        .as_ref()
+        .map(predicate_fallback_required_columns)
+        .unwrap_or_default();
 
     if returning
         .as_ref()
@@ -1531,11 +1543,9 @@ async fn execute_datafusion_write_logical_plan_inner(
                     .validate_upsert_target(&input, &target_columns)
                     .await
                     .map_err(datafusion_error_to_lix_error)?;
-                let proposed_batches = crate::sql2::runtime::stream_input_plan(
-                    Arc::clone(&input),
-                    session.task_ctx(),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                let proposed_batches =
+                    crate::sql2::runtime::stream_input_plan(Arc::clone(&input), session.task_ctx())
+                        .map_err(datafusion_error_to_lix_error)?;
                 let action = match &conflict.action {
                     crate::sql2::bind::write::BoundConflictAction::DoNothing => {
                         crate::sql2::providers::UpsertAction::DoNothing
@@ -1613,11 +1623,24 @@ async fn execute_datafusion_write_logical_plan_inner(
             }
             match &returning {
                 Some(returning) => write_target
-                    .update_with_returning(&state, assignments, filters, returning.clone())
+                    .update_with_returning(
+                        &state,
+                        assignments,
+                        filters,
+                        returning.clone(),
+                        predicate_selection.clone(),
+                        predicate_required_columns.clone(),
+                    )
                     .await
                     .map_err(datafusion_error_to_lix_error),
                 None => write_target
-                    .update(&state, assignments, filters)
+                    .update(
+                        &state,
+                        assignments,
+                        filters,
+                        predicate_selection.clone(),
+                        predicate_required_columns.clone(),
+                    )
                     .await
                     .map_err(datafusion_error_to_lix_error),
             }
@@ -1638,11 +1661,22 @@ async fn execute_datafusion_write_logical_plan_inner(
             }
             match &returning {
                 Some(returning) => write_target
-                    .delete_with_returning(&state, filters, returning.clone())
+                    .delete_with_returning(
+                        &state,
+                        filters,
+                        returning.clone(),
+                        predicate_selection.clone(),
+                        predicate_required_columns.clone(),
+                    )
                     .await
                     .map_err(datafusion_error_to_lix_error),
                 None => write_target
-                    .delete(&state, filters)
+                    .delete(
+                        &state,
+                        filters,
+                        predicate_selection.clone(),
+                        predicate_required_columns.clone(),
+                    )
                     .await
                     .map_err(datafusion_error_to_lix_error),
             }
@@ -1848,7 +1882,7 @@ async fn datafusion_returning_projection(
         .map(|(column, alias)| (column.to_ascii_lowercase(), alias.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut expressions = Vec::with_capacity(returning.items.len());
-    for item in &returning.items {
+    for (index, item) in returning.items.iter().enumerate() {
         let mut sql_expr = item.sql_expr.clone().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -1856,22 +1890,16 @@ async fn datafusion_returning_projection(
             )
         })?;
         rewrite_returning_image_qualifiers(&mut sql_expr, &old_aliases, &new_aliases);
-        let forced_name = item.output_alias.as_ref().or_else(|| {
-            item.expr
-                .as_ref()
-                .is_some_and(|expr| matches!(expr, BoundExpr::Column(_)))
-                .then_some(&item.output_name)
-        });
-        expressions.push(match forced_name {
-            Some(name) => format!("{sql_expr} AS {}", Ident::with_quote('"', name.clone())),
-            None => sql_expr.to_string(),
-        });
+        expressions.push(format!(
+            "{sql_expr} AS {}",
+            Ident::with_quote('"', format!("__lix_returning_result_{index}"))
+        ));
     }
     let sql = format!(
         "SELECT {} FROM {} AS {}",
         expressions.join(", "),
         Ident::with_quote('"', INPUT_TABLE_NAME),
-        Ident::with_quote('"', target_name),
+        returning_target_alias_sql(returning, target_name),
     );
     let (logical_plan, parameter_count) =
         datafusion_plan_from_sql_with_params(session, &sql, params).await?;
@@ -1891,58 +1919,66 @@ async fn datafusion_returning_projection(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    // The private OLD/NEW input columns are an execution adapter. For an
-    // implicit expression label, ask DataFusion to derive the name after
-    // replacing only those private column nodes with their SQL-facing
-    // qualifiers; keep the executable plan unchanged.
+    // DataFusion requires unique projection names, but RETURNING permits
+    // duplicate public labels such as OLD.score, NEW.score. Keep unique names
+    // on the executable projection and restore public labels in the result
+    // fields after planning.
     if let LogicalPlan::Projection(projection) = &logical_plan {
         for (index, (item, expression)) in returning.items.iter().zip(&projection.expr).enumerate()
         {
-            if item.output_alias.is_some()
-                || item
-                    .expr
-                    .as_ref()
-                    .is_some_and(|expr| matches!(expr, BoundExpr::Column(_)))
+            let output_name = if let Some(alias) = &item.output_alias {
+                alias.clone()
+            } else if item
+                .expr
+                .as_ref()
+                .is_some_and(|expr| matches!(expr, BoundExpr::Column(_)))
             {
-                continue;
-            }
-            let display_expr = expression
-                .clone()
-                .transform_up(|expression| {
-                    let Expr::Column(column) = expression else {
-                        return Ok(Transformed::no(expression));
-                    };
-                    let replacement = old_aliases
-                        .iter()
-                        .find(|(_, alias)| alias.as_str() == column.name.as_str())
-                        .map(|(name, _)| ("old", name))
-                        .or_else(|| {
-                            new_aliases
-                                .iter()
-                                .find(|(_, alias)| alias.as_str() == column.name.as_str())
-                                .map(|(name, _)| ("new", name))
-                        });
-                    Ok(match replacement {
-                        Some((image, name)) => Transformed::yes(Expr::Column(Column::new(
-                            Some(datafusion::common::TableReference::bare(image)),
-                            name.clone(),
-                        ))),
-                        None => Transformed::no(Expr::Column(column)),
+                item.output_name.clone()
+            } else {
+                let expression = match expression {
+                    Expr::Alias(alias) => alias.expr.as_ref().clone(),
+                    expression => expression.clone(),
+                };
+                // The private OLD/NEW input columns are an execution adapter.
+                // Ask DataFusion to derive an implicit expression label after
+                // replacing only those private column nodes with SQL-facing
+                // qualifiers; keep the executable plan unchanged.
+                expression
+                    .transform_up(|expression| {
+                        let Expr::Column(column) = expression else {
+                            return Ok(Transformed::no(expression));
+                        };
+                        let replacement = old_aliases
+                            .iter()
+                            .find(|(_, alias)| alias.as_str() == column.name.as_str())
+                            .map(|(name, _)| ("old", name))
+                            .or_else(|| {
+                                new_aliases
+                                    .iter()
+                                    .find(|(_, alias)| alias.as_str() == column.name.as_str())
+                                    .map(|(name, _)| ("new", name))
+                            });
+                        Ok(match replacement {
+                            Some((image, name)) => Transformed::yes(Expr::Column(Column::new(
+                                Some(datafusion::common::TableReference::bare(image)),
+                                name.clone(),
+                            ))),
+                            None => Transformed::no(Expr::Column(column)),
+                        })
                     })
-                })
-                .map_err(datafusion_error_to_lix_error)?
-                .data;
-            fields[index] = fields[index]
-                .clone()
-                .with_name(display_expr.schema_name().to_string());
+                    .map_err(datafusion_error_to_lix_error)?
+                    .data
+                    .schema_name()
+                    .to_string()
+            };
+            fields[index] = fields[index].clone().with_name(output_name);
         }
     }
     let state = session.state();
     let logical_plan = state
         .optimize(&logical_plan)
         .map_err(datafusion_error_to_lix_error)?;
-    let read_source_columns =
-        optimized_returning_source_columns(&logical_plan, INPUT_TABLE_NAME)?;
+    let read_source_columns = optimized_returning_source_columns(&logical_plan, INPUT_TABLE_NAME)?;
     if let Some(unavailable) = read_source_columns
         .difference(&available_source_columns)
         .next()
@@ -2236,9 +2272,8 @@ async fn insert_values_input_plan(
             })
             .collect::<Vec<_>>(),
     ));
-    let df_schema = Arc::new(
-        DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
-    );
+    let df_schema =
+        Arc::new(DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?);
     let rows = values
         .rows
         .iter()
@@ -2501,6 +2536,10 @@ pub(crate) fn write_read_dependencies(
         _ => {}
     }
 
+    if let Some(statement) = write_predicate_selection_statement(plan, target_table_name)? {
+        statements.push(statement);
+    }
+
     if let Some(returning) = plan.bound.returning.as_ref()
         && returning
             .items
@@ -2522,9 +2561,10 @@ pub(crate) fn write_read_dependencies(
             })
             .collect::<Vec<_>>();
         let sql = format!(
-            "SELECT {} FROM {}",
+            "SELECT {} FROM {} AS {}",
             expressions.join(", "),
-            Ident::with_quote('"', target_table_name.to_owned())
+            Ident::with_quote('"', target_table_name.to_owned()),
+            returning_target_alias_sql(returning, target_table_name)
         );
         statements.push(crate::sql2::parse::parse_statement(&sql)?);
     }
@@ -2555,9 +2595,9 @@ pub(crate) fn write_read_dependencies(
         | ProviderSelection::OnlyWithVisibleSchemas { names, .. } => names
             .iter()
             .any(|name| crate::sql2::providers::READ_TABLE_FUNCTION_NAMES.contains(&name.as_str())),
-        ProviderSelection::All | ProviderSelection::AllWithHistory(_) => statements
-            .iter()
-            .any(statement_uses_read_table_functions),
+        ProviderSelection::All | ProviderSelection::AllWithHistory(_) => {
+            statements.iter().any(statement_uses_read_table_functions)
+        }
     };
 
     let selection = match source {
@@ -2590,6 +2630,33 @@ pub(crate) fn write_read_dependencies(
     Ok((selection, needs_read_table_functions, relation_names))
 }
 
+pub(crate) fn write_predicate_selection_statement(
+    plan: &LogicalWritePlan,
+    target_table_name: &str,
+) -> Result<Option<DataFusionStatement>, LixError> {
+    let Some(fallback) = &plan.bound.predicate_fallback else {
+        return Ok(None);
+    };
+    let sql = write_predicate_selection_sql(fallback, target_table_name);
+    crate::sql2::parse::parse_statement(&sql).map(Some)
+}
+
+fn write_predicate_selection_sql(
+    fallback: &crate::sql2::bind::write::BoundWritePredicateFallback,
+    relation_name: &str,
+) -> String {
+    // Preserve the source alias's quoting semantics. Quoting an originally
+    // unquoted `T` here changes it from the folded identifier `t` to a
+    // case-sensitive `T`, while the raw predicate still refers to `T` as
+    // unquoted SQL.
+    let alias = fallback.target_alias.to_string();
+    format!(
+        "SELECT {alias}.* FROM {} AS {alias} WHERE {}",
+        Ident::with_quote('"', relation_name.to_owned()),
+        fallback.expr,
+    )
+}
+
 fn returning_expression_needs_provider_discovery(expression: &SqlExpr) -> bool {
     struct ProviderDependencyVisitor;
 
@@ -2598,24 +2665,22 @@ fn returning_expression_needs_provider_discovery(expression: &SqlExpr) -> bool {
 
         fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
             if let SqlExpr::Function(function) = expression
-                && crate::sql2::parse::object_name_is_public_function(
-                    &function.name,
-                    "lix_row_ref",
-                )
+                && crate::sql2::parse::object_name_is_public_function(&function.name, "lix_row_ref")
             {
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
         }
 
-        fn pre_visit_table_factor(&mut self, _table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        fn pre_visit_table_factor(
+            &mut self,
+            _table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
             ControlFlow::Break(())
         }
     }
 
-    expression
-        .visit(&mut ProviderDependencyVisitor)
-        .is_break()
+    expression.visit(&mut ProviderDependencyVisitor).is_break()
 }
 
 fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool {
@@ -2624,7 +2689,10 @@ fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool 
     impl Visitor for ReadTableFunctionVisitor {
         type Break = ();
 
-        fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
             let TableFactor::Table {
                 name,
                 args: Some(_),
@@ -2635,9 +2703,7 @@ fn statement_uses_read_table_functions(statement: &DataFusionStatement) -> bool 
             };
             if crate::sql2::providers::READ_TABLE_FUNCTION_NAMES
                 .iter()
-                .any(|function| {
-                    crate::sql2::parse::object_name_is_public_function(name, function)
-                })
+                .any(|function| crate::sql2::parse::object_name_is_public_function(name, function))
             {
                 ControlFlow::Break(())
             } else {
@@ -2971,7 +3037,7 @@ async fn deferred_returning_image_columns(
         "SELECT {} FROM {} AS {}",
         expressions.join(", "),
         Ident::with_quote('"', input_table_name.clone()),
-        Ident::with_quote('"', target_name),
+        returning_target_alias_sql(returning, target_name),
     );
     let (plan, _) = datafusion_plan_from_sql_with_params(session, &sql, params).await?;
     let state = session.state();
@@ -3000,6 +3066,14 @@ async fn deferred_returning_image_columns(
         }
     }
     Ok(images)
+}
+
+fn returning_target_alias_sql(returning: &BoundReturning, target_name: &str) -> String {
+    returning
+        .target_alias
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Ident::with_quote('"', target_name.to_owned()).to_string())
 }
 
 fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
@@ -3242,13 +3316,7 @@ fn datafusion_conflict_assignments(
     schema: &Schema,
     assignments: &[crate::sql2::bind::write::BoundAssignment],
     params: &[Value],
-) -> Result<
-    Vec<(
-        String,
-        Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-    )>,
-    LixError,
-> {
+) -> Result<Vec<(String, Arc<dyn datafusion::physical_expr::PhysicalExpr>)>, LixError> {
     let mut fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -3325,6 +3393,162 @@ fn datafusion_write_filters(
         )));
     }
     Ok(filters)
+}
+
+fn datafusion_write_predicate_selection(
+    session: &SessionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Option<DmlBatchSelection> {
+    let fallback = plan.bound.predicate_fallback.clone()?;
+    let session = session.clone();
+    let params = params.to_vec();
+    Some(Arc::new(move |batch| {
+        let session = session.clone();
+        let fallback = fallback.clone();
+        let params = params.clone();
+        Box::pin(async move {
+            datafusion_select_write_predicate_batch(&session, batch, &fallback, &params)
+                .await
+                .map_err(crate::sql2::error::lix_error_to_datafusion_error)
+        })
+    }))
+}
+
+fn predicate_fallback_required_columns(
+    fallback: &crate::sql2::bind::write::BoundWritePredicateFallback,
+) -> BTreeSet<String> {
+    struct ColumnVisitor<'a> {
+        names: BTreeSet<String>,
+        public_columns: &'a BTreeSet<String>,
+    }
+
+    impl Visitor for ColumnVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            let identifier = match expr {
+                SqlExpr::Identifier(ident) => Some(ident),
+                SqlExpr::CompoundIdentifier(parts) => parts.last(),
+                _ => None,
+            };
+            if let Some(identifier) = identifier {
+                let name = normalized_returning_identifier(identifier);
+                if self.public_columns.contains(&name) {
+                    self.names.insert(name);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = ColumnVisitor {
+        names: BTreeSet::new(),
+        public_columns: &fallback.public_columns,
+    };
+    let _ = fallback.expr.visit(&mut visitor);
+    visitor.names
+}
+
+async fn datafusion_select_write_predicate_batch(
+    session: &SessionContext,
+    source_batch: RecordBatch,
+    fallback: &crate::sql2::bind::write::BoundWritePredicateFallback,
+    params: &[Value],
+) -> Result<RecordBatch, LixError> {
+    let source_schema = source_batch.schema();
+    let private_scope = uuid::Uuid::now_v7().simple().to_string();
+    let mut used_names = source_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .chain(fallback.public_columns.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut candidate_fields = Vec::with_capacity(source_schema.fields().len());
+    for (index, field) in source_schema.fields().iter().enumerate() {
+        if fallback.public_columns.contains(field.name()) {
+            candidate_fields.push(field.as_ref().clone());
+            continue;
+        }
+        let mut suffix = 0_usize;
+        let private_name = loop {
+            let candidate = format!("__lix_dml_private_{private_scope}_{index}_{suffix}");
+            if used_names.insert(candidate.clone()) {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        candidate_fields.push(field.as_ref().clone().with_name(private_name));
+    }
+    let candidate_schema = Arc::new(Schema::new(candidate_fields));
+    let candidate_batch = RecordBatch::try_new(
+        Arc::clone(&candidate_schema),
+        source_batch.columns().to_vec(),
+    )
+    .map_err(|error| datafusion_error_to_lix_error(error.into()))?;
+    let table_name = format!("__lix_dml_candidates_{private_scope}");
+    let provider = Arc::new(
+        MemTable::try_new(Arc::clone(&candidate_schema), vec![vec![candidate_batch]])
+            .map_err(datafusion_error_to_lix_error)?,
+    );
+    session
+        .register_table(&table_name, provider)
+        .map_err(datafusion_error_to_lix_error)?;
+
+    let result = async {
+        let sql = write_predicate_selection_sql(fallback, &table_name);
+        let mut statement = crate::sql2::parse::parse_statement(&sql)?;
+        bind_table_function_parameters(&mut statement, params)?;
+        let logical_plan = create_logical_plan_from_statement(session, statement, params).await?;
+        validate_supported_logical_plan(&logical_plan)?;
+        let logical_plan = bind_plan_param_values(logical_plan, params)?;
+        let physical_plan = session
+            .state()
+            .create_physical_plan(&logical_plan)
+            .await
+            .map_err(datafusion_error_to_lix_error)?;
+        let batches = crate::sql2::runtime::collect_input_plan(physical_plan, session.task_ctx())
+            .await
+            .map_err(datafusion_error_to_lix_error)?;
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(source_schema.clone()));
+        }
+        let output_schema = batches[0].schema();
+        if batches.iter().any(|batch| batch.schema() != output_schema) {
+            return Err(LixError::unknown(
+                "DataFusion predicate selection produced inconsistent target schemas",
+            ));
+        }
+        let output = datafusion::arrow::compute::concat_batches(&output_schema, &batches)
+            .map_err(|error| datafusion_error_to_lix_error(error.into()))?;
+        if output.num_columns() != source_schema.fields().len()
+            || output_schema
+                .fields()
+                .iter()
+                .zip(candidate_schema.fields())
+                .any(|(actual, expected)| actual.name() != expected.name())
+            || output
+                .columns()
+                .iter()
+                .zip(source_schema.fields())
+                .any(|(array, field)| array.data_type() != field.data_type())
+        {
+            return Err(LixError::unknown(
+                "DataFusion predicate selection changed the target row shape",
+            ));
+        }
+        RecordBatch::try_new(source_schema, output.columns().to_vec())
+            .map_err(|error| datafusion_error_to_lix_error(error.into()))
+    }
+    .await;
+    let cleanup = session
+        .deregister_table(&table_name)
+        .map_err(datafusion_error_to_lix_error);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(batch), Ok(_)) => Ok(batch),
+    }
 }
 
 fn datafusion_filters_from_predicate(
@@ -3625,15 +3849,16 @@ pub(crate) fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String,
 }
 
 fn bound_write_requires_datafusion(plan: &LogicalWritePlan) -> bool {
-    (matches!(plan.bound.op, BoundWriteOp::Insert)
-        && matches!(plan.bound.input, BoundWriteInput::Query { .. }))
+    plan.bound.predicate_fallback.is_some()
+        || (matches!(plan.bound.op, BoundWriteOp::Insert)
+            && matches!(plan.bound.input, BoundWriteInput::Query { .. }))
         || (matches!(plan.bound.op, BoundWriteOp::Update)
-        && (plan
-            .bound
-            .assignments
-            .iter()
-            .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
-            || bound_predicate_requires_datafusion(&plan.bound.predicate)))
+            && (plan
+                .bound
+                .assignments
+                .iter()
+                .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
+                || bound_predicate_requires_datafusion(&plan.bound.predicate)))
         || plan.bound.returning.as_ref().is_some_and(|returning| {
             returning.items.iter().any(|item| {
                 item.expr
@@ -4591,7 +4816,10 @@ mod tests {
                 }
             })
             .collect();
-        let returning = crate::sql2::bind::write::BoundReturning { items };
+        let returning = crate::sql2::bind::write::BoundReturning {
+            items,
+            target_alias: None,
+        };
         let table_schema = Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("content", DataType::Binary, true),
@@ -5399,12 +5627,9 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
-                &planning_session.state(),
-                &plan.plan,
-                &table_name,
-            )
-            .unwrap();
+            let (selection, needs_read_table_functions, relation_names) =
+                write_read_dependencies(&planning_session.state(), &plan.plan, &table_name)
+                    .unwrap();
             assert!(!needs_read_table_functions, "{sql}");
             assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0), "{sql}");
 
@@ -5453,12 +5678,9 @@ mod tests {
         let table_name =
             write_target_table_name(&insert_select.plan).expect("target should resolve");
         let planning_session = ctx.datafusion_session();
-        let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
-            &planning_session.state(),
-            &insert_select.plan,
-            &table_name,
-        )
-        .unwrap();
+        let (selection, needs_read_table_functions, relation_names) =
+            write_read_dependencies(&planning_session.state(), &insert_select.plan, &table_name)
+                .unwrap();
         assert!(!needs_read_table_functions);
         assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0));
 
@@ -5513,10 +5735,7 @@ mod tests {
                 "INSERT INTO lix_file(id, path) \
                  SELECT id, to_path FROM lix_diff('lix_file')",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_diff".to_string(),
-                        "lix_file".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_diff".to_string(), "lix_file".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
             ),
@@ -5544,30 +5763,36 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (actual, _, relation_names) = write_read_dependencies(
-                &planning_session.state(),
-                &plan.plan,
-                &table_name,
-            )
-            .unwrap();
+            let (actual, _, relation_names) =
+                write_read_dependencies(&planning_session.state(), &plan.plan, &table_name)
+                    .unwrap();
             assert_eq!(actual, expected, "{sql}");
             if sql.contains("FROM lix_file") {
-                assert!(relation_names
-                    .as_ref()
-                    .is_some_and(|names| names.contains("lix_file")), "{sql}");
+                assert!(
+                    relation_names
+                        .as_ref()
+                        .is_some_and(|names| names.contains("lix_file")),
+                    "{sql}"
+                );
             }
             if sql.contains("FROM lix_change") {
-                assert!(relation_names
-                    .as_ref()
-                    .is_some_and(|names| names.contains("lix_change")), "{sql}");
+                assert!(
+                    relation_names
+                        .as_ref()
+                        .is_some_and(|names| names.contains("lix_change")),
+                    "{sql}"
+                );
             }
             if sql.contains("information_schema") {
-                assert!(crate::sql2::providers::write_read_relation_selection(
-                    &ctx.public_catalog().unwrap(),
-                    &actual,
-                    relation_names.as_ref(),
-                )
-                .is_empty(), "{sql}");
+                assert!(
+                    crate::sql2::providers::write_read_relation_selection(
+                        &ctx.public_catalog().unwrap(),
+                        &actual,
+                        relation_names.as_ref(),
+                    )
+                    .is_empty(),
+                    "{sql}"
+                );
             }
         }
     }
@@ -5579,10 +5804,7 @@ mod tests {
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
                  RETURNING (SELECT value FROM lix_key_value WHERE key = 'returning-probe') AS related_value",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_file".to_string(),
-                        "lix_key_value".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_file".to_string(), "lix_key_value".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
                 false,
@@ -5602,10 +5824,7 @@ mod tests {
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
                  RETURNING (SELECT COUNT(*) FROM lix_change) AS change_count",
                 crate::sql2::providers::ProviderSelection::Only {
-                    names: BTreeSet::from([
-                        "lix_change".to_string(),
-                        "lix_file".to_string(),
-                    ]),
+                    names: BTreeSet::from(["lix_change".to_string(), "lix_file".to_string()]),
                     history_relations: BTreeSet::new(),
                 },
                 false,
@@ -5779,7 +5998,9 @@ mod tests {
                     WriteExecutorMode::ForceDataFusion,
                 )
                 .await
-                .unwrap_or_else(|error| panic!("write with RETURNING should execute: {sql}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("write with RETURNING should execute: {sql}: {error}")
+                });
 
             assert_eq!(path, WriteExecutorPath::DataFusion, "{sql}");
             let returning = result.returning.expect("RETURNING result should exist");
