@@ -28,7 +28,8 @@ use super::table::{
 use super::write::{
     BoundAssignment, BoundConflictAction, BoundInsertConflict, BoundInsertValues, BoundParamMap,
     BoundReturning, BoundReturningItem, BoundWrite, BoundWriteInput, BoundWriteOp,
-    BoundWriteTarget, DirectoryWriteSurface, FileWriteSurface, RowWriteSurface,
+    BoundWritePredicateFallback, BoundWriteTarget, DirectoryWriteSurface, FileWriteSurface,
+    RowWriteSurface,
 };
 
 #[cfg(test)]
@@ -167,6 +168,7 @@ pub(super) fn bind_insert_bound(
         op: BoundWriteOp::Insert,
         input,
         predicate: BoundPredicate::True,
+        predicate_fallback: None,
         assignments: Vec::new(),
         conflict,
         returning,
@@ -182,7 +184,7 @@ pub(super) fn bind_update_bound(
 ) -> Result<BoundWrite, LixError> {
     let mut params = ParamBinder::default();
     reject_unsupported_update_clauses(update)?;
-    let table = bind_table_with_joins(catalog, &update.table)?;
+    let (table, target_alias) = bind_table_with_joins(catalog, &update.table)?;
     require_write_capability(&table.surface, BoundWriteOp::Update)?;
     let mut target_columns = BTreeSet::new();
     let mut assignments = Vec::new();
@@ -194,8 +196,17 @@ pub(super) fn bind_update_bound(
             value: bind_expr(&table, &assignment.value, &mut params)?,
         });
     }
-    let predicate = bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
-    let returning = bind_returning(&table, update.returning.as_ref(), &mut params, "UPDATE")?;
+    let (predicate, predicate_expr) =
+        bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
+    let predicate_fallback = predicate_expr
+        .map(|expr| bound_write_predicate_fallback(&table, target_alias.clone(), expr));
+    let returning = bind_returning(
+        &table,
+        update.returning.as_ref(),
+        &mut params,
+        "UPDATE",
+        target_alias.clone(),
+    )?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -207,6 +218,7 @@ pub(super) fn bind_update_bound(
         op: BoundWriteOp::Update,
         input: BoundWriteInput::None,
         predicate,
+        predicate_fallback,
         assignments,
         conflict: None,
         returning,
@@ -222,10 +234,19 @@ pub(super) fn bind_delete_bound(
 ) -> Result<BoundWrite, LixError> {
     let mut params = ParamBinder::default();
     reject_unsupported_delete_clauses(delete)?;
-    let table = bind_delete_target(catalog, &delete.from)?;
+    let (table, target_alias) = bind_delete_target(catalog, &delete.from)?;
     require_write_capability(&table.surface, BoundWriteOp::Delete)?;
-    let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
-    let returning = bind_returning(&table, delete.returning.as_ref(), &mut params, "DELETE")?;
+    let (predicate, predicate_expr) =
+        bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
+    let predicate_fallback = predicate_expr
+        .map(|expr| bound_write_predicate_fallback(&table, target_alias.clone(), expr));
+    let returning = bind_returning(
+        &table,
+        delete.returning.as_ref(),
+        &mut params,
+        "DELETE",
+        target_alias.clone(),
+    )?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -237,6 +258,7 @@ pub(super) fn bind_delete_bound(
         op: BoundWriteOp::Delete,
         input: BoundWriteInput::None,
         predicate,
+        predicate_fallback,
         assignments: Vec::new(),
         conflict: None,
         returning,
@@ -253,6 +275,7 @@ fn bind_returning(
     returning: Option<&Vec<SelectItem>>,
     params: &mut ParamBinder,
     action: &str,
+    target_alias: Option<Ident>,
 ) -> Result<Option<BoundReturning>, LixError> {
     let Some(returning) = returning else {
         return Ok(None);
@@ -294,7 +317,7 @@ fn bind_returning(
                 let image = match qualifier.as_str() {
                     "old" => Some(super::expr::ReturningImage::Old),
                     "new" => Some(super::expr::ReturningImage::New),
-                    name if name == table.name => None,
+                    name if name == table.qualifier.as_deref().unwrap_or(&table.name) => None,
                     _ => {
                         return Err(super::error::unsupported(format!(
                             "unknown SQL table qualifier '{qualifier}'"
@@ -315,7 +338,9 @@ fn bind_returning(
                             Ident::new(&column.name),
                         ]),
                         None => Expr::CompoundIdentifier(vec![
-                            Ident::new(&table.name),
+                            target_alias
+                                .clone()
+                                .unwrap_or_else(|| Ident::with_quote('"', table.name.clone())),
                             Ident::new(&column.name),
                         ]),
                     };
@@ -362,7 +387,10 @@ fn bind_returning(
         )));
     }
 
-    Ok(Some(BoundReturning { items }))
+    Ok(Some(BoundReturning {
+        items,
+        target_alias,
+    }))
 }
 
 fn bind_returning_expr(
@@ -395,7 +423,7 @@ fn bind_insert_returning(
     returning: Option<&Vec<SelectItem>>,
     params: &mut ParamBinder,
 ) -> Result<Option<BoundReturning>, LixError> {
-    bind_returning(table, returning, params, "INSERT")
+    bind_returning(table, returning, params, "INSERT", None)
 }
 
 fn reject_returning_wildcard_options(
@@ -574,7 +602,7 @@ fn reject_unsupported_delete_clauses(delete: &Delete) -> Result<(), LixError> {
 fn bind_table_with_joins(
     catalog: &PublicCatalog,
     table: &TableWithJoins,
-) -> Result<BoundTable, LixError> {
+) -> Result<(BoundTable, Option<Ident>), LixError> {
     if !table.joins.is_empty() {
         return Err(super::error::unsupported(
             "joined DML targets are not supported",
@@ -595,9 +623,12 @@ fn bind_table_with_joins(
     else {
         return Err(super::error::unsupported("unsupported DML target"));
     };
-    if alias.is_some() {
+    if alias
+        .as_ref()
+        .is_some_and(|alias| !alias.columns.is_empty())
+    {
         return Err(super::error::unsupported(
-            "DML target aliases are not supported",
+            "DML target alias column lists are not supported",
         ));
     }
     if args.is_some()
@@ -612,10 +643,16 @@ fn bind_table_with_joins(
             "DML target table modifiers are not supported",
         ));
     }
-    bind_public_table(catalog, name)
+    let target_alias = alias.as_ref().map(|alias| alias.name.clone());
+    let mut table = bind_public_table(catalog, name)?;
+    table.qualifier = target_alias.as_ref().map(normalize_identifier);
+    Ok((table, target_alias))
 }
 
-fn bind_delete_target(catalog: &PublicCatalog, from: &FromTable) -> Result<BoundTable, LixError> {
+fn bind_delete_target(
+    catalog: &PublicCatalog,
+    from: &FromTable,
+) -> Result<(BoundTable, Option<Ident>), LixError> {
     let tables = match from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
@@ -795,11 +832,45 @@ fn bind_optional_predicate(
     table: &BoundTable,
     expr: Option<&Expr>,
     params: &mut ParamBinder,
-) -> Result<BoundPredicate, LixError> {
-    expr.map_or_else(
-        || Ok(BoundPredicate::True),
-        |expr| bind_predicate(table, expr, params),
-    )
+) -> Result<(BoundPredicate, Option<Expr>), LixError> {
+    let Some(expr) = expr else {
+        return Ok((BoundPredicate::True, None));
+    };
+
+    // Keep the native path's predicate tree for shapes it already handles.
+    // Binding against a temporary parameter map prevents a partially bound
+    // native tree from leaking parameters when the full SQL expression needs
+    // DataFusion planning instead.
+    let mut native_params = ParamBinder::default();
+    match bind_predicate(table, expr, &mut native_params) {
+        Ok(predicate) => {
+            params.params.extend(native_params.params);
+            Ok((predicate, None))
+        }
+        Err(error) if error.code == LixError::CODE_UNSUPPORTED_SQL => {
+            bind_returning_expr_params(expr, params)?;
+            Ok((BoundPredicate::True, Some(expr.clone())))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn bound_write_predicate_fallback(
+    table: &BoundTable,
+    target_alias: Option<Ident>,
+    expr: Expr,
+) -> BoundWritePredicateFallback {
+    BoundWritePredicateFallback {
+        expr,
+        target_alias: target_alias.unwrap_or_else(|| Ident::with_quote('"', table.name.clone())),
+        public_columns: table
+            .surface
+            .columns
+            .iter()
+            .filter(|column| column.is_public())
+            .map(|column| column.name.clone())
+            .collect(),
+    }
 }
 
 fn bind_predicate(
@@ -1000,7 +1071,7 @@ fn bind_expr_context(
                 });
                 return Ok(BoundExpr::Column(column));
             }
-            if table_name != table.name {
+            if table_name != table.qualifier.as_deref().unwrap_or(&table.name) {
                 return Err(super::error::unsupported(format!(
                     "unknown SQL table qualifier '{table_name}'"
                 )));
@@ -2242,17 +2313,33 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_unsupported_write_clauses() {
+    fn bind_statement_binds_target_aliases_and_hides_the_base_qualifier() {
         let statement =
-            parse_statement("UPDATE lix_file AS f SET name = 'next' WHERE f.id = 'file1'");
-        let error = bind_statement(&statement, &[], "branch1")
-            .expect_err("target aliases should not be ignored");
+            parse_statement("UPDATE lix_file AS f SET name = f.name WHERE f.id = 'file1'");
+        let bound = bind_statement(&statement, &[], "branch1")
+            .expect("target aliases should bind for assignments and fallback predicates");
 
+        assert!(bound.predicate_fallback.is_none());
+        assert!(matches!(
+            &bound.assignments[0].value,
+            BoundExpr::Column(column) if column.table == "lix_file" && column.name == "name"
+        ));
+        assert!(matches!(
+            &bound.predicate,
+            BoundPredicate::Eq(
+                BoundExpr::Column(column),
+                BoundExpr::Literal(BoundLiteral::Text(value)),
+            ) if column.table == "lix_file" && column.name == "id" && value == "file1"
+        ));
+
+        let statement = parse_statement("UPDATE lix_file AS f SET name = lix_file.name");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("an alias should hide the original table qualifier");
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(
             error
                 .message
-                .contains("DML target aliases are not supported")
+                .contains("unknown SQL table qualifier 'lix_file'")
         );
     }
 

@@ -11,8 +11,8 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::common::ExecuteStatementMetadata;
-use crate::sql2::bind::write::BoundWriteOp;
 use crate::sql2::SqlWriteExecutionContext;
+use crate::sql2::bind::write::BoundWriteOp;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
 
@@ -337,6 +337,9 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     let SqlLogicalPlan::Write(write_plan) = plan else {
         return Ok(None);
     };
+    if write_plan.plan.bound.predicate_fallback.is_some() {
+        return Ok(None);
+    }
     validate_write_parameter_count(&write_plan.plan, parameter_batch.num_columns())?;
     let direct_new_change_id_columns = direct_new_change_id_columns(&write_plan.plan);
     if let Some(results) = super::bound_public_write::try_execute_row_insert_parameter_batch(
@@ -374,6 +377,9 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
     let SqlLogicalPlan::Write(write_plan) = plan else {
         return Ok(None);
     };
+    if write_plan.plan.bound.predicate_fallback.is_some() {
+        return Ok(None);
+    }
     let Some(first) = parameter_rows.first() else {
         return Ok(None);
     };

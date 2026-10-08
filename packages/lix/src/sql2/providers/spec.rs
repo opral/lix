@@ -539,6 +539,7 @@ fn select_returning_image(
 #[derive(Clone, Debug, Default)]
 pub(super) struct DmlPlanOptions {
     pub(super) returning_columns: BTreeSet<String>,
+    pub(super) required_columns: BTreeSet<String>,
 }
 
 impl DmlPlanOptions {
@@ -553,9 +554,15 @@ impl DmlPlanOptions {
                     }
                 })
                 .unwrap_or_default(),
+            required_columns: BTreeSet::new(),
         }
     }
 }
+
+/// Optional SQL-planned selection applied to a provider's candidate batch
+/// before its existing mutation handler receives the matched rows.
+pub(crate) type DmlBatchSelection =
+    Arc<dyn Fn(RecordBatch) -> BoxFuture<'static, Result<RecordBatch>> + Send + Sync>;
 
 /// Exec-time INSERT handler: pulls source input batches, stages
 /// the resulting transaction writes, and returns the inserted-row count.
@@ -759,6 +766,19 @@ pub(super) trait TableSpec: Send + Sync + 'static {
         )))
     }
 
+    /// Plan an UPDATE while exposing extra source columns needed by an
+    /// execution-time selection stage. Most providers already return all of
+    /// their identity and public columns and can use the ordinary plan.
+    async fn plan_update_with_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        _options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update(write_ctx, assignments, filters).await
+    }
+
     /// Plan an UPDATE that must produce the exact updated post-image.  Like
     /// [`TableSpec::plan_insert_with_returning`], this deliberately rejects by
     /// default so a newly writable provider cannot silently report only the
@@ -774,6 +794,18 @@ pub(super) trait TableSpec: Send + Sync + 'static {
             "UPDATE RETURNING is not supported on {}",
             self.table_name()
         )))
+    }
+
+    async fn plan_update_with_returning_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+        _options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_returning(write_ctx, assignments, filters, returning)
+            .await
     }
 
     /// The spec's `INSERT ... ON CONFLICT` capability, if it supports upsert.
@@ -920,55 +952,29 @@ impl SpecWriteTarget {
         state: &dyn Session,
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table = self.spec.table_name();
-        self.spec.validate_update_assignments(&assignments)?;
-        let filters = self.spec.prepare_write_filters(filters)?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(
-                        expr,
-                        &df_schema,
-                        state.execution_props(),
-                        &PhysicalPlanningContext::default(),
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| {
-                create_physical_expr(
-                    expr,
-                    &df_schema,
-                    state.execution_props(),
-                    &PhysicalPlanningContext::default(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let planned = self
-            .spec
-            .plan_update(self.write_ctx.clone(), physical_assignments, &filters)
-            .await?;
-        Ok(Arc::new(SpecDmlExec::new(
-            table.into(),
-            "UPDATE",
-            planned,
-            physical_filters,
+        self.update_impl(
+            state,
+            assignments,
+            filters,
             None,
-        )))
+            selection,
+            required_columns,
+        )
+        .await
     }
 
     pub(crate) async fn delete(
         &self,
         state: &dyn Session,
         filters: Vec<Expr>,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.delete_impl(state, filters, None).await
+        self.delete_impl(state, filters, None, selection, required_columns)
+            .await
     }
 
     /// Execute an `INSERT ... ON CONFLICT` against this table. The conflict
@@ -1037,8 +1043,11 @@ impl SpecWriteTarget {
         state: &dyn Session,
         filters: Vec<Expr>,
         returning: DmlReturning,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.delete_impl(state, filters, Some(returning)).await
+        self.delete_impl(state, filters, Some(returning), selection, required_columns)
+            .await
     }
 
     /// Plan an INSERT whose provider captures a post-write `RETURNING`
@@ -1086,6 +1095,28 @@ impl SpecWriteTarget {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
         returning: DmlReturning,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.update_impl(
+            state,
+            assignments,
+            filters,
+            Some(returning),
+            selection,
+            required_columns,
+        )
+        .await
+    }
+
+    async fn update_impl(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+        returning: Option<DmlReturning>,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table = self.spec.table_name();
         self.spec.validate_update_assignments(&assignments)?;
@@ -1116,21 +1147,38 @@ impl SpecWriteTarget {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let planned = self
-            .spec
-            .plan_update_with_returning(
-                self.write_ctx.clone(),
-                physical_assignments,
-                &filters,
-                returning,
-            )
-            .await?;
+        let mut options = DmlPlanOptions::from_returning(returning.as_ref());
+        options.required_columns = required_columns;
+        let planned = match &returning {
+            Some(returning) => {
+                self.spec
+                    .plan_update_with_returning_options(
+                        self.write_ctx.clone(),
+                        physical_assignments,
+                        &filters,
+                        returning.clone(),
+                        options,
+                    )
+                    .await?
+            }
+            None => {
+                self.spec
+                    .plan_update_with_options(
+                        self.write_ctx.clone(),
+                        physical_assignments,
+                        &filters,
+                        options,
+                    )
+                    .await?
+            }
+        };
         Ok(Arc::new(SpecDmlExec::new(
             table.into(),
             "UPDATE",
             planned,
             physical_filters,
             None,
+            selection,
         )))
     }
 
@@ -1139,17 +1187,17 @@ impl SpecWriteTarget {
         state: &dyn Session,
         filters: Vec<Expr>,
         returning: Option<DmlReturning>,
+        selection: Option<DmlBatchSelection>,
+        required_columns: BTreeSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let table = self.spec.table_name();
         let filters = self.spec.prepare_write_filters(filters)?;
         let physical_filters = physical_filters(&self.schema, &filters, state)?;
+        let mut options = DmlPlanOptions::from_returning(returning.as_ref());
+        options.required_columns = required_columns;
         let planned = self
             .spec
-            .plan_delete_with_options(
-                self.write_ctx.clone(),
-                &filters,
-                DmlPlanOptions::from_returning(returning.as_ref()),
-            )
+            .plan_delete_with_options(self.write_ctx.clone(), &filters, options)
             .await?;
         Ok(Arc::new(SpecDmlExec::new(
             table.into(),
@@ -1157,6 +1205,7 @@ impl SpecWriteTarget {
             planned,
             physical_filters,
             returning,
+            selection,
         )))
     }
 }
@@ -1842,6 +1891,7 @@ pub(super) struct SpecDmlExec {
     source: RowSource,
     apply: DmlApply,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    selection: Option<DmlBatchSelection>,
     returning: Option<DmlReturning>,
     result_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -1854,6 +1904,7 @@ impl SpecDmlExec {
         planned: PlannedDml,
         filters: Vec<Arc<dyn PhysicalExpr>>,
         returning: Option<DmlReturning>,
+        selection: Option<DmlBatchSelection>,
     ) -> Self {
         let result_schema = dml_count_schema();
         let properties = dml_plan_properties(Arc::clone(&result_schema));
@@ -1863,6 +1914,7 @@ impl SpecDmlExec {
             source: planned.source,
             apply: planned.apply,
             filters,
+            selection,
             returning,
             result_schema,
             properties: Arc::new(properties),
@@ -1947,6 +1999,7 @@ impl ExecutionPlan for SpecDmlExec {
         let source = Arc::clone(&self.source);
         let apply = Arc::clone(&self.apply);
         let filters = self.filters.clone();
+        let selection = self.selection.clone();
         let returning = self.returning.clone();
         let table = Arc::clone(&self.table);
         let result_schema = Arc::clone(&self.result_schema);
@@ -1954,7 +2007,11 @@ impl ExecutionPlan for SpecDmlExec {
 
         let stream = stream::once(async move {
             let source_batch = source().await?;
-            let matched_batch = filter_batch(source_batch, &filters, &table)?;
+            let selected_batch = match selection {
+                Some(selection) => selection(source_batch).await?,
+                None => source_batch,
+            };
+            let matched_batch = filter_batch(selected_batch, &filters, &table)?;
             let returned_batch = returning
                 .as_ref()
                 .map(|returning| returning.project_images(Some(&matched_batch), None))
