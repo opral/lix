@@ -17,7 +17,17 @@ import {
 	serializeWorkerError,
 	type WorkerInput,
 	type WorkerResponse,
+	type SerializedWorkerError,
 } from "./protocol.js";
+
+export type RepositoryHostOutput = WorkerResponse | {
+	kind: "repository.disconnected";
+	error?: SerializedWorkerError;
+};
+export type RepositoryHostConnection = {
+	receive(message: WorkerInput): void;
+	disconnect(): Promise<void>;
+};
 
 export function createRepositoryHost() {
 	let owner: SharedEngineOwner | undefined;
@@ -30,9 +40,10 @@ export function createRepositoryHost() {
 	let localRoot: Promise<import("../binding-types.js").LixBinding> | undefined;
 
 	return {
-		connect(port: MessagePort) {
+		connect(send: (message: RepositoryHostOutput) => void): RepositoryHostConnection {
 			let client: SharedEngineClient | undefined;
 			let disconnected = false;
+			let disconnecting: Promise<void> | undefined;
 			let input: ((message: WorkerInput) => void) | undefined;
 			const prepareClient = async (
 				...args: Parameters<typeof openLixBinding>
@@ -283,7 +294,7 @@ export function createRepositoryHost() {
 			};
 			const controller = startWorkerHost(
 				{
-					postMessage: (message: WorkerResponse) => port.postMessage(message),
+					postMessage: (message: WorkerResponse) => send(message),
 					onMessage: (listener) => {
 						input = listener;
 					},
@@ -362,7 +373,6 @@ export function createRepositoryHost() {
 				true,
 			);
 			const disconnect = async () => {
-				if (disconnected) return;
 				disconnected = true;
 				let failure: unknown;
 				let detachAttempted = false;
@@ -384,24 +394,21 @@ export function createRepositoryHost() {
 					}
 				}
 				try {
-					port.postMessage({
+					send({
 						kind: "repository.disconnected",
 						error:
 							failure === undefined ? undefined : serializeWorkerError(failure),
 					});
 				} finally {
-					port.close();
+					input = undefined;
 				}
 			};
-			port.onmessage = (event) => {
-				const message = event.data;
-				if (message?.kind === "repository.disconnect") {
-					void disconnect();
-					return;
-				}
-				input?.(message as WorkerInput);
+			// The router and engine host live in the same worker. Keep their
+			// call boundary direct; cross-context transport is owned by the router.
+			return {
+				receive(message) { input?.(message); },
+				disconnect() { return disconnecting ??= disconnect(); },
 			};
-			port.start();
 		},
 		async close() {
 			if (localRoot) await (await localRoot).close();

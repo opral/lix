@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { createRepositoryHost } from "./repository-host.js";
+import { createRepositoryHost, type RepositoryHostConnection } from "./repository-host.js";
 import {
 	CLOSE_TIMEOUT_MS,
 	type RepositoryMessage,
@@ -21,7 +21,7 @@ const start = (event: MessageEvent) => {
 	postMessage({ kind: "build", buildId, token });
 	const channel = new BroadcastChannel(channelName);
 	const generation = crypto.randomUUID();
-	const clients = new Map<string, MessagePort>();
+	const clients = new Map<string, RepositoryHostConnection>();
 	const departed = new Set<string>();
 	const teardownCallbacks = new Map<string, Set<number>>();
 	const opening = new Map<string, number>();
@@ -89,30 +89,29 @@ const start = (event: MessageEvent) => {
 		if (message.kind === "connect") {
 			if (departed.has(message.client)) return;
 			if (!clients.has(message.client)) {
-				const { port1, port2 } = new MessageChannel();
-				clients.set(message.client, port1);
 				teardownCallbacks.set(message.client, new Set());
-				port1.onmessage = (event) => {
-					const response = event.data;
-					if (opening.has(message.client) && opening.get(message.client) === event.data?.id) {
+				let retired = false;
+				const connection = host.connect((response) => {
+					if (retired) return;
+					if (opening.has(message.client) && opening.get(message.client) === ("id" in response ? response.id : undefined)) {
 						opening.delete(message.client);
 						// Failed opening may have left a rejected compiler or uncertain
 						// provider cleanup. Do not cache that runtime for another open.
-						cleanupFailed ||= event.data.ok !== true;
+						cleanupFailed ||= !("ok" in response) || response.ok !== true;
 					}
 					// A successful engine context proves compiler initialization finished.
-					runtimeWarm ||= event.data?.ok === true && event.data.context !== undefined;
-					if (event.data?.kind === "repository.disconnected") {
-						cleanupFailed ||= event.data.error !== undefined;
+					runtimeWarm ||= "ok" in response && response.ok === true && "context" in response && response.context !== undefined;
+					if ("kind" in response && response.kind === "repository.disconnected") {
+						retired = true;
+						cleanupFailed ||= response.error !== undefined;
 						clients.delete(message.client);
 						teardownCallbacks.delete(message.client);
 						departed.delete(message.client);
-						port1.close();
 						send({
 							kind: "disconnected",
 							client: message.client,
 							generation,
-							error: event.data.error,
+							error: response.error,
 						});
 						retire();
 					} else if (
@@ -126,12 +125,11 @@ const start = (event: MessageEvent) => {
 							kind: "output",
 							client: message.client,
 							generation,
-							message: event.data,
+							message: response,
 						});
 					}
-				};
-				port1.start();
-				host.connect(port2);
+				});
+				clients.set(message.client, connection);
 				// Death detection closes the host outside its finite-operation queue.
 				void navigator.locks.request(message.lease, async () => {
 					if (!clients.has(message.client)) return;
@@ -141,11 +139,11 @@ const start = (event: MessageEvent) => {
 						send({ kind: "gone", generation });
 						close();
 					}, CLOSE_TIMEOUT_MS);
-					port1.addEventListener("message", (event) => {
-						if (event.data?.kind === "repository.disconnected")
-							clearTimeout(timer);
-					});
-					port1.postMessage({ kind: "repository.disconnect" });
+					// Keep cleanup callbacks routable until disconnect finishes.
+					void connection.disconnect().then(
+						() => clearTimeout(timer),
+						() => { /* Keep the watchdog armed when cleanup is uncertain. */ },
+					);
 				});
 			}
 			send({ kind: "connected", client: message.client, generation });
@@ -160,15 +158,13 @@ const start = (event: MessageEvent) => {
 			if (!departed.has(message.client) || allowedTeardownResult) {
 				if ("operation" in message.message && message.message.operation.kind === "open")
 					opening.set(message.client, message.message.id);
-				clients.get(message.client)?.postMessage(message.message);
+				clients.get(message.client)?.receive(message.message);
 				if (allowedTeardownResult && teardownRequestId !== undefined)
 					teardownCallbacks.get(message.client)?.delete(teardownRequestId);
 			}
 		} else if (message.kind === "disconnect") {
 			departed.add(message.client);
-			clients
-				.get(message.client)
-				?.postMessage({ kind: "repository.disconnect" });
+			void clients.get(message.client)?.disconnect();
 		}
 	};
 	// This unversioned owner lock belongs to the same realm as engine and OPFS.

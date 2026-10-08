@@ -1,6 +1,6 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import type { LixBinding } from "../binding-types.js";
-import type { WorkerInput, WorkerResponse } from "./protocol.js";
+import type { WorkerInput } from "./protocol.js";
 
 const mocks = vi.hoisted(() => ({
 	open: vi.fn(),
@@ -25,7 +25,7 @@ vi.mock("./durable-local-admission.js", () => ({
 	},
 }));
 
-import { createRepositoryHost } from "./repository-host.js";
+import { createRepositoryHost, type RepositoryHostOutput } from "./repository-host.js";
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -73,11 +73,8 @@ test("last detach sends DELETE with the admitted credentials after close cancels
 		return root;
 	});
 
-	const output: WorkerResponse[] = [];
-	let onmessage: ((event: MessageEvent) => void) | null = null;
-	let portClosed = false;
-	const port = {
-		postMessage(message: WorkerResponse) {
+	const output: RepositoryHostOutput[] = [];
+	const onOutput = (message: RepositoryHostOutput) => {
 			output.push(message);
 			if ("kind" in message && message.kind === "sync.headers") {
 				queueMicrotask(() => send({
@@ -118,17 +115,9 @@ test("last detach sends DELETE with the admitted credentials after close cancels
 					},
 				}));
 			}
-		},
-		start() {},
-		close() { portClosed = true; },
-		get onmessage() { return onmessage; },
-		set onmessage(value: ((event: MessageEvent) => void) | null) { onmessage = value; },
-	} as unknown as MessagePort;
-	const send = (message: WorkerInput | { kind: "repository.disconnect" }) => {
-		if (!onmessage) throw new Error("Repository host did not install its message handler");
-		onmessage({ data: message } as MessageEvent);
 	};
-	createRepositoryHost().connect(port);
+	const connection = createRepositoryHost().connect(onOutput);
+	const send = (message: WorkerInput) => connection.receive(message);
 
 	send({
 		id: 1,
@@ -160,7 +149,8 @@ test("last detach sends DELETE with the admitted credentials after close cancels
 		"kind" in message && message.kind === "sync.headers",
 	).length;
 	currentToken = "unverified-new-token";
-	send({ kind: "repository.disconnect" });
+	const firstClose = connection.disconnect();
+	expect(connection.disconnect()).toBe(firstClose);
 
 	await vi.waitFor(() => expect(output.some((message) =>
 		"kind" in message && message.kind === "repository.disconnected",
@@ -183,5 +173,9 @@ test("last detach sends DELETE with the admitted credentials after close cancels
 	expect(output.find((message) =>
 		"kind" in message && message.kind === "repository.disconnected",
 	)).toMatchObject({ kind: "repository.disconnected", error: undefined });
-	expect(portClosed).toBe(true);
+	await firstClose;
+	const afterClose = output.length;
+	connection.receive({id:99,sessionId:0,operation:{kind:"execute",sql:"SELECT 1",params:[]}});
+	await Promise.resolve();
+	expect(output).toHaveLength(afterClose);
 });
