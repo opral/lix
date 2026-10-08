@@ -32,6 +32,25 @@ lix.execute(
 .await?;
 ```
 
+## Verify file content
+
+Compute a SHA-256 checksum of the exact stored bytes without downloading the
+file. Bind `$1` to its absolute path:
+
+```sql
+SELECT encode(sha256(content), 'hex') AS content_sha256
+FROM lix_file
+WHERE path = $1;
+```
+
+Compare the returned lowercase hexadecimal checksum with `sha256sum file` on
+Linux or `shasum -a 256 file` on macOS. This works for text and arbitrary binary
+files; do not cast `content` to text before hashing.
+
+The checksum is computed on demand and reads the complete file, so its cost grows
+with file size. It is not a stored column or Lix's internal chunk-store identity.
+See [SQL Functions](./sql-functions.md) for hashing and encoding functions.
+
 ## How large files are stored
 
 Lix stores file bytes in a content-addressed store. Lix splits large files into chunks. It stores equal chunks once, even when they appear in several files or branches.

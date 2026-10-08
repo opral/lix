@@ -182,6 +182,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 datafusion = { version = "55.1.0", default-features = false, features = [
     "sql",
     "nested_expressions",
+    "crypto_expressions",
+    "encoding_expressions",
     "datetime_expressions",
     "regex_expressions",
     "string_expressions",
