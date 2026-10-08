@@ -52,13 +52,35 @@ pub(super) async fn fixture() -> (
 struct CountingStorage {
     memory: Memory,
     canonical_commits: Arc<Mutex<Vec<Vec<(StorageSpace, StorageKey)>>>>,
+    commits: Arc<Mutex<Vec<CountedCommit>>>,
+    conflict_on_joined_commit: Arc<Mutex<Option<(StorageSpace, StorageKey, Bytes)>>>,
+    joined_commit_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+struct CountedCommit {
+    canonical_keys: Vec<(StorageSpace, StorageKey)>,
+    scratch_keys: Vec<StorageKey>,
+    await_durable: bool,
+}
+
+fn is_canonical_test_key(space: StorageSpace, key: &StorageKey) -> bool {
+    space != STAGING_SPACE
+        && !is_non_content_revision_key(space.id.0, key.0.as_ref())
 }
 
 struct CountingWrite<W> {
     inner: W,
     canonical_commits: Arc<Mutex<Vec<Vec<(StorageSpace, StorageKey)>>>>,
+    commits: Arc<Mutex<Vec<CountedCommit>>>,
+    conflict_on_joined_commit: Arc<Mutex<Option<(StorageSpace, StorageKey, Bytes)>>>,
+    joined_commit_attempts: Arc<AtomicUsize>,
+    memory: Memory,
+    await_durable: bool,
     canonical_write: bool,
     canonical_keys: Vec<(StorageSpace, StorageKey)>,
+    scratch_keys: Vec<StorageKey>,
+    scratch_ledger_write: bool,
 }
 
 impl Storage for CountingStorage {
@@ -97,14 +119,26 @@ impl Storage for CountingStorage {
     ) -> impl Future<
         Output = Result<Self::Write<'_>, StorageError>,
     > + Send {
+        let await_durable = opts.await_durable;
         let write = self.memory.begin_write(opts);
         let canonical_commits = Arc::clone(&self.canonical_commits);
+        let commits = Arc::clone(&self.commits);
+        let conflict_on_joined_commit = Arc::clone(&self.conflict_on_joined_commit);
+        let joined_commit_attempts = Arc::clone(&self.joined_commit_attempts);
+        let memory = self.memory.clone();
         async move {
             Ok(CountingWrite {
                 inner: write.await?,
                 canonical_commits,
+                commits,
+                conflict_on_joined_commit,
+                joined_commit_attempts,
+                memory,
+                await_durable,
                 canonical_write: false,
                 canonical_keys: Vec::new(),
+                scratch_keys: Vec::new(),
+                scratch_ledger_write: false,
             })
         }
     }
@@ -116,14 +150,22 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        if space != STAGING_SPACE {
-            self.canonical_write = true;
-            self.canonical_keys.extend(
-                entries
-                    .entries
-                    .iter()
-                    .map(|entry| (space, entry.key.clone())),
-            );
+        if space == STAGING_SPACE {
+            self.scratch_keys
+                .extend(entries.entries.iter().map(|entry| entry.key.clone()));
+            self.scratch_ledger_write |= entries
+                .entries
+                .iter()
+                .any(|entry| entry.key.0.as_ref() == b"operations");
+        } else {
+            let canonical = entries
+                .entries
+                .iter()
+                .filter(|entry| is_canonical_test_key(space, &entry.key))
+                .map(|entry| (space, entry.key.clone()))
+                .collect::<Vec<_>>();
+            self.canonical_write |= !canonical.is_empty();
+            self.canonical_keys.extend(canonical);
         }
         self.inner.put_many(space, entries)
     }
@@ -133,14 +175,22 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        if space != STAGING_SPACE {
-            self.canonical_write = true;
-            self.canonical_keys.extend(
-                entries
-                    .entries
-                    .iter()
-                    .map(|entry| (space, entry.key.clone())),
-            );
+        if space == STAGING_SPACE {
+            self.scratch_keys
+                .extend(entries.entries.iter().map(|entry| entry.key.clone()));
+            self.scratch_ledger_write |= entries
+                .entries
+                .iter()
+                .any(|entry| entry.key.0.as_ref() == b"operations");
+        } else {
+            let canonical = entries
+                .entries
+                .iter()
+                .filter(|entry| is_canonical_test_key(space, &entry.key))
+                .map(|entry| (space, entry.key.clone()))
+                .collect::<Vec<_>>();
+            self.canonical_write |= !canonical.is_empty();
+            self.canonical_keys.extend(canonical);
         }
         self.inner.replace_many(space, entries)
     }
@@ -150,10 +200,18 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         space: StorageSpace,
         keys: &[StorageKey],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        if space != STAGING_SPACE {
-            self.canonical_write = true;
-            self.canonical_keys
-                .extend(keys.iter().cloned().map(|key| (space, key)));
+        if space == STAGING_SPACE {
+            self.scratch_keys.extend(keys.iter().cloned());
+            self.scratch_ledger_write |= keys.iter().any(|key| key.0.as_ref() == b"operations");
+        } else {
+            let canonical = keys
+                .iter()
+                .filter(|key| is_canonical_test_key(space, key))
+                .cloned()
+                .map(|key| (space, key))
+                .collect::<Vec<_>>();
+            self.canonical_write |= !canonical.is_empty();
+            self.canonical_keys.extend(canonical);
         }
         self.inner.delete_many(space, keys)
     }
@@ -163,7 +221,9 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         space: StorageSpace,
         range: StorageKeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        if space != STAGING_SPACE {
+        if space == STAGING_SPACE {
+            self.scratch_keys.push(StorageKey(Bytes::new()));
+        } else {
             self.canonical_write = true;
         }
         self.inner.delete_range(space, range)
@@ -175,13 +235,50 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         Output = Result<StorageCommitResult, StorageError>,
     > + Send {
         async move {
+            if self.canonical_write && self.scratch_ledger_write {
+                self.joined_commit_attempts.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.canonical_write && self.scratch_ledger_write {
+                let conflict = {
+                    self.conflict_on_joined_commit
+                        .lock()
+                        .expect("commit conflict hook is not poisoned")
+                        .take()
+                };
+                if let Some((space, key, bytes)) = conflict {
+                    let mut conflict = self
+                        .memory
+                        .begin_write(StorageWriteOptions::default())
+                        .await?;
+                    conflict
+                        .put_many(
+                            space,
+                            PutBatch {
+                                entries: vec![PutEntry {
+                                    key,
+                                    value: StorageValue { bytes },
+                                }],
+                            },
+                        )
+                        .await?;
+                    conflict.commit().await?;
+                }
+            }
             let result = self.inner.commit().await?;
             if self.canonical_write {
                 self.canonical_commits
                     .lock()
                     .expect("test commit counter is not poisoned")
-                    .push(self.canonical_keys);
+                    .push(self.canonical_keys.clone());
             }
+            self.commits
+                .lock()
+                .expect("test commit records are not poisoned")
+                .push(CountedCommit {
+                    canonical_keys: self.canonical_keys,
+                    scratch_keys: self.scratch_keys,
+                    await_durable: self.await_durable,
+                });
             Ok(result)
         }
     }
@@ -199,9 +296,15 @@ async fn counting_fixture() -> (
 ) {
     let (storage, state, request) = fixture().await;
     let canonical_commits = Arc::new(Mutex::new(Vec::new()));
+    let commits = Arc::new(Mutex::new(Vec::new()));
+    let conflict_on_joined_commit = Arc::new(Mutex::new(None));
+    let joined_commit_attempts = Arc::new(AtomicUsize::new(0));
     let counted = StorageAdapter::new(CountingStorage {
         memory: storage.storage().clone(),
         canonical_commits: Arc::clone(&canonical_commits),
+        commits,
+        conflict_on_joined_commit,
+        joined_commit_attempts,
     });
     counted.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     (counted, state, request, canonical_commits)
@@ -234,6 +337,46 @@ where
         permit,
     )
 }
+
+fn required_tree_chunk(request: &mut ReadFulfillmentRequest) -> ReadInput {
+    let bytes = b"validated immutable read input".to_vec();
+    let address = ReadInputAddress::Object(NativeObjectRef::TrackedStateTreeChunk(
+        *blake3::hash(&bytes).as_bytes(),
+    ));
+    request.required = vec![address.clone()];
+    request.interests = vec![LogicalReadInterest::CollectionGeneration {
+        branch_id: request.descriptor.selected_branch.branch_id.clone(),
+        schema_key: "lix_key_value".into(),
+        file_id: None,
+    }];
+    ReadInput { address, bytes }
+}
+
+async fn owner_is_reaping<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    id: uuid::Uuid,
+) -> bool {
+    let key = StorageKey(Bytes::from_static(b"operations"));
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let bytes = PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(&key))
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .expect("scratch ownership ledger is present");
+    let ledger: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let owner = id.to_string();
+    ledger[owner.as_str()]["reaping"]
+        .as_bool()
+        .expect("scratch owner has a reaping state")
+}
+
 fn chunk(index: u32, bytes: usize) -> ReadInput {
     let mut data = vec![0x5a; bytes];
     data[..4].copy_from_slice(&index.to_be_bytes());
@@ -566,9 +709,221 @@ async fn promotion_co_packs_valid_change_locator_units_in_two_canonical_commits(
 }
 
 #[tokio::test]
+async fn final_install_claims_scratch_reaping_in_the_same_durable_commit() {
+    let (storage, state, mut request, _) = counting_fixture().await;
+    let input = required_tree_chunk(&mut request);
+    let coordinate = input.address.coordinate().unwrap();
+    let mut stage = stage(&storage, &state, &request).await;
+    stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    stage.append_page(vec![input]).await.unwrap();
+
+    stage.promote(&request, false).await.unwrap();
+
+    let commits = storage.storage().commits.lock().unwrap().clone();
+    let joined = commits
+        .iter()
+        .filter(|commit| {
+            commit.canonical_keys.contains(&coordinate)
+                && commit
+                    .scratch_keys
+                    .iter()
+                    .any(|key| key.0.as_ref() == b"operations")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(joined.len(), 1, "final install and reaping claim share one commit");
+    assert!(joined[0].await_durable, "the joined commit remains strictly durable");
+}
+
+#[tokio::test]
+async fn crash_after_joined_commit_keeps_install_and_resumes_scratch_cleanup() {
+    let (storage, state, mut request, _) = counting_fixture().await;
+    let input = required_tree_chunk(&mut request);
+    let coordinate = input.address.coordinate().unwrap();
+    let mut stage = stage(&storage, &state, &request).await;
+    let owner = stage.id;
+    stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    stage.append_page(vec![input]).await.unwrap();
+
+    let inputs = stage.read_many(&[0]).await.unwrap();
+    let mut response = stage.header.clone();
+    response.inputs = inputs;
+    let capability = ScratchOwnerFinalizeCapability { owner };
+    install_inputs(
+        &storage,
+        &state,
+        &request,
+        &response,
+        false,
+        Some(&capability),
+    )
+    .await
+    .unwrap();
+    assert!(owner_is_reaping(&storage, owner).await);
+
+    // Model process loss after the atomic canonical install/reaping commit.
+    reap_expired(&storage).await.unwrap();
+
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(PointReadPlan::new(coordinate.0, std::slice::from_ref(&coordinate.1))
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .is_some());
+    let frame = &stage.inputs[0].frames[0];
+    assert!(PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(frame))
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .is_none());
+    let ledger_key = StorageKey(Bytes::from_static(b"operations"));
+    assert!(PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(&ledger_key))
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .is_none());
+}
+
+#[tokio::test]
+async fn empty_finalization_uses_one_guarded_owner_claim_commit() {
+    let (storage, state, request, _) = counting_fixture().await;
+    let mut stage = stage(&storage, &state, &request).await;
+    // This directly exercises the empty-promotion branch; the transport
+    // request validator normally rejects a request without required inputs.
+    stage.validated = true;
+
+    stage.promote(&request, false).await.unwrap();
+
+    let commits = storage.storage().commits.lock().unwrap().clone();
+    assert_eq!(commits.len(), 3, "reserve, final owner claim, and ledger removal");
+    assert!(commits.iter().all(|commit| commit.await_durable));
+    assert_eq!(
+        commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .scratch_keys
+                    .iter()
+                    .any(|key| key.0.as_ref() == b"operations")
+            })
+            .count(),
+        3,
+        "empty promotion has no separate renewal or reaping-claim write"
+    );
+}
+
+#[tokio::test]
+async fn failed_last_install_never_claims_scratch_reaping() {
+    let (storage, state, mut request, _) = counting_fixture().await;
+    let input = required_tree_chunk(&mut request);
+    let coordinate = input.address.coordinate().unwrap();
+    let mut stage = stage(&storage, &state, &request).await;
+    let owner = stage.id;
+    stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    stage.append_page(vec![input]).await.unwrap();
+    *storage
+        .storage()
+        .conflict_on_joined_commit
+        .lock()
+        .unwrap() = Some((
+        coordinate.0,
+        coordinate.1,
+        Bytes::from_static(b"racing conflicting immutable value"),
+    ));
+
+    let error = stage.promote(&request, false).await.unwrap_err();
+
+    assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+    assert!(!owner_is_reaping(&storage, owner).await);
+    assert_eq!(
+        storage
+            .storage()
+            .joined_commit_attempts
+            .load(Ordering::Relaxed),
+        1,
+        "the conflicting final install is rejected atomically"
+    );
+}
+
+#[tokio::test]
+async fn final_install_retries_a_concurrent_scratch_ledger_renewal() {
+    let (storage, state, mut request, _) = counting_fixture().await;
+    let input = required_tree_chunk(&mut request);
+    let coordinate = input.address.coordinate().unwrap();
+    let mut stage = stage(&storage, &state, &request).await;
+    let owner = stage.id;
+    stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    stage.append_page(vec![input]).await.unwrap();
+
+    let ledger_key = StorageKey(Bytes::from_static(b"operations"));
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let ledger_bytes = PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(&ledger_key))
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .and_then(|value| match value {
+            StorageProjectedValue::FullValue(bytes) => Some(bytes),
+            StorageProjectedValue::KeyOnly => None,
+        })
+        .unwrap();
+    drop(read);
+    let mut ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+    let expires = ledger[&owner.to_string()]["expires_at_ms"]
+        .as_u64()
+        .unwrap();
+    ledger[&owner.to_string()]["expires_at_ms"] = serde_json::json!(expires + 1);
+    *storage
+        .storage()
+        .conflict_on_joined_commit
+        .lock()
+        .unwrap() = Some((
+        STAGING_SPACE,
+        ledger_key,
+        Bytes::from(serde_json::to_vec(&ledger).unwrap()),
+    ));
+
+    stage.promote(&request, false).await.unwrap();
+
+    assert_eq!(
+        storage
+            .storage()
+            .joined_commit_attempts
+            .load(Ordering::Relaxed),
+        2,
+        "the raced ledger CAS is retried before final publication"
+    );
+    let commits = storage.storage().commits.lock().unwrap().clone();
+    assert_eq!(
+        commits
+            .iter()
+            .filter(|commit| {
+                commit.canonical_keys.contains(&coordinate)
+                    && commit
+                        .scratch_keys
+                        .iter()
+                        .any(|key| key.0.as_ref() == b"operations")
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn promotion_rejects_changed_admission_before_installing_inputs() {
     let (storage, state, request) = fixture().await;
     let mut stage = stage(&storage, &state, &request).await;
+    let owner = stage.id;
     let input = chunk(240, 1024);
     let coordinate = input.address.coordinate().unwrap();
     stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
@@ -609,6 +964,7 @@ async fn promotion_rejects_changed_admission_before_installing_inputs() {
         error.code,
         crate::sync::runtime::PARTIAL_ADMISSION_CHANGED_CODE
     );
+    assert!(!owner_is_reaping(&storage, owner).await);
     let read = storage.begin_read(Default::default()).await.unwrap();
     assert!(
         PointReadPlan::new(coordinate.0, std::slice::from_ref(&coordinate.1))
@@ -692,7 +1048,7 @@ async fn private_128_mib_closure_promotes_only_after_terminal_validation_and_rea
         .unwrap();
     let (rows, more) = cursor.next_page(32).await.unwrap().into_parts();
     assert!(!more);
-    assert_eq!(rows.len(), 1, "only the empty ownership ledger remains");
+    assert!(rows.is_empty(), "completed ownership and its empty ledger are reaped");
 }
 
 #[tokio::test]

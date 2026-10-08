@@ -37,6 +37,23 @@ pub(crate) struct StagedClosure<S: Storage + Clone + Send + Sync + 'static> {
     heartbeat: Option<crate::background_task::OwnedBackgroundTask>,
 }
 
+/// The only authority to fold a scratch-owner reaping claim into a canonical
+/// installation transaction. Instances are created by `promote` only after
+/// the complete response has passed validation.
+pub(super) struct ScratchOwnerFinalizeCapability {
+    owner: uuid::Uuid,
+}
+
+pub(super) async fn stage_owner_reaping_fence<R: StorageAdapterRead>(
+    read: &R,
+    state: &PartialReplicaState,
+    capability: &ScratchOwnerFinalizeCapability,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<(), LixError> {
+    lifecycle::stage_reaping_fence(read, state, capability.owner, writes, preconditions).await
+}
+
 impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
     fn new(
         storage: &StorageAdapter<S>,
@@ -415,7 +432,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             ));
         }
         let mut hydrated = super::super::runtime::HydratedInputs::default();
-        for group in groups {
+        let mut groups = groups.into_iter().peekable();
+        while let Some(group) = groups.next() {
             let group_bytes = group
                 .iter()
                 .map(|&index| self.inputs[index].len)
@@ -426,30 +444,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             let inputs = self.read_many(&group).await?;
             let mut response = self.header.clone();
             response.inputs = inputs;
+            let finalize = groups.peek().is_none().then_some(
+                ScratchOwnerFinalizeCapability { owner: self.id },
+            );
             let installed = install_inputs(
                 &self.storage,
                 &self.state,
                 request,
                 &response,
                 immutable_only,
+                finalize.as_ref(),
             )
             .await?;
             hydrated.keys.extend(installed.keys);
             hydrated.blob_manifests.extend(installed.blob_manifests);
         }
-        let read = self.storage.begin_read(Default::default()).await?;
-        let actual = super::super::partial_state::load_partial_replica_state(&read)
-            .await?
-            .ok_or_else(|| invalid("partial admission is absent after promotion"))?
-            .0;
-        drop(read);
-        if actual != self.state {
-            return Err(LixError::new(
-                super::super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
-                "read promotion admission changed",
-            ));
+        if self.inputs.is_empty() {
+            lifecycle::finalize_empty(&self.storage, &self.state, self.id).await?;
         }
-        lifecycle::commit_frames(&self.storage, &self.state, self.id, &[]).await?;
         self.release_scratch().await?;
         Ok(hydrated)
     }

@@ -70,6 +70,86 @@ async fn load<R: StorageAdapterRead>(read: &R) -> Result<(Ledger, Option<Bytes>)
         _ => Err(invalid("scratch ledger exceeds byte bound")),
     }
 }
+
+/// Add the active owner -> reaping transition to a caller's existing write
+/// set. The caller supplies its own admission and domain preconditions, so the
+/// canonical installation and scratch fence commit atomically.
+pub(super) async fn stage_reaping_fence<R: StorageAdapterRead>(
+    read: &R,
+    state: &PartialReplicaState,
+    id: uuid::Uuid,
+    writes: &mut StorageWriteSet,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<(), LixError> {
+    let (mut ledger, expected) = load(read).await?;
+    let owner = ledger.get_mut(&id.to_string()).ok_or_else(|| {
+        LixError::new(
+            "LIX_READ_FULFILLMENT_RESTART",
+            "scratch owner disappeared before finalization",
+        )
+    })?;
+    if owner.reaping || owner.epoch != state.epoch_id() {
+        return Err(LixError::new(
+            "LIX_READ_FULFILLMENT_RESTART",
+            "scratch owner was fenced before finalization",
+        ));
+    }
+    owner.reaping = true;
+    preconditions.push(condition(expected));
+    writes.put(
+        STAGING_SPACE,
+        ledger_key(),
+        serde_json::to_vec(&ledger).map_err(|_| invalid("invalid scratch ownership ledger"))?,
+    );
+    Ok(())
+}
+
+/// Empty closures still need an atomic admission check and owner reaping
+/// claim. This is the terminal fence which a non-empty closure folds into its
+/// final canonical install transaction.
+pub(super) async fn finalize_empty<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    id: uuid::Uuid,
+) -> Result<(), LixError> {
+    for _ in 0..16 {
+        let read = storage.begin_read(Default::default()).await?;
+        let (actual, admission) =
+            super::super::super::partial_state::load_partial_replica_state(&read)
+                .await?
+                .ok_or_else(|| invalid("partial admission is absent during finalization"))?;
+        if actual != *state {
+            return Err(LixError::new(
+                super::super::super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
+                "read promotion admission changed",
+            ));
+        }
+        let mut writes = storage.new_write_set();
+        let mut preconditions = vec![StoragePrecondition::KeyValueEquals {
+            space: super::super::super::PARTIAL_REPLICA_STATE_SPACE,
+            key: super::super::super::partial_state::partial_replica_state_key(),
+            expected: admission,
+        }];
+        stage_reaping_fence(&read, state, id, &mut writes, &mut preconditions).await?;
+        drop(read);
+        match storage
+            .commit_partial_replica_write_set(
+                super::super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Err(StorageWriteSetError::Storage(StorageError::PreconditionFailed(_))) => continue,
+            result => return result.map(|_| ()).map_err(Into::into),
+        }
+    }
+    Err(invalid("scratch finalization contention exceeded retry budget"))
+}
 fn condition(expected: Option<Bytes>) -> StoragePrecondition {
     match expected {
         Some(expected) => StoragePrecondition::KeyValueEquals {
@@ -90,11 +170,15 @@ async fn write<S: Storage + Clone + Send + Sync + 'static>(
     admission: Option<Bytes>,
 ) -> Result<bool, LixError> {
     let mut writes = storage.new_write_set();
-    writes.put(
-        STAGING_SPACE,
-        ledger_key(),
-        serde_json::to_vec(ledger).map_err(|_| invalid("invalid scratch ownership ledger"))?,
-    );
+    if ledger.is_empty() {
+        writes.delete(STAGING_SPACE, ledger_key());
+    } else {
+        writes.put(
+            STAGING_SPACE,
+            ledger_key(),
+            serde_json::to_vec(ledger).map_err(|_| invalid("invalid scratch ownership ledger"))?,
+        );
+    }
     let mut preconditions = vec![condition(expected)];
     if let Some(expected) = admission {
         preconditions.push(StoragePrecondition::KeyValueEquals {
@@ -142,7 +226,14 @@ async fn reap<S: Storage + Clone + Send + Sync + 'static>(
         let read = storage.begin_read(Default::default()).await?;
         let (mut ledger, expected) = load(&read).await?;
         if ledger.is_empty() {
-            return Ok(());
+            let Some(expected) = expected else {
+                return Ok(());
+            };
+            drop(read);
+            if write(storage, &ledger, Some(expected), None).await? {
+                return Ok(());
+            }
+            continue;
         }
         let Some((state, admission)) =
             super::super::super::partial_state::load_partial_replica_state(&read).await?
@@ -497,6 +588,52 @@ mod tests {
             .await
             .unwrap();
         assert!(frames.values.iter().all(Option::is_none));
+        stage.released = true;
+        stage.permit.take();
+    }
+
+    #[tokio::test]
+    async fn final_reaping_fence_rejects_missing_or_already_fenced_owner() {
+        let (storage, state, request) = super::super::tests::fixture().await;
+        let mut stage = super::super::tests::stage(&storage, &state, &request).await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let missing = uuid::Uuid::now_v7();
+        let error = stage_reaping_fence(
+            &read,
+            &state,
+            missing,
+            &mut writes,
+            &mut preconditions,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_READ_FULFILLMENT_RESTART");
+        drop(read);
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let (mut ledger, expected) = load(&read).await.unwrap();
+        drop(read);
+        ledger.get_mut(&stage.id.to_string()).unwrap().reaping = true;
+        assert!(write(&storage, &ledger, expected, None).await.unwrap());
+
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let mut preconditions = Vec::new();
+        let error = stage_reaping_fence(
+            &read,
+            &state,
+            stage.id,
+            &mut writes,
+            &mut preconditions,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_READ_FULFILLMENT_RESTART");
+        drop(read);
+
+        release(storage.clone(), stage.id).await.unwrap();
         stage.released = true;
         stage.permit.take();
     }

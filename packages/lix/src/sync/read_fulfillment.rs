@@ -3082,7 +3082,7 @@ pub(super) async fn install<S: Storage + Clone + Send + Sync + 'static>(
     if request.epoch_id != state.epoch_id() || request.descriptor != *state.descriptor() {
         return Err(invalid("read fulfillment basis changed"));
     }
-    install_inputs(storage, state, request, response, false).await
+    install_inputs(storage, state, request, response, false, None).await
 }
 
 /// Warm a moving working-diff candidate's dependency closure without publishing
@@ -3097,7 +3097,7 @@ pub(super) async fn install_candidate_immutable<S: Storage + Clone + Send + Sync
     response: &ReadFulfillmentResponse,
 ) -> Result<(), LixError> {
     validate_candidate_immutable_basis(previous, next, request, response)?;
-    install_inputs(storage, previous, request, response, true)
+    install_inputs(storage, previous, request, response, true, None)
         .await
         .map(|_| ())
 }
@@ -3183,6 +3183,7 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
     request: &ReadFulfillmentRequest,
     response: &ReadFulfillmentResponse,
     immutable_only: bool,
+    finalize_scratch: Option<&staging::ScratchOwnerFinalizeCapability>,
 ) -> Result<super::runtime::HydratedInputs, LixError> {
     let payload_change_ids = response
         .inputs
@@ -3574,6 +3575,16 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
         }
         crate::binary_cas::stage_transfer_publication_fence(&read, &mut writes, &mut preconditions)
             .await?;
+        if let Some(capability) = finalize_scratch {
+            staging::stage_owner_reaping_fence(
+                &read,
+                state,
+                capability,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await?;
+        }
         drop(read);
         match storage
             .commit_partial_replica_write_set(
