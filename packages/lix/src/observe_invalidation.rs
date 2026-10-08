@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -32,6 +33,13 @@ pub(crate) struct ObserveInvalidation {
 struct ObserveSignals {
     generation: AtomicU64,
     sender: watch::Sender<ObserveInvalidationEvent>,
+    observable_revision: StdMutex<ObservableRevisionState>,
+}
+
+#[derive(Debug, Default)]
+struct ObservableRevisionState {
+    initialized: bool,
+    revision: Option<Bytes>,
 }
 
 #[derive(Debug, Default)]
@@ -47,20 +55,14 @@ impl ObserveInvalidation {
             signals: Arc::new(ObserveSignals {
                 generation: AtomicU64::new(0),
                 sender,
+                observable_revision: StdMutex::default(),
             }),
             watcher: Arc::default(),
         }
     }
 
     pub(crate) fn bump(&self) -> u64 {
-        let next = self.signals.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.signals.sender.send_modify(|event| {
-            if matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
-                return;
-            }
-            *event = ObserveInvalidationEvent::Generation(next);
-        });
-        next
+        bump_signals(&self.signals)
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -76,8 +78,8 @@ impl ObserveInvalidation {
     }
 
     pub(crate) fn bump_if_storage_changed(&self, stats: &StorageWriteSetStats) {
-        if stats.staged_puts > 0 || stats.staged_deletes > 0 {
-            self.bump();
+        if let Some(revision) = stats.observable_revision {
+            observe_storage_revision(&self.signals, Some(Bytes::copy_from_slice(&revision)));
         }
     }
 
@@ -120,6 +122,26 @@ impl ObserveInvalidation {
 
         match storage.watch_for_changes().await {
             Ok(mut changes) => {
+                // The backend watch is physical and may wake on private work.
+                // Subscribe first, then establish the observable-token
+                // baseline while holding the startup gate. An event racing
+                // the baseline is either reflected in the first observer read
+                // or remains queued for the task below to compare.
+                let initial_revision = match storage.load_observable_revision().await {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        let error: LixError = error.into();
+                        if matches!(
+                            error.code.as_str(),
+                            LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
+                        ) {
+                            self.fail_terminal(error.clone());
+                        }
+                        return Err(error);
+                    }
+                };
+                seed_observable_revision(&self.signals, initial_revision);
+                let watched_storage = storage.clone();
                 let weak_signals = Arc::downgrade(&self.signals);
                 let lifecycle = Arc::clone(&self.watcher);
                 let no_receivers = self.signals.sender.clone();
@@ -153,10 +175,34 @@ impl ObserveInvalidation {
                             .await;
                             match changed {
                                 Some(Ok(())) => {
-                                    if let Some(signals) = weak_signals.upgrade() {
-                                        bump_signals(&signals);
-                                    } else {
-                                        break;
+                                    // Only a canonical engine commit that
+                                    // advanced `o` changes an observer result.
+                                    // Keep the backend's physical watch contract
+                                    // untouched and filter at this consumer.
+                                    match watched_storage.load_observable_revision().await {
+                                        Ok(current_revision) => {
+                                            if let Some(signals) = weak_signals.upgrade() {
+                                                observe_storage_revision(&signals, current_revision);
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if let Some(signals) = weak_signals.upgrade() {
+                                                if matches!(
+                                                    error,
+                                                    StorageError::Fenced | StorageError::Closed(_)
+                                                ) {
+                                                    fail_terminal_signals(&signals, error.into());
+                                                } else {
+                                                    // Let the stable-read loop retry and reopen
+                                                    // the watcher after a transient token read.
+                                                    bump_signals(&signals);
+                                                }
+                                            }
+                                            *lifecycle.started.lock().await = false;
+                                            break;
+                                        }
                                     }
                                     // Storage adapters are permitted to report
                                     // an already-ready invalidation repeatedly.
@@ -225,7 +271,7 @@ impl ObserveInvalidation {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            let mut last_seen_revision = match storage.load_mutation_revision().await {
+            let initial_revision = match storage.load_observable_revision().await {
                 Ok(revision) => revision,
                 Err(error) => {
                     let error: LixError = error.into();
@@ -238,6 +284,7 @@ impl ObserveInvalidation {
                     return Err(error);
                 }
             };
+            seed_observable_revision(&self.signals, initial_revision);
             let weak_signals = Arc::downgrade(&self.signals);
             let lifecycle = Arc::clone(&self.watcher);
             let no_receivers = self.signals.sender.clone();
@@ -278,7 +325,7 @@ impl ObserveInvalidation {
                                 }
                             }
                         }
-                        let current_revision = match storage.load_mutation_revision().await {
+                        let current_revision = match storage.load_observable_revision().await {
                             Ok(revision) => revision,
                             Err(error) => {
                                 let error: LixError = error.into();
@@ -295,13 +342,10 @@ impl ObserveInvalidation {
                                 continue;
                             }
                         };
-                        if current_revision != last_seen_revision {
-                            last_seen_revision = current_revision;
-                            if let Some(signals) = weak_signals.upgrade() {
-                                bump_signals(&signals);
-                            } else {
-                                break;
-                            }
+                        if let Some(signals) = weak_signals.upgrade() {
+                            observe_storage_revision(&signals, current_revision);
+                        } else {
+                            break;
                         }
                     }
                 },
@@ -331,14 +375,40 @@ impl Drop for ObserveInvalidation {
     }
 }
 
-fn bump_signals(signals: &ObserveSignals) {
-    let next = signals.generation.fetch_add(1, Ordering::SeqCst) + 1;
+fn bump_signals(signals: &ObserveSignals) -> u64 {
+    let mut next = 0;
     signals.sender.send_modify(|event| {
+        next = signals.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if matches!(event, ObserveInvalidationEvent::TerminalError(_)) {
             return;
         }
         *event = ObserveInvalidationEvent::Generation(next);
     });
+    next
+}
+
+fn seed_observable_revision(signals: &ObserveSignals, revision: Option<Bytes>) {
+    let mut state = signals
+        .observable_revision
+        .lock()
+        .expect("observer revision lock should not poison");
+    if !state.initialized {
+        state.revision = revision;
+        state.initialized = true;
+    }
+}
+
+fn observe_storage_revision(signals: &ObserveSignals, revision: Option<Bytes>) {
+    let mut state = signals
+        .observable_revision
+        .lock()
+        .expect("observer revision lock should not poison");
+    let changed = !state.initialized || state.revision != revision;
+    state.revision = revision;
+    state.initialized = true;
+    if changed {
+        bump_signals(signals);
+    }
 }
 
 fn fail_terminal_signals(signals: &ObserveSignals, error: LixError) {
@@ -378,6 +448,37 @@ mod tests {
                 if error.code == "LIX_ERROR_SYNC_ITEM_TOO_LARGE"
         ));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_bumps_publish_the_final_monotonic_generation() {
+        const BUMPERS: usize = 16;
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let mut observer = invalidation.subscribe();
+        let barrier = Arc::new(std::sync::Barrier::new(BUMPERS + 1));
+        let mut tasks = Vec::with_capacity(BUMPERS);
+        for _ in 0..BUMPERS {
+            let invalidation = Arc::clone(&invalidation);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                invalidation.bump();
+            }));
+        }
+        barrier.wait();
+        for task in tasks {
+            task.await.expect("bump worker should finish");
+        }
+
+        let expected_generation =
+            u64::try_from(BUMPERS).expect("test bump count fits in a generation");
+        assert_eq!(invalidation.generation(), expected_generation);
+        assert!(matches!(
+            observer.borrow_and_update().clone(),
+            ObserveInvalidationEvent::Generation(generation)
+                if generation == expected_generation
+        ));
+    }
+
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -429,11 +530,14 @@ mod tests {
         }
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            // Take the read snapshot before blocking so callers can exercise
+            // a commit racing a stale watcher baseline.
+            let read = self.inner.begin_read(options).await?;
             if self.first_read.swap(false, Ordering::AcqRel) {
                 self.entered.notify_waiters();
                 self.release.notified().await;
             }
-            self.inner.begin_read(options).await
+            Ok(read)
         }
 
         async fn begin_write(
@@ -608,6 +712,70 @@ mod tests {
             Ok(StorageChangeWatch::from_source(AlwaysReadyChangeSource {
                 dropped: Arc::clone(&self.dropped),
                 _storage_lifetime: Arc::clone(&self.lifetime),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct SignalChangeWatchStorage {
+        inner: Memory,
+        changes: watch::Sender<u64>,
+    }
+
+    impl SignalChangeWatchStorage {
+        fn signal_physical_change(&self) {
+            self.changes.send_modify(|generation| *generation += 1);
+        }
+    }
+
+    struct SignalChangeSource {
+        changes: watch::Receiver<u64>,
+    }
+
+    impl StorageChangeSource for SignalChangeSource {
+        fn changed(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+            Box::pin(async move {
+                self.changes
+                    .changed()
+                    .await
+                    .map_err(|_| StorageError::Closed("change signal closed".into()))?;
+                Ok(())
+            })
+        }
+    }
+
+    impl Storage for SignalChangeWatchStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+
+        async fn watch_for_changes(&self) -> Result<StorageChangeWatch, StorageError> {
+            Ok(StorageChangeWatch::from_source(SignalChangeSource {
+                changes: self.changes.subscribe(),
             }))
         }
     }
@@ -920,15 +1088,17 @@ mod tests {
             lifetime: Arc::clone(&lifetime),
         };
         drop(lifetime);
-        let mut observer = invalidation.subscribe();
+        let observer = invalidation.subscribe();
         invalidation
             .ensure_external_watcher(StorageAdapter::new(storage))
             .await
             .expect("always-ready change watcher should start");
-        tokio::time::timeout(Duration::from_secs(1), observer.changed())
-            .await
-            .expect("always-ready source should publish an invalidation")
-            .expect("observer channel should remain open");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            invalidation.generation(),
+            0,
+            "spurious physical notifications with an unchanged observable token are ignored"
+        );
 
         drop(invalidation);
         assert!(owner.upgrade().is_none(), "owner should be fully dropped");
@@ -942,6 +1112,191 @@ mod tests {
             "joined watcher should release storage retained by its source"
         );
         drop(observer);
+    }
+
+    #[tokio::test]
+    async fn physical_private_change_is_ignored_but_external_visible_change_wakes_observer() {
+        let inner = Memory::new();
+        let (changes, _) = watch::channel(0_u64);
+        let storage = SignalChangeWatchStorage { inner, changes };
+        let observer_storage = StorageAdapter::new(storage.clone());
+        let writer_storage = StorageAdapter::new(storage.clone());
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let mut observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(observer_storage)
+            .await
+            .expect("observer should establish a physical watch and o baseline");
+
+        let mut private = writer_storage.new_write_set();
+        private.put(
+            crate::sync::PARTIAL_READ_INTEREST_SPACE,
+            crate::storage::Key(Bytes::from_static(b"recipe")),
+            b"private query recipe".as_slice(),
+        );
+        let (_, private_stats) = writer_storage
+            .commit_write_set(private, WriteOptions::default())
+            .await
+            .expect("external private journal write");
+        assert_eq!(private_stats.observable_revision, None);
+        invalidation.bump_if_storage_changed(&private_stats);
+        storage.signal_physical_change();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), observer.changed())
+                .await
+                .is_err(),
+            "private physical changes must not invalidate observers"
+        );
+        assert_eq!(invalidation.generation(), 0);
+
+        let mut visible = writer_storage.new_write_set();
+        visible.put(
+            crate::hot_state::ROW_SPACE,
+            crate::storage::Key(Bytes::from_static(b"visible")),
+            b"visible result".as_slice(),
+        );
+        let (_, visible_stats) = writer_storage
+            .commit_write_set(visible, WriteOptions::default())
+            .await
+            .expect("external visible row write");
+        storage.signal_physical_change();
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("visible revision change should wake observer")
+            .expect("observer channel should remain open");
+        assert_eq!(invalidation.generation(), 1);
+        invalidation.bump_if_storage_changed(&visible_stats);
+        assert_eq!(
+            invalidation.generation(),
+            1,
+            "local completion after the watcher must deduplicate the accepted token"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_and_watcher_notifications_deduplicate_the_committed_revision_in_both_orders() {
+        for local_first in [true, false] {
+            let storage = StorageAdapter::new(Memory::new());
+            let mut visible = storage.new_write_set();
+            visible.put(
+                crate::hot_state::ROW_SPACE,
+                crate::storage::Key(Bytes::from_static(b"visible")),
+                b"committed value".as_slice(),
+            );
+            let (_, stats) = storage
+                .commit_write_set(visible, WriteOptions::default())
+                .await
+                .expect("visible commit should return its accepted token");
+            let token = stats
+                .observable_revision
+                .expect("visible commit should return the exact generated token");
+            assert_eq!(
+                storage.load_observable_revision().await.unwrap(),
+                Some(Bytes::copy_from_slice(&token)),
+                "returned token must match the committed observer revision"
+            );
+
+            let invalidation = ObserveInvalidation::new();
+            seed_observable_revision(&invalidation.signals, None);
+            let watcher_observation = Some(Bytes::copy_from_slice(&token));
+            if local_first {
+                invalidation.bump_if_storage_changed(&stats);
+                assert_eq!(invalidation.generation(), 1);
+                observe_storage_revision(&invalidation.signals, watcher_observation);
+            } else {
+                observe_storage_revision(&invalidation.signals, watcher_observation);
+                assert_eq!(invalidation.generation(), 1);
+                invalidation.bump_if_storage_changed(&stats);
+            }
+            assert_eq!(
+                invalidation.generation(),
+                1,
+                "local completion and watcher must share one revision observation"
+            );
+
+            let mut private = storage.new_write_set();
+            private.put(
+                crate::sync::PARTIAL_READ_INTEREST_SPACE,
+                crate::storage::Key(Bytes::from_static(b"private")),
+                b"private journal entry".as_slice(),
+            );
+            let (_, private_stats) = storage
+                .commit_write_set(private, WriteOptions::default())
+                .await
+                .expect("private commit should succeed");
+            assert_eq!(private_stats.observable_revision, None);
+            invalidation.bump_if_storage_changed(&private_stats);
+            observe_storage_revision(&invalidation.signals, Some(Bytes::copy_from_slice(&token)));
+            assert_eq!(
+                invalidation.generation(),
+                1,
+                "a private completion must neither bump nor reset the last visible token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_revision_during_stale_watcher_baseline_is_not_overwritten_and_polling_still_wakes() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let mut observer = invalidation.subscribe();
+        let storage = BlockingFirstReadStorage::new();
+        let adapter = StorageAdapter::new(storage.clone());
+        let startup = {
+            let invalidation = Arc::clone(&invalidation);
+            let adapter = adapter.clone();
+            tokio::spawn(async move { invalidation.ensure_external_watcher(adapter).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_initial_read())
+            .await
+            .expect("watcher should block after capturing its stale initial snapshot");
+
+        let mut visible = adapter.new_write_set();
+        visible.put(
+            crate::hot_state::ROW_SPACE,
+            crate::storage::Key(Bytes::from_static(b"visible")),
+            b"first value".as_slice(),
+        );
+        let (_, stats) = adapter
+            .commit_write_set(visible, WriteOptions::default())
+            .await
+            .expect("local visible commit should succeed during baseline read");
+        invalidation.bump_if_storage_changed(&stats);
+        assert_eq!(invalidation.generation(), 1);
+        observer
+            .changed()
+            .await
+            .expect("local commit should notify the observer");
+        observer.borrow_and_update();
+
+        storage.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), startup)
+            .await
+            .expect("watcher startup should finish after baseline release")
+            .expect("watcher startup task should not panic")
+            .expect("watcher should start its native revision poller");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), observer.changed())
+                .await
+                .is_err(),
+            "stale baseline must not overwrite the local token and cause a duplicate poll wake"
+        );
+        assert_eq!(invalidation.generation(), 1);
+
+        let mut external = adapter.new_write_set();
+        external.put(
+            crate::hot_state::ROW_SPACE,
+            crate::storage::Key(Bytes::from_static(b"external")),
+            b"second value".as_slice(),
+        );
+        adapter
+            .commit_write_set(external, WriteOptions::default())
+            .await
+            .expect("external visible commit should succeed");
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("native polling must observe a distinct external revision")
+            .expect("observer channel should remain open");
+        assert_eq!(invalidation.generation(), 2);
     }
 
     #[tokio::test]

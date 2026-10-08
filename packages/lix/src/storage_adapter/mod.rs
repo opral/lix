@@ -38,7 +38,7 @@ pub use crate::storage::{
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
     Storage, StorageError, StorageOwnerGate, StorageOwnerGuard, StorageOwnerLease, StorageRead,
-    StorageScanSource, StorageSessionToken, StorageSpace, StorageSpaceRole,
+    StorageScanSource, StorageSessionToken, StorageSpace, StorageSpaceRole, StorageSpaceVisibility,
     StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };
@@ -49,7 +49,7 @@ pub(crate) use crate::storage::{
 pub use context::StorageAdapter;
 pub(crate) use context::{
     load_repository_mutation_revision, repository_mutation_revision_precondition,
-    stage_mutation_revision,
+    stage_mutation_revision, stage_storage_revisions,
 };
 pub(crate) use epoch::{EpochBank, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE};
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
@@ -58,8 +58,9 @@ pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub(crate) use spaces::{
     REVISION_KEY_ACCOUNT, REVISION_KEY_BINARY_CAS_PUBLICATION, REVISION_KEY_BINARY_CAS_RECLAMATION,
-    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_TRACKED_MUTATION,
-    REVISION_SPACE, load_revision, load_revisions, revision_key,
+    REVISION_KEY_CATALOG, REVISION_KEY_FILESYSTEM_PATH, REVISION_KEY_OBSERVABLE,
+    REVISION_KEY_TRACKED_MUTATION, REVISION_SPACE, is_non_content_revision_key, load_revision,
+    load_revisions, revision_key,
 };
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,

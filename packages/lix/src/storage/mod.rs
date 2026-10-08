@@ -32,8 +32,8 @@ pub use types::{
     EncodedMutationBatchError, EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key,
     KeyRange, MAX_SCAN_PAGE_ROWS, Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency,
     ReadDurability, ReadEntry, ReadOptions, ScanChunk, ScanOrder, SnapshotRef, SpaceId,
-    StorageSpace, StorageSpaceRole, StoredValue, ValueIntegrity, ValueSemantics, WriteOptions,
-    WriteStats,
+    StorageSpace, StorageSpaceRole, StorageSpaceVisibility, StoredValue, ValueIntegrity,
+    ValueSemantics, WriteOptions, WriteStats,
 };
 
 mod read_budget;

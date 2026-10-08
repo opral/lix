@@ -4,7 +4,7 @@ use super::*;
 mod lifecycle;
 pub(crate) use lifecycle::{reap_abandoned, reap_expired};
 
-pub(crate) const STAGING_SPACE: StorageSpace = StorageSpace::declare(
+pub(crate) const STAGING_SPACE: StorageSpace = StorageSpace::declare_private(
     StorageSpaceId(0x0007_0024),
     "sync.read_operation_scratch.v1",
     ValueSemantics::Mutable,

@@ -244,8 +244,8 @@ impl Witness {
     ) -> Result<(), LixError> {
         independent_invariants(&self.source, &actual)?;
         descriptors(&self.source, &actual, options).await?;
-        // Only the exact protocol marker and physical mutation counter are
-        // intentionally absent from the portable content witness.
+        // Only the exact protocol marker and adapter-owned physical/observer
+        // revision tokens are absent from the portable content witness.
         let portable = |records: &Records| {
             records
                 .iter()
@@ -265,7 +265,7 @@ impl Witness {
 fn ignored(space: u32, key: &[u8]) -> bool {
     (space == crate::init::REPOSITORY_PROTOCOL_SPACE.id.0
         && key == crate::init::REPOSITORY_PROTOCOL_KEY)
-        || (space == REVISION_SPACE.id.0 && key == b"m")
+        || is_non_content_revision_key(space, key)
 }
 
 fn independent_invariants(source: &Records, target: &Records) -> Result<(), LixError> {

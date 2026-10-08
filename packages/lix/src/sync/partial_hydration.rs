@@ -149,10 +149,17 @@ where
     }
     let mut writes = storage.new_write_set();
     completed.stage_into(&mut writes);
+    let availability =
+        super::native_object::validated_native_dependency_availability_from_staged(
+            &[address],
+            &writes,
+            raw.clone(),
+        )?;
     drop(read);
     let installed = storage
-        .commit_partial_replica_write_set(
+        .commit_partial_native_dependency_availability_write_set(
             super::partial_replica_write_capability(),
+            availability,
             writes,
             StorageWriteOptions {
                 preconditions: vec![
@@ -211,7 +218,105 @@ mod tests {
     use super::super::partial_bootstrap::stage_partial_bootstrap;
     use super::super::partial_state::stage_partial_replica_state;
     use super::*;
+    use crate::sync::native_object::NativeObjectResponse;
     use crate::{Memory, open_lix};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Notify, watch};
+
+    #[derive(Clone)]
+    struct SignalChangeWatchStorage {
+        inner: Memory,
+        changes: watch::Sender<u64>,
+        wait_count: Arc<AtomicUsize>,
+        wait_entered: Arc<Notify>,
+    }
+
+    impl SignalChangeWatchStorage {
+        fn signal_physical_change(&self) {
+            self.changes.send_modify(|generation| *generation += 1);
+        }
+
+        async fn wait_for_watch_wait(&self, expected: usize) {
+            loop {
+                let notified = self.wait_entered.notified();
+                if self.wait_count.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    struct SignalChangeSource {
+        changes: watch::Receiver<u64>,
+        wait_count: Arc<AtomicUsize>,
+        wait_entered: Arc<Notify>,
+    }
+
+    impl crate::storage::StorageChangeSource for SignalChangeSource {
+        fn changed(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::storage::StorageError>> + Send + '_>>
+        {
+            let wait_count = Arc::clone(&self.wait_count);
+            let wait_entered = Arc::clone(&self.wait_entered);
+            Box::pin(async move {
+                wait_count.fetch_add(1, Ordering::AcqRel);
+                wait_entered.notify_one();
+                self.changes
+                    .changed()
+                    .await
+                    .map_err(|_| crate::storage::StorageError::Closed("watch closed".into()))?;
+                Ok(())
+            })
+        }
+    }
+
+    impl Storage for SignalChangeWatchStorage {
+        type Read<'a>
+            = crate::storage::MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = crate::storage::MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, crate::storage::StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            options: crate::storage::ReadOptions,
+        ) -> Result<Self::Read<'_>, crate::storage::StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: crate::storage::WriteOptions,
+        ) -> Result<Self::Write<'_>, crate::storage::StorageError> {
+            self.inner.begin_write(options).await
+        }
+
+        async fn watch_for_changes(
+            &self,
+        ) -> Result<crate::storage::StorageChangeWatch, crate::storage::StorageError> {
+            Ok(crate::storage::StorageChangeWatch::from_source(
+                SignalChangeSource {
+                    changes: self.changes.subscribe(),
+                    wait_count: Arc::clone(&self.wait_count),
+                    wait_entered: Arc::clone(&self.wait_entered),
+                },
+            ))
+        }
+    }
 
     pub(super) async fn fixture() -> (StorageAdapter<Memory>, PartialReplicaState) {
         let authority = open_lix().await.unwrap();
@@ -260,6 +365,8 @@ mod tests {
     #[tokio::test]
     async fn partial_native_hydration_is_durable_and_warm_calls_make_no_requests() {
         let (storage, state) = fixture().await;
+        let before_mutation = storage.load_mutation_revision().await.unwrap();
+        let before_observable = storage.load_observable_revision().await.unwrap();
         let bytes = vec![42; MAX_NATIVE_OBJECT_PAYLOAD_BYTES + 17];
         let address = NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(&bytes).as_bytes());
         let report = hydrate_native_object(&storage, &state, address, bytes.len(), |request| {
@@ -282,6 +389,60 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(warm, NativeHydrationReport::default());
+        assert_ne!(
+            storage.load_mutation_revision().await.unwrap(),
+            before_mutation,
+            "physical hydration still advances the mutation revision"
+        );
+        assert_eq!(
+            storage.load_observable_revision().await.unwrap(),
+            before_observable,
+            "validated dependency availability does not notify repository observers"
+        );
+
+        let visible_bytes = b"ordinary visible native write";
+        let visible_address =
+            NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(visible_bytes).as_bytes());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let raw = load_partial_replica_state(&read).await.unwrap().unwrap().1;
+        drop(read);
+        let mut visible = storage.new_write_set();
+        visible.put_content_addressed_batch(
+            visible_address.space(),
+            [(
+                StorageKey(Bytes::from(visible_address.storage_key())),
+                crate::storage_adapter::StorageValue {
+                    bytes: Bytes::from_static(visible_bytes),
+                },
+            )],
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                visible,
+                StorageWriteOptions {
+                    preconditions: vec![
+                        StoragePrecondition::KeyAbsent {
+                            space: visible_address.space(),
+                            key: StorageKey(Bytes::from(visible_address.storage_key())),
+                        },
+                        StoragePrecondition::KeyValueEquals {
+                            space: PARTIAL_REPLICA_STATE_SPACE,
+                            key: partial_replica_state_key(),
+                            expected: raw,
+                        },
+                    ],
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            storage.load_observable_revision().await.unwrap(),
+            before_observable,
+            "ordinary visible writes still advance the observer revision"
+        );
         let mut unauthorized = storage.new_write_set();
         crate::init::stage_repository_protocol(&mut unauthorized);
         assert!(
@@ -290,6 +451,170 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn dependency_visibility_intent_rejects_mixed_public_mutations() {
+        let (storage, state) = fixture().await;
+        let native_bytes = b"validated native dependency";
+        let native_address =
+            NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(native_bytes).as_bytes());
+        let response = NativeObjectResponse {
+            lix_id: state.repository_id().into(),
+            objects: vec![super::super::native_object::NativeObject {
+                address: native_address,
+                bytes: native_bytes.to_vec(),
+            }],
+        };
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let raw = load_partial_replica_state(&read).await.unwrap().unwrap().1;
+        drop(read);
+        let public_bytes = b"unrelated public mutation";
+        let public_address =
+            NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(public_bytes).as_bytes());
+        let mut writes = storage.new_write_set();
+        super::super::native_object::stage_native_objects(
+            state.repository_id(),
+            &[native_address],
+            &response,
+            &mut writes,
+        )
+        .unwrap();
+        let availability =
+            crate::sync::native_object::validated_native_dependency_availability_from_staged(
+                &[native_address],
+                &writes,
+                raw.clone(),
+            )
+            .unwrap();
+        writes.put_content_addressed_batch(
+            public_address.space(),
+            [(
+                StorageKey(Bytes::from(public_address.storage_key())),
+                crate::storage_adapter::StorageValue {
+                    bytes: Bytes::from_static(public_bytes),
+                },
+            )],
+        );
+        let before_observable = storage.load_observable_revision().await.unwrap();
+        let error = storage
+            .commit_partial_native_dependency_availability_write_set(
+                super::super::partial_replica_write_capability(),
+                availability,
+                writes,
+                StorageWriteOptions {
+                    preconditions: vec![
+                        StoragePrecondition::KeyAbsent {
+                            space: native_address.space(),
+                            key: StorageKey(Bytes::from(native_address.storage_key())),
+                        },
+                        StoragePrecondition::KeyValueEquals {
+                            space: PARTIAL_REPLICA_STATE_SPACE,
+                            key: partial_replica_state_key(),
+                            expected: raw,
+                        },
+                    ],
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Admission(_)
+        ));
+        assert_eq!(
+            storage.load_observable_revision().await.unwrap(),
+            before_observable
+        );
+        assert!(
+            !native_object_is_resident(&storage, &state, native_address)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_ignores_hydration_wake_but_sees_later_visible_write() {
+        let (base, state) = fixture().await;
+        let (changes, _) = watch::channel(0_u64);
+        let watched = SignalChangeWatchStorage {
+            inner: base.storage().clone(),
+            changes,
+            wait_count: Arc::new(AtomicUsize::new(0)),
+            wait_entered: Arc::new(Notify::new()),
+        };
+        let storage = StorageAdapter::new(watched.clone());
+        let invalidation = Arc::new(crate::observe_invalidation::ObserveInvalidation::new());
+        let mut observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(storage.clone())
+            .await
+            .unwrap();
+        watched.wait_for_watch_wait(1).await;
+        observer.borrow_and_update();
+
+        let bytes = b"unrelated same-epoch native object";
+        let address = NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(bytes).as_bytes());
+        hydrate_native_object(&storage, &state, address, bytes.len(), |request| {
+            std::future::ready(Ok(response(&state, &request, bytes)))
+        })
+        .await
+        .unwrap();
+        watched.signal_physical_change();
+        // The watcher returns to its next physical wait only after comparing
+        // the shared observable revision and deciding this hydration was private.
+        watched.wait_for_watch_wait(2).await;
+        assert_eq!(invalidation.generation(), 0);
+        assert!(!observer.has_changed().unwrap());
+
+        let visible_bytes = b"later visible native object";
+        let visible_address =
+            NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(visible_bytes).as_bytes());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let raw = load_partial_replica_state(&read).await.unwrap().unwrap().1;
+        drop(read);
+        let mut visible = storage.new_write_set();
+        visible.put_content_addressed_batch(
+            visible_address.space(),
+            [(
+                StorageKey(Bytes::from(visible_address.storage_key())),
+                crate::storage_adapter::StorageValue {
+                    bytes: Bytes::from_static(visible_bytes),
+                },
+            )],
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                visible,
+                StorageWriteOptions {
+                    preconditions: vec![
+                        StoragePrecondition::KeyAbsent {
+                            space: visible_address.space(),
+                            key: StorageKey(Bytes::from(visible_address.storage_key())),
+                        },
+                        StoragePrecondition::KeyValueEquals {
+                            space: PARTIAL_REPLICA_STATE_SPACE,
+                            key: partial_replica_state_key(),
+                            expected: raw,
+                        },
+                    ],
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        watched.signal_physical_change();
+        watched.wait_for_watch_wait(3).await;
+        assert_eq!(invalidation.generation(), 1);
+        assert!(observer.has_changed().unwrap());
+        assert!(matches!(
+            observer.borrow_and_update().clone(),
+            crate::observe_invalidation::ObserveInvalidationEvent::Generation(1)
+        ));
     }
 
     #[tokio::test]
@@ -353,7 +678,7 @@ mod tests {
         let (storage, state) = fixture().await;
         let bytes = b"concurrent native object";
         let address = NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(bytes).as_bytes());
-        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
         let fetch = |request| {
             let gate = gate.clone();
             let answer = response(&state, &request, bytes);

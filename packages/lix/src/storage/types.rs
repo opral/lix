@@ -31,6 +31,21 @@ pub enum StorageSpaceRole {
     Rebuildable,
 }
 
+/// Whether mutations in a logical space change repository-visible state.
+///
+/// Most storage is observable by default. Only explicitly private coordination
+/// or staging state may opt out of advancing Lix's observer revision. Private
+/// writes still physically mutate storage and rotate the storage mutation token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StorageSpaceVisibility {
+    /// A mutation can change a result an observer may read.
+    #[default]
+    Observable,
+    /// Private coordination or temporary bytes that do not change a result.
+    /// This does not suppress backend change-watch notifications.
+    Private,
+}
+
 /// Who is responsible for detecting corruption of a space's *value* bytes.
 ///
 /// This exists because one space in the engine authenticates its own values
@@ -74,6 +89,8 @@ pub struct StorageSpace {
     /// Who detects value corruption in this space. See [`ValueIntegrity`].
     pub value_integrity: ValueIntegrity,
     pub role: StorageSpaceRole,
+    /// Whether mutations in this space should invalidate repository observers.
+    pub visibility: StorageSpaceVisibility,
 }
 
 impl StorageSpace {
@@ -96,6 +113,27 @@ impl StorageSpace {
             value_semantics,
             value_integrity: ValueIntegrity::BackendVerified,
             role: StorageSpaceRole::Authoritative,
+            visibility: StorageSpaceVisibility::Observable,
+        }
+    }
+
+    /// Declares private, non-observable operation state.
+    ///
+    /// This is intentionally separate from [`StorageSpace::declare`]: new
+    /// spaces remain observable unless they make an explicit private-work
+    /// declaration in the storage registry.
+    pub(crate) const fn declare_private(
+        id: SpaceId,
+        name: &'static str,
+        value_semantics: ValueSemantics,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            value_semantics,
+            value_integrity: ValueIntegrity::BackendVerified,
+            role: StorageSpaceRole::Authoritative,
+            visibility: StorageSpaceVisibility::Private,
         }
     }
 
@@ -128,6 +166,7 @@ impl StorageSpace {
             value_semantics,
             value_integrity: ValueIntegrity::ContentAddressed,
             role: StorageSpaceRole::Authoritative,
+            visibility: StorageSpaceVisibility::Observable,
         }
     }
 
@@ -152,7 +191,11 @@ impl StorageSpace {
             "this space id is registered immutable in ALL_STORAGE_SPACES; read \
              the space back from the registry instead of re-declaring it"
         );
-        Self::declare(id, name, ValueSemantics::Mutable)
+        let space = Self::declare(id, name, ValueSemantics::Mutable);
+        Self {
+            visibility: crate::storage_spaces::registered_visibility(id),
+            ..space
+        }
     }
 
     /// An immutable space. Registered ids are checked against the registry;
@@ -163,7 +206,11 @@ impl StorageSpace {
             "this space id is registered mutable in ALL_STORAGE_SPACES; read \
              the space back from the registry instead of re-declaring it"
         );
-        Self::declare(id, name, ValueSemantics::Immutable)
+        let space = Self::declare(id, name, ValueSemantics::Immutable);
+        Self {
+            visibility: crate::storage_spaces::registered_visibility(id),
+            ..space
+        }
     }
 
     /// The same space id and name, re-declared mutable, for corruption tests.
@@ -204,6 +251,7 @@ impl StorageSpace {
             // authenticate them.
             value_integrity: ValueIntegrity::BackendVerified,
             role: self.role,
+            visibility: self.visibility,
         }
     }
 }

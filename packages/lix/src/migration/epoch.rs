@@ -1879,7 +1879,7 @@ where
 fn is_witnessed_content_key(space: StorageSpace, key: &[u8]) -> bool {
     !(space == crate::init::REPOSITORY_PROTOCOL_SPACE
         && key == crate::init::REPOSITORY_PROTOCOL_KEY)
-        && !(space == crate::storage_adapter::REVISION_SPACE && key == b"m")
+        && !crate::storage_adapter::is_non_content_revision_key(space.id.0, key)
 }
 
 async fn migrate_sparse_candidate<S>(
@@ -2259,13 +2259,30 @@ async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
 where
     S: Storage,
 {
+    // This bank is hidden behind the migration pointer until its exact
+    // contents are published.  Clear it through the migration write path so
+    // the target does not manufacture adapter revision tokens that are not
+    // present in the source being copied or restored. In particular, old
+    // snapshots predate the observable revision key; creating that key here
+    // would make the verified candidate differ from the snapshot payload.
     for space in
         epoch_data_spaces().chain(std::iter::once(crate::sync::READ_OPERATION_SCRATCH_SPACE))
     {
-        adapter
-            .clear_space(space, durable_candidate_write_options())
+        let mut write = adapter
+            .begin_migration_write(durable_candidate_write_options())
             .await
             .map_err(storage_error)?;
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        write.commit().await.map_err(storage_error)?;
     }
     Ok(())
 }
@@ -4283,6 +4300,36 @@ pub(super) mod tests {
                 .is_some_and(|(_, bytes)| bytes == second.claim)
         );
         second.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_import_clear_does_not_invent_observable_revision() {
+        let storage = crate::Memory::new();
+        let mut seed = storage.begin_write(WriteOptions::default()).await.unwrap();
+        seed.put_many(
+            EpochBank::A.map_space(crate::storage_adapter::REVISION_SPACE),
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: crate::storage_adapter::revision_key(
+                        crate::storage_adapter::REVISION_KEY_OBSERVABLE,
+                    ),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"stale-candidate-token"),
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        seed.commit().await.unwrap();
+
+        let import = begin_fresh_epoch_import(storage.clone()).await.unwrap();
+        assert_eq!(
+            import.candidate().load_observable_revision().await.unwrap(),
+            None,
+            "clearing a hidden candidate must leave revision content for the source import"
+        );
+        import.abort().await.unwrap();
     }
 
     #[tokio::test]

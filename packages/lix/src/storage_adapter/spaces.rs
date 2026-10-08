@@ -41,10 +41,22 @@ pub(crate) const REVISION_KEY_BINARY_CAS_PUBLICATION: &[u8] = b"p";
 pub(crate) const REVISION_KEY_CATALOG: &[u8] = b"c";
 /// Filesystem path-index cache-freshness token.
 pub(crate) const REVISION_KEY_FILESYSTEM_PATH: &[u8] = b"f";
-/// Any-storage-mutation token consumed by `observe`.
+/// Physical any-storage-mutation token retained for storage-generation checks.
+/// Observer invalidation compares `REVISION_KEY_OBSERVABLE` instead.
 pub(crate) const REVISION_KEY_MUTATION: &[u8] = b"m";
+/// Observable repository-state token. Unlike the physical mutation token, it
+/// is not rotated by private operation scratch or read-interest journal writes.
+pub(crate) const REVISION_KEY_OBSERVABLE: &[u8] = b"o";
 /// Tracked-state mutation token used as the transaction snapshot fence.
 pub(crate) const REVISION_KEY_TRACKED_MUTATION: &[u8] = b"t";
+
+/// These adapter-owned tokens describe physical/observer bookkeeping rather
+/// than repository content, so migration's portable content witnesses omit
+/// them while continuing to cover every other revision-space key.
+pub(crate) fn is_non_content_revision_key(space_id: u32, key: &[u8]) -> bool {
+    space_id == REVISION_SPACE.id.0
+        && (key == REVISION_KEY_MUTATION || key == REVISION_KEY_OBSERVABLE)
+}
 
 pub(crate) fn revision_key(key: &'static [u8]) -> Key {
     Key(Bytes::from_static(key))
@@ -167,6 +179,47 @@ mod tests {
         assert_eq!(space.id, SpaceId(7));
         assert_eq!(space.name, "test.space");
         assert_eq!(space.to_string(), "test.space(SpaceId(7), Mutable)");
+        assert_eq!(
+            space.visibility,
+            crate::storage::StorageSpaceVisibility::Observable
+        );
+    }
+
+    #[test]
+    fn portable_content_ignores_only_physical_and_observable_revision_tokens() {
+        assert!(super::is_non_content_revision_key(
+            super::REVISION_SPACE.id.0,
+            super::REVISION_KEY_MUTATION
+        ));
+        assert!(super::is_non_content_revision_key(
+            super::REVISION_SPACE.id.0,
+            super::REVISION_KEY_OBSERVABLE
+        ));
+        for key in [
+            super::REVISION_KEY_ACCOUNT,
+            super::REVISION_KEY_BINARY_CAS_PUBLICATION,
+            super::REVISION_KEY_BINARY_CAS_RECLAMATION,
+            super::REVISION_KEY_CATALOG,
+            super::REVISION_KEY_FILESYSTEM_PATH,
+            super::REVISION_KEY_TRACKED_MUTATION,
+        ] {
+            assert!(
+                !super::is_non_content_revision_key(super::REVISION_SPACE.id.0, key),
+                "semantic revision key {:?} must remain witnessed",
+                key
+            );
+        }
+        assert!(!super::is_non_content_revision_key(SpaceId(7).0, b"m"));
+    }
+
+    #[test]
+    fn checked_redeclarations_preserve_private_registry_visibility() {
+        let declared = crate::sync::PARTIAL_READ_INTEREST_SPACE;
+        let checked = StorageSpace::mutable(declared.id, declared.name);
+        assert_eq!(
+            checked.visibility,
+            crate::storage::StorageSpaceVisibility::Private
+        );
     }
 
     #[test]

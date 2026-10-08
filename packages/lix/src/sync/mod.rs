@@ -246,6 +246,10 @@ pub(crate) struct CertifiedReplicaWriteCapability {
     _private: (),
 }
 
+// Native validation remains private to its owner. Storage consumes only the
+// opaque, bounded availability proof through this sync-facing boundary.
+pub(crate) use native_object::NativeDependencyAvailabilityCapability;
+
 /// Only the partial sync owner can bypass the ordinary receipt write fence.
 /// This capability proves ownership of installation, never full-state coverage.
 pub(crate) struct PartialReplicaWriteCapability {
