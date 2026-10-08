@@ -101,6 +101,93 @@ fn content(result: ExecuteResult) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn parameterized_exact_id_full_content_is_captured_before_first_memory_miss() {
+    let id = "01920000-0000-7000-8000-00000000f42a";
+    let path = "/point-read/selected.md";
+    let bytes = b"exact ID content with metadata".to_vec();
+    let metadata = serde_json::json!({"frontmatter": {"title": "selected"}, "ordinal": 7});
+    let authority = open_lix().await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) \
+             VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Text(id.to_owned()),
+                Value::Text(path.to_owned()),
+                Value::Blob(bytes.clone().into()),
+                Value::Jsonb(metadata.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    let (authority, engine, session, state) =
+        publication::fixture_from_authority(authority, None).await;
+    let storage = engine.storage();
+    let sql = "SELECT id, path, content, lixcol_metadata \
+               FROM lix_file WHERE id = $1 LIMIT $2";
+    let params = [Value::Text(id.to_owned()), Value::Integer(1)];
+
+    let first_miss = session
+        .execute(sql, &params)
+        .await
+        .expect_err("the descriptor-only Memory replica must miss before hydration");
+    let serialized_recipes = first_miss
+        .details
+        .as_ref()
+        .and_then(|details| details.get("readFulfillment"))
+        .and_then(|capture| capture.get("interests"))
+        .expect("the first miss must carry the operation's captured read recipes");
+    let recipes: Vec<crate::hot_state::LogicalReadInterest> =
+        serde_json::from_value(serialized_recipes.clone())
+            .expect("captured recipes must retain their typed wire shape");
+    let content_recipe = recipes
+        .iter()
+        .find_map(|recipe| match recipe {
+            crate::hot_state::LogicalReadInterest::FileContent {
+                file_ids: Some(file_ids),
+                request,
+                ..
+            } => Some((file_ids, &request.projection.columns)),
+            _ => None,
+        })
+        .expect("full-content projection must be captured before provider misses");
+    assert_eq!(
+        content_recipe.0,
+        &[id.to_owned()],
+        "the early recipe must stay limited to the exact bound ID"
+    );
+    assert_eq!(
+        content_recipe.1,
+        &["snapshot_content".to_owned(), "metadata".to_owned()],
+        "the early recipe must include the metadata actually selected by SQL"
+    );
+
+    let result = execute_file_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        sql,
+        &params,
+        &mut FileFetches::default(),
+    )
+    .await
+    .expect("the captured read must hydrate and then return the local SQL row");
+    assert_eq!(result.rows().len(), 1);
+    let row = &result.rows()[0];
+    assert_eq!(row.get::<String>("id").unwrap(), id);
+    assert_eq!(row.get::<String>("path").unwrap(), path);
+    assert_eq!(row.get::<Vec<u8>>("content").unwrap(), bytes);
+    assert_eq!(
+        row.get::<serde_json::Value>("lixcol_metadata").unwrap(),
+        metadata
+    );
+}
+
+#[tokio::test]
 async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
     use std::sync::Arc;
 

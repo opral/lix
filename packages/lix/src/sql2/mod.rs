@@ -128,14 +128,18 @@ mod aggregate_statistics;
 pub(crate) use plan::read::execute_native_read;
 pub(crate) use plan::read::statement::ExactFilesystemRead;
 pub(crate) use plan::read::statement::{
-    exact_filesystem_read_interest_route, exact_filesystem_read_route,
+    exact_file_content_id_read, exact_file_content_id_uses_nonfull_content,
+    exact_filesystem_read_interest_route,
+    exact_filesystem_read_route,
 };
 pub(crate) use plan::read::statement::{
-    LateLixFileProjection, StatementReadPlan, is_acknowledgeable_file_content_read,
-    late_materialized_lix_file_content_read, plan_read_statement,
+    ExactFileContentIdRead, LateLixFileProjection, StatementReadPlan,
+    is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read,
+    plan_read_statement,
 };
 
 pub(crate) use providers::{
+    exact_id_file_content_interest, lix_file_content_scan_request,
     prepare_native_diff_interest, validate_bounded_history_recipe_shape,
     prepare_native_file_content_inputs,
     prepare_native_file_content_interest,

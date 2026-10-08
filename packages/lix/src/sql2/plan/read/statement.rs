@@ -660,6 +660,194 @@ pub(crate) enum ExactFilesystemRead {
     IdManifestBatch(BTreeSet<String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactFileContentIdRead {
+    pub(crate) file_id: String,
+    pub(crate) include_metadata: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactFileContentIdProjection {
+    file_id: String,
+    uses_content: bool,
+    returns_full_content: bool,
+    include_metadata: bool,
+}
+
+/// Recognize only a single-table exact file-ID content read for operation
+/// preflight. Unlike the general point-read predicate, this may resolve a
+/// positive integer LIMIT placeholder because the ID predicate is unique.
+/// Offsets, path selectors, joins, aliases, and extra predicates remain out of
+/// scope so the seed cannot widen the SQL result's dependency set.
+pub(crate) fn exact_file_content_id_read(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactFileContentIdRead> {
+    let projection = exact_file_content_id_projection(statement, params, true)?;
+    projection.returns_full_content.then_some(ExactFileContentIdRead {
+        file_id: projection.file_id,
+        include_metadata: projection.include_metadata,
+    })
+}
+
+/// True when a strict exact-ID query uses content only inside a computed
+/// projection. Such reads must stay on their existing provider/executor path:
+/// preflighting them as `FileContent` would fetch the complete blob for
+/// metadata-only size calculations and bounded substring projections.
+pub(crate) fn exact_file_content_id_uses_nonfull_content(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> bool {
+    exact_file_content_id_projection(statement, params, false)
+        .is_some_and(|projection| projection.uses_content && !projection.returns_full_content)
+}
+
+fn exact_file_content_id_projection(
+    statement: &DataFusionStatement,
+    params: &[Value],
+    require_all_params_used_by_identity_or_limit: bool,
+) -> Option<ExactFileContentIdProjection> {
+    let simple = simple_single_table_select(statement)?;
+    if simple.table_name != "lix_file"
+        || !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.order_by.is_some()
+        || simple.query.fetch.is_some()
+    {
+        return None;
+    }
+
+    let mut used_params = BTreeSet::new();
+    let selection = simple.select.selection.as_ref()?;
+    let file_id = exact_file_id_equality(selection, params, &mut used_params)?;
+    exact_file_content_limit(simple.query.limit_clause.as_ref(), params, &mut used_params)?;
+    if require_all_params_used_by_identity_or_limit
+        && (used_params.len() != params.len()
+            || (1..=params.len()).any(|index| !used_params.contains(&index)))
+    {
+        return None;
+    }
+
+    let mut uses_content = false;
+    let mut returns_full_content = false;
+    let mut include_metadata = false;
+    for item in &simple.select.projection {
+        let expression = match item {
+            SelectItem::UnnamedExpr(expression) => Some(expression),
+            SelectItem::ExprWithAlias { expr, .. } | SelectItem::ExprWithAliases { expr, .. } => {
+                Some(expr)
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                uses_content = true;
+                returns_full_content = true;
+                include_metadata = true;
+                None
+            }
+        };
+        if let Some(expression) = expression {
+            uses_content |= expression_mentions_column(expression, "content");
+            returns_full_content |= direct_column_name(expression).as_deref() == Some("content");
+            include_metadata |= expression_mentions_column(expression, "lixcol_metadata");
+        }
+    }
+    Some(ExactFileContentIdProjection {
+        file_id,
+        uses_content,
+        returns_full_content,
+        include_metadata,
+    })
+}
+
+fn exact_file_id_equality(
+    expression: &Expr,
+    params: &[Value],
+    used_params: &mut BTreeSet<usize>,
+) -> Option<String> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expression
+    else {
+        return None;
+    };
+    match (exact_point_column(left), exact_point_column(right)) {
+        (Some(column), None) if column == "id" => {
+            exact_file_content_text_value(right, params, used_params)
+        }
+        (None, Some(column)) if column == "id" => {
+            exact_file_content_text_value(left, params, used_params)
+        }
+        _ => None,
+    }
+}
+
+fn exact_file_content_text_value(
+    expression: &Expr,
+    params: &[Value],
+    used_params: &mut BTreeSet<usize>,
+) -> Option<String> {
+    let Expr::Value(value) = expression else {
+        return None;
+    };
+    match &value.value {
+        SqlValue::Placeholder(placeholder) => {
+            let index = placeholder.strip_prefix('$')?.parse::<usize>().ok()?;
+            if index == 0 || index > params.len() {
+                return None;
+            }
+            let Value::Text(value) = &params[index - 1] else {
+                return None;
+            };
+            used_params.insert(index);
+            Some(value.clone())
+        }
+        SqlValue::SingleQuotedString(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn exact_file_content_limit(
+    limit_clause: Option<&LimitClause>,
+    params: &[Value],
+    used_params: &mut BTreeSet<usize>,
+) -> Option<()> {
+    let Some(limit_clause) = limit_clause else {
+        return Some(());
+    };
+    let LimitClause::LimitOffset {
+        limit: Some(Expr::Value(value)),
+        offset: None,
+        limit_by,
+    } = limit_clause
+    else {
+        return None;
+    };
+    if !limit_by.is_empty() {
+        return None;
+    }
+    match &value.value {
+        SqlValue::Number(number, _) if number.parse::<u64>().is_ok_and(|value| value > 0) => {
+            Some(())
+        }
+        SqlValue::Placeholder(placeholder) => {
+            let index = placeholder.strip_prefix('$')?.parse::<usize>().ok()?;
+            if index == 0 || index > params.len() {
+                return None;
+            }
+            let Value::Integer(value) = &params[index - 1] else {
+                return None;
+            };
+            if *value <= 0 {
+                return None;
+            }
+            used_params.insert(index);
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 fn exact_schema_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
@@ -752,6 +940,15 @@ pub(crate) fn exact_filesystem_read_interest_route(
     statement: &DataFusionStatement,
     params: &[Value],
 ) -> Option<ExactFilesystemRead> {
+    if exact_file_content_id_uses_nonfull_content(statement, params) {
+        return None;
+    }
+    if let Some(read) = exact_file_content_id_read(statement, params) {
+        return Some(ExactFilesystemRead::Point(
+            sql2::ExactLixFileReadSelector::Id(read.file_id),
+            sql2::ExactLixFileReadColumn::Content,
+        ));
+    }
     exact_filesystem_read_route(statement, params).or_else(|| {
         exact_lix_file_point_read_with_literals(statement, params)
             .map(|(selector, column)| ExactFilesystemRead::Point(selector, column))

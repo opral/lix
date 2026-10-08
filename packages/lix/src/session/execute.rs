@@ -4436,6 +4436,14 @@ pub(crate) fn seed_foreground_filesystem_interest(
     let Some(capture) = capture else {
         return Ok(());
     };
+    if let Some(read) = sql2::exact_file_content_id_read(statement, params) {
+        register_seeded_exact_id_file_content_interest(
+            capture,
+            active_branch_id,
+            &read,
+        )?;
+        return Ok(());
+    }
     let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
         return Ok(());
     };
@@ -4489,6 +4497,28 @@ pub(crate) fn seed_foreground_filesystem_interest(
         content,
         None,
     )
+}
+
+fn register_seeded_exact_id_file_content_interest(
+    capture: &crate::hot_state::ReadInterestRegistry,
+    active_branch_id: &str,
+    read: &sql2::ExactFileContentIdRead,
+) -> Result<(), LixError> {
+    let branch_ids = vec![active_branch_id.to_owned()];
+    let scope = crate::filesystem::FilesystemPathIndexRequest::new(branch_ids.clone())
+        .with_scope(crate::filesystem::FilesystemPathIndexScope::FileIds(vec![
+            read.file_id.clone(),
+        ]))
+        .scope;
+    capture.register(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+        scope,
+        branch_ids: branch_ids.clone(),
+        include_blob_refs: true,
+        cache_small_blob_data: false,
+    })?;
+    let request = sql2::lix_file_content_scan_request(&branch_ids, read.include_metadata);
+    capture.register(sql2::exact_id_file_content_interest(&request, &read.file_id))?;
+    Ok(())
 }
 
 fn register_seeded_file_interest(
@@ -7859,6 +7889,262 @@ mod tests {
                 "unexpected fast-path match for {sql}"
             );
         }
+    }
+
+    #[test]
+    fn exact_file_content_id_interest_accepts_only_positive_integer_bound_limits() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        let statement = sql2::parse_statement(
+            "SELECT id, path, lixcol_metadata, content \
+             FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        let params = [Value::Text(file_id.clone()), Value::Integer(1)];
+        assert_eq!(
+            sql2::exact_file_content_id_read(&statement, &params),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: true,
+            })
+        );
+        assert_eq!(
+            exact_filesystem_read_route(&statement, &params),
+            None,
+            "a dependency seed must not redirect execution from DataFusion"
+        );
+        assert_eq!(
+            exact_filesystem_read_interest_route(&statement, &params),
+            Some(ExactFilesystemRead::Point(
+                ExactLixFileReadSelector::Id(file_id.clone()),
+                ExactLixFileReadColumn::Content,
+            ))
+        );
+        let content_only = sql2::parse_statement(
+            "SELECT content FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &content_only,
+                &[Value::Text(file_id.clone()), Value::Integer(1)]
+            ),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: false,
+            }),
+            "unprojected metadata must stay out of the storage projection"
+        );
+
+        for invalid_limit in [
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Real(1.0),
+            Value::Text("1".to_string()),
+            Value::Null,
+        ] {
+            let invalid_params = [Value::Text(file_id.clone()), invalid_limit];
+            assert_eq!(
+                sql2::exact_file_content_id_read(&statement, &invalid_params),
+                None,
+                "nonpositive or noninteger bound limits must not seed"
+            );
+            assert_eq!(
+                exact_filesystem_read_interest_route(&statement, &invalid_params),
+                None,
+                "invalid parameter limits must not reach an older point route"
+            );
+        }
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &statement,
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Integer(1),
+                    Value::Text("unused".to_string()),
+                ]
+            ),
+            None,
+            "unused bound parameters must not broaden the seed"
+        );
+
+        for (sql, bound) in [
+            (
+                "SELECT content FROM lix_file WHERE id = $1 LIMIT $2 OFFSET 0",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1 AND name = 'x' LIMIT $2",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file WHERE path = $1 LIMIT $2",
+                Value::Integer(1),
+            ),
+            (
+                "SELECT content FROM lix_file JOIN lix_directory ON true \
+                 WHERE lix_file.id = $1 LIMIT $2",
+                Value::Integer(1),
+            ),
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                sql2::exact_file_content_id_read(
+                    &statement,
+                    &[Value::Text(file_id.clone()), bound]
+                ),
+                None,
+                "unsupported query shape must not seed: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_file_content_preflight_does_not_widen_size_or_substring_projections() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        for sql in [
+            "SELECT OCTET_LENGTH(content), lixcol_metadata \
+             FROM lix_file WHERE id = $1",
+            "SELECT SUBSTRING(content FROM 1 FOR 4) AS preview \
+             FROM lix_file WHERE id = $1",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            let params = [Value::Text(file_id.clone())];
+            assert_eq!(sql2::exact_file_content_id_read(&statement, &params), None);
+            assert!(sql2::exact_file_content_id_uses_nonfull_content(
+                &statement, &params
+            ));
+            assert_eq!(
+                exact_filesystem_read_route(&statement, &params),
+                None,
+                "computed content projections must retain the DataFusion/provider path"
+            );
+            assert_eq!(
+                exact_filesystem_read_interest_route(&statement, &params),
+                None,
+                "preflight must not request the complete file blob"
+            );
+
+            let capture = crate::hot_state::ReadInterestRegistry::new(16, 64 * 1024);
+            seed_foreground_filesystem_interest(
+                Some(&capture),
+                "01920000-0000-7000-8000-0000000000b1",
+                &statement,
+                &params,
+            )
+            .unwrap();
+            assert!(
+                capture
+                    .snapshot()
+                    .unwrap()
+                    .interests
+                    .iter()
+                    .all(|interest| !matches!(
+                        interest.as_ref(),
+                        crate::hot_state::LogicalReadInterest::FileContent { .. }
+                    )),
+                "size and range projections must not seed a full-content recipe"
+            );
+        }
+
+        let parameterized_substring = sql2::parse_statement(
+            "SELECT SUBSTRING(content FROM $2 FOR $3) AS preview \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        let substring_params = [
+            Value::Text(file_id.clone()),
+            Value::Integer(2),
+            Value::Integer(4),
+        ];
+        assert_eq!(
+            sql2::exact_file_content_id_read(&parameterized_substring, &substring_params),
+            None,
+            "projection parameters cannot widen the direct full-content seed"
+        );
+        assert!(sql2::exact_file_content_id_uses_nonfull_content(
+            &parameterized_substring,
+            &substring_params
+        ));
+        assert_eq!(
+            exact_filesystem_read_interest_route(&parameterized_substring, &substring_params),
+            None,
+            "parameterized range reads must not fall through to the broad point seed"
+        );
+
+        let aliased_direct_content = sql2::parse_statement(
+            "SELECT lix_file.content AS body, lixcol_metadata AS meta \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        assert_eq!(
+            sql2::exact_file_content_id_read(
+                &aliased_direct_content,
+                &[Value::Text(file_id.clone())]
+            ),
+            Some(sql2::ExactFileContentIdRead {
+                file_id: file_id.clone(),
+                include_metadata: true,
+            }),
+            "aliases around direct source columns still require the full blob"
+        );
+
+        let with_computed_and_direct = sql2::parse_statement(
+            "SELECT OCTET_LENGTH(content), content \
+             FROM lix_file WHERE id = $1",
+        )
+        .unwrap();
+        assert!(sql2::exact_file_content_id_read(
+            &with_computed_and_direct,
+            &[Value::Text(file_id)]
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn exact_file_content_seed_captures_matching_projection_without_provider_io() {
+        let file_id = "01920000-0000-7000-8000-0000000000a2".to_string();
+        let branch_id = "01920000-0000-7000-8000-0000000000b1";
+        let statement = sql2::parse_statement(
+            "SELECT id, path, lixcol_metadata, content \
+             FROM lix_file WHERE id = $1 LIMIT $2",
+        )
+        .unwrap();
+        let capture = crate::hot_state::ReadInterestRegistry::new(16, 64 * 1024);
+        seed_foreground_filesystem_interest(
+            Some(&capture),
+            branch_id,
+            &statement,
+            &[Value::Text(file_id.clone()), Value::Integer(1)],
+        )
+        .expect("preflight should record the recipe without performing I/O");
+
+        let snapshot = capture.snapshot().expect("recipe snapshot should succeed");
+        assert!(snapshot.interests.iter().any(|interest| matches!(
+            interest.as_ref(),
+            crate::hot_state::LogicalReadInterest::FilesystemPaths {
+                scope: crate::filesystem::FilesystemPathIndexScope::FileIds(ids),
+                branch_ids,
+                include_blob_refs: true,
+                cache_small_blob_data: false,
+            } if ids == &[file_id.clone()] && branch_ids == &[branch_id.to_string()]
+        )));
+        let file_content = snapshot
+            .interests
+            .iter()
+            .filter_map(|interest| match interest.as_ref() {
+                crate::hot_state::LogicalReadInterest::FileContent { .. } => Some(interest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_content.len(), 1);
+        assert_eq!(
+            file_content[0].as_ref(),
+            &sql2::exact_id_file_content_interest(
+                &sql2::lix_file_content_scan_request(&[branch_id.to_string()], true),
+                &file_id,
+            ),
+            "the seed must use the shared provider recipe and metadata projection"
+        );
     }
 
     #[tokio::test]

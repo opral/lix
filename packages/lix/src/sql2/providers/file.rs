@@ -12,8 +12,9 @@
 
 mod interest;
 pub(crate) use interest::{
-    prepare_native_file_content_inputs, prepare_native_file_content_interest,
-    prepare_native_file_metadata_interest,
+    exact_id_file_content_interest, lix_file_content_projection,
+    lix_file_content_scan_request, prepare_native_file_content_inputs,
+    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
 };
 pub(super) use interest::{retain_metadata, retain_selected_batch, retain_selected_entries};
 
@@ -1417,6 +1418,36 @@ impl TableSpec for LixFileSpec {
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
+        // The operation-level AST recognizer has already proved this is a
+        // simple exact-ID content read (one table, one equality, no joins or
+        // extra predicates). Mirror its shared recipe before the first path
+        // index I/O. Other provider scans retain their existing post-selection
+        // declaration, since a provider cannot see enclosing SQL joins or
+        // offsets on its own.
+        let mut predeclared_file_content = false;
+        if needs_data && filters.len() == 1
+            && let Some(file_id) = exact_file_id_equality_filter(&filters)
+            && let FileIdConstraint::Ids(ids) = &target_file_ids
+            && ids.len() == 1
+            && ids.contains(&file_id)
+            && use_path_index
+            && let Some(registry) = self.hot_state.read_interest_registry()
+        {
+            let interest = exact_id_file_content_interest(&request, &file_id);
+            let snapshot = registry
+                .snapshot()
+                .map_err(lix_error_to_datafusion_error)?;
+            if snapshot
+                .interests
+                .iter()
+                .any(|candidate| candidate.as_ref() == &interest)
+            {
+                registry
+                    .register(interest)
+                    .map_err(lix_error_to_datafusion_error)?;
+                predeclared_file_content = true;
+            }
+        }
         // An exact-ID projection limited to id/path needs only those rows and
         // their ancestry. Reuse the scoped path validator, but avoid creating
         // the persistent lookup maps needed by general path selection. Keep
@@ -1532,7 +1563,7 @@ impl TableSpec for LixFileSpec {
                 Some(matches)
             }
         };
-        if needs_data {
+        if needs_data && !predeclared_file_content {
             interest::retain_content(
                 self.hot_state.as_ref(),
                 &request,
@@ -6443,15 +6474,10 @@ fn lix_file_hot_state_projection(projected_schema: Option<&Schema>) -> HotStateP
     let Some(schema) = projected_schema else {
         return HotStateProjection::default();
     };
-    let mut columns = vec!["snapshot_content".to_string()];
-    if schema
+    lix_file_content_projection(schema
         .fields()
         .iter()
-        .any(|field| field.name() == "lixcol_metadata")
-    {
-        columns.push("metadata".to_string());
-    }
-    HotStateProjection { columns }
+        .any(|field| field.name() == "lixcol_metadata"))
 }
 
 async fn scan_lix_file_live_batch(
@@ -6653,6 +6679,23 @@ impl FileIdConstraint {
 
 fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
     exact_string_column_constraint_from_filters(filters, "id")
+}
+
+fn exact_file_id_equality_filter(filters: &[Expr]) -> Option<String> {
+    let [Expr::BinaryExpr(expression)] = filters else {
+        return None;
+    };
+    if expression.op != Operator::Eq {
+        return None;
+    }
+    string_column_literal_filter(expression.left.as_ref(), expression.right.as_ref(), "id")
+        .or_else(|| {
+            string_column_literal_filter(
+                expression.right.as_ref(),
+                expression.left.as_ref(),
+                "id",
+            )
+        })
 }
 
 fn exact_plugin_archive_delete_target_from_filters(filters: &[Expr]) -> Result<Option<String>> {
@@ -9646,21 +9689,42 @@ mod tests {
         let parent = crate::hot_state::ReadInterestRegistry::new(64, 64 * 1024);
         for _ in 0..2 {
             let capture = crate::hot_state::ReadInterestRegistry::capture(parent.clone());
+            let statement = crate::sql2::parse_statement(
+                "SELECT content, lixcol_metadata FROM lix_file WHERE id = $1",
+            )
+            .expect("point query should parse");
+            crate::session::seed_foreground_filesystem_interest(
+                Some(&capture),
+                branch,
+                &statement,
+                &[Value::Text(target.to_string())],
+            )
+            .expect("point query should seed before provider planning");
+            let expected_interest = super::exact_id_file_content_interest(
+                &super::lix_file_content_scan_request(&[branch.to_string()], true),
+                target,
+            );
+            let path_index_requests = Arc::new(AtomicUsize::new(0));
             let spec = LixFileSpec::active_branch(
                 branch,
                 Arc::new(CapturingIndexedHotReader {
                     registry: capture.clone(),
                 }),
-                Arc::new(StaticFilesystemPathIndexReader {
+                Arc::new(PreseedCheckingFilesystemPathIndexReader {
                     index: index.clone(),
-                    request_count: Arc::new(AtomicUsize::new(0)),
+                    registry: capture.clone(),
+                    expected: expected_interest.clone(),
+                    request_count: path_index_requests.clone(),
                 }),
                 Arc::new(TestBranchRefReader),
                 Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])),
                 PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
                 test_functions(),
             );
-            let projection = vec![spec.schema().index_of("content").unwrap()];
+            let projection = vec![
+                spec.schema().index_of("content").unwrap(),
+                spec.schema().index_of("lixcol_metadata").unwrap(),
+            ];
             let planned = spec
                 .plan_scan(
                     Some(&projection),
@@ -9672,7 +9736,24 @@ mod tests {
                 .unwrap();
             let batch = planned.source.load_single_batch().await.unwrap();
             assert_eq!(batch.num_rows(), 1);
+            assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
             let captured = capture.snapshot().unwrap();
+            let content_interests = captured
+                .interests
+                .iter()
+                .filter(|interest| {
+                    matches!(
+                        interest.as_ref(),
+                        crate::hot_state::LogicalReadInterest::FileContent { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                content_interests.len(),
+                1,
+                "the provider declaration should deduplicate with its preflight seed"
+            );
+            assert_eq!(content_interests[0].as_ref(), &expected_interest);
             let rows = captured
                 .interests
                 .iter()
@@ -9908,6 +9989,35 @@ mod tests {
     struct StaticFilesystemPathIndexReader {
         index: Arc<FilesystemPathIndex>,
         request_count: Arc<AtomicUsize>,
+    }
+
+    struct PreseedCheckingFilesystemPathIndexReader {
+        index: Arc<FilesystemPathIndex>,
+        registry: Arc<crate::hot_state::ReadInterestRegistry>,
+        expected: crate::hot_state::LogicalReadInterest,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FilesystemPathIndexReader for PreseedCheckingFilesystemPathIndexReader {
+        async fn path_index(
+            &self,
+            _request: &FilesystemPathIndexRequest,
+        ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+            let snapshot = self
+                .registry
+                .snapshot()
+                .expect("operation seed should be captured before path-index I/O");
+            assert!(
+                snapshot
+                    .interests
+                    .iter()
+                    .any(|interest| interest.as_ref() == &self.expected),
+                "exact-ID content recipe must be present before path-index I/O"
+            );
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.index))
+        }
     }
 
     #[async_trait]

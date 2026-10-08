@@ -1,6 +1,59 @@
 //! Native file-content preparation shared with partial working-set refresh.
 use super::*;
 use crate::hot_state::{FilePathInterest, FilePathInterestComparison, LogicalReadInterest};
+
+/// The storage projection shared by operation preflight and the `lix_file`
+/// provider. File content always needs the snapshot; metadata is included only
+/// when the caller's projected schema needs it.
+pub(crate) fn lix_file_content_projection(include_metadata: bool) -> HotStateProjection {
+    let mut columns = vec!["snapshot_content".to_string()];
+    if include_metadata {
+        columns.push("metadata".to_string());
+    }
+    HotStateProjection { columns }
+}
+
+/// Build the scan request for a known file-content point read. Keeping this
+/// constructor shared makes the operation seed byte-for-byte equivalent to
+/// the provider's later declaration.
+pub(crate) fn lix_file_content_scan_request(
+    branch_ids: &[String],
+    include_metadata: bool,
+) -> HotStateScanRequest {
+    HotStateScanRequest {
+        filter: HotStateFilter {
+            schema_keys: vec![
+                "lix_file_descriptor".to_string(),
+                "lix_binary_blob_ref".to_string(),
+                "lix_directory_descriptor".to_string(),
+            ],
+            branch_ids: branch_ids.to_vec(),
+            ..HotStateFilter::default()
+        },
+        projection: lix_file_content_projection(include_metadata),
+        // A filtered point scan is not limited at the HOT request layer. Keep
+        // this consistent with `lix_file_scan_request` in the provider.
+        limit: None,
+    }
+}
+
+/// Construct the bounded, indexed recipe for one exact file ID. The recipe is
+/// a dependency declaration; it does not stand in for evaluating SQL rows.
+pub(crate) fn exact_id_file_content_interest(
+    request: &HotStateScanRequest,
+    file_id: &str,
+) -> LogicalReadInterest {
+    LogicalReadInterest::FileContent {
+        request: request.clone(),
+        file_ids: Some(vec![file_id.to_string()]),
+        directory_ids: None,
+        root_directory: false,
+        indexed: true,
+        path_predicate: FilePathInterest::All,
+        byte_range: None,
+    }
+}
+
 fn retained_path(predicate: &FilePathPredicate) -> FilePathInterest {
     match predicate {
         FilePathPredicate::All => FilePathInterest::All,
