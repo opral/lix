@@ -236,14 +236,16 @@ export class Lix {
 		const observationId = ++this.#nextObservationId;
 		const unregisterToken = {};
 		const lifecycle = new ObservationLifecycle(
-			this.#runOperation(() =>
-				this.binding.observe(
-					sql,
-					params.map((param, index) =>
-						toNativeValue(normalizeParam(param, index)),
+			(signal) =>
+				this.#runOperation(() =>
+					this.binding.observe(
+						sql,
+						params.map((param, index) =>
+							toNativeValue(normalizeParam(param, index)),
+						),
+						{ signal },
 					),
 				),
-			),
 			(drain) => {
 				observationFinalizer.unregister(unregisterToken);
 				this.#observations.delete(observationId);
@@ -655,6 +657,7 @@ class Observation implements AsyncIterableIterator<ObserveEvent> {
 class ObservationLifecycle {
 	private readonly stopped = new Set<() => void>();
 	private readonly abort = () => this.stop();
+	private readonly setupController = new AbortController();
 	private readonly setup: { error?: unknown } = {};
 	private closed = false;
 	private bindingClosePromise: Promise<void> | undefined;
@@ -662,15 +665,25 @@ class ObservationLifecycle {
 	private readonly observeBinding: Promise<ObserveEventsBinding | undefined>;
 
 	constructor(
-		observeBinding: Promise<ObserveEventsBinding>,
+		observeBinding: (signal: AbortSignal) => Promise<ObserveEventsBinding>,
 		private readonly onClose: (drain: Promise<void>) => void = () => undefined,
 		private readonly signal?: AbortSignal,
 	) {
 		const setup = this.setup;
-		this.observeBinding = observeBinding.catch((error: unknown) => {
-			setup.error = error;
-			return undefined;
-		});
+		let observeBindingPromise: Promise<ObserveEventsBinding | undefined>;
+		if (signal?.aborted) {
+			observeBindingPromise = Promise.resolve(undefined);
+		} else {
+			try {
+				observeBindingPromise = Promise.resolve(observeBinding(this.setupController.signal));
+			} catch (error) {
+				observeBindingPromise = Promise.reject(error);
+			}
+		}
+		this.observeBinding = observeBindingPromise.catch((error: unknown) => {
+				setup.error = error;
+				return undefined;
+			});
 		if (signal?.aborted) this.stop();
 		else signal?.addEventListener("abort", this.abort, { once: true });
 	}
@@ -725,6 +738,7 @@ class ObservationLifecycle {
 		if (this.closed) return;
 		this.closed = true;
 		this.signal?.removeEventListener("abort", this.abort);
+		this.setupController.abort();
 		for (const stop of this.stopped) stop();
 		this.stopped.clear();
 		this.bindingClosePromise ??= this.observeBinding

@@ -32,6 +32,7 @@ export class RepositorySession {
 			remote: number;
 			session: number;
 			sequence: number;
+			registrationRequestId: number;
 			operation: Extract<WorkerOperation, { kind: "observe" }>;
 		}
 	>();
@@ -40,6 +41,7 @@ export class RepositorySession {
 	private callbacks = new Map<number, number>();
 	private callbackIds = new Map<number, number>();
 	private requests = new Map<number, WorkerRequest>();
+	private cancelledObserverRequests = new Set<number>();
 	private queueTimers = new Map<number, ReturnType<typeof setTimeout>>();
 	private internal = new Map<
 		number,
@@ -77,6 +79,17 @@ export class RepositorySession {
 		);
 		for (const request of this.requests.values()) {
 			const kind = request.operation.kind;
+			if (
+				kind === "observe" &&
+				this.cancelledObserverRequests.delete(request.id)
+			) {
+				this.output({
+					id: request.id,
+					ok: false,
+					error: serializeWorkerError(observerRegistrationCancelledError()),
+				});
+				continue;
+			}
 			if (kind === "observe.close") {
 				this.observations.delete(request.operation.observeId);
 				this.output({ id: request.id, ok: true });
@@ -193,11 +206,16 @@ export class RepositorySession {
 				observation.remote = (
 					await this.call(observation.operation, session.remote)
 				).value as number;
-				if (!this.observations.has(id))
+				if (
+					this.cancelledObserverRequests.delete(observation.registrationRequestId) ||
+					!this.observations.has(id)
+				) {
+					this.observations.delete(id);
 					await this.call(
 						{ kind: "observe.close", observeId: observation.remote },
 						0,
 					);
+				}
 			}
 		}
 	}
@@ -220,6 +238,10 @@ export class RepositorySession {
 	post(message: WorkerInput) {
 		if (this.stopped) return;
 		if (!("id" in message)) {
+			if (message.kind === "observe.cancel") {
+				this.cancelObserverRegistration(message.requestId);
+				return;
+			}
 			if ("requestId" in message) {
 				const requestId = this.callbacks.get(message.requestId);
 				if (requestId !== undefined) this.send({ ...message, requestId });
@@ -344,6 +366,48 @@ export class RepositorySession {
 			});
 		}
 	}
+	private cancelObserverRegistration(requestId: number): void {
+		const queuedIndex = this.queue.findIndex(
+			(message) =>
+				"id" in message &&
+				message.id === requestId &&
+				message.operation.kind === "observe",
+		);
+		if (queuedIndex >= 0) {
+			const [message] = this.queue.splice(queuedIndex, 1);
+			if ("id" in message) {
+				this.clearQueueTimer(message.id);
+				this.output({
+					id: message.id,
+					ok: false,
+					error: serializeWorkerError(observerRegistrationCancelledError()),
+				});
+			}
+			return;
+		}
+		for (const [wireId, request] of this.requests) {
+			if (request.id !== requestId || request.operation.kind !== "observe") continue;
+			this.cancelledObserverRequests.add(requestId);
+			this.send({ kind: "observe.cancel", requestId: wireId });
+			return;
+		}
+		for (const [logicalId, observation] of this.observations) {
+			if (observation.registrationRequestId !== requestId) continue;
+			if (!this.ready) {
+				this.cancelledObserverRequests.add(requestId);
+				return;
+			}
+			this.observations.delete(logicalId);
+			const session = this.sessions.get(observation.session);
+			if (session) {
+				void this.call(
+					{ kind: "observe.close", observeId: observation.remote },
+					0,
+				).catch(() => undefined);
+			}
+			return;
+		}
+	}
 	receive(message: WorkerResponse) {
 		if (this.stopped) return;
 		if (
@@ -381,6 +445,19 @@ export class RepositorySession {
 		if (!request) return;
 		this.requests.delete(message.id);
 		const operation = request.operation;
+		if (
+			operation.kind === "observe" &&
+			this.cancelledObserverRequests.delete(request.id)
+		) {
+			if (message.ok)
+				this.send({ kind: "observe.cancel", requestId: message.id });
+			this.output({
+				id: request.id,
+				ok: false,
+				error: serializeWorkerError(observerRegistrationCancelledError()),
+			});
+			return;
+		}
 		if (!message.ok) {
 			this.output({ ...message, id: request.id });
 			return;
@@ -415,6 +492,7 @@ export class RepositorySession {
 				remote: message.value as number,
 				session: request.sessionId,
 				sequence: 0,
+				registrationRequestId: request.id,
 				operation,
 			});
 		} else if (operation.kind === "observe.next") {
@@ -452,6 +530,7 @@ export class RepositorySession {
 			pending.reject(repositoryError("LIX_ERROR_CLOSED", "Repository closed"));
 		this.internal.clear();
 		this.queue.length = 0;
+		this.cancelledObserverRequests.clear();
 		for (const timer of this.queueTimers.values()) clearTimeout(timer);
 		this.queueTimers.clear();
 	}
@@ -477,4 +556,11 @@ export class RepositorySession {
 		if (timer !== undefined) clearTimeout(timer);
 		this.queueTimers.delete(id);
 	}
+}
+
+function observerRegistrationCancelledError(): Error & { code: string } {
+	const error = new Error("Observer registration was cancelled") as Error & { code: string };
+	error.name = "AbortError";
+	error.code = "LIX_OBSERVER_CANCELLED";
+	return error;
 }

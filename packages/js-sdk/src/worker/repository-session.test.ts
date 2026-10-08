@@ -97,6 +97,101 @@ test("acknowledges an initial request while waiting for the repository owner", (
 	});
 	expect(f.output).toContainEqual({ kind: "request.queued", id });
 });
+
+test("canceled observer setup is removed from the pre-ready replay queue", async () => {
+	const f = fixture();
+	const openId = f.request({
+		kind: "open",
+		storage: { kind: "memory" },
+		telemetryEnabled: false,
+		progressEnabled: false,
+	});
+	const observeId = f.request({ kind: "observe", sql: "SELECT 1", params: [] });
+	f.session.post({ kind: "observe.cancel", requestId: observeId });
+	await tick();
+	expect(f.output).toContainEqual(
+		expect.objectContaining({
+			id: observeId,
+			ok: false,
+			error: expect.objectContaining({ code: "LIX_OBSERVER_CANCELLED" }),
+		}),
+	);
+	f.session.connected();
+	await tick();
+	expect(f.sent.filter((message): message is WorkerRequest => "id" in message).map((m) => m.operation.kind))
+		.toEqual(["open"]);
+	expect(f.result(openId)).toMatchObject({ ok: true });
+});
+
+test("canceled in-flight observer is not replayed after owner loss", async () => {
+	const f = fixture();
+	await f.open();
+	f.pause();
+	const observeId = f.request({ kind: "observe", sql: "SELECT 1", params: [] });
+	const registration = f.sent.at(-1) as WorkerRequest;
+	f.session.post({ kind: "observe.cancel", requestId: observeId });
+	f.session.lost();
+	await tick();
+	expect(f.output).toContainEqual(
+		expect.objectContaining({
+			id: observeId,
+			ok: false,
+			error: expect.objectContaining({ code: "LIX_OBSERVER_CANCELLED" }),
+		}),
+	);
+	const observesBeforeRecovery = f.sent.filter(
+		(message): message is WorkerRequest =>
+			"id" in message && message.operation.kind === "observe",
+	);
+	f.resume();
+	f.session.connected();
+	await tick();
+	const observesAfterRecovery = f.sent.filter(
+		(message): message is WorkerRequest =>
+			"id" in message && message.operation.kind === "observe",
+	);
+	expect(observesAfterRecovery).toEqual(observesBeforeRecovery);
+	expect(registration.operation.kind).toBe("observe");
+});
+
+test("observer cancellation maps active requests and closes current remote after recovery", async () => {
+	const f = fixture();
+	await f.open();
+	f.pause();
+	const observeId = f.request({ kind: "observe", sql: "SELECT 1", params: [] });
+	const registration = f.sent.at(-1) as WorkerRequest;
+	f.session.post({ kind: "observe.cancel", requestId: observeId });
+	expect(f.sent.at(-1)).toEqual({ kind: "observe.cancel", requestId: registration.id });
+	// A success already in flight is withheld and canceled again at the mapped
+	// wire ID, rather than publishing an unowned remote observer to the client.
+	f.session.receive({ id: registration.id, ok: true, value: 70 });
+	await tick();
+	expect(f.output).toContainEqual(
+		expect.objectContaining({
+			id: observeId,
+			ok: false,
+			error: expect.objectContaining({ code: "LIX_OBSERVER_CANCELLED" }),
+		}),
+	);
+	expect(f.sent.filter((message) => !("id" in message) && message.kind === "observe.cancel"))
+		.toHaveLength(2);
+
+	f.resume();
+	const recoveredLogicalId = f.request({ kind: "observe", sql: "SELECT 2", params: [] });
+	await tick();
+	f.session.lost();
+	f.session.connected();
+	await tick();
+	f.pause();
+	f.session.post({ kind: "observe.cancel", requestId: recoveredLogicalId });
+	const recoveredClose = f.sent.at(-1) as WorkerRequest;
+	expect(recoveredClose.operation.kind).toBe("observe.close");
+	if (recoveredClose.operation.kind !== "observe.close")
+		throw new Error("expected observer close after recovery");
+	expect(recoveredClose.operation.observeId).toBe(12);
+	f.session.receive({ id: recoveredClose.id, ok: true });
+	await tick();
+});
 test("owner loss during detached migration cleanup preserves the unknown outcome", async () => {
 	const f = fixture();
 	f.session.connected();

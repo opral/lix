@@ -90,7 +90,11 @@ export type LixBinding = {
 		statements: BindingBatchStatement[],
 		options?: LixBatchOptions,
 	): Promise<{ results: BindingExecuteResult[]; commit?: CommitSpan | null }>;
-	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
+	observe(
+		sql: string,
+		params: BindingParam[],
+		options?: { signal?: AbortSignal },
+	): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;

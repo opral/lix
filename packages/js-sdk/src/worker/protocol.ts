@@ -182,6 +182,7 @@ export type WorkerOperation =
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
+	| { kind: "observe.cancel"; requestId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
 			kind: "sync.headers.result";

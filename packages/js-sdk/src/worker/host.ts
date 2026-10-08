@@ -46,7 +46,15 @@ export function startWorkerHost(
 	let closed = false;
 	let closing = false;
 	const schedulerScope = operationScheduler.createScope();
-	type ObserverAdmission = { sessionId: number; slot: ObserverSlot; active: boolean };
+	type ObserverAdmission = {
+		requestId: number;
+		sessionId: number;
+		slot?: ObserverSlot;
+		active: boolean;
+		cancelled: boolean;
+		controller: AbortController;
+		observeId?: number;
+	};
 	type ObservationRecord = {
 		binding: ObserveEventsBinding;
 		sessionId: number;
@@ -110,17 +118,64 @@ export function startWorkerHost(
 	const observationClosuresBySession = new Map<number, Set<Promise<void>>>();
 	const observerAdmissions = new Set<ObserverAdmission>();
 	const observerAdmissionsBySession = new Map<number, Set<ObserverAdmission>>();
+	const observerAdmissionsByRequest = new Map<number, ObserverAdmission>();
 	const directOperations = new Set<Promise<void>>();
 
 	function releaseObserverAdmission(admission: ObserverAdmission): void {
 		if (!admission.active) return;
 		admission.active = false;
-		admission.slot.release();
+		admission.slot?.release();
 		observerAdmissions.delete(admission);
+		observerAdmissionsByRequest.delete(admission.requestId);
 		const sessionAdmissions = observerAdmissionsBySession.get(admission.sessionId);
 		sessionAdmissions?.delete(admission);
 		if (sessionAdmissions?.size === 0)
 			observerAdmissionsBySession.delete(admission.sessionId);
+	}
+
+	function trackObservationClosure(
+		observeId: number,
+		events: ObservationRecord | undefined,
+	): Promise<void> {
+		const closure = closeObservation(observeId, events);
+		observationClosures.add(closure);
+		if (events) {
+			let closures = observationClosuresBySession.get(events.sessionId);
+			if (!closures) {
+				closures = new Set();
+				observationClosuresBySession.set(events.sessionId, closures);
+			}
+			closures.add(closure);
+		}
+		const forget = () => {
+			observationClosures.delete(closure);
+			if (!events) return;
+			const closures = observationClosuresBySession.get(events.sessionId);
+			closures?.delete(closure);
+			if (closures?.size === 0) observationClosuresBySession.delete(events.sessionId);
+		};
+		void closure.then(forget, forget);
+		return closure;
+	}
+
+	function cancelObserverRegistration(requestId: number): void {
+		const admission = observerAdmissionsByRequest.get(requestId);
+		if (!admission || !admission.active) return;
+		admission.cancelled = true;
+		admission.controller.abort();
+		if (!admission.slot) {
+			operationScheduler.cancelQueued(
+				schedulerScope,
+				observerRegistrationCancelledError(),
+				(work) => work.requestId === requestId,
+			);
+			return;
+		}
+		if (admission.observeId !== undefined) {
+			const events = observations.get(admission.observeId);
+			observations.delete(admission.observeId);
+			void trackObservationClosure(admission.observeId, events).catch(() => undefined);
+		}
 	}
 
 	function postStarted(request: WorkerRequest): void {
@@ -182,6 +237,10 @@ export function startWorkerHost(
 			reserveTransactionSlot?: boolean;
 			useTransactionSlot?: boolean;
 			queueWaitMs?: number | null;
+			observerRegistration?: {
+				reserve(): ObserverSlot | undefined;
+				onReserved(slot: ObserverSlot): void;
+			};
 			onTimeout?: (error: Error) => void;
 			onNotAccepted?: () => void;
 			onRejected?: (error: Error) => void;
@@ -199,11 +258,13 @@ export function startWorkerHost(
 		const acceptedWork = {
 			scope: schedulerScope,
 			lane: options.lane,
+			requestId: request.id,
 			pool: options.pool,
 			sessionId: options.sessionId,
 			barrier: options.barrier,
 			reserveTransactionSlot: options.reserveTransactionSlot,
 			queueWaitMs: options.queueWaitMs,
+			observerRegistration: options.observerRegistration,
 			onQueued: () => postQueued(request),
 			run: async (transactionSlot?: TransactionSlot) => {
 				postStarted(request);
@@ -365,23 +426,15 @@ export function startWorkerHost(
 		}
 		if (message.operation.kind === "observe") {
 			const observation = message.operation;
-			const slot = operationScheduler.reserveObserverSlot();
-			if (!slot) {
-				const error = Object.assign(
-					new Error("The worker has reached its active observer limit"),
-					{ code: "LIX_WORKER_OBSERVER_LIMIT" },
-				);
-				void respond(message, async () => {
-					throw error;
-				});
-				return;
-			}
 			const admission: ObserverAdmission = {
+				requestId: message.id,
 				sessionId: message.sessionId,
-				slot,
+				controller: new AbortController(),
 				active: true,
+				cancelled: false,
 			};
 			observerAdmissions.add(admission);
+			observerAdmissionsByRequest.set(message.id, admission);
 			let sessionAdmissions = observerAdmissionsBySession.get(message.sessionId);
 			if (!sessionAdmissions) {
 				sessionAdmissions = new Set();
@@ -392,6 +445,12 @@ export function startWorkerHost(
 				lane: `observe:${message.sessionId}`,
 				pool: "independent",
 				sessionId: message.sessionId,
+				observerRegistration: {
+					reserve: () => operationScheduler.reserveObserverSlot(),
+					onReserved: (slot) => {
+						admission.slot = slot;
+					},
+				},
 				onRejected: () => releaseObserverAdmission(admission),
 				onNotAccepted: () => releaseObserverAdmission(admission),
 				runOperation: () =>
@@ -495,6 +554,10 @@ export function startWorkerHost(
 		message: Exclude<WorkerInput, WorkerRequest>,
 	): void {
 			switch (message.kind) {
+			case "observe.cancel": {
+				cancelObserverRegistration(message.requestId);
+				break;
+			}
 			case "openSnapshot.cancel": {
 				closeSnapshotInput(message.snapshotId);
 				break;
@@ -1231,6 +1294,10 @@ export function startWorkerHost(
 
 	async function closeObservationsForSession(sessionId: number): Promise<void> {
 		const pending: Promise<void>[] = [];
+		for (const admission of observerAdmissionsBySession.get(sessionId) ?? []) {
+			admission.cancelled = true;
+			admission.controller.abort();
+		}
 		operationScheduler.cancelQueued(
 			schedulerScope,
 			workerStateError("Lix session is closing"),
@@ -1262,7 +1329,13 @@ export function startWorkerHost(
 		const generation = lifetime.generation;
 		let adopted = false;
 		try {
-			const events = await requiredLix(sessionId).observe(sql, params);
+			const events = await requiredLix(sessionId).observe(sql, params, {
+				signal: admission.controller.signal,
+			});
+			if (admission.cancelled) {
+				await Promise.resolve(events.close()).catch(() => undefined);
+				throw observerRegistrationCancelledError();
+			}
 			if (
 				closed ||
 				lifetime.closing ||
@@ -1274,6 +1347,12 @@ export function startWorkerHost(
 			}
 			const observeId = nextObserveId++;
 			observations.set(observeId, { binding: events, sessionId, admission });
+			admission.observeId = observeId;
+			if (!admission.slot) {
+				observations.delete(observeId);
+				await Promise.resolve(events.close()).catch(() => undefined);
+				throw workerStateError("Observer registration lost its admission slot");
+			}
 			adopted = true;
 			return observeId;
 		} finally {
@@ -1350,6 +1429,13 @@ function workerStateError(message: string): Error & { code?: string } {
 	const error = new Error(message) as Error & { code?: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+function observerRegistrationCancelledError(): Error & { code: string } {
+	const error = new Error("Observer registration was cancelled") as Error & { code: string };
+	error.name = "AbortError";
+	error.code = "LIX_OBSERVER_CANCELLED";
 	return error;
 }
 

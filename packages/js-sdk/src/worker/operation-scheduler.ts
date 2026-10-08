@@ -4,6 +4,8 @@ export const WORKER_OPERATION_MAX_OBSERVERS = 32;
 export const WORKER_OPERATION_MAX_OBSERVER_ACTIVE = WORKER_OPERATION_MAX_OBSERVERS;
 export const WORKER_OPERATION_MAX_QUEUED = 128;
 export const WORKER_OPERATION_MAX_QUEUED_PER_SESSION = 32;
+export const WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS = 32;
+export const WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS_PER_SESSION = 32;
 export const WORKER_OPERATION_QUEUE_WAIT_MS = 30_000;
 // Independent resource classes keep observer/control cleanup admissible when
 // ordinary operations have filled their bounded request budget.
@@ -30,6 +32,8 @@ export type TransactionSlot = { adopt(): void };
 export type ObserverSlot = { release(): void };
 
 export type ScheduledWorkerOperation = {
+	/** Original client request ID, used to cancel one queued observer registration. */
+	requestId?: number;
 	scope: WorkerOperationScope;
 	lane: string;
 	pool?: "finite" | "independent" | "observer";
@@ -38,6 +42,11 @@ export type ScheduledWorkerOperation = {
 	reserveTransactionSlot?: boolean;
 	queueWaitMs?: number | null;
 	onQueued?(): void;
+	/** Claims the observer-registration slot atomically when this work starts. */
+	observerRegistration?: {
+		reserve(): ObserverSlot | undefined;
+		onReserved(slot: ObserverSlot): void;
+	};
 	run(transactionSlot?: TransactionSlot): Promise<void>;
 	onRejected(error: Error): void;
 };
@@ -49,6 +58,8 @@ export type WorkerOperationSchedulerLimits = {
 	maxObserverRegistrations: number;
 	maxQueued: number;
 	maxQueuedPerSession: number;
+	maxQueuedObserverRegistrations: number;
+	maxQueuedObserverRegistrationsPerSession: number;
 	queueWaitMs: number;
 };
 
@@ -67,6 +78,10 @@ export class WorkerOperationScheduler {
 		WorkerOperationScope,
 		Map<number, number>
 	>();
+	private readonly queuedObserverByScopeSession = new Map<
+		WorkerOperationScope,
+		Map<number, number>
+	>();
 	private readonly transactionSlotsByScopeSession = new Map<
 		WorkerOperationScope,
 		Map<number, number>
@@ -80,6 +95,7 @@ export class WorkerOperationScheduler {
 	private activeIndependent = 0;
 	private activeObservers = 0;
 	private reservedObserverSlots = 0;
+	private queuedObserverRegistrations = 0;
 	private transactionSlots = 0;
 	private pumping = false;
 
@@ -91,6 +107,10 @@ export class WorkerOperationScheduler {
 			maxIndependentActive: WORKER_OPERATION_MAX_INDEPENDENT_ACTIVE,
 			maxQueued: WORKER_OPERATION_MAX_QUEUED,
 			maxQueuedPerSession: WORKER_OPERATION_MAX_QUEUED_PER_SESSION,
+			maxQueuedObserverRegistrations:
+				WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS,
+			maxQueuedObserverRegistrationsPerSession:
+				WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS_PER_SESSION,
 			queueWaitMs: WORKER_OPERATION_QUEUE_WAIT_MS,
 			...limits,
 			// Every admitted observer must be able to hold a read concurrently.
@@ -108,8 +128,7 @@ export class WorkerOperationScheduler {
 
 	/** Reserve one global observer slot, including while registration is pending. */
 	reserveObserverSlot(): ObserverSlot | undefined {
-		if (this.reservedObserverSlots >= this.limits.maxObserverRegistrations)
-			return undefined;
+		if (this.reservedObserverSlots >= this.limits.maxObserverRegistrations) return undefined;
 		this.reservedObserverSlots++;
 		let active = true;
 		return {
@@ -200,13 +219,27 @@ export class WorkerOperationScheduler {
 		if (this.transactionSlotsByScopeSession.has(scope)) return;
 		this.sessionCounts.delete(scope);
 		this.queuedByScopeSession.delete(scope);
+		this.queuedObserverByScopeSession.delete(scope);
 		this.transactionSlotsByScopeSession.delete(scope);
 		this.activeLanes.delete(scope);
 		this.activeBarriers.delete(scope);
 	}
 
 	private hasQueueCapacity(work: ScheduledWorkerOperation): boolean {
-		if (this.queue.length + this.transactionSlots >= this.limits.maxQueued) return false;
+		if (work.observerRegistration) {
+			if (
+				this.queuedObserverRegistrations >=
+				this.limits.maxQueuedObserverRegistrations
+			)
+				return false;
+			return (
+				work.sessionId === undefined ||
+				this.queuedObserverFor(work.scope, work.sessionId) <
+					this.limits.maxQueuedObserverRegistrationsPerSession
+			);
+		}
+		const queuedRegular = this.queue.length - this.queuedObserverRegistrations;
+		if (queuedRegular + this.transactionSlots >= this.limits.maxQueued) return false;
 		if (work.sessionId === undefined) return true;
 		return (
 			this.queuedFor(work.scope, work.sessionId) +
@@ -217,6 +250,7 @@ export class WorkerOperationScheduler {
 
 	private canStartImmediately(work: ScheduledWorkerOperation): boolean {
 		if (!this.hasPoolCapacity(work)) return false;
+		if (work.observerRegistration && !this.hasObserverRegistrationCapacity()) return false;
 		if (this.activeBarriers.has(work.scope)) return false;
 		if (work.barrier) {
 			return (
@@ -235,7 +269,8 @@ export class WorkerOperationScheduler {
 	private canReserveTransactionSlot(work: ScheduledWorkerOperation): boolean {
 		if (work.sessionId === undefined) return false;
 		return (
-			this.queue.length + this.transactionSlots < this.limits.maxQueued &&
+			this.queue.length - this.queuedObserverRegistrations + this.transactionSlots <
+				this.limits.maxQueued &&
 			this.queuedFor(work.scope, work.sessionId) +
 				this.transactionSlotsFor(work.scope, work.sessionId) <
 				this.limits.maxQueuedPerSession
@@ -244,7 +279,13 @@ export class WorkerOperationScheduler {
 
 	private enqueue(work: ScheduledWorkerOperation): void {
 		this.queue.push(work);
-		if (work.sessionId !== undefined) this.changeQueued(work.scope, work.sessionId, 1);
+		if (work.observerRegistration) {
+			this.queuedObserverRegistrations++;
+			if (work.sessionId !== undefined)
+				this.changeQueuedObserver(work.scope, work.sessionId, 1);
+		} else if (work.sessionId !== undefined) {
+			this.changeQueued(work.scope, work.sessionId, 1);
+		}
 		try {
 			work.onQueued?.();
 		} catch {
@@ -273,7 +314,13 @@ export class WorkerOperationScheduler {
 		const timer = this.queueTimers.get(work);
 		if (timer !== undefined) clearTimeout(timer);
 		this.queueTimers.delete(work);
-		if (work.sessionId !== undefined) this.changeQueued(work.scope, work.sessionId, -1);
+		if (work.observerRegistration) {
+			this.queuedObserverRegistrations--;
+			if (work.sessionId !== undefined)
+				this.changeQueuedObserver(work.scope, work.sessionId, -1);
+		} else if (work.sessionId !== undefined) {
+			this.changeQueued(work.scope, work.sessionId, -1);
+		}
 		return work;
 	}
 
@@ -290,6 +337,7 @@ export class WorkerOperationScheduler {
 				for (let index = 0; index < this.queue.length; index++) {
 					const work = this.queue[index];
 					if (!this.hasPoolCapacity(work)) continue;
+					if (work.observerRegistration && !this.hasObserverRegistrationCapacity()) continue;
 					if (this.activeBarriers.has(work.scope)) continue;
 					const hasEarlierScopeBarrier = this.queue
 						.slice(0, index)
@@ -316,6 +364,21 @@ export class WorkerOperationScheduler {
 	}
 
 	private start(work: ScheduledWorkerOperation): void {
+		if (work.observerRegistration) {
+			const slot = work.observerRegistration.reserve();
+			if (!slot) {
+				// No other scheduled work can interleave between the pump's capacity
+				// check and this synchronous reservation. Treat a broken precondition
+				// as an admission failure instead of running without the permit.
+				try {
+					work.onRejected(workerQueueFullError());
+				} catch {
+					// A failed response callback cannot retain the scheduler queue entry.
+				}
+				return;
+			}
+			work.observerRegistration.onReserved(slot);
+		}
 		if (work.pool === "independent") this.activeIndependent++;
 		else if (work.pool === "observer") this.activeObservers++;
 		else this.activeFinite++;
@@ -387,8 +450,16 @@ export class WorkerOperationScheduler {
 		return this.activeFinite < this.limits.maxActive;
 	}
 
+	private hasObserverRegistrationCapacity(): boolean {
+		return this.reservedObserverSlots < this.limits.maxObserverRegistrations;
+	}
+
 	private queuedFor(scope: WorkerOperationScope, sessionId: number): number {
 		return this.queuedByScopeSession.get(scope)?.get(sessionId) ?? 0;
+	}
+
+	private queuedObserverFor(scope: WorkerOperationScope, sessionId: number): number {
+		return this.queuedObserverByScopeSession.get(scope)?.get(sessionId) ?? 0;
 	}
 
 	private transactionSlotsFor(scope: WorkerOperationScope, sessionId: number): number {
@@ -402,6 +473,20 @@ export class WorkerOperationScheduler {
 		else values.delete(sessionId);
 		if (values.size > 0) this.queuedByScopeSession.set(scope, values);
 		else this.queuedByScopeSession.delete(scope);
+	}
+
+	private changeQueuedObserver(
+		scope: WorkerOperationScope,
+		sessionId: number,
+		delta: number,
+	): void {
+		const values =
+			this.queuedObserverByScopeSession.get(scope) ?? new Map<number, number>();
+		const next = (values.get(sessionId) ?? 0) + delta;
+		if (next > 0) values.set(sessionId, next);
+		else values.delete(sessionId);
+		if (values.size > 0) this.queuedObserverByScopeSession.set(scope, values);
+		else this.queuedObserverByScopeSession.delete(scope);
 	}
 
 	private changeTransactionSlots(

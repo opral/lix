@@ -98,6 +98,74 @@ test("observer admission reservations are global across scopes and reusable", ()
 	afterTeardown!.release();
 });
 
+test("observer admission waiters use a separate bounded quota and cannot starve finite work", async () => {
+	const scheduler = new WorkerOperationScheduler({
+		maxActive: 1,
+		maxIndependentActive: 1,
+		maxObserverRegistrations: 1,
+		maxQueued: 1,
+		maxQueuedPerSession: 1,
+		maxQueuedObserverRegistrations: 1,
+		maxQueuedObserverRegistrationsPerSession: 1,
+		queueWaitMs: null,
+	});
+	const scope = scheduler.createScope();
+	const blocker = deferred<void>();
+	const started: string[] = [];
+	scheduler.schedule(
+		work(scope, "finite:blocker", async () => {
+			started.push("blocker");
+			await blocker.promise;
+		}, () => {}, 1),
+	);
+	await vi.waitFor(() => expect(started).toEqual(["blocker"]));
+
+	const occupied = scheduler.reserveObserverSlot();
+	expect(occupied).toBeDefined();
+	const observerQueued = vi.fn();
+	let promotedSlot: import("./operation-scheduler.js").ObserverSlot | undefined;
+	expect(
+		scheduler.schedule({
+			scope,
+			lane: "observe:1",
+			sessionId: 1,
+			pool: "independent",
+			queueWaitMs: null,
+			onQueued: observerQueued,
+			observerRegistration: {
+				reserve: () => scheduler.reserveObserverSlot(),
+				onReserved: (slot) => {
+					promotedSlot = slot;
+				},
+			},
+			run: async () => {
+				started.push("observer");
+				promotedSlot?.release();
+			},
+			onRejected: () => {},
+		}),
+	).toBe(true);
+	expect(observerQueued).toHaveBeenCalledOnce();
+
+	const finiteQueued = vi.fn();
+	expect(
+		scheduler.schedule({
+			...work(scope, "finite:followup", async () => {
+				started.push("finite");
+			}, () => {}, 1),
+			queueWaitMs: null,
+			onQueued: finiteQueued,
+		}),
+	).toBe(true);
+	expect(finiteQueued).toHaveBeenCalledOnce();
+	blocker.resolve();
+	await vi.waitFor(() => expect(started).toContain("finite"));
+	expect(started).not.toContain("observer");
+	occupied!.release();
+	await vi.waitFor(() => expect(started).toContain("observer"));
+	await scheduler.drainScope(scope);
+});
+
 test("a lifecycle barrier fences its host scope without blocking other hosts", async () => {
 	const scheduler = new WorkerOperationScheduler();
 	const scopeA = scheduler.createScope();

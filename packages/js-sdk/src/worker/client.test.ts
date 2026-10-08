@@ -91,6 +91,37 @@ test("worker observation keeps its creation parent for only the first frame", as
 	await third;
 });
 
+test("aborting worker observer setup sends cancellation and keeps its request until settlement", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	const binding = workerBinding(client, new BindingLease(() => undefined), 0);
+	const controller = new AbortController();
+	const opening = binding.observe("SELECT 1", [], { signal: controller.signal });
+	let settled = false;
+	void opening.then(
+		() => (settled = true),
+		() => (settled = true),
+	);
+	const registration = transport.sent.at(-1);
+	if (!registration || !("id" in registration))
+		throw new Error("expected observer registration");
+	controller.abort();
+	await Promise.resolve();
+	expect(settled).toBe(false);
+	expect(transport.sent).toContainEqual({
+		kind: "observe.cancel",
+		requestId: registration.id,
+	});
+	transport.emit({
+		id: registration.id,
+		ok: false,
+		error: { name: "AbortError", message: "Observer registration was cancelled", code: "LIX_OBSERVER_CANCELLED" },
+	});
+	await expect(opening).rejects.toMatchObject({ code: "LIX_OBSERVER_CANCELLED" });
+	await client.terminate();
+});
+
 test("worker termination preserves only the remote session-close fetch until disconnect acknowledgment", async () => {
 	const repositoryId = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
 	const sent: WorkerInput[] = [];

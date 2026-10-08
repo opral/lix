@@ -1,0 +1,44 @@
+{
+  "workload": "Production-image browser OPFS shared-tab editing, native SlateDB authority and MinIO",
+  "date": "2026-10-08",
+  "method": "One before/after diagnostic run of the same existing editing scenario, unchanged server and two shared CPUs, fresh disposable repository state",
+  "baselineRevision": "a1f7f9b7720d71e18290158a43d1d4f140c57cbd",
+  "productionPatchSha256": "0ef4bf0016c95dc71cf7f7b7cb0231982aeab46ce10e4ce1bf4328929969d06c",
+  "serverBinarySha256": "a46e4ce9a44c45d0320afee46d225a3957d3987136f9ef090d40f6aa13febe28",
+  "wasmSha256": "394cbddb02b547a1fb5db663446ee926ebdcd08334e33e1ef74f42d863ac5fe3",
+  "activeObserverLimit": 32,
+  "candidateWaitingLimits": { "global": 32, "perScopeSession": 32 },
+  "ordinaryQueueLimits": { "global": 128, "perScopeSession": 32 },
+  "before": {
+    "testDurationMs": 63414,
+    "testPassed": false,
+    "dataAndFreshReopenAssertionsPassed": true,
+    "observedActivePeak": 32,
+    "capacityRejections": 4,
+    "saturatedClientSplits": [[14, 18], [13, 19]],
+    "saturationUntilFirstCloseMsApproximate": [10, 100],
+    "navigationMs": 1012,
+    "editorReadyMs": [2232, 3184],
+    "editRounds": 12,
+    "burstToEqualityMs": 8022,
+    "postEditToEqualityMs": 4972
+  },
+  "after": {
+    "testDurationMs": 63132,
+    "testPassed": true,
+    "dataAndFreshReopenAssertionsPassed": true,
+    "observedActivePeak": 32,
+    "capacityRejections": 0,
+    "navigationMs": 940,
+    "editorReadyMs": [1995, 2941],
+    "editRounds": 12,
+    "burstToEqualityMs": 7824,
+    "postEditToEqualityMs": 4979
+  },
+  "limits": [
+    "One pair on a shared host does not establish a latency or tail improvement; post-edit convergence was essentially unchanged.",
+    "QA-only counters were removed from production source. The profiled image preceded removal of a no-op slot method and correction of rejection cleanup; the final source separately passes focused lifecycle tests and requires full production-image acceptance.",
+    "Counters were captured while pages still held observers, before browser-context cleanup; reserve/release totals do not establish a teardown leak or complete drain.",
+    "The cold and multi-edit scenario is not a sub-100 ms warm peer-visibility measurement. That target remains unmet."
+  ]
+}

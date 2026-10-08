@@ -47,6 +47,8 @@ type PendingRequest = {
 	operation: WorkerOperation;
 	category: "ordinary" | "observer-close" | "control";
 	timer?: ReturnType<typeof setTimeout>;
+	abortSignal?: AbortSignal;
+	abortListener?: () => void;
 	resolve(value: unknown): void;
 	reject(error: unknown): void;
 };
@@ -54,6 +56,7 @@ type PendingRequest = {
 type RequestWorker = <T>(
 	operation: WorkerOperation,
 	telemetryParent?: TelemetryParentContext,
+	signal?: AbortSignal,
 ) => Promise<T>;
 type NotifyWorker = (notification: WorkerNotification) => void;
 
@@ -324,10 +327,11 @@ export function wrapTelemetryParentBinding(
 				return async (
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
+					options?: Parameters<LixBinding["observe"]>[2],
 				) => {
 					const initialParent = prepareOperation();
 					return wrapTelemetryParentObserve(
-						await target.observe(sql, params),
+						await target.observe(sql, params, options),
 						parentContext,
 						initialParent,
 					);
@@ -460,9 +464,9 @@ export function workerBinding(
 	sessionId: number,
 ): LixBinding {
 	let closed = false;
-	const request: RequestWorker = (operation, telemetryParent) => {
+	const request: RequestWorker = (operation, telemetryParent, signal) => {
 		if (closed) return Promise.reject(workerClosedError());
-		return client.request(operation, sessionId, telemetryParent);
+		return client.request(operation, sessionId, telemetryParent, signal);
 	};
 	const notify: NotifyWorker = (notification) => {
 		if (!closed) client.notify(notification);
@@ -483,11 +487,12 @@ export function workerBinding(
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
 			request({ kind: "executeBatch", statements, options }),
-		observe: async (sql, params) => {
+		observe: async (sql, params, options) => {
 			const initialParent = client.currentTelemetryParent();
 			const observeId = await request<number>(
 				{ kind: "observe", sql, params },
 				initialParent,
+				options?.signal,
 			);
 			return workerObserveBinding(
 				request,
@@ -696,7 +701,9 @@ export class LixWorkerClient {
 		operation: WorkerOperation,
 		sessionId = 0,
 		telemetryParent?: TelemetryParentContext,
+		signal?: AbortSignal,
 	): Promise<T> {
+		if (signal?.aborted) return Promise.reject(observerRegistrationCancelledError());
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
@@ -724,12 +731,13 @@ export class LixWorkerClient {
 			const pendingRequest: PendingRequest = {
 				operation,
 				category,
+				abortSignal: signal,
 				resolve: (value) => {
-					this.clearPendingTimer(pendingRequest);
+					this.cleanupPendingRequest(pendingRequest);
 					resolve(value as T);
 				},
 				reject: (error) => {
-					this.clearPendingTimer(pendingRequest);
+					this.cleanupPendingRequest(pendingRequest);
 					reject(error);
 				},
 			};
@@ -757,6 +765,17 @@ export class LixWorkerClient {
 				this.pending.delete(id);
 				if (this.pending.size === 0) this.connection.unref();
 				pending?.reject(error);
+			}
+			if (this.pending.has(id) && signal && operation.kind === "observe") {
+				pendingRequest.abortListener = () => {
+					// Keep the request pending until the host/repository settles it. If
+					// registration already completed remotely, the cancel notification
+					// carries the same request ID so the host can close that iterator.
+					if (this.pending.has(id))
+						this.notify({ kind: "observe.cancel", requestId: id });
+				};
+				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
+				if (signal.aborted) pendingRequest.abortListener();
 			}
 		});
 	}
@@ -1059,6 +1078,14 @@ export class LixWorkerClient {
 		if (pending.timer !== undefined) clearTimeout(pending.timer);
 		pending.timer = undefined;
 	}
+
+	private cleanupPendingRequest(pending: PendingRequest): void {
+		this.clearPendingTimer(pending);
+		if (pending.abortSignal && pending.abortListener)
+			pending.abortSignal.removeEventListener("abort", pending.abortListener);
+		pending.abortSignal = undefined;
+		pending.abortListener = undefined;
+	}
 }
 
 function isSyncResponseTooLarge(error: unknown): boolean {
@@ -1073,6 +1100,13 @@ function workerClosedError(): Error & { code: string } {
 	const error = new Error("Lix worker is closed") as Error & { code: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+function observerRegistrationCancelledError(): Error & { code: string } {
+	const error = new Error("Observer registration was cancelled") as Error & { code: string };
+	error.name = "AbortError";
+	error.code = "LIX_OBSERVER_CANCELLED";
 	return error;
 }
 
