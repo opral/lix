@@ -112,6 +112,12 @@ name = "registered_row_returning"
 path = "benches/registered_row_returning.rs"
 harness = false
 
+[[bench]]
+name = "mutation_predicates"
+path = "benches/mutation_predicates.rs"
+harness = false
+required-features = ["storage-benches"]
+
 # `lix::storage_adapter` is only `pub` behind `storage-benches`.
 [[bench]]
 name = "commit_graph_scale"
