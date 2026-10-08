@@ -112,6 +112,12 @@ name = "registered_row_returning"
 path = "benches/registered_row_returning.rs"
 harness = false
 
+[[bench]]
+name = "mutation_predicates"
+path = "benches/mutation_predicates.rs"
+harness = false
+required-features = ["storage-benches"]
+
 # `lix::storage_adapter` is only `pub` behind `storage-benches`.
 [[bench]]
 name = "commit_graph_scale"
@@ -176,13 +182,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 datafusion = { version = "55.1.0", default-features = false, features = [
     "sql",
     "nested_expressions",
+    "crypto_expressions",
+    "encoding_expressions",
     "datetime_expressions",
     "regex_expressions",
     "string_expressions",
     "unicode_expressions",
 ] }
 musli = { version = "0.0.149", features = ["storage"] }
-# musli 0.0.149 cannot compile against newer musli-core 0.1.x allocator traits.
+# Keep the exact core version compatible with musli 0.0.149 allocator traits.
+# musli-core 0.1.9 changed that API without a compatible musli release in this range.
 musli-core = { version = "=0.1.4", default-features = false }
 sha2 = "0.10"
 smallvec = "1.15"

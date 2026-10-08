@@ -92,10 +92,12 @@ capacity is reserved before discovery, and replay egress is charged to a hard
 three-times operation page/byte budget. Bound release requests finish or cancel
 idempotently; abrupt cancellation uses bounded expiry.
 
-The client reserves private physical scratch before receiving data, stages each
-page with admission fencing, then verifies the complete commitment, required
-frontier and selected-row membership using compact proof facts. Scratch grants
-no coverage. Only fully validated dependency groups enter normal storage through
+The client reserves bounded private staging before receiving data. Small closures
+can retain payloads under a shared nonblocking 4 MiB permit; unavailable capacity,
+oversized payloads and framed records use durable owner-fenced scratch. It stages
+each page with admission fencing, then verifies the complete commitment, required
+frontier and selected-row membership using compact proof facts. Neither staging
+path grants coverage. Only fully validated dependency groups enter normal storage through
 the existing CAS installer; owner bundles and payload/locator pairs remain atomic.
 Scratch is registered in format87, excluded from semantic snapshots and copied
 repository epochs, and has durable ownership/expiry/reaping. Its migration from86
@@ -106,8 +108,8 @@ fallback. Lower-level bounded transfer primitives remain for writes and speciali
 history/diff paths. Bounded fixed historical metadata diffs use read fulfillment
 when both endpoints prove on the leased selected-branch first-parent lane. Captured
 historical diffs retain specialized discovery because private pending client
-history can be absent from the authority. Sync31 peers share this
-wire cutover; old live peers are rejected.
+history can be absent from the authority. Current sync32 peers share this
+wire contract; old live peers are rejected.
 
 ## Profiling
 

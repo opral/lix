@@ -558,3 +558,8 @@ required-features = ["plugin-tests"]
 name = "transaction_conflicts"
 path = "tests/transaction_conflicts.rs"
 required-features = ["plugin-tests"]
+
+[[example]]
+name = "content_checksum_profile"
+path = "examples/content_checksum_profile.rs"
+required-features = ["rocksdb"]

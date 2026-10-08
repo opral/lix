@@ -1,0 +1,172 @@
+{
+  "qualification": "Local prototype, diagnostic shared-host timings, exact data and fresh-page reopen passed. Four source files differ from the frozen matched control. Three Luna source reviewers agreed.",
+  "memoryTests": {
+    "passed": 30,
+    "log": "retained-closure-r22-memory-tests-r1.log"
+  },
+  "sqlPairs": {
+    "0": {
+      "control": {
+        "open": 823.1499999761581,
+        "initialFiniteSync": 0.050000011920928955,
+        "coldSelectedSql": 535.5500000119209,
+        "residentRepeatSql": 12.600000023841858,
+        "reopenOpen": 36.34999996423721,
+        "reopenRead": 95.0,
+        "reopenAndRead": 131.3499999642372
+      },
+      "candidate": {
+        "open": 997.75,
+        "initialFiniteSync": 0.0,
+        "coldSelectedSql": 393.75,
+        "residentRepeatSql": 12.550000011920929,
+        "reopenOpen": 33.80000001192093,
+        "reopenRead": 90.19999998807907,
+        "reopenAndRead": 124.0
+      }
+    },
+    "100": {
+      "control": {
+        "open": 792.3500000238419,
+        "initialFiniteSync": 0.050000011920928955,
+        "coldSelectedSql": 618.5999999642372,
+        "residentRepeatSql": 12.25,
+        "reopenOpen": 35.15000003576279,
+        "reopenRead": 86.19999998807907,
+        "reopenAndRead": 121.35000002384186
+      },
+      "candidate": {
+        "open": 1611.3500000238419,
+        "initialFiniteSync": 0.0,
+        "coldSelectedSql": 592.8999999761581,
+        "residentRepeatSql": 13.699999988079071,
+        "reopenOpen": 31.55000001192093,
+        "reopenRead": 93.19999998807907,
+        "reopenAndRead": 124.75
+      }
+    },
+    "500": {
+      "control": {
+        "open": 896.25,
+        "initialFiniteSync": 0.0,
+        "coldSelectedSql": 1124.449999988079,
+        "residentRepeatSql": 12.050000011920929,
+        "reopenOpen": 35.85000002384186,
+        "reopenRead": 87.75000005960464,
+        "reopenAndRead": 123.6000000834465
+      },
+      "candidate": {
+        "open": 1093.7999999523163,
+        "initialFiniteSync": 0.0,
+        "coldSelectedSql": 895.2500000596046,
+        "residentRepeatSql": 12.150000035762787,
+        "reopenOpen": 32.69999998807907,
+        "reopenRead": 90.30000001192093,
+        "reopenAndRead": 123.0
+      }
+    }
+  },
+  "warmPeer": {
+    "qualification": "Two interleaved pairs, 20 edits each, only edits 3\u201319 summarized. Real browser OPFS/HTTP/native SlateDB. Shared host with builds pinned outside timed CPUs; elapsed timings diagnostic. Identical native and provider images; SDK differs only by R22 bounded closure retention.",
+    "arms": {
+      "control": {
+        "summary": {
+          "localWriteReceiptMs": {
+            "median": 106.9000244140625,
+            "p95NearestRank": 140.89990234375,
+            "max": 151.099853515625
+          },
+          "peerVisibleMs": {
+            "median": 968.9500732421875,
+            "p95NearestRank": 1064.2001953125,
+            "max": 1118.400146484375
+          },
+          "workerWriteMs": {
+            "median": 69.60009765625,
+            "p95NearestRank": 84.89990234375,
+            "max": 115.800048828125
+          }
+        },
+        "runs": [
+          {
+            "repeat": 1,
+            "validation": {
+              "localPeerAuthorityEqual": true,
+              "bytes": 16,
+              "closedPageTargetId": "27EDBE104791DB7FF0F5CC6C5D6D9201",
+              "oldPageTargetAbsentAfterClose": true,
+              "reopenedPageTargetId": "47744E1C2982F14F5374F59CFD10B5D4",
+              "freshPageTargetDistinct": true
+            },
+            "errors": [],
+            "medianPeerMs": 915.39990234375
+          },
+          {
+            "repeat": 2,
+            "validation": {
+              "localPeerAuthorityEqual": true,
+              "bytes": 16,
+              "closedPageTargetId": "9FC6EB55FA6C2820DFD6BCFC9DFECF52",
+              "oldPageTargetAbsentAfterClose": true,
+              "reopenedPageTargetId": "084E8324EF3B1BEF96A9DC9970AE278E",
+              "freshPageTargetDistinct": true
+            },
+            "errors": [],
+            "medianPeerMs": 1003.400146484375
+          }
+        ]
+      },
+      "candidate": {
+        "summary": {
+          "localWriteReceiptMs": {
+            "median": 101.3499755859375,
+            "p95NearestRank": 132.699951171875,
+            "max": 141.60009765625
+          },
+          "peerVisibleMs": {
+            "median": 839.5001220703125,
+            "p95NearestRank": 975.300048828125,
+            "max": 1180.800048828125
+          },
+          "workerWriteMs": {
+            "median": 64.25,
+            "p95NearestRank": 98.5,
+            "max": 104
+          }
+        },
+        "runs": [
+          {
+            "repeat": 1,
+            "validation": {
+              "localPeerAuthorityEqual": true,
+              "bytes": 16,
+              "closedPageTargetId": "B9552133C08F01F5FB0828A598E5968B",
+              "oldPageTargetAbsentAfterClose": true,
+              "reopenedPageTargetId": "3D175FADC376458EB7984F1336951128",
+              "freshPageTargetDistinct": true
+            },
+            "errors": [],
+            "medianPeerMs": 839.900146484375
+          },
+          {
+            "repeat": 2,
+            "validation": {
+              "localPeerAuthorityEqual": true,
+              "bytes": 16,
+              "closedPageTargetId": "A857D7AD87335D0418CBE6CBD7F03288",
+              "oldPageTargetAbsentAfterClose": true,
+              "reopenedPageTargetId": "5602E2CC1D828A2E84917B534C6570A9",
+              "freshPageTargetDistinct": true
+            },
+            "errors": [],
+            "medianPeerMs": 815.10009765625
+          }
+        ]
+      }
+    }
+  },
+  "artifactHashes": {
+    "controlWasm": "796cbd7abc88497d61c20c7d9f911afab3b4b2dc0ead0b552b1fd46713122b65",
+    "candidateWasm": "a334303c66b3f6ac429c41da93e8a05c3bafec1f12f5bffe377b6ab8627dba0f"
+  }
+}

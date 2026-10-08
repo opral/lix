@@ -1924,7 +1924,8 @@ impl TableSpec for LixFileSpec {
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
-            || options.returning_columns.contains("content");
+            || options.returning_columns.contains("content")
+            || options.required_columns.contains("content");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = resolve_provider_branch_ids(
@@ -2003,7 +2004,24 @@ impl TableSpec for LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
-        self.plan_update_with_post_image(write_ctx, assignments, filters, None)
+        self.plan_update_with_post_image(
+            write_ctx,
+            assignments,
+            filters,
+            None,
+            DmlPlanOptions::default(),
+        )
+        .await
+    }
+
+    async fn plan_update_with_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, None, options)
             .await
     }
 
@@ -2014,7 +2032,25 @@ impl TableSpec for LixFileSpec {
         filters: &[Expr],
         returning: DmlReturning,
     ) -> Result<PlannedDml> {
-        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
+        self.plan_update_with_post_image(
+            write_ctx,
+            assignments,
+            filters,
+            Some(returning),
+            DmlPlanOptions::default(),
+        )
+        .await
+    }
+
+    async fn plan_update_with_returning_options(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+        options: DmlPlanOptions,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning), options)
             .await
     }
 }
@@ -2026,10 +2062,12 @@ impl LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
         returning: Option<DmlReturning>,
+        options: DmlPlanOptions,
     ) -> Result<PlannedDml> {
         let needs_data = filters
             .iter()
             .any(|filter| contains_column(filter, "content"))
+            || options.required_columns.contains("content")
             || assignments.iter().any(|(column_name, expr)| {
                 column_name == "path" || physical_expr_contains_column(expr, "content")
             })

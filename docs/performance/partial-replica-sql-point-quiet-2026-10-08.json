@@ -1,0 +1,39 @@
+{
+  "environment": "Real browser OPFS, HTTP to native SlateDB R20, old production OPFS, synthetic 100 ms delay per cold read fulfillment. No root build active during this repeat; shared host is not exclusively reserved. Three interleaved pairs.",
+  "arms": {
+    "control": {
+      "medianTimingsMs": {
+        "open": 856.7,
+        "initialFiniteSync": 0,
+        "coldSelectedSql": 1006,
+        "residentRepeatSql": 12.4,
+        "reopenOpen": 33.6,
+        "reopenRead": 85.3,
+        "reopenAndRead": 118.3
+      },
+      "allReopenedBytesEqual": true,
+      "coldDependencyWaves": [
+        2,
+        2,
+        2
+      ]
+    },
+    "candidate": {
+      "medianTimingsMs": {
+        "open": 795,
+        "initialFiniteSync": 0,
+        "coldSelectedSql": 857.1,
+        "residentRepeatSql": 13,
+        "reopenOpen": 33.6,
+        "reopenRead": 90.2,
+        "reopenAndRead": 123.8
+      },
+      "allReopenedBytesEqual": true,
+      "coldDependencyWaves": [
+        1,
+        1,
+        1
+      ]
+    }
+  }
+}

@@ -2,8 +2,8 @@ use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef, ReturningImage};
 use super::read::BoundRead;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use std::collections::BTreeMap;
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Ident};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundWrite {
@@ -11,6 +11,10 @@ pub(crate) struct BoundWrite {
     pub(crate) op: BoundWriteOp,
     pub(crate) input: BoundWriteInput,
     pub(crate) predicate: BoundPredicate,
+    /// The original SQL predicate when it is outside the compact native
+    /// predicate representation. DataFusion plans this against a temporary
+    /// view of the provider's candidate rows at execution time.
+    pub(crate) predicate_fallback: Option<BoundWritePredicateFallback>,
     pub(crate) assignments: Vec<BoundAssignment>,
     pub(crate) conflict: Option<BoundInsertConflict>,
     /// The row projection requested by a DML `RETURNING` clause.
@@ -24,8 +28,23 @@ pub(crate) struct BoundWrite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundWritePredicateFallback {
+    pub(crate) expr: SqlExpr,
+    /// The qualifier visible to the original WHERE clause. With no explicit
+    /// target alias, this is the target table name.
+    pub(crate) target_alias: Ident,
+    /// SQL-visible target columns. Provider-private identity columns are
+    /// renamed in the temporary relation so a fallback cannot address them.
+    pub(crate) public_columns: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundReturning {
     pub(crate) items: Vec<BoundReturningItem>,
+    /// The target range variable from the original DML statement, retained so
+    /// DataFusion's SQL-planned RETURNING projection resolves aliased columns
+    /// in the same scope as the user's statement.
+    pub(crate) target_alias: Option<Ident>,
 }
 
 impl BoundReturning {
