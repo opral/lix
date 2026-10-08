@@ -103,7 +103,9 @@ test("queues initial open until elected owner connects and rejects stale output"
 		generation: "old",
 		message: { id: 1, ok: true },
 	});
-	expect(c.listener).not.toHaveBeenCalled();
+	expect(
+		c.listener.mock.calls.filter(([message]) => "ok" in message),
+	).toHaveLength(0);
 	c.receive({
 		kind: "output",
 		client,
@@ -114,7 +116,9 @@ test("queues initial open until elected owner connects and rejects stale output"
 			context: { branchId: "main", accountId: "account" },
 		},
 	});
-	expect(c.listener).toHaveBeenCalledOnce();
+	expect(
+		c.listener.mock.calls.filter(([message]) => "ok" in message),
+	).toHaveLength(1);
 	const closing = c.result.terminate();
 	c.receive({ kind: "disconnected", client, generation: "owner-1" });
 	await closing;

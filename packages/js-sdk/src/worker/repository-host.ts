@@ -10,6 +10,7 @@ import {
 } from "./shared-admission.js";
 import { DurableLocalAdmission } from "./durable-local-admission.js";
 import { startWorkerHost } from "./host.js";
+import { WorkerOperationScheduler } from "./operation-scheduler.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
 import type { LixOpenReport } from "../types.js";
 import type { SyncServerBindingOptions } from "../binding-types.js";
@@ -38,6 +39,7 @@ export function createRepositoryHost() {
 	const admitted = new SharedAdmissionCache();
 	let rootIdentity: AdmissionIdentity | undefined;
 	let localRoot: Promise<import("../binding-types.js").LixBinding> | undefined;
+	const operationScheduler = new WorkerOperationScheduler();
 
 	return {
 		connect(send: (message: RepositoryHostOutput) => void): RepositoryHostConnection {
@@ -371,6 +373,7 @@ export function createRepositoryHost() {
 					);
 				},
 				true,
+				operationScheduler,
 			);
 			const disconnect = async () => {
 				disconnected = true;

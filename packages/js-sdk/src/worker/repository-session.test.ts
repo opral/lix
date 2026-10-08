@@ -69,7 +69,7 @@ function fixture() {
 			return request.id;
 		},
 		result(id: number) {
-			return output.find((m) => "id" in m && m.id === id) as Extract<
+			return output.find((m) => "ok" in m && m.id === id) as Extract<
 				WorkerResponse,
 				{ ok: true }
 			>;
@@ -87,6 +87,16 @@ function fixture() {
 		},
 	};
 }
+test("acknowledges an initial request while waiting for the repository owner", () => {
+	const f = fixture();
+	const id = f.request({
+		kind: "open",
+		storage: { kind: "memory" },
+		telemetryEnabled: false,
+		progressEnabled: false,
+	});
+	expect(f.output).toContainEqual({ kind: "request.queued", id });
+});
 test("owner loss during detached migration cleanup preserves the unknown outcome", async () => {
 	const f = fixture();
 	f.session.connected();

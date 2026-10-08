@@ -1,4 +1,12 @@
 import { operationDeadline, lostOperationError } from "./request-lifecycle.js";
+import {
+	WORKER_CLIENT_MAX_CONTROL_PENDING,
+	WORKER_CLIENT_MAX_ORDINARY_PENDING,
+	WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING,
+	WORKER_CLIENT_MAX_PENDING,
+	WORKER_OPERATION_QUEUE_WAIT_MS,
+	workerQueueFullError,
+} from "./operation-scheduler.js";
 import { emitOpenProgress } from "../open-progress.js";
 import { fetchTransport, type HttpTransport } from "../http-transport.js";
 import {
@@ -37,6 +45,8 @@ type SyncServerRuntimeOptions = LixServerOptions & {
 
 type PendingRequest = {
 	operation: WorkerOperation;
+	category: "ordinary" | "observer-close" | "control";
+	timer?: ReturnType<typeof setTimeout>;
 	resolve(value: unknown): void;
 	reject(error: unknown): void;
 };
@@ -51,6 +61,21 @@ const MAX_IDLE_WORKERS = 1;
 // The common serial reopen path retains one worker so its prepared plugin cache
 // survives close(). Concurrent opens still receive isolated workers.
 const idleWorkers: LixWorkerClient[] = [];
+
+function workerOperationCategory(
+	operation: WorkerOperation,
+): PendingRequest["category"] {
+	if (operation.kind === "observe.close") return "observer-close";
+	if (
+		operation.kind === "close" ||
+		operation.kind === "exportSnapshot.cancel" ||
+		operation.kind === "transaction.commit" ||
+		operation.kind === "transaction.rollback" ||
+		operation.kind === "openSnapshot.finish"
+	)
+		return "control";
+	return "ordinary";
+}
 
 export async function openLixWorker(
 	storage: LixStorageConfig,
@@ -126,6 +151,24 @@ export async function pumpSnapshotToWorker(
 		(value) => ({ kind: "open-complete", value }) as const,
 		(error: unknown) => ({ kind: "open-error", error }) as const,
 	);
+	const waitForSnapshotRequest = async (request: Promise<unknown>): Promise<boolean> => {
+		const requestCompletion = request.then(
+			(value) => ({ kind: "request-complete", value }) as const,
+			(error: unknown) => ({ kind: "request-error", error }) as const,
+		);
+		const outcome = await Promise.race([requestCompletion, openCompletion]);
+		if (outcome.kind === "open-error") throw outcome.error;
+		if (outcome.kind === "open-complete") {
+			// A successful open normally consumes through EOF. If it completed early,
+			// stop the producer and wait for the in-flight write's host-side cleanup.
+			await reader.cancel().catch(() => undefined);
+			client.notify({ kind: "openSnapshot.cancel", snapshotId });
+			await requestCompletion;
+			return false;
+		}
+		if (outcome.kind === "request-error") throw outcome.error;
+		return true;
+	};
 	try {
 		while (true) {
 			const outcome = await Promise.race([
@@ -153,14 +196,16 @@ export async function pumpSnapshotToWorker(
 				throw new TypeError("snapshot stream chunks must be Uint8Array values");
 			}
 			for (const chunk of ownedSnapshotRestoreChunks(read.value)) {
-				await client.request({
+				if (!(await waitForSnapshotRequest(client.request({
 					kind: "openSnapshot.write",
 					snapshotId,
 					chunk,
-				});
+				})))) return;
 			}
 		}
-		await client.request({ kind: "openSnapshot.finish", snapshotId });
+		if (!(await waitForSnapshotRequest(
+			client.request({ kind: "openSnapshot.finish", snapshotId }),
+		))) return;
 	} catch (error) {
 		await reader.cancel(error).catch(() => undefined);
 		client.notify({ kind: "openSnapshot.cancel", snapshotId });
@@ -655,39 +700,51 @@ export class LixWorkerClient {
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
+		const category = workerOperationCategory(operation);
+		let controlPending = 0;
+		let observerClosePending = 0;
+		let ordinaryPending = 0;
+		for (const pending of this.pending.values()) {
+			if (pending.category === "control") controlPending++;
+			else if (pending.category === "observer-close") observerClosePending++;
+			else ordinaryPending++;
+		}
+		if (
+			this.pending.size >= WORKER_CLIENT_MAX_PENDING ||
+			(category === "control" && controlPending >= WORKER_CLIENT_MAX_CONTROL_PENDING) ||
+			(category === "observer-close" &&
+				observerClosePending >= WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING) ||
+			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING)
+		) {
+			return Promise.reject(workerQueueFullError());
+		}
 		const id = this.nextRequestId++;
 		if (this.pending.size === 0) this.connection.ref();
 		return new Promise<T>((resolve, reject) => {
-			const milliseconds = operationDeadline(operation);
-			const timer =
-				milliseconds === undefined
-					? undefined
-					: setTimeout(() => {
-							this.handleFatal(
-								Object.assign(
-									new Error(
-										`Lix ${operation.kind} did not settle within ${milliseconds}ms`,
-									),
-									{
-										code:
-											operation.kind === "open"
-												? "LIX_OPEN_TIMEOUT"
-												: "LIX_OPERATION_TIMEOUT",
-									},
-								),
-							);
-						}, milliseconds);
-			this.pending.set(id, {
+			const pendingRequest: PendingRequest = {
 				operation,
+				category,
 				resolve: (value) => {
-					clearTimeout(timer);
+					this.clearPendingTimer(pendingRequest);
 					resolve(value as T);
 				},
 				reject: (error) => {
-					clearTimeout(timer);
+					this.clearPendingTimer(pendingRequest);
 					reject(error);
 				},
-			});
+			};
+			this.pending.set(id, pendingRequest);
+			pendingRequest.timer = setTimeout(() => {
+				if (!this.pending.has(id)) return;
+				this.handleFatal(
+					Object.assign(
+						new Error(
+							`Lix worker did not acknowledge request receipt within ${WORKER_OPERATION_QUEUE_WAIT_MS}ms`,
+						),
+						{ code: "LIX_WORKER_START_TIMEOUT" },
+					),
+				);
+			}, WORKER_OPERATION_QUEUE_WAIT_MS);
 			try {
 				this.connection.postMessage({
 					id,
@@ -764,6 +821,35 @@ export class LixWorkerClient {
 			message.kind !== "sync.fetch.cancel"
 		) return;
 		switch (message.kind) {
+			case "request.started": {
+				const pending = this.pending.get(message.id);
+				if (!pending) break;
+				this.clearPendingTimer(pending);
+				const milliseconds = operationDeadline(pending.operation);
+				if (milliseconds !== undefined) {
+					pending.timer = setTimeout(() => {
+						this.handleFatal(
+							Object.assign(
+								new Error(
+									`Lix ${pending.operation.kind} did not settle within ${milliseconds}ms`,
+								),
+								{
+									code:
+									pending.operation.kind === "open"
+										? "LIX_OPEN_TIMEOUT"
+										: "LIX_OPERATION_TIMEOUT",
+								},
+							),
+						);
+					}, milliseconds);
+				}
+				break;
+			}
+			case "request.queued": {
+				const pending = this.pending.get(message.id);
+				if (pending) this.clearPendingTimer(pending);
+				break;
+			}
 			case "telemetry":
 				try {
 					this.telemetry?.onExport(message.request);
@@ -967,6 +1053,11 @@ export class LixWorkerClient {
 			pending.reject(lostOperationError(pending.operation, error));
 		this.pending.clear();
 		this.connection.unref();
+	}
+
+	private clearPendingTimer(pending: PendingRequest): void {
+		if (pending.timer !== undefined) clearTimeout(pending.timer);
+		pending.timer = undefined;
 	}
 }
 

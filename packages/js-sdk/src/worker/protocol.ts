@@ -249,6 +249,8 @@ export type WorkerResponse =
 			context?: { branchId: string; accountId: string };
 	  }
 	| { id: number; ok: false; error: SerializedWorkerError }
+	| { kind: "request.started"; id: number }
+	| { kind: "request.queued"; id: number }
 	| { kind: "telemetry"; request: Uint8Array }
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number; transportScope?: number }

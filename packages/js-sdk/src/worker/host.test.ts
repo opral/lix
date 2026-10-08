@@ -7,6 +7,7 @@ import type {
 } from "./protocol.js";
 import { startWorkerHost } from "./host.js";
 import { LixWorkerClient } from "./client.js";
+import { WorkerOperationScheduler } from "./operation-scheduler.js";
 
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
@@ -134,6 +135,377 @@ test("observation setup bypasses a blocked finite operation", async () => {
 	await vi.waitFor(() => expect(executeCalls).toBe(2));
 });
 
+test("independent sessions progress while each session keeps FIFO order", async () => {
+	const held = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const calls: string[] = [];
+	const result = { columns: [], rows: [], rowsAffected: 0, notices: [] };
+	const child = {
+		setTelemetryParent() {},
+		close: async () => {},
+		async execute(sql: string) {
+			calls.push(`child:${sql}`);
+			return result;
+		},
+	} as unknown as LixBinding;
+	const root = {
+		setTelemetryParent() {},
+		async openAnotherSession() {
+			return child;
+		},
+		async execute(sql: string) {
+			calls.push(`root:${sql}`);
+			if (sql === "held") await held.promise;
+			return result;
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => root,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "openAnotherSession", options: {} },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "held", params: [] },
+	});
+	await vi.waitFor(() => expect(calls).toEqual(["root:held"]));
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "same-session-next", params: [] },
+	});
+	receive({
+		id: 5,
+		sessionId: 1,
+		operation: { kind: "execute", sql: "resident-session", params: [] },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: result }));
+	expect(calls).toEqual(["root:held", "child:resident-session"]);
+	expect(responses.some((message) => "ok" in message && message.id === 4)).toBe(false);
+	held.resolve();
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 4, ok: true, value: result }));
+	expect(calls).toEqual([
+		"root:held",
+		"child:resident-session",
+		"root:same-session-next",
+	]);
+});
+
+test("transaction IDs are bound to their owning session", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const executeTransaction = vi.fn(async () => ({
+		columns: [],
+		rows: [],
+		rowsAffected: 0,
+		notices: [],
+	}));
+	const rollback = vi.fn(async () => {});
+	const child = { setTelemetryParent() {}, close: async () => {} } as unknown as LixBinding;
+	const root = {
+		setTelemetryParent() {},
+		close: async () => {},
+		openAnotherSession: async () => child,
+		beginTransaction: async () => ({ execute: executeTransaction, rollback }),
+	} as unknown as LixBinding;
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => root,
+	);
+	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" }, telemetryEnabled: false, progressEnabled: false } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "openAnotherSession", options: {} } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({ id: 3, sessionId: 0, operation: { kind: "beginTransaction" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true, value: 1 }));
+	receive({
+		id: 4,
+		sessionId: 1,
+		operation: { kind: "transaction.execute", transactionId: 1, sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({ id: 4, ok: false, error: expect.objectContaining({ code: "LIX_TRANSACTION_OWNER_MISMATCH" }) }),
+		),
+	);
+	expect(executeTransaction).not.toHaveBeenCalled();
+	receive({ kind: "transaction.abandon", transactionId: 1 });
+	await vi.waitFor(() => expect(rollback).toHaveBeenCalledOnce());
+	await host.close();
+});
+
+test("a duplicate terminal request cannot consume another transaction reservation", async () => {
+	const held = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const commitA = vi.fn(async () => undefined);
+	const commitB = vi.fn(async () => undefined);
+	let transactionIndex = 0;
+	const transactions = [
+		{ commit: commitA, rollback: async () => {}, execute: async () => undefined },
+		{ commit: commitB, rollback: async () => {}, execute: async () => undefined },
+	];
+	const binding = {
+		setTelemetryParent() {},
+		close: async () => {},
+		async execute(sql: string) {
+			if (sql === "hold") await held.promise;
+			return { columns: [], rows: [], rowsAffected: 0, notices: [] };
+		},
+		async beginTransaction() {
+			return transactions[transactionIndex++];
+		},
+	} as unknown as LixBinding;
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		new WorkerOperationScheduler({
+			maxActive: 1,
+			queueWaitMs: 5_000,
+		}),
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "beginTransaction" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({ id: 3, sessionId: 0, operation: { kind: "beginTransaction" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true, value: 2 }));
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "hold", params: [] },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ kind: "request.started", id: 4 }),
+	);
+	receive({
+		id: 5,
+		sessionId: 0,
+		operation: { kind: "transaction.commit", transactionId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ kind: "request.queued", id: 5 }),
+	);
+	receive({
+		id: 6,
+		sessionId: 0,
+		operation: { kind: "transaction.commit", transactionId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 6,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_INVALID_TRANSACTION_STATE" }),
+			}),
+		),
+	);
+	receive({
+		id: 7,
+		sessionId: 0,
+		operation: { kind: "transaction.commit", transactionId: 2 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ kind: "request.queued", id: 7 }),
+	);
+	held.resolve();
+	await vi.waitFor(() => {
+		expect(responses).toContainEqual({ id: 5, ok: true, value: undefined });
+		expect(responses).toContainEqual({ id: 7, ok: true, value: undefined });
+	});
+	expect(commitA).toHaveBeenCalledOnce();
+	expect(commitB).toHaveBeenCalledOnce();
+	await host.close();
+});
+
+test("scheduler saturation returns a typed error and disconnect drains the active lane", async () => {
+	const held = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const calls: string[] = [];
+	const closed = vi.fn(async () => {});
+	const binding = {
+		setTelemetryParent() {},
+		close: closed,
+		async execute(sql: string) {
+			calls.push(sql);
+			if (sql === "active") await held.promise;
+			return { columns: [], rows: [], rowsAffected: 0, notices: [] };
+		},
+	} as unknown as LixBinding;
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		new WorkerOperationScheduler({
+			maxActive: 1,
+			maxQueued: 1,
+			maxQueuedPerSession: 1,
+			queueWaitMs: 5_000,
+		}),
+	);
+	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" }, telemetryEnabled: false, progressEnabled: false } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "execute", sql: "active", params: [] } });
+	await vi.waitFor(() => expect(calls).toEqual(["active"]));
+	receive({ id: 3, sessionId: 0, operation: { kind: "execute", sql: "queued", params: [] } });
+	receive({ id: 4, sessionId: 0, operation: { kind: "execute", sql: "overflow", params: [] } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({ id: 4, ok: false, error: expect.objectContaining({ code: "LIX_WORKER_QUEUE_FULL" }) }),
+		),
+	);
+	const shutdown = host.close();
+	expect(closed).not.toHaveBeenCalled();
+	held.resolve();
+	await shutdown;
+	expect(calls).toEqual(["active"]);
+	expect(responses).toContainEqual(expect.objectContaining({ id: 3, ok: false }));
+	expect(closed).toHaveBeenCalledOnce();
+});
+
+test("timed-out snapshot open aborts its queued restore writer", async () => {
+	const held = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const openedSnapshots: Array<ReadableStream<Uint8Array> | undefined> = [];
+	const binding = {
+		setTelemetryParent() {},
+		async close() {},
+		async execute() {
+			await held.promise;
+			return { columns: [], rows: [], rowsAffected: 0, notices: [] };
+		},
+	} as unknown as LixBinding;
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async (_storage, _telemetry, _parent, _server, _progress, snapshot) => {
+			openedSnapshots.push(snapshot);
+			return binding;
+		},
+		undefined,
+		false,
+		new WorkerOperationScheduler({
+			maxActive: 1,
+			maxQueued: 1,
+			maxQueuedPerSession: 1,
+			queueWaitMs: 100,
+		}),
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "hold", params: [] },
+	});
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+			snapshotId: 44,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.queued", id: 3 }));
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: {
+			kind: "openSnapshot.write",
+			snapshotId: 44,
+			chunk: new Uint8Array([1, 2, 3]),
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 4 }));
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 3,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_WORKER_QUEUE_TIMEOUT" }),
+			}),
+		),
+	);
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({ id: 4, ok: false }),
+		),
+	);
+	// The failed open retired this exact input instead of leaving a writer for a
+	// snapshot that can no longer be consumed.
+	receive({
+		id: 5,
+		sessionId: 0,
+		operation: { kind: "openSnapshot.finish", snapshotId: 44 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({ id: 5, ok: false }),
+		),
+	);
+	expect(openedSnapshots).toEqual([undefined]);
+	held.resolve();
+	await host.close();
+});
+
 test("observation close acknowledges only after the binding drains its active read", async () => {
 	const closeBarrier = deferred<void>();
 	const responses: WorkerResponse[] = [];
@@ -180,6 +552,539 @@ test("observation close acknowledges only after the binding drains its active re
 	expect(responses).not.toContainEqual({ id: 3, ok: true });
 	closeBarrier.resolve();
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true }));
+});
+
+test("a concurrent observation next rejects immediately instead of waiting behind the first", async () => {
+	const readStarted = deferred<void>();
+	const readBarrier = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	let nextCalls = 0;
+	const events: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		async next() {
+			nextCalls += 1;
+			if (nextCalls === 2) {
+				readStarted.resolve();
+				await readBarrier.promise;
+			}
+			return undefined as never;
+		},
+		async close() {
+			readBarrier.resolve();
+		},
+	};
+	const binding = {
+		setTelemetryParent() {},
+		observe: async () => events,
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe.next", observeId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ id: 3, ok: true, value: undefined }),
+	);
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "observe.next", observeId: 1 },
+	});
+	await readStarted.promise;
+	receive({
+		id: 5,
+		sessionId: 0,
+		operation: { kind: "observe.next", observeId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 5,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_OBSERVE_NEXT_IN_FLIGHT" }),
+			}),
+		),
+	);
+	expect(nextCalls).toBe(2); // Initial read and the one held read only.
+	receive({
+		id: 6,
+		sessionId: 0,
+		operation: { kind: "observe.close", observeId: 1 },
+	});
+	await vi.waitFor(() => {
+		expect(responses).toContainEqual({ id: 4, ok: true, value: undefined });
+		expect(responses).toContainEqual({ id: 6, ok: true });
+	});
+});
+
+test("all admitted idle observers run without consuming snapshot-pull capacity", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	let registrationIndex = 0;
+	const startedReads: number[] = [];
+	const events = Array.from({ length: 32 }, (_, index) => {
+		const read = deferred<void>();
+		return {
+			setTelemetryParent() {},
+			async next() {
+				startedReads.push(index);
+				await read.promise;
+				return undefined;
+			},
+			close() {
+				read.resolve();
+			},
+		};
+	});
+	const snapshot = {
+		next: vi.fn(async () => new Uint8Array([42])),
+		cancel: vi.fn(async () => {}),
+	};
+	const scheduler = new WorkerOperationScheduler({
+		maxActive: 1,
+		maxIndependentActive: 1,
+		maxObserverActive: 32,
+	});
+	const binding = {
+		setTelemetryParent() {},
+		close: async () => {},
+		async observe() {
+			return events[registrationIndex++];
+		},
+		exportSnapshot: () => snapshot,
+	} as unknown as LixBinding;
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		scheduler,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	for (let index = 0; index < events.length; index++) {
+		receive({
+			id: index + 2,
+			sessionId: 0,
+			operation: { kind: "observe", sql: "SELECT 1", params: [] },
+		});
+		await vi.waitFor(() =>
+			expect(responses).toContainEqual({ id: index + 2, ok: true, value: index + 1 }),
+		);
+	}
+	for (let index = 0; index < events.length; index++) {
+		receive({
+			id: index + 20,
+			sessionId: 0,
+			operation: { kind: "observe.next", observeId: index + 1 },
+		});
+	}
+	await vi.waitFor(() => expect(startedReads).toHaveLength(32));
+	receive({ id: 100, sessionId: 0, operation: { kind: "exportSnapshot" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 100, ok: true, value: 1 }));
+	receive({
+		id: 101,
+		sessionId: 0,
+		operation: { kind: "exportSnapshot.next", exportId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ id: 101, ok: true, value: new Uint8Array([42]) }),
+	);
+	expect(snapshot.next).toHaveBeenCalledOnce();
+
+	const secondResponses: WorkerResponse[] = [];
+	let receiveSecond!: (message: WorkerInput) => void;
+	const secondEvents: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		next: async () => undefined,
+		close: async () => {},
+	};
+	const secondBinding = {
+		setTelemetryParent() {},
+		close: async () => {},
+		observe: async () => secondEvents,
+	} as unknown as LixBinding;
+	const secondHost = startWorkerHost(
+		{
+			postMessage: (message) => secondResponses.push(message),
+			onMessage: (listener) => (receiveSecond = listener),
+		},
+		async () => secondBinding,
+		undefined,
+		false,
+		scheduler,
+	);
+	receiveSecond({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 1, ok: true }));
+	receiveSecond({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() =>
+		expect(secondResponses).toContainEqual(
+			expect.objectContaining({
+				id: 2,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_WORKER_OBSERVER_LIMIT" }),
+			}),
+		),
+	);
+
+	// Closing one host session releases all 32 reservations only after each
+	// active read is settled, then another host sharing the scheduler can admit.
+	receive({ id: 102, sessionId: 0, operation: { kind: "close" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 102, ok: true }));
+	receiveSecond({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 3, ok: true, value: 1 }));
+	await host.close();
+	await secondHost.close();
+});
+
+test("session close fences a pending observer registration and closes its late iterator", async () => {
+	const registration = deferred<ObserveEventsBinding>();
+	const registrationStarted = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const events: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		next: vi.fn(async () => undefined),
+		close: vi.fn(async () => {}),
+	};
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		observe() {
+			registrationStarted.resolve();
+			return registration.promise;
+		},
+	} as unknown as LixBinding;
+	const scheduler = new WorkerOperationScheduler({ maxObserverRegistrations: 1 });
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		scheduler,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await registrationStarted.promise;
+	const secondResponses: WorkerResponse[] = [];
+	let receiveSecond!: (message: WorkerInput) => void;
+	const secondEvents: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		next: async () => undefined,
+		close: async () => {},
+	};
+	const secondBinding = {
+		setTelemetryParent() {},
+		close: async () => {},
+		observe: async () => secondEvents,
+	} as unknown as LixBinding;
+	const secondHost = startWorkerHost(
+		{
+			postMessage: (message) => secondResponses.push(message),
+			onMessage: (listener) => (receiveSecond = listener),
+		},
+		async () => secondBinding,
+		undefined,
+		false,
+		scheduler,
+	);
+	receiveSecond({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 1, ok: true }));
+	receiveSecond({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() =>
+		expect(secondResponses).toContainEqual(
+			expect.objectContaining({
+				id: 2,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_WORKER_OBSERVER_LIMIT" }),
+			}),
+		),
+	);
+	receive({ id: 3, sessionId: 0, operation: { kind: "close" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 3 }));
+	expect(responses).not.toContainEqual(expect.objectContaining({ id: 3, ok: true }));
+	expect(binding.close).not.toHaveBeenCalled();
+
+	// Close drains the pending registration. Its late iterator is closed before
+	// the Lix binding, and no observer ID is published for the closing session.
+	registration.resolve(events);
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({ id: 2, ok: false }),
+		),
+	);
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true }));
+	expect(events.close).toHaveBeenCalledOnce();
+	expect(binding.close).toHaveBeenCalledOnce();
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "observe.next", observeId: 1 },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({ id: 4, ok: true, value: undefined }),
+	);
+	expect(events.next).not.toHaveBeenCalled();
+	await host.close();
+	receiveSecond({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 3, ok: true, value: 1 }));
+	await secondHost.close();
+	const thirdResponses: WorkerResponse[] = [];
+	let receiveThird!: (message: WorkerInput) => void;
+	const thirdBinding = {
+		setTelemetryParent() {},
+		close: async () => {},
+		observe: async () => ({
+			setTelemetryParent() {},
+			next: async () => undefined,
+			close: async () => {},
+		}),
+	} as unknown as LixBinding;
+	const thirdHost = startWorkerHost(
+		{
+			postMessage: (message) => thirdResponses.push(message),
+			onMessage: (listener) => (receiveThird = listener),
+		},
+		async () => thirdBinding,
+		undefined,
+		false,
+		scheduler,
+	);
+	receiveThird({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(thirdResponses).toContainEqual({ id: 1, ok: true }));
+	receiveThird({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(thirdResponses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	await thirdHost.close();
+});
+
+test("observer close preserves binding errors, drains its read, and releases admission", async () => {
+	const read = deferred<void>();
+	const readStarted = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const closeError = Object.assign(new Error("observer close failed"), {
+		code: "TEST_OBSERVER_CLOSE_FAILED",
+	});
+	const events: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		async next() {
+			readStarted.resolve();
+			await read.promise;
+			return undefined;
+		},
+		async close() {
+			throw closeError;
+		},
+	};
+	const scheduler = new WorkerOperationScheduler({ maxObserverRegistrations: 1 });
+	const host = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => ({
+			setTelemetryParent() {},
+			close: async () => {},
+			observe: async () => events,
+		} as unknown as LixBinding),
+		undefined,
+		false,
+		scheduler,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "observe", sql: "SELECT 1", params: [] } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({ id: 3, sessionId: 0, operation: { kind: "observe.next", observeId: 1 } });
+	await readStarted.promise;
+	receive({ id: 4, sessionId: 0, operation: { kind: "observe.close", observeId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 4 }));
+	receive({ id: 5, sessionId: 0, operation: { kind: "observe.close", observeId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 5 }));
+	expect(responses).not.toContainEqual(expect.objectContaining({ id: 4, ok: expect.any(Boolean) }));
+	expect(responses).not.toContainEqual(expect.objectContaining({ id: 5, ok: expect.any(Boolean) }));
+	const secondResponses: WorkerResponse[] = [];
+	let receiveSecond!: (message: WorkerInput) => void;
+	const secondHost = startWorkerHost(
+		{
+			postMessage: (message) => secondResponses.push(message),
+			onMessage: (listener) => (receiveSecond = listener),
+		},
+		async () => ({
+			setTelemetryParent() {},
+			close: async () => {},
+			observe: async () => ({
+				setTelemetryParent() {},
+				next: async () => undefined,
+				close: async () => {},
+			}),
+		} as unknown as LixBinding),
+		undefined,
+		false,
+		scheduler,
+	);
+	receiveSecond({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 1, ok: true }));
+	receiveSecond({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() =>
+		expect(secondResponses).toContainEqual(
+			expect.objectContaining({
+				id: 2,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_WORKER_OBSERVER_LIMIT" }),
+			}),
+		),
+	);
+	read.resolve();
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 4,
+				ok: false,
+				error: expect.objectContaining({ code: "TEST_OBSERVER_CLOSE_FAILED" }),
+			}),
+		),
+	);
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 5,
+				ok: false,
+				error: expect.objectContaining({ code: "TEST_OBSERVER_CLOSE_FAILED" }),
+			}),
+		),
+	);
+	receiveSecond({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(secondResponses).toContainEqual({ id: 3, ok: true, value: 1 }));
+	await host.close();
+	await secondHost.close();
 });
 
 test("worker shutdown also waits for an observation close RPC already in flight", async () => {
@@ -328,7 +1233,7 @@ test("worker forwards the durable transaction commit receipt", async () => {
 		onMessage: (listener) => { receive = listener; },
 	}, async () => binding);
 	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" } } });
-	await vi.waitFor(() => expect(responses.some((response) => response.id === 1)).toBe(true));
+	await vi.waitFor(() => expect(responses.some((response) => "ok" in response && response.id === 1)).toBe(true));
 	receive({ id: 2, sessionId: 0, operation: { kind: "beginTransaction" } });
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
 	receive({ id: 3, sessionId: 0, operation: { kind: "transaction.commit", transactionId: 1 } });
@@ -416,7 +1321,7 @@ test("a credential callback from a nonresponsive page cannot leave opening pendi
 		});
 		await host.close();
 		expect(
-			responses.filter((message) => "id" in message && message.id === 1),
+			responses.filter((message) => "ok" in message && message.id === 1),
 		).toHaveLength(1);
 	} finally {
 		vi.useRealTimers();

@@ -29,21 +29,44 @@ import {
 	type WorkerSyncServerOptions,
 	isSessionCloseRequest,
 } from "./protocol.js";
+import {
+	WorkerOperationScheduler,
+	workerQueueFullError,
+	type ObserverSlot,
+	type TransactionSlot,
+} from "./operation-scheduler.js";
 
 export function startWorkerHost(
 	endpoint: WorkerHostEndpoint,
 	openBinding: typeof openLixBinding = openLixBinding,
 	convertBinding: typeof convertReplicaBinding = convertReplicaBinding,
 	checkpointSessions = false,
+	operationScheduler: WorkerOperationScheduler = new WorkerOperationScheduler(),
 ): { close(afterSessionsClosed?: () => Promise<void>): Promise<void> } {
 	let closed = false;
 	let closing = false;
+	const schedulerScope = operationScheduler.createScope();
+	type ObserverAdmission = { sessionId: number; slot: ObserverSlot; active: boolean };
+	type ObservationRecord = {
+		binding: ObserveEventsBinding;
+		sessionId: number;
+		admission: ObserverAdmission;
+	};
 	const sessions = new Map<number, LixBinding>();
+	const sessionLifetimes = new Map<number, { closing: boolean; generation: number }>();
 	let nextSessionId = 1;
 	let nextTransactionId = 1;
 	let nextObserveId = 1;
-	const transactions = new Map<number, LixTransactionBinding>();
-	const observations = new Map<number, ObserveEventsBinding>();
+	const transactions = new Map<
+		number,
+		{
+			binding: LixTransactionBinding;
+			sessionId: number;
+			reservationActive: boolean;
+			terminalQueued: boolean;
+		}
+	>();
+	const observations = new Map<number, ObservationRecord>();
 	let nextSnapshotExportId = 1;
 	const snapshotExports = new Map<number, SnapshotExportBinding>();
 	const snapshotInputs = new Map<
@@ -77,9 +100,163 @@ export function startWorkerHost(
 	// Fetch ownership spans the header/body handoff; waiter maps only describe
 	// the currently pending callback, not the lifetime of the peer's reader.
 	const activeSyncFetches = new Set<number>();
-	let finiteQueue = Promise.resolve();
+	const observationNextReads = new Set<number>();
+	const observationReadsBySession = new Map<number, Set<Promise<void>>>();
+	const observationReadsById = new Map<number, Set<Promise<void>>>();
+	const observationClosePromises = new Map<number, Promise<void>>();
 	const registrations = new Set<Promise<void>>();
+	const registrationsBySession = new Map<number, Set<Promise<void>>>();
 	const observationClosures = new Set<Promise<void>>();
+	const observationClosuresBySession = new Map<number, Set<Promise<void>>>();
+	const observerAdmissions = new Set<ObserverAdmission>();
+	const observerAdmissionsBySession = new Map<number, Set<ObserverAdmission>>();
+	const directOperations = new Set<Promise<void>>();
+
+	function releaseObserverAdmission(admission: ObserverAdmission): void {
+		if (!admission.active) return;
+		admission.active = false;
+		admission.slot.release();
+		observerAdmissions.delete(admission);
+		const sessionAdmissions = observerAdmissionsBySession.get(admission.sessionId);
+		sessionAdmissions?.delete(admission);
+		if (sessionAdmissions?.size === 0)
+			observerAdmissionsBySession.delete(admission.sessionId);
+	}
+
+	function postStarted(request: WorkerRequest): void {
+		endpoint.postMessage({ kind: "request.started", id: request.id });
+	}
+
+	function postQueued(request: WorkerRequest): void {
+		endpoint.postMessage({ kind: "request.queued", id: request.id });
+	}
+
+	function trackDirect(request: WorkerRequest, operation: () => Promise<unknown>): Promise<void> {
+		postStarted(request);
+		const completion = respond(request, operation);
+		directOperations.add(completion);
+		void completion.finally(() => directOperations.delete(completion));
+		return completion;
+	}
+
+	function scheduleLaneRequest(
+		request: WorkerRequest,
+		lane: string,
+		sessionId: number | undefined,
+		operation: () => Promise<unknown>,
+		pool: "independent" | "observer" = "independent",
+	): Promise<void> {
+		let resolveCompletion!: () => void;
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
+		const rejectRequest = (error: Error) => {
+			void respond(request, async () => {
+				throw error;
+			}).finally(resolveCompletion);
+		};
+		const accepted = operationScheduler.schedule({
+			scope: schedulerScope,
+			lane,
+			pool,
+			sessionId,
+		onQueued: () => postQueued(request),
+			run: () => {
+				postStarted(request);
+				return respond(request, operation).finally(resolveCompletion);
+			},
+			onRejected: rejectRequest,
+		});
+		if (!accepted) rejectRequest(workerQueueFullError());
+		return completion;
+	}
+
+	function scheduleRequest(
+		request: WorkerRequest,
+		options: {
+			lane: string;
+			pool?: "finite" | "independent";
+			sessionId?: number;
+			barrier?: boolean;
+			runOperation?: () => Promise<unknown>;
+			reserveTransactionSlot?: boolean;
+			useTransactionSlot?: boolean;
+			queueWaitMs?: number | null;
+			onTimeout?: (error: Error) => void;
+			onNotAccepted?: () => void;
+			onRejected?: (error: Error) => void;
+		},
+	): Promise<void> {
+		let resolveCompletion!: () => void;
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
+		const finishWithError = (error: Error) => {
+			void respond(request, async () => {
+				throw error;
+			}).finally(resolveCompletion);
+		};
+		const acceptedWork = {
+			scope: schedulerScope,
+			lane: options.lane,
+			pool: options.pool,
+			sessionId: options.sessionId,
+			barrier: options.barrier,
+			reserveTransactionSlot: options.reserveTransactionSlot,
+			queueWaitMs: options.queueWaitMs,
+			onQueued: () => postQueued(request),
+			run: async (transactionSlot?: TransactionSlot) => {
+				postStarted(request);
+				const needsSession = ![
+					"open",
+					"observe",
+					"hosted.create",
+					"hosted.delete",
+					"replica.convert",
+					"replica.cleanup",
+				].includes(request.operation.kind);
+				const binding = needsSession ? requiredLix(request.sessionId) : undefined;
+				return respond(request, async () => {
+					if (closed) throw workerStateError("Worker client disconnected");
+					binding?.setTelemetryParent(request.telemetryParent);
+					try {
+						const value = options.runOperation
+							? await options.runOperation()
+							: await handleFiniteOperation(
+									request.sessionId,
+									request.operation,
+									request.telemetryParent,
+								);
+						if (request.operation.kind === "beginTransaction")
+							transactionSlot?.adopt();
+						return value;
+					} finally {
+						// Clear the exact carrier captured before this await. A child close
+						// may remove its map entry while this operation is still unwinding.
+						binding?.setTelemetryParent();
+					}
+				}).finally(resolveCompletion);
+			},
+			onRejected: (error: Error) => {
+				options.onTimeout?.(error);
+				options.onRejected?.(error);
+				finishWithError(error);
+			},
+		};
+		let accepted: boolean;
+		if (options.useTransactionSlot) {
+			accepted = operationScheduler.scheduleUsingTransactionSlot(acceptedWork);
+		} else {
+			accepted = operationScheduler.schedule(acceptedWork);
+		}
+		if (!accepted) {
+			options.onNotAccepted?.();
+			const error = workerQueueFullError();
+			options.onRejected?.(error);
+			finishWithError(error);
+		}
+		return completion;
+	}
 
 	endpoint.onMessage((message: WorkerInput) => {
 		if (closed && "id" in message) return;
@@ -92,7 +269,7 @@ export function startWorkerHost(
 			message.operation.kind === "openSnapshot.finish"
 		) {
 			const operation = message.operation;
-			void respond(message, () => handleSnapshotInput(operation));
+			void trackDirect(message, () => handleSnapshotInput(operation));
 			return;
 		}
 		if (
@@ -109,89 +286,253 @@ export function startWorkerHost(
 		) {
 			if (message.operation.kind === "observe.next") {
 				const observeId = message.operation.observeId;
-				void respond(message, () =>
-					handleObserveNext(observeId, message.telemetryParent),
-				);
+				const observation = observations.get(observeId);
+				if (observation && !isSessionLive(observation.sessionId)) {
+					void respond(message, async () => {
+						throw workerStateError("Lix session is closing");
+					});
+				} else if (observationNextReads.has(observeId)) {
+					void respond(message, async () => {
+						throw observationNextInFlightError();
+					});
+				} else {
+					observationNextReads.add(observeId);
+					const next = scheduleLaneRequest(
+						message,
+					`observer:${observeId}`,
+						observation?.sessionId,
+						() => handleObserveNext(observeId, message.telemetryParent),
+						"observer",
+					);
+					let reads: Set<Promise<void>> | undefined;
+					if (observation) {
+						reads = observationReadsBySession.get(observation.sessionId);
+						if (!reads) {
+							reads = new Set();
+							observationReadsBySession.set(observation.sessionId, reads);
+						}
+						reads.add(next);
+						let readsForObserver = observationReadsById.get(observeId);
+						if (!readsForObserver) {
+							readsForObserver = new Set();
+							observationReadsById.set(observeId, readsForObserver);
+						}
+						readsForObserver.add(next);
+					}
+					void next.finally(() => {
+						observationNextReads.delete(observeId);
+						if (!observation || !reads) return;
+						reads.delete(next);
+						if (reads.size === 0) observationReadsBySession.delete(observation.sessionId);
+						const readsForObserver = observationReadsById.get(observeId);
+						readsForObserver?.delete(next);
+						if (readsForObserver?.size === 0) observationReadsById.delete(observeId);
+					});
+				}
 			} else if (message.operation.kind === "observe.close") {
 				const observeId = message.operation.observeId;
-				const closure = respond(message, () => handleObserveClose(observeId));
+				const sessionId = observations.get(observeId)?.sessionId;
+				const closure = trackDirect(message, () => handleObserveClose(observeId));
 				observationClosures.add(closure);
-				void closure.finally(() => observationClosures.delete(closure));
+				if (sessionId !== undefined) {
+					let closures = observationClosuresBySession.get(sessionId);
+					if (!closures) {
+						closures = new Set();
+						observationClosuresBySession.set(sessionId, closures);
+					}
+					closures.add(closure);
+				}
+				void closure.finally(() => {
+					observationClosures.delete(closure);
+					if (sessionId === undefined) return;
+					const closures = observationClosuresBySession.get(sessionId);
+					closures?.delete(closure);
+					if (closures?.size === 0) observationClosuresBySession.delete(sessionId);
+				});
 			} else if (message.operation.kind === "exportSnapshot.next") {
 				const exportId = message.operation.exportId;
-				void respond(message, () => handleSnapshotNext(exportId));
+				void scheduleLaneRequest(
+					message,
+					`snapshot:${exportId}`,
+					undefined,
+					() => handleSnapshotNext(exportId),
+				);
 			} else {
 				const exportId = message.operation.exportId;
-				void respond(message, () => handleSnapshotCancel(exportId));
+				void trackDirect(message, () => handleSnapshotCancel(exportId));
 			}
 			return;
 		}
 		if (message.operation.kind === "observe") {
-			const operation = message.operation;
-			// Observation setup is metadata-only. Keeping it behind the global
-			// finite-operation queue lets a long-running operation block a newly
-			// mounted query, including one that needs lazy history hydration.
-			// The live `next()` lane is already independent for the same reason.
-			const registration = respond(message, () =>
-				handleObserveRegistration(
-					message.sessionId,
-					operation.sql,
-					operation.params,
-				),
-			);
-            registrations.add(registration);
-            void registration.finally(() => registrations.delete(registration));
+			const observation = message.operation;
+			const slot = operationScheduler.reserveObserverSlot();
+			if (!slot) {
+				const error = Object.assign(
+					new Error("The worker has reached its active observer limit"),
+					{ code: "LIX_WORKER_OBSERVER_LIMIT" },
+				);
+				void respond(message, async () => {
+					throw error;
+				});
+				return;
+			}
+			const admission: ObserverAdmission = {
+				sessionId: message.sessionId,
+				slot,
+				active: true,
+			};
+			observerAdmissions.add(admission);
+			let sessionAdmissions = observerAdmissionsBySession.get(message.sessionId);
+			if (!sessionAdmissions) {
+				sessionAdmissions = new Set();
+				observerAdmissionsBySession.set(message.sessionId, sessionAdmissions);
+			}
+			sessionAdmissions.add(admission);
+			const registration = scheduleRequest(message, {
+				lane: `observe:${message.sessionId}`,
+				pool: "independent",
+				sessionId: message.sessionId,
+				onRejected: () => releaseObserverAdmission(admission),
+				onNotAccepted: () => releaseObserverAdmission(admission),
+				runOperation: () =>
+					handleObserveRegistration(
+						message.sessionId,
+						observation.sql,
+						observation.params,
+						admission,
+					),
+			});
+			registrations.add(registration);
+			let sessionRegistrations = registrationsBySession.get(message.sessionId);
+			if (!sessionRegistrations) {
+				sessionRegistrations = new Set();
+				registrationsBySession.set(message.sessionId, sessionRegistrations);
+			}
+			sessionRegistrations.add(registration);
+			void registration.finally(() => registrations.delete(registration));
+			void registration.finally(() => {
+				const values = registrationsBySession.get(message.sessionId);
+				values?.delete(registration);
+				if (values?.size === 0) registrationsBySession.delete(message.sessionId);
+			});
 			return;
 		}
-		finiteQueue = finiteQueue.then(async () => {
-			try {
-				await respond(message, async () => {
-                    if (closed) throw workerStateError("Worker client disconnected");
-					if (
-						message.operation.kind !== "open" &&
-						message.operation.kind !== "hosted.create" &&
-						message.operation.kind !== "hosted.delete" &&
-						message.operation.kind !== "replica.convert" &&
-						message.operation.kind !== "replica.cleanup"
-					) {
-						requiredLix(message.sessionId).setTelemetryParent(
-							message.telemetryParent,
+		const operation = message.operation;
+		const transactionId =
+			"transactionId" in operation ? operation.transactionId : undefined;
+		let transaction:
+			| ReturnType<typeof requiredTransaction>
+			| undefined;
+		try {
+			transaction = transactionId === undefined
+				? undefined
+				: requiredTransaction(
+						transactionId,
+						message.sessionId,
+					);
+		} catch (error) {
+			void respond(message, async () => {
+				throw error;
+			});
+			return;
+		}
+		const terminal =
+			operation.kind === "transaction.commit" ||
+			operation.kind === "transaction.rollback";
+		const lane =
+			operation.kind === "hosted.create" || operation.kind === "hosted.delete"
+				? "hosted:mutation"
+				: `session:${message.sessionId}`;
+		const options = {
+			lane,
+			sessionId:
+				operation.kind === "replica.convert" ||
+				operation.kind === "replica.cleanup" ||
+				operation.kind === "hosted.create" ||
+				operation.kind === "hosted.delete"
+					? undefined
+					: message.sessionId,
+			barrier:
+				operation.kind === "open" ||
+				operation.kind === "replica.convert" ||
+				operation.kind === "replica.cleanup",
+			onRejected:
+				operation.kind === "open" && operation.snapshotId !== undefined
+					? (error: Error) => closeSnapshotInput(operation.snapshotId!, error)
+					: undefined,
+		};
+		if (terminal && transaction) {
+			transaction.terminalQueued = true;
+			transaction.reservationActive = false;
+		}
+	void scheduleRequest(message, {
+			...options,
+			reserveTransactionSlot: operation.kind === "beginTransaction",
+			useTransactionSlot: terminal,
+				onTimeout:
+				terminal && transaction
+					? (error) => {
+						if ((error as Error & { code?: string }).code !== "LIX_WORKER_QUEUE_TIMEOUT" || closing) return;
+						transaction.terminalQueued = false;
+						transaction.reservationActive = true;
+						operationScheduler.restoreTransactionSlot(
+							schedulerScope,
+							transaction.sessionId,
 						);
 					}
-					return handleFiniteOperation(
-						message.sessionId,
-						message.operation,
-						message.telemetryParent,
-					);
-				});
-			} finally {
-				// The mutable FFI carrier is safe only within this serialized
-				// operation. Clear it before another request or background task
-				// can accidentally inherit a stale remote parent.
-				(
-					sessions.get(message.sessionId) ?? sessions.get(0)
-				)?.setTelemetryParent();
-			}
+					: undefined,
+			onNotAccepted:
+				terminal && transaction
+					? () => {
+						transaction.terminalQueued = false;
+						transaction.reservationActive = true;
+					}
+					: undefined,
 		});
 	});
 
 	function handleNotification(
 		message: Exclude<WorkerInput, WorkerRequest>,
 	): void {
-		switch (message.kind) {
+			switch (message.kind) {
 			case "openSnapshot.cancel": {
-				const input = snapshotInputs.get(message.snapshotId);
-				snapshotInputs.delete(message.snapshotId);
-				if (input) void input.writer.abort().catch(() => undefined);
+				closeSnapshotInput(message.snapshotId);
 				break;
 			}
-			case "transaction.abandon":
-				finiteQueue = finiteQueue.then(async () => {
-					const transaction = transactions.get(message.transactionId);
-					transactions.delete(message.transactionId);
-					if (transaction) await transaction.rollback().catch(() => undefined);
-				});
+			case "transaction.abandon": {
+				const transaction = transactions.get(message.transactionId);
+				if (!transaction || transaction.terminalQueued) break;
+				transaction.terminalQueued = true;
+				const hadReservation = transaction.reservationActive;
+				transaction.reservationActive = false;
+				const work = {
+					scope: schedulerScope,
+					lane: `session:${transaction.sessionId}`,
+					sessionId: transaction.sessionId,
+					queueWaitMs: null,
+					run: async () => {
+						transactions.delete(message.transactionId);
+						await transaction.binding.rollback().catch(() => undefined);
+					},
+					onRejected: () => {
+						if (!hadReservation || closing) return;
+						transaction.terminalQueued = false;
+						transaction.reservationActive = true;
+						operationScheduler.restoreTransactionSlot(
+							schedulerScope,
+							transaction.sessionId,
+						);
+					},
+				};
+				const accepted = hadReservation
+					? operationScheduler.scheduleUsingTransactionSlot(work)
+					: operationScheduler.schedule(work);
+				if (!accepted) {
+					transaction.terminalQueued = false;
+					transaction.reservationActive = hadReservation;
+				}
 				break;
+			}
 			case "sync.headers.result": {
 				const pending = pendingSyncHeaders.get(message.requestId);
 				pendingSyncHeaders.delete(message.requestId);
@@ -251,6 +592,15 @@ export function startWorkerHost(
 	): Promise<void> {
 		try {
 			const value = await operation();
+			if (request.operation.kind === "observe") {
+				const registered = observations.get(value as number);
+				if (
+					!isSessionLive(request.sessionId) ||
+					registered?.sessionId !== request.sessionId
+				) {
+					throw workerStateError("Lix session closed during observer registration");
+				}
+			}
 			const kind = request.operation.kind;
 			const checkpoint =
 				checkpointSessions &&
@@ -292,10 +642,10 @@ export function startWorkerHost(
 	): Promise<unknown> {
 		switch (operation.kind) {
             case "replica.cleanup":
-                if (sessions.size>0) throw workerStateError("Migration cleanup requires closed storage");
+                if (operationScheduler.totalOpenSessions() > 0) throw workerStateError("Migration cleanup requires closed storage");
                 return retryReplicaMigrationCleanupBinding(operation.storage,createSyncServerBridge(operation.server)!);
             case "replica.convert":
-                if (sessions.size>0) throw workerStateError("Conversion requires closed storage");
+                if (operationScheduler.totalOpenSessions() > 0) throw workerStateError("Conversion requires closed storage");
                 return convertBinding(operation.storage,createSyncServerBridge(operation.server)!,operation.branchId);
 			case "hosted.create":
 				return createHostedBinding(operation.server);
@@ -331,10 +681,12 @@ export function startWorkerHost(
 							snapshot,
 						);
 						sessions.set(0, opened);
+						sessionLifetimes.set(0, { closing: false, generation: 0 });
+						operationScheduler.setSessionCount(schedulerScope, sessions.size);
 						return opened.openReport?.() satisfies LixOpenReport | undefined;
 					} finally {
 						if (operation.snapshotId !== undefined) {
-							snapshotInputs.delete(operation.snapshotId);
+							closeSnapshotInput(operation.snapshotId);
 						}
 					}
 				}
@@ -347,6 +699,8 @@ export function startWorkerHost(
 				);
 				const openedSessionId = nextSessionId++;
 				sessions.set(openedSessionId, opened);
+				sessionLifetimes.set(openedSessionId, { closing: false, generation: 0 });
+				operationScheduler.setSessionCount(schedulerScope, sessions.size);
 				return openedSessionId;
 			}
 			case "execute":
@@ -361,26 +715,47 @@ export function startWorkerHost(
 					operation.options,
 				);
 			case "beginTransaction": {
-				const transaction = await requiredLix(sessionId).beginTransaction();
+				const binding = await requiredLix(sessionId).beginTransaction();
 				const transactionId = nextTransactionId++;
-				transactions.set(transactionId, transaction);
+				transactions.set(transactionId, {
+					binding,
+					sessionId,
+					reservationActive: true,
+					terminalQueued: false,
+				});
 				return transactionId;
 			}
 			case "transaction.execute":
-				return requiredTransaction(operation.transactionId).execute(
+				return requiredTransaction(operation.transactionId, sessionId).binding.execute(
 					operation.sql,
 					operation.params,
 					operation.options,
 				);
 			case "transaction.commit": {
-				const transaction = requiredTransaction(operation.transactionId);
+				const transaction = requiredTransaction(operation.transactionId, sessionId, true);
 				transactions.delete(operation.transactionId);
-				return await transaction.commit();
+				try {
+					return await transaction.binding.commit();
+				} finally {
+					if (transaction.reservationActive)
+						operationScheduler.releaseTransactionSlot(
+							schedulerScope,
+							transaction.sessionId,
+						);
+				}
 			}
 			case "transaction.rollback": {
-				const transaction = requiredTransaction(operation.transactionId);
+				const transaction = requiredTransaction(operation.transactionId, sessionId, true);
 				transactions.delete(operation.transactionId);
-				await transaction.rollback();
+				try {
+					await transaction.binding.rollback();
+				} finally {
+					if (transaction.reservationActive)
+						operationScheduler.releaseTransactionSlot(
+							schedulerScope,
+							transaction.sessionId,
+						);
+				}
 				return undefined;
 			}
 			case "replicaRecoverySources":
@@ -444,9 +819,30 @@ export function startWorkerHost(
 				throw workerStateError("observe must use the observation lane");
 			case "close": {
 				const openLix = requiredLix(sessionId);
-				await openLix.close();
-				sessions.delete(sessionId);
-				return undefined;
+				const lifetime = requiredSessionLifetime(sessionId);
+				lifetime.closing = true;
+				lifetime.generation++;
+				try {
+					for (const [transactionId, transaction] of transactions) {
+						if (transaction.sessionId !== sessionId) continue;
+						transactions.delete(transactionId);
+						await transaction.binding.rollback().catch(() => undefined);
+						if (transaction.reservationActive)
+							operationScheduler.releaseTransactionSlot(
+								schedulerScope,
+								transaction.sessionId,
+							);
+					}
+					await closeObservationsForSession(sessionId);
+					await openLix.close();
+					sessions.delete(sessionId);
+					sessionLifetimes.delete(sessionId);
+					operationScheduler.setSessionCount(schedulerScope, sessions.size);
+					return undefined;
+				} catch (error) {
+					if (sessions.get(sessionId) === openLix) lifetime.closing = false;
+					throw error;
+				}
 			}
 			case "observe.next":
 				throw workerStateError("observe.next must use the observation lane");
@@ -496,6 +892,17 @@ export function startWorkerHost(
 		return input;
 	}
 
+	function closeSnapshotInput(snapshotId: number, reason?: unknown): void {
+		const input = snapshotInputs.get(snapshotId);
+		if (!input) return;
+		snapshotInputs.delete(snapshotId);
+		// A queued open has no reader yet. Cancel that side to release any
+		// backpressured TransformStream writes; if restore already locked it,
+		// cancellation rejects and aborting the writer still signals the reader.
+		void input.readable.cancel(reason).catch(() => undefined);
+		void input.writer.abort(reason).catch(() => undefined);
+	}
+
 	async function handleSnapshotInput(
 		operation: Extract<
 			WorkerOperation,
@@ -533,6 +940,7 @@ export function startWorkerHost(
         try {
           const failure = workerStateError("Worker client disconnected");
           const fetchFailure = transportAbortFailure();
+          operationScheduler.cancelQueued(schedulerScope, failure);
           for (const requestId of Array.from(activeSyncFetches)) {
             // The peer may still own a fetch/reader even with no pull pending.
             // A disconnected channel cannot receive cancellation; local close
@@ -552,24 +960,39 @@ export function startWorkerHost(
             captureSync(() => pending.reject(fetchFailure));
           }
           pendingSyncStreamPulls.clear();
-          await capture(async () => {
-            await Promise.allSettled(
-              Array.from(observations.values(), (observation) =>
-                Promise.resolve().then(() => observation.close()),
-              ),
-            );
-          });
-          observations.clear();
-          await Promise.allSettled([...observationClosures]);
+		  for (const snapshotId of [...snapshotInputs.keys()])
+			captureSync(() => closeSnapshotInput(snapshotId, failure));
+		  for (const lifetime of sessionLifetimes.values()) {
+		    lifetime.closing = true;
+		    lifetime.generation++;
+		  }
+		  await capture(async () => {
+		    await Promise.allSettled(
+		      [...sessions.keys()].map((sessionId) => closeObservationsForSession(sessionId)),
+		    );
+		  });
+		  await Promise.allSettled([...observationClosures]);
           for (const snapshot of snapshotExports.values()) {
             await capture(() => Promise.resolve().then(() => snapshot.cancel()));
           }
           snapshotExports.clear();
-          await finiteQueue.catch(() => undefined);
-          await Promise.allSettled(registrations);
+          await capture(() => operationScheduler.drainScope(schedulerScope));
+		  await Promise.allSettled([
+		    ...registrations,
+            ...observationClosures,
+            ...directOperations,
+		  ]);
+		  for (const admission of observerAdmissions) releaseObserverAdmission(admission);
           // The active finite operation has finished; never roll back a handle
           // concurrently with its execute/commit operation.
-          for (const transaction of transactions.values()) await transaction.rollback().catch(() => undefined);
+          for (const transaction of transactions.values()) {
+            await transaction.binding.rollback().catch(() => undefined);
+            if (transaction.reservationActive)
+              operationScheduler.releaseTransactionSlot(
+                schedulerScope,
+                transaction.sessionId,
+              );
+          }
           transactions.clear();
           for (const snapshot of snapshotExports.values()) {
             await capture(() => Promise.resolve().then(() => snapshot.cancel()));
@@ -577,6 +1000,14 @@ export function startWorkerHost(
           snapshotExports.clear();
           for (const session of sessions.values()) await capture(() => session.close());
           sessions.clear();
+		  sessionLifetimes.clear();
+		  registrationsBySession.clear();
+		  observationClosuresBySession.clear();
+		  observationReadsBySession.clear();
+		  observationReadsById.clear();
+		  observationClosePromises.clear();
+		  observerAdmissionsBySession.clear();
+          operationScheduler.setSessionCount(schedulerScope, 0);
         } catch (error) {
           if (!closeFailed) closeFailure = error;
           closeFailed = true;
@@ -586,6 +1017,7 @@ export function startWorkerHost(
           // retire it even if any local cleanup step failed unexpectedly.
           await capture(() => afterSessionsClosed?.());
           closing = false;
+          operationScheduler.releaseScope(schedulerScope);
         }
         if (closeFailed) throw closeFailure;
     } };
@@ -755,44 +1187,137 @@ export function startWorkerHost(
 	): Promise<unknown> {
 		const events = observations.get(observeId);
 		if (!events) return undefined;
-		events.setTelemetryParent(telemetryParent);
-		return events.next();
+		events.binding.setTelemetryParent(telemetryParent);
+		return events.binding.next();
 	}
 
 	async function handleObserveClose(observeId: number): Promise<void> {
 		const events = observations.get(observeId);
 		observations.delete(observeId);
-		await events?.close();
+		return closeObservation(observeId, events);
+	}
+
+	function closeObservation(
+		observeId: number,
+		events: ObservationRecord | undefined,
+	): Promise<void> {
+		const existing = observationClosePromises.get(observeId);
+		if (existing) return existing;
+		let closeFailure: unknown;
+		let closeFailed = false;
+		const closing = Promise.resolve().then(async () => {
+			try {
+				try {
+					await events?.binding.close();
+				} catch (error) {
+					closeFailure = error;
+					closeFailed = true;
+				}
+				await Promise.allSettled([...(observationReadsById.get(observeId) ?? [])]);
+				if (closeFailed) throw closeFailure;
+			} finally {
+				events && releaseObserverAdmission(events.admission);
+				observationReadsById.delete(observeId);
+			}
+		});
+		observationClosePromises.set(observeId, closing);
+		const forget = () => {
+			if (observationClosePromises.get(observeId) === closing)
+				observationClosePromises.delete(observeId);
+		};
+		void closing.then(forget, forget);
+		return closing;
+	}
+
+	async function closeObservationsForSession(sessionId: number): Promise<void> {
+		const pending: Promise<void>[] = [];
+		operationScheduler.cancelQueued(
+			schedulerScope,
+			workerStateError("Lix session is closing"),
+			(work) => work.lane === `observe:${sessionId}`,
+		);
+		for (const [observeId, events] of observations) {
+			if (events.sessionId !== sessionId) continue;
+			observations.delete(observeId);
+			pending.push(closeObservation(observeId, events));
+		}
+		pending.push(...(observationClosuresBySession.get(sessionId) ?? []));
+		pending.push(...(observationReadsBySession.get(sessionId) ?? []));
+		pending.push(...(registrationsBySession.get(sessionId) ?? []));
+		await Promise.allSettled(pending);
+		for (const admission of observerAdmissionsBySession.get(sessionId) ?? [])
+			releaseObserverAdmission(admission);
 	}
 
 	async function handleObserveRegistration(
 		sessionId: number,
 		sql: string,
 		params: Parameters<LixBinding["observe"]>[1],
+		admission: ObserverAdmission,
 	): Promise<number> {
 		// Do not touch the mutable Lix telemetry carrier here: it belongs to the
 		// serialized finite lane. Each `observe.next` supplies telemetry directly
 		// to its observation binding.
-		const events = await requiredLix(sessionId).observe(sql, params);
-		if (closed) {
-			await events.close();
-			throw workerStateError("Worker client disconnected");
+		const lifetime = requiredSessionLifetime(sessionId);
+		const generation = lifetime.generation;
+		let adopted = false;
+		try {
+			const events = await requiredLix(sessionId).observe(sql, params);
+			if (
+				closed ||
+				lifetime.closing ||
+				lifetime.generation !== generation ||
+				sessionLifetimes.get(sessionId) !== lifetime
+			) {
+				await Promise.resolve(events.close()).catch(() => undefined);
+				throw workerStateError("Lix session closed during observer registration");
+			}
+			const observeId = nextObserveId++;
+			observations.set(observeId, { binding: events, sessionId, admission });
+			adopted = true;
+			return observeId;
+		} finally {
+			if (!adopted) releaseObserverAdmission(admission);
 		}
-		const observeId = nextObserveId++;
-		observations.set(observeId, events);
-		return observeId;
 	}
 
 	function requiredLix(sessionId: number): LixBinding {
 		const lix = sessions.get(sessionId);
-		if (!lix) throw workerStateError("Lix session is closed");
+		if (!lix || !isSessionLive(sessionId)) throw workerStateError("Lix session is closed");
 		return lix;
 	}
 
-	function requiredTransaction(transactionId: number): LixTransactionBinding {
+	function requiredSessionLifetime(
+		sessionId: number,
+	): { closing: boolean; generation: number } {
+		const lifetime = sessionLifetimes.get(sessionId);
+		if (!lifetime || lifetime.closing || !sessions.has(sessionId))
+			throw workerStateError("Lix session is closed");
+		return lifetime;
+	}
+
+	function isSessionLive(sessionId: number): boolean {
+		return sessions.has(sessionId) && sessionLifetimes.get(sessionId)?.closing === false;
+	}
+
+	function requiredTransaction(
+		transactionId: number,
+		sessionId: number,
+		allowTerminal = false,
+	) {
 		const transaction = transactions.get(transactionId);
 		if (!transaction) {
 			const error = workerStateError("Lix transaction is closed");
+			error.code = "LIX_INVALID_TRANSACTION_STATE";
+			throw error;
+		}
+		if (transaction.sessionId !== sessionId) {
+			const error = workerStateError("Lix transaction belongs to another session");
+			error.code = "LIX_TRANSACTION_OWNER_MISMATCH";
+			throw error;
+		}
+		if (transaction.terminalQueued && !allowTerminal) {
+			const error = workerStateError("Lix transaction is completing");
 			error.code = "LIX_INVALID_TRANSACTION_STATE";
 			throw error;
 		}
@@ -825,6 +1350,12 @@ function workerStateError(message: string): Error & { code?: string } {
 	const error = new Error(message) as Error & { code?: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+function observationNextInFlightError(): Error & { code?: string } {
+	const error = workerStateError("An observation next call is already in flight");
+	error.code = "LIX_OBSERVE_NEXT_IN_FLIGHT";
 	return error;
 }
 

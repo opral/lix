@@ -93,7 +93,7 @@ const start = (event: MessageEvent) => {
 				let retired = false;
 				const connection = host.connect((response) => {
 					if (retired) return;
-					if (opening.has(message.client) && opening.get(message.client) === ("id" in response ? response.id : undefined)) {
+					if ("ok" in response && opening.has(message.client) && opening.get(message.client) === response.id) {
 						opening.delete(message.client);
 						// Failed opening may have left a rejected compiler or uncertain
 						// provider cleanup. Do not cache that runtime for another open.

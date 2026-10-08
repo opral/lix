@@ -8,8 +8,13 @@ import {
 } from "./protocol.js";
 import { repositoryError, OPEN_TIMEOUT_MS } from "./repository-protocol.js";
 import { lostOperationError } from "./request-lifecycle.js";
+import {
+	WORKER_CLIENT_MAX_PENDING,
+	workerQueueFullError,
+	workerQueueTimeoutError,
+} from "./operation-scheduler.js";
 type Context = { branchId: string; accountId: string };
-type Reply = Extract<WorkerResponse, { id: number }>;
+type Reply = Extract<WorkerResponse, { ok: boolean }>;
 /** Logical handles survive owner generations; transactions and snapshot streams do not. */
 export class RepositorySession {
 	private epoch = 0;
@@ -35,6 +40,7 @@ export class RepositorySession {
 	private callbacks = new Map<number, number>();
 	private callbackIds = new Map<number, number>();
 	private requests = new Map<number, WorkerRequest>();
+	private queueTimers = new Map<number, ReturnType<typeof setTimeout>>();
 	private internal = new Map<
 		number,
 		{ resolve(reply: Reply): void; reject(error: Error): void }
@@ -61,7 +67,7 @@ export class RepositorySession {
 		this.internal.clear();
 		this.transactions.clear();
 		this.exports.clear();
-		const replay: WorkerInput[] = [];
+		const replay: WorkerRequest[] = [];
 		const closingObservations = new Set(
 			Array.from(this.requests.values()).flatMap((request) =>
 				request.operation.kind === "observe.close"
@@ -93,8 +99,16 @@ export class RepositorySession {
 					"activeAccountId",
 					"syncHealth",
 				].includes(kind)
-			)
-				replay.push(request);
+			) {
+				if (this.queue.length + replay.length < WORKER_CLIENT_MAX_PENDING)
+					replay.push(request);
+				else
+					this.output({
+						id: request.id,
+						ok: false,
+						error: serializeWorkerError(workerQueueFullError()),
+					});
+			}
 			else if (kind === "close") {
 				this.sessions.delete(request.sessionId);
 				this.output({ id: request.id, ok: true });
@@ -117,6 +131,10 @@ export class RepositorySession {
 		}
 		this.requests.clear();
 		this.queue.unshift(...replay);
+		for (const request of replay) {
+			this.output({ kind: "request.queued", id: request.id });
+			this.startQueueTimer(request);
+		}
 		clearTimeout(this.deadline);
 		this.deadline = setTimeout(
 			() =>
@@ -139,7 +157,10 @@ export class RepositorySession {
 				this.recovering = false;
 				this.ready = true;
 				clearTimeout(this.deadline);
-				for (const message of this.queue.splice(0)) this.post(message);
+				for (const message of this.queue.splice(0)) {
+					if ("id" in message) this.clearQueueTimer(message.id);
+					this.post(message);
+				}
 			})
 			.catch((error) => {
 				if (epoch === this.epoch && !this.stopped) this.fatal(error);
@@ -222,6 +243,16 @@ export class RepositorySession {
 			}
 			return;
 		}
+		if (
+			this.queue.length + this.requests.size >= WORKER_CLIENT_MAX_PENDING
+		) {
+			this.output({
+				id: message.id,
+				ok: false,
+				error: serializeWorkerError(workerQueueFullError()),
+			});
+			return;
+		}
 		let observationCloseLogicalId: number | undefined;
 		let trackedMessage = message;
 		if (message.operation.kind === "observe.close") {
@@ -234,6 +265,8 @@ export class RepositorySession {
 					return;
 				}
 				this.queue.push(message);
+				this.output({ kind: "request.queued", id: message.id });
+				this.startQueueTimer(message);
 				return;
 			}
 			if (!observation) {
@@ -248,6 +281,8 @@ export class RepositorySession {
 		}
 		if (!this.ready) {
 			this.queue.push(message);
+			this.output({ kind: "request.queued", id: message.id });
+			this.startQueueTimer(message);
 			return;
 		}
 		try {
@@ -311,6 +346,15 @@ export class RepositorySession {
 	}
 	receive(message: WorkerResponse) {
 		if (this.stopped) return;
+		if (
+			"kind" in message &&
+			(message.kind === "request.started" || message.kind === "request.queued")
+		) {
+			if (this.internal.has(message.id)) return;
+			const request = this.requests.get(message.id);
+			if (request) this.output({ ...message, id: request.id });
+			return;
+		}
 		if (!("id" in message)) {
 			if ("requestId" in message) {
 				let requestId = this.callbackIds.get(message.requestId);
@@ -408,5 +452,29 @@ export class RepositorySession {
 			pending.reject(repositoryError("LIX_ERROR_CLOSED", "Repository closed"));
 		this.internal.clear();
 		this.queue.length = 0;
+		for (const timer of this.queueTimers.values()) clearTimeout(timer);
+		this.queueTimers.clear();
+	}
+	private startQueueTimer(request: WorkerRequest): void {
+		if (this.queueTimers.has(request.id)) return;
+		const timer = setTimeout(() => {
+			this.queueTimers.delete(request.id);
+			const index = this.queue.findIndex(
+				(message) => "id" in message && message.id === request.id,
+			);
+			if (index < 0) return;
+			this.queue.splice(index, 1);
+			this.output({
+				id: request.id,
+				ok: false,
+				error: serializeWorkerError(workerQueueTimeoutError()),
+			});
+		}, OPEN_TIMEOUT_MS);
+		this.queueTimers.set(request.id, timer);
+	}
+	private clearQueueTimer(id: number): void {
+		const timer = this.queueTimers.get(id);
+		if (timer !== undefined) clearTimeout(timer);
+		this.queueTimers.delete(id);
 	}
 }

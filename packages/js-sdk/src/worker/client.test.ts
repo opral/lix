@@ -444,6 +444,57 @@ test("worker open rejection interrupts a stalled source tail", async () => {
 	await client.terminate();
 });
 
+test("worker open rejection interrupts a backpressured snapshot write", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	let canceled = false;
+	const source = new ReadableStream<Uint8Array>(
+		{
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("snapshot chunk"));
+			},
+			cancel() {
+				canceled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const open = deferred<unknown>();
+	const pumping = pumpSnapshotToWorker(
+		client,
+		source.getReader(),
+		92,
+		open.promise,
+	);
+	await vi.waitFor(() => {
+		expect(
+			transport.sent.some(
+				(message) =>
+					"id" in message &&
+					message.operation.kind === "openSnapshot.write",
+			),
+		).toBe(true);
+	});
+	const semanticError = Object.assign(new Error("snapshot open was rejected"), {
+		name: "LixError",
+		code: "LIX_WORKER_QUEUE_TIMEOUT",
+	});
+	open.reject(semanticError);
+
+	await expect(pumping).rejects.toBe(semanticError);
+	expect(canceled).toBe(true);
+	expect(
+		transport.sent.some(
+			(message) =>
+				"kind" in message &&
+				message.kind === "openSnapshot.cancel" &&
+				message.snapshotId === 92,
+		),
+	).toBe(true);
+	await client.terminate();
+});
+
 test("browser sync resolves fresh headers for reconnect requests", async () => {
 	const transport = fakeConnection();
 	let generation = 0;
@@ -826,6 +877,7 @@ test("an unanswered open rejects within its budget and disposes its connection",
 		const failure = expect(opening).rejects.toMatchObject({
 			code: "LIX_OPEN_TIMEOUT",
 		});
+		transport.emit({ kind: "request.started", id: 1 });
 		await vi.advanceTimersByTimeAsync(30_000);
 		await failure;
 		expect(transport.terminateCount()).toBe(1);
@@ -836,6 +888,55 @@ test("an unanswered open rejects within its budget and disposes its connection",
 		).rejects.toMatchObject({
 			code: "LIX_ERROR_CLOSED",
 		});
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("an unstarted queued request stays recoverable until admission returns an error", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const pending = client.request({ kind: "activeBranchId" });
+		const failure = expect(pending).rejects.toMatchObject({
+			code: "LIX_WORKER_QUEUE_TIMEOUT",
+		});
+		transport.emit({ kind: "request.queued", id: 1 });
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(transport.terminateCount()).toBe(0);
+		expect(client.isDisposed).toBe(false);
+		transport.emit({
+			id: 1,
+			ok: false,
+			error: {
+				name: "Error",
+				message: "Worker operation waited too long to start",
+				code: "LIX_WORKER_QUEUE_TIMEOUT",
+			},
+		});
+		await failure;
+		expect(transport.terminateCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a worker that never acknowledges request receipt is terminated", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const pending = client.request({ kind: "activeBranchId" });
+		const failure = expect(pending).rejects.toMatchObject({
+			code: "LIX_WORKER_START_TIMEOUT",
+		});
+		await vi.advanceTimersByTimeAsync(30_000);
+		await failure;
+		expect(transport.terminateCount()).toBe(1);
+		expect(client.isDisposed).toBe(true);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -855,6 +956,7 @@ test("lost execute acknowledgement rejects as unknown outcome without replaying"
 		const failure = expect(pending).rejects.toMatchObject({
 			code: "LIX_WRITE_OUTCOME_UNKNOWN",
 		});
+		transport.emit({ kind: "request.started", id: 1 });
 		await vi.advanceTimersByTimeAsync(60_000);
 		await failure;
 		expect(transport.sent).toHaveLength(1);
@@ -862,4 +964,41 @@ test("lost execute acknowledgement rejects as unknown outcome without replaying"
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+test("observer and lifecycle cleanup keep bounded client admission when ordinary work is full", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection, false);
+	client.beginLease();
+	const ordinary: Promise<unknown>[] = [];
+	for (let index = 0; index < 120; index++) {
+		ordinary.push(
+			client.request({ kind: "execute", sql: "SELECT 1", params: [] }),
+		);
+	}
+	const observerCloses: Promise<unknown>[] = [];
+	for (let observeId = 1; observeId <= 32; observeId++) {
+		observerCloses.push(client.request({ kind: "observe.close", observeId }));
+	}
+	const lifecycle: Promise<unknown>[] = [];
+	for (let transactionId = 1; transactionId <= 7; transactionId++) {
+		lifecycle.push(client.request({ kind: "transaction.rollback", transactionId }));
+	}
+	const sessionClose = client.request({ kind: "close" });
+	expect(transport.sent).toHaveLength(160);
+	await expect(
+		client.request({ kind: "execute", sql: "SELECT 2", params: [] }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+	await expect(
+		client.request({ kind: "observe.close", observeId: 33 }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+	await expect(
+		client.request({ kind: "transaction.rollback", transactionId: 8 }),
+	).rejects.toMatchObject({ code: "LIX_WORKER_QUEUE_FULL" });
+
+	for (const request of transport.sent) {
+		if ("id" in request)
+			transport.emit({ id: request.id, ok: true, value: undefined });
+	}
+	await Promise.all([...ordinary, ...observerCloses, ...lifecycle, sessionClose]);
 });
