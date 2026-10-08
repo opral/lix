@@ -387,8 +387,10 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
             None,
+            false,
         )
         .await
+        .map(|_| ())
     }
 }
 

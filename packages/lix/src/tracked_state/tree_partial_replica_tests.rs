@@ -262,4 +262,93 @@ mod partial_replica {
             );
         }
     }
+
+    #[tokio::test]
+    async fn prepared_row_pk_point_read_installs_only_the_selected_head_path() {
+        let authority_memory = Memory::new();
+        let authority = StorageAdapter::new(authority_memory.clone());
+        let tree = TrackedStateTree::new();
+        let row_count = 10_000;
+        let mut primary =
+            crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(row_count);
+        for index in 0..row_count {
+            let file_id = format!("file-{index:05}");
+            let row_pk = format!("row-{index:05}");
+            let key = key("schema", Some(&file_id), &row_pk);
+            let value = value(&format!("change-{index:05}"), Some("{}"));
+            primary.push(
+                TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    row_pk: &key.row_pk,
+                },
+                TrackedStateIndexValueRef {
+                    change_id: value.change_id,
+                    commit_id: value.commit_id,
+                    author_id: &value.author_id,
+                    deleted: value.deleted,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                    semantic_fingerprint: value.semantic_fingerprint,
+                },
+            );
+        }
+        let (_, secondary) =
+            super::super::super::row_pk_index::with_row_pk_index_mutations(primary.finish())
+                .expect("row-PK catalog mutations");
+        let base = apply_mutations_for_test(
+            &tree,
+            &authority,
+            None,
+            secondary.into_mutations(),
+            None,
+        )
+        .await
+        .expect("authority row-PK catalog");
+        let selected = key("schema", Some("file-05000"), "row-05000");
+        let requested = Arc::new(Mutex::new(BTreeSet::new()));
+        let recording = StorageAdapterReadScope::new(RecordingChunkRead {
+            read: authority_memory
+                .begin_read(crate::storage::ReadOptions::default())
+                .await
+                .expect("point-frontier snapshot"),
+            requested: Arc::clone(&requested),
+        });
+        super::super::super::row_pk_index::prepare_row_pk_index_point_inputs(
+            &recording,
+            &base.root_id,
+            std::slice::from_ref(&selected),
+        )
+        .await
+        .expect("selected row-PK point path");
+        drop(recording);
+
+        let requested = requested.lock().expect("recorded hashes").clone();
+        assert_eq!(
+            requested.len(),
+            base.tree_height,
+            "one exact identity should load one chunk per row-PK tree level"
+        );
+        let partial = StorageAdapter::new(Memory::new());
+        copy_chunks(&authority, &partial, requested.iter().copied()).await;
+        let encoded = super::super::super::row_pk_index::encode_row_pk_index_key(
+            TrackedStateKeyRef {
+                schema_key: &selected.schema_key,
+                file_id: selected.file_id.as_deref(),
+                row_pk: &selected.row_pk,
+            },
+        )
+        .expect("selected row-PK key");
+        let read = partial.begin_read(StorageReadOptions::default()).await.unwrap();
+        let resolved = TrackedStateTree::new()
+            .get_many_encoded(&read, &base.root_id, &[Bytes::from(encoded)])
+            .await
+            .expect("point read from retained frontier");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].as_ref().map(|value| value.change_id),
+            Some(ChangeId::for_test_label("change-05000")),
+            "the selected identity resolves without authority access"
+        );
+    }
 }

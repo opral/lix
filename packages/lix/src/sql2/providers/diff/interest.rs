@@ -8,17 +8,18 @@ pub(crate) async fn prepare_native_diff_interest<R>(
     request: &TrackedStateDiffRequest,
     projected_columns: &[String],
     native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
-) -> Result<(), crate::LixError>
+    collect_selected_head_keys: bool,
+) -> Result<Vec<TrackedStateKey>, crate::LixError>
 where
     R: StorageAdapterRead + Clone,
 {
     if from == to {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let prepare = async {
         let from_descriptor = commit_state_descriptor(&store, from).await?;
         let to_descriptor = commit_state_descriptor(&store, to).await?;
-        let mut tracked = TrackedStateContext::new().reader(store);
+        let mut tracked = TrackedStateContext::new().reader(store.clone());
         if let Some(budget) = native_diff_budget {
             tracked = tracked.with_native_diff_identity_budget(budget);
         }
@@ -49,6 +50,22 @@ where
             diff.validate_live_payloads()
                 .map_err(lix_error_to_datafusion_error)?;
         }
+        // Preserve the exact keys produced by the bounded native diff so the
+        // caller can close one combined point frontier against the selected
+        // current head. The authority's shared diff identity budget caps this
+        // set; candidate warming does not request a duplicate key batch.
+        let selected_head_keys = if collect_selected_head_keys {
+            diff.entries
+                .iter()
+                .map(|entry| TrackedStateKey {
+                    schema_key: entry.identity.schema_key().to_owned(),
+                    file_id: entry.identity.file_id().map(str::to_owned),
+                    row_pk: entry.identity.row_pk().clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         match relation {
             "lix_file" => {
                 file_diff_rows(
@@ -82,7 +99,7 @@ where
                 schema_diff_rows(diff, relation, &projection, &from_global, &to_global)?;
             }
         }
-        Ok::<(), DataFusionError>(())
+        Ok::<Vec<TrackedStateKey>, DataFusionError>(selected_head_keys)
     }
     .await;
     prepare.map_err(datafusion_error_to_lix_error)

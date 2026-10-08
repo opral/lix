@@ -128,6 +128,12 @@ where
         String,
         std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>,
     >::new();
+    // Diff identities are prepared separately from the exact mutation
+    // frontier: they need only their selected-head point paths, never mutation
+    // predecessor or successor expansion.
+    let mut selected_head_diff_keys = std::collections::BTreeSet::<
+        crate::tracked_state::TrackedStateKey,
+    >::new();
     // The ordinary native recorder sees physical rows, but direct change
     // locators are derived from the change ID and therefore have no physical
     // row to observe. Retain the returned identities and close this logical
@@ -322,7 +328,14 @@ where
                     branch_id.as_deref(),
                     to,
                 )?;
-                crate::sql2::prepare_native_diff_interest(
+                let collect_selected_head_keys = matches!(
+                    &purpose,
+                    NativeReadPreparationPurpose::Authority { .. }
+                ) && branch_id.as_deref()
+                    == Some(descriptor.selected_branch.branch_id.as_str())
+                    && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
+                    && descriptor.selected_branch.head.row_pk_index_root_id.is_some();
+                selected_head_diff_keys.extend(crate::sql2::prepare_native_diff_interest(
                     read.clone(),
                     relation,
                     &from,
@@ -333,8 +346,9 @@ where
                     },
                     projected_columns,
                     native_diff_budget.clone(),
+                    collect_selected_head_keys,
                 )
-                .await?;
+                .await?);
             }
             LogicalReadInterest::History {
                 branch_id,
@@ -459,6 +473,7 @@ where
                             &request,
                             projected_columns,
                             native_diff_budget.clone(),
+                            false,
                         )
                         .await?;
                     }
@@ -629,6 +644,16 @@ where
             &read,
             &crate::tracked_state::TrackedStateRootId::new(root),
             &keys.into_iter().collect::<Vec<_>>(),
+        )
+        .await?;
+    }
+    if !selected_head_diff_keys.is_empty()
+        && let Some(root) = descriptor.selected_branch.head.row_pk_index_root_id
+    {
+        crate::tracked_state::prepare_row_pk_index_point_inputs(
+            &read,
+            &crate::tracked_state::TrackedStateRootId::new(root),
+            &selected_head_diff_keys.into_iter().collect::<Vec<_>>(),
         )
         .await?;
     }

@@ -2337,6 +2337,110 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         "retained working-diff closure should serve warm count offline"
     );
 
+    // An exact moving-diff route selects a small known identity set. Its
+    // fulfillment must include the selected branch head's row-PK tree point
+    // paths so subsequent execution can finish while the network is held.
+    let mut selected_file_ids = Vec::new();
+    for edit in 0..new_working_edits {
+        let selected_file = authority_execute(
+            &server,
+            authority.lix_id(),
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(format!("/bounded-working-diff/new-{edit}.txt"))],
+        )
+        .await;
+        selected_file_ids.push(
+            selected_file
+                .rows()[0]
+                .get::<String>("id")
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let exact_working_diff_sql =
+        "SELECT id, diff_type FROM lix_diff('lix_file') WHERE id IN ($1, $2, $3) ORDER BY id";
+    let exact_working_diff_params = selected_file_ids
+        .iter()
+        .cloned()
+        .map(Value::Text)
+        .collect::<Vec<_>>();
+    let exact_values = |result: &ExecuteResult| {
+        result.rows().iter().map(|row| (
+            row.get::<String>("id").unwrap(),
+            row.get::<String>("diff_type").unwrap(),
+        )).collect::<Vec<_>>()
+    };
+    let exact_working_expected = authority_execute(
+        &server,
+        authority.lix_id(),
+        exact_working_diff_sql,
+        &exact_working_diff_params,
+    )
+    .await;
+    let exact_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (
+        exact_replica,
+        exact_worker,
+        exact_storage,
+        exact_state,
+        _exact_transport,
+        _exact_engine,
+    ) = open_cold_replica_with_delay(exact_log.clone(), 100).await;
+    exact_log.lock().unwrap().clear();
+    let exact_started = Instant::now();
+    let exact_working = exact_replica
+        .execute(exact_working_diff_sql, &exact_working_diff_params)
+        .await
+        .unwrap();
+    assert_eq!(exact_values(&exact_working), exact_values(&exact_working_expected));
+    assert!(
+        exact_started.elapsed() < std::time::Duration::from_secs(3),
+        "exact selected-head diff should close under a held 100ms network"
+    );
+    let exact_recipes = fulfillment_requests(&exact_log);
+    assert_eq!(exact_recipes.len(), 1);
+    assert!(only_read_fulfillment(&exact_log));
+    assert!(response_bytes(&exact_recipes) < 2 * 1024 * 1024);
+    let selected_head_row_pk_root = exact_state
+        .descriptor()
+        .selected_branch
+        .head
+        .row_pk_index_root_id
+        .expect("selected fixture head has a row-PK root");
+    let root_key = StorageKey(bytes::Bytes::copy_from_slice(
+        &selected_head_row_pk_root,
+    ));
+    let read = exact_storage.begin_read(Default::default()).await.unwrap();
+    let root_values = PointReadPlan::new(
+        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+        std::slice::from_ref(&root_key),
+    )
+        .materialize(&read, Default::default())
+        .await
+        .unwrap()
+        .value;
+    assert!(
+        root_values.first().is_some_and(|value| value.is_some()),
+        "exact diff closure must retain its selected-head row-PK root"
+    );
+    drop(read);
+    exact_log.lock().unwrap().clear();
+    assert_eq!(
+        exact_values(
+            &exact_replica
+                .execute(exact_working_diff_sql, &exact_working_diff_params)
+                .await
+                .unwrap()
+        ),
+        exact_values(&exact_working_expected)
+    );
+    assert!(
+        exact_log.lock().unwrap().is_empty(),
+        "selected-head exact diff closure must execute offline"
+    );
+    exact_replica.close().await.unwrap();
+    exact_worker.abort();
+
     // Keep the moving Diff interest retained while the authority advances its
     // checkpoint and then starts a new active working set. The candidate must
     // use the retained recipe to batch its immutable dependencies before the

@@ -66,7 +66,8 @@ pub(crate) use row_materialization::{
     materialize_batch_from_index_entry_refs,
 };
 pub(crate) use row_pk_index::{
-    backfill_row_pk_index_for_commit, decode_row_pk_index_key, row_pk_index_scan_request,
+    backfill_row_pk_index_for_commit, decode_row_pk_index_key,
+    prepare_row_pk_index_point_inputs, row_pk_index_scan_request,
     stage_row_pk_index_from_deltas, stage_row_pk_index_from_deltas_with_base,
     stage_row_pk_index_from_members, with_row_pk_index_mutations,
 };
