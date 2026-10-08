@@ -3301,7 +3301,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lix"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "ahash",
  "async-stream",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "lix-schema"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-filesystem"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "lix",
  "lix-storage-rocksdb",
@@ -3387,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-rocksdb"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-slatedb"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "lix_collaboration_test_support"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "async-trait",
  "serde",

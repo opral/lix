@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.1 - 2026-10-08
+
+### Patch
+
+- Fixed filesystem deletion sync crashes caused by exhausting the default worker thread stack.
+- Fixed UPDATE and DELETE predicates containing subqueries, allowing applications to mutate related rows directly in SQL. Mutations also support target aliases and preserve OLD and NEW row values in RETURNING expressions.
+- Fixed compilation for Rust applications consuming Lix without an existing dependency lockfile.
+
 ## 0.19.0 — 2026-10-06
 
 ### Improvements
