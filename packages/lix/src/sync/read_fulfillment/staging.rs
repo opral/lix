@@ -32,6 +32,11 @@ pub(crate) struct StagedClosure<S: Storage + Clone + Send + Sync + 'static> {
     state: PartialReplicaState,
     id: uuid::Uuid,
     inputs: Vec<StagedInputRef>,
+    /// Present only while the nonblocking transfer-wide RAM permit is held;
+    /// entries align by index with `inputs` and own their decoded payloads.
+    retained_inputs: Option<Vec<ReadInput>>,
+    retained_payload_bytes: usize,
+    retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
     coordinates: BTreeSet<(StorageSpace, StorageKey)>,
     payload_bytes: usize,
     index_bytes: usize,
@@ -68,6 +73,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         mut header: ReadFulfillmentResponse,
         id: uuid::Uuid,
         permit: lifecycle::Permit,
+        retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
         read_operation_owner: Option<super::super::http::ReadOperationOwner>,
     ) -> Self {
         header.inputs.clear();
@@ -76,6 +82,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             state: state.clone(),
             id,
             inputs: Vec::new(),
+            retained_inputs: retained_payload_permit.as_ref().map(|_| Vec::new()),
+            retained_payload_bytes: 0,
+            retained_payload_permit,
             coordinates: BTreeSet::new(),
             payload_bytes: 0,
             index_bytes: 0,
@@ -129,6 +138,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         if self.released {
             return Ok(());
         }
+        self.retained_inputs.take();
+        self.retained_payload_bytes = 0;
+        self.retained_payload_permit.take();
         if let Some(cleanup) = self.remote_operation_cleanup.take() {
             cleanup().await;
         }
@@ -171,15 +183,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
     }
 
     async fn append_page(&mut self, page: Vec<ReadInput>) -> Result<(), LixError> {
-        let page_bytes = page.iter().map(|input| input.bytes.len()).sum::<usize>();
+        let page_bytes = page
+            .iter()
+            .try_fold(0usize, |total, input| total.checked_add(input.bytes.len()))
+            .ok_or_else(|| invalid("scratch write page size overflowed"))?;
         if page_bytes > PAGE_PAYLOAD_BYTES {
             return Err(invalid("scratch write page exceeds transport budget"));
         }
-        let mut frames = Vec::new();
-        let mut staged = Vec::new();
-        for input in page {
+
+        let mut staged = Vec::with_capacity(page.len());
+        let mut page_coordinates = BTreeSet::new();
+        for input in &page {
             input.address.validate(&input.bytes)?;
-            if !self.coordinates.insert(input.address.coordinate()?) {
+            let coordinate = input.address.coordinate()?;
+            if self.coordinates.contains(&coordinate) || !page_coordinates.insert(coordinate) {
                 return Err(invalid("staged closure repeats an input coordinate"));
             }
             let index_bytes = serde_json::to_vec(&input.address)
@@ -193,29 +210,137 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             {
                 return Err(invalid("staged closure payload or index budget exceeded"));
             }
-            let mut key = self.id.as_bytes().to_vec();
-            key.extend_from_slice(&((self.inputs.len() + staged.len()) as u32).to_be_bytes());
-            key.extend_from_slice(&0u32.to_be_bytes());
-            let key = StorageKey(Bytes::from(key));
             let len = input.bytes.len();
-            let digest = *blake3::hash(&input.bytes).as_bytes();
             self.payload_bytes += len;
             self.index_bytes += index_bytes;
-            frames.push((key.clone(), Bytes::from(input.bytes)));
             staged.push(StagedInputRef {
-                address: input.address,
+                address: input.address.clone(),
                 len,
                 received: len,
-                digest,
-                frames: vec![key],
+                // Retained inputs are validated against the terminal closure
+                // commitment before promotion. Compute a per-input digest only
+                // if they later spill to durable scratch.
+                digest: [0; 32],
+                frames: Vec::new(),
             });
+        }
+
+        self.coordinates.extend(page_coordinates);
+        if self.retained_inputs.is_some()
+            && self
+                .retained_payload_bytes
+                .checked_add(page_bytes)
+                .is_some_and(|total| {
+                    total <= super::super::transfer::RETAINED_READ_CLOSURE_BYTES
+                })
+        {
+            self.retained_payload_bytes += page_bytes;
+            self.inputs.extend(staged);
+            self.retained_inputs
+                .as_mut()
+                .expect("retained payload mode has a payload vector")
+                .extend(page);
+            return Ok(());
+        }
+
+        // The retained closure is always at most one page, so it can be
+        // atomically spilled through the same owner-fenced scratch writer.
+        // Release the process permit only after that write is acknowledged.
+        if self.retained_inputs.is_some() {
+            self.spill_retained().await?;
+        }
+        self.append_page_to_scratch(page, staged).await
+    }
+
+    async fn append_page_to_scratch(
+        &mut self,
+        page: Vec<ReadInput>,
+        mut staged: Vec<StagedInputRef>,
+    ) -> Result<(), LixError> {
+        let page_bytes = page.iter().map(|input| input.bytes.len()).sum::<usize>();
+        if page_bytes > PAGE_PAYLOAD_BYTES || page.len() != staged.len() {
+            return Err(invalid("scratch write page exceeds transport budget"));
+        }
+        let mut frames = Vec::with_capacity(page.len());
+        for (offset, input) in page.into_iter().enumerate() {
+            let index = self.inputs.len() + offset;
+            if staged[offset].address != input.address
+                || staged[offset].len != input.bytes.len()
+            {
+                return Err(invalid("scratch page metadata changed before staging"));
+            }
+            staged[offset].digest = *blake3::hash(&input.bytes).as_bytes();
+            let mut key = self.id.as_bytes().to_vec();
+            key.extend_from_slice(&(index as u32).to_be_bytes());
+            key.extend_from_slice(&0u32.to_be_bytes());
+            let key = StorageKey(Bytes::from(key));
+            staged[offset].frames = vec![key.clone()];
+            frames.push((key, Bytes::from(input.bytes)));
         }
         lifecycle::commit_frames(&self.storage, &self.state, self.id, &frames).await?;
         self.inputs.extend(staged);
         Ok(())
     }
 
+    async fn spill_retained(&mut self) -> Result<(), LixError> {
+        let Some(retained) = self.retained_inputs.as_ref() else {
+            return Ok(());
+        };
+        self.validate_retained_metadata(retained)?;
+        let inputs = self
+            .retained_inputs
+            .take()
+            .expect("retained inputs were checked above");
+        if inputs.is_empty() {
+            self.retained_payload_bytes = 0;
+            self.retained_payload_permit.take();
+            return Ok(());
+        }
+        let staged = std::mem::take(&mut self.inputs);
+        self.append_page_to_scratch(inputs, staged).await?;
+        self.retained_payload_bytes = 0;
+        self.retained_payload_permit.take();
+        Ok(())
+    }
+
+    fn validate_retained_metadata(&self, inputs: &[ReadInput]) -> Result<(), LixError> {
+        let mut payload_bytes = 0usize;
+        if inputs.len() != self.inputs.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "retained read closure has the wrong input count",
+            ));
+        }
+        for (input, staged) in inputs.iter().zip(&self.inputs) {
+            payload_bytes = payload_bytes
+                .checked_add(input.bytes.len())
+                .ok_or_else(|| invalid("retained read closure size overflowed"))?;
+            if input.address != staged.address
+                || input.bytes.len() != staged.len
+                || staged.received != staged.len
+                || !staged.frames.is_empty()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "retained read closure metadata is inconsistent",
+                ));
+            }
+        }
+        if payload_bytes != self.retained_payload_bytes
+            || payload_bytes > super::super::transfer::RETAINED_READ_CLOSURE_BYTES
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "retained read closure exceeds its memory budget",
+            ));
+        }
+        Ok(())
+    }
+
     async fn append_frame(&mut self, frame: ReadInputFrame) -> Result<(), LixError> {
+        if self.retained_inputs.is_some() {
+            self.spill_retained().await?;
+        }
         if frame.offset == 0 {
             if !self.coordinates.insert(frame.address.coordinate()?)
                 || self.inputs.len() >= MAX_RECORDS
@@ -365,6 +490,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
                 "staged read closure admission or terminal page differs",
             ));
         }
+        if let Some(inputs) = self.retained_inputs.as_ref() {
+            self.validate_retained_metadata(inputs)?;
+            let inputs = self
+                .retained_inputs
+                .take()
+                .expect("retained inputs were checked above");
+            self.header.inputs = inputs;
+            let result = validate_complete(request, &self.header);
+            self.retained_inputs = Some(std::mem::take(&mut self.header.inputs));
+            result?;
+            self.validated = true;
+            return Ok(());
+        }
         let mut digest = blake3::Hasher::new();
         digest.update(request.digest()?.as_bytes());
         let mut proof_inputs = Vec::new();
@@ -495,24 +633,46 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
             if group_bytes > MAX_INPUT_BYTES {
                 return Err(invalid("native owner bundle exceeds its codec budget"));
             }
-            let inputs = self.read_many(&group).await?;
-            let mut response = self.header.clone();
-            response.inputs = inputs;
             let finalize = groups.peek().is_none().then_some(
                 ScratchOwnerFinalizeCapability { owner: self.id },
             );
-            let installed = install_inputs(
-                &self.storage,
-                &self.state,
-                request,
-                &response,
-                immutable_only,
-                finalize.as_ref(),
-            )
-            .await?;
+            let installed = if let Some(retained) = self.retained_inputs.as_ref() {
+                let inputs = group
+                    .iter()
+                    .map(|&index| {
+                        retained
+                            .get(index)
+                            .ok_or_else(|| invalid("retained staged input is absent"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                install_inputs_from_refs(
+                    &self.storage,
+                    &self.state,
+                    request,
+                    &inputs,
+                    immutable_only,
+                    finalize.as_ref(),
+                )
+                .await?
+            } else {
+                let owned = self.read_many(&group).await?;
+                let inputs = owned.iter().collect::<Vec<_>>();
+                install_inputs_from_refs(
+                    &self.storage,
+                    &self.state,
+                    request,
+                    &inputs,
+                    immutable_only,
+                    finalize.as_ref(),
+                )
+                .await?
+            };
             hydrated.keys.extend(installed.keys);
             hydrated.blob_manifests.extend(installed.blob_manifests);
         }
+        self.retained_inputs.take();
+        self.retained_payload_bytes = 0;
+        self.retained_payload_permit.take();
         if self.inputs.is_empty() {
             lifecycle::finalize_empty(&self.storage, &self.state, self.id).await?;
         }
@@ -687,22 +847,64 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     C: super::super::http::RawHttpClient + Clone + 'static,
 {
-    fetch_staged_with_permit(
+    // Production capacity is decided before any HTTP dispatch. Unit tests
+    // inject the permit explicitly so concurrent tests stay deterministic.
+    #[cfg(test)]
+    let retained_payload_permit = None;
+    #[cfg(not(test))]
+    let retained_payload_permit =
+        super::super::transfer::RetainedPayloadPermit::try_acquire();
+    fetch_staged_with_permits(
         storage,
         state,
         transport,
         request,
         lifecycle::Permit::acquire()?,
+        retained_payload_permit,
     )
     .await
 }
 
+#[cfg(test)]
 async fn fetch_staged_with_permit<S, C>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
     owner_permit: lifecycle::Permit,
+) -> Result<StagedClosure<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
+    fetch_staged_with_permits(storage, state, transport, request, owner_permit, None).await
+}
+
+#[cfg(test)]
+async fn fetch_staged_with_retained_payload_permit<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    owner_permit: lifecycle::Permit,
+) -> Result<StagedClosure<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
+    let retained = super::super::transfer::RetainedPayloadPermit::try_acquire()
+        .expect("retained payload test owns the bounded slot");
+    fetch_staged_with_permits(storage, state, transport, request, owner_permit, Some(retained))
+        .await
+}
+
+async fn fetch_staged_with_permits<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    owner_permit: lifecycle::Permit,
+    retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
 ) -> Result<StagedClosure<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -726,6 +928,7 @@ where
                 &transport,
                 &request,
                 (owner_id, owner_permit),
+                retained_payload_permit,
                 read_operation_owner,
                 cancel_receiver,
             )
@@ -776,6 +979,20 @@ fn cancellation_error() -> LixError {
     LixError::new("LIX_READ_FULFILLMENT_CANCELED", "staged fetch was canceled")
 }
 
+fn response_header(response: &ReadFulfillmentResponse) -> ReadFulfillmentResponse {
+    ReadFulfillmentResponse {
+        lix_id: response.lix_id.clone(),
+        epoch_id: response.epoch_id.clone(),
+        request_digest: response.request_digest.clone(),
+        inputs: Vec::new(),
+        frame: None,
+        profile: response.profile.clone(),
+        closure_digest: response.closure_digest.clone(),
+        continuation: response.continuation.clone(),
+        outcome: response.outcome,
+    }
+}
+
 struct StagedFetchAttemptError {
     error: LixError,
     remote_operation_cleanup: Option<RemoteOperationCleanup>,
@@ -789,6 +1006,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         // remote operation. The returned process permit stays with the
         // driver's retry/error state, and its outer ReadOperationOwner stays
         // alive until that remote cleanup (or same-ID network retry) finishes.
+        self.retained_inputs.take();
+        self.retained_payload_bytes = 0;
+        self.retained_payload_permit.take();
         let remote_operation_cleanup = self.remote_operation_cleanup.take();
         let _ = self.release_local_scratch().await;
         StagedFetchAttemptError {
@@ -815,6 +1035,7 @@ async fn fetch_staged_owned<S, C>(
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
     initial_owner: (uuid::Uuid, lifecycle::Permit),
+    retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
     read_operation_owner: super::super::http::ReadOperationOwner,
     mut cancellation: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<StagedClosure<S>, LixError>
@@ -828,6 +1049,7 @@ where
     let mut reusable_permit = Some(initial_owner.1);
     let mut next_owner_id = initial_owner.0;
     let mut retry_remote_cleanup: Option<RemoteOperationCleanup> = None;
+    let mut first_retained_payload_permit = retained_payload_permit;
     for _ in 0..3 {
         if cancellation_requested(&mut cancellation) {
             if let Some(cleanup) = retry_remote_cleanup.take() {
@@ -844,6 +1066,7 @@ where
             reusable_permit
                 .take()
                 .map(|permit| (next_owner_id, permit)),
+            first_retained_payload_permit.take(),
             read_operation_owner.clone(),
             &mut cancellation,
         )
@@ -969,6 +1192,7 @@ async fn fetch_staged_once<S, C>(
     transport: &super::super::http::HttpSyncTransport<C>,
     request: &ReadFulfillmentRequest,
     owner: Option<(uuid::Uuid, lifecycle::Permit)>,
+    retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
     read_operation_owner: super::super::http::ReadOperationOwner,
     cancellation: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<StagedClosure<S>, StagedFetchAttemptError>
@@ -1009,6 +1233,7 @@ where
         header,
         id,
         permit,
+        retained_payload_permit,
         Some(read_operation_owner),
     );
     if cancellation_requested(cancellation) {
@@ -1036,9 +1261,7 @@ where
     if cancellation_requested(cancellation) {
         return Err(stage.into_attempt_error(cancellation_error()).await);
     }
-    stage.header = page.clone();
-    stage.header.inputs.clear();
-    stage.header.frame = None;
+    stage.header = response_header(&page);
     if page.outcome != ReadFulfillmentOutcome::Complete {
         if let Err(error) = validate_complete(request, &page) {
             return Err(stage.into_attempt_error(error).await);

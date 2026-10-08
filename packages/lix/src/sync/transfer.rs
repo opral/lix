@@ -4,6 +4,7 @@ use crate::LixError;
 use serde::Serialize;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const CONTENT_GROUP_ITEMS: usize = 32;
 pub(crate) const CONTENT_GROUP_BYTES: usize = 1024 * 1024;
@@ -12,6 +13,29 @@ pub(super) const MANIFEST_PAGE_ITEMS: usize = super::MAX_SYNC_BLOB_BATCH_ITEMS;
 pub(super) const MANIFEST_PAGE_ENCODED_BYTES: usize = CONTENT_GROUP_BYTES;
 pub(super) const MANIFEST_PAGE_DECODED_BYTES: usize = CONTENT_GROUP_BYTES;
 pub(super) const MAX_MANIFEST_SINGLETON_ENCODED_BYTES: usize = 2 * CONTENT_GROUP_BYTES;
+
+/// One read closure may retain at most one transport page per native process
+/// or WASM instance. Requests that cannot reserve this capacity use their
+/// existing durable scratch path without waiting.
+pub(crate) const RETAINED_READ_CLOSURE_BYTES: usize = 4 * 1024 * 1024;
+static RETAINED_READ_CLOSURE_RESERVED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct RetainedPayloadPermit;
+
+impl RetainedPayloadPermit {
+    pub(crate) fn try_acquire() -> Option<Self> {
+        RETAINED_READ_CLOSURE_RESERVED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for RetainedPayloadPermit {
+    fn drop(&mut self) {
+        RETAINED_READ_CLOSURE_RESERVED.store(false, Ordering::Release);
+    }
+}
 
 struct BoundedJsonSizeWriter {
     written: usize,

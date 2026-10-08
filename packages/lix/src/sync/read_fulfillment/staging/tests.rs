@@ -2,9 +2,25 @@ use super::*;
 use std::sync::{
     Arc,
     Mutex,
+    OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::future::Future;
+
+static RETAINED_PAYLOAD_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn retained_payload_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    RETAINED_PAYLOAD_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+fn assert_retained_payload_slot_available() {
+    let permit = super::super::super::transfer::RetainedPayloadPermit::try_acquire()
+        .expect("retained payload slot is restored after the operation");
+    drop(permit);
+}
 
 pub(super) async fn fixture() -> (
     StorageAdapter<Memory>,
@@ -56,6 +72,7 @@ struct CountingStorage {
     conflict_on_joined_commit: Arc<Mutex<Option<(StorageSpace, StorageKey, Bytes)>>>,
     joined_commit_attempts: Arc<AtomicUsize>,
     commit_ack_gate: Arc<Mutex<Option<Arc<CommitAckGate>>>>,
+    fail_scratch_payload_ack_after_commit: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     close_when_ledger_empty: Arc<AtomicBool>,
 }
@@ -99,6 +116,7 @@ struct CountingWrite<W> {
     conflict_on_joined_commit: Arc<Mutex<Option<(StorageSpace, StorageKey, Bytes)>>>,
     joined_commit_attempts: Arc<AtomicUsize>,
     commit_ack_gate: Arc<Mutex<Option<Arc<CommitAckGate>>>>,
+    fail_scratch_payload_ack_after_commit: Arc<AtomicBool>,
     memory: Memory,
     closed: Arc<AtomicBool>,
     close_when_ledger_empty: Arc<AtomicBool>,
@@ -174,6 +192,8 @@ impl Storage for CountingStorage {
         let conflict_on_joined_commit = Arc::clone(&self.conflict_on_joined_commit);
         let joined_commit_attempts = Arc::clone(&self.joined_commit_attempts);
         let commit_ack_gate = Arc::clone(&self.commit_ack_gate);
+        let fail_scratch_payload_ack_after_commit =
+            Arc::clone(&self.fail_scratch_payload_ack_after_commit);
         let closed = Arc::clone(&self.closed);
         let close_when_ledger_empty = Arc::clone(&self.close_when_ledger_empty);
         let memory = self.memory.clone();
@@ -185,6 +205,7 @@ impl Storage for CountingStorage {
                 conflict_on_joined_commit,
                 joined_commit_attempts,
                 commit_ack_gate,
+                fail_scratch_payload_ack_after_commit,
                 memory,
                 closed,
                 close_when_ledger_empty,
@@ -318,6 +339,18 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
                 }
             }
             let result = self.inner.commit().await?;
+            if self
+                .scratch_keys
+                .iter()
+                .any(|key| !key.0.is_empty() && key.0.as_ref() != b"operations")
+                && self
+                    .fail_scratch_payload_ack_after_commit
+                    .swap(false, Ordering::SeqCst)
+            {
+                return Err(StorageError::Closed(
+                    "injected ambiguous scratch payload acknowledgement".into(),
+                ));
+            }
             let gate = if self.scratch_ledger_write {
                 self.commit_ack_gate
                     .lock()
@@ -390,11 +423,25 @@ async fn counting_fixture() -> (
         conflict_on_joined_commit,
         joined_commit_attempts,
         commit_ack_gate: Arc::new(Mutex::new(None)),
+        fail_scratch_payload_ack_after_commit: Arc::new(AtomicBool::new(false)),
         closed: Arc::new(AtomicBool::new(false)),
         close_when_ledger_empty: Arc::new(AtomicBool::new(false)),
     });
     counted.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     (counted, state, request, canonical_commits)
+}
+
+fn staged_payload_put_keys(storage: &StorageAdapter<CountingStorage>) -> Vec<StorageKey> {
+    storage
+        .storage()
+        .commits
+        .lock()
+        .expect("test commit records are not poisoned")
+        .iter()
+        .flat_map(|commit| commit.scratch_keys.iter())
+        .filter(|key| !key.0.is_empty() && key.0.as_ref() != b"operations")
+        .cloned()
+        .collect()
 }
 
 pub(super) async fn stage<S>(
@@ -422,6 +469,39 @@ where
         },
         id,
         permit,
+        None,
+        None,
+    )
+}
+
+async fn stage_with_retained_payload<S>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+) -> StagedClosure<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let (id, permit) = lifecycle::reserve(storage, state).await.unwrap();
+    let retained = super::super::super::transfer::RetainedPayloadPermit::try_acquire()
+        .expect("retained payload test owns the bounded slot");
+    StagedClosure::new(
+        storage,
+        state,
+        ReadFulfillmentResponse {
+            frame: None,
+            lix_id: request.descriptor.lix_id.clone(),
+            epoch_id: request.epoch_id.clone(),
+            request_digest: request.digest().unwrap(),
+            inputs: vec![],
+            profile: Default::default(),
+            closure_digest: input_digest(request, &[]).unwrap(),
+            continuation: None,
+            outcome: ReadFulfillmentOutcome::Complete,
+        },
+        id,
+        permit,
+        Some(retained),
         None,
     )
 }
@@ -1192,6 +1272,7 @@ async fn repository_scratch_admission_is_bounded_and_release_restores_capacity()
 
 #[tokio::test]
 async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_promotion() {
+    let _retained_guard = retained_payload_test_guard().await;
     let (storage, state, mut request, canonical_commits) = counting_fixture().await;
     let change_id = crate::changelog::ChangeId::for_test_label("large-framed-change");
     let owner = crate::changelog::CommitId::for_test_label("large-framed-owner");
@@ -1259,7 +1340,7 @@ async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_p
             },
         ),
     };
-    let mut stage = stage(&storage, &state, &request).await;
+    let mut stage = stage_with_retained_payload(&storage, &state, &request).await;
     let mut digest = blake3::Hasher::new();
     digest.update(request.digest().unwrap().as_bytes());
     update_digest(&mut digest, &input);
@@ -1276,6 +1357,9 @@ async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_p
             .await
             .unwrap();
     }
+    assert!(stage.retained_inputs.is_none());
+    assert!(stage.retained_payload_permit.is_none());
+    assert_retained_payload_slot_available();
     stage.append_page(vec![locator.clone()]).await.unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     for address in [&input.address, &locator.address] {
@@ -1424,6 +1508,7 @@ struct LifecycleReadClient {
     account: String,
     inputs: Vec<ReadInput>,
     paginate: bool,
+    corrupt_closure_digest: bool,
     malformed_first_once: Arc<AtomicBool>,
     active_spools: Arc<AtomicUsize>,
     peak_spools: Arc<AtomicUsize>,
@@ -1442,6 +1527,11 @@ impl LifecycleReadClient {
         } else {
             &self.inputs
         };
+        let mut closure_digest = input_digest(request, closure_inputs).unwrap();
+        if self.corrupt_closure_digest {
+            let replacement = if closure_digest.starts_with('0') { '1' } else { '0' };
+            closure_digest.replace_range(..1, &replacement.to_string());
+        }
         let response = ReadFulfillmentResponse {
             frame: None,
             lix_id: self.lix_id.clone(),
@@ -1449,7 +1539,7 @@ impl LifecycleReadClient {
             request_digest: request.digest().unwrap(),
             inputs,
             profile: Default::default(),
-            closure_digest: input_digest(request, closure_inputs).unwrap(),
+            closure_digest,
             continuation,
             outcome: ReadFulfillmentOutcome::Complete,
         };
@@ -1544,6 +1634,7 @@ fn lifecycle_client(
         account: crate::SYSTEM_ACCOUNT_ID.into(),
         inputs,
         paginate,
+        corrupt_closure_digest: false,
         malformed_first_once: Arc::new(AtomicBool::new(malformed_first_once)),
         active_spools: Arc::new(AtomicUsize::new(0)),
         peak_spools: Arc::new(AtomicUsize::new(0)),
@@ -1721,6 +1812,7 @@ async fn durable_scratch_owner_count<S: Storage + Clone + Send + Sync + 'static>
 
 #[tokio::test]
 async fn staged_fallback_releases_both_quotas_before_nested_current_payload_fetch() {
+    let _retained_guard = retained_payload_test_guard().await;
     for fallback_outcome in [
         ReadFulfillmentOutcome::NativeFallback,
         ReadFulfillmentOutcome::OperationFallback,
@@ -1752,9 +1844,15 @@ async fn staged_fallback_releases_both_quotas_before_nested_current_payload_fetc
         transport.bind_native_baseline_lease(&lease.lease).unwrap();
 
         let fallback_started = std::time::Instant::now();
-        let fallback = fetch_staged(&storage, &state, &transport, &request)
-            .await
-            .unwrap();
+        let fallback = fetch_staged_with_retained_payload_permit(
+            &storage,
+            &state,
+            &transport,
+            &request,
+            lifecycle::Permit::acquire().unwrap(),
+        )
+        .await
+        .unwrap();
         let fallback_ms = fallback_started.elapsed().as_secs_f64() * 1000.0;
         let owners_before_child = durable_scratch_owner_count(&storage).await;
         println!(
@@ -1769,6 +1867,9 @@ async fn staged_fallback_releases_both_quotas_before_nested_current_payload_fetc
         assert_eq!(fallback.outcome(), fallback_outcome);
         assert!(fallback.released);
         assert!(fallback.permit.is_none());
+        assert!(fallback.retained_inputs.is_none());
+        assert!(fallback.retained_payload_permit.is_none());
+        assert_retained_payload_slot_available();
         assert_eq!(owners_before_child, 1, "only the blocker remains owned");
         assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
 
@@ -1812,6 +1913,272 @@ async fn staged_fallback_releases_both_quotas_before_nested_current_payload_fetc
             })
         );
     }
+}
+
+#[tokio::test]
+async fn retained_endpoint_closure_avoids_scratch_and_overflow_spills_exact_inputs() {
+    let _retained_guard = retained_payload_test_guard().await;
+
+    let (storage, state, request, _) = counting_fixture().await;
+    let input = chunk(431, 64 * 1024);
+    let request = lifecycle_request(request, std::slice::from_ref(&input));
+    let client = lifecycle_client(&request, vec![input.clone()], false, false);
+    let transport = lifecycle_transport(&request, client).await;
+    let mut staged = fetch_staged_with_retained_payload_permit(
+        &storage,
+        &state,
+        &transport,
+        &request,
+        lifecycle::Permit::acquire().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.retained_payload_bytes, input.bytes.len());
+    assert_eq!(staged.retained_inputs.as_ref().unwrap().len(), 1);
+    assert!(staged_payload_put_keys(&storage).is_empty());
+
+    let coordinate = input.address.coordinate().unwrap();
+    let hydrated = staged.promote(&request, false).await.unwrap();
+    assert!(hydrated.keys.contains(&coordinate));
+    assert!(staged.retained_inputs.is_none());
+    assert!(staged.retained_payload_permit.is_none());
+    assert!(staged_payload_put_keys(&storage).is_empty());
+    assert_retained_payload_slot_available();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let ReadInputAddress::BlobChunk(hash) = input.address else {
+        unreachable!();
+    };
+    assert_eq!(
+        crate::binary_cas::load_verified_chunk(
+            &read,
+            crate::binary_cas::ChunkHash::from_bytes(hash),
+        )
+        .await
+        .unwrap(),
+        Some(input.bytes)
+    );
+
+    let (storage, state, request, _) = counting_fixture().await;
+    let occupied = super::super::super::transfer::RetainedPayloadPermit::try_acquire()
+        .expect("retained payload test owns the bounded slot");
+    let input = chunk(438, 40 * 1024);
+    let request = lifecycle_request(request, std::slice::from_ref(&input));
+    let client = lifecycle_client(&request, vec![input.clone()], false, false);
+    let transport = lifecycle_transport(&request, client).await;
+    let mut staged = fetch_staged_with_permit(
+        &storage,
+        &state,
+        &transport,
+        &request,
+        lifecycle::Permit::acquire().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(staged.retained_inputs.is_none());
+    assert!(staged.retained_payload_permit.is_none());
+    assert_eq!(staged_payload_put_keys(&storage).len(), 1);
+    let hydrated = staged.promote(&request, false).await.unwrap();
+    let coordinate = input.address.coordinate().unwrap();
+    assert!(hydrated.keys.contains(&coordinate));
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let ReadInputAddress::BlobChunk(hash) = input.address else {
+        unreachable!();
+    };
+    assert_eq!(
+        crate::binary_cas::load_verified_chunk(
+            &read,
+            crate::binary_cas::ChunkHash::from_bytes(hash),
+        )
+        .await
+        .unwrap(),
+        Some(input.bytes)
+    );
+    assert!(super::super::super::transfer::RetainedPayloadPermit::try_acquire().is_none());
+    drop(occupied);
+    assert_retained_payload_slot_available();
+
+    let (storage, state, request, _) = counting_fixture().await;
+    let input = chunk(434, 32 * 1024);
+    let request = lifecycle_request(request, std::slice::from_ref(&input));
+    let mut client = lifecycle_client(&request, vec![input.clone()], false, false);
+    client.corrupt_closure_digest = true;
+    let transport = lifecycle_transport(&request, client).await;
+    let error = fetch_staged_with_retained_payload_permit(
+        &storage,
+        &state,
+        &transport,
+        &request,
+        lifecycle::Permit::acquire().unwrap(),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "LIX_READ_FULFILLMENT_INVALID");
+    assert!(staged_payload_put_keys(&storage).is_empty());
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let coordinate = input.address.coordinate().unwrap();
+    assert!(
+        read.get_many(&[StorageGetManyRequest {
+            space: coordinate.0,
+            keys: &[coordinate.1],
+            opts: Default::default(),
+        }])
+        .await
+        .unwrap()
+        .values[0]
+            .is_none(),
+        "a bad full-closure digest cannot publish retained content"
+    );
+    assert_retained_payload_slot_available();
+
+    let (storage, state, request, _) = counting_fixture().await;
+    let inputs = vec![
+        chunk(432, 5 * 1024 * 1024 / 2),
+        chunk(433, 5 * 1024 * 1024 / 2),
+    ];
+    let request = lifecycle_request(request, &inputs);
+    let client = lifecycle_client(&request, inputs.clone(), true, false);
+    let transport = lifecycle_transport(&request, client).await;
+    let mut staged = fetch_staged_with_retained_payload_permit(
+        &storage,
+        &state,
+        &transport,
+        &request,
+        lifecycle::Permit::acquire().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(staged.retained_inputs.is_none());
+    assert!(staged.retained_payload_permit.is_none());
+    assert_eq!(staged_payload_put_keys(&storage).len(), inputs.len());
+    assert_eq!(
+        staged
+            .read_many(&[0, 1])
+            .await
+            .unwrap()
+            .iter()
+            .map(|input| input.bytes.as_slice())
+            .collect::<Vec<_>>(),
+        inputs
+            .iter()
+            .map(|input| input.bytes.as_slice())
+            .collect::<Vec<_>>()
+    );
+    let hydrated = staged.promote(&request, false).await.unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    for input in inputs {
+        let coordinate = input.address.coordinate().unwrap();
+        assert!(hydrated.keys.contains(&coordinate));
+        let ReadInputAddress::BlobChunk(hash) = input.address else {
+            unreachable!();
+        };
+        assert_eq!(
+            crate::binary_cas::load_verified_chunk(
+                &read,
+                crate::binary_cas::ChunkHash::from_bytes(hash),
+            )
+            .await
+            .unwrap(),
+            Some(input.bytes)
+        );
+    }
+    assert_retained_payload_slot_available();
+
+    let (storage, state, request, _) = counting_fixture().await;
+    storage
+        .storage()
+        .fail_scratch_payload_ack_after_commit
+        .store(true, Ordering::SeqCst);
+    let inputs = vec![
+        chunk(436, 5 * 1024 * 1024 / 2),
+        chunk(437, 5 * 1024 * 1024 / 2),
+    ];
+    let request = lifecycle_request(request, &inputs);
+    let client = lifecycle_client(&request, inputs.clone(), true, false);
+    let transport = lifecycle_transport(&request, client).await;
+    assert!(
+        fetch_staged_with_retained_payload_permit(
+            &storage,
+            &state,
+            &transport,
+            &request,
+            lifecycle::Permit::acquire().unwrap(),
+        )
+        .await
+        .is_err(),
+        "an ambiguous durable spill aborts the fetch attempt"
+    );
+    assert!(
+        !storage
+            .storage()
+            .fail_scratch_payload_ack_after_commit
+            .load(Ordering::SeqCst),
+        "the spill commit was applied before its acknowledgement failed"
+    );
+    assert_eq!(durable_scratch_owner_count(&storage).await, 0);
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut scratch = read
+        .begin_scan(
+            STAGING_SPACE,
+            StorageKeyRange {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+            },
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (scratch_rows, more) = scratch.next_page(32).await.unwrap().into_parts();
+    assert!(!more);
+    assert!(scratch_rows.iter().all(|row| row.key.0.as_ref() == b"operations"));
+    for input in inputs {
+        let coordinate = input.address.coordinate().unwrap();
+        assert!(
+            read.get_many(&[StorageGetManyRequest {
+                space: coordinate.0,
+                keys: &[coordinate.1],
+                opts: Default::default(),
+            }])
+            .await
+            .unwrap()
+            .values[0]
+                .is_none(),
+            "a failed scratch spill never partially promotes canonical data"
+        );
+    }
+    assert_retained_payload_slot_available();
+}
+
+#[tokio::test]
+async fn dropping_retained_payload_attempt_releases_slot_without_publication() {
+    let _retained_guard = retained_payload_test_guard().await;
+    let (storage, state, request, _) = counting_fixture().await;
+    let input = chunk(435, 48 * 1024);
+    let coordinate = input.address.coordinate().unwrap();
+    let mut staged = stage_with_retained_payload(&storage, &state, &request).await;
+    staged.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
+    staged.append_page(vec![input]).await.unwrap();
+    assert!(staged_payload_put_keys(&storage).is_empty());
+    assert!(staged.retained_inputs.is_some());
+
+    drop(staged);
+    assert_retained_payload_slot_available();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(
+        read.get_many(&[StorageGetManyRequest {
+            space: coordinate.0,
+            keys: &[coordinate.1],
+            opts: Default::default(),
+        }])
+        .await
+        .unwrap()
+        .values[0]
+            .is_none(),
+        "dropping an unvalidated retained closure cannot publish its bytes"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -2052,6 +2419,7 @@ async fn successful_paginated_operations_complete_more_than_64_times() {
 
 #[tokio::test]
 async fn lost_terminal_response_retries_once_then_restarts_with_a_fresh_id() {
+    let _retained_guard = retained_payload_test_guard().await;
     for mode in [
         TerminalLossMode::SinglePage,
         TerminalLossMode::PaginatedTerminalPage,
@@ -2069,9 +2437,15 @@ async fn lost_terminal_response_retries_once_then_restarts_with_a_fresh_id() {
         let (transport, fault_state) =
             terminal_loss_transport(&request, inputs.clone(), mode).await;
 
-        let mut stage = fetch_staged(&storage, &state, &transport, &request)
-            .await
-            .unwrap();
+        let mut stage = fetch_staged_with_retained_payload_permit(
+            &storage,
+            &state,
+            &transport,
+            &request,
+            lifecycle::Permit::acquire().unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stage.header.closure_digest, expected_digest);
         let promoted = stage.promote(&request, false).await.unwrap();
         assert!(
@@ -2650,6 +3024,7 @@ async fn retry_reservation_failure_transport(
 
 #[tokio::test]
 async fn canceled_fetch_keeps_reservation_owned_until_durable_commit_acknowledges() {
+    let _retained_guard = retained_payload_test_guard().await;
     let (storage, state, request, _) = counting_fixture().await;
     let input = chunk(301, 1024);
     let request = lifecycle_request(request, std::slice::from_ref(&input));
@@ -2672,12 +3047,21 @@ async fn canceled_fetch_keeps_reservation_owned_until_durable_commit_acknowledge
     let task_state = state.clone();
     let task_transport = transport.clone();
     let task_request = request.clone();
+    let owner_permit = lifecycle::Permit::acquire().unwrap();
     let task = tokio::spawn(async move {
-        fetch_staged(&task_storage, &task_state, &task_transport, &task_request).await
+        fetch_staged_with_retained_payload_permit(
+            &task_storage,
+            &task_state,
+            &task_transport,
+            &task_request,
+            owner_permit,
+        )
+        .await
     });
 
     committed.await.unwrap();
     assert_eq!(durable_scratch_owner_count(&storage).await, 1);
+    assert!(super::super::super::transfer::RetainedPayloadPermit::try_acquire().is_none());
     task.abort();
     let _ = task.await;
     assert_eq!(
@@ -2689,6 +3073,7 @@ async fn canceled_fetch_keeps_reservation_owned_until_durable_commit_acknowledge
 
     acknowledge.send(()).unwrap();
     wait_for_owner_count(&storage, 0).await;
+    assert_retained_payload_slot_available();
     assert_eq!(client_state.entered.load(Ordering::SeqCst), 0);
     assert_eq!(state.baseline_lease().lease_id, baseline_lease_id);
     let coordinate = input.address.coordinate().unwrap();

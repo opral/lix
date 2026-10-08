@@ -3256,17 +3256,37 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
     immutable_only: bool,
     finalize_scratch: Option<&staging::ScratchOwnerFinalizeCapability>,
 ) -> Result<super::runtime::HydratedInputs, LixError> {
-    let payload_change_ids = response
-        .inputs
+    let inputs = response.inputs.iter().collect::<Vec<_>>();
+    install_inputs_from_refs(
+        storage,
+        state,
+        request,
+        &inputs,
+        immutable_only,
+        finalize_scratch,
+    )
+    .await
+}
+
+async fn install_inputs_from_refs<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &ReadFulfillmentRequest,
+    inputs: &[&ReadInput],
+    immutable_only: bool,
+    finalize_scratch: Option<&staging::ScratchOwnerFinalizeCapability>,
+) -> Result<super::runtime::HydratedInputs, LixError> {
+    let payload_change_ids = inputs
         .iter()
+        .copied()
         .filter_map(|input| match &input.address {
             ReadInputAddress::ChangeRecord { change_id, .. } => Some(change_id.clone()),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let paired_change_locator_ids = response
-        .inputs
+    let paired_change_locator_ids = inputs
         .iter()
+        .copied()
         .filter_map(|input| match &input.address {
             ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(change_id))
                 if payload_change_ids.contains(change_id) =>
@@ -3304,7 +3324,7 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
         // bundle whose bytes differ from the authority's optional closure.
         // Load and validate the paired inventory here so preserving it cannot
         // turn a corrupt local header into a permissive cache hit.
-        for input in response.inputs.iter().filter(|input| {
+        for input in inputs.iter().copied().filter(|input| {
             matches!(
                 input.address,
                 ReadInputAddress::Metadata(NativeMetadataRef::CommitStateHeader(_))
@@ -3369,7 +3389,7 @@ async fn install_inputs<S: Storage + Clone + Send + Sync + 'static>(
         }
         let mut manifests = Vec::new();
         let mut chunks = Vec::new();
-        for input in &response.inputs {
+        for &input in inputs {
             // The candidate closure may seed absent mutable-key metadata for
             // later evaluation, but it must never select or replace a local
             // overlay. Required mutable inputs are outside this route; the
