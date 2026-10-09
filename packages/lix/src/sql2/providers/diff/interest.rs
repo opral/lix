@@ -10,6 +10,7 @@ pub(crate) async fn prepare_native_diff_interest<R>(
     projected_columns: &[String],
     native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
     collect_selected_head_keys: bool,
+    collect_working_diff_candidates: bool,
 ) -> Result<PreparedNativeDiffInputs, crate::LixError>
 where
     R: StorageAdapterRead + Clone,
@@ -18,6 +19,7 @@ where
         return Ok(PreparedNativeDiffInputs {
             selected_head_keys: Vec::new(),
             visible_after_change_ids: Vec::new(),
+            raw_working_diff_candidates: None,
         });
     }
     let prepare = async {
@@ -38,7 +40,7 @@ where
         let provenance = projected_columns
             .iter()
             .any(|name| matches!(name.as_str(), "from_lixcol_global" | "to_lixcol_global"));
-        let (diff, from_global, to_global) = effective_diff(
+        let (diff, from_global, to_global, raw_working_diff_candidates) = effective_diff(
             &mut tracked,
             from,
             to,
@@ -48,6 +50,7 @@ where
             None,
             provenance,
             relation == "lix_file",
+            collect_working_diff_candidates,
         )
         .await?;
         if request.retain_payloads {
@@ -114,6 +117,7 @@ where
         Ok::<PreparedNativeDiffInputs, DataFusionError>(PreparedNativeDiffInputs {
             selected_head_keys,
             visible_after_change_ids,
+            raw_working_diff_candidates,
         })
     }
     .await;

@@ -3911,6 +3911,341 @@ async fn export_blob_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Default)]
+    struct ProfileSpaceCounts {
+        name: String,
+        calls: u64,
+        keys: u64,
+        bytes: u64,
+    }
+
+    #[derive(Default)]
+    struct ProfileReadCounters {
+        adapter_calls: AtomicU64,
+        backend_calls: AtomicU64,
+        backend_keys: AtomicU64,
+        backend_bytes: AtomicU64,
+        empty_calls: AtomicU64,
+        scans: AtomicU64,
+        by_space: Mutex<BTreeMap<u32, ProfileSpaceCounts>>,
+        unique_keys: Mutex<BTreeSet<(u32, StorageKey)>>,
+        unique_value_keys: Mutex<BTreeSet<(u32, StorageKey)>>,
+        unique_value_bytes: AtomicU64,
+    }
+
+    #[derive(Clone)]
+    struct LatencyProfileRead<R> {
+        inner: Arc<R>,
+        counters: Arc<ProfileReadCounters>,
+        latency: Duration,
+    }
+
+    impl<R> LatencyProfileRead<R> {
+        fn new(inner: R, latency: Duration) -> Self {
+            Self {
+                inner: Arc::new(inner),
+                counters: Arc::new(ProfileReadCounters::default()),
+                latency,
+            }
+        }
+
+        fn record_point_call(&self, requests: &[StorageGetManyRequest<'_>]) -> bool {
+            self.counters.adapter_calls.fetch_add(1, Ordering::Relaxed);
+            let key_count = requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum::<u64>();
+            if key_count == 0 {
+                self.counters.empty_calls.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            self.counters.backend_calls.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .backend_keys
+                .fetch_add(key_count, Ordering::Relaxed);
+            let mut by_space = self.counters.by_space.lock().unwrap();
+            for request in requests {
+                let counts = by_space.entry(request.space.id.0).or_default();
+                counts.name = request.space.name.to_owned();
+                if !request.keys.is_empty() {
+                    counts.calls += 1;
+                    counts.keys += request.keys.len() as u64;
+                }
+                let mut unique_keys = self.counters.unique_keys.lock().unwrap();
+                unique_keys.extend(
+                    request
+                        .keys
+                        .iter()
+                        .cloned()
+                        .map(|key| (request.space.id.0, key)),
+                );
+            }
+            true
+        }
+
+        fn record_result_bytes(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+            values: &[Option<StorageProjectedValue>],
+        ) {
+            let bytes = values
+                .iter()
+                .flatten()
+                .map(|value| match value {
+                    StorageProjectedValue::KeyOnly => 0,
+                    StorageProjectedValue::FullValue(value) => value.len() as u64,
+                })
+                .sum::<u64>();
+            self.counters
+                .backend_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            let mut by_space = self.counters.by_space.lock().unwrap();
+            let mut remaining = bytes;
+            let mut offset: usize = 0;
+            for request in requests {
+                let counts = by_space.entry(request.space.id.0).or_default();
+                counts.name = request.space.name.to_owned();
+                let end = offset.saturating_add(request.keys.len()).min(values.len());
+                let request_bytes = values[offset..end]
+                    .iter()
+                    .flatten()
+                    .map(|value| match value {
+                        StorageProjectedValue::KeyOnly => 0,
+                        StorageProjectedValue::FullValue(value) => value.len() as u64,
+                    })
+                    .sum::<u64>()
+                    .min(remaining);
+                counts.bytes += request_bytes;
+                remaining -= request_bytes;
+                let end = offset.saturating_add(request.keys.len()).min(values.len());
+                let mut unique_value_keys = self.counters.unique_value_keys.lock().unwrap();
+                for (key, value) in request.keys.iter().zip(&values[offset..end]) {
+                    if unique_value_keys.insert((request.space.id.0, key.clone())) {
+                        let value_bytes = match value {
+                            Some(StorageProjectedValue::FullValue(value)) => value.len() as u64,
+                            Some(StorageProjectedValue::KeyOnly) | None => 0,
+                        };
+                        self.counters
+                            .unique_value_bytes
+                            .fetch_add(value_bytes, Ordering::Relaxed);
+                    }
+                }
+                offset = end;
+            }
+        }
+
+        fn summary(&self) -> serde_json::Value {
+            let spaces = self
+                .counters
+                .by_space
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(space, counts)| {
+                    serde_json::json!({
+                        "space_id": space,
+                        "space_name": counts.name,
+                        "calls": counts.calls,
+                        "keys": counts.keys,
+                        "bytes": counts.bytes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "adapter_calls": self.counters.adapter_calls.load(Ordering::Relaxed),
+                "backend_calls": self.counters.backend_calls.load(Ordering::Relaxed),
+                "backend_keys": self.counters.backend_keys.load(Ordering::Relaxed),
+                "backend_bytes": self.counters.backend_bytes.load(Ordering::Relaxed),
+                "unique_backend_keys": self.counters.unique_keys.lock().unwrap().len(),
+                "unique_value_bytes": self.counters.unique_value_bytes.load(Ordering::Relaxed),
+                "duplicate_key_occurrences": self.counters.backend_keys.load(Ordering::Relaxed)
+                    .saturating_sub(self.counters.unique_keys.lock().unwrap().len() as u64),
+                "empty_calls": self.counters.empty_calls.load(Ordering::Relaxed),
+                "scans": self.counters.scans.load(Ordering::Relaxed),
+                "spaces": spaces,
+            })
+        }
+    }
+
+    impl<R: StorageAdapterRead> StorageAdapterRead for LatencyProfileRead<R> {
+        fn requires_physical_reads(&self) -> bool {
+            self.inner.requires_physical_reads()
+        }
+
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        async fn get_many(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+        ) -> Result<StorageGetManyResult, StorageError> {
+            let physical = self.record_point_call(requests);
+            if physical {
+                tokio::time::sleep(self.latency).await;
+            }
+            let result = self.inner.get_many(requests).await?;
+            self.record_result_bytes(requests, &result.values);
+            Ok(result)
+        }
+
+        async fn get_many_bounded(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+            budget: ReadBudget,
+        ) -> Result<StorageGetManyResult, StorageError> {
+            let physical = self.record_point_call(requests);
+            if physical {
+                tokio::time::sleep(self.latency).await;
+            }
+            let result = self.inner.get_many_bounded(requests, budget).await?;
+            self.record_result_bytes(requests, &result.values);
+            Ok(result)
+        }
+
+        async fn get_many_bounded_prefix(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+            offset: usize,
+            max_slots: usize,
+            budget: ReadBudget,
+        ) -> Result<GetManyPrefixResult, StorageError> {
+            let physical = self.record_point_call(requests);
+            if physical {
+                tokio::time::sleep(self.latency).await;
+            }
+            let result = self
+                .inner
+                .get_many_bounded_prefix(requests, offset, max_slots, budget)
+                .await?;
+            self.record_result_bytes(requests, &result.values);
+            Ok(result)
+        }
+
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: StorageKeyRange,
+            opts: StorageBeginScanOptions,
+        ) -> Result<StorageScanCursor<'_>, StorageError> {
+            self.counters.scans.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.latency).await;
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn working_diff_authority_reuses_raw_candidates_and_completes_closure() {
+        const FILES: usize = 13;
+        const BACKEND_DELAY: Duration = Duration::from_millis(1);
+
+        for edit_count in [13usize, 30usize] {
+        let authority = crate::open_lix().await.unwrap();
+        authority.set_sync_role(super::super::SyncRole::Authority).unwrap();
+        for index in 0..FILES {
+            authority
+                .execute(
+                    "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+                    &[
+                        crate::Value::Text(uuid::Uuid::now_v7().to_string()),
+                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                        crate::Value::Blob(Bytes::from_static(b"before").into()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
+        for edit in 0..edit_count {
+            let index = edit % FILES;
+            authority
+                .execute(
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
+                    &[
+                        crate::Value::Blob(Bytes::from(format!("after-{edit}-{index}")).into()),
+                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let descriptor = leased.descriptor;
+        let head = descriptor.selected_branch.head.commit_id.clone();
+        assert_ne!(checkpoint.to_string(), head);
+        let interest = LogicalReadInterest::Diff {
+            branch_id: Some(descriptor.selected_branch.branch_id.clone()),
+            relation: "lix_file".to_owned(),
+            from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+            filter: crate::tracked_state::TrackedStateFilter {
+                include_tombstones: true,
+                ..Default::default()
+            },
+            retain_payloads: false,
+            projected_columns: Vec::new(),
+            limit: None,
+        };
+        let request = ReadFulfillmentRequest {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            release: false,
+            operation_expires_at_ms: leased.lease.expires_at_ms,
+            epoch_id: uuid::Uuid::now_v7().to_string(),
+            descriptor: descriptor.clone(),
+            interests: vec![interest],
+            required: vec![ReadInputAddress::Metadata(
+                NativeMetadataRef::CommitStateHeader(head.clone()),
+            )],
+            continuation: None,
+        };
+        request.validate(&descriptor.lix_id).unwrap();
+        let read = authority
+            .storage_adapter()
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let profiled = LatencyProfileRead::new(Arc::new(read), BACKEND_DELAY);
+        let checkpoint = descriptor.selected_branch.checkpoint.commit_id.clone();
+        crate::tracked_state::arm_diff_commits_test_probe(&checkpoint, &head);
+        let started = Instant::now();
+        let response = discover(
+            profiled.clone(),
+            &descriptor.lix_id,
+            authority.active_account_id(),
+            &leased.lease.lease_id,
+            &request,
+            crate::hot_state::HotStateContext::new(
+                crate::tracked_state::TrackedStateContext::new(),
+                crate::commit_graph::CommitGraphContext::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        let diff_passes = crate::tracked_state::take_diff_commits_test_probe(&checkpoint, &head);
+        assert_eq!(response.outcome, ReadFulfillmentOutcome::Complete);
+        assert_eq!(diff_passes, 1, "working diff raw candidates should be reused");
+        assert!(response.inputs.iter().any(|input| {
+            input.address
+                == ReadInputAddress::Metadata(NativeMetadataRef::CommitStateHeader(head.clone()))
+        }));
+        eprintln!(
+            "working_diff_profile files={FILES} edits={edit_count} diff_passes={diff_passes} inputs={} backend_delay_us={} elapsed_ms={} fulfillment_profile={} backend_profile={}",
+            response.inputs.len(),
+            BACKEND_DELAY.as_micros(),
+            elapsed.as_millis(),
+            serde_json::to_string(&response.profile).unwrap(),
+            serde_json::to_string(&profiled.summary()).unwrap(),
+        );
+        authority.close().await.unwrap();
+        }
+    }
 
     async fn fixture() -> (ReadFulfillmentRequest, ReadFulfillmentResponse) {
         let authority = crate::open_lix().await.unwrap();

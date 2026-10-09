@@ -37,6 +37,7 @@ pub(crate) use crate::row_columnar::{RowColumnarWriteSets, row_group_set_id};
 #[allow(unused_imports)]
 pub(crate) use context::{
     BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
+    PreparedWorkingDiffMutationCandidates,
 };
 pub(crate) fn is_derived_schema(schema_key: &str) -> bool {
     derived::is_derived_schema(schema_key)

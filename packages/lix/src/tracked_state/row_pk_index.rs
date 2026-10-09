@@ -12,6 +12,7 @@ use crate::tracked_state::types::{
     TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
+use crate::tracked_state::TrackedStateDiff;
 use crate::{LixError, NullableKeyFilter};
 
 const NULL_FILE_ID_TAG: &str = "n";
@@ -520,6 +521,47 @@ pub(crate) async fn prepare_row_pk_mutation_inputs_at_commit(
         })?;
     if let Some(root) = topology.row_pk_index_root_id() {
         prepare_row_pk_index_mutation_inputs(store, root, keys).await?;
+    }
+    Ok(())
+}
+
+/// Prepare mutation paths directly from a retained raw endpoint diff. Its
+/// dictionary-backed identities remain shared with the effective diff result,
+/// avoiding a second owned `TrackedStateKey` batch for this operation.
+pub(crate) async fn prepare_row_pk_mutation_inputs_at_commit_from_diff(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: crate::changelog::CommitId,
+    diff: &TrackedStateDiff,
+) -> Result<(), LixError> {
+    if diff.entries.is_empty() {
+        return Ok(());
+    }
+    let topology = super::storage::load_published_commit_state_topology(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "current mutation preparation lacks its native header",
+                ),
+            )
+        })?;
+    if let Some(root) = topology.row_pk_index_root_id() {
+        let encoded = diff
+            .entries
+            .iter()
+            .map(|entry| {
+                encode_row_pk_index_key(TrackedStateKeyRef {
+                    schema_key: entry.identity.schema_key(),
+                    file_id: entry.identity.file_id(),
+                    row_pk: entry.identity.row_pk(),
+                })
+                .map(bytes::Bytes::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        super::tree::TrackedStateTree::new()
+            .prepare_existing_key_mutation_inputs(store, root, &encoded)
+            .await?;
     }
     Ok(())
 }

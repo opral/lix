@@ -24,7 +24,8 @@ use crate::hot_state::{
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
+    TrackedStateContext, TrackedStateDiff, TrackedStateFilter, TrackedStateReadColumns,
+    TrackedStateScanRequest,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -46,6 +47,21 @@ const EXACT_COUNT_GLOBAL_MAX_ENTRIES: usize = 128;
 const EXACT_COUNT_GLOBAL_MAX_BYTES: usize = 512 * 1024;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
+
+/// One root-local diff candidate batch retained during this authority's
+/// preparation call. The caller supplies it only for an accepted moving
+/// working-diff recipe; this context still checks the captured branch control
+/// before using the identities for checkpoint mutation paths.
+pub(crate) struct PreparedWorkingDiffMutationCandidates {
+    pub(crate) branch_id: String,
+    pub(crate) checkpoint_commit_id: String,
+    pub(crate) head_commit_id: String,
+    pub(crate) relation: String,
+    pub(crate) filter: TrackedStateFilter,
+    pub(crate) retain_payloads: bool,
+    pub(crate) projected_columns: Vec<String>,
+    pub(crate) diff: std::sync::Arc<TrackedStateDiff>,
+}
 
 /// Transaction-local branch publication controls.
 ///
@@ -1984,6 +2000,7 @@ where
             captured,
             active_account_id,
             None,
+            &[],
         )
     }
 
@@ -1992,6 +2009,7 @@ where
         captured: &'a super::ReadInterestSnapshot,
         active_account_id: &'a str,
         native_diff_budget: Option<crate::tracked_state::NativeDiffIdentityBudget>,
+        working_diff_candidates: &'a [PreparedWorkingDiffMutationCandidates],
     ) -> futures_util::future::BoxFuture<
         'a,
         Result<Vec<(String, crate::tracked_state::TrackedStateKey)>, LixError>,
@@ -2054,7 +2072,10 @@ where
                         from: super::DiffInterestEndpoint::WorkingCheckpoint,
                         to: super::DiffInterestEndpoint::ActiveHead,
                         filter,
-                        ..
+                        relation,
+                        retain_payloads,
+                        projected_columns,
+                        limit,
                     } => {
                         // Only a working diff requests checkpoint publication
                         // inputs. Ordinary current reads and fixed historical
@@ -2074,35 +2095,57 @@ where
                         if let Some(checkpoint) = control.working_diff_checkpoint_commit_id
                             && checkpoint != control.head_commit_id
                         {
-                            let mut tracked = TrackedStateContext::new().reader(&self.store);
-                            if let Some(budget) = native_diff_budget.clone() {
-                                tracked = tracked.with_native_diff_identity_budget(budget);
-                            }
-                            let diff = tracked
-                                .diff_commits(
-                                    &checkpoint.to_string(),
-                                    &control.head_commit_id.to_string(),
-                                    &crate::tracked_state::TrackedStateDiffRequest {
-                                        filter: filter.clone(),
-                                        retain_payloads: false,
-                                    },
+                            let captured = (!retain_payloads && limit.is_none()).then(|| {
+                                working_diff_candidates.iter().find(|candidate| {
+                                    candidate.branch_id == *branch
+                                        && candidate.checkpoint_commit_id
+                                            == checkpoint.to_string()
+                                        && candidate.head_commit_id
+                                            == control.head_commit_id.to_string()
+                        && candidate.relation == *relation
+                        && candidate.filter == *filter
+                        && candidate.retain_payloads == *retain_payloads
+                        && candidate.projected_columns == *projected_columns
+                                })
+                            }).flatten();
+                            if let Some(candidate) = captured {
+                                crate::tracked_state::prepare_row_pk_mutation_inputs_at_commit_from_diff(
+                                    &self.store,
+                                    checkpoint,
+                                    &candidate.diff,
                                 )
                                 .await?;
-                            let keys = diff
-                                .entries
-                                .iter()
-                                .map(|entry| crate::tracked_state::TrackedStateKey {
-                                    schema_key: entry.identity.schema_key().to_owned(),
-                                    file_id: entry.identity.file_id().map(str::to_owned),
-                                    row_pk: entry.identity.row_pk().clone(),
-                                })
-                                .collect::<Vec<_>>();
-                            crate::tracked_state::prepare_row_pk_mutation_inputs_at_commit(
-                                &self.store,
-                                checkpoint,
-                                &keys,
-                            )
-                            .await?;
+                            } else {
+                                let mut tracked = TrackedStateContext::new().reader(&self.store);
+                                if let Some(budget) = native_diff_budget.clone() {
+                                    tracked = tracked.with_native_diff_identity_budget(budget);
+                                }
+                                let diff = tracked
+                                    .diff_commits(
+                                        &checkpoint.to_string(),
+                                        &control.head_commit_id.to_string(),
+                                        &crate::tracked_state::TrackedStateDiffRequest {
+                                            filter: filter.clone(),
+                                            retain_payloads: false,
+                                        },
+                                    )
+                                    .await?;
+                                let keys = diff
+                                    .entries
+                                    .iter()
+                                    .map(|entry| crate::tracked_state::TrackedStateKey {
+                                        schema_key: entry.identity.schema_key().to_owned(),
+                                        file_id: entry.identity.file_id().map(str::to_owned),
+                                        row_pk: entry.identity.row_pk().clone(),
+                                    })
+                                    .collect::<Vec<_>>();
+                                crate::tracked_state::prepare_row_pk_mutation_inputs_at_commit(
+                                    &self.store,
+                                    checkpoint,
+                                    &keys,
+                                )
+                                .await?;
+                            }
                         }
                         continue;
                     }
