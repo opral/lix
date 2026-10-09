@@ -33,6 +33,9 @@ const MAX_PAGES: usize = 2 * MAX_PAYLOAD_BYTES / PAGE_PAYLOAD_BYTES + 1;
 const MAX_RECORDS: usize = 16384;
 const MAX_READ_CALLS: usize = 65536;
 const MAX_READ_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_POINT_READ_CACHE_KEYS: usize = 512;
+const MAX_POINT_READ_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_POINT_READ_CACHE_KEY_BYTES: usize = 64 * 1024;
 const MAX_RECIPE_BYTES: usize = 512 * 1024;
 const MARKER: &str = "readFulfillment";
 
@@ -1141,19 +1144,87 @@ fn append_receipt_input(
 #[derive(Default)]
 struct Observations {
     values: BTreeMap<(StorageSpace, StorageKey), spool::PayloadRef>,
+    point_read_cache: BTreeMap<(StorageSpace, StorageKey), Bytes>,
+    point_read_cache_bytes: usize,
+    point_read_cache_key_bytes: usize,
     payloads: Arc<Mutex<spool::PayloadSpool>>,
     profile: DiscoveryProfile,
+    work_calls: usize,
+    requested_keys: usize,
+    logical_output_bytes: usize,
     exhausted: bool,
 }
 impl Observations {
     fn charge_call(&mut self) -> Result<(), StorageError> {
-        if self.profile.storage_calls >= MAX_READ_CALLS {
+        self.charge_work_call()?;
+        self.charge_storage_call()
+    }
+    fn charge_work_call(&mut self) -> Result<(), StorageError> {
+        if self.work_calls >= MAX_READ_CALLS {
             self.exhausted = true;
             return Err(StorageError::Io(
                 "read discovery work limit exceeded".into(),
             ));
         }
+        self.work_calls += 1;
+        Ok(())
+    }
+    fn charge_storage_call(&mut self) -> Result<(), StorageError> {
+        if self.profile.storage_calls >= MAX_READ_CALLS {
+            self.exhausted = true;
+            return Err(StorageError::Io(
+                "read discovery storage call limit exceeded".into(),
+            ));
+        }
         self.profile.storage_calls += 1;
+        Ok(())
+    }
+    fn charge_requested_keys(&mut self, keys: usize) -> Result<(), StorageError> {
+        let Some(next) = self.requested_keys.checked_add(keys) else {
+            self.exhausted = true;
+            return Err(StorageError::Io(
+                "read discovery requested key budget exceeded".into(),
+            ));
+        };
+        if next > 4 * MAX_READ_CALLS {
+            self.exhausted = true;
+            return Err(StorageError::Io(
+                "read discovery requested key budget exceeded".into(),
+            ));
+        }
+        self.requested_keys = next;
+        Ok(())
+    }
+    fn charge_storage_keys(&mut self, keys: usize) -> Result<(), StorageError> {
+        let Some(next) = self.profile.storage_keys.checked_add(keys) else {
+            self.exhausted = true;
+            return Err(StorageError::Io(
+                "read discovery physical key budget exceeded".into(),
+            ));
+        };
+        if next > 4 * MAX_READ_CALLS {
+            self.exhausted = true;
+            return Err(StorageError::Io(
+                "read discovery physical key budget exceeded".into(),
+            ));
+        }
+        self.profile.storage_keys = next;
+        Ok(())
+    }
+    fn ensure_logical_output_bytes(&mut self, bytes: usize) -> Result<(), StorageError> {
+        if self
+            .logical_output_bytes
+            .checked_add(bytes)
+            .is_none_or(|next| next > MAX_READ_BYTES)
+        {
+            self.exhausted = true;
+            return Err(StorageError::ReadBudgetExceeded { singleton: false });
+        }
+        Ok(())
+    }
+    fn charge_logical_output_bytes(&mut self, bytes: usize) -> Result<(), StorageError> {
+        self.ensure_logical_output_bytes(bytes)?;
+        self.logical_output_bytes += bytes;
         Ok(())
     }
     fn observe(
@@ -1172,6 +1243,7 @@ impl Observations {
                 "read discovery byte limit exceeded".into(),
             ));
         }
+        self.charge_logical_output_bytes(bytes.len())?;
         if !is_input_space(space) {
             return Ok(());
         }
@@ -1193,6 +1265,28 @@ impl Observations {
                     StorageError::Io(error.to_string())
                 })?;
             self.values.insert((space, key.clone()), payload);
+        }
+        if !self.point_read_cache.contains_key(&(space, key.clone()))
+            && self.point_read_cache.len() < MAX_POINT_READ_CACHE_KEYS
+        {
+            let Some(cache_bytes) = self.point_read_cache_bytes.checked_add(bytes.len()) else {
+                return Ok(());
+            };
+            let Some(cache_key_bytes) = self.point_read_cache_key_bytes.checked_add(key.0.len())
+            else {
+                return Ok(());
+            };
+            if cache_bytes <= MAX_POINT_READ_CACHE_BYTES
+                && cache_key_bytes <= MAX_POINT_READ_CACHE_KEY_BYTES
+            {
+                self.point_read_cache
+                    .insert(
+                        (space, StorageKey(Bytes::copy_from_slice(&key.0))),
+                        Bytes::copy_from_slice(bytes),
+                    );
+                self.point_read_cache_bytes = cache_bytes;
+                self.point_read_cache_key_bytes = cache_key_bytes;
+            }
         }
         Ok(())
     }
@@ -1224,61 +1318,158 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
         &self,
         requests: &[StorageGetManyRequest<'_>],
     ) -> Result<StorageGetManyResult, StorageError> {
+        let total_keys = requests.iter().try_fold(0usize, |total, request| {
+            total
+                .checked_add(request.keys.len())
+                .ok_or(StorageError::InvalidKey)
+        })?;
+        let mut slots = Vec::new();
+        let mut miss_ranges = Vec::new();
+        let mut cached_output_bytes = 0usize;
+        let mut miss_count = 0usize;
         {
             let mut observations = self.observations.lock().unwrap();
-            observations.charge_call()?;
-            let keys = requests
-                .iter()
-                .map(|request| request.keys.len())
-                .sum::<usize>();
-            observations.profile.storage_keys =
-                observations.profile.storage_keys.saturating_add(keys);
-            if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
-                observations.exhausted = true;
-                return Err(StorageError::Io(
-                    "read discovery physical key budget exceeded".into(),
-                ));
+            observations.charge_work_call()?;
+            observations.charge_requested_keys(total_keys)?;
+            slots.reserve(total_keys);
+            for (request_index, request) in requests.iter().enumerate() {
+                let mut miss_start = None;
+                for (key_index, key) in request.keys.iter().enumerate() {
+                    let cache_key = (request.space, key.clone());
+                    let cached_len = is_input_space(request.space)
+                        .then(|| observations.point_read_cache.get(&cache_key).map(Bytes::len))
+                        .flatten();
+                    let cached = if let Some(cached_len) = cached_len {
+                        let projected = match request.opts.projection {
+                            StorageCoreProjection::KeyOnly => StorageProjectedValue::KeyOnly,
+                            StorageCoreProjection::FullValue => {
+                                let Some(next_bytes) = cached_output_bytes.checked_add(cached_len)
+                                else {
+                                    observations.exhausted = true;
+                                    return Err(StorageError::ReadBudgetExceeded {
+                                        singleton: false,
+                                    });
+                                };
+                                if next_bytes > MAX_INPUT_BYTES {
+                                    observations.exhausted = true;
+                                    return Err(StorageError::ReadBudgetExceeded {
+                                        singleton: false,
+                                    });
+                                }
+                                observations.ensure_logical_output_bytes(next_bytes)?;
+                                cached_output_bytes = next_bytes;
+                                let bytes = observations
+                                    .point_read_cache
+                                    .get(&cache_key)
+                                    .expect("cache value remains present under observations lock")
+                                    .clone();
+                                StorageProjectedValue::FullValue(bytes)
+                            }
+                        };
+                        Some(projected)
+                    } else {
+                        None
+                    };
+                    if cached.is_some() {
+                        if let Some(start) = miss_start.take() {
+                            miss_ranges.push((request_index, start, key_index));
+                        }
+                    } else {
+                        miss_count += 1;
+                        miss_start.get_or_insert(key_index);
+                    }
+                    slots.push(cached);
+                }
+                if let Some(start) = miss_start {
+                    miss_ranges.push((request_index, start, request.keys.len()));
+                }
+            }
+            observations.ensure_logical_output_bytes(cached_output_bytes)?;
+            observations.charge_logical_output_bytes(cached_output_bytes)?;
+            observations.charge_storage_keys(miss_count)?;
+            if miss_count > 0 {
+                // Cache-only requests still consume the request work budget,
+                // but do not count as physical storage calls.
+                observations.charge_storage_call()?;
             }
         }
-        let (result, peak_provider_bytes, pages) = collect_bounded_point_pages(
-            &self.base,
-            requests,
-            DISCOVERY_READ_BUDGET,
-            MAX_INPUT_BYTES,
-            32,
-        )
-        .await
-        .map_err(|error| {
-            if matches!(error, StorageError::ReadBudgetExceeded { .. }) {
-                self.observations.lock().unwrap().exhausted = true;
-            }
-            error
-        })?;
-        let mut values = result.values.iter();
+
+        let missing_requests = miss_ranges
+            .iter()
+            .map(|(request_index, start, end)| {
+                let request = &requests[*request_index];
+                StorageGetManyRequest {
+                    space: request.space,
+                    keys: &request.keys[*start..*end],
+                    opts: request.opts,
+                }
+            })
+            .collect::<Vec<_>>();
+        let logical_output_bytes = {
+            let observations = self.observations.lock().unwrap();
+            MAX_READ_BYTES
+                .checked_sub(observations.logical_output_bytes)
+                .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?
+        };
+        let remaining_bytes = MAX_INPUT_BYTES
+            .saturating_sub(cached_output_bytes)
+            .min(logical_output_bytes);
+        let (fetched, peak_provider_bytes, pages) = if miss_count == 0 {
+            (Vec::new(), 0, 0)
+        } else {
+            let (result, peak_provider_bytes, pages) = collect_bounded_point_pages(
+                &self.base,
+                &missing_requests,
+                DISCOVERY_READ_BUDGET,
+                remaining_bytes,
+                32,
+            )
+            .await
+            .map_err(|error| {
+                if matches!(error, StorageError::ReadBudgetExceeded { .. }) {
+                    self.observations.lock().unwrap().exhausted = true;
+                }
+                error
+            })?;
+            (result.values, peak_provider_bytes, pages)
+        };
+
+        let mut fetched = fetched.into_iter();
+        let mut slots = slots.into_iter();
         let mut observations = self.observations.lock().unwrap();
         for _ in 1..pages {
-            observations.charge_call()?;
+            observations.charge_work_call()?;
+            observations.charge_storage_call()?;
         }
         observations.profile.peak_provider_bytes = observations
             .profile
             .peak_provider_bytes
             .max(peak_provider_bytes);
+        let mut values = Vec::with_capacity(total_keys);
         for request in requests {
             for key in request.keys {
-                let value = values.next().ok_or_else(|| {
+                let slot = slots.next().ok_or_else(|| {
                     StorageError::Io("discovery storage cardinality mismatch".into())
                 })?;
-                if let Some(value) = value {
+                if let Some(value) = slot {
+                    values.push(Some(value));
+                    continue;
+                }
+                let value = fetched.next().ok_or_else(|| {
+                    StorageError::Io("discovery storage cardinality mismatch".into())
+                })?;
+                if let Some(value) = &value {
                     observations.observe(request.space, key, value)?;
                 }
+                values.push(value);
             }
         }
-        if values.next().is_some() {
+        if slots.next().is_some() || fetched.next().is_some() {
             return Err(StorageError::Io(
                 "discovery storage cardinality mismatch".into(),
             ));
         }
-        Ok(result)
+        Ok(StorageGetManyResult::new(values))
     }
     async fn get_many_bounded_prefix(
         &self,
@@ -1288,13 +1479,21 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
         budget: ReadBudget,
     ) -> Result<GetManyPrefixResult, StorageError> {
         self.observations.lock().unwrap().charge_call()?;
+        let remaining_logical_bytes = {
+            let observations = self.observations.lock().unwrap();
+            MAX_READ_BYTES
+                .checked_sub(observations.logical_output_bytes)
+                .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?
+        };
         let budget = ReadBudget {
             max_result_bytes: budget
                 .max_result_bytes
-                .min(DISCOVERY_READ_BUDGET.max_result_bytes),
+                .min(DISCOVERY_READ_BUDGET.max_result_bytes)
+                .min(remaining_logical_bytes),
             max_single_value_bytes: budget
                 .max_single_value_bytes
-                .min(DISCOVERY_READ_BUDGET.max_single_value_bytes),
+                .min(DISCOVERY_READ_BUDGET.max_single_value_bytes)
+                .min(remaining_logical_bytes),
         };
         let result = self
             .base
@@ -1318,6 +1517,7 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
             .profile
             .storage_keys
             .saturating_add(result.values.len());
+        observations.charge_requested_keys(result.values.len())?;
         if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
             observations.exhausted = true;
             return Err(StorageError::ReadBudgetExceeded { singleton: false });
@@ -1326,11 +1526,13 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
             .values
             .iter()
             .flatten()
-            .map(|value| match value {
-                StorageProjectedValue::FullValue(bytes) => bytes.len(),
-                StorageProjectedValue::KeyOnly => 0,
+            .try_fold(0usize, |total, value| {
+                total.checked_add(match value {
+                    StorageProjectedValue::FullValue(bytes) => bytes.len(),
+                    StorageProjectedValue::KeyOnly => 0,
+                })
             })
-            .sum();
+            .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?;
         observations.profile.peak_provider_bytes =
             observations.profile.peak_provider_bytes.max(bytes);
         for ((space, key), value) in window
@@ -1379,9 +1581,25 @@ impl StorageScanSource for DependencyScan<'_> {
     {
         Box::pin(async move {
             self.observations.lock().unwrap().charge_call()?;
+            let remaining_logical_bytes = {
+                let observations = self.observations.lock().unwrap();
+                MAX_READ_BYTES
+                    .checked_sub(observations.logical_output_bytes)
+                    .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?
+            };
             let (rows, more) = self
                 .base
-                .next_page_bounded(limit.min(MAX_SCAN_PAGE_ROWS), DISCOVERY_READ_BUDGET)
+                .next_page_bounded(
+                    limit.min(MAX_SCAN_PAGE_ROWS),
+                    ReadBudget {
+                        max_result_bytes: DISCOVERY_READ_BUDGET
+                            .max_result_bytes
+                            .min(remaining_logical_bytes),
+                        max_single_value_bytes: DISCOVERY_READ_BUDGET
+                            .max_single_value_bytes
+                            .min(remaining_logical_bytes),
+                    },
+                )
                 .await
                 .map_err(|error| {
                     if matches!(error, StorageError::ReadBudgetExceeded { .. }) {
@@ -1393,13 +1611,16 @@ impl StorageScanSource for DependencyScan<'_> {
             let mut observations = self.observations.lock().unwrap();
             observations.profile.storage_keys =
                 observations.profile.storage_keys.saturating_add(rows.len());
+            observations.charge_requested_keys(rows.len())?;
             let provider_bytes = rows
                 .iter()
-                .map(|row| match &row.value {
-                    StorageProjectedValue::FullValue(bytes) => bytes.len(),
-                    StorageProjectedValue::KeyOnly => 0,
+                .try_fold(0usize, |total, row| {
+                    total.checked_add(match &row.value {
+                        StorageProjectedValue::FullValue(bytes) => bytes.len(),
+                        StorageProjectedValue::KeyOnly => 0,
+                    })
                 })
-                .sum::<usize>();
+                .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?;
             observations.profile.peak_provider_bytes =
                 observations.profile.peak_provider_bytes.max(provider_bytes);
             if observations.profile.storage_keys > 4 * MAX_READ_CALLS {
@@ -4137,113 +4358,434 @@ mod tests {
         }
     }
 
+    type PointCacheTestRead = DependencyRead<
+        LatencyProfileRead<Arc<StorageAdapterReadScope<MemoryRead>>>,
+    >;
+
+    async fn point_cache_fixture(
+        entries: &[(StorageKey, Bytes)],
+    ) -> (
+        PointCacheTestRead,
+        Arc<ProfileReadCounters>,
+        Arc<Mutex<Observations>>,
+    ) {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        for (key, bytes) in entries {
+            writes.put(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                key.clone(),
+                bytes.as_ref(),
+            );
+        }
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .expect("seed immutable point values");
+        let base = storage
+            .begin_read(Default::default())
+            .await
+            .expect("begin pinned read");
+        let profiled = LatencyProfileRead::new(Arc::new(base), Duration::ZERO);
+        let counters = Arc::clone(&profiled.counters);
+        let observations = Arc::new(Mutex::new(Observations::default()));
+        (
+            DependencyRead {
+                base: profiled,
+                observations: Arc::clone(&observations),
+            },
+            counters,
+            observations,
+        )
+    }
+
+    fn point_cache_key(value: u8) -> StorageKey {
+        StorageKey(Bytes::copy_from_slice(&[value; 32]))
+    }
+
+    fn point_cache_request(
+        keys: &[StorageKey],
+        projection: StorageCoreProjection,
+    ) -> StorageGetManyRequest<'_> {
+        StorageGetManyRequest {
+            space: crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            keys,
+            opts: StorageGetOptions { projection },
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_reads_reuse_positive_values_without_changing_captured_closure() {
+        let key = point_cache_key(0x41);
+        let bytes = Bytes::from_static(b"immutable native input");
+        let (read, counters, observations) =
+            point_cache_fixture(&[(key.clone(), bytes.clone())]).await;
+        let request = [point_cache_request(
+            std::slice::from_ref(&key),
+            StorageCoreProjection::FullValue,
+        )];
+
+        let first = read.get_many(&request).await.expect("first point read");
+        let repeated = read.get_many(&request).await.expect("reused point read");
+
+        assert_eq!(first, repeated);
+        assert_eq!(
+            counters.backend_calls.load(Ordering::Relaxed),
+            1,
+            "the repeated immutable coordinate should not reach storage"
+        );
+        assert_eq!(counters.backend_keys.load(Ordering::Relaxed), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.values.len(), 1);
+        assert_ne!(
+            observations
+                .point_read_cache
+                .get(&(
+                    crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                    key.clone(),
+                ))
+                .expect("full-value point read is retained")
+                .as_ptr(),
+            bytes.as_ptr(),
+            "cache retains an exact-size copy instead of a slice into the source backing"
+        );
+        assert_eq!(observations.profile.payload_bytes, bytes.len());
+        assert_eq!(observations.profile.storage_bytes, bytes.len());
+        assert_eq!(observations.profile.storage_keys, 1);
+        assert_eq!(observations.profile.storage_calls, 1);
+        assert_eq!(observations.logical_output_bytes, 2 * bytes.len());
+    }
+
+    #[tokio::test]
+    async fn dependency_point_cache_obeys_projection_and_positive_only_rules() {
+        let full_key = point_cache_key(0x51);
+        let upgrade_key = point_cache_key(0x52);
+        let missing_key = point_cache_key(0x53);
+        let full_bytes = Bytes::from_static(b"full cached value");
+        let upgrade_bytes = Bytes::from_static(b"upgraded after key-only");
+        let (read, counters, observations) = point_cache_fixture(&[
+            (full_key.clone(), full_bytes.clone()),
+            (upgrade_key.clone(), upgrade_bytes.clone()),
+        ])
+        .await;
+
+        let full_request = [point_cache_request(
+            std::slice::from_ref(&full_key),
+            StorageCoreProjection::FullValue,
+        )];
+        let full = read.get_many(&full_request).await.expect("read full value");
+        let key_only_request = [point_cache_request(
+            std::slice::from_ref(&full_key),
+            StorageCoreProjection::KeyOnly,
+        )];
+        let key_only = read
+            .get_many(&key_only_request)
+            .await
+            .expect("project cached value as key-only");
+        assert_eq!(key_only.values, vec![Some(StorageProjectedValue::KeyOnly)]);
+        assert_eq!(counters.backend_calls.load(Ordering::Relaxed), 1);
+
+        let upgrade_key_only = [point_cache_request(
+            std::slice::from_ref(&upgrade_key),
+            StorageCoreProjection::KeyOnly,
+        )];
+        let key_only_miss = read
+            .get_many(&upgrade_key_only)
+            .await
+            .expect("key-only miss read");
+        assert_eq!(
+            key_only_miss.values,
+            vec![Some(StorageProjectedValue::KeyOnly)]
+        );
+        let upgrade_full = [point_cache_request(
+            std::slice::from_ref(&upgrade_key),
+            StorageCoreProjection::FullValue,
+        )];
+        let full_after_key_only = read
+            .get_many(&upgrade_full)
+            .await
+            .expect("upgrade key-only result to full value");
+        let full_after_key_only_again = read
+            .get_many(&upgrade_full)
+            .await
+            .expect("reuse upgraded full value");
+        assert_eq!(full_after_key_only, full_after_key_only_again);
+        assert_eq!(
+            full_after_key_only.values,
+            vec![Some(StorageProjectedValue::FullValue(upgrade_bytes))]
+        );
+        assert_eq!(counters.backend_calls.load(Ordering::Relaxed), 3);
+
+        let missing_request = [point_cache_request(
+            std::slice::from_ref(&missing_key),
+            StorageCoreProjection::FullValue,
+        )];
+        let missing_first = read
+            .get_many(&missing_request)
+            .await
+            .expect("first missing-key lookup");
+        let missing_again = read
+            .get_many(&missing_request)
+            .await
+            .expect("missing keys are not cached");
+        assert_eq!(missing_first.values, vec![None]);
+        assert_eq!(missing_again.values, vec![None]);
+        assert_eq!(counters.backend_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            observations.lock().unwrap().point_read_cache.len(),
+            2,
+            "only positive full values enter the cache"
+        );
+        assert_eq!(
+            full.values[0],
+            Some(StorageProjectedValue::FullValue(full_bytes))
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_point_cache_preserves_prefix_progress_and_reuses_observed_values() {
+        let first_key = point_cache_key(0x61);
+        let second_key = point_cache_key(0x62);
+        let first_bytes = Bytes::from_static(b"first prefix value");
+        let second_bytes = Bytes::from_static(b"second prefix value");
+        let (read, counters, observations) = point_cache_fixture(&[
+            (first_key.clone(), first_bytes.clone()),
+            (second_key.clone(), second_bytes.clone()),
+        ])
+        .await;
+        let keys = [first_key, second_key];
+        let request = [point_cache_request(&keys, StorageCoreProjection::FullValue)];
+
+        let first_page = read
+            .get_many_bounded_prefix(&request, 0, 1, DISCOVERY_READ_BUDGET)
+            .await
+            .expect("first bounded prefix");
+        let second_page = read
+            .get_many_bounded_prefix(&request, 1, 1, DISCOVERY_READ_BUDGET)
+            .await
+            .expect("second bounded prefix");
+        assert_eq!(first_page.next_offset, Some(1));
+        assert_eq!(second_page.next_offset, None);
+        assert_eq!(
+            first_page.values,
+            vec![Some(StorageProjectedValue::FullValue(first_bytes))]
+        );
+        assert_eq!(
+            second_page.values,
+            vec![Some(StorageProjectedValue::FullValue(second_bytes))]
+        );
+
+        let exact = read
+            .get_many(&request)
+            .await
+            .expect("reuse prefix observations");
+        assert_eq!(
+            exact.values,
+            [first_page.values[0].clone(), second_page.values[0].clone()]
+        );
+        assert_eq!(counters.backend_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(observations.lock().unwrap().requested_keys, 4);
+    }
+
+    #[tokio::test]
+    async fn dependency_point_cache_charges_repeated_full_value_output_to_work_budget() {
+        let key = point_cache_key(0x71);
+        let bytes = Bytes::from(vec![0x71; 1024 * 1024]);
+        let (read, counters, observations) =
+            point_cache_fixture(&[(key.clone(), bytes.clone())]).await;
+        let request = [point_cache_request(
+            std::slice::from_ref(&key),
+            StorageCoreProjection::FullValue,
+        )];
+
+        for _ in 0..MAX_READ_BYTES / bytes.len() {
+            let result = read
+                .get_many(&request)
+                .await
+                .expect("full-value output remains within the cumulative bound");
+            assert!(matches!(
+                result.values.first().and_then(Option::as_ref),
+                Some(StorageProjectedValue::FullValue(value)) if value.len() == bytes.len()
+            ));
+        }
+        let refused = read.get_many(&request).await;
+        assert!(matches!(
+            refused,
+            Err(StorageError::ReadBudgetExceeded { singleton: false })
+        ));
+        assert_eq!(counters.backend_calls.load(Ordering::Relaxed), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.logical_output_bytes, MAX_READ_BYTES);
+        assert_eq!(observations.profile.storage_bytes, bytes.len());
+    }
+
+    #[tokio::test]
+    async fn dependency_scan_refuses_before_reading_past_remaining_logical_budget() {
+        let storage = StorageAdapter::new(Memory::new());
+        let key = point_cache_key(0x72);
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            key,
+            b"scan value".as_slice(),
+        );
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .expect("seed scan row");
+        let read = storage
+            .begin_read(Default::default())
+            .await
+            .expect("begin pinned scan read");
+        let base = read
+            .begin_scan(
+                crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+                StorageKeyRange {
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Unbounded,
+                },
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .expect("begin storage scan");
+        let observations = Arc::new(Mutex::new(Observations::default()));
+        observations.lock().unwrap().logical_output_bytes = MAX_READ_BYTES;
+        let mut scan = DependencyScan {
+            base,
+            space: crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+            observations: Arc::clone(&observations),
+        };
+
+        let error = scan
+            .next_page(1)
+            .await
+            .expect_err("logical budget is exhausted");
+
+        assert!(matches!(
+            error,
+            StorageError::ReadBudgetExceeded { singleton: true }
+                | StorageError::ReadBudgetExceeded { singleton: false }
+        ));
+        let observations = observations.lock().unwrap();
+        assert!(observations.exhausted);
+        assert_eq!(observations.profile.storage_bytes, 0);
+    }
+
     #[tokio::test]
     async fn working_diff_authority_reuses_raw_candidates_and_completes_closure() {
         const FILES: usize = 13;
         const BACKEND_DELAY: Duration = Duration::from_millis(1);
 
         for edit_count in [13usize, 30usize] {
-        let authority = crate::open_lix().await.unwrap();
-        authority.set_sync_role(super::super::SyncRole::Authority).unwrap();
-        for index in 0..FILES {
+            let authority = crate::open_lix().await.unwrap();
             authority
-                .execute(
-                    "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-                    &[
-                        crate::Value::Text(uuid::Uuid::now_v7().to_string()),
-                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
-                        crate::Value::Blob(Bytes::from_static(b"before").into()),
-                    ],
-                )
+                .set_sync_role(super::super::SyncRole::Authority)
+                .unwrap();
+            for index in 0..FILES {
+                authority
+                    .execute(
+                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+                        &[
+                            crate::Value::Text(uuid::Uuid::now_v7().to_string()),
+                            crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                            crate::Value::Blob(Bytes::from_static(b"before").into()),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
+            for edit in 0..edit_count {
+                let index = edit % FILES;
+                authority
+                    .execute(
+                        "UPDATE lix_file SET content = $1 WHERE path = $2",
+                        &[
+                            crate::Value::Blob(Bytes::from(format!("after-{edit}-{index}")).into()),
+                            crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let leased = authority
+                .leased_partial_replica_descriptor(None)
                 .await
                 .unwrap();
-        }
-        let checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
-        for edit in 0..edit_count {
-            let index = edit % FILES;
-            authority
-                .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
-                    &[
-                        crate::Value::Blob(Bytes::from(format!("after-{edit}-{index}")).into()),
-                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
-                    ],
-                )
+            let descriptor = leased.descriptor;
+            let head = descriptor.selected_branch.head.commit_id.clone();
+            assert_ne!(checkpoint.to_string(), head);
+            let interest = LogicalReadInterest::Diff {
+                branch_id: Some(descriptor.selected_branch.branch_id.clone()),
+                relation: "lix_file".to_owned(),
+                from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                filter: crate::tracked_state::TrackedStateFilter {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                retain_payloads: false,
+                projected_columns: Vec::new(),
+                limit: None,
+            };
+            let request = ReadFulfillmentRequest {
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                release: false,
+                operation_expires_at_ms: leased.lease.expires_at_ms,
+                epoch_id: uuid::Uuid::now_v7().to_string(),
+                descriptor: descriptor.clone(),
+                interests: vec![interest],
+                required: vec![ReadInputAddress::Metadata(
+                    NativeMetadataRef::CommitStateHeader(head.clone()),
+                )],
+                continuation: None,
+            };
+            request.validate(&descriptor.lix_id).unwrap();
+            let read = authority
+                .storage_adapter()
+                .begin_read(Default::default())
                 .await
                 .unwrap();
-        }
-        let leased = authority
-            .leased_partial_replica_descriptor(None)
+            let profiled = LatencyProfileRead::new(Arc::new(read), BACKEND_DELAY);
+            let checkpoint = descriptor.selected_branch.checkpoint.commit_id.clone();
+            crate::tracked_state::arm_diff_commits_test_probe(&checkpoint, &head);
+            let started = Instant::now();
+            let response = discover(
+                profiled.clone(),
+                &descriptor.lix_id,
+                authority.active_account_id(),
+                &leased.lease.lease_id,
+                &request,
+                crate::hot_state::HotStateContext::new(
+                    crate::tracked_state::TrackedStateContext::new(),
+                    crate::commit_graph::CommitGraphContext::new(),
+                ),
+            )
             .await
             .unwrap();
-        let descriptor = leased.descriptor;
-        let head = descriptor.selected_branch.head.commit_id.clone();
-        assert_ne!(checkpoint.to_string(), head);
-        let interest = LogicalReadInterest::Diff {
-            branch_id: Some(descriptor.selected_branch.branch_id.clone()),
-            relation: "lix_file".to_owned(),
-            from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
-            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
-            filter: crate::tracked_state::TrackedStateFilter {
-                include_tombstones: true,
-                ..Default::default()
-            },
-            retain_payloads: false,
-            projected_columns: Vec::new(),
-            limit: None,
-        };
-        let request = ReadFulfillmentRequest {
-            operation_id: uuid::Uuid::now_v7().to_string(),
-            release: false,
-            operation_expires_at_ms: leased.lease.expires_at_ms,
-            epoch_id: uuid::Uuid::now_v7().to_string(),
-            descriptor: descriptor.clone(),
-            interests: vec![interest],
-            required: vec![ReadInputAddress::Metadata(
-                NativeMetadataRef::CommitStateHeader(head.clone()),
-            )],
-            continuation: None,
-        };
-        request.validate(&descriptor.lix_id).unwrap();
-        let read = authority
-            .storage_adapter()
-            .begin_read(Default::default())
-            .await
-            .unwrap();
-        let profiled = LatencyProfileRead::new(Arc::new(read), BACKEND_DELAY);
-        let checkpoint = descriptor.selected_branch.checkpoint.commit_id.clone();
-        crate::tracked_state::arm_diff_commits_test_probe(&checkpoint, &head);
-        let started = Instant::now();
-        let response = discover(
-            profiled.clone(),
-            &descriptor.lix_id,
-            authority.active_account_id(),
-            &leased.lease.lease_id,
-            &request,
-            crate::hot_state::HotStateContext::new(
-                crate::tracked_state::TrackedStateContext::new(),
-                crate::commit_graph::CommitGraphContext::new(),
-            ),
-        )
-        .await
-        .unwrap();
-        let elapsed = started.elapsed();
-        let diff_passes = crate::tracked_state::take_diff_commits_test_probe(&checkpoint, &head);
-        assert_eq!(response.outcome, ReadFulfillmentOutcome::Complete);
-        assert_eq!(diff_passes, 1, "working diff raw candidates should be reused");
-        assert!(response.inputs.iter().any(|input| {
-            input.address
-                == ReadInputAddress::Metadata(NativeMetadataRef::CommitStateHeader(head.clone()))
-        }));
-        eprintln!(
-            "working_diff_profile files={FILES} edits={edit_count} diff_passes={diff_passes} inputs={} backend_delay_us={} elapsed_ms={} fulfillment_profile={} backend_profile={}",
-            response.inputs.len(),
-            BACKEND_DELAY.as_micros(),
-            elapsed.as_millis(),
-            serde_json::to_string(&response.profile).unwrap(),
-            serde_json::to_string(&profiled.summary()).unwrap(),
-        );
-        authority.close().await.unwrap();
+            let elapsed = started.elapsed();
+            let diff_passes =
+                crate::tracked_state::take_diff_commits_test_probe(&checkpoint, &head);
+            assert_eq!(response.outcome, ReadFulfillmentOutcome::Complete);
+            assert_eq!(
+                diff_passes, 1,
+                "working diff raw candidates should be reused"
+            );
+            assert!(response.inputs.iter().any(|input| {
+                input.address
+                    == ReadInputAddress::Metadata(NativeMetadataRef::CommitStateHeader(
+                        head.clone(),
+                    ))
+            }));
+            eprintln!(
+                "working_diff_profile files={FILES} edits={edit_count} diff_passes={diff_passes} inputs={} backend_delay_us={} elapsed_ms={} fulfillment_profile={} backend_profile={}",
+                response.inputs.len(),
+                BACKEND_DELAY.as_micros(),
+                elapsed.as_millis(),
+                serde_json::to_string(&response.profile).unwrap(),
+                serde_json::to_string(&profiled.summary()).unwrap(),
+            );
+            authority.close().await.unwrap();
         }
     }
 
@@ -7469,7 +8011,6 @@ mod tests {
         assert_eq!(error.message, "authority lacks required chunk");
         authority.close().await.unwrap();
     }
-
 }
 
 #[cfg(test)]

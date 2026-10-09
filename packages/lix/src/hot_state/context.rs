@@ -2099,9 +2099,9 @@ where
                                 working_diff_candidates.iter().find(|candidate| {
                                     candidate.branch_id == *branch
                                         && candidate.checkpoint_commit_id
-                                            == checkpoint.to_string()
+                                            == checkpoint
                                         && candidate.head_commit_id
-                                            == control.head_commit_id.to_string()
+                                            == control.head_commit_id
                         && candidate.relation == *relation
                         && candidate.filter == *filter
                         && candidate.retain_payloads == *retain_payloads
