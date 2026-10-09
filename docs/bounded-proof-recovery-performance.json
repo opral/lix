@@ -1,0 +1,393 @@
+{
+  "schema_version": 1,
+  "title": "Bounded proof recovery performance evidence",
+  "source": {
+    "base_commit": "e6ddad383d7c595c350de1a4ae6ecc6871069d97",
+    "candidate_source_tree": "95b83b9005f3f15882e91742e5cca5e87e297abf",
+    "candidate_patch_sha256": "5a8cc56ef47cca7da25976711bfce4f261a4ef09279de76000a91d78fd212135",
+    "sync_protocol_version": 33,
+    "physical_storage_format_version": 87,
+    "bounds": {
+      "baseline_sync_protocol_version": 32,
+      "candidate_sync_protocol_version": 33,
+      "server_protocol_version": 12,
+      "physical_storage_format_version": 87,
+      "per_storage_provider_page_records_max": 32,
+      "queued_frontier_max": 32,
+      "logical_metadata_walk_commits_max": 64,
+      "walk_response_records_max": 128,
+      "aggregate_walk_response_raw_bytes_max": 262144,
+      "byte_budget_scope": "Walk response payload and its dependencies; checkpoint pointer/coverage collectors keep separate bounded-input budgets."
+    }
+  },
+  "paired_runtime": {
+    "ui_revision": "61b7675f019faeecce10dbfcfdf983e1d158514b",
+    "browser": "Chromium",
+    "same_scenario_source": true,
+    "storage": "Local MinIO HTTP/S3 on bounded 8 GiB tmpfs; fresh isolated prefix for each trial. This does not establish production S3 performance.",
+    "baseline_proto32": {
+      "client_source_tree": "a9638aa9234dda90e31c0cad0f13082003b96fee",
+      "client_wasm_sha256": "9274228fdf4dd336cf2766b7a33fbfa9ed6679ed4d805bba4a924eb7be1f415a",
+      "web_image_id": "sha256:73a687d11988b90e6e9f9eadf094a08a1466d14aeb0d264592ebaf29682f9669",
+      "native_server_source_tree": "a9638aa9234dda90e31c0cad0f13082003b96fee",
+      "native_server_patch_sha256": "e9064587d5246bc0b859861fc3723e0ca900fd85c3e9937122701401afc08261",
+      "native_server_binary_sha256": "1324679672aa9f91b47b49a33c51c48570c0b4ce44f473e6747d5a04221591c1",
+      "native_server_image_id": "sha256:c6b223bfa5b892b19e06fde0f1a35aae4a09f4f11d43119bf554da4c3fb1c80c"
+    },
+    "candidate_proto33": {
+      "client_source_tree": "09bb48e259216151c2f86ceda79937908d49dc93",
+      "client_patch_sha256": "d0526f0172f0248dd58b6f0423bec31994cf9c35b5e6d72cf4ce55b66e777420",
+      "client_wasm_sha256": "a9604fccc9a3f021ed2d17e88aa75587754cb341f288f269a1d719697e0bb46d",
+      "web_image_id": "sha256:26824ac1c6bb06b17b07a180ac1ee0eeb020b4610de8b78c20ba2e0d4fcf679b",
+      "native_server_source_tree": "95b83b9005f3f15882e91742e5cca5e87e297abf",
+      "native_server_patch_sha256": "5a8cc56ef47cca7da25976711bfce4f261a4ef09279de76000a91d78fd212135",
+      "native_server_binary_sha256": "f25d779416e37960906f0369d5ed30620f6454d54fcebbfa7cd777349b82eab5",
+      "native_server_image_id": "sha256:c284366097c35f057c0bb6fdb763f7078a03ff4c7e90b22dea4ab25f9de9cd70"
+    },
+    "private_instrumentation": "Client profile hooks only, in both arms, not shipped; native server profiling feature disabled in both arms. The baseline server overlay includes the same bounded JSON writer as the candidate to isolate proof-page behavior."
+  },
+  "browser_comparison": {
+    "latency_case_ms": 500,
+    "edits_per_run": 60,
+    "valid_order": [
+      "C2",
+      "B2",
+      "B3",
+      "C3",
+      "B4",
+      "C4"
+    ],
+    "excluded_runs": {
+      "runs": [
+        "B1 proto32",
+        "C1R2 proto33"
+      ],
+      "reason": "Diagnostic capture checks passed, but the primary Playwright equality labels were absent; excluded from n=3."
+    },
+    "samples": [
+      {
+        "run": "C2",
+        "arm": "candidate",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 14038,
+        "burst_to_equality_ms": 27277,
+        "proof_pages": 3,
+        "manifest_members": 36,
+        "encoded_manifest_bytes": 20501,
+        "decoded_inline_bytes": 9354
+      },
+      {
+        "run": "B2",
+        "arm": "baseline",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 10995,
+        "burst_to_equality_ms": 24669,
+        "proof_pages": 5,
+        "manifest_members": 40,
+        "encoded_manifest_bytes": 22659,
+        "decoded_inline_bytes": 10303
+      },
+      {
+        "run": "B3",
+        "arm": "baseline",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 11069,
+        "burst_to_equality_ms": 24821,
+        "proof_pages": 5,
+        "manifest_members": 40,
+        "encoded_manifest_bytes": 22659,
+        "decoded_inline_bytes": 10303
+      },
+      {
+        "run": "C3",
+        "arm": "candidate",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 11065,
+        "burst_to_equality_ms": 24391,
+        "proof_pages": 3,
+        "manifest_members": 39,
+        "encoded_manifest_bytes": 22322,
+        "decoded_inline_bytes": 10218
+      },
+      {
+        "run": "B4",
+        "arm": "baseline",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 14068,
+        "burst_to_equality_ms": 27878,
+        "proof_pages": 6,
+        "manifest_members": 35,
+        "encoded_manifest_bytes": 19862,
+        "decoded_inline_bytes": 9042
+      },
+      {
+        "run": "C4",
+        "arm": "candidate",
+        "playwright_status": "passed",
+        "post_edit_to_equality_ms": 11003,
+        "burst_to_equality_ms": 24493,
+        "proof_pages": 3,
+        "manifest_members": 39,
+        "encoded_manifest_bytes": 22322,
+        "decoded_inline_bytes": 10218
+      }
+    ],
+    "medians_ms": {
+      "control_proto32": {
+        "post_edit_to_equality": 11069,
+        "burst_to_equality": 24821
+      },
+      "candidate_proto33": {
+        "post_edit_to_equality": 11065,
+        "burst_to_equality": 24493
+      },
+      "candidate_minus_control": {
+        "post_edit_to_equality": -4,
+        "burst_to_equality": -328
+      },
+      "interpretation": "Primary timings overlap substantially. The 4 ms median post-edit difference is below the fixture's expect.poll interval granularity (100/250/500/1000 ms) and is not evidence of a sub-second improvement. All six trials passed exact convergence/reopen assertions."
+    },
+    "profile_counters": {
+      "scope": "Sums across emitted completed preparation attempts for the three primary runs per arm. Cancelled attempts are omitted. Timer totals are deliberately excluded; these counts and bytes are not wall-time or CPU.",
+      "proto32": {
+        "completed_attempt_events": 64,
+        "error_outcome_events": 3,
+        "metadata_walk_calls": 23,
+        "metadata_walk_requested_commit_identities": 368,
+        "metadata_walk_returned_records": 407,
+        "metadata_walk_raw_bytes": 124824,
+        "metadata_walk_max_requested_page_records": 32,
+        "metadata_walk_max_response_records": 32,
+        "native_object_range_calls": 57
+      },
+      "proto33": {
+        "completed_attempt_events": 61,
+        "error_outcome_events": 3,
+        "metadata_walk_calls": 15,
+        "metadata_walk_requested_commit_identities": 960,
+        "metadata_walk_returned_records": 433,
+        "metadata_walk_raw_bytes": 133242,
+        "metadata_walk_max_requested_page_records": 128,
+        "metadata_walk_max_response_records": 70,
+        "native_object_range_calls": 57
+      },
+      "interpretation": "Proto33 used 15 vs 23 metadata-walk requests (~35% fewer), with 433 vs 407 returned records and 133242 vs 124824 raw bytes (~7% more). Native object-range call count was 57 in each arm. Requested identity counts describe widened request windows, not unique returned records. Timers are not included and no CPU or critical-chain inference is made."
+    },
+    "interpretation": "Proof paging fell from 5\u20136 pages to 3 with similar returned members and payload bytes. n=3 browser medians are flat; no UX or sub-100 ms improvement claim is supported.",
+    "observation_resolution_ms": [
+      100,
+      250,
+      500,
+      1000
+    ]
+  },
+  "targeted_ancestry_fixture": {
+    "transport_delay_ms": 30,
+    "baseline_calls": 3,
+    "baseline_elapsed_ms": 96.037872,
+    "candidate_calls": 1,
+    "candidate_elapsed_ms": 33.022921,
+    "interpretation": "Controlled real-client ancestry test; mechanism-level round-trip evidence, not production-S3 latency or an end-to-end browser improvement."
+  },
+  "bounded_json_writer": {
+    "native_test_profile_correctness_tests": {
+      "profile": "unoptimized test profile",
+      "passed": 4,
+      "failed": 0
+    },
+    "optimized_standalone_microbenchmark": {
+      "payloads": [
+        {
+          "encoded_bytes": 17408,
+          "samples": 12,
+          "encodes_per_sample_per_arm": 100,
+          "legacy_median_ns": 6394,
+          "bounded_median_ns": 4251,
+          "output_bytes_identical": true
+        },
+        {
+          "encoded_bytes": 409600,
+          "samples": 12,
+          "encodes_per_sample_per_arm": 100,
+          "legacy_median_ns": 152652,
+          "bounded_median_ns": 88047,
+          "output_bytes_identical": true
+        }
+      ],
+      "oversized_body": {
+        "limit_bytes": 67108864,
+        "encoded_body_bytes": 67108867,
+        "legacy_bytes_materialized_before_reject": 67108867,
+        "legacy_vec_capacity_bytes": 134217732,
+        "bounded_bytes_retained_before_reject": 1,
+        "bounded_vec_capacity_bytes": 128,
+        "rejected": true
+      },
+      "scope": "Synthetic JSON output-buffer behavior only; these values do not measure process RSS, browser performance, or end-to-end database latency."
+    }
+  },
+  "validation": {
+    "matched_full7_proto32": {
+      "status": "passed",
+      "passed": 7,
+      "failed": 0,
+      "skipped": 0,
+      "duration_ms": 451314
+    },
+    "matched_full7_proto33": {
+      "status": "passed",
+      "passed": 7,
+      "failed": 0,
+      "skipped": 0,
+      "duration_ms": 447772
+    },
+    "native_library_tests": {
+      "status": "passed",
+      "passed": 4988,
+      "skipped": 74
+    },
+    "native_doctests": {
+      "status": "passed",
+      "passed": 10,
+      "failed": 0
+    },
+    "default_native_check": "passed",
+    "bounded_json_writer_native_tests": "4 passed in unoptimized test profile",
+    "browser_sdk_tests": {
+      "passed": 60,
+      "skipped": 3
+    },
+    "opfs_tests": {
+      "passed": 73
+    },
+    "packed_browser_smoke": "passed",
+    "optimized_standalone_serializer_benchmark": "completed; separate from unoptimized native correctness tests",
+    "pending": [
+      "Native workspace clippy",
+      "Native all-features checks",
+      "Native docs checks",
+      "Node SDK tests",
+      "Cloud CI",
+      "Exact production preview"
+    ]
+  },
+  "limitations": [
+    "The n=3 browser medians are flat and within the fixture polling/marker resolution; no statistically supported speedup is claimed.",
+    "Browser transfer-busy and summed-request-latency values include background sync activity and are not used as critical-path measures.",
+    "Profile events cover completed preparation attempts; cancelled attempts are omitted. Profile errors are attempt outcomes, not final browser-test failures, and are not attributed without error-code evidence.",
+    "Private transport timers can be inclusive; no timer sums are interpreted as wall time or CPU.",
+    "The profile has no request-correlated waterfall proving a critical chain.",
+    "Local MinIO on tmpfs does not represent production S3.",
+    "Serializer capacities are output Vec capacities, not total memory use or RSS."
+  ],
+  "evidence_artifacts": [
+    {
+      "name": "r33-proto32-vs-proto33-summary.json",
+      "sha256": "3292d7a9d3e5a73d78b0f975eaacb40e35071b359e7f7cf72f3b4c30a4bff290"
+    },
+    {
+      "name": "cloud61-production-frozen-r1.json",
+      "sha256": "cf139b681d8ea7f3e8df746bdd77663404dd9b8264adc7cd3c4ca31cade9aeba"
+    },
+    {
+      "name": "cloud61-profile-baseline-overlay.json",
+      "sha256": "0e75e1b285187319f27e3c573ed5392bf9eddcc09a26b7b288b745168b332279"
+    },
+    {
+      "name": "cloud61-profile-baseline-sdk-dist-manifest.json",
+      "sha256": "55c3a0a93cc6aadd1b5e02a4ecdb4b2bfae08c2b41510e646e680779d5077b86"
+    },
+    {
+      "name": "cloud61-candidate-profile-frozen.json",
+      "sha256": "a2caa8a65527b8a3c327a3f9e5d5a1d13ef9f8a875498405e9942cde9aecdba0"
+    },
+    {
+      "name": "cloud61-candidate-profile-sdk-dist.manifest.json",
+      "sha256": "30bf26fd1b5064faa6b13e898eb2a3705660b8dcc35aa8d83b110cfe463c3f48"
+    },
+    {
+      "name": "baseline-proto32.json",
+      "sha256": "d32498d75d490f9a249f023e251afb33d6bcd055af39ee0bc1d86b0f63cd8a48"
+    },
+    {
+      "name": "candidate-proto33.json",
+      "sha256": "89bcf03bfd440047db6750e02dfb24b3ca9350d3071225fa2647eccc998edd9e"
+    },
+    {
+      "name": "cloud61-serializer-microbench-output-r1.json",
+      "sha256": "0fbe729e23899623e671adf82f5320d07d2eeb7aeccc13759487844550403b23"
+    },
+    {
+      "name": "cloud61-candidate-focused-bounded_json_writer_tests-r2.log",
+      "sha256": "79d2d8324e17a03e3d42da2b89f0c488e793d38633a249005e01aa77adb03f6c"
+    },
+    {
+      "name": "cloud61-production-engine-nextest-r1.log",
+      "sha256": "a8e1112db3ce6fd7b8abe63576c9f25c4fc6e24f1ff08ef1953c2c45b2d05880"
+    },
+    {
+      "name": "cloud61-production-engine-doctest-r1.log",
+      "sha256": "bfd6110640d7d3c9d9dac90024efa62b3707cc47ff695a22be398366b895c3fc"
+    },
+    {
+      "name": "cloud61-production-default-test-target-check-r1.log",
+      "sha256": "ad9a98405d701e98d28a06c830fd490f60498358f1f4086576df8102a69e3db7"
+    },
+    {
+      "name": "r33-B5-proto32-full7-playwright.json",
+      "sha256": "22f3d31f4c851d943c78fa175b58755fbb1f8be94a17a850a12b29e3869aa45d"
+    },
+    {
+      "name": "r33-C5-proto33-full7-playwright.json",
+      "sha256": "05f654b03272f40195642fccc9d8adcb50d4bccfaf62a799c5b067e2a9d65ee0"
+    },
+    {
+      "name": "r33-C2-proto33-500ms-playwright.json",
+      "sha256": "3315af300e6b7f8b46a2136f9be5ae864dda1d72609e41f0260e9c721d5a1e1a"
+    },
+    {
+      "name": "r33-B2-proto32-500ms-playwright.json",
+      "sha256": "26b8f2d409afa86e16e583e7b298e15f49b2479629bf14b5f999531044a4b2c6"
+    },
+    {
+      "name": "r33-B3-proto32-500ms-playwright.json",
+      "sha256": "c319e3c210d37f87a085b02200924e16dc2bad6deea801783dee81f5420b5928"
+    },
+    {
+      "name": "r33-C3-proto33-500ms-playwright.json",
+      "sha256": "f44263a687cd3f1a4e1006dbad4a7d713928e73751b4d44d1cddf2041f1685db"
+    },
+    {
+      "name": "r33-B4-proto32-500ms-playwright.json",
+      "sha256": "85e4e191a313b82e368ba39512aceca7a6d60fd5e0147be3fba817dd4c1000f5"
+    },
+    {
+      "name": "r33-C4-proto33-500ms-playwright.json",
+      "sha256": "7fb64823aca4927f8135841ac5c52dbfbcf3b174def74790a4dcec799a3db7f5"
+    },
+    {
+      "name": "r33-B2-proto32-500ms.json",
+      "sha256": "209c912e99d00fb11e1176e74c489c9747f723b33dbbf44f35be7d56bc585bba"
+    },
+    {
+      "name": "r33-B3-proto32-500ms.json",
+      "sha256": "7022d4fff47c61219724b3b604e8d510de815b1f123a3014151b38c8d6bbe5d6"
+    },
+    {
+      "name": "r33-B4-proto32-500ms.json",
+      "sha256": "a26acadf9166a7cc600c65db0f19c056f379a656663b5cfb8b95c01c42a5b944"
+    },
+    {
+      "name": "r33-C2-proto33-500ms.json",
+      "sha256": "e10d0103ed0418d71d73e5193c88bf0459b394aa95e9d7f2be85b32216c79735"
+    },
+    {
+      "name": "r33-C3-proto33-500ms.json",
+      "sha256": "93d15fce5aca594c9043f5b3f9f4bc143319d6646d27d7d4d68d9897b598e7f0"
+    },
+    {
+      "name": "r33-C4-proto33-500ms.json",
+      "sha256": "c30bba823a7238027a435d57ed1e1e1d56a1e2c3ebf242b66ff7d3790bf1fedb"
+    }
+  ]
+}
