@@ -1871,6 +1871,27 @@ test("close waits for queued operations before deleting the remote session", asy
 	expect(order).toEqual(["execute-start", "execute-finish", "delete"]);
 });
 
+test("remote streams are rejected explicitly without contacting the server", async () => {
+	const requests: string[] = [];
+	const lix = await openLix({
+		server: {
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(`${request.method} ${new URL(request.url).pathname}`);
+				return handshakeResponse();
+			},
+		},
+	});
+	const opened = requests.length;
+	await expect(lix.stream("SELECT 1").next()).rejects.toMatchObject({
+		code: "LIX_UNSUPPORTED_REMOTE_OPERATION",
+		details: { operation: "stream" },
+	});
+	expect(requests).toHaveLength(opened);
+	await lix.close();
+});
+
 function handshakeResponse() {
 	return Response.json({
 		protocolVersion: 12,

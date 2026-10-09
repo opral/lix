@@ -15,10 +15,12 @@ import {
 	openDirectLixBinding,
 } from "#worker-factory";
 import type {
+	BindingExecuteResult,
 	LixBinding,
 	LixStorageConfig,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
@@ -72,6 +74,7 @@ function workerOperationCategory(
 	if (
 		operation.kind === "close" ||
 		operation.kind === "exportSnapshot.cancel" ||
+		operation.kind === "stream.cancel" ||
 		operation.kind === "transaction.commit" ||
 		operation.kind === "transaction.rollback" ||
 		operation.kind === "openSnapshot.finish"
@@ -501,6 +504,15 @@ export function workerBinding(
 				() => client.currentTelemetryParent(),
 			);
 		},
+		stream: async (sql, params, options) => {
+			const streamId = await request<number>({
+				kind: "stream",
+				sql,
+				params,
+				options,
+			});
+			return workerQueryStreamBinding(request, streamId);
+		},
 		beginTransaction: async () => {
 			const transactionId = await request<number>({
 				kind: "beginTransaction",
@@ -560,6 +572,29 @@ export function workerBinding(
 				closed = true;
 				await lease.release();
 			}
+		},
+	};
+}
+
+function workerQueryStreamBinding(
+	request: RequestWorker,
+	streamId: number,
+): QueryStreamBinding {
+	let finished = false;
+	return {
+		next: async () => {
+			if (finished) return undefined;
+			const page = await request<BindingExecuteResult | undefined>({
+				kind: "stream.next",
+				streamId,
+			});
+			if (page == null) finished = true;
+			return page;
+		},
+		cancel: async () => {
+			if (finished) return;
+			finished = true;
+			await request({ kind: "stream.cancel", streamId });
 		},
 	};
 }

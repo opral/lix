@@ -4,6 +4,7 @@ import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 } from "./binding-types.js";
 import {
 	normalizeOptionals,
@@ -26,6 +27,8 @@ import type {
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenAnotherSessionOptions,
+	QueryPage,
+	StreamOptions,
 	LixOpenHostProfile,
 	LixOpenReport,
 	ReplicaRecoverySource,
@@ -52,6 +55,10 @@ const transactionFinalizer = new FinalizationRegistry<{
 });
 const observationFinalizer = new FinalizationRegistry<ObservationLifecycle>(
 	(lifecycle) => lifecycle.stop(),
+);
+// An abandoned, unexhausted stream still pins a read snapshot; release it.
+const queryStreamFinalizer = new FinalizationRegistry<QueryStreamLifecycle>(
+	(lifecycle) => void lifecycle.cancel().catch(() => undefined),
 );
 const hostedCreators = new WeakMap<
 	Lix,
@@ -110,6 +117,7 @@ export class Lix {
 	>();
 	readonly #observationDrains = new Set<Promise<void>>();
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
+	readonly #queryStreams = new Set<QueryStreamLifecycle>();
 	#nextObservationId = 0;
 	#transactionsOpening = 0;
 	#activeTransactions = 0;
@@ -412,6 +420,66 @@ export class Lix {
 		return this.#runOperation(() => this.binding.createBranch(options));
 	}
 
+	/**
+	 * Streams one read statement page by page from a single pinned snapshot.
+	 *
+	 * Unlike `execute()`, the result is not limited by the buffered read budget
+	 * (64 MiB / 1M rows) or the read deadline, so it suits bulk reads such as
+	 * loading a whole project. Each page holds at most `pageBytes` of row data.
+	 * The statement is planned on the first `next()`; writes are rejected.
+	 *
+	 * Breaking out of `for await`, calling `return()`, aborting `signal`, or
+	 * closing this Lix cancels the stream and releases its snapshot. A pull
+	 * after `close()` rejects with `LIX_ERROR_CLOSED`.
+	 */
+	stream(
+		sql: string,
+		params: SqlParam[] | undefined,
+		options: StreamOptions & { rowMode: "array" },
+	): AsyncIterableIterator<QueryPage<ResultArrayRow>>;
+	stream<TRow extends object = ResultObjectRow>(
+		sql: string,
+		params?: SqlParam[],
+		options?: StreamOptions & { rowMode?: "object" },
+	): AsyncIterableIterator<QueryPage<TRow>>;
+	stream(
+		sql: string,
+		params?: SqlParam[],
+		options?: StreamOptions,
+	): AsyncIterableIterator<QueryPage<ResultRow>>;
+	stream(
+		sql: string,
+		params: SqlParam[] = [],
+		options: StreamOptions = {},
+	): AsyncIterableIterator<QueryPage<ResultRow>> {
+		assertStreamArgs(sql, params, options);
+		this.#assertAcceptingOperations();
+		const { pageBytes, rowMode = "object", signal } = options;
+		const nativeParams = params.map((param, index) =>
+			toNativeValue(normalizeParam(param, index)),
+		);
+		const lifecycle = new QueryStreamLifecycle(
+			() =>
+				this.#runOperation(() =>
+					this.binding.stream(
+						sql,
+						nativeParams,
+						pageBytes === undefined ? undefined : { pageBytes },
+					),
+				),
+			rowMode,
+			() => {
+				this.#queryStreams.delete(lifecycle);
+				queryStreamFinalizer.unregister(lifecycle);
+			},
+			signal,
+		);
+		if (!signal?.aborted) this.#queryStreams.add(lifecycle);
+		const pages = new QueryPages<ResultRow>(lifecycle);
+		queryStreamFinalizer.register(pages, lifecycle, lifecycle);
+		return pages;
+	}
+
 	/** Streams this handle's state. Local partial replicas include their cached
 	 * inputs and pending edits; remote handles export the complete authority. */
 	exportSnapshot(): ReadableStream<Uint8Array> {
@@ -558,8 +626,13 @@ export class Lix {
 			}
 			this.#observations.clear();
 			const observationDrains = [...this.#observationDrains];
+			const queryStreams = [...this.#queryStreams].map((stream) =>
+				stream.cancel(closedError()),
+			);
+			this.#queryStreams.clear();
 			this.closePromise = (async () => {
 				await Promise.allSettled(observationDrains);
+				await Promise.allSettled(queryStreams);
 				await Promise.allSettled(
 					[...this.#snapshotExports].map((snapshot) => snapshot.cancel()),
 				);
@@ -610,10 +683,121 @@ export class Lix {
 
 	#assertAcceptingOperations(): void {
 		if (this.#acceptingOperations) return;
-		const error = new Error("Lix is closed") as Error & { code: string };
-		error.name = "LixError";
-		error.code = "LIX_ERROR_CLOSED";
-		throw error;
+		throw closedError();
+	}
+}
+
+function closedError(): Error & { code: string } {
+	const error = new Error("Lix is closed") as Error & { code: string };
+	error.name = "LixError";
+	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+class QueryPages<TRow extends object>
+	implements AsyncIterableIterator<QueryPage<TRow>>
+{
+	constructor(private readonly lifecycle: QueryStreamLifecycle) {}
+
+	[Symbol.asyncIterator](): AsyncIterableIterator<QueryPage<TRow>> {
+		return this;
+	}
+
+	next(): Promise<IteratorResult<QueryPage<TRow>>> {
+		return this.lifecycle.next() as Promise<IteratorResult<QueryPage<TRow>>>;
+	}
+
+	async return(): Promise<IteratorResult<QueryPage<TRow>>> {
+		await this.lifecycle.cancel();
+		return { done: true, value: undefined };
+	}
+}
+
+const STREAM_ENDED = Symbol("stream ended");
+
+/**
+ * Pulls are serialized: a `next()` issued while another is pending waits for
+ * it, so pages are always delivered in order. Cancelling settles a pending
+ * pull at once, even if the binding has not answered yet, and releases the
+ * engine stream.
+ */
+class QueryStreamLifecycle {
+	#binding: Promise<QueryStreamBinding> | undefined;
+	#tail: Promise<unknown> = Promise.resolve();
+	#done = false;
+	#failure: unknown;
+	#cancelPromise: Promise<void> | undefined;
+	#ended!: () => void;
+	readonly #endedSignal = new Promise<typeof STREAM_ENDED>((resolve) => {
+		this.#ended = () => resolve(STREAM_ENDED);
+	});
+	readonly #abort = () =>
+		void this.cancel(this.signal?.reason).catch(() => undefined);
+
+	constructor(
+		private readonly open: () => Promise<QueryStreamBinding>,
+		private readonly rowMode: "object" | "array",
+		private readonly onFinish: () => void,
+		private readonly signal?: AbortSignal,
+	) {
+		if (signal?.aborted) {
+			this.#done = true;
+			this.#failure = signal.reason;
+			this.#ended();
+		} else signal?.addEventListener("abort", this.#abort, { once: true });
+	}
+
+	next(): Promise<IteratorResult<QueryPage<ResultRow>>> {
+		const pull = this.#tail.then(() => this.#pull());
+		this.#tail = pull.catch(() => undefined);
+		return pull;
+	}
+
+	async #pull(): Promise<IteratorResult<QueryPage<ResultRow>>> {
+		if (this.#done) return this.#end();
+		try {
+			this.#binding ??= this.open();
+			const binding = await Promise.race([this.#binding, this.#endedSignal]);
+			if (this.#done || binding === STREAM_ENDED) return this.#end();
+			const page = await Promise.race([binding.next(), this.#endedSignal]);
+			if (this.#done || page === STREAM_ENDED) return this.#end();
+			if (page == null) {
+				this.#finish();
+				return { done: true, value: undefined };
+			}
+			const result = wrapExecuteResult(page, this.rowMode);
+			return {
+				done: false,
+				value: { columns: result.columns, rows: result.rows },
+			};
+		} catch (error) {
+			if (this.#done) return this.#end();
+			await this.cancel().catch(() => undefined);
+			throw error;
+		}
+	}
+
+	#end(): IteratorResult<QueryPage<ResultRow>> {
+		if (this.#failure !== undefined) throw this.#failure;
+		return { done: true, value: undefined };
+	}
+
+	/** Ends the stream. With `failure`, pending and later pulls reject with it. */
+	cancel(failure?: unknown): Promise<void> {
+		if (!this.#done && failure !== undefined) this.#failure = failure;
+		this.#finish();
+		return (this.#cancelPromise ??= (async () => {
+			const binding = await this.#binding?.catch(() => undefined);
+			await binding?.cancel();
+		})());
+	}
+
+	#finish(): void {
+		if (this.#done) return;
+		this.#done = true;
+		this.#ended();
+		this.signal?.removeEventListener("abort", this.#abort);
+		this.onFinish();
 	}
 }
 
@@ -951,6 +1135,42 @@ function assertExecuteArgs(
 			'"object" | "array"',
 			typeof options.rowMode,
 			receiver,
+		);
+	}
+}
+
+function assertStreamArgs(
+	sql: string,
+	params: SqlParam[],
+	options: StreamOptions,
+) {
+	assertSqlArgs("stream", "lix", sql, params);
+	if (!options || typeof options !== "object" || Array.isArray(options)) {
+		throw invalidArgument("stream", "options", "object", typeof options, "lix");
+	}
+	if (
+		options.pageBytes !== undefined &&
+		(!Number.isSafeInteger(options.pageBytes) || options.pageBytes < 1)
+	) {
+		throw invalidArgument(
+			"stream",
+			"options.pageBytes",
+			"positive integer",
+			typeof options.pageBytes,
+			"lix",
+		);
+	}
+	if (
+		options.rowMode !== undefined &&
+		options.rowMode !== "object" &&
+		options.rowMode !== "array"
+	) {
+		throw invalidArgument(
+			"stream",
+			"options.rowMode",
+			'"object" or "array"',
+			typeof options.rowMode,
+			"lix",
 		);
 	}
 }

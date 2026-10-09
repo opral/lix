@@ -3,6 +3,7 @@ import type {
 	BindingBatchStatement,
 	BindingParam,
 	LixStorageConfig,
+	QueryStreamBindingOptions,
 } from "../binding-types.js";
 import type {
 	CreateBranchOptions,
@@ -175,6 +176,14 @@ export type WorkerOperation =
 	| { kind: "exportSnapshot" }
 	| { kind: "exportSnapshot.next"; exportId: number }
 	| { kind: "exportSnapshot.cancel"; exportId: number }
+	| {
+			kind: "stream";
+			sql: string;
+			params: BindingParam[];
+			options?: QueryStreamBindingOptions;
+	  }
+	| { kind: "stream.next"; streamId: number }
+	| { kind: "stream.cancel"; streamId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "observe.close"; observeId: number }

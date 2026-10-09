@@ -36,6 +36,9 @@ const commitPolicy = {
 	exportSnapshot: false,
 	"exportSnapshot.next": false,
 	"exportSnapshot.cancel": false,
+	stream: false,
+	"stream.next": false,
+	"stream.cancel": false,
 	observe: false,
 	"observe.next": false,
 	"observe.close": false,
@@ -49,6 +52,10 @@ export function operationDeadline(
 	operation: WorkerOperation,
 ): number | undefined {
 	if (operation.kind === "observe.next") return undefined;
+	// One page may wait on a sort or aggregate over the whole input before its
+	// first row exists. Streams have no whole-operation deadline, and a pull is
+	// cancellable through `stream.cancel`, so a slow page must not be fatal.
+	if (operation.kind === "stream.next") return undefined;
 	if (operation.kind === "close") return 5_000;
 	if (operation.kind === "open") return 30_000;
 	return 60_000;

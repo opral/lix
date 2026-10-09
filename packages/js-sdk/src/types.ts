@@ -353,6 +353,25 @@ export type ExecuteBatchResult<TRow extends object = ResultObjectRow> = {
 	commit: CommitSpan | null;
 };
 
+export type StreamOptions = {
+	/**
+	 * Upper bound for one page's rows in public value bytes (one value slot per
+	 * cell plus text, JSON and blob payload bytes). A single larger row is
+	 * returned as a page of its own. Defaults to 1 MiB; at most 64 MiB.
+	 */
+	pageBytes?: number;
+	/** Returns positional arrays instead of plain objects. Defaults to "object". */
+	rowMode?: "object" | "array";
+	/** Aborting cancels the stream; the pending or next pull rejects with the signal's reason. */
+	signal?: AbortSignal;
+};
+
+/** One page of a `lix.stream()` read. Pages are never empty. */
+export type QueryPage<TRow extends object = ResultObjectRow> = {
+	columns: ResultColumn[];
+	rows: TRow[];
+};
+
 export type ObserveEvent = {
 	sequence: number;
 	mutationSequence: number;

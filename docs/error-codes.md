@@ -156,6 +156,8 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_PROTOCOL_SESSION_INVALID` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_PROTOCOL_SESSION_REQUIRED` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
+| `LIX_ERROR_QUERY_STREAM_LOST` | [packages/js-sdk/src/worker/repository-session.ts](../packages/js-sdk/src/worker/repository-session.ts) |
+| `LIX_ERROR_QUERY_STREAM_NEXT_IN_FLIGHT` | [packages/js-bindings/wasm.rs](../packages/js-bindings/wasm.rs) |
 | `LIX_ERROR_READ_ONLY` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_RECOVERING` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_REPLICA_REPLACEMENT_UNAVAILABLE` | [packages/lix/src/sync/repository.rs](../packages/lix/src/sync/repository.rs) |

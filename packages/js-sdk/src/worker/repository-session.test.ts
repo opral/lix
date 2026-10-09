@@ -40,6 +40,7 @@ function fixture() {
 						"observe",
 						"beginTransaction",
 						"exportSnapshot",
+						"stream",
 					].includes(message.operation.kind)
 						? resource++
 						: undefined,
@@ -417,4 +418,32 @@ test("standalone replica conversion does not require an open session", async () 
 			operation: expect.objectContaining({ kind: "replica.convert" }),
 		}),
 	]);
+});
+
+test("query streams map to the owner's id and do not survive owner loss", async () => {
+	const f = fixture();
+	await f.open();
+	const open = f.request({ kind: "stream", sql: "SELECT 1", params: [] });
+	await tick();
+	const streamId = f.result(open).value as number;
+	f.pause();
+	const pending = f.request({ kind: "stream.next", streamId });
+	await tick();
+	expect((f.sent.at(-1) as WorkerRequest).operation).toEqual({
+		kind: "stream.next",
+		streamId: 10,
+	});
+	// A pull in flight when the owner dies fails: its snapshot died with it.
+	f.session.lost();
+	expect(f.result(pending)).toMatchObject({ ok: false });
+	f.resume();
+	f.session.connected();
+	await tick();
+	const stale = f.request({ kind: "stream.next", streamId });
+	expect(f.result(stale)).toMatchObject({
+		ok: false,
+		error: { code: "LIX_ERROR_QUERY_STREAM_LOST" },
+	});
+	const cancel = f.request({ kind: "stream.cancel", streamId });
+	expect(f.result(cancel)).toMatchObject({ ok: true });
 });

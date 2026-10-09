@@ -51,6 +51,8 @@ export type {
 	MergeBranchReceipt,
 	MergeChangeStats,
 	ObserveEvent,
+	QueryPage,
+	StreamOptions,
 	OpenLixOptions,
 	Durability,
 	OpenAnotherSessionOptions,

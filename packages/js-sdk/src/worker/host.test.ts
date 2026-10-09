@@ -1856,3 +1856,76 @@ test("worker teardown disables its session DELETE lane after owner detach fails"
     response: { mode: "buffered", maxBytes: 128 },
   })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
 });
+
+test("stream pulls use their own lane and session close cancels open streams", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const execute = deferred<void>();
+	const page = {
+		columns: [{ name: "n", type: "integer" }],
+		rows: [[{ kind: "integer", value: 1 }]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const streams: { cancel: ReturnType<typeof vi.fn>; next: ReturnType<typeof vi.fn> }[] = [];
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		async execute() {
+			await execute.promise;
+			return { columns: [], rows: [], rowsAffected: 1, notices: [] };
+		},
+		async stream() {
+			const stream = {
+				next: vi.fn(async () => page),
+				cancel: vi.fn(async () => {}),
+			};
+			streams.push(stream);
+			return stream;
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "stream", sql: "SELECT n", params: [], options: { pageBytes: 64 } },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+
+	// A write occupying the session lane does not hold up a pull.
+	receive({ id: 3, sessionId: 0, operation: { kind: "execute", sql: "UPDATE t", params: [] } });
+	receive({ id: 4, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 4, ok: true, value: page }));
+	expect(responses.some((message) => "id" in message && message.id === 3 && "ok" in message)).toBe(false);
+	execute.resolve();
+	await vi.waitFor(() => expect(responses.some((message) => "ok" in message && message.id === 3)).toBe(true));
+
+	receive({ id: 5, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: 2 }));
+	receive({ id: 6, sessionId: 0, operation: { kind: "stream.cancel", streamId: 2 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 6, ok: true }));
+	expect(streams[1].cancel).toHaveBeenCalledOnce();
+
+	receive({ id: 7, sessionId: 0, operation: { kind: "close" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 7, ok: true }));
+	expect(streams[0].cancel).toHaveBeenCalledOnce();
+	expect(streams[1].cancel).toHaveBeenCalledOnce();
+	expect(binding.close).toHaveBeenCalledOnce();
+});

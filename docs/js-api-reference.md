@@ -152,7 +152,7 @@ Executes one PostgreSQL-dialect SQL statement against the active Lix session. Pa
 
 For a partial replica with on-demand sync, prefetch a view by executing its SELECT on hover, then execute the same SELECT when opening it. Resident inputs stay local. Use ordinary `execute()` for writes; a read does not promise that all later write validation or commit dependencies are resident.
 
-Cancellable buffered local and partial-replica reads have a 30-second deadline including input hydration, and return at most 64 MiB or 1,000,000 rows per operation. `executeBatch()` shares the result budget across its read statements. Narrow large queries or request file ranges. Exceeding these bounds reports `LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes are never canceled or replayed by the read deadline.
+Cancellable buffered local and partial-replica reads have a 30-second deadline including input hydration, and return at most 64 MiB or 1,000,000 rows per operation. `executeBatch()` shares the result budget across its read statements. Narrow large queries, request file ranges, or read large results with [`stream()`](#stream). Exceeding these bounds reports `LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes are never canceled or replayed by the read deadline.
 
 Parameters:
 
@@ -241,6 +241,30 @@ const { results: returning } = await lix.executeBatch([
 ]);
 console.log(returning[0].rows[0]?.done);
 ```
+
+### stream()
+
+```ts
+const pages = lix.stream(sql, params?, { pageBytes?, rowMode?, signal? }?);
+```
+
+Streams one read statement page by page. The statement runs once against one storage snapshot that stays pinned until the stream ends, so every page belongs to the same consistent state; writes committed after the stream opened are not visible in it. Unlike `execute()`, a stream is not limited by the 64 MiB / 1,000,000-row read budget or the read deadline, so it suits bulk reads such as loading a whole project.
+
+Each value is `{ columns, rows }` with the same column and row representation as `execute()`. Pages are never empty and hold at most `pageBytes` of row data (default 1 MiB, at most 64 MiB) measured as one value slot per cell plus text, JSON and blob bytes; a single larger row is returned as a page of its own. The statement is planned on the first `next()`, which reports SQL errors.
+
+```ts
+for await (const page of lix.stream(
+  "SELECT id, message_id, pattern FROM inlang_variant",
+  [],
+  { pageBytes: 4 * 1024 * 1024 },
+)) {
+  for (const row of page.rows) compile(row);
+}
+```
+
+Breaking out of the loop, calling `return()`, aborting `signal`, or closing Lix cancels the stream and releases its snapshot. A pending or later pull rejects with the signal's reason after an abort and with `LIX_ERROR_CLOSED` after `close()`, so a truncated read is never mistaken for a complete one. An open stream does not block writes on the same handle; it only holds its snapshot.
+
+Streams are read-only: writes and statements calling `uuidv7()` or `current_timestamp()` reject with `LIX_ERROR_READ_ONLY`. Reads of file content and reads on partial replicas run as one buffered read (with its budget and deadline) and are then delivered page by page. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
 
 ### observe()
 

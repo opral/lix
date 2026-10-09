@@ -15,7 +15,8 @@ import {
 } from "./operation-scheduler.js";
 type Context = { branchId: string; accountId: string };
 type Reply = Extract<WorkerResponse, { ok: boolean }>;
-/** Logical handles survive owner generations; transactions and snapshot streams do not. */
+/** Logical handles survive owner generations; transactions, snapshot streams
+ * and query streams do not (their snapshot belonged to the lost owner). */
 export class RepositorySession {
 	private epoch = 0;
 	private ready = false;
@@ -38,6 +39,7 @@ export class RepositorySession {
 	>();
 	private transactions = new Map<number, number>();
 	private exports = new Map<number, number>();
+	private queryStreams = new Map<number, number>();
 	private callbacks = new Map<number, number>();
 	private callbackIds = new Map<number, number>();
 	private requests = new Map<number, WorkerRequest>();
@@ -69,6 +71,7 @@ export class RepositorySession {
 		this.internal.clear();
 		this.transactions.clear();
 		this.exports.clear();
+		this.queryStreams.clear();
 		const replay: WorkerRequest[] = [];
 		const closingObservations = new Set(
 			Array.from(this.requests.values()).flatMap((request) =>
@@ -327,6 +330,20 @@ export class RepositorySession {
 					);
 				operation.exportId = remote;
 			}
+			if ("streamId" in operation) {
+				const remote = this.queryStreams.get(operation.streamId);
+				if (remote === undefined) {
+					if (operation.kind === "stream.cancel") {
+						this.output({ id: message.id, ok: true, value: undefined });
+						return;
+					}
+					throw repositoryError(
+						"LIX_ERROR_QUERY_STREAM_LOST",
+						"Query stream belonged to a previous repository owner; start a new stream",
+					);
+				}
+				operation.streamId = remote;
+			}
 			if ("observeId" in operation) {
 				if (operation.kind !== "observe.close") {
 					const remote = this.observations.get(operation.observeId);
@@ -511,6 +528,11 @@ export class RepositorySession {
 		} else if (operation.kind === "exportSnapshot") {
 			value = this.nextResource++;
 			this.exports.set(value as number, message.value as number);
+		} else if (operation.kind === "stream") {
+			value = this.nextResource++;
+			this.queryStreams.set(value as number, message.value as number);
+		} else if (operation.kind === "stream.next") {
+			if (value == null) this.queryStreams.delete(operation.streamId);
 		} else if (operation.kind === "close")
 			this.sessions.delete(request.sessionId);
 		else if (
@@ -520,6 +542,8 @@ export class RepositorySession {
 			this.transactions.delete(operation.transactionId);
 		else if (operation.kind === "exportSnapshot.cancel")
 			this.exports.delete(operation.exportId);
+		else if (operation.kind === "stream.cancel")
+			this.queryStreams.delete(operation.streamId);
 		this.output({ ...message, id: request.id, value });
 	}
 	close() {

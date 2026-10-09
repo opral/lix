@@ -53,6 +53,17 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
+export type QueryStreamBindingOptions = {
+	/** Page size in public value bytes; the engine default applies when omitted. */
+	pageBytes?: number;
+};
+
+/** One open read stream. `next()` resolves null/undefined once exhausted. */
+export type QueryStreamBinding = {
+	next(): Promise<BindingExecuteResult | null | undefined>;
+	cancel(): void | Promise<void>;
+};
+
 export type SnapshotExportBinding = {
 	next(): Promise<Uint8Array | null | undefined>;
 	cancel(): void | Promise<void>;
@@ -95,6 +106,12 @@ export type LixBinding = {
 		params: BindingParam[],
 		options?: { signal?: AbortSignal },
 	): Promise<ObserveEventsBinding>;
+	/** Plans `sql` and pins its read snapshot; rows arrive through `next()`. */
+	stream(
+		sql: string,
+		params: BindingParam[],
+		options?: QueryStreamBindingOptions,
+	): Promise<QueryStreamBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;

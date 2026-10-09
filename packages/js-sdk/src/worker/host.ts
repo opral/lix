@@ -11,6 +11,7 @@ import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 	SnapshotExportBinding,
 } from "../binding-types.js";
 import type {
@@ -77,6 +78,13 @@ export function startWorkerHost(
 	const observations = new Map<number, ObservationRecord>();
 	let nextSnapshotExportId = 1;
 	const snapshotExports = new Map<number, SnapshotExportBinding>();
+	let nextQueryStreamId = 1;
+	// Each stream belongs to one session: closing that session (or the host)
+	// cancels it so its read snapshot never outlives the session.
+	const queryStreams = new Map<
+		number,
+		{ binding: QueryStreamBinding; sessionId: number }
+	>();
 	const snapshotInputs = new Map<
 		number,
 		{
@@ -343,7 +351,9 @@ export function startWorkerHost(
 			message.operation.kind === "observe.next" ||
 			message.operation.kind === "observe.close" ||
 			message.operation.kind === "exportSnapshot.next" ||
-			message.operation.kind === "exportSnapshot.cancel"
+			message.operation.kind === "exportSnapshot.cancel" ||
+			message.operation.kind === "stream.next" ||
+			message.operation.kind === "stream.cancel"
 		) {
 			if (message.operation.kind === "observe.next") {
 				const observeId = message.operation.observeId;
@@ -410,6 +420,19 @@ export function startWorkerHost(
 					closures?.delete(closure);
 					if (closures?.size === 0) observationClosuresBySession.delete(sessionId);
 				});
+			} else if (message.operation.kind === "stream.next") {
+				// Pulls run on the stream's own lane: a slow page never holds the
+				// session lane, and an idle stream never blocks it.
+				const streamId = message.operation.streamId;
+				void scheduleLaneRequest(
+					message,
+					`stream:${streamId}`,
+					undefined,
+					() => handleQueryStreamNext(streamId),
+				);
+			} else if (message.operation.kind === "stream.cancel") {
+				const streamId = message.operation.streamId;
+				void trackDirect(message, () => handleQueryStreamCancel(streamId));
 			} else if (message.operation.kind === "exportSnapshot.next") {
 				const exportId = message.operation.exportId;
 				void scheduleLaneRequest(
@@ -870,6 +893,26 @@ export function startWorkerHost(
 				snapshotExports.set(exportId, snapshot);
 				return exportId;
 			}
+			case "stream": {
+				const stream = await requiredLix(sessionId).stream(
+					operation.sql,
+					operation.params,
+					operation.options,
+				);
+				if (!isSessionLive(sessionId)) {
+					await Promise.resolve(stream.cancel()).catch(() => undefined);
+					throw workerStateError("Lix session is closing");
+				}
+				const streamId = nextQueryStreamId++;
+				queryStreams.set(streamId, { binding: stream, sessionId });
+				return streamId;
+			}
+			case "stream.next":
+				throw workerStateError("stream pulls bypass the finite operation queue");
+			case "stream.cancel":
+				throw workerStateError(
+					"stream cancellation bypasses the finite operation queue",
+				);
 			case "exportSnapshot.next":
 				throw workerStateError(
 					"snapshot pulls bypass the finite operation queue",
@@ -897,6 +940,7 @@ export function startWorkerHost(
 							);
 					}
 					await closeObservationsForSession(sessionId);
+					await cancelQueryStreams(sessionId);
 					await openLix.close();
 					sessions.delete(sessionId);
 					sessionLifetimes.delete(sessionId);
@@ -912,6 +956,46 @@ export function startWorkerHost(
 			case "observe.close":
 				throw workerStateError("observe.close must use the observation lane");
 		}
+	}
+
+	async function handleQueryStreamNext(
+		streamId: number,
+	): Promise<unknown> {
+		const stream = queryStreams.get(streamId);
+		if (!stream) return undefined;
+		try {
+			const page = await stream.binding.next();
+			if (page == null) queryStreams.delete(streamId);
+			return page ?? undefined;
+		} catch (error) {
+			queryStreams.delete(streamId);
+			await Promise.resolve(stream.binding.cancel()).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	async function handleQueryStreamCancel(streamId: number): Promise<void> {
+		const stream = queryStreams.get(streamId);
+		queryStreams.delete(streamId);
+		if (stream) await stream.binding.cancel();
+	}
+
+	/** Cancels the streams of one session, or of every session. */
+	async function cancelQueryStreams(sessionId?: number): Promise<void> {
+		const cancelled: Promise<void>[] = [];
+		const lanes = new Set<string>();
+		for (const [streamId, stream] of queryStreams) {
+			if (sessionId !== undefined && stream.sessionId !== sessionId) continue;
+			queryStreams.delete(streamId);
+			lanes.add(`stream:${streamId}`);
+			cancelled.push(Promise.resolve().then(() => stream.binding.cancel()));
+		}
+		operationScheduler.cancelQueued(
+			schedulerScope,
+			workerStateError("Lix session is closing"),
+			(work) => lanes.has(work.lane),
+		);
+		await Promise.allSettled(cancelled);
 	}
 
 	async function handleSnapshotNext(
@@ -1039,6 +1123,7 @@ export function startWorkerHost(
             await capture(() => Promise.resolve().then(() => snapshot.cancel()));
           }
           snapshotExports.clear();
+          await capture(() => cancelQueryStreams());
           await capture(() => operationScheduler.drainScope(schedulerScope));
 		  await Promise.allSettled([
 		    ...registrations,

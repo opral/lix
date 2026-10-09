@@ -9,6 +9,7 @@ import type {
 	LixStorageConfig,
 	LixBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
@@ -117,6 +118,16 @@ function normalizeNativeObserveEvents(
 	}) as ObserveEventsBinding;
 }
 
+/** The addon's `QueryStream` class resolves `null` at the end of a stream. */
+function normalizeNativeQueryStream(
+	stream: QueryStreamBinding,
+): QueryStreamBinding {
+	return {
+		next: () => stream.next(),
+		cancel: () => stream.cancel(),
+	};
+}
+
 function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 	return new Proxy(binding, {
 		get(target, property, receiver) {
@@ -144,6 +155,10 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
 				) => normalizeNativeObserveEvents(await target.observe(sql, params));
+			}
+			if (property === "stream") {
+				return async (...args: Parameters<LixBinding["stream"]>) =>
+					normalizeNativeQueryStream(await target.stream(...args));
 			}
 			const value = Reflect.get(target, property, receiver) as unknown;
 			return typeof value === "function" ? value.bind(target) : value;

@@ -30,3 +30,17 @@ test("opening and closing have finite budgets; observation waits remain long-liv
 		operationDeadline({ kind: "observe.next", observeId: 1 }),
 	).toBeUndefined();
 });
+test("stream pulls have no fatal deadline and never report an unknown write outcome", () => {
+	expect(operationDeadline({ kind: "stream.next", streamId: 1 })).toBeUndefined();
+	expect(
+		operationDeadline({ kind: "stream", sql: "SELECT 1", params: [] }),
+	).toBe(60000);
+	const error = new Error("owner died");
+	for (const operation of [
+		{ kind: "stream", sql: "SELECT 1", params: [] },
+		{ kind: "stream.next", streamId: 1 },
+		{ kind: "stream.cancel", streamId: 1 },
+	] as const) {
+		expect(lostOperationError(operation, error)).toBe(error);
+	}
+});
