@@ -473,8 +473,10 @@ pub(crate) async fn validate_prepared_writes(
         return Ok(StagedIndexValues::default());
     }
     let mut pending_constraints = PendingConstraintIndexes::default();
-    let mut validated_constraint_rows =
-        BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
+    pending_constraints
+        .identity_targets
+        .reserve(constraint_rows.len());
+    let mut validated_constraint_rows = ValidatedConstraintRows::new(&constraint_rows);
     let mut file_owner_validator = FileOwnerReferenceValidator::default();
     let mut staged_constraint_rows = Vec::new();
     let mut index_extractor = StagedIndexExtractor::new(input.schema_catalog);
@@ -482,11 +484,13 @@ pub(crate) async fn validate_prepared_writes(
         let row = *row;
         if row.is_tombstone() {
             pending_constraints.remember_tombstone(row);
+            validated_constraint_rows.push(None, true);
             continue;
         }
         let validated = validate_row_content(input.schema_catalog, &pending_schema_domains, row)?;
-        pending_constraints.remember_row(row, validated.schema_plan, validated.payload.clone())?;
-        validated_constraint_rows.insert(row.domain_row_identity(), validated);
+        let fresh_identity =
+            pending_constraints.remember_row(row, validated.schema_plan, validated.payload.clone())?;
+        validated_constraint_rows.push(Some(validated), fresh_identity);
     }
     for row in &staged_rows {
         let row = *row;
@@ -495,8 +499,7 @@ pub(crate) async fn validate_prepared_writes(
             validate_staged_row_metadata(row)?;
         }
         let validated = validated_constraint_rows
-            .get(&row.domain_row_identity())
-            .cloned()
+            .get(row, &pending_constraints)
             .map(Ok)
             .unwrap_or_else(|| {
                 validate_row_content(input.schema_catalog, &pending_schema_domains, row)
@@ -2622,6 +2625,114 @@ impl PendingSchemaDomains {
     }
 }
 
+/// Validated content of the scope's constraint rows, looked up by staged rows.
+///
+/// Semantically this is the map `identity -> content of the last live
+/// constraint row with that identity`. A scope's staged rows are a
+/// contiguous, in-order run of its constraint rows, so while live identities
+/// are unique the content is found positionally, by comparing the identity
+/// fields in place, without building, probing, and dropping an ordered map
+/// keyed by owned identities. Anything the positional walk cannot prove
+/// (duplicate live identities, a tombstone sharing a live identity, rows out
+/// of order) falls back to the exact map, built on first use.
+struct ValidatedConstraintRows<'r, 'a> {
+    rows: &'r [PreparedValidationRow<'a>],
+    contents: Vec<Option<ValidatedRowContent<'a>>>,
+    live_identities_unique: bool,
+    cursor: usize,
+    located_run: bool,
+    by_identity: Option<BTreeMap<DomainRowIdentity, ValidatedRowContent<'a>>>,
+}
+
+impl<'r, 'a> ValidatedConstraintRows<'r, 'a> {
+    fn new(rows: &'r [PreparedValidationRow<'a>]) -> Self {
+        Self {
+            rows,
+            contents: Vec::with_capacity(rows.len()),
+            live_identities_unique: true,
+            cursor: 0,
+            located_run: false,
+            by_identity: None,
+        }
+    }
+
+    /// Records the next constraint row's content (`None` for tombstones).
+    fn push(&mut self, content: Option<ValidatedRowContent<'a>>, fresh_identity: bool) {
+        self.live_identities_unique &= fresh_identity;
+        self.contents.push(content);
+    }
+
+    fn get(
+        &mut self,
+        row: PreparedValidationRow<'_>,
+        pending_constraints: &PendingConstraintIndexes<'_>,
+    ) -> Option<ValidatedRowContent<'a>> {
+        if self.live_identities_unique
+            && let Some(position) = self.position_of(row)
+        {
+            match &self.contents[position] {
+                // The only live constraint row with this identity.
+                Some(content) => return Some(content.clone()),
+                // A tombstone slot: the map holds an entry only if some live
+                // constraint row shares the identity.
+                None if !pending_constraints
+                    .identity_targets
+                    .contains(&row.domain_row_identity()) =>
+                {
+                    return None;
+                }
+                None => {}
+            }
+        }
+        self.by_identity
+            .get_or_insert_with(|| {
+                let mut by_identity = BTreeMap::new();
+                for (constraint_row, content) in self.rows.iter().zip(&self.contents) {
+                    if let Some(content) = content {
+                        by_identity.insert(constraint_row.domain_row_identity(), content.clone());
+                    }
+                }
+                by_identity
+            })
+            .get(&row.domain_row_identity())
+            .cloned()
+    }
+
+    /// Finds the constraint row with `row`'s identity, expecting staged rows
+    /// to arrive in constraint-row order. The start of the run is searched
+    /// once; afterwards only the next position is tried, so an unexpected
+    /// order degrades to the map rather than to quadratic scanning.
+    fn position_of(&mut self, row: PreparedValidationRow<'_>) -> Option<usize> {
+        if let Some(candidate) = self.rows.get(self.cursor)
+            && same_domain_row_identity(*candidate, row)
+        {
+            self.located_run = true;
+            self.cursor += 1;
+            return Some(self.cursor - 1);
+        }
+        if self.located_run {
+            return None;
+        }
+        self.located_run = true;
+        let position = self
+            .rows
+            .iter()
+            .position(|candidate| same_domain_row_identity(*candidate, row))?;
+        self.cursor = position + 1;
+        Some(position)
+    }
+}
+
+/// `left.domain_row_identity() == right.domain_row_identity()`, compared in
+/// place.
+fn same_domain_row_identity(left: PreparedValidationRow<'_>, right: PreparedValidationRow<'_>) -> bool {
+    left.row_pk() == right.row_pk()
+        && left.schema_key() == right.schema_key()
+        && left.branch_id() == right.branch_id()
+        && left.untracked() == right.untracked()
+        && left.file_id() == right.file_id()
+}
+
 #[derive(Clone)]
 struct ValidatedRowContent<'a> {
     schema_plan: &'a SchemaPlan,
@@ -2826,21 +2937,22 @@ impl<'a> PendingConstraintIndexes<'a> {
         self.tombstones.push(PendingTombstone { identity });
     }
 
+    /// Returns whether the row's identity was new to the live identity set.
     fn remember_row<'p>(
         &mut self,
         row: PreparedValidationRow<'a>,
         schema_plan: &'a SchemaPlan,
         payload: impl Into<ValidatedRowPayload<'p>>,
-    ) -> Result<(), LixError> {
+    ) -> Result<bool, LixError> {
         let payload = payload.into();
-        self.remember_identity_target(row);
+        let fresh_identity = self.remember_identity_target(row);
         self.remember_primary_key_target(row, schema_plan, payload.clone());
         self.remember_unique_targets(row, schema_plan, payload)?;
-        Ok(())
+        Ok(fresh_identity)
     }
 
-    fn remember_identity_target(&mut self, row: PreparedValidationRow<'_>) {
-        self.identity_targets.insert(row.domain_row_identity());
+    fn remember_identity_target(&mut self, row: PreparedValidationRow<'_>) -> bool {
+        self.identity_targets.insert(row.domain_row_identity())
     }
 
     fn remember_primary_key_target(
@@ -9297,6 +9409,126 @@ mod tests {
                 .validate(&json!({ "key": "k", "value": "v" }))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validated_constraint_rows_match_last_live_identity_map() {
+        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .unwrap();
+        let row = |key: &str, branch: &str, tombstone: bool| {
+            let mut row = pending_registered_schema_row("validated_constraint_rows");
+            row.row_pk = RowPk::single(key);
+            row.branch_id = branch.into();
+            if tombstone {
+                row.snapshot = None;
+            }
+            row
+        };
+        // (key, branch, tombstone) per constraint row; staged rows are given
+        // as constraint positions, or as extra rows absent from constraints.
+        type Spec = (&'static str, &'static str, bool);
+        let scenarios: Vec<(Vec<Spec>, Vec<Result<usize, Spec>>)> = vec![
+            // Ordinary scope: staged rows are the in-order constraint run.
+            (
+                vec![("a", "other", false), ("b", "main", false), ("c", "main", false)],
+                vec![Ok(1), Ok(2)],
+            ),
+            // Duplicate live identities: the last one wins.
+            (
+                vec![("a", "main", false), ("a", "main", false), ("b", "main", false)],
+                vec![Ok(0), Ok(1), Ok(2)],
+            ),
+            // A tombstone shares a live identity: the live content is used.
+            (
+                vec![("a", "main", false), ("a", "main", true)],
+                vec![Ok(1), Ok(0)],
+            ),
+            // A lone tombstone has no content.
+            (vec![("a", "main", true), ("b", "main", false)], vec![Ok(0), Ok(1)]),
+            // Out of order and absent rows.
+            (
+                vec![("a", "main", false), ("b", "main", false), ("c", "main", false)],
+                vec![Ok(2), Ok(0), Err(("z", "main", false)), Ok(1)],
+            ),
+            // Same key in another branch is another identity.
+            (
+                vec![("a", "main", false), ("a", "other", false)],
+                vec![Ok(1), Ok(0)],
+            ),
+        ];
+        for (constraint_specs, staged_specs) in scenarios {
+            let constraint_test_rows = constraint_specs
+                .iter()
+                .map(|(key, branch, tombstone)| row(key, branch, *tombstone))
+                .collect::<Vec<_>>();
+            let extra_test_rows = staged_specs
+                .iter()
+                .filter_map(|spec| spec.err().map(|(key, branch, tombstone)| row(key, branch, tombstone)))
+                .collect::<Vec<_>>();
+            let constraint_rows = constraint_test_rows
+                .iter()
+                .map(|row| PreparedValidationRow::State(row.borrowed()))
+                .collect::<Vec<_>>();
+            let mut extra = extra_test_rows.iter();
+            let staged_rows = staged_specs
+                .iter()
+                .map(|spec| match spec {
+                    Ok(position) => constraint_rows[*position],
+                    Err(_) => PreparedValidationRow::State(extra.next().unwrap().borrowed()),
+                })
+                .collect::<Vec<_>>();
+
+            let mut pending = PendingConstraintIndexes::default();
+            let mut lookup = ValidatedConstraintRows::new(&constraint_rows);
+            let mut reference = BTreeMap::new();
+            let mut payloads = Vec::new();
+            for constraint_row in &constraint_rows {
+                if constraint_row.is_tombstone() {
+                    lookup.push(None, true);
+                    continue;
+                }
+                let payload = Arc::new(
+                    crate::row_payload::TypedRow::from_test_json_unchecked(
+                        constraint_row.row_pk(),
+                        &json!({ "key": "k", "value": payloads.len() }),
+                    )
+                    .unwrap(),
+                );
+                payloads.push(Arc::clone(&payload));
+                let content = ValidatedRowContent {
+                    schema_plan: plan,
+                    payload: ValidatedRowPayload::Typed(payload),
+                };
+                let fresh = pending
+                    .identity_targets
+                    .insert(constraint_row.domain_row_identity());
+                reference.insert(constraint_row.domain_row_identity(), content.clone());
+                lookup.push(Some(content), fresh);
+            }
+            for staged_row in &staged_rows {
+                let expected = reference.get(&staged_row.domain_row_identity());
+                let actual = lookup.get(*staged_row, &pending);
+                match (expected, actual) {
+                    (None, None) => {}
+                    (Some(expected), Some(actual)) => {
+                        let (
+                            ValidatedRowPayload::Typed(expected),
+                            ValidatedRowPayload::Typed(actual),
+                        ) = (&expected.payload, &actual.payload)
+                        else {
+                            panic!("test contents are typed");
+                        };
+                        assert!(Arc::ptr_eq(expected, actual));
+                    }
+                    (expected, actual) => panic!(
+                        "lookup diverged: expected {}, got {}",
+                        expected.is_some(),
+                        actual.is_some()
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
