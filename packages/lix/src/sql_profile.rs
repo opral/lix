@@ -54,17 +54,6 @@ pub(crate) struct SqlReadProfile {
     /// it is never set by the production result path.
     pub(crate) result_count_only_rows: u64,
     pub(crate) result_count_only_batches: u64,
-    /// Number of public rows consumed while the profile scope was active.
-    pub(crate) result_rows_consumed: u64,
-    /// Number of rows materialized into the public `Vec<Row>` representation
-    /// or an owned benchmark scalar row while the profile scope was active.
-    pub(crate) result_rows_materialized: u64,
-    /// Number of owned rows retained through the end of result consumption.
-    /// Cursor modes materialize one scalar row at a time but retain none.
-    pub(crate) result_rows_retained: u64,
-    /// Checksum of consumed scalar values. This is a benchmark-only
-    /// correctness witness, not a public result API.
-    pub(crate) result_checksum: u64,
     /// Elapsed admission/read intervals recorded by storage-benches builds.
     /// They include CPU and waits, and can overlap SQL phases and each other.
     #[cfg(feature = "storage-benches")]
@@ -247,26 +236,6 @@ pub(crate) fn record_result_count_only(rows: usize, batches: usize) {
         profile.result_count_only_batches = profile
             .result_count_only_batches
             .saturating_add(batches as u64);
-    });
-}
-
-#[cfg(feature = "storage-benches")]
-pub(crate) fn record_result_rows(consumed: usize, materialized: usize, retained: usize) {
-    let _ = ACTIVE_PROFILE.try_with(|profile| {
-        let mut profile = profile.borrow_mut();
-        profile.result_rows_consumed = profile.result_rows_consumed.saturating_add(consumed as u64);
-        profile.result_rows_materialized = profile
-            .result_rows_materialized
-            .saturating_add(materialized as u64);
-        profile.result_rows_retained = profile.result_rows_retained.saturating_add(retained as u64);
-    });
-}
-
-#[cfg(feature = "storage-benches")]
-pub(crate) fn record_result_checksum(checksum: u64) {
-    let _ = ACTIVE_PROFILE.try_with(|profile| {
-        let mut profile = profile.borrow_mut();
-        profile.result_checksum = profile.result_checksum.wrapping_add(checksum);
     });
 }
 
@@ -510,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_profile_early_drop_stops_before_later_datafusion_partition() {
+    async fn dropped_stream_stops_before_later_datafusion_partition() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())
             .await
@@ -565,21 +534,28 @@ mod tests {
             .await
             .expect("second cancellation partition should seed");
 
-        let profile = session
-            .execute_result_streaming_profiled(
-                "SELECT id, ordinal, payload FROM sql_profile_cancel_a \
-                 UNION ALL SELECT id, ordinal, payload FROM sql_profile_cancel_b",
-                &[],
-                "live",
-                Some(1),
-            )
-            .await
-            .expect("live cancellation profile should execute");
+        let session = std::sync::Arc::new(session);
+        let (pages, profile) = scope(async {
+            let mut stream = session
+                .query_stream(
+                    "SELECT id, ordinal, payload FROM sql_profile_cancel_a \
+                     UNION ALL SELECT id, ordinal, payload FROM sql_profile_cancel_b",
+                    &[],
+                    1,
+                )
+                .await?;
+            let first = stream.next_page().await?.expect("first page");
+            drop(stream);
+            Ok(vec![first])
+        })
+        .await;
+        let pages = pages.expect("streamed profile should execute");
 
-        assert_eq!(profile.result_rows_consumed, 1);
-        assert_eq!(profile.result_rows_materialized, 1);
-        assert_eq!(profile.result_rows_retained, 0);
-        assert_eq!(profile.scan_rows, 4);
+        assert_eq!(pages[0].len(), 1, "a one-byte page holds exactly one row");
+        assert_eq!(
+            profile.scan_rows, 4,
+            "dropping the stream after one page never executes the second partition"
+        );
         assert!(profile.scan_batches > 0);
     }
 }

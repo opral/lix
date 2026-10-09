@@ -14,8 +14,12 @@
 //! ```
 //!
 //! `LIX_INLANG_PHASES` is a comma-separated subset of
-//! `commit,flat,join,keyset` (default: all). Profile the built binary with
-//! `samply record` or `perf record -g` using the same environment.
+//! `commit,flat,join,keyset,stream` (default: all). `stream` reads the same
+//! flat and joined shapes through `Lix::query_stream` with
+//! `LIX_INLANG_STREAM_PAGE_BYTES` pages (default 1 MiB). Every read phase
+//! reports `peak_rss_mib`, the process high-water mark reset at phase start
+//! (Linux only). Profile the built binary with `samply record` or
+//! `perf record -g` using the same environment.
 
 use std::future::Future;
 use std::hint::black_box;
@@ -25,6 +29,13 @@ use lix::storage::Memory;
 use lix::{Json, Lix, Value, open_lix};
 
 const BATCH_ROWS: usize = 500;
+
+/// Paraglide's compile read: every bundle with its messages and variants.
+const JOIN_NESTED_SQL: &str = "SELECT b.id AS bundle_id, b.declarations, m.id AS message_id, m.locale, m.selectors, \
+     v.id AS variant_id, v.matches, v.pattern \
+     FROM inlang_bundle b LEFT JOIN inlang_message m ON m.bundle_id = b.id \
+     LEFT JOIN inlang_variant v ON v.message_id = m.id \
+     ORDER BY b.id, m.id, v.id";
 
 fn schema_sql(key: &str, columns: &str, foreign_key: Option<(&str, &str)>) -> String {
     let fk = foreign_key
@@ -76,15 +87,86 @@ fn multi_row_insert(table: &str, columns: &[&str], rows: usize) -> String {
 }
 
 async fn timed<T>(label: &str, rows: usize, operation: impl Future<Output = T>) -> T {
+    let start_rss = reset_peak_rss();
     let started = Instant::now();
     let result = operation.await;
     let elapsed = started.elapsed();
     println!(
-        "inlang_project_scale phase={label} rows={rows} ms={} us_per_row={:.1}",
+        "inlang_project_scale phase={label} rows={rows} ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={}",
         elapsed.as_millis(),
-        elapsed.as_secs_f64() * 1e6 / rows.max(1) as f64
+        elapsed.as_secs_f64() * 1e6 / rows.max(1) as f64,
+        peak_rss_mib()
     );
     result
+}
+
+/// Resets the kernel's resident-set high-water mark so the next
+/// `peak_rss_mib()` covers only the phase that follows. Returns the resident
+/// set at the reset, i.e. the phase's starting point.
+fn reset_peak_rss() -> String {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    status_mib("VmRSS:")
+}
+
+fn peak_rss_mib() -> String {
+    status_mib("VmHWM:")
+}
+
+fn status_mib(field: &str) -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .and_then(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
+        })
+        .map_or_else(|| "n/a".to_owned(), |kib| (kib / 1024).to_string())
+}
+
+/// Pulls every page of `sql`, touching each row the way a consumer would.
+async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes: usize) {
+    let start_rss = reset_peak_rss();
+    let started = Instant::now();
+    let mut first_page_ms = None;
+    let mut rows = 0usize;
+    let mut pages = 0usize;
+    let outcome = async {
+        let mut stream = session
+            .query_stream(sql, &[])
+            .with_page_bytes(page_bytes)
+            .await?;
+        while let Some(page) = stream.next_page().await? {
+            first_page_ms.get_or_insert_with(|| started.elapsed().as_millis());
+            pages += 1;
+            rows += black_box(page.rows()).len();
+        }
+        Ok::<_, lix::LixError>(())
+    }
+    .await;
+    let elapsed = started.elapsed();
+    match outcome {
+        Ok(()) => println!(
+            "inlang_project_scale phase={label} rows={rows} pages={pages} page_bytes={page_bytes} \
+             ms={} first_page_ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={}",
+            elapsed.as_millis(),
+            first_page_ms.unwrap_or_default(),
+            elapsed.as_secs_f64() * 1e6 / rows.max(1) as f64,
+            peak_rss_mib()
+        ),
+        Err(error) => println!(
+            "inlang_project_scale phase={label} error={} ms={}",
+            error.code,
+            elapsed.as_millis()
+        ),
+    }
 }
 
 async fn insert_all(
@@ -106,8 +188,8 @@ async fn insert_all(
 async fn run() {
     let locales = env_usize("LIX_INLANG_LOCALES", 30);
     let messages = env_usize("LIX_INLANG_MESSAGES", 5_000);
-    let phases =
-        std::env::var("LIX_INLANG_PHASES").unwrap_or_else(|_| "commit,flat,join,keyset".into());
+    let phases = std::env::var("LIX_INLANG_PHASES")
+        .unwrap_or_else(|_| "commit,flat,join,keyset,stream".into());
     let rows = locales * messages;
     println!(
         "inlang_project_scale locales={locales} messages={messages} message_rows={rows} variant_rows={rows}"
@@ -328,18 +410,30 @@ async fn run() {
             }
         }
     }
+    if phases.contains("stream") {
+        let page_bytes = env_usize(
+            "LIX_INLANG_STREAM_PAGE_BYTES",
+            lix::DEFAULT_QUERY_STREAM_PAGE_BYTES,
+        );
+        stream_phase(
+            &session,
+            "stream_variants",
+            "SELECT id, message_id, matches, pattern FROM inlang_variant",
+            page_bytes,
+        )
+        .await;
+        stream_phase(
+            &session,
+            "stream_messages",
+            "SELECT id, bundle_id, locale, selectors FROM inlang_message",
+            page_bytes,
+        )
+        .await;
+        stream_phase(&session, "stream_join_nested", JOIN_NESTED_SQL, page_bytes).await;
+    }
     if phases.contains("join") {
         let result = timed("join_nested", rows, async {
-            session
-                .execute(
-                    "SELECT b.id AS bundle_id, b.declarations, m.id AS message_id, m.locale, m.selectors, \
-                     v.id AS variant_id, v.matches, v.pattern \
-                     FROM inlang_bundle b LEFT JOIN inlang_message m ON m.bundle_id = b.id \
-                     LEFT JOIN inlang_variant v ON v.message_id = m.id \
-                     ORDER BY b.id, m.id, v.id",
-                    &[],
-                )
-                .await
+            session.execute(JOIN_NESTED_SQL, &[]).await
         })
         .await;
         match result {

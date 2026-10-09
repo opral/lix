@@ -160,8 +160,8 @@ pub(crate) async fn collect_plan_with_schema(
 /// Create a pull-based stream from a DataFusion physical plan without
 /// collecting its output batches first. The caller owns the stream and may
 /// stop polling it early; dropping the stream then drops the underlying scan
-/// futures as well.
-#[cfg(feature = "storage-benches")]
+/// futures as well. No read-result budget applies: streamed reads are bounded
+/// by their consumer's page window instead of by total result size.
 pub(crate) async fn stream_plan(
     state: &SessionState,
     logical_plan: RuntimeReadPlan,
@@ -651,7 +651,6 @@ async fn collect_adapted_input_plan(
     Ok(batches)
 }
 
-#[cfg(feature = "storage-benches")]
 fn stream_adapted_input_plan(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,

@@ -41,7 +41,6 @@ mod udfs;
 mod value_contract;
 mod write_normalization;
 
-#[cfg(feature = "storage-benches")]
 pub(crate) use error::datafusion_error_to_lix_error;
 
 #[cfg(test)]
@@ -64,11 +63,7 @@ pub(crate) use context::{
     WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
-#[cfg(feature = "storage-benches")]
-pub(crate) use exec::{
-    BatchRowCursor, execute_read_statement_in_session_with_batch_stream,
-    execute_read_statement_in_session_with_collected_batches,
-};
+pub(crate) use exec::{ResultPager, execute_read_statement_in_session_with_batch_stream};
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
@@ -133,7 +128,7 @@ pub(crate) use plan::read::statement::{
     exact_filesystem_read_route,
 };
 pub(crate) use plan::read::statement::{
-    ExactFileContentIdRead, LateLixFileProjection, StatementReadPlan,
+    ExactFileContentIdRead, LateLixFileProjection, NativeReadPlan, StatementReadPlan,
     is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read,
     plan_read_statement,
 };

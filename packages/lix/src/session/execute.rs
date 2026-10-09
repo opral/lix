@@ -30,7 +30,6 @@ use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::parser::Statement as DataFusionStatement;
-#[cfg(feature = "storage-benches")]
 use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
@@ -414,6 +413,14 @@ impl ExecuteResult {
 
     pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
         Self::from_query_parts(columns, Vec::new(), rows, 0, Vec::new())
+    }
+
+    pub(crate) fn from_typed_rows(
+        columns: Vec<String>,
+        column_types: Vec<ResultColumnType>,
+        rows: Vec<Vec<Value>>,
+    ) -> Self {
+        Self::from_query_parts(columns, column_types, rows, 0, Vec::new())
     }
 
     pub(crate) fn from_idempotency_parts(
@@ -1277,149 +1284,294 @@ where
         result.map(|result| (result, profile))
     }
 
-    /// Benchmark-only comparison of the eager result path with internal
-    /// collected-batch and live-batch consumers. No stream escapes the scoped
-    /// storage read, and this does not change the public execution contract.
-    #[cfg(feature = "storage-benches")]
-    pub(crate) async fn execute_result_streaming_profiled(
+    /// Opens a pull-based stream over one read statement.
+    ///
+    /// Ordinary reads stream live from one pinned storage snapshot without the
+    /// buffered read budget or deadline. Reads whose rows only exist after the
+    /// whole statement ran (filesystem content hydration, plugin file-view
+    /// acknowledgement, partial-replica read-interest capture) execute
+    /// buffered and are paged out. Writes and durable runtime functions are
+    /// rejected.
+    pub(crate) async fn query_stream(
+        self: &Arc<Self>,
+        sql: &str,
+        params: &[Value],
+        page_bytes: usize,
+    ) -> Result<super::QueryStream, LixError> {
+        let page_bytes = super::query_stream::validate_page_bytes(page_bytes)?;
+        let (statement, route) = self.query_stream_route(sql, params)?;
+        match route {
+            QueryStreamRoute::Live => {
+                self.open_live_query_stream(sql.to_owned(), statement, params.to_vec(), page_bytes)
+                    .await
+            }
+            QueryStreamRoute::Materialized => {
+                let session = Arc::clone(self);
+                let sql = sql.to_owned();
+                let params = params.to_vec();
+                // SAFETY: the future owns its Arc session and request values,
+                // exactly like `execute_with_idempotency_and_options_and_metadata`.
+                let result = unsafe {
+                    super::AssumeSendFuture::new(
+                        async move { session.execute(&sql, &params).await },
+                    )
+                };
+                self.open_materialized_query_stream(result, page_bytes)
+                    .await
+            }
+        }
+    }
+
+    /// Classifies one statement for [`Self::query_stream`].
+    pub(crate) fn query_stream_route(
         &self,
         sql: &str,
         params: &[Value],
-        mode: &str,
-        row_limit: Option<usize>,
-    ) -> Result<crate::SqlReadProfile, LixError> {
-        let (result, profile) = crate::sql_profile::scope(async {
-            if mode == "full" {
-                let result = self.execute(sql, params).await?;
-                let rows = result.rows();
-                let consumed = row_limit.map_or(rows.len(), |limit| limit.min(rows.len()));
-                let checksum = rows.iter().take(consumed).try_fold(0u64, |checksum, row| {
-                    profile_result_checksum(checksum, row.values())
-                })?;
-                crate::sql_profile::record_result_rows(consumed, rows.len(), rows.len());
-                crate::sql_profile::record_result_checksum(checksum);
-                return Ok(());
-            }
-
-            if !matches!(mode, "stream" | "live" | "count_only") {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("unknown result streaming profile mode '{mode}'"),
-                ));
-            }
-
-            self.ensure_open()?;
-            let statement = self.sql_planning_cache.parse_statement(sql)?;
-            if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Read
-                || sql2::statement_has_durable_runtime_function(&statement)
-                || exact_filesystem_read_route(&statement, params).is_some()
-                || late_materialized_lix_file_content_read(&statement, params).is_some()
-            {
-                return Err(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "result streaming profiler accepts only ordinary cancellable reads",
-                ));
-            }
-
-            let _operation_guard = self.begin_waitable_session_operation().await?;
-            let read_scope = self
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await?;
-            with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
-                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                    let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                    let ctx = SessionSqlExecutionContext {
-                        active_branch_id: &active_branch_id,
-                        active_account_id: self.active_account_id(),
-                        read_store,
-                        hot_state: Arc::clone(&self.hot_state),
-                        binary_cas: Arc::clone(&self.binary_cas),
-                        branch_ctx: Arc::clone(&self.branch_ctx),
-                        catalog_context: Arc::clone(&self.catalog_context),
-                        sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                        functions: FunctionProviderHandle::system(),
-                        plugin_host: self.plugin_host.clone(),
-                        file_views: None,
-                    };
-                    let read_session =
-                        sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
-
-                    match mode {
-                        "stream" => {
-                            let result =
-                                sql2::execute_read_statement_in_session_with_collected_batches(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut cursor =
-                                sql2::BatchRowCursor::collected(&result.fields, &result.batches);
-                            consume_profile_cursor(&mut cursor, row_limit).await?;
-                        }
-                        "live" => {
-                            let mut result =
-                                sql2::execute_read_statement_in_session_with_batch_stream(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut cursor = sql2::BatchRowCursor::live(&mut result);
-                            consume_profile_cursor(&mut cursor, row_limit).await?;
-                            drop(cursor);
-                            drop(result);
-                        }
-                        "count_only" => {
-                            let mut result =
-                                sql2::execute_read_statement_in_session_with_batch_stream(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut rows = 0usize;
-                            let mut batches = 0usize;
-                            while let Some(batch) = {
-                                let started = std::time::Instant::now();
-                                let batch = result
-                                    .stream
-                                    .try_next()
-                                    .await
-                                    .map_err(sql2::datafusion_error_to_lix_error);
-                                crate::sql_profile::record_phase(
-                                    crate::sql_profile::Phase::ArrowExecution,
-                                    started.elapsed(),
-                                );
-                                batch?
-                            } {
-                                rows = rows.saturating_add(batch.num_rows());
-                                batches = batches.saturating_add(1);
-                            }
-                            crate::sql_profile::record_result_count_only(rows, batches);
-                            crate::sql_profile::record_result_rows(rows, 0, 0);
-                            drop(result);
-                        }
-                        _ => unreachable!("profile mode validated before opening read"),
-                    }
-                    drop(read_session);
-                    drop(ctx);
-                    Ok(())
-                },
+    ) -> Result<(DataFusionStatement, QueryStreamRoute), LixError> {
+        self.ensure_open()?;
+        if let Some(operation) = &self.account_insertion {
+            operation.ensure_sql(sql, params)?;
+        }
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+            return Err(
+                LixError::new(LixError::CODE_READ_ONLY, "query streams are read-only")
+                    .with_hint("Use execute() for statements that write."),
+            );
+        }
+        if sql2::statement_has_durable_runtime_function(&statement) {
+            return Err(LixError::new(
+                LixError::CODE_READ_ONLY,
+                "query streams cannot call runtime functions that persist state",
             )
-            .await
-        })
+            .with_hint("Use execute() for statements that call lix_uuid_v7(), lix_timestamp() or similar functions."));
+        }
+        let read_plan = sql2::plan_read_statement(&statement, params);
+        let materialized = matches!(read_plan.native, Some(sql2::NativeReadPlan::Filesystem(_)))
+            || read_plan.late_content.is_some()
+            || read_plan.acknowledge_file_views
+            || self.hot_state.capture_foreground_read_interests().is_some();
+        Ok((
+            statement,
+            if materialized {
+                QueryStreamRoute::Materialized
+            } else {
+                QueryStreamRoute::Live
+            },
+        ))
+    }
+
+    /// Pages a result that must be fully executed before its rows exist.
+    pub(crate) async fn open_materialized_query_stream(
+        &self,
+        result: impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static,
+        page_bytes: usize,
+    ) -> Result<super::QueryStream, LixError> {
+        let page_bytes = super::query_stream::validate_page_bytes(page_bytes)?;
+        let (sender, receiver) = super::query_stream::query_stream_channel();
+        super::QueryStream::open(
+            &self.query_streams,
+            || self.ensure_open(),
+            receiver,
+            super::query_stream::produce_materialized_pages(result, page_bytes, sender),
+            None,
+        )
+        .await
+    }
+
+    async fn open_live_query_stream(
+        self: &Arc<Self>,
+        sql: String,
+        statement: DataFusionStatement,
+        params: Vec<Value>,
+        page_bytes: usize,
+    ) -> Result<super::QueryStream, LixError> {
+        let (sender, receiver) = super::query_stream::query_stream_channel();
+        let session = Arc::clone(self);
+        // SAFETY: the producer owns its Arc session, request values and
+        // channel sender; the storage read it opens is borrowed from that
+        // owned session and dropped before the future completes. Remaining
+        // compiler failures are the higher-ranked SQL futures shared with
+        // `execute`.
+        let producer = unsafe {
+            super::AssumeSendFuture::new(async move {
+                session
+                    .produce_live_query_stream(&sql, statement, &params, page_bytes, sender)
+                    .await;
+            })
+        };
+        let admission_session = Arc::clone(self);
+        let admission: super::query_stream::QueryStreamPullAdmission = Arc::new(move || {
+            let session = Arc::clone(&admission_session);
+            Box::pin(async move {
+                let guard = session.begin_waitable_session_operation().await?;
+                let guard: super::query_stream::QueryStreamPullGuard = Box::new(guard);
+                Ok(guard)
+            })
+        });
+        super::QueryStream::open(
+            &self.query_streams,
+            || self.ensure_open(),
+            receiver,
+            producer,
+            Some(admission),
+        )
+        .await
+    }
+
+    /// Streams one read from one pinned snapshot. Failures before the first
+    /// page restart from a fresh snapshot under the buffered expired-read
+    /// policy; after a page was handed out they end the stream.
+    async fn produce_live_query_stream(
+        &self,
+        sql: &str,
+        statement: DataFusionStatement,
+        params: &[Value],
+        page_bytes: usize,
+        sender: super::query_stream::QueryStreamSender,
+    ) {
+        let mut progress = QueryStreamProgress::default();
+        let outcome = async {
+            self.refresh_active_branch_base_if_stale().await?;
+            let mut retries = ExpiredReadRetryState::default();
+            loop {
+                let attempt = async {
+                    let read = self
+                        .storage
+                        .begin_read(StorageReadOptions::default())
+                        .await?;
+                    let progress = &mut progress;
+                    let statement = statement.clone();
+                    let sender = &sender;
+                    with_static_session_sql_read::<StorageImpl, _, _, _>(
+                        read,
+                        move |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                            self.stream_read_statement_with_store(
+                                read_store, sql, statement, params, page_bytes, sender, progress,
+                            )
+                        },
+                    )
+                    .await
+                }
+                .await;
+                let Err(error) = attempt else {
+                    return Ok(());
+                };
+                if progress.page_sent || sender.is_closed() {
+                    return Err(error);
+                }
+                let Some(delay) = retries.next_delay(&error) else {
+                    return Err(error);
+                };
+                tokio::task::yield_now().await;
+                if !delay.is_zero() {
+                    super::query_stream::retry_delay(delay).await;
+                }
+            }
+        }
         .await;
-        result?;
-        Ok(profile)
+        if let Err(error) = outcome
+            && !sender.is_closed()
+        {
+            let _ = sender
+                .send(super::query_stream::QueryStreamMessage::Error(
+                    normalize_sql_surface_error(error, sql),
+                ))
+                .await;
+        }
+    }
+
+    async fn stream_read_statement_with_store(
+        &self,
+        read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        sql: &str,
+        statement: DataFusionStatement,
+        params: &[Value],
+        page_bytes: usize,
+        sender: &super::query_stream::QueryStreamSender,
+        progress: &mut QueryStreamProgress,
+    ) -> Result<(), LixError> {
+        use super::query_stream::{
+            QueryStreamHeader, QueryStreamMessage, send_query_stream_message,
+        };
+
+        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        let ctx = SessionSqlExecutionContext {
+            active_branch_id: &active_branch_id,
+            active_account_id: self.active_account_id(),
+            read_store,
+            hot_state: Arc::clone(&self.hot_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            branch_ctx: Arc::clone(&self.branch_ctx),
+            catalog_context: Arc::clone(&self.catalog_context),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+            functions: FunctionProviderHandle::system(),
+            plugin_host: self.plugin_host.clone(),
+            file_views: None,
+        };
+        let read_session =
+            sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
+        let mut result = sql2::execute_read_statement_in_session_with_batch_stream(
+            &read_session,
+            sql,
+            statement,
+            params,
+        )
+        .await?;
+        if !progress.header_sent {
+            let header = QueryStreamHeader {
+                columns: result
+                    .fields
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+                column_types: result
+                    .fields
+                    .iter()
+                    .map(sql2::result_column_type)
+                    .collect::<Result<_, _>>()?,
+                notices: std::mem::take(&mut result.notices),
+            };
+            send_query_stream_message(sender, QueryStreamMessage::Header(header)).await?;
+            progress.header_sent = true;
+        }
+        let mut pager = sql2::ResultPager::new(result.fields.clone(), page_bytes);
+        loop {
+            #[cfg(feature = "storage-benches")]
+            let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+            let batch = result
+                .stream
+                .try_next()
+                .await
+                .map_err(sql2::datafusion_error_to_lix_error);
+            #[cfg(feature = "storage-benches")]
+            if let Some(started) = started {
+                crate::sql_profile::record_phase(
+                    crate::sql_profile::Phase::ArrowExecution,
+                    started.elapsed(),
+                );
+            }
+            let Some(batch) = batch? else {
+                break;
+            };
+            for page in pager.push(batch)? {
+                send_query_stream_message(
+                    sender,
+                    QueryStreamMessage::Page(query_stream_page(page)),
+                )
+                .await?;
+                progress.page_sent = true;
+            }
+        }
+        if let Some(page) = pager.finish()? {
+            send_query_stream_message(sender, QueryStreamMessage::Page(query_stream_page(page)))
+                .await?;
+            progress.page_sent = true;
+        }
+        drop(result);
+        drop(read_session);
+        drop(ctx);
+        Ok(())
     }
 
     pub(crate) async fn execute_with_options(
@@ -4264,85 +4416,25 @@ fn sql_substring_byte_range(start: i64, length: u64, size: u64) -> (u64, u64) {
     (effective_start, effective_end)
 }
 
-#[cfg(feature = "storage-benches")]
-async fn consume_profile_cursor(
-    cursor: &mut sql2::BatchRowCursor<'_>,
-    row_limit: Option<usize>,
-) -> Result<(), LixError> {
-    let limit = row_limit.unwrap_or(usize::MAX);
-    let mut consumed = 0usize;
-    let mut checksum = 0u64;
-    while consumed < limit {
-        let Some(values) = cursor.next_values().await? else {
-            break;
-        };
-        checksum = profile_result_checksum(checksum, &values)?;
-        consumed += 1;
-    }
-    crate::sql_profile::record_result_rows(consumed, consumed, 0);
-    crate::sql_profile::record_result_checksum(checksum);
-    Ok(())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryStreamRoute {
+    /// Streams from a live DataFusion plan over one pinned snapshot.
+    Live,
+    /// Executes buffered, then pages the materialized result.
+    Materialized,
 }
 
-#[cfg(feature = "storage-benches")]
-fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixError> {
-    if values.len() != 3 {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "streaming profile expected exactly three projected values",
-        ));
-    }
-    let mut checksum = if checksum == 0 {
-        0xcbf2_9ce4_8422_2325
-    } else {
-        checksum
-    };
-    checksum = profile_checksum_bytes(checksum, &[0xff]);
-    for value in values {
-        checksum = match value {
-            Value::Null => profile_checksum_bytes(checksum, &[0]),
-            Value::Boolean(value) => profile_checksum_bytes(checksum, &[1, u8::from(*value)]),
-            Value::Integer(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[2]);
-                profile_checksum_bytes(checksum, &value.to_le_bytes())
-            }
-            Value::Real(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[3]);
-                profile_checksum_bytes(checksum, &value.to_bits().to_le_bytes())
-            }
-            Value::Text(value) => profile_checksum_sized_bytes(checksum, 4, value.as_bytes()),
-            Value::Jsonb(value) => {
-                profile_checksum_sized_bytes(checksum, 5, value.to_string().as_bytes())
-            }
-            Value::Blob(value) => {
-                profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
-            }
-            Value::Timestamptz(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[7]);
-                profile_checksum_bytes(checksum, &value.to_le_bytes())
-            }
-            Value::RowRef(value) => {
-                profile_checksum_sized_bytes(checksum, 8, value.as_str().as_bytes())
-            }
-        };
-    }
-    Ok(checksum)
+#[derive(Default)]
+struct QueryStreamProgress {
+    header_sent: bool,
+    page_sent: bool,
 }
 
-#[cfg(feature = "storage-benches")]
-fn profile_checksum_sized_bytes(checksum: u64, tag: u8, bytes: &[u8]) -> u64 {
-    let checksum = profile_checksum_bytes(checksum, &[tag]);
-    let checksum = profile_checksum_bytes(checksum, &(bytes.len() as u64).to_le_bytes());
-    profile_checksum_bytes(checksum, bytes)
-}
-
-#[cfg(feature = "storage-benches")]
-fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        checksum ^= u64::from(*byte);
-        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    checksum
+fn query_stream_page(page: sql2::SessionReadResult) -> ExecuteResult {
+    ExecuteResult::from_session_read_result(sql2::SessionReadSqlResult {
+        runtime_functions: None,
+        query: page,
+    })
 }
 
 fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), LixError> {

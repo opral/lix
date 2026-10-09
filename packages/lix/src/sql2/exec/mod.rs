@@ -1,5 +1,6 @@
 pub(crate) mod bound_public_write;
 pub(crate) mod datafusion;
+pub(crate) mod result_pages;
 pub(crate) mod write;
 
 use crate::SqlQueryResult;
@@ -73,17 +74,14 @@ impl SqlWriteResult {
     }
 }
 
-#[cfg(feature = "storage-benches")]
-pub(crate) use datafusion::{
-    BatchRowCursor, execute_read_statement_in_session_with_batch_stream,
-    execute_read_statement_in_session_with_collected_batches,
-};
+pub(crate) use datafusion::execute_read_statement_in_session_with_batch_stream;
 pub(crate) use datafusion::{
     DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadResult, SessionReadSqlResult,
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, prepare_read_session,
     prepare_read_session_at_head, query_result_from_batches, query_values_from_batches,
 };
+pub(crate) use result_pages::ResultPager;
 #[cfg(test)]
 pub(crate) use write::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,

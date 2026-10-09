@@ -1293,6 +1293,76 @@ where
     }
 }
 
+/// Configures one streamed read. See [`Lix::query_stream`].
+#[expect(missing_debug_implementations)]
+pub struct QueryStreamBuilder<'a, StorageImpl = Memory>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix: &'a Lix<StorageImpl>,
+    sql: String,
+    params: Vec<Value>,
+    page_bytes: usize,
+}
+
+impl<StorageImpl> QueryStreamBuilder<'_, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Caps each page's rows at `page_bytes` public value bytes (one `Value`
+    /// slot per cell plus text, JSON and blob payload bytes). A single row
+    /// larger than the cap is returned as a page of its own. Defaults to
+    /// [`crate::DEFAULT_QUERY_STREAM_PAGE_BYTES`].
+    pub fn with_page_bytes(mut self, page_bytes: usize) -> Self {
+        self.page_bytes = page_bytes;
+        self
+    }
+}
+
+impl<'a, StorageImpl> IntoFuture for QueryStreamBuilder<'a, StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    type Output = Result<crate::QueryStream, LixError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        // SAFETY: the builder owns its request values and borrows only the
+        // Sync Lix handle across suspension, as `ExecuteBuilder` does.
+        Box::pin(unsafe {
+            crate::session::AssumeSendFuture::new(async move {
+                let lix = self.lix;
+                let page_bytes = self.page_bytes;
+                let (_, route) = lix.session.query_stream_route(&self.sql, &self.params)?;
+                // A partial replica fetches missing inputs by restarting the
+                // whole statement after hydration, and may answer from its
+                // authority; neither can resume a stream that already handed
+                // out rows. Execute buffered and page the result instead.
+                if route == crate::session::QueryStreamRoute::Materialized
+                    || lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
+                {
+                    let buffered = lix.clone();
+                    let (sql, params) = (self.sql, self.params);
+                    // SAFETY: the future owns a Lix clone and its request
+                    // values; it is the same future `ExecuteBuilder` returns.
+                    let result = crate::session::AssumeSendFuture::new(async move {
+                        buffered.execute(&sql, &params).await
+                    });
+                    return lix
+                        .session
+                        .open_materialized_query_stream(result, page_bytes)
+                        .await;
+                }
+                lix.retry_sync_demands(|| {
+                    lix.session
+                        .query_stream(&self.sql, &self.params, page_bytes)
+                })
+                .await
+            })
+        })
+    }
+}
+
 /// Configures one atomic SQL batch execution.
 #[expect(missing_debug_implementations)]
 pub struct ExecuteBatchBuilder<'a, StorageImpl = Memory>
@@ -2080,6 +2150,32 @@ where
         }
     }
 
+    /// Streams one read statement in byte-bounded pages.
+    ///
+    /// The statement runs once against one storage snapshot that stays
+    /// pinned until the stream ends, is cancelled or dropped, or this handle
+    /// closes. Rows arrive through [`crate::QueryStream::next_page`] in the
+    /// same value representation as [`ExecuteResult`]. Unlike `execute()`,
+    /// the stream is not limited by the buffered read budget (64 MiB / 1M
+    /// rows) or the 30 s read deadline, so it suits bulk reads of any size.
+    ///
+    /// Streams are read-only: writes and runtime functions that persist
+    /// state are rejected. Reads of file content and reads on partial
+    /// replicas execute buffered (with the buffered limits) and are then
+    /// paged out. An idle stream never blocks writes on this handle.
+    pub fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [Value],
+    ) -> QueryStreamBuilder<'a, StorageImpl> {
+        QueryStreamBuilder {
+            lix: self,
+            sql: sql.to_owned(),
+            params: params.to_vec(),
+            page_bytes: crate::DEFAULT_QUERY_STREAM_PAGE_BYTES,
+        }
+    }
+
     /// Classifies one SQL execution for a caller that owns its transport
     /// lifecycle.
     ///
@@ -2366,6 +2462,22 @@ where
         sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
     ) {
         self.sync_demand_tx = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
+        self.session.running_query_stream_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_stream_route_for_test(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::session::QueryStreamRoute, LixError> {
+        self.session
+            .query_stream_route(sql, params)
+            .map(|(_, route)| route)
     }
 
     #[cfg(test)]

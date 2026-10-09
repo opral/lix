@@ -54,20 +54,26 @@ impl ReadResultBudget {
         Ok(())
     }
     pub(crate) fn charge_values(&mut self, values: &[Value]) -> Result<(), LixError> {
-        let bytes = values.iter().fold(0usize, |bytes, value| {
-            bytes.saturating_add(
-                size_of::<Value>()
-                    + match value {
-                        Value::Text(value) => value.len(),
-                        Value::Jsonb(value) => value.as_bytes().len(),
-                        Value::Blob(value) => value.len(),
-                        Value::RowRef(value) => value.as_str().len(),
-                        _ => 0,
-                    },
-            )
-        });
-        self.charge(bytes, 1)
+        self.charge(public_row_bytes(values), 1)
     }
+}
+
+/// Bytes one public result row occupies: one `Value` slot per cell plus its
+/// variable-length payload. Buffered budgets and streamed page sizes share
+/// this measure so a page size means the same thing on every read path.
+pub(crate) fn public_row_bytes(values: &[Value]) -> usize {
+    values.iter().fold(0usize, |bytes, value| {
+        bytes.saturating_add(
+            size_of::<Value>()
+                + match value {
+                    Value::Text(value) => value.len(),
+                    Value::Jsonb(value) => value.as_bytes().len(),
+                    Value::Blob(value) => value.len(),
+                    Value::RowRef(value) => value.as_str().len(),
+                    _ => 0,
+                },
+        )
+    })
 }
 
 #[cfg(test)]

@@ -186,6 +186,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) sync_mode: SyncModeState,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub(super) query_streams: Arc<super::query_stream::QueryStreamRegistry>,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -287,6 +288,7 @@ where
             sync_mode,
             plugin_host,
             telemetry,
+            query_streams: Arc::default(),
             transaction_manager,
         }
     }
@@ -312,8 +314,18 @@ where
     /// successful writes are committed before their operation returns.
     pub async fn close(&self) -> Result<(), LixError> {
         self.transaction_manager.close().await?;
+        // Streams register before re-checking that the session is open, and
+        // the manager rejects that check from here on, so every stream that
+        // could still pull is cancelled now and releases its read snapshot.
+        self.query_streams.cancel_all(closed_error);
         self.observe_invalidation.bump();
         Ok(())
+    }
+
+    /// Streams of this session whose producer still pins a read snapshot.
+    #[cfg(test)]
+    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
+        self.query_streams.running_count()
     }
 
     pub fn is_closed(&self) -> bool {

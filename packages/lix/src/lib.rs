@@ -166,6 +166,7 @@ pub use handle::{
     Durability,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
+    QueryStreamBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
     RemoteLix, RemoteExecuteBuilder, RemoteLixTransaction, RemoteObserveEvents,
     RemoteOpenAnotherSessionBuilder, RemoteTransactionExecuteBuilder, RemoteExecuteBatchBuilder, open_lix,
@@ -207,6 +208,7 @@ pub use session::{
     CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
     TryFromValue,
 };
+pub use session::{DEFAULT_QUERY_STREAM_PAGE_BYTES, MAX_QUERY_STREAM_PAGE_BYTES, QueryStream};
 #[doc(hidden)]
 pub use session::CoherentReadBatch;
 pub(crate) use session::{
