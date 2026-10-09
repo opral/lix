@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.20.0 - 2026-10-09
+
+### Minor
+
+- Recover and hydrate repositories through shared, byte-bounded dependency pages and content batches. Sealed read operations retain an immutable leased basis, stage content privately, validate the complete dependency proof on the client, and publish only validated dependencies. Interrupted operations release their scratch data, and reopening a replica reclaims abandoned work before admitting new reads. The authority reclaims inactive retained responses under pressure, allowing new reads after client termination without waiting for cached responses to expire.
+
+  Matching clients and authorities must use the protocol and storage-format versions advertised by the SDK's compatibility metadata. Storage providers must support byte-admitted exact reads, ordered point-read prefixes, and scan pages. Supported old physical repositories migrate before opening; SlateDB adds a resumable length-indexed layout while retaining the original generation and its immutable content.
+- Added SQL hashing and binary encoding functions for file verification.
+
+  Use `encode(sha256(content), 'hex')` to compare a file's stored bytes with a local SHA-256 checksum without downloading the file. Checksums are computed on demand.
+
+### Patch
+
+- Propagate worker HTTP cancellation to the response stream even when queued data has stopped RPC pulls. Aborted streams discard queued chunks and stop requesting more data, preserving the existing timeout-versus-caller-cancellation policy.
+- Reuse a bounded warm worker runtime when reopening OPFS repositories. Close storage and release repository ownership before reusing an idle worker, preserve offline plugin readiness, and discard workers whose cleanup fails or times out.
+- Batch partial-replica dependency discovery and verified content transfer with shared count and byte limits. Plan exact file-content dependencies before transfer, prepare returned-row catalogs together, and retain small validated read closures in bounded memory with durable staging as the fallback. Allow independent resident worker reads to proceed while another operation waits on the network. Preserve old physical repository migration, owner and publication fences, and fail-closed content validation. Local paired browser measurements show faster cold file reads and warm peer updates; warm collaboration still exceeds the 100 ms target.
+- Fix browser HTTP deadline classification across WASM, fetch adapters and worker RPC. Deadline exhaustion carries the standard TimeoutError reason and remains retryable network unavailability; explicit caller cancellation remains cancelled. Header and body failures retain the distinction without exposing abort reason text or changing existing deadlines and resource limits.
+- Release remote sessions when browser partial replicas close. Keep the last successfully admitted same-account credentials available only for the exact session-release request while child handles and the shared owner finish shutting down; do not refresh admission during teardown. Classify close-triggered fetch cancellation as transport abort, then retire the provider and callback channel. Preserve other attached clients, cancel active streams, and retain the storage ownership fence if local cleanup fails. Apply the same cleanup ordering when repository opening fails after creating its owner.
+- Worker-host shutdown now cancels every active HTTP fetch across the client boundary before retiring local streams and handles, releasing retained browser fetch controllers and body readers even when no pull is pending.
+- The JavaScript SDK now fails every active HTTP response stream when its worker host disconnects, including backpressured streams with queued bytes and no pending pull. This prevents callers from consuming stale queued responses after disconnection.
+- Fixed filesystem deletion sync crashes caused by exhausting the default worker thread stack.
+- Fixed fresh downstream stable Rust builds that could fail while compiling the storage codec, even when locked workspace builds succeeded.
+- Treat disappearance during retired disk-cache deletion as successful cleanup. Keep other I/O errors and unsafe entry types terminal. This prevents already-deleted nested cache directories from retaining failed cleanup capacity and blocking new repository opens.
+- Report an unknown write outcome when a repository owner disappears before acknowledging migration cleanup. Require every worker operation to declare its lost-acknowledgement policy, preventing cleanup results from being presented as safely retryable.
+- Fixed partial replicas restarting remote dependency downloads when foreground reads interrupt synchronization.
+
+  Remote edits can finish syncing while local reads continue. Invalidated downloads release their remote and local resources before a replacement starts, without blocking resident reads.
+- Preserve existing browser repository data when opening fails to acquire a physical file handle. A failed open releases its resources without deleting the stored repository.
+- Align the OpenAPI header constants and admission examples with the engine's current server and sync protocols. Validate documented versions against the shared compatibility definition so stale headers cannot silently pass release checks.
+- Repository opening now reports actual migration progress and stalled dependencies, even while an open operation remains unfinished.
+
+  Request deadlines are distinguished from capacity exhaustion and migration stalls. Retries share the existing opener, preserving migration ownership and stored data.
+- Resume partial-replica uploads from a fresh authority descriptor after a rejected publication or expired serving lease. Keep the exact pending upload until inclusion is proven, prevent local edits or progress on another branch from replaying stale coordinates ahead of recovery, and keep expired serving roots fenced until durable publication adopts a fresh lease.
+- Bound the reference server's retained SlateDB cache file handles across its configured live repository capacity, reserving process descriptor headroom for active reads and runtime work. Closing cached handles preserves cached object bytes and authoritative repository data. Reject invalid zero-handle storage cache configurations before runtime startup.
+- Fixed UPDATE and DELETE predicates containing subqueries, allowing applications to mutate related rows directly in SQL. Mutations also support target aliases and preserve OLD and NEW row values in RETURNING expressions.
+- Fixed compilation for Rust applications consuming Lix without an existing dependency lockfile.
+- Let transient browser view transitions wait for a bounded observer admission slot instead of failing immediately. Use the shared worker scheduler with separate waiting budgets so SQL operations retain capacity. Cancel obsolete registrations across worker startup, owner recovery, and session teardown without leaking late observers.
+
 ## 0.19.0 — 2026-10-06
 
 ### Improvements
