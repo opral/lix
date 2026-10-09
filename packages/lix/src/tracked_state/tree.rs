@@ -3232,7 +3232,19 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
                 .iter()
                 .any(|filter| matches!(filter, NullableKeyFilter::Any))
         {
-            ranges.push(prefix_scan_range(encode_schema_key_prefix(schema_key)));
+            if let Some(window) = request_row_pk_window(request) {
+                // Every file scope holds its own window of the interval: read
+                // the exact unfiled window and the file-scoped remainder, which
+                // `child_summary_overlaps_request` narrows per scope.
+                ranges.extend(window.schema_key_ranges(schema_key).into_iter().map(
+                    |range| EncodedScanRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                ));
+            } else {
+                ranges.push(prefix_scan_range(encode_schema_key_prefix(schema_key)));
+            }
             continue;
         }
 
@@ -3364,6 +3376,20 @@ fn row_pk_scan_range(
     EncodedScanRange { start, end }
 }
 
+/// The primary-key interval of a scan that names no exact identities; exact
+/// identities already bind their own point ranges.
+fn request_row_pk_window(
+    request: &TrackedStateTreeScanRequest,
+) -> Option<crate::tracked_state::RowPkWindow> {
+    if !request.row_pks.is_empty() {
+        return None;
+    }
+    crate::tracked_state::RowPkWindow::from_bounds(
+        request.row_pk_lower.as_ref(),
+        request.row_pk_upper.as_ref(),
+    )
+}
+
 fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = bytes.to_vec();
     for index in (0..out.len()).rev() {
@@ -3385,6 +3411,21 @@ fn child_summary_overlaps_request(
     ranges: &[EncodedScanRange],
 ) -> bool {
     if !child_summary_overlaps_scan_ranges(child, ranges) {
+        return false;
+    }
+    if request.row_pks.is_empty()
+        && (request.file_ids.is_empty()
+            || request
+                .file_ids
+                .iter()
+                .any(|owner| matches!(owner, NullableKeyFilter::Any)))
+        && !crate::tracked_state::span_may_intersect_row_pk_bounds(
+            request.row_pk_lower.as_ref(),
+            request.row_pk_upper.as_ref(),
+            &child.first_key,
+            &child.last_key,
+        )
+    {
         return false;
     }
     if !request.schema_keys.is_empty()

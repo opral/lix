@@ -11546,6 +11546,7 @@ pub(crate) async fn load_local_commit_delta_members_with_payloads(
         &[],
         usize::MAX,
         true,
+        None,
     )
     .await?
     .expect("unbounded local commit-delta scan cannot exceed its segment limit");
@@ -11573,8 +11574,39 @@ pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
         file_ids,
         max_segment_count,
         false,
+        None,
     )
     .await
+}
+
+/// Loads the members of one schema whose primary key lies in `window`, in
+/// every file scope.
+///
+/// Ordered layouts read only the mutation parts whose key span can intersect
+/// the window; layouts without part bounds decode as before. Either way the
+/// result is filtered to the window, so it is exactly the window-restricted
+/// subset of [`load_commit_delta_members_with_payloads_for_schemas`].
+pub(crate) async fn load_commit_delta_members_with_payloads_in_row_pk_window(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_key: &str,
+    window: &super::RowPkWindow,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    #[cfg(test)]
+    COMMIT_DELTA_SCAN_PROBE.with(|probe| probe.set((probe.get().0, probe.get().1 + 1)));
+    let mut members = load_commit_delta_members_with_payloads_for_schemas_impl(
+        store,
+        commit_id,
+        &[schema_key.to_owned()],
+        &[],
+        usize::MAX,
+        false,
+        Some(window),
+    )
+    .await?
+    .expect("unbounded window member load cannot exceed its segment limit");
+    members.retain(|member| window.contains(&member.key.row_pk));
+    Ok(members)
 }
 
 /// Loads a bounded window of authenticated mutation parts in one point-read
@@ -11711,6 +11743,7 @@ pub(crate) async fn load_commit_history_members_with_payloads_for_schemas(
         file_ids,
         usize::MAX,
         true,
+        None,
     )
     .await?
     .expect("unbounded history member load cannot exceed its segment limit"))
@@ -11723,6 +11756,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
     file_ids: &[String],
     max_segment_count: usize,
     expand_standalone_complete_state: bool,
+    row_pk_window: Option<&super::RowPkWindow>,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     if let Some((mut diff, standalone_complete_state)) = complete_state_fence_tree_diff(
         store,
@@ -12025,6 +12059,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
             file_ids,
             max_segment_count,
             true,
+            row_pk_window,
         )
         .await?
     else {
@@ -12055,6 +12090,7 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
         file_ids,
         max_segment_count.saturating_sub(local_segment_count),
         true,
+        row_pk_window,
     )
     .await?
     else {
@@ -13445,6 +13481,7 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
         &[],
         usize::MAX,
         false,
+        None,
     )
     .await?
     else {
@@ -13629,6 +13666,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
+    row_pk_window: Option<&super::RowPkWindow>,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let Some(root) = state.mutation_directory_root.as_ref() else {
         let manifest = commit_delta_manifest_from_commit_state(state);
@@ -13643,6 +13681,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
                 &manifest,
                 schema_keys,
                 hydrate_selected_payloads,
+                row_pk_window,
             )
             .await?,
             segment_count,
@@ -13658,6 +13697,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             file_ids,
             max_segment_count,
             hydrate_selected_payloads,
+            row_pk_window,
         )
         .await;
     }
@@ -13670,6 +13710,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
                 &manifest,
                 schema_keys,
                 hydrate_selected_payloads,
+                row_pk_window,
             )
             .await?,
             0,
@@ -13722,6 +13763,7 @@ async fn load_authenticated_local_commit_delta_members_for_schemas(
             &manifest,
             schema_keys,
             hydrate_selected_payloads,
+            row_pk_window,
         )
         .await?,
         segment_count,
@@ -13792,6 +13834,7 @@ async fn load_bounded_commit_delta_members_for_schemas(
     file_ids: &[String],
     max_segment_count: usize,
     hydrate_selected_payloads: bool,
+    row_pk_window: Option<&super::RowPkWindow>,
 ) -> Result<Option<(Vec<CommitDeltaMember>, usize)>, LixError> {
     let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
         replacement_payload_error("bounded payload scan omitted its mutation-directory root")
@@ -13801,7 +13844,27 @@ async fn load_bounded_commit_delta_members_for_schemas(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let requested_files = file_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let ranges = bounded_commit_delta_key_ranges(&requested_schemas, &requested_files);
+    // A primary-key window names no file scope: it is the exact window in the
+    // unfiled scope plus the file-scoped remainder, whose parts are narrowed
+    // by their boundary keys once the directory has named them.
+    let row_pk_window = row_pk_window.filter(|_| requested_files.is_empty());
+    let ranges = match row_pk_window {
+        Some(window) if !requested_schemas.is_empty() => {
+            super::row_pk_window::normalize_row_pk_window_key_ranges(
+                requested_schemas
+                    .iter()
+                    .flat_map(|schema_key| window.schema_key_ranges(schema_key))
+                    .collect(),
+            )
+            .into_iter()
+            .map(|range| super::mutation_directory::MutationDirectoryKeyRange {
+                start: Bytes::from(range.start),
+                end: range.end.map(Bytes::from),
+            })
+            .collect::<Vec<_>>()
+        }
+        _ => bounded_commit_delta_key_ranges(&requested_schemas, &requested_files),
+    };
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_bounded_scan(
         !requested_files.is_empty(),
@@ -13820,6 +13883,15 @@ async fn load_bounded_commit_delta_members_for_schemas(
     )
     .await?
     .into_runs();
+    let mut runs = runs;
+    if let Some(window) = row_pk_window {
+        runs.retain(|run| match &run.entry {
+            super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
+                window.span_may_intersect(&part.first_key, &part.last_key)
+            }
+            _ => true,
+        });
+    }
     if runs.len() > max_segment_count {
         return Ok(None);
     }
@@ -13901,6 +13973,9 @@ async fn load_bounded_commit_delta_members_for_schemas(
                 .is_some_and(|file_id| requested_files.contains(file_id))
         });
     }
+    if let Some(window) = row_pk_window {
+        members.retain(|member| window.contains(&member.key.row_pk));
+    }
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_segment_members_kept(members.len());
     if hydrate_selected_payloads {
@@ -13953,6 +14028,7 @@ async fn load_commit_delta_members_from_manifest(
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
     hydrate_selected_payloads: bool,
+    row_pk_window: Option<&super::RowPkWindow>,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     if let Some(parts) = manifest.columnar_parts.as_ref() {
         if !schema_keys.is_empty() && !schema_keys.iter().any(|schema| schema == &parts.schema_key)
@@ -13976,7 +14052,13 @@ async fn load_commit_delta_members_from_manifest(
             &mut members,
         )?;
     } else {
-        let segment_indices = commit_delta_segments_for_schemas(manifest, &requested_schemas);
+        let mut segment_indices = commit_delta_segments_for_schemas(manifest, &requested_schemas);
+        if let Some(window) = row_pk_window {
+            segment_indices.retain(|&segment_index| {
+                let bounds = &manifest.segments[segment_index];
+                window.span_may_intersect(&bounds.first_key, &bounds.last_key)
+            });
+        }
         let segment_keys = segment_indices
             .iter()
             .map(|&segment_index| {
@@ -14012,6 +14094,9 @@ async fn load_commit_delta_members_from_manifest(
     }
     if !requested_schemas.is_empty() {
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
+    }
+    if let Some(window) = row_pk_window {
+        members.retain(|member| window.contains(&member.key.row_pk));
     }
     if hydrate_selected_payloads {
         hydrate_selected_members(store, &mut members).await?;
@@ -16524,7 +16609,9 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     continue;
                 }
                 let members =
-                    load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[], true)
+                    load_commit_delta_members_from_manifest(
+                        store, commit_id, &manifest, &[], true, None,
+                    )
                         .await?;
                 for member in members {
                     if !member.authored && is_payload_free_selected_tombstone(&member) {

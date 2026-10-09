@@ -4248,7 +4248,24 @@ async fn scan_packed_current_base_rows(
             // selected schema. Decode each packed segment once with its payload sidecar
             // instead of first scanning the identity/value plane and then
             // issuing a second manifest + segment pass for the same rows.
-            let members =
+            let row_pk_window = crate::tracked_state::RowPkWindow::from_bounds(
+                request.filter.row_pk_lower.as_ref(),
+                request.filter.row_pk_upper.as_ref(),
+            );
+            let members = if let Some(window) = row_pk_window.as_ref() {
+                // A primary-key interval reads only the mutation parts that
+                // can hold one of its keys in some file scope. The per-row
+                // filter below still applies the same bounds.
+                Some(
+                    crate::tracked_state::load_commit_delta_members_with_payloads_in_row_pk_window(
+                        store,
+                        base_ref.commit_id,
+                        &request.filter.schema_keys[0],
+                        window,
+                    )
+                    .await?,
+                )
+            } else {
                 crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
                     store,
                     base_ref.commit_id,
@@ -4264,7 +4281,8 @@ async fn scan_packed_current_base_rows(
                     // algorithm as collections are repartitioned.
                     usize::MAX,
                 )
-                .await?;
+                .await?
+            };
             if single_base {
                 if let Some(members) = members {
                     let mut ordered = Vec::with_capacity(members.len());
@@ -14028,6 +14046,22 @@ async fn hot_scan_entries_with_physical_entry_limit<'a>(
         return Ok(hot_scan_entries_fit_budget(entries, retained_byte_budget));
     }
 
+    // A primary-key interval without a file filter is one key window per
+    // file scope of the file-first HOT index. Seek each scope's window instead
+    // of decoding the whole schema prefix and filtering every row.
+    if physical_entry_limit.is_none()
+        && filter.row_pks.is_empty()
+        && filter.file_ids.is_empty()
+        && !filter.schema_keys.is_empty()
+        && (filter.row_pk_lower.is_some() || filter.row_pk_upper.is_some())
+    {
+        let prefixes = hot_row_pk_window_scope_prefixes(store, branch_id, generation, filter).await?;
+        let entries = HotScanEntries::Decoded(
+            scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
+        );
+        return Ok(hot_scan_entries_fit_budget(entries, retained_byte_budget));
+    }
+
     #[cfg(feature = "storage-benches")]
     if is_blob_ref_probe {
         crate::storage_bench::record_hot_blob_ref_scan_fallback();
@@ -14144,6 +14178,74 @@ async fn hot_scan_entries_with_physical_entry_limit<'a>(
         rows.truncate(limit);
     }
     Ok(Some(HotScanEntries::Decoded(rows)))
+}
+
+/// Names every `(schema, file)` partition prefix that can hold a HOT row of
+/// the requested schemas: the unfiled partition, plus each file partition
+/// found by skip-scanning the file-first index — one seek reads the next key,
+/// whose file id names a partition, and the following seek starts after that
+/// whole partition. The cost is one seek per file scope, never one row read
+/// per row outside the requested primary-key window.
+async fn hot_row_pk_window_scope_prefixes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    filter: &TrackedStateFilter,
+) -> Result<Vec<Vec<u8>>, LixError> {
+    let scope = hot_scope_prefix(branch_id, generation);
+    let mut prefixes = Vec::new();
+    for schema_key in &filter.schema_keys {
+        let mut schema_prefix = scope.clone();
+        write_key_string(&mut schema_prefix, schema_key, KEY_PART_FINAL);
+        let schema_range = StoragePrefix {
+            bytes: Bytes::from(schema_prefix.clone()),
+        }
+        .to_range()?;
+        let mut unfiled_prefix = schema_prefix.clone();
+        write_file_id(&mut unfiled_prefix, None);
+        prefixes.push(unfiled_prefix);
+        let mut next = Some(StorageKey(Bytes::from(schema_prefix)));
+        while let Some(start) = next.take() {
+            let mut cursor = store
+                .begin_scan(
+                    ROW_SPACE,
+                    crate::storage_adapter::StorageKeyRange {
+                        lower: std::ops::Bound::Included(start),
+                        upper: schema_range.upper.clone(),
+                    },
+                    StorageBeginScanOptions::default(),
+                )
+                .await?;
+            // Deliberately bounded: one key names the next file partition.
+            let (page, _) = cursor.next_page(1).await?.into_parts();
+            let Some(entry) = page.into_iter().next() else {
+                break;
+            };
+            let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+            let mut partition_prefix = scope.clone();
+            write_key_string(&mut partition_prefix, schema_key, KEY_PART_FINAL);
+            write_file_id(&mut partition_prefix, identity.file_id());
+            let partition_range = StoragePrefix {
+                bytes: Bytes::from(partition_prefix.clone()),
+            }
+            .to_range()?;
+            if identity.file_id().is_some() {
+                prefixes.push(partition_prefix);
+            }
+            next = match partition_range.upper {
+                std::ops::Bound::Excluded(end) => Some(end),
+                std::ops::Bound::Included(_) => {
+                    return Err(head_value_error(
+                        "HOT partition prefix range has an inclusive upper bound",
+                    ));
+                }
+                std::ops::Bound::Unbounded => None,
+            };
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    Ok(prefixes)
 }
 
 /// Reads a bounded typed-PK interval from one unfiled HOT schema. The file

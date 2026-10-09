@@ -4964,6 +4964,10 @@ fn jsonb_sql_equality_key(value: &str) -> Result<String> {
 }
 
 #[cfg(test)]
+#[path = "schema_pk_window_tests.rs"]
+mod pk_window_tests;
+
+#[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
     #[tokio::test]

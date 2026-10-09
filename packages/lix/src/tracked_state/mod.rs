@@ -21,6 +21,7 @@ pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;
 mod row_pk_index;
+mod row_pk_window;
 mod scoped_current_state;
 pub(crate) mod scoped_range;
 mod storage;
@@ -65,6 +66,7 @@ pub(crate) use row_materialization::{
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
     materialize_batch_from_index_entry_refs,
 };
+pub(crate) use row_pk_window::{RowPkWindow, span_may_intersect_row_pk_bounds};
 pub(crate) use row_pk_index::{
     backfill_row_pk_index_for_commit, decode_row_pk_index_key,
     prepare_row_pk_index_point_inputs, row_pk_index_scan_request,
@@ -95,6 +97,7 @@ pub(crate) use storage::{
     load_authenticated_commit_delta_index_values, load_authoritative_live_change_records,
     load_authoritative_selected_change_records, load_change_record_by_id,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
+    load_commit_delta_members_with_payloads_in_row_pk_window,
     load_commit_delta_parts_members_with_payloads_for_schema, load_commit_delta_replay_metadata,
     load_commit_delta_selection_certificate, load_commit_history_members_with_payloads_for_schemas,
     load_commit_mutation_directory_roots, load_commit_state_manifest, load_commit_state_manifests,
