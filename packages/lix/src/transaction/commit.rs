@@ -569,6 +569,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
+    let semantic_fingerprints = StateRowSemanticFingerprints::new(state_rows.len());
     let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
@@ -581,6 +582,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
+        &semantic_fingerprints,
         capture_sync_commits,
         capture_canonical_change_id_remap,
     ))
@@ -675,6 +677,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &ordered_replacements,
             &staged_delta_index.ordered_replacement_assignments,
             &journal_functions,
+            &semantic_fingerprints,
         )
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -694,6 +697,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
         &checkpoint_incorporation_sources,
+        &semantic_fingerprints,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -840,6 +844,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 .filter(|commit| commit.global_scope)
                 .map(|commit| commit.commit_id)
                 .collect(),
+            &semantic_fingerprints,
         )?
     } else {
         Vec::new()
@@ -1625,8 +1630,84 @@ fn encode_builtin_snapshot(
         })
 }
 
+/// Semantic fingerprints of prepared state rows, each computed at most once
+/// per commit.
+///
+/// Commit-delta staging, persistent-root staging, and commit-state manifests
+/// each project the same tracked row into a [`TrackedStateDeltaRef`]. The
+/// fingerprint depends only on the row's schema key, identity, snapshot, and
+/// metadata, none of which change after row indexing (later stages assign
+/// change ids only), so the first projection's value is reused verbatim.
+struct StateRowSemanticFingerprints {
+    rows: Vec<std::sync::OnceLock<Option<[u8; 32]>>>,
+}
+
+impl StateRowSemanticFingerprints {
+    fn new(row_count: usize) -> Self {
+        Self {
+            rows: std::iter::repeat_with(std::sync::OnceLock::new)
+                .take(row_count)
+                .collect(),
+        }
+    }
+
+    fn get(
+        &self,
+        row_index: RowIndex,
+        row: PreparedStateRowRef<'_>,
+    ) -> Result<Option<[u8; 32]>, LixError> {
+        let Some(cell) = self.rows.get(row_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "semantic fingerprint memo does not cover the prepared row",
+            ));
+        };
+        if let Some(fingerprint) = cell.get() {
+            return Ok(*fingerprint);
+        }
+        let fingerprint = state_row_semantic_fingerprint(row)?;
+        Ok(*cell.get_or_init(|| fingerprint))
+    }
+
+    fn delta<'a>(
+        &self,
+        state_rows: &'a PreparedStateBatch,
+        row_index: RowIndex,
+    ) -> Result<TrackedStateDeltaRef<'a>, LixError> {
+        let row = state_rows.row(row_index);
+        tracked_delta_from_state_row_with_fingerprint(row, self.get(row_index, row)?)
+    }
+
+    fn commit_delta<'a>(
+        &self,
+        state_rows: &'a PreparedStateBatch,
+        row_index: RowIndex,
+    ) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+        let row = state_rows.row(row_index);
+        tracked_commit_delta_from_state_row_with_fingerprint(row, self.get(row_index, row)?)
+    }
+}
+
+fn state_row_semantic_fingerprint(
+    row: PreparedStateRowRef<'_>,
+) -> Result<Option<[u8; 32]>, LixError> {
+    crate::tracked_state::tracked_payload_semantic_fingerprint(
+        row.schema_key,
+        row.row_pk,
+        row.snapshot,
+        row.metadata,
+    )
+}
+
 fn tracked_delta_from_state_row(
     row: PreparedStateRowRef<'_>,
+) -> Result<TrackedStateDeltaRef<'_>, LixError> {
+    tracked_delta_from_state_row_with_fingerprint(row, state_row_semantic_fingerprint(row)?)
+}
+
+fn tracked_delta_from_state_row_with_fingerprint(
+    row: PreparedStateRowRef<'_>,
+    semantic_fingerprint: Option<[u8; 32]>,
 ) -> Result<TrackedStateDeltaRef<'_>, LixError> {
     let Some(change_id) = row.change_id else {
         return Err(LixError::new(
@@ -1655,20 +1736,16 @@ fn tracked_delta_from_state_row(
         deleted: row.snapshot.is_none(),
         created_at,
         updated_at: row.updated_at,
-        semantic_fingerprint: crate::tracked_state::tracked_payload_semantic_fingerprint(
-            row.schema_key,
-            row.row_pk,
-            row.snapshot,
-            row.metadata,
-        )?,
+        semantic_fingerprint,
     })
 }
 
-fn tracked_commit_delta_from_state_row(
+fn tracked_commit_delta_from_state_row_with_fingerprint(
     row: PreparedStateRowRef<'_>,
+    semantic_fingerprint: Option<[u8; 32]>,
 ) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
     Ok(TrackedStateCommitDeltaRef {
-        delta: tracked_delta_from_state_row(row)?,
+        delta: tracked_delta_from_state_row_with_fingerprint(row, semantic_fingerprint)?,
         metadata: row.metadata,
         snapshot: row.snapshot,
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
@@ -1975,6 +2052,7 @@ async fn stage_tracked_commit_delta_index(
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    semantic_fingerprints: &StateRowSemanticFingerprints,
     capture_sync_commits: bool,
     capture_canonical_change_id_remap: bool,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
@@ -2142,8 +2220,7 @@ async fn stage_tracked_commit_delta_index(
                     Some(stage)
                 } else {
                     let make_delta = |row_index| {
-                        let row = state_rows.row(row_index);
-                        let mut delta = tracked_commit_delta_from_state_row(row)?;
+                        let mut delta = semantic_fingerprints.commit_delta(state_rows, row_index)?;
                         if let Some(created_at) = lifecycle_created_at {
                             delta.delta.created_at = created_at;
                         }
@@ -2222,7 +2299,7 @@ async fn stage_tracked_commit_delta_index(
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
-            let mut delta = tracked_commit_delta_from_state_row(row)?;
+            let mut delta = semantic_fingerprints.commit_delta(state_rows, row_index)?;
             delta.base_coordinate =
                 row_columnar_write_sets
                     .state_row_location(row_index)
@@ -2427,6 +2504,7 @@ fn materialize_staged_sync_commits(
     checkpoint_conversations: &BTreeMap<CommitId, String>,
     staged_snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
     global_commit_ids: &BTreeSet<CommitId>,
+    semantic_fingerprints: &StateRowSemanticFingerprints,
 ) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
     use crate::sync::{
         SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
@@ -2442,7 +2520,7 @@ fn materialize_staged_sync_commits(
             .unwrap_or_default()
         {
             let row = state_rows.row(row_index);
-            let delta = tracked_delta_from_state_row(row)?;
+            let delta = semantic_fingerprints.delta(state_rows, row_index)?;
             let decoded_snapshot = row.materialize_decoded_snapshot()?;
             let snapshot_json = decoded_snapshot
                 .as_ref()
@@ -6500,6 +6578,7 @@ async fn stage_tracked_roots(
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     ordered_replacement_assignments: &BTreeMap<CommitId, OrderedAddressableCommitDeltaStage>,
     functions: &FunctionProviderHandle,
+    semantic_fingerprints: &StateRowSemanticFingerprints,
 ) -> Result<BTreeMap<CommitId, TrackedStateCommitRoot>, LixError> {
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
@@ -6707,7 +6786,8 @@ async fn stage_tracked_roots(
                     state_row_indices.len(),
                     &first_mutation_key,
                     &file_delete_cascades,
-                    OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection),
+                    OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection)
+                        .with_semantic_fingerprints(semantic_fingerprints),
                 )
                 .await?
                 .is_some()
@@ -6717,7 +6797,7 @@ async fn stage_tracked_roots(
         }
         let deltas = state_row_indices
             .iter()
-            .map(|&row_index| tracked_delta_from_state_row(state_rows.row(row_index)))
+            .map(|&row_index| semantic_fingerprints.delta(state_rows, row_index))
             .chain(
                 selected_changes(&staged.selected_change_batches).map(|change_ref| {
                     tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
@@ -6781,6 +6861,7 @@ fn stage_commit_state_manifests<'a, S>(
     state_rows: &'a PreparedStateBatch,
     row_indices: &'a BTreeMap<CommitId, Vec<RowIndex>>,
     checkpoint_incorporation_sources: &'a BTreeMap<CommitId, CommitId>,
+    semantic_fingerprints: &'a StateRowSemanticFingerprints,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -7127,7 +7208,7 @@ where
                 }
                 let deltas = indices
                     .iter()
-                    .map(|&index| tracked_delta_from_state_row(state_rows.row(index)))
+                    .map(|&index| semantic_fingerprints.delta(state_rows, index))
                     .collect::<Result<Vec<_>, _>>()?;
                 crate::tracked_state::stage_row_pk_index_from_deltas_with_base(
                     read,
@@ -7237,6 +7318,7 @@ struct OrderedStateRowMutations<'a> {
     row_indices: std::slice::Iter<'a, RowIndex>,
     state_rows: &'a PreparedStateBatch,
     insert_selection: &'a PreparedInsertSelection,
+    semantic_fingerprints: Option<&'a StateRowSemanticFingerprints>,
 }
 
 impl<'a> OrderedStateRowMutations<'a> {
@@ -7249,7 +7331,16 @@ impl<'a> OrderedStateRowMutations<'a> {
             row_indices: row_indices.iter(),
             state_rows,
             insert_selection,
+            semantic_fingerprints: None,
         }
+    }
+
+    fn with_semantic_fingerprints(
+        mut self,
+        semantic_fingerprints: &'a StateRowSemanticFingerprints,
+    ) -> Self {
+        self.semantic_fingerprints = Some(semantic_fingerprints);
+        self
     }
 }
 
@@ -7259,8 +7350,12 @@ impl<'a> Iterator for OrderedStateRowMutations<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let row_index = *self.row_indices.next()?;
         let row = self.state_rows.row(row_index);
+        let delta = match self.semantic_fingerprints {
+            Some(fingerprints) => fingerprints.delta(self.state_rows, row_index),
+            None => tracked_delta_from_state_row(row),
+        };
         Some(
-            tracked_delta_from_state_row(row).map(|delta| TrackedStateRootMutationRef {
+            delta.map(|delta| TrackedStateRootMutationRef {
                 delta,
                 require_absence: tracked_row_requires_absence(
                     row_index,
@@ -10798,6 +10893,7 @@ mod tests {
             &PreparedStateBatch::default(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &StateRowSemanticFingerprints::new(0),
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");
@@ -12016,6 +12112,55 @@ mod tests {
                 .expect("owner authority batch counter lock"),
             vec![CHANGE_COUNT],
             "same-source direct IDs need one batched authority check; missing owners must still use the local standalone batch",
+        );
+    }
+
+    #[test]
+    fn memoized_semantic_fingerprints_match_direct_projection() {
+        let mut with_metadata = tracked_global_row("fingerprint-memo-2");
+        with_metadata.row_pk = RowPk::single("row-2");
+        with_metadata.snapshot = Some(test_snapshot(
+            &with_metadata.row_pk,
+            &serde_json::json!({ "value": [1, null, "two"] }),
+        ));
+        with_metadata.metadata = Some(lix_schema::Jsonb::from_value(
+            serde_json::json!({ "origin": "import" }),
+        ));
+        let mut json_null_metadata = tracked_global_row("fingerprint-memo-3");
+        json_null_metadata.row_pk = RowPk::single("row-2");
+        json_null_metadata.snapshot = with_metadata.snapshot.clone();
+        json_null_metadata.metadata =
+            Some(lix_schema::Jsonb::from_value(serde_json::Value::Null));
+        let mut tombstone = tracked_global_row("fingerprint-memo-4");
+        tombstone.row_pk = RowPk::single("row-4");
+        tombstone.snapshot = None;
+        let batch = prepared_rows![
+            tracked_global_row("fingerprint-memo-1"),
+            with_metadata,
+            json_null_metadata,
+            tombstone,
+        ];
+        let memo = StateRowSemanticFingerprints::new(batch.len());
+        let mut fingerprints = Vec::new();
+        for row_index in 0..batch.len() {
+            let direct = tracked_delta_from_state_row(batch.row(row_index)).unwrap();
+            // First use fills the memo; the second and third reuse it.
+            let commit_delta = memo.commit_delta(&batch, row_index).unwrap();
+            let root_delta = memo.delta(&batch, row_index).unwrap();
+            let cached = memo.delta(&batch, row_index).unwrap();
+            for delta in [commit_delta.delta, root_delta, cached] {
+                assert_eq!(format!("{delta:?}"), format!("{direct:?}"));
+            }
+            assert_eq!(commit_delta.snapshot, batch.row(row_index).snapshot);
+            assert_eq!(commit_delta.metadata, batch.row(row_index).metadata);
+            fingerprints.push(direct.semantic_fingerprint);
+        }
+        assert!(fingerprints[0].is_some());
+        assert_ne!(fingerprints[1], fingerprints[2], "SQL NULL vs JSON null metadata");
+        assert_eq!(fingerprints[3], None, "tombstones carry no fingerprint");
+        assert!(
+            memo.get(batch.len(), batch.row(0)).is_err(),
+            "rows outside the memo must not be served"
         );
     }
 
