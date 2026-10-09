@@ -7,6 +7,8 @@
     clippy::unnecessary_wraps
 )]
 
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
@@ -646,6 +648,21 @@ impl<'a> StagedIndexExtractor<'a> {
         }
     }
 
+    /// Memoized per schema key; probes before inserting so the common
+    /// already-derived case does not allocate an owned key per row.
+    fn surface_spec(&mut self, schema_key: &str) -> Option<Arc<crate::sql2::SchemaSurfaceSpec>> {
+        if let Some(spec) = self.specs.get(schema_key) {
+            return spec.clone();
+        }
+        let spec = self
+            .schema_catalog
+            .schema(schema_key)
+            .and_then(|schema| crate::sql2::derive_schema_surface_spec_from_schema(schema).ok())
+            .map(Arc::new);
+        self.specs.insert(schema_key.to_owned(), spec.clone());
+        spec
+    }
+
     fn observe(&mut self, row: PreparedValidationRow<'_>, snapshot: &JsonValue) {
         if row.schema_key() == REGISTERED_SCHEMA_KEY {
             // Registration snapshots nominate columns for a completeness
@@ -668,19 +685,7 @@ impl<'a> StagedIndexExtractor<'a> {
             }
             return;
         }
-        let schema_catalog = self.schema_catalog;
-        let spec = self
-            .specs
-            .entry(row.schema_key().to_owned())
-            .or_insert_with(|| {
-                schema_catalog
-                    .schema(row.schema_key())
-                    .and_then(|schema| {
-                        crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()
-                    })
-                    .map(Arc::new)
-            })
-            .clone();
+        let spec = self.surface_spec(row.schema_key());
         let Some(spec) = spec else {
             return;
         };
@@ -734,19 +739,7 @@ impl<'a> StagedIndexExtractor<'a> {
             }
             return;
         }
-        let schema_catalog = self.schema_catalog;
-        let spec = self
-            .specs
-            .entry(row.schema_key().to_owned())
-            .or_insert_with(|| {
-                schema_catalog
-                    .schema(row.schema_key())
-                    .and_then(|schema| {
-                        crate::sql2::derive_schema_surface_spec_from_schema(schema).ok()
-                    })
-                    .map(Arc::new)
-            })
-            .clone();
+        let spec = self.surface_spec(row.schema_key());
         let Some(spec) = spec else {
             return;
         };
@@ -796,7 +789,7 @@ fn typed_hot_index_columns(
                 .collect::<Option<Vec<_>>>();
             (
                 *ordinal,
-                values.and_then(|values| UniqueConstraintValue(values).exact_hot_index_value()),
+                values.and_then(|values| UniqueConstraintValue(values.into()).exact_hot_index_value()),
             )
         }))
         .collect()
@@ -2020,7 +2013,7 @@ fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str
 
 async fn validate_committed_insert_identities(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: Option<&PendingConstraintIndexes>,
+    pending_constraints: Option<&PendingConstraintIndexes<'_>>,
 ) -> Result<(), LixError> {
     validate_committed_insert_identity_entries(
         input.hot_state,
@@ -2132,7 +2125,7 @@ pub(crate) async fn validate_certified_fresh_plugin_file_import(
 async fn validate_committed_insert_identity_entries<'a, I>(
     hot_state: &dyn HotStateReader,
     entries: I,
-    pending_constraints: Option<&PendingConstraintIndexes>,
+    pending_constraints: Option<&PendingConstraintIndexes<'_>>,
 ) -> Result<(), LixError>
 where
     I: IntoIterator<Item = PreparedInsertRef<'a>>,
@@ -2274,7 +2267,7 @@ fn insert_scope_key<'a>(
 
 async fn validate_branch_ref_delete_restrictions(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<(), LixError> {
     for tombstone in &pending_constraints.tombstones {
         if tombstone.identity.schema_key() != BRANCH_REF_SCHEMA_KEY {
@@ -2814,29 +2807,30 @@ fn validate_primary_key_identity(
 }
 
 #[derive(Default)]
-struct PendingConstraintIndexes {
-    unique_values: BTreeMap<PendingUniqueKey, RowPk>,
+struct PendingConstraintIndexes<'a> {
+    unique_values: BTreeMap<PendingUniqueKey<'a>, RowPk>,
     identity_targets: HashSet<DomainRowIdentity>,
-    fk_targets: BTreeMap<PendingForeignKeyTargetKey, Vec<PendingForeignKeyTarget>>,
-    fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
+    fk_targets: BTreeMap<PendingForeignKeyTargetKey<'a>, Vec<PendingForeignKeyTarget>>,
+    fk_references:
+        BTreeMap<PendingForeignKeyReferenceTarget<'a>, Vec<PendingForeignKeyReference>>,
     row_ref_references: BTreeMap<DomainRowIdentity, Vec<PendingRowRefReference>>,
     row_ref_targets: BTreeMap<DomainRowIdentity, Vec<PendingRowRefTarget>>,
     tombstones: Vec<PendingTombstone>,
     tombstone_identities: HashSet<DomainRowIdentity>,
 }
 
-impl PendingConstraintIndexes {
+impl<'a> PendingConstraintIndexes<'a> {
     fn remember_tombstone(&mut self, row: PreparedValidationRow<'_>) {
         let identity = row.domain_row_identity();
         self.tombstone_identities.insert(identity.clone());
         self.tombstones.push(PendingTombstone { identity });
     }
 
-    fn remember_row<'a>(
+    fn remember_row<'p>(
         &mut self,
-        row: PreparedValidationRow<'_>,
-        schema_plan: &SchemaPlan,
-        payload: impl Into<ValidatedRowPayload<'a>>,
+        row: PreparedValidationRow<'a>,
+        schema_plan: &'a SchemaPlan,
+        payload: impl Into<ValidatedRowPayload<'p>>,
     ) -> Result<(), LixError> {
         let payload = payload.into();
         self.remember_identity_target(row);
@@ -2851,8 +2845,8 @@ impl PendingConstraintIndexes {
 
     fn remember_primary_key_target(
         &mut self,
-        row: PreparedValidationRow<'_>,
-        schema_plan: &SchemaPlan,
+        row: PreparedValidationRow<'a>,
+        schema_plan: &'a SchemaPlan,
         payload: ValidatedRowPayload<'_>,
     ) {
         if let Some(primary_key_paths) = schema_plan.primary_key.as_ref() {
@@ -2862,8 +2856,8 @@ impl PendingConstraintIndexes {
 
     fn remember_unique_targets(
         &mut self,
-        row: PreparedValidationRow<'_>,
-        schema_plan: &SchemaPlan,
+        row: PreparedValidationRow<'a>,
+        schema_plan: &'a SchemaPlan,
         payload: ValidatedRowPayload<'_>,
     ) -> Result<(), LixError> {
         for unique_paths in &schema_plan.uniques {
@@ -2874,9 +2868,9 @@ impl PendingConstraintIndexes {
             };
             self.remember_fk_target(row, unique_paths, payload.clone());
             let key = PendingUniqueKey {
-                schema_key: row.schema_key().to_string(),
+                schema_key: Cow::Borrowed(row.schema_key_ref()),
                 domain: row.domain(),
-                pointer_group: unique_paths.clone(),
+                pointer_group: Cow::Borrowed(unique_paths),
                 value,
             };
             if let Some(existing_row_pk) =
@@ -2902,8 +2896,8 @@ impl PendingConstraintIndexes {
 
     fn remember_fk_target(
         &mut self,
-        row: PreparedValidationRow<'_>,
-        pointer_group: &[Vec<String>],
+        row: PreparedValidationRow<'a>,
+        pointer_group: &'a [Vec<String>],
         payload: ValidatedRowPayload<'_>,
     ) {
         let Some(value) = UniqueConstraintValue::from_payload(payload, pointer_group, false) else {
@@ -2911,9 +2905,9 @@ impl PendingConstraintIndexes {
         };
         self.fk_targets
             .entry(PendingForeignKeyTargetKey {
-                schema_key: row.schema_key().to_string(),
+                schema_key: Cow::Borrowed(row.schema_key_ref()),
                 domain: row.domain(),
-                pointer_group: pointer_group.to_vec(),
+                pointer_group: Cow::Borrowed(pointer_group),
                 value,
             })
             .or_default()
@@ -2922,11 +2916,11 @@ impl PendingConstraintIndexes {
             });
     }
 
-    fn remember_foreign_key_references<'a>(
+    fn remember_foreign_key_references<'p>(
         &mut self,
-        row: PreparedValidationRow<'_>,
-        schema_plan: &SchemaPlan,
-        payload: impl Into<ValidatedRowPayload<'a>>,
+        row: PreparedValidationRow<'a>,
+        schema_plan: &'a SchemaPlan,
+        payload: impl Into<ValidatedRowPayload<'p>>,
     ) -> Result<(), LixError> {
         let payload = payload.into();
         for foreign_key in &schema_plan.foreign_keys {
@@ -2938,9 +2932,9 @@ impl PendingConstraintIndexes {
                 continue;
             };
             let target = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
-                schema_key: foreign_key.referenced_schema.schema_key.clone(),
+                schema_key: Cow::Borrowed(&foreign_key.referenced_schema.schema_key),
                 domain: foreign_key_target_domain(row, foreign_key),
-                pointer_group: foreign_key.referenced_properties.clone(),
+                pointer_group: Cow::Borrowed(&foreign_key.referenced_properties),
                 value: local_value,
             });
             self.fk_references
@@ -2954,12 +2948,12 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
-    fn remember_row_ref_references<'a>(
+    fn remember_row_ref_references<'p>(
         &mut self,
         catalog: &CatalogSnapshot,
         row: PreparedValidationRow<'_>,
         schema_plan: &SchemaPlan,
-        payload: impl Into<ValidatedRowPayload<'a>>,
+        payload: impl Into<ValidatedRowPayload<'p>>,
     ) -> Result<(), LixError> {
         let payload = payload.into();
         for row_ref in &schema_plan.row_refs {
@@ -3054,7 +3048,7 @@ impl PendingConstraintIndexes {
                     targets.iter().any(|target| {
                         !self.tombstones_target_identity(&DomainRowIdentity::new(
                             domain.clone(),
-                            key.schema_key.clone(),
+                            key.schema_key.as_ref(),
                             target.row_pk.clone(),
                         ))
                     })
@@ -3064,7 +3058,7 @@ impl PendingConstraintIndexes {
 
     fn active_references_to(
         &self,
-        target: &PendingForeignKeyReferenceTarget,
+        target: &PendingForeignKeyReferenceTarget<'a>,
     ) -> Vec<&PendingForeignKeyReference> {
         self.fk_references
             .get(target)
@@ -3076,7 +3070,7 @@ impl PendingConstraintIndexes {
 
     fn active_references_to_any(
         &self,
-        targets: &[PendingForeignKeyReferenceTarget],
+        targets: &[PendingForeignKeyReferenceTarget<'a>],
     ) -> Vec<&PendingForeignKeyReference> {
         let mut references = Vec::new();
         for target in targets {
@@ -3154,9 +3148,9 @@ impl PendingConstraintIndexes {
             .map(|pointer| parse_json_pointer(pointer))
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
-            schema_key: schema_key.to_string(),
+            schema_key: schema_key.to_string().into(),
             domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
-            pointer_group,
+            pointer_group: pointer_group.into(),
             value,
         });
         Ok(self.fk_references.contains_key(&key))
@@ -3176,9 +3170,9 @@ impl PendingConstraintIndexes {
             .map(|pointer| parse_json_pointer(pointer))
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyTargetKey {
-            schema_key: schema_key.to_string(),
+            schema_key: schema_key.to_string().into(),
             domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
-            pointer_group,
+            pointer_group: pointer_group.into(),
             value,
         };
         Ok(self.fk_targets.contains_key(&key))
@@ -3216,23 +3210,27 @@ struct PendingRowRefTarget {
     detach: bool,
 }
 
+/// Constraint keys borrow schema keys and pointer groups from the prepared
+/// rows and the transaction's catalog snapshot, both of which outlive
+/// validation, instead of copying them for every staged row. `Cow` orders,
+/// compares, and hashes exactly like the owned value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PendingUniqueKey {
-    schema_key: String,
+struct PendingUniqueKey<'a> {
+    schema_key: Cow<'a, str>,
     domain: Domain,
-    pointer_group: Vec<Vec<String>>,
+    pointer_group: Cow<'a, [Vec<String>]>,
     value: UniqueConstraintValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PendingUniqueConstraintScope {
-    schema_key: String,
+struct PendingUniqueConstraintScope<'a> {
+    schema_key: Cow<'a, str>,
     domain: Domain,
-    pointer_group: Vec<Vec<String>>,
+    pointer_group: Cow<'a, [Vec<String>]>,
 }
 
-impl From<&PendingUniqueKey> for PendingUniqueConstraintScope {
-    fn from(key: &PendingUniqueKey) -> Self {
+impl<'a> From<&PendingUniqueKey<'a>> for PendingUniqueConstraintScope<'a> {
+    fn from(key: &PendingUniqueKey<'a>) -> Self {
         Self {
             schema_key: key.schema_key.clone(),
             domain: key.domain.clone(),
@@ -3242,21 +3240,32 @@ impl From<&PendingUniqueKey> for PendingUniqueConstraintScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PendingForeignKeyTargetKey {
-    schema_key: String,
+struct PendingForeignKeyTargetKey<'a> {
+    schema_key: Cow<'a, str>,
     domain: Domain,
-    pointer_group: Vec<Vec<String>>,
+    pointer_group: Cow<'a, [Vec<String>]>,
     value: UniqueConstraintValue,
 }
 
+impl PendingForeignKeyTargetKey<'_> {
+    fn into_owned(self) -> PendingForeignKeyTargetKey<'static> {
+        PendingForeignKeyTargetKey {
+            schema_key: Cow::Owned(self.schema_key.into_owned()),
+            domain: self.domain,
+            pointer_group: Cow::Owned(self.pointer_group.into_owned()),
+            value: self.value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PendingForeignKeyReferenceTarget {
-    Key(PendingForeignKeyTargetKey),
+enum PendingForeignKeyReferenceTarget<'a> {
+    Key(PendingForeignKeyTargetKey<'a>),
 }
 
 fn validate_pending_delete_restrictions(
     schema_catalog: &CatalogSnapshot,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<(), LixError> {
     if pending_constraints.fk_references.is_empty()
         && pending_constraints.row_ref_references.is_empty()
@@ -3277,9 +3286,9 @@ fn validate_pending_delete_restrictions(
                 .into_iter()
                 .map(|domain| {
                     PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
-                        schema_key: tombstone.identity.schema_key_owned(),
+                        schema_key: Cow::Owned(tombstone.identity.schema_key_owned()),
                         domain,
-                        pointer_group: primary_key_paths.clone(),
+                        pointer_group: Cow::Owned(primary_key_paths.clone()),
                         value: UniqueConstraintValue::from_row_pk(tombstone.identity.row_pk()),
                     })
                 })
@@ -3660,7 +3669,7 @@ fn delete_action_probe(
 async fn validate_committed_delete_restrictions(
     input: &TransactionValidationInput<'_>,
     schema_catalog: &CatalogSnapshot,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<(), LixError> {
     let delete_schema_catalog = input.delete_schema_catalog.unwrap_or(schema_catalog);
     let mut normal_batches = BTreeMap::<
@@ -3688,7 +3697,7 @@ async fn validate_committed_delete_restrictions(
             };
             for source_domain in delete_restriction_source_domains(
                 &tombstone.identity,
-                reference.source_key.schema_key.as_str(),
+                reference.source_key.schema_key.as_ref(),
             ) {
                 normal_batches
                     .entry(NormalDeleteRestrictionBatchKey {
@@ -3805,7 +3814,7 @@ fn row_ref_source_domains(identity: &DomainRowIdentity) -> Vec<Domain> {
 
 async fn validate_committed_normal_delete_restriction_batches(
     hot_state: &dyn HotStateReader,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     catalog: &CatalogSnapshot,
     batches: BTreeMap<
         NormalDeleteRestrictionBatchKey,
@@ -3945,7 +3954,7 @@ struct UnresolvedForeignKeyCheck {
     source_identity: DomainRowIdentity,
     source_schema_key: String,
     source_pointer_group: Vec<Vec<String>>,
-    target: PendingForeignKeyTargetKey,
+    target: PendingForeignKeyTargetKey<'static>,
     target_exists_in_global_scope: bool,
 }
 
@@ -4015,7 +4024,7 @@ fn resolve_row_ref_target(
 }
 
 fn validate_pending_row_refs(
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     staged_rows: &[(
         PreparedValidationRow<'_>,
         &SchemaPlan,
@@ -4051,7 +4060,7 @@ fn validate_pending_row_refs(
 
 async fn validate_committed_row_refs(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     unresolved_checks: &[UnresolvedRowRefCheck],
 ) -> Result<Vec<UnresolvedRowRefCheck>, LixError> {
     let mut batches = BTreeMap::<(Domain, String), BTreeSet<RowPk>>::new();
@@ -4162,7 +4171,7 @@ fn staged_commit_row_ref_is_satisfied(
 /// and schema before probing, which keeps one point-read batch per scope.
 async fn committed_global_row_ref_targets(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     unresolved_checks: &[UnresolvedRowRefCheck],
 ) -> Result<HashSet<DomainRowIdentity>, LixError> {
     let mut matched = HashSet::new();
@@ -4300,7 +4309,7 @@ fn reject_unresolved_row_refs(unresolved_checks: &[UnresolvedRowRefCheck]) -> Re
 
 fn validate_pending_foreign_keys(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     staged_rows: &[(
         PreparedValidationRow<'_>,
         &SchemaPlan,
@@ -4367,12 +4376,12 @@ fn validate_pending_normal_foreign_key(
     row: PreparedValidationRow<'_>,
     foreign_key: &ForeignKeyPlan,
     local_value: UniqueConstraintValue,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
     let key = PendingForeignKeyTargetKey {
-        schema_key: foreign_key.referenced_schema.schema_key.clone(),
+        schema_key: Cow::Borrowed(&foreign_key.referenced_schema.schema_key),
         domain: foreign_key_target_domain(row, foreign_key),
-        pointer_group: foreign_key.referenced_properties.clone(),
+        pointer_group: Cow::Borrowed(&foreign_key.referenced_properties),
         value: local_value,
     };
     if pending_constraints.has_reachable_fk_target_key(&key) {
@@ -4382,7 +4391,7 @@ fn validate_pending_normal_foreign_key(
         source_identity: row.domain_row_identity(),
         source_schema_key: row.schema_key().to_string(),
         source_pointer_group: foreign_key.local_properties.clone(),
-        target: key,
+        target: key.into_owned(),
         target_exists_in_global_scope: false,
     }))
 }
@@ -4407,7 +4416,7 @@ fn global_scope_domain(domain: &Domain) -> Domain {
 
 async fn validate_committed_foreign_keys(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     unresolved_checks: &[UnresolvedForeignKeyCheck],
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
     let mut still_unresolved = Vec::new();
@@ -4479,7 +4488,7 @@ fn reject_unresolved_foreign_keys(
 }
 
 fn unresolved_foreign_key_target_description(
-    target: &PendingForeignKeyTargetKey,
+    target: &PendingForeignKeyTargetKey<'_>,
 ) -> Result<String, LixError> {
     Ok(format!(
         " for target '{}.{}' value {}",
@@ -4492,8 +4501,8 @@ fn unresolved_foreign_key_target_description(
 async fn committed_normal_foreign_key_target_exists(
     hot_state: &dyn HotStateReader,
     schema_catalog: &CatalogSnapshot,
-    pending_constraints: &PendingConstraintIndexes,
-    target: &PendingForeignKeyTargetKey,
+    pending_constraints: &PendingConstraintIndexes<'_>,
+    target: &PendingForeignKeyTargetKey<'_>,
 ) -> Result<bool, LixError> {
     let row_pks: Vec<RowPk> = primary_key_row_pk_for_target(schema_catalog, target)
         .into_iter()
@@ -4502,7 +4511,7 @@ async fn committed_normal_foreign_key_target_exists(
         let rows = scan_committed_constraint_rows(
             hot_state,
             &domain,
-            vec![target.schema_key.clone()],
+            vec![target.schema_key.to_string()],
             row_pks.clone(),
             false,
         )
@@ -4539,13 +4548,13 @@ async fn committed_normal_foreign_key_target_exists(
 /// into an unbounded collection read.
 async fn committed_global_foreign_key_targets(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
     unresolved_checks: &[UnresolvedForeignKeyCheck],
-) -> Result<BTreeSet<PendingForeignKeyTargetKey>, LixError> {
+) -> Result<BTreeSet<PendingForeignKeyTargetKey<'static>>, LixError> {
     let mut matched = BTreeSet::new();
     let mut batches = BTreeMap::<
         (Domain, String, Vec<Vec<String>>),
-        BTreeMap<UniqueConstraintValue, Vec<PendingForeignKeyTargetKey>>,
+        BTreeMap<UniqueConstraintValue, Vec<PendingForeignKeyTargetKey<'static>>>,
     >::new();
 
     for check in unresolved_checks {
@@ -4560,8 +4569,8 @@ async fn committed_global_foreign_key_targets(
             batches
                 .entry((
                     domain,
-                    check.target.schema_key.clone(),
-                    check.target.pointer_group.clone(),
+                    check.target.schema_key.to_string(),
+                    check.target.pointer_group.to_vec(),
                 ))
                 .or_default()
                 .entry(check.target.value.clone())
@@ -4574,9 +4583,9 @@ async fn committed_global_foreign_key_targets(
         let mut row_pks = Vec::with_capacity(values.len());
         for value in values.keys() {
             let target = PendingForeignKeyTargetKey {
-                schema_key: schema_key.clone(),
+                schema_key: Cow::Borrowed(schema_key.as_str()),
                 domain: domain.clone(),
-                pointer_group: pointer_group.clone(),
+                pointer_group: Cow::Borrowed(pointer_group.as_slice()),
                 value: value.clone(),
             };
             let Some(row_pk) = primary_key_row_pk_for_target(input.schema_catalog, &target) else {
@@ -4620,10 +4629,10 @@ async fn committed_global_foreign_key_targets(
 
 fn primary_key_row_pk_for_target(
     schema_catalog: &CatalogSnapshot,
-    target: &PendingForeignKeyTargetKey,
+    target: &PendingForeignKeyTargetKey<'_>,
 ) -> Option<RowPk> {
     let (_, target_plan) = schema_catalog.plan_for_key(&target.schema_key)?;
-    if target_plan.primary_key.as_ref()? != &target.pointer_group {
+    if target_plan.primary_key.as_deref()? != &*target.pointer_group {
         return None;
     }
     let values = target
@@ -4637,7 +4646,7 @@ fn primary_key_row_pk_for_target(
 
 async fn validate_committed_unique_constraints(
     input: &TransactionValidationInput<'_>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<(), LixError> {
     let mut pending_by_scope = BTreeMap::<
         PendingUniqueConstraintScope,
@@ -4700,7 +4709,7 @@ async fn validate_committed_unique_constraints(
                 let committed_rows = scan_committed_constraint_rows(
                     input.hot_state,
                     &scope.domain,
-                    vec![scope.schema_key.clone()],
+                    vec![scope.schema_key.to_string()],
                     Vec::new(),
                     false,
                 )
@@ -4740,7 +4749,7 @@ fn declared_column_probe(
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
 ) -> Option<crate::hot_state::DeclaredColumnEq> {
-    let [pointer] = scope.pointer_group.as_slice() else {
+    let [pointer] = &*scope.pointer_group else {
         return None;
     };
     let [property] = pointer.as_slice() else {
@@ -4757,7 +4766,7 @@ fn declared_column_probe(
         .find(|column| column.name == *property)?
         .ordinal;
     Some(crate::hot_state::DeclaredColumnEq {
-        schema_key: scope.schema_key.clone(),
+        schema_key: scope.schema_key.to_string(),
         ordinal,
         values: vec![value.exact_hot_index_value()?],
     })
@@ -4770,7 +4779,7 @@ fn reject_committed_unique_conflicts(
     committed_rows: &CommittedHotStateRows,
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
-    pending_constraints: &PendingConstraintIndexes,
+    pending_constraints: &PendingConstraintIndexes<'_>,
 ) -> Result<(), LixError> {
     for committed_row in committed_rows.iter() {
         if !committed_row_is_in_exact_unique_scope(committed_row, scope) {
@@ -4811,20 +4820,20 @@ fn reject_committed_unique_conflicts(
 
 fn filesystem_namespace_owns_unique_constraint(key: &PendingUniqueKey) -> bool {
     matches!(
-        key.schema_key.as_str(),
+        key.schema_key.as_ref(),
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY | FILE_DESCRIPTOR_SCHEMA_KEY
     )
 }
 
 fn pending_unique_owner_is_insert(
     input: &TransactionValidationInput<'_>,
-    key: &PendingUniqueKey,
+    key: &PendingUniqueKey<'_>,
     row_pk: &RowPk,
 ) -> bool {
     // Conflict-aware inserts use Replace mode, but retain their logical Insert
     // origin when the row is new. Both forms must keep the original single scan.
     input.staged_writes.inserts().any(|insert| {
-        insert.row.schema_key.as_str() == key.schema_key.as_str()
+        insert.row.schema_key.as_str() == key.schema_key.as_ref()
             && insert.row.row_pk == row_pk
             && Domain::exact_file(
                 insert.row.branch_id.to_string(),
@@ -4844,7 +4853,7 @@ fn pending_unique_owner_is_insert(
 async fn committed_unique_value_is_unchanged(
     hot_state: &dyn HotStateReader,
     catalog: &CatalogSnapshot,
-    key: &PendingUniqueKey,
+    key: &PendingUniqueKey<'_>,
     row_pk: &RowPk,
 ) -> Result<bool, LixError> {
     let committed_rows = load_committed_constraint_rows(
@@ -4875,7 +4884,10 @@ fn committed_row_is_in_exact_unique_scope(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UniqueConstraintValue(Vec<String>);
+/// Stable encodings of one constraint tuple. Almost every constraint is a
+/// single column, so the tuple is stored inline; a `SmallVec` orders, compares,
+/// and hashes exactly like the equivalent `Vec`.
+struct UniqueConstraintValue(SmallVec<[String; 1]>);
 
 impl UniqueConstraintValue {
     #[cfg(test)]
@@ -4899,13 +4911,13 @@ impl UniqueConstraintValue {
     }
 
     fn from_row_ref(encoded: &str) -> Self {
-        Self(vec![stable_unique_value(&JsonValue::String(
+        Self(smallvec::smallvec![stable_unique_value(&JsonValue::String(
             encoded.to_owned(),
         ))])
     }
 
     fn from_snapshot(snapshot: &JsonValue, pointers: &[Vec<String>]) -> Option<Self> {
-        let mut values = Vec::with_capacity(pointers.len());
+        let mut values = SmallVec::with_capacity(pointers.len());
         for pointer in pointers {
             let value = json_pointer_get(snapshot, pointer)?;
             values.push(stable_unique_value(value));
@@ -4914,7 +4926,7 @@ impl UniqueConstraintValue {
     }
 
     fn from_snapshot_non_null(snapshot: &JsonValue, pointers: &[Vec<String>]) -> Option<Self> {
-        let mut values = Vec::with_capacity(pointers.len());
+        let mut values = SmallVec::with_capacity(pointers.len());
         for pointer in pointers {
             let value = json_pointer_get(snapshot, pointer)?;
             if value.is_null() {
@@ -4940,7 +4952,7 @@ impl UniqueConstraintValue {
                 }
             }
             ValidatedRowPayload::Typed(typed) => {
-                let mut values = Vec::with_capacity(paths.len());
+                let mut values = SmallVec::with_capacity(paths.len());
                 for path in paths {
                     let [column] = path.as_slice() else {
                         return None;
@@ -4967,7 +4979,7 @@ impl UniqueConstraintValue {
         let [encoded] = self.0.as_slice() else {
             return (self.0.len() > 1).then(|| {
                 crate::hot_state::HotIndexValue::String(
-                    serde_json::to_string(&self.0).expect("string tuple encoding"),
+                    serde_json::to_string(self.0.as_slice()).expect("string tuple encoding"),
                 )
             });
         };
@@ -5610,7 +5622,7 @@ mod tests {
 
     fn test_plan_from_schema(schema: JsonValue) -> &'static SchemaPlan {
         let key = schema_key_from_definition(&schema).expect("test schema should have key");
-        let visible_schemas = match key.schema_key.as_str() {
+        let visible_schemas = match key.schema_key.as_ref() {
             "fk_child_schema" => vec![fk_parent_schema(), schema],
             FILE_DESCRIPTOR_SCHEMA_KEY => vec![directory_descriptor_schema(), schema],
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => vec![schema],
@@ -8013,7 +8025,7 @@ mod tests {
                 false,
                 Some("01920000-0000-7000-8000-0000000000a2".into()),
             ),
-            pointer_group: vec![vec!["id".into()]],
+            pointer_group: vec![vec!["id".into()]].into(),
             value: UniqueConstraintValue::string_values(["parent-1"]),
         };
         let check = UnresolvedForeignKeyCheck {
@@ -9095,8 +9107,8 @@ mod tests {
         let from_snapshot = UniqueConstraintValue::from_snapshot(&snapshot, &pointer_group)
             .expect("snapshot value should encode");
 
-        assert_eq!(from_identity.0, vec!["String(\"parent-1\")".to_string()]);
-        assert_eq!(from_snapshot.0, vec!["\"parent-1\"".to_string()]);
+        assert_eq!(from_identity.0.as_slice(), vec!["String(\"parent-1\")".to_string()]);
+        assert_eq!(from_snapshot.0.as_slice(), vec!["\"parent-1\"".to_string()]);
         assert_ne!(from_identity, from_snapshot);
     }
 
@@ -9262,6 +9274,84 @@ mod tests {
                 .validate(&json!({ "key": "k", "value": "v" }))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn shared_and_borrowed_constraint_keys_order_hash_and_compare_like_owned_strings() {
+        use std::hash::{BuildHasher, RandomState};
+        let hasher = RandomState::new();
+        let shared_branch = SharedStr::from("branch-b");
+        let shared_domain = Domain::exact_file(&shared_branch, false, None);
+        let owned_domain = Domain::exact_file("branch-b".to_string(), false, None);
+        assert_eq!(shared_domain, owned_domain);
+        assert_eq!(hasher.hash_one(&shared_domain), hasher.hash_one(&owned_domain));
+        assert_eq!(format!("{shared_domain:?}"), format!("{owned_domain:?}"));
+        assert_eq!(
+            shared_domain.fingerprint_component(),
+            owned_domain.fingerprint_component()
+        );
+        let identity = |schema_key: SharedStr| {
+            DomainRowIdentity::new(shared_domain.clone(), schema_key, RowPk::single("row"))
+        };
+        assert_eq!(
+            hasher.hash_one(identity(SharedStr::from("schema"))),
+            hasher.hash_one(identity("schema".to_string().into())),
+        );
+
+        // Keys built the way validation now builds them (borrowed schema key
+        // and pointer group, inline tuple) must sort exactly like the owned
+        // tuple they replaced, so pending-constraint iteration order and the
+        // first reported violation are unchanged.
+        let pointer_a = vec![vec!["a".to_string()]];
+        let pointer_b = vec![vec!["b".to_string()], vec!["c".to_string()]];
+        let mut cases = Vec::new();
+        for schema_key in ["schema_b", "schema_a", "schema_a_suffix"] {
+            for branch in ["main", "feature", "global"] {
+                for untracked in [false, true] {
+                    for pointer in [&pointer_a, &pointer_b] {
+                        for value in [vec!["\"x\"".to_string()], vec!["1".into(), "null".into()]] {
+                            cases.push((schema_key, branch, untracked, pointer, value));
+                        }
+                    }
+                }
+            }
+        }
+        let mut borrowed = cases
+            .iter()
+            .map(|(schema_key, branch, untracked, pointer, value)| PendingForeignKeyTargetKey {
+                schema_key: Cow::Borrowed(*schema_key),
+                domain: Domain::exact_file(SharedStr::from(*branch), *untracked, None),
+                pointer_group: Cow::Borrowed(pointer.as_slice()),
+                value: UniqueConstraintValue(value.iter().cloned().collect()),
+            })
+            .collect::<Vec<_>>();
+        let mut owned = cases
+            .iter()
+            .map(|(schema_key, branch, untracked, pointer, value)| {
+                (
+                    schema_key.to_string(),
+                    Domain::exact_file(branch.to_string(), *untracked, None),
+                    (*pointer).clone(),
+                    value.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        borrowed.sort();
+        owned.sort();
+        for (key, (schema_key, domain, pointer, value)) in borrowed.iter().zip(&owned) {
+            assert_eq!(key.schema_key.as_ref(), schema_key);
+            assert_eq!(&key.domain, domain);
+            assert_eq!(key.pointer_group.as_ref(), pointer.as_slice());
+            assert_eq!(key.value.0.as_slice(), value.as_slice());
+        }
+        let index = borrowed
+            .iter()
+            .cloned()
+            .map(|key| (key, ()))
+            .collect::<BTreeMap<_, _>>();
+        for key in &borrowed {
+            assert!(index.contains_key(&key.clone().into_owned()));
+        }
     }
 
     #[test]
@@ -9497,13 +9587,13 @@ mod tests {
         let catalog = CatalogSnapshot::from_visible_schemas(&[unique_schema()])
             .expect("unique schema catalog should build");
         let mut target = PendingForeignKeyTargetKey {
-            schema_key: "unique_schema".to_string(),
+            schema_key: "unique_schema".into(),
             domain: Domain::exact_file(
                 "01920000-0000-7000-8000-0000000000a1",
                 false,
                 Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             ),
-            pointer_group: vec![vec!["id".to_string()]],
+            pointer_group: vec![vec!["id".to_string()]].into(),
             value: UniqueConstraintValue::string_values(["row-1"]),
         };
 
@@ -9512,7 +9602,7 @@ mod tests {
             Some(RowPk::single("row-1"))
         );
 
-        target.pointer_group = vec![vec!["slug".to_string()]];
+        target.pointer_group = vec![vec!["slug".to_string()]].into();
         assert_eq!(
             primary_key_row_pk_for_target(&catalog, &target),
             None,
@@ -9672,7 +9762,7 @@ mod tests {
         let target = PendingForeignKeyTargetKey {
             schema_key: "unique_schema".into(),
             domain: Domain::exact_file(branch_id, false, Some(file_id.into())),
-            pointer_group: vec![vec!["slug".into()]],
+            pointer_group: vec![vec!["slug".into()]].into(),
             value: UniqueConstraintValue::string_values(["old-slug"]),
         };
         let hot_state = StaticHotStateReader {

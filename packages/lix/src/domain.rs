@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::MaterializedHotStateRowRef;
+use crate::common::SharedStr;
 use crate::row_pk::RowPk;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
@@ -9,16 +10,21 @@ use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 /// A domain is the complete scope in which a row identity is meaningful:
 /// branch, durability, and file scope. Projection methods on this type are
 /// deliberately named so callers cannot silently erase part of the coordinate.
+///
+/// Identifiers are shared strings: validation builds one domain per staged
+/// row, and prepared rows already own interned [`SharedStr`] handles, so a
+/// domain derived from a row costs a reference-count increment rather than an
+/// allocation. Ordering, equality, hashing, and formatting are those of `str`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Domain {
-    branch_id: String,
+    branch_id: SharedStr,
     untracked: bool,
     file_scope: DomainFileScope,
 }
 
 impl Domain {
     pub(crate) fn exact_file(
-        branch_id: impl Into<String>,
+        branch_id: impl Into<SharedStr>,
         untracked: bool,
         file_id: Option<String>,
     ) -> Self {
@@ -29,7 +35,7 @@ impl Domain {
         }
     }
 
-    pub(crate) fn any_file(branch_id: impl Into<String>, untracked: bool) -> Self {
+    pub(crate) fn any_file(branch_id: impl Into<SharedStr>, untracked: bool) -> Self {
         Self {
             branch_id: branch_id.into(),
             untracked,
@@ -37,7 +43,7 @@ impl Domain {
         }
     }
 
-    pub(crate) fn schema_catalog(branch_id: impl Into<String>, untracked: bool) -> Self {
+    pub(crate) fn schema_catalog(branch_id: impl Into<SharedStr>, untracked: bool) -> Self {
         Self::any_file(branch_id, untracked)
     }
 
@@ -114,7 +120,7 @@ impl Domain {
     }
 
     pub(crate) fn contains_ref(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
-        row.branch_id() == self.branch_id
+        row.branch_id() == self.branch_id.as_str()
             && row.untracked() == self.untracked
             && self.contains_canonical_ref(row)
     }
@@ -122,7 +128,7 @@ impl Domain {
     /// Matches branch and file scope while accepting whichever durability
     /// member won canonical tracked/untracked overlay.
     pub(crate) fn contains_canonical_ref(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
-        row.branch_id() == self.branch_id
+        row.branch_id() == self.branch_id.as_str()
             && committed_row_ref_is_exact_branch_scoped(row, &self.branch_id)
             && match &self.file_scope {
                 DomainFileScope::Any => true,
@@ -207,12 +213,12 @@ pub(crate) enum DomainFileScope {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
-    schema_key: String,
+    schema_key: SharedStr,
     row_pk: RowPk,
 }
 
 impl DomainRowIdentity {
-    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, row_pk: RowPk) -> Self {
+    pub(crate) fn new(domain: Domain, schema_key: impl Into<SharedStr>, row_pk: RowPk) -> Self {
         Self {
             domain,
             schema_key: schema_key.into(),
@@ -229,16 +235,20 @@ impl DomainRowIdentity {
         )
     }
 
-    pub(crate) fn in_domain(domain: Domain, schema_key: impl Into<String>, row_pk: RowPk) -> Self {
+    pub(crate) fn in_domain(
+        domain: Domain,
+        schema_key: impl Into<SharedStr>,
+        row_pk: RowPk,
+    ) -> Self {
         Self::new(domain, schema_key, row_pk)
     }
 
     #[cfg(test)]
     pub(crate) fn exact(
-        branch_id: impl Into<String>,
+        branch_id: impl Into<SharedStr>,
         untracked: bool,
         file_id: Option<String>,
-        schema_key: impl Into<String>,
+        schema_key: impl Into<SharedStr>,
         row_pk: RowPk,
     ) -> Self {
         Self::new(
@@ -257,7 +267,7 @@ impl DomainRowIdentity {
     }
 
     pub(crate) fn schema_key_owned(&self) -> String {
-        self.schema_key.clone()
+        self.schema_key.to_string()
     }
 
     pub(crate) fn row_pk(&self) -> &RowPk {

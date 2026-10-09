@@ -221,6 +221,18 @@ impl From<&str> for SharedStr {
     }
 }
 
+impl From<&String> for SharedStr {
+    fn from(value: &String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl From<&SharedStr> for SharedStr {
+    fn from(value: &SharedStr) -> Self {
+        value.clone()
+    }
+}
+
 impl From<Box<str>> for SharedStr {
     fn from(value: Box<str>) -> Self {
         Self::from(value.into_string())
