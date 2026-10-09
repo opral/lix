@@ -4,6 +4,18 @@ use std::path::PathBuf;
 use wit_bindgen_rust::{Opts, WithOption};
 
 fn main() {
+    // The unoptimized engine test executable can exceed 4 GiB. Mold 2.30
+    // places unwind tables before other read-only data, which can overflow
+    // their signed 32-bit panic-personality references across the large text
+    // section. Rust's bundled LLD keeps those references within range and
+    // diagnoses overflow instead of producing a broken unwind table.
+    // Apply this to Lix-owned linked targets; the tests-only Cargo directive
+    // does not cover library unit tests. Dependency executables keep their
+    // own linker, and other targets (including Wasm) retain their settings.
+    if env::var("TARGET").expect("Cargo sets TARGET") == "x86_64-unknown-linux-gnu" {
+        println!("cargo:rustc-link-arg=-fuse-ld=lld");
+    }
+
     generate(
         "plugin",
         "combined_bindings.rs",
