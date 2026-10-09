@@ -3701,6 +3701,40 @@ where
     bounded_sync_json_response(response, "sync history", MAX_SYNC_PULL_RESPONSE_BYTES)
 }
 
+struct BoundedSyncJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for BoundedSyncJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("sync response byte limit exceeded"));
+        };
+        if self.exceeded || next_len > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("sync response byte limit exceeded"));
+        }
+        if next_len > self.bytes.capacity() {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(next_len)
+                .min(self.limit);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn bounded_sync_json_response<T>(
     value: T,
     operation: &'static str,
@@ -3709,18 +3743,24 @@ fn bounded_sync_json_response<T>(
 where
     T: Serialize,
 {
-    let encoded = serde_json::to_vec(&value).map_err(|error| {
+    let mut writer = BoundedSyncJsonWriter {
+        bytes: Vec::with_capacity(max_bytes.min(128)),
+        limit: max_bytes,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut writer, &value);
+    if writer.exceeded {
+        return Err(ApiError::sync_response_too_large(operation, max_bytes));
+    }
+    result.map_err(|error| {
         ApiError::from(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("encode {operation} response: {error}"),
         ))
     })?;
-    if encoded.len() > max_bytes {
-        return Err(ApiError::sync_response_too_large(operation, max_bytes));
-    }
     Ok(HttpResponse::builder()
         .header(CONTENT_TYPE, "application/json")
-        .body(ServerProtocolBody::full(encoded))
+        .body(ServerProtocolBody::full(writer.bytes))
         .expect("static sync response headers are valid"))
 }
 
@@ -6362,6 +6402,53 @@ mod tests {
         }
         assert!(!openapi.contains("rowPk: {}"));
         assert!(openapi.contains("sourceCommitId:"));
+    }
+
+    #[test]
+    fn bounded_sync_json_response_stops_serializing_at_the_byte_limit() {
+        struct CountedSequence<'a>(&'a AtomicUsize);
+        impl Serialize for CountedSequence<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq as _;
+                let mut sequence = serializer.serialize_seq(Some(1_000_000))?;
+                for _ in 0..1_000_000 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    sequence.serialize_element(&0u8)?;
+                }
+                sequence.end()
+            }
+        }
+        let visited = AtomicUsize::new(0);
+        let error = bounded_sync_json_response(CountedSequence(&visited), "sync pull", 32)
+            .expect_err("serialization must stop before constructing the oversized body");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(visited.load(Ordering::Relaxed) <= 17);
+    }
+
+    #[tokio::test]
+    async fn bounded_sync_json_response_accepts_the_exact_encoded_limit() {
+        let value = json!({ "escaped": "\n\"", "unicode": "λ" });
+        let expected = serde_json::to_vec(&value).unwrap();
+        let response = bounded_sync_json_response(&value, "sync pull", expected.len()).unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected.as_slice());
+        let error = bounded_sync_json_response(&value, "sync pull", expected.len() - 1)
+            .expect_err("one byte beyond the bound must fail");
+        assert_eq!(error.body.error.code, "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE");
+    }
+
+    #[test]
+    fn bounded_sync_json_response_preserves_serialization_errors() {
+        struct InvalidResponse;
+        impl Serialize for InvalidResponse {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("invalid response fixture"))
+            }
+        }
+        let error = bounded_sync_json_response(InvalidResponse, "sync pull", 32)
+            .expect_err("serializer failures must remain internal errors");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(error.body.error.code, "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE");
     }
 
     #[test]
@@ -9745,7 +9832,9 @@ mod tests {
     #[tokio::test]
     async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
         let app = app().await;
-        for version in ["11", "13", "20", "999", "not-a-number"] {
+        let stale = (crate::sync::SYNC_PROTOCOL_VERSION - 1).to_string();
+        let future = (crate::sync::SYNC_PROTOCOL_VERSION + 1).to_string();
+        for version in [stale.as_str(), future.as_str(), "20", "999", "not-a-number"] {
             let builder = Request::builder()
                 .uri("/lix/v1/sync/pull")
                 .header(SYNC_PROTOCOL_VERSION_HEADER, version);
@@ -9795,7 +9884,10 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/sync/merge")
                     .header(SESSION_ID_HEADER, session_id)
-                    .header(SYNC_PROTOCOL_VERSION_HEADER, "13")
+                    .header(
+                        SYNC_PROTOCOL_VERSION_HEADER,
+                        (crate::sync::SYNC_PROTOCOL_VERSION - 1).to_string(),
+                    )
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from("invalid JSON"))
                     .unwrap(),
@@ -9810,7 +9902,7 @@ mod tests {
         );
         assert_eq!(
             response["error"]["details"]["clientSyncProtocolVersion"],
-            13
+            crate::sync::SYNC_PROTOCOL_VERSION - 1
         );
         assert_eq!(
             response["error"]["details"]["serverSyncProtocolVersion"],
@@ -10276,9 +10368,27 @@ mod tests {
                 .all(|object| object["address"]["kind"] == "commit_graph_record")
         );
         assert_eq!(response["epochId"], body["epochId"]);
+
+        let mut maximum = body.clone();
+        maximum["maxCommits"] = json!(64);
+        let maximum = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            Some(&session),
+            &[("lix-native-baseline-lease", lease)],
+            Some(maximum),
+        )
+        .await;
+        assert_eq!(maximum.status(), StatusCode::OK);
+        let maximum = response_json(maximum).await;
+        let maximum_objects = maximum["objects"].as_array().unwrap();
+        assert!(!maximum_objects.is_empty() && maximum_objects.len() <= 64);
+        assert_eq!(maximum_objects[0]["address"]["commitId"], body["anchor"]);
+
         for (field, value) in [
             ("maxCommits", json!(0)),
-            ("maxCommits", json!(17)),
+            ("maxCommits", json!(65)),
             ("epochId", json!("bad")),
             ("anchor", json!("bad")),
             ("includeStateHeaders", json!("bad")),

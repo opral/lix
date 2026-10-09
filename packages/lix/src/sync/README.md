@@ -1,6 +1,6 @@
 # Repository sync
 
-The current wire contract uses sync protocol 32 and server protocol 12.
+The current wire contract uses sync protocol 33 and server protocol 12.
 Repository physical format is 87. Upgrade the SDK and authority together;
 older physical repositories use the migrations described below.
 

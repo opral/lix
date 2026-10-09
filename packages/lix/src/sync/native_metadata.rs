@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_NATIVE_METADATA_BATCH: usize = 32;
+/// A bounded history walk may return a graph record and one optional state
+/// header for each of its 64 selected commits. Ordinary exact metadata
+/// requests and dependency selection remain capped at `MAX_NATIVE_METADATA_BATCH`.
+pub(crate) const MAX_NATIVE_METADATA_WALK_RECORDS: usize = 128;
 pub(crate) const MAX_NATIVE_METADATA_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_NATIVE_METADATA_RESPONSE_BYTES: usize =
     MAX_NATIVE_METADATA_PAYLOAD_BYTES.div_ceil(3) * 4 + 65536;
@@ -186,7 +190,18 @@ pub(super) async fn native_metadata_residency(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let values = read.get_many(&requests).await?.values;
+    let (values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+            max_single_value_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        },
+        MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        32,
+    )
+    .await?;
+    let values = values.values;
     if values.len() != addresses.len() {
         return Err(invalid("native metadata storage cardinality mismatch"));
     }
@@ -236,14 +251,28 @@ pub(super) async fn native_metadata_residency(
 pub(crate) fn validate_native_metadata_request(
     request: &NativeMetadataRequest,
 ) -> Result<(), LixError> {
-    canonical_id(&request.epoch_id)?;
-    if request.objects.is_empty() || request.objects.len() > MAX_NATIVE_METADATA_BATCH {
-        return Err(invalid(
-            "native metadata request requires between 1 and 32 objects",
-        ));
+    validate_native_metadata_addresses(
+        &request.epoch_id,
+        &request.objects,
+        MAX_NATIVE_METADATA_BATCH,
+    )
+}
+
+fn validate_native_metadata_addresses(
+    epoch_id: &str,
+    addresses: &[NativeMetadataRef],
+    max_records: usize,
+) -> Result<(), LixError> {
+    canonical_id(epoch_id)?;
+    if max_records == 0
+        || max_records > MAX_NATIVE_METADATA_WALK_RECORDS
+        || addresses.is_empty()
+        || addresses.len() > max_records
+    {
+        return Err(invalid("native metadata request exceeds its record bound"));
     }
     let mut unique = BTreeSet::new();
-    for address in &request.objects {
+    for address in addresses {
         key(address)?;
         if !unique.insert(address) {
             return Err(invalid("native metadata request repeats an address"));
@@ -257,16 +286,41 @@ pub(crate) fn validate_native_metadata_response(
     response: &NativeMetadataResponse,
 ) -> Result<(), LixError> {
     validate_native_metadata_request(request)?;
+    validate_native_metadata_response_for_addresses(
+        repository_id,
+        &request.epoch_id,
+        &request.objects,
+        MAX_NATIVE_METADATA_BATCH,
+        response,
+    )
+}
+
+/// Validates an already-authorized exact response address list. Walk responses
+/// use this shared payload/owner validator with up to 128 records while the
+/// standalone exact metadata endpoint remains capped at 32 request objects.
+pub(crate) fn validate_native_metadata_response_for_addresses(
+    repository_id: &str,
+    epoch_id: &str,
+    expected_addresses: &[NativeMetadataRef],
+    max_records: usize,
+    response: &NativeMetadataResponse,
+) -> Result<(), LixError> {
+    validate_native_metadata_addresses(epoch_id, expected_addresses, max_records)?;
     if response.lix_id != repository_id
-        || response.epoch_id != request.epoch_id
-        || response.objects.len() != request.objects.len()
+        || response.epoch_id != epoch_id
+        || response.objects.len() != expected_addresses.len()
     {
         return Err(invalid(
             "native metadata response repository, epoch or cardinality mismatch",
         ));
     }
     let mut total = 0usize;
-    for (expected, object) in request.objects.iter().zip(&response.objects) {
+    let mut seen = BTreeSet::new();
+    for (expected, object) in expected_addresses.iter().zip(&response.objects) {
+        key(expected)?;
+        if !seen.insert(expected) {
+            return Err(invalid("native metadata response repeats an address"));
+        }
         if expected != &object.address {
             return Err(invalid("native metadata response address mismatch"));
         }
@@ -283,7 +337,7 @@ pub(crate) fn validate_native_metadata_response(
             object.checkpoint_conversation.as_ref(),
         )?;
     }
-    super::native_dependencies::validate(response)?;
+    super::native_dependencies::validate(response, max_records)?;
     Ok(())
 }
 
@@ -402,7 +456,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             }
         }
         if !requests.is_empty() {
-            let loaded = read.get_many(&requests).await?.values;
+            let (loaded, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+                &read,
+                &requests,
+                crate::storage_adapter::ReadBudget {
+                    max_result_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+                    max_single_value_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+                },
+                MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+                MAX_NATIVE_METADATA_BATCH,
+            )
+            .await?;
+            let loaded = loaded.values;
             if loaded.len() != physical_indices.len() {
                 return Err(invalid("native metadata storage cardinality mismatch"));
             }
@@ -524,7 +589,173 @@ pub(crate) async fn stage_native_metadata(
     request: &NativeMetadataRequest,
     response: &NativeMetadataResponse,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
-    validate_native_metadata_response(state.repository_id(), request, response)?;
+    validate_native_metadata_request(request)?;
+    stage_validated_native_metadata(
+        read,
+        writes,
+        state,
+        request,
+        response,
+        MAX_NATIVE_METADATA_BATCH,
+    )
+    .await
+}
+
+/// Stage the missing suffix of an already authenticated bounded-walk response.
+/// The full response is validated first; only selected primary records and
+/// dependencies whose owners are among those selected records are installed.
+pub(crate) async fn stage_selected_native_metadata(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    full_request: &NativeMetadataRequest,
+    full_response: &NativeMetadataResponse,
+    selected_addresses: &[NativeMetadataRef],
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    validate_native_metadata_addresses(
+        &full_request.epoch_id,
+        &full_request.objects,
+        MAX_NATIVE_METADATA_WALK_RECORDS,
+    )?;
+    validate_native_metadata_response_for_addresses(
+        state.repository_id(),
+        &full_request.epoch_id,
+        &full_request.objects,
+        MAX_NATIVE_METADATA_WALK_RECORDS,
+        full_response,
+    )?;
+    if full_request.epoch_id != state.epoch_id() {
+        return Err(invalid(
+            "native metadata request belongs to another local epoch",
+        ));
+    }
+    if selected_addresses.is_empty() || selected_addresses.len() > full_request.objects.len() {
+        return Err(invalid("native metadata selection exceeds its request"));
+    }
+    let requested = full_request
+        .objects
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut selected = BTreeSet::new();
+    for address in selected_addresses {
+        key(address)?;
+        if !requested.contains(address) || !selected.insert(address.clone()) {
+            return Err(invalid("native metadata selection is not an exact subset"));
+        }
+    }
+    let selected_objects = full_response
+        .objects
+        .iter()
+        .filter(|object| selected.contains(&object.address))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected_objects.len() != selected_addresses.len() {
+        return Err(invalid("native metadata selection cardinality mismatch"));
+    }
+    let dependencies = if full_response.dependencies.metadata.is_empty()
+        && full_response.dependencies.objects.is_empty()
+    {
+        // Native metadata walks return graph records and optional headers, not
+        // change locators. Their validated response therefore has no derived
+        // dependencies, so avoid decoding every selected header a second time.
+        super::native_dependencies::NativeDependencyBundle::default()
+    } else {
+        let selected_graph_owners = selected_objects
+            .iter()
+            .filter_map(|object| match &object.address {
+                NativeMetadataRef::CommitGraphRecord(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        // Dependency selection is optional cache warming. Keep only dependencies
+        // validated by the full response that belong to a selected graph record.
+        let dependency_metadata = full_response
+            .dependencies
+            .metadata
+            .iter()
+            .filter(|item| match &item.address {
+                NativeMetadataRef::CommitStateHeader(id) => {
+                    selected_graph_owners.contains(id.as_str())
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let available_headers = selected_objects
+            .iter()
+            .chain(&dependency_metadata)
+            .filter_map(|item| match &item.address {
+                NativeMetadataRef::CommitStateHeader(id) => {
+                    Some((id.as_str(), item.bytes.as_slice()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut selected_catalogs = BTreeSet::new();
+        for (id, bytes) in available_headers {
+            let owner = canonical_id(id)?;
+            selected_catalogs.insert(crate::tracked_state::commit_state_catalog_address(
+                owner, bytes,
+            )?);
+        }
+        let dependency_objects = full_response
+            .dependencies
+            .objects
+            .iter()
+            .filter(|item| selected_catalogs.contains(&item.address))
+            .cloned()
+            .collect::<Vec<_>>();
+        super::native_dependencies::NativeDependencyBundle {
+            metadata: dependency_metadata,
+            objects: dependency_objects,
+        }
+    };
+    let selected_request = NativeMetadataRequest {
+        epoch_id: full_request.epoch_id.clone(),
+        objects: selected_objects
+            .iter()
+            .map(|object| object.address.clone())
+            .collect(),
+    };
+    let selected_response = NativeMetadataResponse {
+        lix_id: full_response.lix_id.clone(),
+        epoch_id: full_response.epoch_id.clone(),
+        objects: selected_objects,
+        dependencies,
+    };
+    stage_validated_native_metadata(
+        read,
+        writes,
+        state,
+        &selected_request,
+        &selected_response,
+        MAX_NATIVE_METADATA_WALK_RECORDS,
+    )
+    .await
+}
+
+async fn stage_validated_native_metadata(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    request: &NativeMetadataRequest,
+    response: &NativeMetadataResponse,
+    max_records: usize,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    validate_native_metadata_response_for_addresses(
+        state.repository_id(),
+        &request.epoch_id,
+        &request.objects,
+        max_records,
+        response,
+    )?;
+    if request.epoch_id != state.epoch_id() {
+        return Err(invalid(
+            "native metadata request belongs to another local epoch",
+        ));
+    }
     if response.dependencies.metadata.is_empty() && response.dependencies.objects.is_empty() {
         return stage_exact_metadata(read, writes, state, request, response).await;
     }
@@ -614,7 +845,18 @@ async fn stage_exact_metadata(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let values = read.get_many(&requests).await?.values;
+    let (values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+            max_single_value_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        },
+        MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        32,
+    )
+    .await?;
+    let values = values.values;
     if values.len() != keys.len() {
         return Err(invalid("native metadata storage cardinality mismatch"));
     }
@@ -714,12 +956,37 @@ async fn stage_checkpoint_conversation_proofs(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let pointer_values = read.get_many(&pointer_requests).await?.values;
-    let coverage_values = read.get_many(&coverage_requests).await?.values;
+    let (pointer_values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &pointer_requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+            max_single_value_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        },
+        MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        32,
+    )
+    .await?;
+    let (coverage_values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &coverage_requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+            max_single_value_bytes: MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        },
+        MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+        32,
+    )
+    .await?;
+    let pointer_values = pointer_values.values;
+    let coverage_values = coverage_values.values;
     if pointer_values.len() != ids.len() || coverage_values.len() != ids.len() {
-        return Err(invalid("checkpoint conversation proof cardinality mismatch"));
+        return Err(invalid(
+            "checkpoint conversation proof cardinality mismatch",
+        ));
     }
-    let coverage_bytes = crate::checkpoint_conversation::partial_null_coverage_bytes(state.epoch_id())?;
+    let coverage_bytes =
+        crate::checkpoint_conversation::partial_null_coverage_bytes(state.epoch_id())?;
     for (index, (((_id, expected), pointer), coverage)) in facts
         .iter()
         .zip(pointer_values)

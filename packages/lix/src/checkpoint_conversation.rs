@@ -28,6 +28,7 @@ pub(crate) const PARTIAL_CHECKPOINT_CONVERSATION_COVERAGE_SPACE: StorageSpace =
     );
 
 const NULL_COVERAGE_MAGIC: &[u8] = b"LIXCCN1";
+const MAX_CONVERSATION_POINT_READ_BYTES: usize = 256 * 1024;
 
 pub(crate) fn stage_checkpoint_conversation(
     writes: &mut StorageWriteSet,
@@ -137,7 +138,18 @@ pub(crate) async fn load_checkpoint_conversations(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let pointer_values = read.get_many(&pointer_requests).await?.values;
+    let (pointer_values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &pointer_requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_CONVERSATION_POINT_READ_BYTES,
+            max_single_value_bytes: MAX_CONVERSATION_POINT_READ_BYTES,
+        },
+        MAX_CONVERSATION_POINT_READ_BYTES,
+        32,
+    )
+    .await?;
+    let pointer_values = pointer_values.values;
     if pointer_values.len() != commit_ids.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -192,7 +204,18 @@ pub(crate) async fn load_checkpoint_conversations(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let coverage_values = read.get_many(&coverage_requests).await?.values;
+    let (coverage_values, _, _) = crate::storage_adapter::collect_bounded_point_pages(
+        read,
+        &coverage_requests,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: MAX_CONVERSATION_POINT_READ_BYTES,
+            max_single_value_bytes: MAX_CONVERSATION_POINT_READ_BYTES,
+        },
+        MAX_CONVERSATION_POINT_READ_BYTES,
+        32,
+    )
+    .await?;
+    let coverage_values = coverage_values.values;
     if coverage_values.len() != commit_ids.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -252,6 +275,12 @@ pub(crate) async fn partial_checkpoint_conversation_residency(
     epoch_id: &str,
     commit_ids: &[CommitId],
 ) -> Result<Vec<bool>, LixError> {
+    if commit_ids.len() > crate::tracked_state::NativeMetadataRef::MAX_MISSING_BATCH {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "checkpoint conversation residency exceeds the native metadata batch bound",
+        ));
+    }
     let keys = commit_ids
         .iter()
         .map(|id| partial_null_coverage_key(*id))
@@ -274,8 +303,11 @@ pub(crate) async fn partial_checkpoint_conversation_residency(
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let pointers = read.get_many(&pointer_requests).await?.values;
-    let coverage = read.get_many(&coverage_requests).await?.values;
+    let mut retained_bytes = 0usize;
+    let pointers =
+        read_bounded_checkpoint_point_values(read, &pointer_requests, &mut retained_bytes).await?;
+    let coverage =
+        read_bounded_checkpoint_point_values(read, &coverage_requests, &mut retained_bytes).await?;
     if pointers.len() != commit_ids.len() || coverage.len() != commit_ids.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -325,6 +357,34 @@ pub(crate) async fn partial_checkpoint_conversation_residency(
             Ok(pointer_present || null_proven)
         })
         .collect()
+}
+
+async fn read_bounded_checkpoint_point_values(
+    read: &(impl StorageAdapterRead + ?Sized),
+    requests: &[StorageGetManyRequest<'_>],
+    retained_bytes: &mut usize,
+) -> Result<Vec<Option<StorageProjectedValue>>, LixError> {
+    let mut values = Vec::with_capacity(requests.len());
+    let mut offset = 0usize;
+    while offset < requests.len() {
+        let remaining = MAX_CONVERSATION_POINT_READ_BYTES.saturating_sub(*retained_bytes);
+        let budget = crate::storage_adapter::ReadBudget {
+            max_result_bytes: remaining,
+            max_single_value_bytes: remaining,
+        };
+        let (page, bytes) =
+            crate::storage_adapter::read_bounded_point_page(read, requests, offset, 32, budget)
+                .await?;
+        offset = page.next_offset.unwrap_or(requests.len());
+        *retained_bytes = (*retained_bytes)
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_CONVERSATION_POINT_READ_BYTES)
+            .ok_or(crate::storage_adapter::StorageError::ReadBudgetExceeded {
+                singleton: false,
+            })?;
+        values.extend(page.values);
+    }
+    Ok(values)
 }
 
 pub(crate) fn stage_partial_null_coverage(

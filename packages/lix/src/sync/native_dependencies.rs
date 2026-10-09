@@ -47,9 +47,14 @@ fn owners(objects: &[NativeMetadata]) -> Result<BTreeSet<CommitId>, LixError> {
         .collect()
 }
 
-pub(super) fn validate(response: &NativeMetadataResponse) -> Result<(), LixError> {
+pub(super) fn validate(
+    response: &NativeMetadataResponse,
+    max_records: usize,
+) -> Result<(), LixError> {
     let deps = &response.dependencies;
-    if response.objects.len() + deps.metadata.len() + deps.objects.len() > MAX_NATIVE_METADATA_BATCH
+    if max_records == 0
+        || max_records > super::native_metadata::MAX_NATIVE_METADATA_WALK_RECORDS
+        || response.objects.len() + deps.metadata.len() + deps.objects.len() > max_records
     {
         return Err(invalid("native dependency record limit exceeded"));
     }
@@ -115,22 +120,39 @@ async fn read_optional(
     read: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
     key: StorageKey,
+    remaining_bytes: usize,
 ) -> Result<Option<Bytes>, LixError> {
-    let values = read
-        .get_many(&[StorageGetManyRequest {
-            space,
-            keys: &[key],
-            opts: StorageGetOptions::default(),
-        }])
-        .await?
-        .values;
-    if values.len() != 1 {
+    let request = [StorageGetManyRequest {
+        space,
+        keys: std::slice::from_ref(&key),
+        opts: StorageGetOptions::default(),
+    }];
+    let (page, _) = match crate::storage_adapter::read_bounded_point_page(
+        read,
+        &request,
+        0,
+        1,
+        crate::storage_adapter::ReadBudget {
+            max_result_bytes: remaining_bytes,
+            max_single_value_bytes: remaining_bytes,
+        },
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(crate::storage_adapter::StorageError::ReadBudgetExceeded { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if page.values.len() != 1 {
         return Err(invalid("native dependency storage cardinality mismatch"));
     }
-    Ok(match values.into_iter().next().flatten() {
-        Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes),
-        _ => None,
-    })
+    match page.values.into_iter().next().flatten() {
+        Some(StorageProjectedValue::FullValue(bytes)) => Ok(Some(bytes)),
+        Some(StorageProjectedValue::KeyOnly) => {
+            Err(invalid("native dependency read omitted its payload"))
+        }
+        None => Ok(None),
+    }
 }
 
 pub(super) async fn select(
@@ -149,7 +171,14 @@ pub(super) async fn select(
         let header = if let Some(item) = resident {
             Bytes::copy_from_slice(&item.bytes)
         } else {
-            let Some(header) = read_optional(read, space(&address), key(&address)?).await? else {
+            let Some(header) = read_optional(
+                read,
+                space(&address),
+                key(&address)?,
+                MAX_NATIVE_METADATA_PAYLOAD_BYTES.saturating_sub(bytes),
+            )
+            .await?
+            else {
                 continue;
             };
             if validate_bytes(&address, &header).is_err()
@@ -174,6 +203,7 @@ pub(super) async fn select(
             read,
             catalog.space(),
             StorageKey(Bytes::from(catalog.storage_key())),
+            MAX_NATIVE_METADATA_PAYLOAD_BYTES.saturating_sub(bytes),
         )
         .await?
         else {
@@ -239,42 +269,43 @@ mod tests {
         let mut bad = response.clone();
         bad.dependencies.metadata[0].address =
             NativeMetadataRef::CommitStateHeader("00000000-0000-7000-8000-000000000292".into());
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
-        bad.dependencies.metadata[0].checkpoint_conversation =
-            Some(super::super::native_metadata::CheckpointConversationEnvelope {
+        bad.dependencies.metadata[0].checkpoint_conversation = Some(
+            super::super::native_metadata::CheckpointConversationEnvelope {
                 commit_id: "00000000-0000-7000-8000-000000000292".into(),
                 conversation_id: super::super::native_metadata::RequiredNullable(None),
-            });
-        assert!(validate(&bad).is_err());
+            },
+        );
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
         bad.dependencies.objects[0].bytes[0] ^= 1;
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
         bad.dependencies
             .metadata
             .push(bad.dependencies.metadata[0].clone());
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
         bad.dependencies
             .objects
             .push(bad.dependencies.objects[0].clone());
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
         bad.dependencies.metadata.clear();
         assert!(
-            validate(&bad).is_err(),
+            validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err(),
             "catalog requires the authenticated owner header"
         );
         let mut bad = response.clone();
         bad.dependencies.objects[0]
             .bytes
             .resize(MAX_NATIVE_METADATA_PAYLOAD_BYTES + 1, 0);
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut bad = response.clone();
         bad.dependencies.metadata =
             vec![bad.dependencies.metadata[0].clone(); MAX_NATIVE_METADATA_BATCH];
-        assert!(validate(&bad).is_err());
+        assert!(validate(&bad, MAX_NATIVE_METADATA_BATCH).is_err());
         let mut exact = response;
         exact.dependencies = Default::default();
         validate_native_metadata_response(lix.lix_id(), &request, &exact).unwrap();
@@ -288,6 +319,18 @@ mod tests {
         let header = response.dependencies.metadata[0].clone();
         let catalog = response.dependencies.objects[0].address;
         let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(
+            read_optional(
+                &read,
+                space(&header.address),
+                key(&header.address).unwrap(),
+                0
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "an optional dependency that cannot fit the remaining byte budget is omitted"
+        );
         let mut required = response.objects.clone();
         required.push(header.clone());
         let deps = select(&read, &required).await.unwrap();
@@ -411,7 +454,12 @@ mod tests {
             .chain(&response.dependencies.metadata)
         {
             assert_eq!(
-                read_optional(&read, space(&item.address), key(&item.address).unwrap())
+                read_optional(
+                    &read,
+                    space(&item.address),
+                    key(&item.address).unwrap(),
+                    MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+                )
                     .await
                     .unwrap()
                     .unwrap()
@@ -424,7 +472,8 @@ mod tests {
                 read_optional(
                     &read,
                     item.address.space(),
-                    StorageKey(Bytes::from(item.address.storage_key()))
+                    StorageKey(Bytes::from(item.address.storage_key())),
+                    MAX_NATIVE_METADATA_PAYLOAD_BYTES,
                 )
                 .await
                 .unwrap()
