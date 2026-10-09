@@ -242,12 +242,13 @@
       "duration_ms": 447772
     },
     "native_library_tests": {
-      "status": "passed",
+      "status": "passed on final build.rs",
       "passed": 4988,
-      "skipped": 74
+      "skipped": 74,
+      "duration_seconds": 85.918
     },
     "native_doctests": {
-      "status": "passed",
+      "status": "passed on final build.rs",
       "passed": 10,
       "failed": 0
     },
@@ -263,13 +264,103 @@
     "packed_browser_smoke": "passed",
     "optimized_standalone_serializer_benchmark": "completed; separate from unoptimized native correctness tests",
     "pending": [
-      "Native workspace clippy",
-      "Native all-features checks",
-      "Native docs checks",
-      "Node SDK tests",
       "Cloud CI",
       "Exact production preview"
-    ]
+    ],
+    "node_sdk_tests": {
+      "status": "passed",
+      "passed": 496,
+      "failed": 0,
+      "files": 46
+    },
+    "packed_native_migration_smoke": "passed",
+    "opfs_repository_owner_smoke": {
+      "status": "passed",
+      "checks": 12
+    },
+    "production_sdk_artifact": {
+      "wasm_bytes": 83216452,
+      "wasm_sha256": "639365756652e623e429b77727ee944e82c36a7c632d74d870ad00f1f256bbcf",
+      "filesystem_addon_bytes": 430318440,
+      "filesystem_addon_sha256": "6abb6a19be8ff3b7f8ce2b4f28a31a193d4aa968ae6bfa89771ba0465a31988f",
+      "private_profile_hooks": false,
+      "compatibility": {
+        "server_protocol": 12,
+        "sync_protocol": 33,
+        "physical_storage": 87
+      }
+    },
+    "native_workspace_clippy": "passed on final build.rs; --all-targets --all-features -D warnings",
+    "native_workspace_all_features_initial": {
+      "status": "failed",
+      "passed": 6399,
+      "failed": 3,
+      "skipped": 107,
+      "failure": "SIGSEGV in three expected-panic tests: signed 32-bit panic-personality unwind reference overflow in 4.5 GB opt-level 0 test artifact",
+      "affected_tests": [
+        "plugin::ordering::key::tests::midpoint_asserts_bounds_are_ordered",
+        "tracked_state::bench_support::packed_history_tests::delete_reinsert_requires_a_reinsert_generation",
+        "tracked_state::bench_support::packed_history_tests::repeated_updates_require_an_update_generation"
+      ]
+    },
+    "test_build_prototypes": {
+      "package_lix_opt_level_1": "stopped after exceeding 45-minute CI budget; not accepted",
+      "package_lix_opt_level_1_lto_off": "stopped at 144,741,744 KiB resident compiler memory; not accepted",
+      "production_release_settings": "unchanged",
+      "package_lix_opt_level_0_lld": {
+        "status": "accepted mechanism; canonical full-feature Cargo gate passed",
+        "build_seconds": 740.0172600309597,
+        "expected_panic_tests_passed": 3,
+        "binary_bytes": 4776768256,
+        "binary_sha256": "5b385b87d39e413b9842fa289341b15a654a52ffb72ec547684e41e2fc60ca26",
+        "personality_reference_range_headroom_bytes": 256297726,
+        "relro_and_tls_preserved": true
+      }
+    },
+    "native_workspace_all_features": {
+      "status": "passed",
+      "passed": 6402,
+      "skipped": 107,
+      "duration_seconds": 93.614,
+      "test_profile": "opt-level 0; package-scoped LLD; debug assertions and overflow checks unchanged"
+    },
+    "native_workspace_doctests": {
+      "status": "passed",
+      "passed": 10,
+      "failed": 0
+    },
+    "tooling_tests": {
+      "status": "passed",
+      "passed": 69
+    },
+    "e2e_tests": {
+      "status": "passed",
+      "passed": 261,
+      "skipped": 29
+    },
+    "tooling_doctests": "passed",
+    "tooling_and_e2e_clippy": "passed on final build.rs; warnings denied",
+    "stable_rust_sdk_consumer": {
+      "status": "passed",
+      "cargo": "1.94.0",
+      "rustc": "1.94.0",
+      "features": "no-default-features",
+      "child_compiler_pin_verified": true
+    },
+    "packaged_plugin_contract": {
+      "status": "passed",
+      "target": "wasm32-wasip2",
+      "fresh_packages": true,
+      "final_build_script_verified": true
+    },
+    "docker_server_artifact_promotion": {
+      "status": "passed",
+      "tests": 6
+    },
+    "ci_stable_compiler_checks": {
+      "status": "passed",
+      "tests": 36
+    }
   },
   "limitations": [
     "The n=3 browser medians are flat and within the fixture polling/marker resolution; no statistically supported speedup is claimed.",
@@ -388,6 +479,78 @@
     {
       "name": "r33-C4-proto33-500ms.json",
       "sha256": "c30bba823a7238027a435d57ed1e1e1d56a1e2c3ebf242b66ff7d3790bf1fedb"
+    },
+    {
+      "sha256": "4a87eef5d251875e7a1da6670880a66b05ddbb9a12d9949a2f5f03e88795844b",
+      "name": "final-bounded-proof-pages-sdk-opfs-validation/final-validation-manifest.json"
+    },
+    {
+      "sha256": "4eeee76d4ab922a5a57bece5b3b12a1854f7725891f9b49f90b52daa6cfd0c22",
+      "name": "cloud61-opt0-lld-layout-prototype-r2.json"
+    },
+    {
+      "sha256": "bc8885483195ffbf15fcf8a257e18d1ab976d1cd5b317a7684825e1e2c300c5b",
+      "name": "cloud61-opt0-lld-panic-tests.json"
+    },
+    {
+      "sha256": "8071c077f0ec1668c14f51f79f051b15ae6376936e1508c3a13093110fe37180",
+      "name": "cloud61-opt0-lld-unwind-layout.json"
+    },
+    {
+      "sha256": "7fa2591655f42825a7225125eaae8e445b28774a9f86bbe5679cc9e4216c80fe",
+      "name": "cloud61-opt1-no-lto-stop.json"
+    },
+    {
+      "name": "cloud61-production-workspace-nextest-r3.log",
+      "sha256": "413847b8695439341f87799a261221bb778868c7ff7c4251f4282e2eb0119fe3"
+    },
+    {
+      "name": "cloud61-production-workspace-nextest-r3.junit.xml",
+      "sha256": "8195dfb2f5a3a8684bf3ac575c23a12c2b63d64195451905b10715540ff0ae19"
+    },
+    {
+      "name": "cloud61-production-workspace-clippy-r3.log",
+      "sha256": "7736a6b0c4e86a79d45e0b4fc85ec0f558ce12bca81b4db4265d339114a8760f"
+    },
+    {
+      "name": "cloud61-production-workspace-doctest-r3.log",
+      "sha256": "2d04e874ebf755d3cdab82884e97e445a9372295577f7c57c08d015948969973"
+    },
+    {
+      "name": "cloud61-tooling-gates-r2.json",
+      "sha256": "565b1187d1c4dce39c31386b4dfa59a3d129aa990fc05e99b2b3ff14638605f5"
+    },
+    {
+      "name": "cloud61-production-docker-promotion-r1.log",
+      "sha256": "ffc8399d019963ec1edb53d7da75b3df34db915efcc8ba0027e9696909da1b13"
+    },
+    {
+      "name": "cloud61-stable-compiler-ci-tests.log",
+      "sha256": "d8d08d1393d306595377d57d6ddf314e4be26166689cbaa3e5427ad28b921373"
+    },
+    {
+      "name": "final-stable-external-consumer-rustc194-20261009.log",
+      "sha256": "a245e191e9311b81ac96f71dfe9343b1474c9009e8d020884cff328029848a7d"
+    },
+    {
+      "name": "final-stable-toolchain-env-rerun-20261009.log",
+      "sha256": "363ace295027a09523bfa91e12468d5923b379305418eee46dacba24c09f5f02"
+    },
+    {
+      "name": "final-packaged-plugin-wasip2-rerun-20261009.log",
+      "sha256": "81de96c0ace1e8fef9d829f69a29b75f3f1c5f1ed9d2d1abfb68748e85d05bda"
+    },
+    {
+      "name": "cloud61-production-workspace-allsim-nextest-r3.log",
+      "sha256": "eef0945bc32b102840cfed29923dbaaa9cef6912bde77d75923f4c0dc463013a"
+    },
+    {
+      "name": "cloud61-production-workspace-allsim-nextest-r3.junit.xml",
+      "sha256": "c83481452907c773ace2bc5702658a6d535b17f7a663ed5c2b02a3f8ff99eeca"
+    },
+    {
+      "name": "cloud61-production-workspace-engine-doctest-r3.log",
+      "sha256": "14666313a67dd91db4e12b3de872bbce084863c48a516799850c6e38178def1f"
     }
   ]
 }
