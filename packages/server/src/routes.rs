@@ -758,9 +758,7 @@ async fn lix_protocol_inner(
                     timeout_secs = state.protocol_timeout.as_secs(),
                     "lix runtime admission exceeded its deadline"
                 );
-                return lix_error(LixRuntimeError::AtCapacity {
-                    max: state.manager.max_open_lixes(),
-                });
+                return lix_error(state.manager.open_wait_error(&lix_id, true).await);
             }
         }
     };
@@ -1045,6 +1043,43 @@ fn authorized(headers: &HeaderMap, internal_token: Option<&str>) -> bool {
         .is_some_and(|value| value == internal_token)
 }
 
+fn opening_response(snapshot: crate::store::opening::OpenSnapshot, deadline: bool) -> Response {
+    if snapshot.phase == "failed" {
+        return protocol_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            snapshot
+                .failure_code
+                .as_deref()
+                .unwrap_or("LIX_OPEN_FAILED"),
+            "Repository opening failed.",
+            Some("The opening operation ID correlates server logs and traces.".into()),
+            Some(snapshot.details()),
+        );
+    }
+    let code = if snapshot.stalled {
+        "LIX_OPEN_STALLED"
+    } else if deadline {
+        "LIX_OPEN_DEADLINE_EXCEEDED"
+    } else {
+        "LIX_REPOSITORY_OPENING"
+    };
+    let message = if snapshot.stalled {
+        "Repository opening stopped making observable progress. The existing opener remains owned."
+    } else {
+        "Repository opening is still in progress."
+    };
+    let mut details = snapshot.details();
+    details["requestDeadlineExceeded"] = json!(deadline);
+    protocol_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        code,
+        message,
+        Some("The opening operation ID correlates server logs and traces. Retrying joins the same opening operation.".into()),
+        Some(details),
+    )
+    .with_retry_after()
+}
+
 fn lix_error(error: LixRuntimeError) -> Response {
     match error {
         LixRuntimeError::NotFound => protocol_error(
@@ -1064,6 +1099,8 @@ fn lix_error(error: LixRuntimeError) -> Response {
                 "retryable": false,
             })),
         ),
+        LixRuntimeError::Opening(snapshot) => opening_response(snapshot, false),
+        LixRuntimeError::OpenDeadline(snapshot) => opening_response(snapshot, true),
         LixRuntimeError::AtCapacity { max } => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "LIX_ERROR_CAPACITY",
@@ -1071,22 +1108,6 @@ fn lix_error(error: LixRuntimeError) -> Response {
             Some("Retry after an active lix closes.".to_string()),
             Some(json!({
                 "maxOpenLixes": max,
-                "operation": "lix_open",
-                "retryable": true,
-            })),
-        )
-        .with_retry_after(),
-        LixRuntimeError::Migrating {
-            from_version,
-            to_version,
-        } => protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_ERROR_MIGRATING",
-            "The lix repository is being migrated.",
-            Some("Retry after the migration completes.".to_string()),
-            Some(json!({
-                "fromVersion": from_version,
-                "toVersion": to_version,
                 "operation": "lix_open",
                 "retryable": true,
             })),
@@ -2122,29 +2143,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrating_lix_is_a_retryable_structured_state() {
-        let response = lix_error(LixRuntimeError::Migrating {
-            from_version: 68,
-            to_version: 71,
-        });
+    async fn failed_open_is_terminal_even_when_request_deadline_expires_during_cleanup() {
+        let mut snapshot = opening_snapshot(false);
+        snapshot.phase = "failed";
+        snapshot.failure_phase = Some("storage_publishing");
+        snapshot.failure_code = Some("LIX_STORAGE_ERROR".into());
+        for deadline in [false, true] {
+            let response = opening_response(snapshot.clone(), deadline);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(response.headers().get(header::RETRY_AFTER).is_none());
+            let error = json_body(response).await;
+            assert_eq!(error["error"]["code"], "LIX_STORAGE_ERROR");
+            assert_eq!(error["error"]["details"]["retryable"], false);
+            assert_eq!(error["error"]["details"]["openerRetained"], false);
+            assert_eq!(
+                error["error"]["details"]["openFailurePhase"],
+                "storage_publishing"
+            );
+            assert_eq!(
+                error["error"]["details"]["openOperationId"],
+                snapshot.operation_id
+            );
+        }
+    }
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
-        assert_eq!(
-            json_body(response).await["error"],
-            json!({
-                "code": "LIX_ERROR_MIGRATING",
-                "message": "The lix repository is being migrated.",
-                "hint": "Retry after the migration completes.",
-                "details": {
-                    "exceptionOwner": "protocol",
-                    "fromVersion": 68,
-                    "toVersion": 71,
-                    "operation": "lix_open",
-                    "retryable": true,
-                },
-            })
-        );
+    fn opening_snapshot(stalled: bool) -> crate::store::opening::OpenSnapshot {
+        crate::store::opening::OpenSnapshot {
+            operation_id: "11111111-1111-4111-8111-111111111111".into(),
+            phase: "engine_migrating",
+            dependency: "engine",
+            elapsed_ms: 60000,
+            idle_ms: 60000,
+            rows: 32,
+            bytes: 2048,
+            completed_groups: Some(1),
+            from_format: Some(72),
+            to_format: 87,
+            stalled,
+            failure_code: None,
+            failure_phase: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_deadline_and_stall_report_actual_phase_and_operation() {
+        for (stalled, deadline) in [(false, false), (true, false), (false, true), (true, true)] {
+            let snapshot = opening_snapshot(stalled);
+            let response = lix_error(if deadline {
+                LixRuntimeError::OpenDeadline(snapshot)
+            } else {
+                LixRuntimeError::Opening(snapshot)
+            });
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error = json_body(response).await;
+            assert_eq!(
+                error["error"]["code"],
+                if stalled {
+                    "LIX_OPEN_STALLED"
+                } else if deadline {
+                    "LIX_OPEN_DEADLINE_EXCEEDED"
+                } else {
+                    "LIX_REPOSITORY_OPENING"
+                }
+            );
+            assert_eq!(error["error"]["details"]["openPhase"], "engine_migrating");
+            assert_eq!(
+                error["error"]["details"]["openOperationId"],
+                "11111111-1111-4111-8111-111111111111"
+            );
+            assert_eq!(error["error"]["details"]["openerRetained"], true);
+            assert_eq!(
+                error["error"]["details"]["requestDeadlineExceeded"],
+                deadline
+            );
+            assert_eq!(error["error"]["details"]["retryable"], !stalled);
+        }
     }
 
     #[tokio::test]
@@ -2413,10 +2486,7 @@ mod tests {
     async fn retryable_lix_errors_include_retry_after() {
         for error in [
             LixRuntimeError::AtCapacity { max: 4 },
-            LixRuntimeError::Migrating {
-                from_version: 68,
-                to_version: 71,
-            },
+            LixRuntimeError::Opening(opening_snapshot(false)),
             LixRuntimeError::Recovering,
             LixRuntimeError::ShuttingDown,
         ] {
