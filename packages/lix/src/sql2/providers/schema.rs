@@ -2903,6 +2903,7 @@ impl<'a> RowFilterAnalyzer<'a> {
         Some(RowFilter::ColumnIn {
             column: column_name.to_string(),
             column_type,
+            index: ColumnInIndex::new(column_type, &values),
             values,
         })
     }
@@ -2987,6 +2988,88 @@ enum RowFilterValue {
     String(String),
 }
 
+/// Hash index over a `ColumnIn` literal list.
+///
+/// Residual predicates are evaluated per row, so probing a long `IN (...)`
+/// list linearly costs rows × values: an identity-batched read of 15,000
+/// variants by `message_id IN (...)` spent most of its time here. Text and
+/// integer columns, the exact-equality cases, get a hash set; every other
+/// pairing (UUID text, numeric widening, timestamps) keeps the linear typed
+/// comparison, so semantics are unchanged.
+#[derive(Debug, Clone, Default)]
+struct ColumnInIndex {
+    strings: Option<Arc<HashSet<String>>>,
+    integers: Option<Arc<HashSet<i64>>>,
+}
+
+impl ColumnInIndex {
+    /// Lists this short stay linear; hashing would only add overhead.
+    const MIN_VALUES: usize = 8;
+
+    fn new(column_type: SchemaColumnType, values: &[RowFilterValue]) -> Self {
+        if values.len() < Self::MIN_VALUES {
+            return Self::default();
+        }
+        match column_type {
+            SchemaColumnType::String | SchemaColumnType::RowRef => values
+                .iter()
+                .map(|value| match value {
+                    RowFilterValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<HashSet<_>>>()
+                .map_or_else(Self::default, |strings| Self {
+                    strings: Some(Arc::new(strings)),
+                    integers: None,
+                }),
+            SchemaColumnType::Integer => values
+                .iter()
+                .map(|value| match value {
+                    RowFilterValue::Integer(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<HashSet<_>>>()
+                .map_or_else(Self::default, |integers| Self {
+                    strings: None,
+                    integers: Some(Arc::new(integers)),
+                }),
+            _ => Self::default(),
+        }
+    }
+
+    /// Membership of a typed row value; `None` defers to the linear typed
+    /// comparison (which also reports incompatible value types).
+    fn contains_row_value(&self, actual: &lix_schema::Value) -> Option<bool> {
+        match (actual, &self.strings, &self.integers) {
+            (lix_schema::Value::Null, Some(_), _) | (lix_schema::Value::Null, _, Some(_)) => {
+                Some(false)
+            }
+            (lix_schema::Value::Text(actual), Some(strings), _) => {
+                Some(strings.contains(actual.as_str()))
+            }
+            (lix_schema::Value::Int8(actual), _, Some(integers)) => Some(integers.contains(actual)),
+            _ => None,
+        }
+    }
+
+    /// Membership of a decoded filter value; `None` defers to the linear path.
+    fn contains_filter_value(&self, actual: &RowFilterValue) -> Option<bool> {
+        match (actual, &self.strings, &self.integers) {
+            (RowFilterValue::String(actual), Some(strings), _) => Some(strings.contains(actual)),
+            (RowFilterValue::Integer(actual), _, Some(integers)) => Some(integers.contains(actual)),
+            _ => None,
+        }
+    }
+}
+
+/// The index is derived from `values`, which `RowFilter`'s equality already
+/// compares.
+impl PartialEq for ColumnInIndex {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum RowFilter {
     ColumnEq {
@@ -2998,6 +3081,8 @@ enum RowFilter {
         column: String,
         column_type: SchemaColumnType,
         values: Vec<RowFilterValue>,
+        /// Hash index over `values`, derived from them; see [`ColumnInIndex`].
+        index: ColumnInIndex,
     },
     /// One half-bounded comparison against a literal.
     ///
@@ -3152,11 +3237,14 @@ impl RowFilter {
                 column,
                 column_type,
                 values,
+                index,
             } => Ok(
                 row_snapshot_value(snapshot, schema_key, column, *column_type)?.is_some_and(
                     |actual| {
-                        values.iter().any(|expected| {
-                            row_filter_values_equal(&actual, expected, *column_type)
+                        index.contains_filter_value(&actual).unwrap_or_else(|| {
+                            values.iter().any(|expected| {
+                                row_filter_values_equal(&actual, expected, *column_type)
+                            })
                         })
                     },
                 ),
@@ -3189,7 +3277,14 @@ impl RowFilter {
                 column,
                 column_type,
                 values,
+                index,
             } => {
+                if let Some(hit) = row
+                    .get(column)
+                    .and_then(|actual| index.contains_row_value(actual))
+                {
+                    return Ok(hit);
+                }
                 for expected in values {
                     if row_typed_filter_value_eq(row, schema_key, column, *column_type, expected)? {
                         return Ok(true);
@@ -6520,6 +6615,7 @@ mod tests {
                     column: "middle".to_string(),
                     column_type: SchemaColumnType::String,
                     values: vec![super::RowFilterValue::String("y".to_string())],
+                    index: super::ColumnInIndex::default(),
                 }),
             )),
             Box::new(super::RowFilter::And(
@@ -7900,6 +7996,7 @@ mod tests {
                 column: "lane".to_string(),
                 column_type: SchemaColumnType::String,
                 values: vec![super::RowFilterValue::String("a".to_string())],
+                index: super::ColumnInIndex::default(),
             },
         ];
 
@@ -8697,5 +8794,95 @@ mod tests {
         .expect("retry should populate cache");
 
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod column_in_index_tests {
+    use super::*;
+
+    fn column_in(column_type: SchemaColumnType, values: Vec<RowFilterValue>, indexed: bool) -> RowFilter {
+        RowFilter::ColumnIn {
+            column: "c".to_owned(),
+            column_type,
+            index: if indexed {
+                ColumnInIndex::new(column_type, &values)
+            } else {
+                ColumnInIndex::default()
+            },
+            values,
+        }
+    }
+
+    fn assert_same_typed(column_type: SchemaColumnType, values: Vec<RowFilterValue>, rows: &[lix_schema::Row]) {
+        let indexed = column_in(column_type, values.clone(), true);
+        let linear = column_in(column_type, values, false);
+        for row in rows {
+            assert_eq!(
+                indexed.matches_typed(row, "s").unwrap(),
+                linear.matches_typed(row, "s").unwrap(),
+                "row {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_text_in_list_matches_linear_typed_semantics() {
+        let uuid = "01920000-0000-7000-8000-0000000000a1";
+        let mut values = (0..20).map(|i| RowFilterValue::String(format!("v{i}"))).collect::<Vec<_>>();
+        values.push(RowFilterValue::String(uuid.to_owned()));
+        let row = |value: lix_schema::Value| lix_schema::Row::from([("c".to_owned(), value)]);
+        let rows = [
+            row(lix_schema::Value::Text("v3".to_owned())),
+            row(lix_schema::Value::Text("v30".to_owned())),
+            row(lix_schema::Value::Null),
+            // UUID-typed values compare through parsing, so the index defers.
+            row(lix_schema::Value::Uuid(uuid::Uuid::parse_str(uuid).unwrap())),
+            lix_schema::Row::from([("other".to_owned(), lix_schema::Value::Text("v3".to_owned()))]),
+        ];
+        assert!(matches!(
+            column_in(SchemaColumnType::String, values.clone(), true),
+            RowFilter::ColumnIn { index: ColumnInIndex { strings: Some(_), .. }, .. }
+        ));
+        assert_same_typed(SchemaColumnType::String, values, &rows);
+    }
+
+    #[test]
+    fn indexed_integer_in_list_matches_linear_typed_semantics() {
+        let values = (0..20).map(RowFilterValue::Integer).collect::<Vec<_>>();
+        let row = |value: lix_schema::Value| lix_schema::Row::from([("c".to_owned(), value)]);
+        assert_same_typed(
+            SchemaColumnType::Integer,
+            values,
+            &[row(lix_schema::Value::Int8(5)), row(lix_schema::Value::Int8(99)), row(lix_schema::Value::Null)],
+        );
+    }
+
+    #[test]
+    fn indexed_in_list_matches_linear_snapshot_semantics() {
+        let values = (0..20).map(|i| RowFilterValue::String(format!("v{i}"))).collect::<Vec<_>>();
+        let indexed = column_in(SchemaColumnType::String, values.clone(), true);
+        let linear = column_in(SchemaColumnType::String, values, false);
+        for snapshot in [
+            serde_json::json!({"c": "v7"}),
+            serde_json::json!({"c": "nope"}),
+            serde_json::json!({"c": null}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                indexed.matches_snapshot(Some(&snapshot), "s").unwrap(),
+                linear.matches_snapshot(Some(&snapshot), "s").unwrap(),
+                "snapshot {snapshot}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_in_lists_stay_linear() {
+        let values = (0..3).map(|i| RowFilterValue::String(format!("v{i}"))).collect::<Vec<_>>();
+        assert!(matches!(
+            column_in(SchemaColumnType::String, values, true),
+            RowFilter::ColumnIn { index: ColumnInIndex { strings: None, integers: None }, .. }
+        ));
     }
 }
