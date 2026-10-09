@@ -39,7 +39,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanP
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-    Statistics,
+    SortOrderPushdownResult, Statistics,
 };
 #[cfg(feature = "storage-benches")]
 use futures_util::Stream;
@@ -68,6 +68,7 @@ pub(super) type BatchStreamSource =
     Arc<dyn Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream> + Send + Sync>;
 
 type ScanFetchRebind = Arc<dyn Fn(Option<usize>) -> ScanSource + Send + Sync>;
+type ScanOrderedRebind = Arc<dyn Fn() -> ScanSource + Send + Sync>;
 
 #[derive(Clone)]
 pub(super) struct ScanSource {
@@ -76,6 +77,7 @@ pub(super) struct ScanSource {
     source_statistics: Option<Statistics>,
     open: BatchStreamSource,
     fetch_rebind: Option<ScanFetchRebind>,
+    ordered_rebind: Option<(Arc<str>, ScanOrderedRebind)>,
 }
 
 impl ScanSource {
@@ -104,6 +106,7 @@ impl ScanSource {
             source_statistics,
             open: Arc::new(open),
             fetch_rebind: None,
+            ordered_rebind: None,
         }
     }
 
@@ -112,6 +115,19 @@ impl ScanSource {
         let mut rebound = rebind(fetch);
         rebound.fetch_rebind = Some(rebind);
         Some(rebound)
+    }
+
+    /// Offer an alternative source that yields rows ascending by `column` on
+    /// every execution path, in one partition. DataFusion's sort pushdown
+    /// swaps it in only when the statement sorts by that column, so a scan
+    /// declares an ordering exactly when its query shape asks for one.
+    pub(super) fn with_ordered_rebind(
+        mut self,
+        column: &str,
+        rebind: impl Fn() -> ScanSource + Send + Sync + 'static,
+    ) -> Self {
+        self.ordered_rebind = Some((Arc::from(column), Arc::new(rebind)));
+        self
     }
 
     /// Rebuild this source when DataFusion proves a physical fetch can be
@@ -1506,6 +1522,7 @@ pub(crate) struct SpecScanExec {
     base_limit: Option<usize>,
     target_partitions: usize,
     probe_binding: Option<ScanProbeBinding>,
+    constant_columns: Arc<[String]>,
 }
 
 impl SpecScanExec {
@@ -1587,6 +1604,7 @@ impl SpecScanExec {
             base_limit,
             target_partitions,
             probe_binding,
+            constant_columns: constant_columns.iter().cloned().collect(),
         })
     }
 
@@ -1758,7 +1776,56 @@ impl ExecutionPlan for SpecScanExec {
             base_limit: self.base_limit,
             target_partitions: self.target_partitions,
             probe_binding: self.probe_binding.clone(),
+            constant_columns: Arc::clone(&self.constant_columns),
         }))
+    }
+
+    /// Serves `ORDER BY <column>` from a source that produces that order,
+    /// so DataFusion removes the sort and pushes its fetch into the scan.
+    /// Only an unfetched single-partition scan over its offered column
+    /// qualifies; any other request keeps DataFusion's sort.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let Some((column, rebind)) = self.source.ordered_rebind.as_ref() else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let [requested] = order else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let requested_column = requested.expr.downcast_ref::<Column>();
+        if requested.options.descending
+            || self.physical_cache_key.limit.is_some()
+            || self.fragment_ranges.len() != 1
+            || requested_column.is_none_or(|requested| {
+                requested.name() != column.as_ref()
+                    || self.schema.index_of(column).ok() != Some(requested.index())
+            })
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        let ordered = Self::new(
+            Arc::clone(&self.table),
+            PlannedScan {
+                schema: Arc::clone(&self.schema),
+                source: rebind(),
+                ordering: Some(column.to_string()),
+            },
+            self.target_partitions,
+            // The ordered source is a different read than the one a
+            // statement-level share or a probe replan would reproduce.
+            None,
+            self.physical_cache_key.clone(),
+            &self.constant_columns,
+            None,
+        )?;
+        if ordered.fragment_ranges.len() != 1 {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(ordered),
+        })
     }
 
     fn fetch(&self) -> Option<usize> {

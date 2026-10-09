@@ -718,3 +718,80 @@ async fn full_scans_shadow_multi_scope_root_rows_with_hot_overlays() {
     assert_eq!(rows, expected);
     lix.close().await.unwrap();
 }
+
+/// `ORDER BY id` without a range swaps the scan for the ordered route through
+/// DataFusion's sort pushdown: the plan loses its sort and the scan takes the
+/// fetch, and the rows are exactly the first ids of the unrestricted scan.
+#[tokio::test]
+async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
+    let lix = layered_fixture(19, FixtureShape {
+        checkpoint: false,
+        branch: false,
+    })
+    .await;
+    let plan = physical_plan(
+        &lix,
+        &format!("SELECT id, value FROM {SCHEMA} ORDER BY id LIMIT 10"),
+        &[],
+    )
+    .await;
+    let physical = plan.split("physical_plan").nth(1).expect("physical plan");
+    assert!(!physical.contains("SortExec"), "{plan}");
+    assert!(physical.contains("fetch=10"), "{plan}");
+    assert!(physical.contains("output_ordering=[id@0 ASC"), "{plan}");
+    // Shapes the ordered route does not serve keep DataFusion's sort.
+    for sql in [
+        format!("SELECT id, value FROM {SCHEMA} ORDER BY id DESC LIMIT 10"),
+        format!("SELECT id, value FROM {SCHEMA} ORDER BY value LIMIT 10"),
+        format!("SELECT id, value FROM {SCHEMA} ORDER BY id, value LIMIT 10"),
+    ] {
+        let plan = physical_plan(&lix, &sql, &[]).await;
+        let physical = plan.split("physical_plan").nth(1).expect("physical plan");
+        assert!(physical.contains("SortExec"), "{plan}");
+    }
+
+    let mut reference = all_rows(&lix).await;
+    reference.sort();
+    for limit in [1_usize, 10, 333, 100_000] {
+        let result = lix
+            .execute(
+                &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id LIMIT {limit}"),
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = decode_rows(&result);
+        let expected = reference.iter().take(limit).cloned().collect::<Vec<_>>();
+        assert_eq!(id_sequence(&rows), id_sequence(&expected), "limit {limit}");
+        let mut sorted_rows = rows.clone();
+        sorted_rows.sort();
+        let distinct = sorted_rows.iter().collect::<BTreeSet<_>>();
+        assert_eq!(distinct.len(), rows.len(), "limit {limit}");
+        assert!(
+            rows.iter().all(|row| reference.binary_search(row).is_ok()),
+            "limit {limit} returned a row that is not current"
+        );
+    }
+    let result = lix
+        .execute(
+            &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut rows = decode_rows(&result);
+    assert_eq!(id_sequence(&rows), id_sequence(&reference));
+    rows.sort();
+    assert_eq!(rows, reference);
+    let result = lix
+        .execute(
+            &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id DESC LIMIT 25"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let rows = decode_rows(&result);
+    let expected = reference.iter().rev().take(25).cloned().collect::<Vec<_>>();
+    assert_eq!(id_sequence(&rows), id_sequence(&expected));
+    lix.close().await.unwrap();
+}
