@@ -436,7 +436,7 @@ paths:
       - $ref: "#/components/parameters/ReplicaId"
     post:
       operationId: syncNativeMetadataWalk
-      description: Reads a bounded first-parent prefix of at most 16 commits and their optional state headers, capped at 32 records and 256 KiB decoded payload. A short prefix is not a history-completeness claim. The client validates parent continuity and record identity before epoch-fenced installation. Requires a native baseline lease.
+      description: Reads a bounded selected graph prefix of at most 64 commits and their optional state headers, capped at 128 total records and 256 KiB decoded payload, including dependencies. A short prefix is not a history-completeness claim. The client validates selection-specific continuity and record identity before epoch-fenced installation. This walk returns graph records and optional state headers, so it currently has no change-locator-derived dependencies. Requires a native baseline lease.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -447,7 +447,7 @@ paths:
       responses:
         "200":
           description: Explicit native records bound to the repository and echoed caller epoch.
-          content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataResponse" } } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataWalkResponse" } } }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/native-object-range:
     parameters:
@@ -1034,7 +1034,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 32 }
+      schema: { type: integer, const: 33 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1092,7 +1092,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 32 }
+        syncProtocolVersion: { type: integer, const: 33 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1612,7 +1612,7 @@ components:
       properties:
         epochId: { type: string, format: uuid }
         anchor: { type: string, format: uuid }
-        maxCommits: { type: integer, minimum: 1, maximum: 16 }
+        maxCommits: { type: integer, minimum: 1, maximum: 64 }
         includeStateHeaders: { type: boolean }
         selection: { type: string, enum: [history, causal, incorporation, jumpSpine] }
         stops:
@@ -1655,6 +1655,47 @@ components:
             objects:
               type: array
               maxItems: 32
+              items:
+                type: object
+                required: [address, bytes]
+                properties:
+                  address: { $ref: "#/components/schemas/NativeObjectRef" }
+                  bytes: { type: string, format: byte }
+    NativeMetadataWalkResponse:
+      type: object
+      required: [lixId, epochId, objects]
+      description: A walk response is capped at 128 total records and 256 KiB decoded payload, including optional dependencies. For this graph-record/state-header request, dependencies are currently empty; they are included in the aggregate limits if the request shape later permits derivable change-locator dependencies.
+      properties:
+        lixId: { type: string, format: uuid }
+        epochId: { type: string, format: uuid }
+        objects:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            type: object
+            required: [address, bytes]
+            properties:
+              address: { $ref: "#/components/schemas/NativeMetadataRef" }
+              bytes: { type: string, format: byte }
+        dependencies:
+          type: object
+          additionalProperties: false
+          required: [metadata, objects]
+          description: Optional dependencies derived only from returned change locators. The aggregate of objects and both dependency arrays is capped at 128 records and 256 KiB decoded bytes. Dependencies prove no coverage or absence.
+          properties:
+            metadata:
+              type: array
+              maxItems: 128
+              items:
+                type: object
+                required: [address, bytes]
+                properties:
+                  address: { $ref: "#/components/schemas/NativeMetadataRef" }
+                  bytes: { type: string, format: byte }
+            objects:
+              type: array
+              maxItems: 128
               items:
                 type: object
                 required: [address, bytes]

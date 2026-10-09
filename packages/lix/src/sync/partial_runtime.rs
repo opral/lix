@@ -14,7 +14,9 @@ use crate::storage_adapter::{Storage, StorageAdapter, StorageAdapterRead, Storag
 use crate::{LixError, tracked_state::NativeMetadataRef};
 
 use super::http::{HttpSyncTransport, RawHttpClient};
-use super::native_metadata::{NativeMetadataRequest, stage_native_metadata};
+use super::native_metadata::{
+    NativeMetadataRequest, stage_native_metadata, stage_selected_native_metadata,
+};
 use super::partial_hydration::{hydrate_native_object, native_object_is_resident};
 use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
@@ -366,9 +368,8 @@ async fn install_metadata_response_inner<S: Storage + Clone + Send + Sync + 'sta
         // facts. The retained client proof reads and validates those rows itself.
         // Filter in this snapshot on every CAS retry; absent inputs still install
         // through the exact epoch-fenced admission path.
-        let selected;
         let selected_request;
-        let (request, response) = if selection {
+        let (stage_request, stage_response) = if selection {
             let keys = request
                 .objects
                 .iter()
@@ -382,43 +383,78 @@ async fn install_metadata_response_inner<S: Storage + Clone + Send + Sync + 'sta
                     |(address, key)| crate::storage_adapter::StorageGetManyRequest {
                         space: super::native_metadata::space(address),
                         keys: std::slice::from_ref(key),
-                        opts: Default::default(),
+                        opts: crate::storage_adapter::StorageGetOptions {
+                            projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
+                        },
                     },
                 )
                 .collect::<Vec<_>>();
-            let values = read.get_many(&requests).await?.values;
-            if values.len() != response.objects.len() {
+            let mut selected_addresses = Vec::new();
+            let mut offset = 0usize;
+            while offset < requests.len() {
+                let (page, _) = crate::storage_adapter::read_bounded_point_page(
+                    &read,
+                    &requests,
+                    offset,
+                    32,
+                    crate::storage_adapter::ReadBudget {
+                        max_result_bytes: 0,
+                        max_single_value_bytes: 0,
+                    },
+                )
+                .await?;
+                let count = page.values.len();
+                if count == 0 || offset.saturating_add(count) > response.objects.len() {
+                    return Err(LixError::unknown(
+                        "metadata selection residency cardinality mismatch",
+                    ));
+                }
+                for (object, value) in response.objects[offset..offset + count]
+                    .iter()
+                    .zip(page.values)
+                {
+                    match value {
+                        None => selected_addresses.push(object.address.clone()),
+                        Some(crate::storage_adapter::StorageProjectedValue::KeyOnly) => {}
+                        Some(crate::storage_adapter::StorageProjectedValue::FullValue(_)) => {
+                            return Err(LixError::unknown(
+                                "metadata selection residency read returned a payload",
+                            ));
+                        }
+                    }
+                }
+                offset += count;
+            }
+            if offset != response.objects.len() {
                 return Err(LixError::unknown(
                     "metadata selection residency cardinality mismatch",
                 ));
             }
-            selected = super::native_metadata::NativeMetadataResponse {
-                objects: response
-                    .objects
-                    .iter()
-                    .zip(values)
-                    .filter_map(|(object, value)| value.is_none().then(|| object.clone()))
-                    .collect(),
-                ..response.clone()
-            };
-            if selected.objects.is_empty() {
+            if selected_addresses.is_empty() {
                 return Ok(());
             }
             selected_request = NativeMetadataRequest {
-                objects: selected
-                    .objects
-                    .iter()
-                    .map(|object| object.address.clone())
-                    .collect(),
+                objects: selected_addresses,
                 ..request.clone()
             };
-            (&selected_request, &selected)
+            (&selected_request, response)
         } else {
             (request, response)
         };
         let mut writes = storage.new_write_set();
-        let preconditions =
-            stage_native_metadata(&read, &mut writes, state, request, response).await?;
+        let preconditions = if selection {
+            stage_selected_native_metadata(
+                &read,
+                &mut writes,
+                state,
+                request,
+                response,
+                &stage_request.objects,
+            )
+            .await?
+        } else {
+            stage_native_metadata(&read, &mut writes, state, stage_request, stage_response).await?
+        };
         drop(read);
         match storage
             .commit_partial_replica_write_set(
@@ -2645,6 +2681,7 @@ mod tests {
     use super::*;
     use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -2889,6 +2926,85 @@ mod tests {
                     status: 200,
                     status_text: "OK".into(),
                     body: serde_json::to_vec(&value).unwrap(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedGraphWalkClient {
+        handshake: Client,
+        records: Arc<BTreeMap<crate::changelog::CommitId, crate::changelog::CommitRecord>>,
+        response_limit: usize,
+        walk_requests: Arc<AtomicUsize>,
+        per_walk_delay: Duration,
+    }
+
+    impl RawHttpClient for DelayedGraphWalkClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                if !request.url.ends_with("/sync/native-metadata-walk") {
+                    return self.handshake.send(request).await;
+                }
+                self.walk_requests.fetch_add(1, Ordering::SeqCst);
+                let mut walk: super::super::native_metadata_walk::NativeMetadataWalkRequest =
+                    serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                assert_eq!(
+                    walk.selection,
+                    super::super::native_metadata_walk::MetadataSelection::Causal
+                );
+                let response_limit = self.response_limit.min(usize::from(walk.max_commits));
+                // Model a bounded response page while the client still runs
+                // the same proof/resume logic and validates each prefix
+                // against its original request.
+                walk.max_commits = u8::try_from(response_limit).unwrap();
+                let mut pending = vec![
+                    crate::changelog::CommitId::parse_lix(&walk.anchor, "delayed ancestry walk")
+                        .unwrap(),
+                ];
+                let mut seen = BTreeSet::new();
+                let mut addresses = Vec::new();
+                while let Some(id) = pending.pop() {
+                    if addresses.len() == usize::from(walk.max_commits) || !seen.insert(id) {
+                        continue;
+                    }
+                    addresses.push(NativeMetadataRef::CommitGraphRecord(id.to_string()));
+                    let record = &self.records[&id];
+                    if !walk.stops.contains(&id.to_string())
+                        && walk
+                            .minimum_generation
+                            .is_none_or(|minimum| record.generation > minimum)
+                    {
+                        pending.extend(record.parent_commit_ids.iter().copied());
+                    }
+                }
+                let objects = addresses
+                    .into_iter()
+                    .map(|address| {
+                        let id = crate::changelog::CommitId::parse_lix(
+                            address.id(),
+                            "delayed ancestry metadata",
+                        )
+                        .unwrap();
+                        super::super::native_metadata::NativeMetadata {
+                            address,
+                            bytes: crate::changelog::encode_commit_record(&self.records[&id])
+                                .unwrap(),
+                            checkpoint_conversation: None,
+                        }
+                    })
+                    .collect();
+                let response = NativeMetadataResponse {
+                    dependencies: Default::default(),
+                    lix_id: self.handshake.state.repository_id().to_owned(),
+                    epoch_id: walk.epoch_id,
+                    objects,
+                };
+                tokio::time::sleep(self.per_walk_delay).await;
+                Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".into(),
+                    body: serde_json::to_vec(&response).unwrap(),
                 })
             })
         }
@@ -3505,6 +3621,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ancestry_hydration_completes_with_fewer_delayed_walk_round_trips_at_64() {
+        async fn run_scenario(response_limit: usize) -> (usize, Duration) {
+            use crate::changelog::CommitId;
+            use std::collections::BTreeMap;
+
+            let (storage, state, initial_transport, client, address) =
+                fixture_metadata(false, true).await;
+            let initial_addresses = client
+                .metadata
+                .objects
+                .iter()
+                .map(|object| object.address.clone())
+                .collect();
+            hydrate_metadata_batch(&storage, &state, &initial_transport, initial_addresses)
+                .await
+                .unwrap();
+
+            let base_id = CommitId::parse_lix(address.id(), "delayed ancestry base").unwrap();
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let base = super::super::partial_merge_analysis::record(&read, base_id, false)
+                .await
+                .unwrap();
+            drop(read);
+
+            let mut records = BTreeMap::from([(base.commit_id, base.clone())]);
+            let mut head = base.commit_id;
+            for index in 0..40 {
+                let mut record = base.clone();
+                record.commit_id = CommitId::for_test_label(&format!("delayed-ancestry-{index}"));
+                record.generation = records[&head].generation + 1;
+                record.parent_commit_ids = vec![head];
+                record.first_parent_jump_commit_id = head;
+                record.first_parent_jump_span = 1;
+                record.base_commit_id = None;
+                record.is_checkpoint = false;
+                record.first_parent_checkpoint_summary = None;
+                head = record.commit_id;
+                records.insert(head, record);
+            }
+
+            let walk_requests = Arc::new(AtomicUsize::new(0));
+            let transport = HttpSyncTransport::connect_with(
+                DelayedGraphWalkClient {
+                    handshake: client,
+                    records: Arc::new(records),
+                    response_limit,
+                    walk_requests: walk_requests.clone(),
+                    per_walk_delay: Duration::from_millis(30),
+                },
+                state.remote_id(),
+            )
+            .await
+            .unwrap();
+            transport
+                .bind_native_baseline_lease(state.baseline_lease())
+                .unwrap();
+
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let missing = super::super::partial_merge_analysis::bounded_ancestor(
+                &read,
+                &base,
+                head,
+                &mut BTreeMap::new(),
+                4,
+            )
+            .await
+            .unwrap_err();
+            drop(read);
+            let demand = super::super::runtime::native_sync_demand_request_for_error(&missing)
+                .unwrap()
+                .expect("a cold ancestry graph record must create a typed demand");
+
+            let started = std::time::Instant::now();
+            hydrate_demand(&storage, &state, &transport, demand)
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            assert!(
+                super::super::partial_merge_analysis::bounded_ancestor(
+                    &read,
+                    &base,
+                    head,
+                    &mut BTreeMap::new(),
+                    4,
+                )
+                .await
+                .unwrap(),
+                "both response bounds must install a complete proof before retry"
+            );
+            drop(read);
+            (walk_requests.load(Ordering::SeqCst), elapsed)
+        }
+
+        // Compare 16-record and 64-record bounded response pages. Both runs use the real client ancestry
+        // resume, response validation, and durable metadata installer; each
+        // walk round incurs the same artificial network delay.
+        let (old_page_rounds, old_elapsed) = run_scenario(16).await;
+        let (expanded_page_rounds, expanded_elapsed) = run_scenario(64).await;
+        assert_eq!(
+            old_page_rounds, 3,
+            "40 graph records need three 16-record pages"
+        );
+        assert_eq!(
+            expanded_page_rounds, 1,
+            "one 64-record page covers the proof"
+        );
+        eprintln!(
+            "delayed ancestry proof: 16-record pages={old_page_rounds}, elapsed={old_elapsed:?}; 64-record pages={expanded_page_rounds}, elapsed={expanded_elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_batch_filters_resident_entries_and_rejects_wrong_epoch_atomically() {
         let (storage, state, _, client, _) = fixture_metadata(false, true).await;
         let addresses = client
@@ -3641,6 +3871,126 @@ mod tests {
         storage.admit_partial_replica_writer(super::super::partial_replica_write_capability());
         (storage, state, transport, client, address)
     }
+
+    #[tokio::test]
+    async fn bounded_walk_selection_installs_more_than_ordinary_metadata_batch() {
+        let authority = open_lix().await.unwrap();
+        for index in 0..40 {
+            authority
+                .execute(
+                    "SELECT commit_id FROM lix_create_checkpoint($1,NULL)",
+                    &[crate::Value::Text(format!("walk checkpoint {index}"))],
+                )
+                .await
+                .unwrap();
+        }
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let walk = super::super::native_metadata_walk::NativeMetadataWalkRequest {
+            epoch_id: "00000000-0000-7000-8000-000000000498".into(),
+            anchor: descriptor.selected_branch.head.commit_id.clone(),
+            max_commits: 40,
+            include_state_headers: true,
+            selection: super::super::native_metadata_walk::MetadataSelection::History,
+            stops: Vec::new(),
+            minimum_generation: None,
+            require_state_header: false,
+        };
+        let response = authority
+            .read_sync_native_metadata_walk(&walk)
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .objects
+                .iter()
+                .filter(|object| matches!(&object.address, NativeMetadataRef::CommitGraphRecord(_)))
+                .count(),
+            40,
+            "the walk must contain one graph record for each selected checkpoint"
+        );
+        assert_eq!(
+            response
+                .objects
+                .iter()
+                .filter(|object| matches!(&object.address, NativeMetadataRef::CommitStateHeader(_)))
+                .count(),
+            40,
+            "the fixture must exercise 40 graph/header proof pairs"
+        );
+        let exact = super::super::native_metadata_walk::validate_response(
+            authority.lix_id(),
+            &walk,
+            &response,
+        )
+        .unwrap();
+        assert!(response.objects.len() > super::super::native_metadata::MAX_NATIVE_METADATA_BATCH);
+        assert!(
+            response
+                .objects
+                .iter()
+                .filter(|object| object.checkpoint_conversation.is_some())
+                .count()
+                > 32,
+            "the client install fixture must exercise paged checkpoint proof reads"
+        );
+
+        let state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            authority.active_account_id().to_owned(),
+            walk.epoch_id.clone(),
+            descriptor,
+        )
+        .unwrap();
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &state).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage.admit_partial_replica_writer(super::super::partial_replica_write_capability());
+
+        install_metadata_response_inner(&storage, &state, &exact, &response, true)
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        for objects in response.objects.chunks(32) {
+            let keys = objects
+                .iter()
+                .map(|object| super::super::native_metadata::key(&object.address).unwrap())
+                .collect::<Vec<_>>();
+            let requests = objects
+                .iter()
+                .zip(&keys)
+                .map(
+                    |(object, key)| crate::storage_adapter::StorageGetManyRequest {
+                        space: super::super::native_metadata::space(&object.address),
+                        keys: std::slice::from_ref(key),
+                        opts: Default::default(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            let values = read.get_many(&requests).await.unwrap().values;
+            assert_eq!(values.len(), objects.len());
+            for (value, object) in values.into_iter().zip(objects) {
+                assert!(
+                    matches!(value, Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) if bytes.as_ref() == object.bytes.as_slice())
+                );
+            }
+        }
+        drop(read);
+        authority.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn partial_worker_installs_native_metadata_durably() {
         let (storage, state, transport, client, address) = fixture(false).await;

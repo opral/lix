@@ -9832,7 +9832,9 @@ mod tests {
     #[tokio::test]
     async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
         let app = app().await;
-        for version in ["11", "13", "20", "999", "not-a-number"] {
+        let stale = (crate::sync::SYNC_PROTOCOL_VERSION - 1).to_string();
+        let future = (crate::sync::SYNC_PROTOCOL_VERSION + 1).to_string();
+        for version in [stale.as_str(), future.as_str(), "20", "999", "not-a-number"] {
             let builder = Request::builder()
                 .uri("/lix/v1/sync/pull")
                 .header(SYNC_PROTOCOL_VERSION_HEADER, version);
@@ -9882,7 +9884,10 @@ mod tests {
                     .method("POST")
                     .uri("/lix/v1/sync/merge")
                     .header(SESSION_ID_HEADER, session_id)
-                    .header(SYNC_PROTOCOL_VERSION_HEADER, "13")
+                    .header(
+                        SYNC_PROTOCOL_VERSION_HEADER,
+                        (crate::sync::SYNC_PROTOCOL_VERSION - 1).to_string(),
+                    )
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from("invalid JSON"))
                     .unwrap(),
@@ -9897,7 +9902,7 @@ mod tests {
         );
         assert_eq!(
             response["error"]["details"]["clientSyncProtocolVersion"],
-            13
+            crate::sync::SYNC_PROTOCOL_VERSION - 1
         );
         assert_eq!(
             response["error"]["details"]["serverSyncProtocolVersion"],
@@ -10363,9 +10368,27 @@ mod tests {
                 .all(|object| object["address"]["kind"] == "commit_graph_record")
         );
         assert_eq!(response["epochId"], body["epochId"]);
+
+        let mut maximum = body.clone();
+        maximum["maxCommits"] = json!(64);
+        let maximum = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            Some(&session),
+            &[("lix-native-baseline-lease", lease)],
+            Some(maximum),
+        )
+        .await;
+        assert_eq!(maximum.status(), StatusCode::OK);
+        let maximum = response_json(maximum).await;
+        let maximum_objects = maximum["objects"].as_array().unwrap();
+        assert!(!maximum_objects.is_empty() && maximum_objects.len() <= 64);
+        assert_eq!(maximum_objects[0]["address"]["commitId"], body["anchor"]);
+
         for (field, value) in [
             ("maxCommits", json!(0)),
-            ("maxCommits", json!(17)),
+            ("maxCommits", json!(65)),
             ("epochId", json!("bad")),
             ("anchor", json!("bad")),
             ("includeStateHeaders", json!("bad")),

@@ -75,29 +75,10 @@ pub(crate) async fn collect_bounded_point_pages<R: StorageAdapterRead + ?Sized>(
             max_result_bytes: page_budget.max_result_bytes.min(remaining),
             max_single_value_bytes: page_budget.max_single_value_bytes.min(remaining),
         };
-        let page =
-            Box::pin(read.get_many_bounded_prefix(requests, offset, max_slots, budget)).await?;
+        let (page, bytes) =
+            read_bounded_point_page(read, requests, offset, max_slots, budget).await?;
         let count = page.values.len();
-        let next = offset
-            .checked_add(count)
-            .ok_or(StorageError::InvalidCursor)?;
-        if count == 0
-            || count > max_slots.min(crate::storage::MAX_SCAN_PAGE_ROWS)
-            || next > total
-            || page.next_offset != (next < total).then_some(next)
-        {
-            return Err(StorageError::InvalidCursor);
-        }
-        budget.validate_result(&page.values)?;
-        let bytes = page
-            .values
-            .iter()
-            .flatten()
-            .map(|value| match value {
-                ProjectedValue::FullValue(bytes) => bytes.len(),
-                ProjectedValue::KeyOnly => 0,
-            })
-            .sum::<usize>();
+        let next = offset.checked_add(count).ok_or(StorageError::InvalidCursor)?;
         retained = retained
             .checked_add(bytes)
             .filter(|bytes| *bytes <= max_codec_bytes)
@@ -108,6 +89,56 @@ pub(crate) async fn collect_bounded_point_pages<R: StorageAdapterRead + ?Sized>(
         offset = next;
     }
     Ok((GetManyResult::new(values), peak, pages))
+}
+
+/// Read and validate one bounded ordered prefix of an exact point request.
+/// This is the common allocation boundary for consumers that either collect
+/// every slot or process a speculative prefix as pages arrive.
+pub(crate) async fn read_bounded_point_page<R: StorageAdapterRead + ?Sized>(
+    read: &R,
+    requests: &[GetManyRequest<'_>],
+    offset: usize,
+    max_slots: usize,
+    budget: crate::storage::ReadBudget,
+) -> Result<(crate::storage::GetManyPrefixResult, usize), StorageError> {
+    let page_slots = max_slots.min(crate::storage::MAX_SCAN_PAGE_ROWS);
+    let (window, total) = crate::storage::bounded_prefix_requests(requests, offset, page_slots)?;
+    let requested_slots = window.iter().try_fold(0usize, |count, request| {
+        count
+            .checked_add(request.keys.len())
+            .ok_or(StorageError::InvalidKey)
+    })?;
+    if requested_slots == 0 {
+        return crate::storage::GetManyPrefixResult::new(Vec::new(), offset, total)
+            .map(|page| (page, 0));
+    }
+
+    let page = Box::pin(read.get_many_bounded_prefix(requests, offset, page_slots, budget)).await?;
+    let count = page.values.len();
+    let next = offset
+        .checked_add(count)
+        .ok_or(StorageError::InvalidCursor)?;
+    if count == 0
+        || count > requested_slots
+        || count > page_slots
+        || next > total
+        || page.next_offset != (next < total).then_some(next)
+    {
+        return Err(StorageError::InvalidCursor);
+    }
+    budget.validate_result(&page.values)?;
+    let bytes = page
+        .values
+        .iter()
+        .flatten()
+        .try_fold(0usize, |total, value| {
+            total.checked_add(match value {
+                ProjectedValue::FullValue(bytes) => bytes.len(),
+                ProjectedValue::KeyOnly => 0,
+            })
+        })
+        .ok_or(StorageError::ReadBudgetExceeded { singleton: false })?;
+    Ok((page, bytes))
 }
 
 #[derive(Clone, Debug)]

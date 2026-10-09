@@ -53,7 +53,7 @@ pub(crate) use context::{
 };
 pub(crate) use epoch::{EpochBank, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE};
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};
-pub(crate) use point::{collect_bounded_point_pages, exact_get_many};
+pub(crate) use point::{collect_bounded_point_pages, exact_get_many, read_bounded_point_page};
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub(crate) use spaces::{

@@ -567,6 +567,28 @@ mod tests {
         inner: crate::storage_adapter::MemoryRead,
         storage: ExpiringJournalStorage,
     }
+    impl ExpiringJournalRead {
+        fn fail_journal_read(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+        ) -> bool {
+            use std::sync::atomic::Ordering;
+            if requests
+                .iter()
+                .any(|request| request.space == PARTIAL_READ_INTEREST_SPACE)
+                && self
+                    .storage
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.storage.failures.fetch_add(1, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        }
+    }
     impl Storage for ExpiringJournalStorage {
         type Read<'a> = ExpiringJournalRead;
         type Write<'a> = crate::storage_adapter::MemoryWrite;
@@ -600,21 +622,50 @@ mod tests {
             crate::storage_adapter::StorageGetManyResult,
             crate::storage_adapter::StorageError,
         > {
-            use std::sync::atomic::Ordering;
-            if requests
-                .iter()
-                .any(|request| request.space == PARTIAL_READ_INTEREST_SPACE)
-                && self
-                    .storage
-                    .remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-            {
-                self.storage.failures.fetch_add(1, Ordering::SeqCst);
+            if self.fail_journal_read(requests) {
                 return Err(crate::storage_adapter::StorageError::ReadExpired);
             }
             crate::storage_adapter::StorageRead::get_many(&self.inner, requests).await
         }
+
+        async fn get_many_bounded(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+            budget: crate::storage_adapter::ReadBudget,
+        ) -> Result<
+            crate::storage_adapter::StorageGetManyResult,
+            crate::storage_adapter::StorageError,
+        > {
+            if self.fail_journal_read(requests) {
+                return Err(crate::storage_adapter::StorageError::ReadExpired);
+            }
+            crate::storage_adapter::StorageRead::get_many_bounded(&self.inner, requests, budget)
+                .await
+        }
+
+        async fn get_many_bounded_prefix(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+            offset: usize,
+            max_slots: usize,
+            budget: crate::storage_adapter::ReadBudget,
+        ) -> Result<
+            crate::storage_adapter::GetManyPrefixResult,
+            crate::storage_adapter::StorageError,
+        > {
+            if self.fail_journal_read(requests) {
+                return Err(crate::storage_adapter::StorageError::ReadExpired);
+            }
+            crate::storage_adapter::StorageRead::get_many_bounded_prefix(
+                &self.inner,
+                requests,
+                offset,
+                max_slots,
+                budget,
+            )
+            .await
+        }
+
         async fn begin_scan(
             &self,
             space: StorageSpace,

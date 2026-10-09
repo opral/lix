@@ -1,9 +1,9 @@
 //! Bounded immutable dependency selection. This is demand-driven
 //! prefetch, never an opening inventory or a claim that history is complete.
 use super::native_metadata::{
-    MAX_NATIVE_METADATA_PAYLOAD_BYTES, NativeMetadata, NativeMetadataRequest,
-    NativeMetadataResponse, key, space, validate_bytes, validate_native_metadata_request,
-    validate_native_metadata_response,
+    MAX_NATIVE_METADATA_PAYLOAD_BYTES, MAX_NATIVE_METADATA_WALK_RECORDS, NativeMetadata,
+    NativeMetadataRequest, NativeMetadataResponse, key, space, validate_bytes,
+    validate_native_metadata_request,
 };
 use crate::changelog::{CommitId, CommitRecord};
 use crate::storage_adapter::{
@@ -14,8 +14,11 @@ use crate::{Lix, LixError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-// Two possible records per commit remain within the existing 32-record cap.
-pub(crate) const MAX_METADATA_WALK_COMMITS: u8 = 16;
+// Walks can carry up to one graph record and one optional state header per
+// commit. Their encoded records remain bounded independently of this count.
+pub(crate) const MAX_METADATA_WALK_COMMITS: u8 = 64;
+const MAX_METADATA_WALK_RECORDS: usize = MAX_NATIVE_METADATA_WALK_RECORDS;
+const MAX_METADATA_READ_PAGE_SLOTS: usize = 32;
 /// Selection supplies optional native inputs, never a server-side proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,7 +88,7 @@ fn invalid(message: &str) -> LixError {
 pub(crate) fn validate_request(request: &NativeMetadataWalkRequest) -> Result<(), LixError> {
     if request.max_commits == 0 || request.max_commits > MAX_METADATA_WALK_COMMITS {
         return Err(invalid(
-            "native metadata walk requires between 1 and 16 commits",
+            "native metadata walk requires between 1 and 64 commits",
         ));
     }
     if request.stops.len() > 2 || (request.require_state_header && !request.include_state_headers) {
@@ -113,7 +116,11 @@ pub(crate) fn validate_response(
     response: &NativeMetadataResponse,
 ) -> Result<NativeMetadataRequest, LixError> {
     validate_request(request)?;
-    if response.objects.is_empty() || response.objects.len() > usize::from(request.max_commits) * 2
+    if response.objects.is_empty()
+        || response.objects.len()
+            > usize::from(request.max_commits)
+                .saturating_mul(2)
+                .min(MAX_METADATA_WALK_RECORDS)
     {
         return Err(invalid(
             "native metadata walk response exceeds its record bound",
@@ -127,7 +134,13 @@ pub(crate) fn validate_response(
             .map(|object| object.address.clone())
             .collect(),
     };
-    validate_native_metadata_response(repository_id, &exact, response)?;
+    super::native_metadata::validate_native_metadata_response_for_addresses(
+        repository_id,
+        &request.epoch_id,
+        &exact.objects,
+        MAX_METADATA_WALK_RECORDS,
+        response,
+    )?;
     if request.selection != MetadataSelection::History {
         return validate_selected_response(request, response, exact);
     }
@@ -294,13 +307,20 @@ fn validate_selected_response(
     Ok(exact)
 }
 
-/// Batch independently addressed graph/header records at the provider boundary.
-/// Individual decode failures are retained separately: optional lookahead must
-/// not turn an unused sibling into a required corruption failure.
+/// Batch independently addressed graph/header records through bounded provider
+/// pages. Individual decode failures are retained separately: optional
+/// lookahead must not turn an unused sibling into a required corruption failure.
+struct BoundedMetadataInputs {
+    values: Vec<Result<Option<NativeMetadata>, LixError>>,
+    budget_truncated: bool,
+    raw_bytes: usize,
+}
+
 async fn read_many(
     read: &(impl StorageAdapterRead + ?Sized),
     addresses: &[NativeMetadataRef],
-) -> Result<Vec<Result<Option<NativeMetadata>, LixError>>, LixError> {
+    remaining_response_bytes: usize,
+) -> Result<BoundedMetadataInputs, LixError> {
     let keys = addresses
         .iter()
         .map(|address| key(address).map(|key| [key]))
@@ -314,39 +334,93 @@ async fn read_many(
             opts: Default::default(),
         })
         .collect::<Vec<_>>();
-    let values = read.get_many(&requests).await?.values;
-    if values.len() != addresses.len() {
-        return Err(LixError::unknown(
-            "metadata selection storage cardinality mismatch",
-        ));
-    }
-    Ok(addresses
-        .iter()
-        .zip(values)
-        .map(|(address, value)| match value {
-            None => Ok(None),
-            Some(StorageProjectedValue::FullValue(bytes)) => {
-                if bytes.len() > MAX_NATIVE_METADATA_PAYLOAD_BYTES {
-                    return Err(invalid("metadata selection record exceeds byte bound"));
+    let mut values = Vec::with_capacity(addresses.len());
+    let mut offset = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut budget_truncated = false;
+    while offset < requests.len() {
+        let remaining = remaining_response_bytes
+            .min(MAX_NATIVE_METADATA_PAYLOAD_BYTES)
+            .saturating_sub(retained_bytes);
+        if remaining == 0 {
+            budget_truncated = true;
+            break;
+        }
+        let budget = crate::storage_adapter::ReadBudget {
+            max_result_bytes: remaining,
+            max_single_value_bytes: remaining,
+        };
+        let (page, page_bytes) = match crate::storage_adapter::read_bounded_point_page(
+            read,
+            &requests,
+            offset,
+            MAX_METADATA_READ_PAGE_SLOTS,
+            budget,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(crate::storage_adapter::StorageError::ReadBudgetExceeded { .. }) => {
+                budget_truncated = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        retained_bytes = retained_bytes
+            .checked_add(page_bytes)
+            .filter(|bytes| *bytes <= MAX_NATIVE_METADATA_PAYLOAD_BYTES)
+            .ok_or_else(|| invalid("metadata selection payload exceeds byte bound"))?;
+        let count = page.values.len();
+        for (address, value) in addresses[offset..offset + count].iter().zip(page.values) {
+            let value = match value {
+                None => Ok(None),
+                Some(StorageProjectedValue::FullValue(bytes)) => {
+                    if bytes.len() > MAX_NATIVE_METADATA_PAYLOAD_BYTES {
+                        Err(invalid("metadata selection record exceeds byte bound"))
+                    } else {
+                        validate_bytes(address, &bytes).map(|()| {
+                            Some(NativeMetadata {
+                                address: address.clone(),
+                                bytes: bytes.to_vec(),
+                                checkpoint_conversation: None,
+                            })
+                        })
+                    }
                 }
-                validate_bytes(address, &bytes)?;
-                Ok(Some(NativeMetadata {
-                    address: address.clone(),
-                    bytes: bytes.to_vec(),
-                    checkpoint_conversation: None,
-                }))
-            }
-            Some(StorageProjectedValue::KeyOnly) => {
-                Err(LixError::unknown("metadata selection omitted payload"))
-            }
-        })
-        .collect())
+                Some(StorageProjectedValue::KeyOnly) => {
+                    Err(LixError::unknown("metadata selection omitted payload"))
+                }
+            };
+            values.push(value);
+        }
+        offset += count;
+    }
+    Ok(BoundedMetadataInputs {
+        values,
+        budget_truncated,
+        raw_bytes: retained_bytes,
+    })
 }
 
 async fn read_walk(
     read: &(impl StorageAdapterRead + ?Sized),
     repository_id: &str,
     request: &NativeMetadataWalkRequest,
+) -> Result<NativeMetadataResponse, LixError> {
+    read_walk_with_response_budget(
+        read,
+        repository_id,
+        request,
+        MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+    )
+    .await
+}
+
+async fn read_walk_with_response_budget(
+    read: &(impl StorageAdapterRead + ?Sized),
+    repository_id: &str,
+    request: &NativeMetadataWalkRequest,
+    response_budget_bytes: usize,
 ) -> Result<NativeMetadataResponse, LixError> {
     validate_request(request)?;
     let mut pending = vec![request.anchor.clone()];
@@ -355,6 +429,8 @@ async fn read_walk(
     let mut seen = BTreeSet::new();
     let mut previous_generation = None;
     let mut fetched = std::collections::VecDeque::new();
+    let mut stop_after_fetched_prefix = false;
+    let mut fetched_raw_bytes = 0usize;
     loop {
         if fetched.is_empty() {
             let mut group = Vec::new();
@@ -380,12 +456,33 @@ async fn read_walk(
                     addresses
                 })
                 .collect::<Vec<_>>();
-            let values = read_many(read, &addresses).await?;
-            let mut values = values.into_iter();
+            let remaining = response_budget_bytes.saturating_sub(fetched_raw_bytes);
+            let batch = read_many(read, &addresses, remaining).await?;
+            fetched_raw_bytes = fetched_raw_bytes.saturating_add(batch.raw_bytes);
+            stop_after_fetched_prefix = batch.budget_truncated;
+            if batch.values.is_empty() && batch.budget_truncated {
+                if objects.is_empty() && group.iter().any(|id| id == &request.anchor) {
+                    return Err(invalid(
+                        "required metadata anchor exceeds response byte bound",
+                    ));
+                }
+                break;
+            }
+            let mut values = batch.values.into_iter();
             for id in group {
-                let mut inputs = vec![values.next().expect("selected graph slot")];
+                let Some(graph) = values.next() else {
+                    break;
+                };
+                let mut inputs = vec![graph];
                 if request.include_state_headers {
-                    inputs.push(values.next().expect("selected header slot"));
+                    if let Some(header) = values.next() {
+                        inputs.push(header);
+                    } else {
+                        // The graph slot precedes its optional header on the
+                        // wire. An omitted header is a suffix boundary, not a
+                        // claim that the authority had no header.
+                        inputs.push(Ok(None));
+                    }
                 }
                 fetched.push_back((id, inputs));
             }
@@ -482,6 +579,12 @@ async fn read_walk(
                     }
                 }
             }
+        }
+        if stop_after_fetched_prefix && fetched.is_empty() {
+            // A typed byte-budget refusal ends this optional read prefix only
+            // after all records already admitted in the final provider page
+            // have had the existing topology/error checks applied.
+            break;
         }
     }
     let mut checkpoint_indexes = Vec::new();
@@ -581,6 +684,10 @@ mod tests {
     use crate::{Memory, Value, open_lix};
 
     async fn fixture() -> (Lix<Memory>, NativeMetadataWalkRequest) {
+        fixture_with_revisions(12).await
+    }
+
+    async fn fixture_with_revisions(revisions: usize) -> (Lix<Memory>, NativeMetadataWalkRequest) {
         let lix = open_lix().await.unwrap();
         lix.execute(
             "INSERT INTO lix_file (path,content) VALUES ('/walk.txt',$1)",
@@ -588,7 +695,7 @@ mod tests {
         )
         .await
         .unwrap();
-        for index in 0..12 {
+        for index in 0..revisions {
             lix.execute(
                 "UPDATE lix_file SET content=$1 WHERE path='/walk.txt'",
                 &[Value::Blob(format!("revision {index}").into_bytes().into())],
@@ -645,6 +752,87 @@ mod tests {
             let exact = validate_response(lix.lix_id(), &request, &response).unwrap();
             assert_eq!(exact.objects.len(), response.objects.len());
         }
+        drop(read);
+        lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expanded_walk_crosses_old_commit_cap_and_keeps_global_byte_prefix() {
+        let (lix, mut request) = fixture_with_revisions(40).await;
+        request.max_commits = 40;
+        let adapter = lix.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let full = read_walk(&read, lix.lix_id(), &request).await.unwrap();
+        assert_eq!(
+            full.objects
+                .iter()
+                .filter(|object| matches!(object.address, NativeMetadataRef::CommitGraphRecord(_)))
+                .count(),
+            40
+        );
+        assert!(full.objects.len() > 32);
+        validate_response(lix.lix_id(), &request, &full).unwrap();
+        assert!(
+            super::super::native_metadata::validate_native_metadata_response_for_addresses(
+                lix.lix_id(),
+                &request.epoch_id,
+                &full
+                    .objects
+                    .iter()
+                    .map(|object| object.address.clone())
+                    .collect::<Vec<_>>(),
+                super::super::native_metadata::MAX_NATIVE_METADATA_BATCH,
+                &full,
+            )
+            .is_err()
+        );
+
+        let first_graph = full
+            .objects
+            .iter()
+            .find(|object| matches!(object.address, NativeMetadataRef::CommitGraphRecord(_)))
+            .unwrap();
+        request.include_state_headers = false;
+        request.max_commits = 4;
+        let exact_first_record =
+            read_walk_with_response_budget(&read, lix.lix_id(), &request, first_graph.bytes.len())
+                .await
+                .unwrap();
+        assert_eq!(exact_first_record.objects.len(), 1);
+        assert_eq!(exact_first_record.objects[0].address, first_graph.address);
+        validate_response(lix.lix_id(), &request, &exact_first_record).unwrap();
+
+        request.include_state_headers = true;
+        request.require_state_header = false;
+        let first_header = full
+            .objects
+            .iter()
+            .find(|object| matches!(object.address, NativeMetadataRef::CommitStateHeader(_)))
+            .unwrap();
+        let graph_then_partial_header = read_walk_with_response_budget(
+            &read,
+            lix.lix_id(),
+            &request,
+            first_graph.bytes.len() + first_header.bytes.len() - 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(graph_then_partial_header.objects.len(), 1);
+        assert_eq!(
+            graph_then_partial_header.objects[0].address,
+            first_graph.address
+        );
+        validate_response(lix.lix_id(), &request, &graph_then_partial_header).unwrap();
+
+        request.require_state_header = true;
+        let required_header_does_not_silently_truncate = read_walk_with_response_budget(
+            &read,
+            lix.lix_id(),
+            &request,
+            first_graph.bytes.len() + first_header.bytes.len() - 1,
+        )
+        .await;
+        assert!(required_header_does_not_silently_truncate.is_err());
         drop(read);
         lix.close().await.unwrap();
     }
@@ -749,9 +937,14 @@ mod tests {
             // Optional selection does not turn corrupt data into absence or a
             // successful required read, including the omitted state header.
             assert!(
-                read_many(&read, std::slice::from_ref(&damaged))
+                read_many(
+                    &read,
+                    std::slice::from_ref(&damaged),
+                    MAX_NATIVE_METADATA_PAYLOAD_BYTES,
+                )
                     .await
                     .unwrap()
+                    .values
                     .remove(0)
                     .is_err()
             );
