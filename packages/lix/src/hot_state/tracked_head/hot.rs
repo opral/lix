@@ -3472,27 +3472,31 @@ async fn packed_current_base_has_schema(
 fn packed_member_matches_filter(
     member: &crate::tracked_state::CommitDeltaMember,
     filter: &TrackedStateFilter,
+    row_pks: &crate::tracked_state::RowPkLookup<'_>,
 ) -> bool {
     packed_identity_matches_filter(
         &member.key.schema_key,
         &member.key.row_pk,
         member.key.file_id.as_deref(),
         filter,
+        row_pks,
     )
 }
 
+/// `row_pks` is `RowPkLookup::new(&filter.row_pks)`, built once per scan.
 fn packed_identity_matches_filter(
     schema_key: &str,
     row_pk: &RowPk,
     file_id: Option<&str>,
     filter: &TrackedStateFilter,
+    row_pks: &crate::tracked_state::RowPkLookup<'_>,
 ) -> bool {
     (filter.schema_keys.is_empty()
         || filter
             .schema_keys
             .iter()
             .any(|requested| requested == schema_key))
-        && filter.matches_row_pk(row_pk)
+        && filter.matches_row_pk_with(row_pks, row_pk)
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|filter| match filter {
                 NullableKeyFilter::Any => true,
@@ -4226,6 +4230,7 @@ async fn scan_packed_current_base_rows(
         )
         .await;
     }
+    let row_pks = crate::tracked_state::RowPkLookup::new(&request.filter.row_pks);
     let single_base = base_refs.len() == 1;
     let mut winners = BTreeMap::new();
     let mut ordered_winners = None;
@@ -4265,7 +4270,7 @@ async fn scan_packed_current_base_rows(
                     let mut ordered = Vec::with_capacity(members.len());
                     for member in members {
                         if member.value.deleted
-                            || !packed_member_matches_filter(&member, &request.filter)
+                            || !packed_member_matches_filter(&member, &request.filter, &row_pks)
                         {
                             continue;
                         }
@@ -4286,7 +4291,7 @@ async fn scan_packed_current_base_rows(
             } else if let Some(members) = members {
                 for member in members {
                     if member.value.deleted
-                        || !packed_member_matches_filter(&member, &request.filter)
+                        || !packed_member_matches_filter(&member, &request.filter, &row_pks)
                     {
                         continue;
                     }
@@ -4346,6 +4351,7 @@ async fn scan_packed_current_base_rows(
                             &key.row_pk,
                             key.file_id.as_deref(),
                             &request.filter,
+                            &row_pks,
                         ) {
                             keys.insert(key);
                         }
@@ -4366,6 +4372,7 @@ async fn scan_packed_current_base_rows(
                                 &key.row_pk,
                                 key.file_id.as_deref(),
                                 &request.filter,
+                                &row_pks,
                             ) {
                                 keys.insert(key);
                             }
@@ -4395,6 +4402,7 @@ async fn scan_packed_current_base_rows(
                         key.row_pk,
                         key.file_id,
                         &request.filter,
+                        &row_pks,
                     )
                 {
                     continue;
@@ -4526,6 +4534,7 @@ async fn scan_packed_current_base_provenance_rows(
     request: &TrackedStateScanRequest,
     limit: Option<usize>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
+    let row_pks = crate::tracked_state::RowPkLookup::new(&request.filter.row_pks);
     let mut winners = BTreeMap::new();
     for base_ref in base_refs {
         let compact = crate::tracked_state::scan_commit_delta_values(
@@ -4543,6 +4552,7 @@ async fn scan_packed_current_base_provenance_rows(
                     key.row_pk,
                     key.file_id,
                     &request.filter,
+                    &row_pks,
                 )
             {
                 continue;
@@ -12762,10 +12772,19 @@ fn hot_exact_identity_batches<'a>(
         .collect::<Vec<_>>();
     schema_keys.sort_unstable();
     schema_keys.dedup();
+    // Every listed identity is trivially a member of the list, so only the
+    // range bounds can exclude one (`matches_row_pk` would rescan the list
+    // per element).
     let row_pks = filter
         .row_pks
         .iter()
-        .filter(|row_pk| filter.matches_row_pk(row_pk))
+        .filter(|row_pk| {
+            crate::tracked_state::row_pk_satisfies_bounds(
+                row_pk,
+                filter.row_pk_lower.as_ref(),
+                filter.row_pk_upper.as_ref(),
+            )
+        })
         .collect::<Vec<_>>();
     let file_ids = if filter.file_ids.is_empty() {
         vec![None]
@@ -13286,6 +13305,7 @@ async fn hot_working_diff_entries(
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    let row_pks = crate::tracked_state::RowPkLookup::new(&filter.row_pks);
     let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
     let packed_refs = packed_refs
         .into_iter()
@@ -13416,6 +13436,7 @@ async fn hot_working_diff_entries(
                 &key.row_pk,
                 key.file_id.as_deref(),
                 filter,
+                &row_pks,
             ) {
                 continue;
             }

@@ -183,7 +183,7 @@ pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DE
 pub(crate) use types::{
     ColumnarMutationPartSet, CommitDeltaLifecycleSummary, CommitStateIncorporation,
     CommitStateManifest, CommitStateMutationInventory, CommitStateMutationPart,
-    CommitStateReplayDebt, MaterializedTrackedStateRow, RowPkRangeBound,
+    CommitStateReplayDebt, MaterializedTrackedStateRow, RowPkLookup, RowPkRangeBound,
     TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
     TrackedStateCommitRootParent, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
     TrackedStateIndexValueRef, TrackedStateReadColumns, TrackedStateRootMutationRef,

@@ -668,6 +668,53 @@ impl TrackedStateFilter {
                 self.row_pk_upper.as_ref(),
             )
     }
+
+    /// [`Self::matches_row_pk`] against a membership lookup built once per
+    /// scan from `self.row_pks`.
+    pub(crate) fn matches_row_pk_with(&self, row_pks: &RowPkLookup<'_>, row_pk: &RowPk) -> bool {
+        row_pks.contains(row_pk)
+            && row_pk_satisfies_bounds(
+                row_pk,
+                self.row_pk_lower.as_ref(),
+                self.row_pk_upper.as_ref(),
+            )
+    }
+}
+
+/// Membership test over a filter's requested row identities.
+///
+/// A filter usually names a handful of identities, but a declared-column
+/// index probe (`WHERE fk IN (...)`) resolves to one identity per matching
+/// row. Probing that list linearly for every row a scan visits is quadratic,
+/// so scans build one lookup up front and reuse it per row.
+pub(crate) enum RowPkLookup<'a> {
+    /// No identity constraint: every row matches.
+    Any,
+    Few(&'a [RowPk]),
+    Many(std::collections::HashSet<&'a RowPk>),
+}
+
+impl<'a> RowPkLookup<'a> {
+    /// Beyond this many identities a hash set beats a linear probe.
+    const LINEAR_MAX: usize = 16;
+
+    pub(crate) fn new(row_pks: &'a [RowPk]) -> Self {
+        if row_pks.is_empty() {
+            Self::Any
+        } else if row_pks.len() <= Self::LINEAR_MAX {
+            Self::Few(row_pks)
+        } else {
+            Self::Many(row_pks.iter().collect())
+        }
+    }
+
+    pub(crate) fn contains(&self, row_pk: &RowPk) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Few(row_pks) => row_pks.contains(row_pk),
+            Self::Many(row_pks) => row_pks.contains(row_pk),
+        }
+    }
 }
 
 pub(crate) fn row_pk_satisfies_bounds(

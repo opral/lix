@@ -433,6 +433,8 @@ impl TrackedStateTree {
                 if ranges.is_empty() {
                     return Ok(Vec::new());
                 }
+                // Raising every start to the cursor can make ranges overlap.
+                ranges = normalize_scan_ranges(ranges);
             }
         }
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
@@ -461,11 +463,13 @@ impl TrackedStateTree {
         // Subtree counts are storage data. A corrupt count must not turn a
         // best-effort scan allocation hint into a capacity panic.
         let _ = rows.try_reserve_exact(reserve);
+        let row_pks = crate::tracked_state::RowPkLookup::new(&request.row_pks);
         self.scan_node(
             store,
             *root_id.as_bytes(),
             request,
             &ranges,
+            &row_pks,
             key_decode_hint,
             &mut rows,
         )
@@ -1873,6 +1877,7 @@ impl TrackedStateTree {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &'a TrackedStateTreeScanRequest,
         ranges: &'a [EncodedScanRange],
+        row_pks: &'a crate::tracked_state::RowPkLookup<'a>,
         key_decode_hint: Option<ScanKeyDecodeHint<'a>>,
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
@@ -1905,7 +1910,7 @@ impl TrackedStateTree {
                             )?,
                             None => decode_key(entry.key)?,
                         };
-                        if key_decode_hint.is_none() && !key_matches_scan_filters(request, &key) {
+                        if key_decode_hint.is_none() && !key_matches_scan_filters(request, row_pks, &key) {
                             continue;
                         }
                         let Some(value) =
@@ -1932,6 +1937,7 @@ impl TrackedStateTree {
                                     child.child_hash,
                                     request,
                                     ranges,
+                                    row_pks,
                                     key_decode_hint,
                                     rows,
                                 )
@@ -2770,6 +2776,7 @@ impl<'a> OrderedTreeAssembler<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct EncodedScanRange {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
@@ -3247,7 +3254,38 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
             ));
         }
     }
-    ranges
+    normalize_scan_ranges(ranges)
+}
+
+/// Sorts ranges by start and merges overlapping or adjacent ones.
+///
+/// Every range list handed to the scan helpers is normalized, so membership
+/// and overlap tests can binary search instead of probing each range. That
+/// matters for identity-bound scans: an index probe over `fk IN (...)` binds
+/// one exact range per matching row, and the scan tests every visited key.
+fn normalize_scan_ranges(mut ranges: Vec<EncodedScanRange>) -> Vec<EncodedScanRange> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+    ranges.sort_unstable_by(|left, right| left.start.cmp(&right.start));
+    let mut merged: Vec<EncodedScanRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            let touches = last
+                .end
+                .as_ref()
+                .is_none_or(|end| range.start.as_slice() <= end.as_slice());
+            if touches {
+                last.end = match (last.end.take(), range.end) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    _ => None,
+                };
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 fn scan_key_decode_hint<'a>(
@@ -3383,30 +3421,48 @@ fn child_summary_overlaps_request(
     })
 }
 
+/// `ranges` must be normalized (see [`normalize_scan_ranges`]): sorted and
+/// disjoint, so ends ascend with starts and both tests can binary search.
 fn child_summary_overlaps_scan_ranges(child: &ChildSummary, ranges: &[EncodedScanRange]) -> bool {
-    ranges.is_empty()
-        || ranges.iter().any(|range| {
-            child.last_key.as_ref() >= range.start.as_slice()
-                && range
-                    .end
-                    .as_ref()
-                    .is_none_or(|end| child.first_key.as_ref() < end.as_slice())
-        })
+    if ranges.is_empty() {
+        return true;
+    }
+    let first = child.first_key.as_ref();
+    // Skip every range that ends at or before the child's first key; the next
+    // one overlaps iff it starts at or before the child's last key.
+    let index = ranges.partition_point(|range| {
+        range
+            .end
+            .as_ref()
+            .is_some_and(|end| end.as_slice() <= first)
+    });
+    ranges
+        .get(index)
+        .is_some_and(|range| range.start.as_slice() <= child.last_key.as_ref())
 }
 
+/// `ranges` must be normalized (see [`normalize_scan_ranges`]).
 fn encoded_key_in_scan_ranges(key: &[u8], ranges: &[EncodedScanRange]) -> bool {
-    ranges.is_empty()
-        || ranges.iter().any(|range| {
-            key >= range.start.as_slice()
-                && range.end.as_ref().is_none_or(|end| key < end.as_slice())
-        })
+    if ranges.is_empty() {
+        return true;
+    }
+    let index = ranges.partition_point(|range| range.start.as_slice() <= key);
+    index > 0
+        && ranges[index - 1]
+            .end
+            .as_ref()
+            .is_none_or(|end| key < end.as_slice())
 }
 
-fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &TrackedStateKey) -> bool {
+fn key_matches_scan_filters(
+    request: &TrackedStateTreeScanRequest,
+    row_pks: &crate::tracked_state::RowPkLookup<'_>,
+    key: &TrackedStateKey,
+) -> bool {
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&key.schema_key) {
         return false;
     }
-    if !request.row_pks.is_empty() && !request.row_pks.contains(&key.row_pk) {
+    if !row_pks.contains(&key.row_pk) {
         return false;
     }
     if !crate::tracked_state::row_pk_satisfies_bounds(
@@ -6584,5 +6640,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(presence, vec![Some(false), None]);
+    }
+}
+
+#[cfg(test)]
+mod scan_range_tests {
+    use super::*;
+    use crate::row_pk::RowPk;
+    use bytes::Bytes;
+
+    /// The pre-normalization semantics: probe every range.
+    fn linear_key_in(key: &[u8], ranges: &[EncodedScanRange]) -> bool {
+        ranges.is_empty()
+            || ranges.iter().any(|range| {
+                key >= range.start.as_slice()
+                    && range.end.as_ref().is_none_or(|end| key < end.as_slice())
+            })
+    }
+
+    fn linear_child_overlaps(first: &[u8], last: &[u8], ranges: &[EncodedScanRange]) -> bool {
+        ranges.is_empty()
+            || ranges.iter().any(|range| {
+                last >= range.start.as_slice()
+                    && range.end.as_ref().is_none_or(|end| first < end.as_slice())
+            })
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn key(&mut self) -> Vec<u8> {
+            let len = 1 + (self.next() % 3) as usize;
+            (0..len).map(|_| (self.next() % 6) as u8).collect()
+        }
+    }
+
+    #[test]
+    fn normalized_binary_search_matches_linear_range_probing() {
+        let mut rng = Lcg(7);
+        for case in 0..2_000 {
+            let count = (rng.next() % 12) as usize;
+            let ranges = (0..count)
+                .map(|_| {
+                    let start = rng.key();
+                    let end = match rng.next() % 5 {
+                        0 => None,
+                        1 => lexicographic_successor(&start),
+                        _ => {
+                            let end = rng.key();
+                            Some(if end > start { end } else { start.iter().copied().chain([9]).collect() })
+                        }
+                    };
+                    EncodedScanRange { start, end }
+                })
+                .collect::<Vec<_>>();
+            let normalized = normalize_scan_ranges(ranges.clone());
+            assert!(
+                normalized.windows(2).all(|pair| pair[0]
+                    .end
+                    .as_ref()
+                    .is_some_and(|end| end.as_slice() < pair[1].start.as_slice())),
+                "case {case}: normalized ranges must be sorted and disjoint: {normalized:?}"
+            );
+            for _ in 0..40 {
+                let key = rng.key();
+                assert_eq!(
+                    encoded_key_in_scan_ranges(&key, &normalized),
+                    linear_key_in(&key, &ranges),
+                    "case {case}: key {key:?} ranges {ranges:?}"
+                );
+                let (a, b) = (rng.key(), rng.key());
+                let (first, last) = if a <= b { (a, b) } else { (b, a) };
+                let child = ChildSummary {
+                    first_key: Bytes::from(first.clone()),
+                    last_key: Bytes::from(last.clone()),
+                    child_hash: [0; TRACKED_STATE_HASH_BYTES],
+                    subtree_count: 1,
+                };
+                assert_eq!(
+                    child_summary_overlaps_scan_ranges(&child, &normalized),
+                    linear_child_overlaps(&first, &last, &ranges),
+                    "case {case}: child {first:?}..={last:?} ranges {ranges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_pk_lookup_matches_list_membership_at_both_sizes() {
+        for size in [0usize, 3, 16, 17, 500] {
+            let row_pks = (0..size).map(|i| RowPk::single(format!("pk-{i}"))).collect::<Vec<_>>();
+            let lookup = crate::tracked_state::RowPkLookup::new(&row_pks);
+            for probe in 0..size + 5 {
+                let row_pk = RowPk::single(format!("pk-{probe}"));
+                assert_eq!(
+                    lookup.contains(&row_pk),
+                    row_pks.is_empty() || row_pks.contains(&row_pk),
+                    "size {size} probe {probe}"
+                );
+            }
+        }
     }
 }
