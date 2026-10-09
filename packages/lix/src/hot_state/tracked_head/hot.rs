@@ -3876,7 +3876,7 @@ async fn scan_root_current_base_rows_for_merge(
         // without materializing history-sized state.
         *limit = limit.saturating_add(other_candidate_count);
     }
-    scan_root_current_base_rows(
+    let rows = scan_root_current_base_rows(
         store,
         branch_id,
         generation,
@@ -3885,7 +3885,30 @@ async fn scan_root_current_base_rows_for_merge(
         root_base_cache,
         None,
     )
-    .await
+    .await?;
+    Ok(order_by_live_identity(rows))
+}
+
+/// Restores live identity order `(schema, row_pk, file)` on a batch read in
+/// tracked-tree key order `(schema, file, row_pk)`.
+///
+/// The two orders differ as soon as a schema spans several file scopes, and
+/// [`merge_ordered_live_batches`] relies on identity order to pair an overlay
+/// row with the root row it shadows. An unordered root batch let a stale root
+/// row and its newer HOT successor pass the merge as two distinct identities.
+fn order_by_live_identity(mut rows: MaterializedHotStateBatch) -> MaterializedHotStateBatch {
+    if (1..rows.len())
+        .all(|index| compare_materialized_live_identity_refs(rows.row(index - 1), rows.row(index)).is_le())
+    {
+        return rows;
+    }
+    let mut permutation = (0..u32::try_from(rows.len()).expect("live-state batch fits u32 rows"))
+        .collect::<Vec<_>>();
+    permutation.sort_by(|left, right| {
+        compare_materialized_live_identity_refs(rows.row(*left as usize), rows.row(*right as usize))
+    });
+    rows.permute_rows(&permutation);
+    rows
 }
 
 async fn load_root_current_base_exact(

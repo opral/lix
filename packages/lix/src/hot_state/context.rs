@@ -6039,20 +6039,21 @@ mod tests {
             .find(|run| run.branch_id == branch_id)
             .expect("local source run exists");
         assert_eq!(local_run.rows.len(), 600);
+        // The root producer restores row-PK identity order from file-first
+        // storage order before it merges overlays, so the run is proven
+        // ordered and the dominant merge resolves it like the general path.
         assert!(
-            !materialized_batch_is_strictly_ordered_unique(&local_run.rows),
-            "the producer must not claim row-PK order for file-first storage order"
+            materialized_batch_is_strictly_ordered_unique(&local_run.rows),
+            "the producer must restore row-PK order from file-first storage order"
         );
-        assert!(!local_run.ordered_unique);
-        assert!(
-            try_merge_dominant_branch_with_global(
-                &mut source_runs,
-                &scope.projection_branch_ids,
-                &request,
-            )
-            .is_none(),
-            "the >=512-row dominant path must decline an unproven source order"
-        );
+        assert!(local_run.ordered_unique);
+        let dominant = try_merge_dominant_branch_with_global(
+            &mut source_runs,
+            &scope.projection_branch_ids,
+            &request,
+        )
+        .expect("an ordered dominant source admits the dominant merge");
+        assert_eq!(dominant.len(), 601);
 
         let visible = reader
             .scan_batch(&request)

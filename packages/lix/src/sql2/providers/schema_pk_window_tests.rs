@@ -362,3 +362,57 @@ async fn primary_key_windows_match_the_unrestricted_scan_on_a_branch_root() {
     })
     .await;
 }
+
+/// A branch serves its inherited rows from a root current base, which the
+/// tracked tree orders `(schema, file, row_pk)`. HOT overlays and packed
+/// bases are ordered `(schema, row_pk, file)`. A full scan must still let
+/// every overlay update and delete shadow its root row in every file scope.
+#[tokio::test]
+async fn full_scans_shadow_multi_scope_root_rows_with_hot_overlays() {
+    let lix = open_fixture().await;
+    lix.execute(
+        &format!(
+            "INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES \
+             ('k1', 'null-1', NULL), ('k3', 'null-3', NULL), \
+             ('k1', 'a-1', '{FILE_A}'), ('k2', 'a-2', '{FILE_A}'), \
+             ('k2', 'b-2', '{FILE_B}'), ('k4', 'b-4', '{FILE_B}')"
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    let branch = lix
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "root-order".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    lix.switch_branch(crate::SwitchBranchOptions {
+        branch_id: branch.id,
+    })
+    .await
+    .unwrap();
+    for statement in [
+        format!("UPDATE {SCHEMA} SET value = 'a-2-updated' WHERE id = 'k2' AND lixcol_file_id = '{FILE_A}'"),
+        format!("DELETE FROM {SCHEMA} WHERE id = 'k1' AND lixcol_file_id = '{FILE_A}'"),
+        format!("UPDATE {SCHEMA} SET value = 'null-3-updated' WHERE id = 'k3' AND lixcol_file_id IS NULL"),
+    ] {
+        lix.execute(&statement, &[]).await.unwrap();
+    }
+    let rows = all_rows(&lix).await;
+    let row = |id: &str, value: &str, file: Option<&str>| -> Row {
+        (id.to_owned(), value.to_owned(), file.map(str::to_owned), false, false)
+    };
+    let mut expected = vec![
+        row("k1", "null-1", None),
+        row("k2", "a-2-updated", Some(FILE_A)),
+        row("k2", "b-2", Some(FILE_B)),
+        row("k3", "null-3-updated", None),
+        row("k4", "b-4", Some(FILE_B)),
+    ];
+    expected.sort();
+    assert_eq!(rows, expected);
+    lix.close().await.unwrap();
+}
