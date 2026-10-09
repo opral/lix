@@ -169,6 +169,11 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
 /// hashing a single canonical typed representation so sync hydration and
 /// current-state serving layouts agree. Typed encoding distinguishes SQL NULL
 /// from JSON null; metadata uses canonical JSONB binary encoding.
+///
+/// Protocol-v69 storage payloads whose row frame is already canonical are
+/// hashed directly: the canonical representation is then the identity frames
+/// derived from the storage envelope followed by the stored row frame, so the
+/// decode and re-encode would reproduce the same bytes.
 pub(crate) fn tracked_payload_semantic_fingerprint(
     schema_key: &str,
     row_pk: &RowPk,
@@ -178,22 +183,15 @@ pub(crate) fn tracked_payload_semantic_fingerprint(
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    let typed = WasmTypedRow::decode_durable_payload(
-        Arc::<[u8]>::from(snapshot),
-        schema_key,
-        row_pk,
-    )?;
-    let canonical_snapshot = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
-        &typed.schema_fingerprint,
-        &typed.row_pk,
-        &typed.row,
-    )
-    .map_err(|error| {
-        crate::LixError::new(
-            crate::LixError::CODE_INTERNAL_ERROR,
-            format!("tracked-state typed payload failed canonical encoding: {error:?}"),
-        )
-    })?;
+    let mut hasher = SEMANTIC_FINGERPRINT_HASHER.clone();
+    hasher.update(&[1]);
+    hasher.update(&(schema_key.len() as u64).to_be_bytes());
+    hasher.update(schema_key.as_bytes());
+    if !hash_verbatim_canonical_snapshot(&mut hasher, row_pk, snapshot) {
+        let canonical_snapshot = decoded_canonical_snapshot(schema_key, row_pk, snapshot)?;
+        hasher.update(&(canonical_snapshot.len() as u64).to_be_bytes());
+        hasher.update(&canonical_snapshot);
+    }
     let metadata = metadata
         .map(lix_schema::Jsonb::binary)
         .transpose()
@@ -203,13 +201,6 @@ pub(crate) fn tracked_payload_semantic_fingerprint(
                 format!("tracked-state metadata failed canonical encoding: {error}"),
             )
         })?;
-    let mut hasher =
-        blake3::Hasher::new_derive_key("lix.tracked-state.payload-semantic-fingerprint.v2");
-    hasher.update(&[1]);
-    hasher.update(&(schema_key.len() as u64).to_be_bytes());
-    hasher.update(schema_key.as_bytes());
-    hasher.update(&(canonical_snapshot.len() as u64).to_be_bytes());
-    hasher.update(&canonical_snapshot);
     match metadata.as_ref() {
         Some(bytes) => {
             hasher.update(&[1]);
@@ -221,6 +212,97 @@ pub(crate) fn tracked_payload_semantic_fingerprint(
         }
     };
     Ok(Some(*hasher.finalize().as_bytes()))
+}
+
+/// Key derivation hashes the context string; do it once and clone the state.
+static SEMANTIC_FINGERPRINT_HASHER: std::sync::LazyLock<blake3::Hasher> =
+    std::sync::LazyLock::new(|| {
+        blake3::Hasher::new_derive_key("lix.tracked-state.payload-semantic-fingerprint.v2")
+    });
+
+/// Reference canonicalization: decode the durable payload and re-encode it as
+/// a self-contained native typed row.
+fn decoded_canonical_snapshot(
+    schema_key: &str,
+    row_pk: &RowPk,
+    snapshot: &[u8],
+) -> Result<Vec<u8>, crate::LixError> {
+    let typed =
+        WasmTypedRow::decode_durable_payload(Arc::<[u8]>::from(snapshot), schema_key, row_pk)?;
+    crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+        &typed.schema_fingerprint,
+        &typed.row_pk,
+        &typed.row,
+    )
+    .map_err(|error| {
+        crate::LixError::new(
+            crate::LixError::CODE_INTERNAL_ERROR,
+            format!("tracked-state typed payload failed canonical encoding: {error:?}"),
+        )
+    })
+}
+
+/// Hashes the length-prefixed canonical snapshot without decoding it when the
+/// stored payload is a protocol-v69 storage row whose frame is provably
+/// verbatim-canonical. Returns `false`, having fed nothing to `hasher`, when
+/// the payload needs the reference decode/re-encode path.
+fn hash_verbatim_canonical_snapshot(
+    hasher: &mut blake3::Hasher,
+    row_pk: &RowPk,
+    snapshot: &[u8],
+) -> bool {
+    use crate::plugin::wire::typed::{
+        BorrowedNativeValue, NATIVE_IDENTITY_MAX_KEY_COMPONENTS, NATIVE_IDENTITY_PAYLOAD_MAX_BYTES,
+        NATIVE_IDENTITY_PAYLOAD_VERSION, canonical_identity_key_frame,
+        verbatim_canonical_storage_row_frame,
+    };
+    use crate::row_pk::RowPkComponent;
+
+    let components = row_pk.components.as_slice();
+    let key_count = components.len();
+    if key_count == 0 || key_count > NATIVE_IDENTITY_MAX_KEY_COMPONENTS {
+        return false;
+    }
+    fn key_value(component: &RowPkComponent) -> Option<BorrowedNativeValue<'_>> {
+        Some(match component {
+            RowPkComponent::String(value) => BorrowedNativeValue::Text(value.as_str()),
+            RowPkComponent::Uuid(value) => BorrowedNativeValue::Uuid(uuid::Uuid::from_bytes(*value)),
+            RowPkComponent::Integer(value) => BorrowedNativeValue::Int8(*value),
+            RowPkComponent::Bytes(_) => return None,
+        })
+    }
+    // Measure the identity frames first so nothing reaches the hasher unless
+    // the whole canonical snapshot can be streamed.
+    let mut key_bytes = 4usize;
+    for component in components {
+        let Some(value) = key_value(component) else {
+            return false;
+        };
+        if !canonical_identity_key_frame(value, |bytes| key_bytes += bytes.len()) {
+            return false;
+        }
+    }
+    let Some((schema_fingerprint, row_frame)) = verbatim_canonical_storage_row_frame(snapshot)
+    else {
+        return false;
+    };
+    let canonical_len = 1 + 32 + key_bytes + 4 + row_frame.len();
+    if canonical_len > NATIVE_IDENTITY_PAYLOAD_MAX_BYTES {
+        return false;
+    }
+    hasher.update(&(canonical_len as u64).to_be_bytes());
+    hasher.update(&[NATIVE_IDENTITY_PAYLOAD_VERSION]);
+    hasher.update(&schema_fingerprint);
+    hasher.update(&(key_count as u32).to_be_bytes());
+    for component in components {
+        let value = key_value(component).expect("identity component measured above");
+        canonical_identity_key_frame(value, |bytes| {
+            hasher.update(bytes);
+        });
+    }
+    hasher.update(&(row_frame.len() as u32).to_be_bytes());
+    hasher.update(row_frame);
+    true
 }
 
 /// Durable tracked-state root metadata for one commit.
@@ -995,5 +1077,251 @@ mod semantic_fingerprint_tests {
                 .expect("tombstone fingerprint should be absent"),
             None
         );
+    }
+
+    /// The fingerprint algorithm before the verbatim fast path existed:
+    /// decode, re-encode with identity, hash. Persisted fingerprints were
+    /// produced by exactly this code, so every payload must still match it.
+    fn reference_fingerprint(
+        schema_key: &str,
+        row_pk: &RowPk,
+        snapshot: Option<&[u8]>,
+        metadata: Option<&Jsonb>,
+    ) -> Option<[u8; 32]> {
+        let snapshot = snapshot?;
+        let typed = crate::row_payload::TypedRow::decode_durable_payload(
+            Arc::<[u8]>::from(snapshot),
+            schema_key,
+            row_pk,
+        )
+        .expect("reference decode");
+        let canonical_snapshot = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &typed.schema_fingerprint,
+            &typed.row_pk,
+            &typed.row,
+        )
+        .expect("reference encode");
+        let metadata = metadata.map(|metadata| metadata.binary().expect("metadata binary"));
+        let mut hasher =
+            blake3::Hasher::new_derive_key("lix.tracked-state.payload-semantic-fingerprint.v2");
+        hasher.update(&[1]);
+        hasher.update(&(schema_key.len() as u64).to_be_bytes());
+        hasher.update(schema_key.as_bytes());
+        hasher.update(&(canonical_snapshot.len() as u64).to_be_bytes());
+        hasher.update(&canonical_snapshot);
+        match metadata.as_ref() {
+            Some(bytes) => {
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    fn takes_verbatim_path(row_pk: &RowPk, snapshot: &[u8]) -> bool {
+        super::hash_verbatim_canonical_snapshot(&mut blake3::Hasher::new(), row_pk, snapshot)
+    }
+
+    fn assert_matches_reference(schema_key: &str, row_pk: &RowPk, snapshot: &[u8]) {
+        let metadata_cases = [
+            None,
+            Some(Jsonb::from_value(serde_json::Value::Null)),
+            Some(Jsonb::from_value(serde_json::json!({"z": [1, 2.5, "x"], "a": null}))),
+        ];
+        for metadata in &metadata_cases {
+            assert_eq!(
+                tracked_payload_semantic_fingerprint(
+                    schema_key,
+                    row_pk,
+                    Some(snapshot),
+                    metadata.as_ref()
+                )
+                .expect("fingerprint should compute"),
+                reference_fingerprint(schema_key, row_pk, Some(snapshot), metadata.as_ref()),
+                "fingerprint diverged for schema {schema_key} payload {snapshot:?}"
+            );
+        }
+    }
+
+    fn storage_payload(row: &lix_schema::Row) -> Vec<u8> {
+        crate::plugin::wire::typed::encode_native_row_payload(
+            &[7; 32],
+            &[lix_schema::Value::Text("placeholder".into())],
+            row,
+        )
+        .expect("storage payload encodes")
+    }
+
+    fn row_frame(fields: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut frame = (fields.len() as u32).to_le_bytes().to_vec();
+        for (name, value) in fields {
+            frame.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(value);
+        }
+        frame
+    }
+
+    fn storage_payload_from_frame(frame: &[u8]) -> Vec<u8> {
+        let mut payload = vec![crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION];
+        payload.extend_from_slice(&[7; 32]);
+        payload.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        payload.extend_from_slice(frame);
+        payload
+    }
+
+    fn jsonb_value_bytes(text: &str) -> Vec<u8> {
+        let mut bytes = vec![6];
+        bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn verbatim_fast_path_is_byte_identical_to_decode_reencode() {
+        use lix_schema::Value;
+        let row_pks = [
+            RowPk::single("plain-id"),
+            RowPk::single("ünïcødé ✓ key"),
+            RowPk::single(""),
+            RowPk::from_schema_values(&[Value::Uuid(uuid::Uuid::from_u128(0x1234_5678))]).unwrap(),
+            RowPk::from_schema_values(&[Value::Int8(-42)]).unwrap(),
+            RowPk::from_schema_values(&[
+                Value::Text("composite".into()),
+                Value::Int8(i64::MAX),
+                Value::Uuid(uuid::Uuid::from_u128(u128::MAX)),
+            ])
+            .unwrap(),
+        ];
+        let json = |value: serde_json::Value| Value::Jsonb(Jsonb::from_value(value));
+        let rows = [
+            lix_schema::Row::from([("id", Value::Text("x".into()))]),
+            lix_schema::Row::from([
+                ("a_null", Value::Null),
+                ("b_json_null", json(serde_json::Value::Null)),
+                ("c_text", Value::Text("héllo \"quoted\" \\ ✓".into())),
+                ("d_empty_text", Value::Text(String::new())),
+                ("e_uuid", Value::Uuid(uuid::Uuid::from_u128(99))),
+                ("f_int", Value::Int8(i64::MIN)),
+                ("g_float_zero", Value::Float8(0.0)),
+                ("h_float", Value::Float8(-1.25)),
+                ("i_float_big", Value::Float8(1e300)),
+                ("j_true", Value::Boolean(true)),
+                ("k_false", Value::Boolean(false)),
+                ("l_timestamp", Value::Timestamptz(1_700_000_000_000)),
+            ]),
+            lix_schema::Row::from([
+                ("declarations", json(serde_json::json!([{"type": "input-variable", "name": "name"}]))),
+                ("id", Value::Text("section1.key_1".into())),
+                (
+                    "pattern",
+                    json(serde_json::json!([{"type": "text", "value": "Hello "}, {"type": "expression", "arg": {"type": "variable-reference", "name": "name"}}])),
+                ),
+                ("numbers", json(serde_json::json!([0, -1, 2.5, 1e16, 10000000000000000_u64, 1e-7, u64::MAX, i64::MIN]))),
+                ("object", json(serde_json::json!({"z": {"nested": [true, false, null]}, "a": "\u{0001}\n\t"}))),
+                ("scalar_json_string", json(serde_json::json!("just text"))),
+                ("scalar_json_number", json(serde_json::json!(3.0))),
+            ]),
+        ];
+        let mut verbatim = 0;
+        for row_pk in &row_pks {
+            for row in &rows {
+                let snapshot = storage_payload(row);
+                assert_matches_reference("fingerprint_test", row_pk, &snapshot);
+                verbatim += usize::from(takes_verbatim_path(row_pk, &snapshot));
+            }
+        }
+        assert_eq!(
+            verbatim,
+            row_pks.len() * rows.len(),
+            "engine-encoded storage payloads should take the verbatim path"
+        );
+    }
+
+    #[test]
+    fn non_verbatim_payloads_fall_back_to_decode_reencode() {
+        let row_pk = RowPk::single("fallback-row");
+
+        // Built-in compact (and compressed) engine payloads.
+        let (_, builtin) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .unwrap();
+        for size in [3, 8192] {
+            let json = serde_json::json!({
+                "key": "fallback-row",
+                "value": {"text": "β".repeat(size), "nested": [true, null, 42]}
+            });
+            let compact = crate::row_payload::TypedRow::from_normalized_json(builtin, &row_pk, &json)
+                .unwrap()
+                .durable_payload()
+                .unwrap();
+            assert!(!takes_verbatim_path(&row_pk, &compact));
+            assert_matches_reference("lix_key_value", &row_pk, &compact);
+        }
+
+        // Legacy self-contained identity payload (version 2).
+        let row = lix_schema::Row::from([("id", lix_schema::Value::Text("fallback-row".into()))]);
+        let identity = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[7; 32],
+            &[lix_schema::Value::Text("fallback-row".into())],
+            &row,
+        )
+        .unwrap();
+        assert!(!takes_verbatim_path(&row_pk, &identity));
+        assert_matches_reference("fingerprint_test", &row_pk, &identity);
+
+        // Columns stored out of lexical order decode, but re-encode sorted.
+        let text = |value: &str| {
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+            bytes
+        };
+        let unsorted = storage_payload_from_frame(&row_frame(&[
+            ("b", &text("second")),
+            ("a", &text("first")),
+        ]));
+        let sorted = storage_payload_from_frame(&row_frame(&[
+            ("a", &text("first")),
+            ("b", &text("second")),
+        ]));
+        assert!(!takes_verbatim_path(&row_pk, &unsorted));
+        assert!(takes_verbatim_path(&row_pk, &sorted));
+        assert_matches_reference("fingerprint_test", &row_pk, &unsorted);
+        assert_eq!(
+            tracked_payload_semantic_fingerprint("fingerprint_test", &row_pk, Some(&unsorted), None)
+                .unwrap(),
+            tracked_payload_semantic_fingerprint("fingerprint_test", &row_pk, Some(&sorted), None)
+                .unwrap(),
+            "column order is not semantic"
+        );
+
+        // Accepted canonical JSONB text whose numbers the decoder re-renders.
+        let mut rerendered = 0;
+        for number in [
+            "100000000000000000000",
+            "1000000000000000000000000",
+            "123456789012345678901234567890",
+            "0.1",
+            "1e16",
+            "10000000000000000",
+        ] {
+            let text = format!("[{number}]");
+            if lix_schema::validate_canonical_json_text(text.as_bytes()).is_err() {
+                continue;
+            }
+            let payload =
+                storage_payload_from_frame(&row_frame(&[("value", &jsonb_value_bytes(&text))]));
+            let verbatim =
+                lix_schema::validate_verbatim_canonical_json_text(text.as_bytes()).is_ok();
+            assert_eq!(takes_verbatim_path(&row_pk, &payload), verbatim);
+            rerendered += usize::from(!verbatim);
+            assert_matches_reference("fingerprint_test", &row_pk, &payload);
+        }
+        assert!(rerendered > 0, "expected a re-rendered JSONB number spelling");
     }
 }
