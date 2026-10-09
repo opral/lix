@@ -170,6 +170,8 @@ where
     // diff; deleted keys remain in the point frontier but prove no locator.
     let mut selected_head_diff_change_ids =
         std::collections::BTreeSet::<crate::changelog::ChangeId>::new();
+    let mut working_diff_mutation_candidates =
+        Vec::<crate::hot_state::PreparedWorkingDiffMutationCandidates>::new();
     // The ordinary native recorder sees physical rows, but direct change
     // locators are derived from the change ID and therefore have no physical
     // row to observe. Retain the returned identities and close this logical
@@ -346,7 +348,7 @@ where
                 filter,
                 retain_payloads,
                 projected_columns,
-                limit: _,
+                limit,
             } => {
                 // Candidate warming remains limited to moving working diffs.
                 // Fixed historical spans are closed only for the exact
@@ -358,6 +360,13 @@ where
                 {
                     continue;
                 }
+                let is_working_diff = matches!(
+                    (from, to),
+                    (
+                        crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                        crate::hot_state::DiffInterestEndpoint::ActiveHead
+                    )
+                );
                 let from = super::partial_candidate_prepare::endpoint(
                     descriptor,
                     branch_id.as_deref(),
@@ -375,6 +384,10 @@ where
                     == Some(descriptor.selected_branch.branch_id.as_str())
                     && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
                     && descriptor.selected_branch.head.row_pk_index_root_id.is_some();
+                let collect_working_diff_candidates = collect_selected_head_keys
+                    && is_working_diff
+                    && !*retain_payloads
+                    && limit.is_none();
                 let prepared_diff = crate::sql2::prepare_native_diff_interest(
                     read.clone(),
                     relation,
@@ -387,10 +400,27 @@ where
                     projected_columns,
                     native_diff_budget.clone(),
                     collect_selected_head_keys,
+                    collect_working_diff_candidates,
                 )
                 .await?;
                 selected_head_diff_keys.extend(prepared_diff.selected_head_keys);
                 selected_head_diff_change_ids.extend(prepared_diff.visible_after_change_ids);
+                if let Some(diff) = prepared_diff.raw_working_diff_candidates
+                    && let Some(branch_id) = branch_id
+                {
+                    working_diff_mutation_candidates.push(
+                        crate::hot_state::PreparedWorkingDiffMutationCandidates {
+                            branch_id: branch_id.clone(),
+                            checkpoint_commit_id: from,
+                            head_commit_id: to,
+                            relation: relation.clone(),
+                            filter: filter.clone(),
+                            retain_payloads: *retain_payloads,
+                            projected_columns: projected_columns.clone(),
+                            diff,
+                        },
+                    );
+                }
             }
             LogicalReadInterest::History {
                 branch_id,
@@ -515,6 +545,7 @@ where
                             &request,
                             projected_columns,
                             native_diff_budget.clone(),
+                            false,
                             false,
                         )
                         .await?;
@@ -676,6 +707,7 @@ where
             interests,
             active_account_id,
             native_diff_budget,
+            &working_diff_mutation_candidates,
         )
         .await?;
     returned_identities.extend(executable_rows.iter().cloned());

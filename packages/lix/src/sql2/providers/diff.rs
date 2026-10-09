@@ -55,6 +55,10 @@ pub(crate) struct PreparedNativeDiffInputs {
     /// Change IDs proven visible at the exact after endpoint. These are
     /// metadata-only dependencies; the row-PK index is not a visibility proof.
     pub(crate) visible_after_change_ids: Vec<crate::changelog::ChangeId>,
+    /// Raw root-local candidates for one accepted working-diff recipe. This
+    /// operation-scoped handle lets mutation preparation reuse the exact
+    /// diff only after it rechecks the branch controls.
+    pub(crate) raw_working_diff_candidates: Option<Arc<TrackedStateDiff>>,
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -396,6 +400,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
             None,
+            false,
             false,
         )
         .await
@@ -904,13 +909,17 @@ where
                         direct_candidates,
                         needs_global_provenance,
                         relation.kind == DiffRelationKind::File,
+                        false,
                     )
                     .await;
                     let (diff, from_global_rows, to_global_rows) =
                         if mode == DiffMode::WorkingHot && !root_backed_working {
-                            effective_result.map_err(hot_only_diff_error)?
+                            let (diff, from, to, _) =
+                                effective_result.map_err(hot_only_diff_error)?;
+                            (diff, from, to)
                         } else {
-                            effective_result?
+                            let (diff, from, to, _) = effective_result?;
+                            (diff, from, to)
                         };
                     if route.request.retain_payloads {
                         diff.validate_live_payloads()
@@ -1384,16 +1393,18 @@ async fn effective_diff<S: StorageAdapterRead>(
     local_candidates: Option<TrackedStateDiff>,
     needs_global_provenance: bool,
     file_relation: bool,
+    capture_raw_working_diff_candidates: bool,
 ) -> Result<(
     TrackedStateDiff,
     HashSet<TrackedStateKey>,
     HashSet<TrackedStateKey>,
+    Option<Arc<TrackedStateDiff>>,
 )> {
     let hot_candidates = local_candidates.is_some();
     let resolve_effective_winners = needs_global_provenance
         || from_descriptor.base_commit_id.is_some()
         || to_descriptor.base_commit_id.is_some();
-    let local_candidates = match local_candidates {
+    let (local_candidates, raw_working_diff_candidates) = match local_candidates {
         // HOT already owns both payloads when each side has a live local row.
         // A pinned base cannot override either winner. Keep these snapshot-local
         // payloads, including on sparse replicas whose authored owners are cold.
@@ -1405,13 +1416,19 @@ async fn effective_diff<S: StorageAdapterRead>(
                             && entry.after.as_ref().is_some_and(|row| !row.deleted)
                     })) =>
         {
-            return Ok((diff, HashSet::new(), HashSet::new()));
+            return Ok((diff, HashSet::new(), HashSet::new(), None));
         }
-        Some(diff) => diff,
-        None => tracked
-            .diff_commits(from_commit_id, to_commit_id, request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?,
+        Some(diff) => (Arc::new(diff), None),
+        None => {
+            let diff = Arc::new(
+                tracked
+                    .diff_commits(from_commit_id, to_commit_id, request)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?,
+            );
+            let captured = capture_raw_working_diff_candidates.then(|| Arc::clone(&diff));
+            (diff, captured)
+        }
     };
     // A root-backed local live/live row is already the effective winner on
     // both sides: `effective_row` gives a local row priority over the pinned
@@ -1469,6 +1486,7 @@ async fn effective_diff<S: StorageAdapterRead>(
             TrackedStateDiff::from_entries(direct_local_entries.into_values().collect()),
             HashSet::new(),
             HashSet::new(),
+            raw_working_diff_candidates,
         ));
     }
     let projection = ChangeRecordProjection {
@@ -1562,7 +1580,12 @@ async fn effective_diff<S: StorageAdapterRead>(
     } else {
         TrackedStateDiff::from_entries(entries.into_values().collect())
     };
-    Ok((diff, from_global_rows, to_global_rows))
+    Ok((
+        diff,
+        from_global_rows,
+        to_global_rows,
+        raw_working_diff_candidates,
+    ))
 }
 
 fn can_partition_rooted_file_local_winners(

@@ -202,6 +202,7 @@ pub mod bench {
 pub(crate) use row_pk_index::{
     prepare_current_row_mutation_inputs, prepare_row_pk_index_mutation_inputs,
     prepare_row_pk_mutation_inputs_at_commit,
+    prepare_row_pk_mutation_inputs_at_commit_from_diff,
 };
 
 // Exact canonical payload authority for current-row edit preparation.
