@@ -251,6 +251,100 @@ impl Drop for WasmSnapshotExport {
     }
 }
 
+/// One open `lix.stream()` read. Pulls are serialized: `next()` takes the
+/// engine stream for the duration of one page, so a second concurrent call
+/// fails instead of interleaving pages. `cancel()` and dropping the object
+/// release the stream's read snapshot.
+#[wasm_bindgen]
+pub struct WasmQueryStream {
+    inner: RefCell<Option<lix::QueryStream>>,
+    finished: Cell<bool>,
+    next_abort: RefCell<Option<AbortHandle>>,
+}
+
+impl WasmQueryStream {
+    pub(crate) fn new(stream: lix::QueryStream) -> Self {
+        Self {
+            inner: RefCell::new(Some(stream)),
+            finished: Cell::new(false),
+            next_abort: RefCell::new(None),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl WasmQueryStream {
+    /// Resolves the next page (an execute result), or `undefined` once the
+    /// stream is exhausted or cancelled.
+    #[wasm_bindgen]
+    pub async fn next(&self) -> Result<JsValue, JsValue> {
+        if self.finished.get() {
+            return Ok(JsValue::UNDEFINED);
+        }
+        let mut stream = self.inner.borrow_mut().take().ok_or_else(|| {
+            lix_error_to_js(
+                LixError::new(
+                    "LIX_ERROR_QUERY_STREAM_NEXT_IN_FLIGHT",
+                    "QueryStream.next() is already in flight",
+                )
+                .with_hint("Await the pending next() call before calling next() again."),
+            )
+        })?;
+        let (abort, registration) = AbortHandle::new_pair();
+        self.next_abort.borrow_mut().replace(abort);
+        let result = Abortable::new(stream.next_page(), registration).await;
+        self.next_abort.borrow_mut().take();
+        let page = match result {
+            Ok(Ok(Some(page))) if !self.finished.get() => page,
+            Ok(Err(error)) if !self.finished.get() => {
+                self.finished.set(true);
+                return Err(lix_error_to_js(error));
+            }
+            // Exhausted, cancelled while pulling, or aborted: dropping the
+            // stream here releases its snapshot.
+            Ok(_) | Err(_) => {
+                self.finished.set(true);
+                stream.cancel();
+                return Ok(JsValue::UNDEFINED);
+            }
+        };
+        self.inner.borrow_mut().replace(stream);
+        execute_result_to_js(page)
+    }
+
+    /// Ends the stream and releases its read snapshot. An in-flight `next()`
+    /// resolves `undefined`.
+    #[wasm_bindgen]
+    pub fn cancel(&self) {
+        self.finished.set(true);
+        if let Some(abort) = self.next_abort.borrow_mut().take() {
+            abort.abort();
+        }
+        if let Some(mut stream) = self.inner.borrow_mut().take() {
+            stream.cancel();
+        }
+    }
+}
+
+pub(super) fn stream_page_bytes_from_js(
+    options: Option<JsValue>,
+) -> Result<Option<usize>, JsValue> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StreamOptionsDto {
+        page_bytes: Option<u64>,
+    }
+    let Some(options) = options.filter(|value| !value.is_undefined() && !value.is_null()) else {
+        return Ok(None);
+    };
+    let options: StreamOptionsDto = from_js(options)?;
+    // The engine validates the accepted range; saturate so oversized values
+    // reach that validation instead of wrapping.
+    Ok(options
+        .page_bytes
+        .map(|page_bytes| usize::try_from(page_bytes).unwrap_or(usize::MAX)))
+}
+
 enum WasmSnapshotInputMessage {
     Chunk(Vec<u8>),
     Done,

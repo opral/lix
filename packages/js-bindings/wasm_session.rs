@@ -26,6 +26,29 @@ macro_rules! wasm_session_methods {
                 crate::wasm::execute_result_to_js(result)
             }
 
+            /// Opens a read stream. Planning errors reject here; rows arrive
+            /// through the returned stream's `next()`.
+            #[wasm_bindgen(js_name = stream)]
+            pub async fn stream(
+                &self,
+                sql: String,
+                params: JsValue,
+                options: Option<JsValue>,
+            ) -> Result<crate::wasm::WasmQueryStream, JsValue> {
+                let params = crate::wasm::values_from_js(params)?;
+                let page_bytes = crate::wasm::stream_page_bytes_from_js(options)?;
+                let stream = self
+                    .instrument_operation(crate::session::SessionOperations::query_stream(
+                        &self.inner,
+                        &sql,
+                        &params,
+                        page_bytes,
+                    ))
+                    .await
+                    .map_err(crate::wasm::lix_error_to_js)?;
+                Ok(crate::wasm::WasmQueryStream::new(stream))
+            }
+
             #[wasm_bindgen(js_name = executeBatch)]
             pub async fn execute_batch(
                 &self,

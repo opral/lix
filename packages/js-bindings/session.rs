@@ -33,6 +33,14 @@ pub(crate) trait SessionOperations: Sized {
     async fn begin_transaction(&self) -> Result<Self::Transaction, LixError>;
     async fn observe(&self, sql: &str, params: &[Value]) -> Result<Self::Observation, LixError>;
     async fn export_snapshot(&self) -> Result<Self::Snapshot, LixError>;
+    /// Streams one read statement in byte-bounded pages; `None` keeps the
+    /// engine's default page size.
+    async fn query_stream(
+        &self,
+        sql: &str,
+        params: &[Value],
+        page_bytes: Option<usize>,
+    ) -> Result<lix::QueryStream, LixError>;
     async fn close(&self) -> Result<(), LixError>;
     async fn execute(
         &self,
@@ -97,6 +105,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
 
     async fn export_snapshot(&self) -> Result<Self::Snapshot, LixError> {
         Ok(Lix::export_snapshot(self))
+    }
+
+    async fn query_stream(
+        &self,
+        sql: &str,
+        params: &[Value],
+        page_bytes: Option<usize>,
+    ) -> Result<lix::QueryStream, LixError> {
+        let stream = Lix::query_stream(self, sql, params);
+        match page_bytes {
+            Some(page_bytes) => stream.with_page_bytes(page_bytes).await,
+            None => stream.await,
+        }
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -309,6 +330,17 @@ mod remote {
 
         async fn export_snapshot(&self) -> Result<Self::Snapshot, LixError> {
             ClientCore::export_snapshot(self).await
+        }
+
+        async fn query_stream(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+            _page_bytes: Option<usize>,
+        ) -> Result<lix::QueryStream, LixError> {
+            // Remote reads run behind the protocol's buffered execute; a
+            // stream would need a server-held snapshot spanning requests.
+            Err(ClientCore::unsupported(self, "stream"))
         }
 
         async fn close(&self) -> Result<(), LixError> {

@@ -113,6 +113,13 @@ pub struct NativeExecuteOptions {
 }
 
 #[napi(object)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeQueryStreamOptions {
+    #[napi(js_name = "pageBytes")]
+    pub page_bytes: Option<u32>,
+}
+
+#[napi(object)]
 #[derive(Debug)]
 pub struct NativeOpenAnotherSessionOptions {
     #[napi(js_name = "branchId")]
@@ -374,6 +381,12 @@ enum LixCommand {
         params: Vec<Value>,
         telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeDeferred<NativeObserveEvents>,
+    },
+    QueryStream {
+        sql: String,
+        params: Vec<Value>,
+        page_bytes: Option<usize>,
+        deferred: NativeDeferred<NativeQueryStream>,
     },
     TransactionExecute {
         transaction_id: u64,
@@ -1012,6 +1025,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
                 deferred.reject(to_napi_error(&error))
             }
             LixCommand::Observe { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::QueryStream { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::TransactionExecute { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
             }
@@ -1222,6 +1236,24 @@ fn handle_lix_command(
             settle_deferred(deferred, result);
             None
         }
+        LixCommand::QueryStream {
+            sql,
+            params,
+            page_bytes,
+            deferred,
+        } => {
+            // Opening plans the statement and pins its snapshot on the actor;
+            // pulls then run on the stream's own thread, so an open stream
+            // never occupies the actor between pages.
+            let result =
+                block_on!(state.lix.query_stream(&sql, &params, page_bytes)).and_then(|stream| {
+                    NativeQueryStream::new(stream).map_err(|error| {
+                        LixError::unknown(format!("failed to start query stream actor: {error}"))
+                    })
+                });
+            settle_deferred(deferred, result);
+            None
+        }
         LixCommand::TransactionExecute {
             transaction_id,
             sql,
@@ -1392,6 +1424,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Observe { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::QueryStream { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::ExportSnapshot { sender, completion } => {
             let _ = sender.send_blocking(NativeSnapshotMessage::Error(lix_closed_error()));
             completion.finish();
@@ -1551,6 +1586,22 @@ impl NativeLixInner {
             Self::FilesystemStorage(lix, _, _) => Ok(NativeObserveEventsInner::FilesystemStorage(
                 crate::session::SessionOperations::observe(lix, sql, params).await?,
             )),
+        }
+    }
+
+    async fn query_stream(
+        &self,
+        sql: &str,
+        params: &[Value],
+        page_bytes: Option<usize>,
+    ) -> std::result::Result<lix::QueryStream, LixError> {
+        match self {
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::query_stream(lix, sql, params, page_bytes).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::query_stream(lix, sql, params, page_bytes).await
+            }
         }
     }
 
@@ -2388,6 +2439,39 @@ impl NativeLix {
         Ok(promise)
     }
 
+    /// Opens a read stream; planning errors reject. Rows arrive through the
+    /// resolved stream's `next()`.
+    #[napi]
+    pub fn stream<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeQueryStreamOptions>,
+    ) -> Result<Object<'env>> {
+        let params = match params {
+            Some(params) => params
+                .into_iter()
+                .map(Value::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| throw_lix_error(env, error))?,
+            None => Vec::new(),
+        };
+        let page_bytes = options
+            .and_then(|options| options.page_bytes)
+            .map(|page_bytes| usize::try_from(page_bytes).unwrap_or(usize::MAX));
+        let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::QueryStream {
+                sql,
+                params,
+                page_bytes,
+                deferred,
+            });
+        Ok(promise)
+    }
+
     #[napi(js_name = "beginTransaction")]
     pub fn begin_transaction<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
         let transaction_id = self.actor.next_transaction_id();
@@ -2885,6 +2969,165 @@ fn close_observe_events(
     }
     let _ = close_signal.send(true);
     let _ = commands.send(ObserveCommand::Close);
+}
+
+/// One open `lix.stream()` read with its own pull thread. Pulls queue in
+/// call order; `cancel()` resolves once the stream released its snapshot.
+#[expect(missing_debug_implementations)]
+#[napi(js_name = "QueryStream")]
+pub struct NativeQueryStream {
+    commands: Sender<QueryStreamCommand>,
+    cancelled: Arc<AtomicBool>,
+    cancel_signal: watch::Sender<bool>,
+    completion: Arc<NativeObserveCompletion>,
+}
+
+type QueryStreamNextResult = std::result::Result<Option<RsExecuteResult>, LixError>;
+type QueryStreamNextDeferred = NativeDeferred<Option<ExecuteResult>>;
+
+enum QueryStreamCommand {
+    Next(QueryStreamNextDeferred),
+    Cancel,
+}
+
+#[napi]
+impl NativeQueryStream {
+    fn new(stream: lix::QueryStream) -> Result<Self> {
+        let (commands, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (cancel_signal, actor_cancel_signal) = watch::channel(false);
+        let completion = Arc::new(NativeObserveCompletion::default());
+        let actor_cancelled = Arc::clone(&cancelled);
+        let actor_completion = Arc::clone(&completion);
+        thread::Builder::new()
+            .name("lix-query-stream".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+            .spawn(move || {
+                run_query_stream_actor(
+                    stream,
+                    receiver,
+                    actor_cancelled,
+                    actor_cancel_signal,
+                    actor_completion,
+                );
+            })
+            .map_err(to_napi_error)?;
+        Ok(Self {
+            commands,
+            cancelled,
+            cancel_signal,
+            completion,
+        })
+    }
+
+    /// Resolves the next page, or `null` once the stream is exhausted or
+    /// cancelled.
+    #[napi]
+    pub fn next<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (QueryStreamNextDeferred, Object<'env>) = env.create_deferred()?;
+        if self.cancelled.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Ok(None));
+            return Ok(promise);
+        }
+        if let Err(error) = self.commands.send(QueryStreamCommand::Next(deferred)) {
+            let QueryStreamCommand::Next(deferred) = error.0 else {
+                unreachable!("next() only sends QueryStreamCommand::Next");
+            };
+            settle_deferred(deferred, Ok(None));
+        }
+        Ok(promise)
+    }
+
+    /// Ends the stream; resolves once its read snapshot is released.
+    #[napi]
+    pub fn cancel<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.completion.register(deferred);
+        cancel_query_stream(&self.commands, &self.cancelled, &self.cancel_signal);
+        Ok(promise)
+    }
+}
+
+impl Drop for NativeQueryStream {
+    fn drop(&mut self) {
+        cancel_query_stream(&self.commands, &self.cancelled, &self.cancel_signal);
+    }
+}
+
+fn cancel_query_stream(
+    commands: &Sender<QueryStreamCommand>,
+    cancelled: &AtomicBool,
+    cancel_signal: &watch::Sender<bool>,
+) {
+    if cancelled.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = cancel_signal.send(true);
+    let _ = commands.send(QueryStreamCommand::Cancel);
+}
+
+fn run_query_stream_actor(
+    mut stream: lix::QueryStream,
+    receiver: mpsc::Receiver<QueryStreamCommand>,
+    cancelled: Arc<AtomicBool>,
+    mut cancel_signal: watch::Receiver<bool>,
+    completion: Arc<NativeObserveCompletion>,
+) {
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(error) => {
+            cancelled.store(true, Ordering::SeqCst);
+            drop(stream);
+            for command in receiver.try_iter() {
+                if let QueryStreamCommand::Next(deferred) = command {
+                    deferred.reject(to_napi_error(&error));
+                }
+            }
+            completion.finish();
+            return;
+        }
+    };
+    while let Ok(command) = receiver.recv() {
+        let QueryStreamCommand::Next(deferred) = command else {
+            break;
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Ok(None));
+            break;
+        }
+        let result: QueryStreamNextResult = rt.block_on(async {
+            tokio::select! {
+                page = stream.next_page() => page,
+                _ = cancel_signal.changed() => Ok(None),
+            }
+        });
+        let result = if cancelled.load(Ordering::SeqCst) {
+            Ok(None)
+        } else {
+            result
+        };
+        let terminal = !matches!(result, Ok(Some(_)));
+        if terminal {
+            // Release the snapshot before the caller observes the end.
+            cancelled.store(true, Ordering::SeqCst);
+            stream.cancel();
+        }
+        settle_deferred(
+            deferred,
+            result.and_then(|page| page.map(ExecuteResult::try_from).transpose()),
+        );
+        if terminal {
+            break;
+        }
+    }
+    cancelled.store(true, Ordering::SeqCst);
+    drop(stream);
+    for command in receiver.try_iter() {
+        if let QueryStreamCommand::Next(deferred) = command {
+            settle_deferred(deferred, Ok(None));
+        }
+    }
+    completion.finish();
 }
 
 impl NativeLix {
