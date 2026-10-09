@@ -151,6 +151,7 @@ struct ImmutableValueStore {
     object_store: Arc<dyn ObjectStore>,
     prefix: ObjectPath,
     cache: Option<ImmutableValueCache>,
+    exact_ranges: bool,
     counters: Option<SlateDBIoCounters>,
     process_segments: Arc<AsyncMutex<HashSet<Key>>>,
 }
@@ -166,9 +167,16 @@ impl ImmutableValueStore {
             object_store,
             prefix: ObjectPath::from(join_db_path(db_path, IMMUTABLE_VALUE_PATH)),
             cache: cache.map(|options| ImmutableValueCache::new(options, counters.clone())),
+            exact_ranges: false,
             counters,
             process_segments: Arc::new(AsyncMutex::new(HashSet::new())),
         }
+    }
+
+    fn exact_range_reader(&self) -> Self {
+        let mut reader = self.clone();
+        reader.exact_ranges = true;
+        reader
     }
 
     fn location(&self, key: &Key) -> Result<ObjectPath, StorageError> {
@@ -267,13 +275,14 @@ impl ImmutableValueStore {
                 let store = Arc::clone(&self.object_store);
                 let location = self.location(&segment_key);
                 let cache = self.cache.clone();
+                let exact_ranges = self.exact_ranges;
                 async move {
                     let location = location?;
                     let requested_ranges = requests
                         .iter()
                         .map(|(_, range)| range.clone())
                         .collect::<Vec<_>>();
-                    let plan = if cache.is_some() {
+                    let plan = if cache.is_some() && !exact_ranges {
                         plan_immutable_extents(&requested_ranges, segment_len)?
                     } else {
                         plan_coalesced_immutable_ranges(&requested_ranges, segment_len)?
@@ -285,7 +294,7 @@ impl ImmutableValueStore {
                             async move {
                                 let cache_key = immutable_range_cache_key(&segment_key, &range)?;
                                 let value = match &cache {
-                                    Some(cache) => cache.get(&cache_key).await,
+                                    Some(cache) => cache.get(&cache_key, range.len()).await,
                                     None => None,
                                 };
                                 Ok::<_, StorageError>((span_index, range, cache_key, value))
@@ -312,7 +321,7 @@ impl ImmutableValueStore {
                         fetch_guards = cache.lock_fetches(&cache_keys).await;
                         let mut locked_misses = Vec::with_capacity(misses.len());
                         for (span_index, range, cache_key) in misses {
-                            if let Some(value) = cache.get(&cache_key).await {
+                            if let Some(value) = cache.get(&cache_key, range.len()).await {
                                 spans[span_index] = Some(value);
                             } else {
                                 locked_misses.push((span_index, range, cache_key));
@@ -683,7 +692,13 @@ impl ImmutableValueCache {
         )
     }
 
-    async fn get(&self, key: &Key) -> Option<Bytes> {
+    async fn get(&self, key: &Key, expected_bytes: usize) -> Option<Bytes> {
+        let encoded_bytes = expected_bytes
+            .checked_add(IMMUTABLE_CACHE_VALUE_MAGIC.len())?
+            .checked_add(32)?;
+        if encoded_bytes > self.max_bytes {
+            return None;
+        }
         if let Some(counters) = &self.counters {
             counters
                 .inner
@@ -691,11 +706,27 @@ impl ImmutableValueCache {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let path = self.path(key)?;
-        let cached = tokio::task::spawn_blocking(move || std::fs::read(path).ok().map(Bytes::from))
-            .await
-            .ok()
-            .flatten()?;
-        if let Some(value) = decode_immutable_cache_value(cached) {
+        let cached = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+
+            let mut file = std::fs::File::open(path).ok()?;
+            if file.metadata().ok()?.len() != u64::try_from(encoded_bytes).ok()? {
+                return None;
+            }
+            // The authoritative range was admitted before cache access. Keep
+            // allocation fixed even if the file grows after the size check.
+            let mut value = vec![0; encoded_bytes];
+            file.read_exact(&mut value).ok()?;
+            let mut trailing = [0];
+            if file.read(&mut trailing).ok()? != 0 {
+                return None;
+            }
+            Some(Bytes::from(value))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(value) = cached.and_then(decode_immutable_cache_value) {
             return Some(value);
         }
         self.remove(key).await;
@@ -3378,8 +3409,7 @@ impl StorageRead for SlateDBRead {
             .await?;
         // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
         // operation. Exact ranges retain the existing shared/coalesced loader.
-        let mut exact_store = self.immutable_value_store.clone();
-        exact_store.cache = None;
+        let exact_store = self.immutable_value_store.exact_range_reader();
         hydrate_immutable_value_gets(&self.worker, &exact_store, requests, &mut results).await?;
         budget.validate_result(&results)?;
         Ok(GetManyResult::new(results))
@@ -3426,8 +3456,7 @@ impl StorageRead for SlateDBRead {
             .await?;
         // Avoid the ordinary 8MiB cache-extent overfetch in a byte-admitted
         // operation. Exact ranges retain the existing shared/coalesced loader.
-        let mut exact_store = self.immutable_value_store.clone();
-        exact_store.cache = None;
+        let exact_store = self.immutable_value_store.exact_range_reader();
         let (admitted_requests, _) =
             lix::storage::bounded_prefix_requests(requests, 0, results.len().max(1))?;
         hydrate_immutable_value_gets(&self.worker, &exact_store, &admitted_requests, &mut results)
@@ -3583,8 +3612,7 @@ impl StorageScanSource for SlateDBScanSource {
                 .await?;
             self.state = Some(state);
             let (mut entries, more) = chunk.into_parts();
-            let mut exact_store = self.immutable_value_store.clone();
-            exact_store.cache = None;
+            let exact_store = self.immutable_value_store.exact_range_reader();
             hydrate_immutable_value_scan(
                 &self.worker,
                 &exact_store,
@@ -8403,6 +8431,341 @@ mod tests {
         assert_eq!(cached.values, vec![Some(ProjectedValue::FullValue(value))]);
     }
 
+    #[tokio::test]
+    async fn bounded_immutable_reads_reuse_exact_ranges_and_repair_bad_cache_files() {
+        const MIB: usize = 1024 * 1024;
+        let directory = tempfile::tempdir().expect("create bounded exact-range cache");
+        let cache_root = directory.path().join("object-cache");
+        let remote = Arc::new(InMemory::new());
+        let object_store = Arc::new(BlockingStore::new(remote.clone()));
+        object_store.set_immutable_range_delay(Duration::from_millis(30));
+        let counters = SlateDBIoCounters::default();
+        let db_path = "bounded-exact-immutable-cache";
+        let storage = SlateDB::open_object_store_with_options_and_io_counters(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions {
+                cache: Some(SlateDBCacheOptions {
+                    root_folder: cache_root.clone(),
+                    max_disk_cache_bytes: 32 * 1024 * 1024,
+                    block_cache_bytes: 0,
+                    metadata_cache_bytes: 0,
+                    max_open_file_handles: 1000,
+                }),
+            },
+            counters.clone(),
+        )
+        .expect("open bounded exact-range storage");
+
+        // One 12 MiB sidecar makes aligned 8 MiB extents observably larger
+        // than the two exact values requested below.
+        let keys = (0..12)
+            .map(|index| Key(Bytes::from(format!("bounded-cache-{index:02}"))))
+            .collect::<Vec<_>>();
+        let values = (0..12)
+            .map(|index| Bytes::from(vec![index as u8 + 1; MIB]))
+            .collect::<Vec<_>>();
+        let mut write = storage
+            .begin_write(Default::default())
+            .await
+            .expect("begin immutable cache seed");
+        write
+            .put_many(
+                TEST_IMMUTABLE_SPACE,
+                PutBatch {
+                    entries: keys
+                        .iter()
+                        .cloned()
+                        .zip(values.iter().cloned())
+                        .map(|(key, bytes)| PutEntry {
+                            key,
+                            value: StoredValue { bytes },
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("stage immutable cache seed");
+        write.commit().await.expect("commit immutable cache seed");
+        storage.flush().await.expect("flush immutable cache seed");
+
+        let read = storage
+            .begin_read(Default::default())
+            .await
+            .expect("begin bounded immutable cache read");
+        let requested_keys = [keys[0].clone(), keys[6].clone()];
+        let requested_values = [values[0].clone(), values[6].clone()];
+        let request = [GetManyRequest {
+            space: TEST_IMMUTABLE_SPACE,
+            keys: &requested_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }];
+        let budget = lix::storage::ReadBudget {
+            max_result_bytes: 2 * MIB,
+            max_single_value_bytes: MIB,
+        };
+
+        // Byte admission rejects before touching either immutable cache or
+        // origin storage, even when a valid cached value might exist.
+        object_store.reset_immutable_range_profile();
+        let cache_reads_before = counters.snapshot().cache_filesystem_reads;
+        let too_small = [GetManyRequest {
+            space: TEST_IMMUTABLE_SPACE,
+            keys: std::slice::from_ref(&keys[0]),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }];
+        assert!(matches!(
+            read.get_many_bounded(
+                &too_small,
+                lix::storage::ReadBudget {
+                    max_result_bytes: MIB,
+                    max_single_value_bytes: MIB - 1,
+                },
+            )
+            .await,
+            Err(StorageError::ReadBudgetExceeded { singleton: true })
+        ));
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+        assert_eq!(
+            counters.snapshot().cache_filesystem_reads,
+            cache_reads_before,
+            "rejected values must not probe the disk cache"
+        );
+
+        let expected = requested_values
+            .iter()
+            .cloned()
+            .map(|value| Some(ProjectedValue::FullValue(value)))
+            .collect::<Vec<_>>();
+        object_store.reset_immutable_range_profile();
+        let cold_started = Instant::now();
+        let cold = read
+            .get_many_bounded(&request, budget)
+            .await
+            .expect("cold bounded immutable read");
+        let cold_elapsed = cold_started.elapsed();
+        assert_eq!(cold.values, expected);
+        let exact_range_bytes = 2 * (MIB + 16) as u64;
+        assert_eq!(
+            object_store.immutable_range_profile(),
+            (1, exact_range_bytes),
+            "cold bounded read must fetch only the requested framed value ranges"
+        );
+        assert!(
+            exact_range_bytes < IMMUTABLE_CACHE_EXTENT_BYTES as u64,
+            "the fixture must distinguish exact ranges from an aligned 8 MiB extent"
+        );
+
+        // Matched warm runs use the same live SlateDB snapshot and values.
+        // This is a delayed in-memory object-store profile, not a wall-time
+        // performance assertion; the invariant is zero additional origin I/O.
+        let mut warm_micros = Vec::new();
+        for _ in 0..4 {
+            object_store.reset_immutable_range_profile();
+            let started = Instant::now();
+            let warm = read
+                .get_many_bounded(&request, budget)
+                .await
+                .expect("warm bounded immutable read");
+            warm_micros.push(started.elapsed().as_micros());
+            assert_eq!(warm.values, expected);
+            assert_eq!(object_store.immutable_range_profile(), (0, 0));
+        }
+
+        // Duplicate slots count independently against response admission,
+        // while hydration still reuses the two unique immutable ranges.
+        let duplicate_keys = [keys[0].clone(), keys[6].clone(), keys[0].clone()];
+        let duplicate_request = [GetManyRequest {
+            space: TEST_IMMUTABLE_SPACE,
+            keys: &duplicate_keys,
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }];
+        let cache_reads_before = counters.snapshot().cache_filesystem_reads;
+        object_store.reset_immutable_range_profile();
+        assert!(matches!(
+            read.get_many_bounded(
+                &duplicate_request,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 2 * MIB,
+                    max_single_value_bytes: MIB,
+                },
+            )
+            .await,
+            Err(StorageError::ReadBudgetExceeded { singleton: false })
+        ));
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+        assert_eq!(
+            counters.snapshot().cache_filesystem_reads,
+            cache_reads_before,
+            "duplicate slots must be admitted before cache probes"
+        );
+        let duplicate = read
+            .get_many_bounded(
+                &duplicate_request,
+                lix::storage::ReadBudget {
+                    max_result_bytes: 3 * MIB,
+                    max_single_value_bytes: MIB,
+                },
+            )
+            .await
+            .expect("admit duplicate slots within their logical result budget");
+        assert_eq!(
+            duplicate.values,
+            vec![
+                Some(ProjectedValue::FullValue(values[0].clone())),
+                Some(ProjectedValue::FullValue(values[6].clone())),
+                Some(ProjectedValue::FullValue(values[0].clone())),
+            ]
+        );
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+
+        object_store.reset_immutable_range_profile();
+        let prefix = read
+            .get_many_bounded_prefix(&request, 0, 2, budget)
+            .await
+            .expect("warm bounded immutable prefix");
+        assert_eq!(prefix.values, expected);
+        assert_eq!(prefix.next_offset, None);
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+
+        object_store.reset_immutable_range_profile();
+        let mut scan = read
+            .begin_scan(
+                TEST_IMMUTABLE_SPACE,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                BeginScanOptions::default(),
+            )
+            .await
+            .expect("begin warm bounded immutable scan");
+        let (scan_page, has_more) = scan
+            .next_page_bounded(
+                1,
+                lix::storage::ReadBudget {
+                    max_result_bytes: MIB,
+                    max_single_value_bytes: MIB,
+                },
+            )
+            .await
+            .expect("read warm bounded immutable scan page")
+            .into_parts();
+        assert!(has_more);
+        assert_eq!(scan_page.len(), 1);
+        assert_eq!(scan_page[0].key, keys[0]);
+        assert_eq!(
+            scan_page[0].value,
+            ProjectedValue::FullValue(values[0].clone())
+        );
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+
+        let cache_directory = cache_root.join(IMMUTABLE_VALUE_CACHE_PATH);
+        let cache_paths = std::fs::read_dir(&cache_directory)
+            .expect("list exact-range cache entries")
+            .map(|entry| entry.expect("read exact-range cache entry").path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(cache_paths.len(), 2, "each exact span gets one cache entry");
+
+        // Digest corruption and a truncated encoded entry both become soft
+        // misses, are fetched from the origin, and are repaired in place.
+        for path in &cache_paths {
+            let mut cached = std::fs::read(path).expect("read exact-range cache entry");
+            *cached.last_mut().expect("cache entry contains a payload") ^= 0x80;
+            std::fs::write(path, cached).expect("corrupt cached range digest");
+        }
+        object_store.reset_immutable_range_profile();
+        let repaired_corrupt = read
+            .get_many_bounded(&request, budget)
+            .await
+            .expect("repair corrupt exact-range cache entries");
+        assert_eq!(repaired_corrupt.values, expected);
+        assert_eq!(
+            object_store.immutable_range_profile(),
+            (1, exact_range_bytes)
+        );
+
+        for path in &cache_paths {
+            let length = std::fs::metadata(path)
+                .expect("stat repaired cache entry")
+                .len();
+            assert!(length > 1);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open cache entry for truncation")
+                .set_len(length - 1)
+                .expect("truncate encoded cache entry");
+        }
+        object_store.reset_immutable_range_profile();
+        let repaired_truncated = read
+            .get_many_bounded(&request, budget)
+            .await
+            .expect("repair truncated exact-range cache entries");
+        assert_eq!(repaired_truncated.values, expected);
+        assert_eq!(
+            object_store.immutable_range_profile(),
+            (1, exact_range_bytes)
+        );
+
+        // A sparse, oversized cache file is rejected from its metadata before
+        // the reader allocates its contents, then replaced by an exact fetch.
+        for path in &cache_paths {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open cache entry for sparse extension")
+                .set_len(64 * 1024 * 1024)
+                .expect("extend cache entry as a sparse file");
+        }
+        object_store.reset_immutable_range_profile();
+        let repaired_oversized = read
+            .get_many_bounded(&request, budget)
+            .await
+            .expect("repair oversized sparse exact-range cache entries");
+        assert_eq!(repaired_oversized.values, expected);
+        assert_eq!(
+            object_store.immutable_range_profile(),
+            (1, exact_range_bytes)
+        );
+
+        // Once repaired, the same exact ranges remain usable after their
+        // authoritative immutable segment object is unavailable.
+        let immutable_prefix = ObjectPath::from(join_db_path(db_path, IMMUTABLE_VALUE_PATH));
+        let remote_segments = remote
+            .list(Some(&immutable_prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list immutable segment objects");
+        assert!(!remote_segments.is_empty());
+        for segment in remote_segments {
+            remote
+                .delete(&segment.location)
+                .await
+                .expect("remove immutable segment after cache repair");
+        }
+        object_store.reset_immutable_range_profile();
+        let after_remote_removal = read
+            .get_many_bounded(&request, budget)
+            .await
+            .expect("read exact ranges from warm cache after origin removal");
+        assert_eq!(after_remote_removal.values, expected);
+        assert_eq!(object_store.immutable_range_profile(), (0, 0));
+
+        eprintln!(
+            "bounded exact-range cache profile: cold={}us remote_ranges=1 remote_bytes={} warm_us={warm_micros:?} warm_remote_ranges=0 same_values=true",
+            cold_elapsed.as_micros(),
+            exact_range_bytes,
+        );
+    }
+
     #[test]
     fn configured_immutable_value_cache_prunes_to_its_byte_bound() {
         let directory = tempfile::tempdir().expect("create bounded immutable chunk cache");
@@ -10422,6 +10785,9 @@ mod tests {
         block_reads: Arc<AtomicBool>,
         block_compacted_reads: Arc<AtomicBool>,
         reads: Arc<OperationBlock>,
+        immutable_range_delay_ms: Arc<AtomicU64>,
+        immutable_range_reads: Arc<AtomicU64>,
+        immutable_range_bytes: Arc<AtomicU64>,
         block_immutable_lists: Arc<AtomicBool>,
         fail_immutable_lists: Arc<AtomicBool>,
         lists: Arc<OperationBlock>,
@@ -10438,6 +10804,9 @@ mod tests {
                 block_reads: Arc::new(AtomicBool::new(false)),
                 block_compacted_reads: Arc::new(AtomicBool::new(false)),
                 reads: Arc::new(OperationBlock::default()),
+                immutable_range_delay_ms: Arc::new(AtomicU64::new(0)),
+                immutable_range_reads: Arc::new(AtomicU64::new(0)),
+                immutable_range_bytes: Arc::new(AtomicU64::new(0)),
                 block_immutable_lists: Arc::new(AtomicBool::new(false)),
                 fail_immutable_lists: Arc::new(AtomicBool::new(false)),
                 lists: Arc::new(OperationBlock::default()),
@@ -10464,6 +10833,25 @@ mod tests {
             OperationBlockGuard::arm(
                 Arc::clone(&self.block_compacted_reads),
                 Arc::clone(&self.reads),
+            )
+        }
+
+        fn set_immutable_range_delay(&self, delay: Duration) {
+            self.immutable_range_delay_ms.store(
+                delay.as_millis().min(u64::MAX as u128) as u64,
+                Ordering::Release,
+            );
+        }
+
+        fn reset_immutable_range_profile(&self) {
+            self.immutable_range_reads.store(0, Ordering::Release);
+            self.immutable_range_bytes.store(0, Ordering::Release);
+        }
+
+        fn immutable_range_profile(&self) -> (u64, u64) {
+            (
+                self.immutable_range_reads.load(Ordering::Acquire),
+                self.immutable_range_bytes.load(Ordering::Acquire),
             )
         }
 
@@ -10497,6 +10885,12 @@ mod tests {
         }
 
         async fn maybe_block_read(&self, location: &ObjectPath) {
+            if location.as_ref().contains(IMMUTABLE_VALUE_PATH) {
+                let delay_ms = self.immutable_range_delay_ms.load(Ordering::Acquire);
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
             let is_sst = location
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"));
@@ -10640,6 +11034,15 @@ mod tests {
             location: &ObjectPath,
             ranges: &[Range<u64>],
         ) -> ObjectStoreResult<Vec<Bytes>> {
+            if location.as_ref().contains(IMMUTABLE_VALUE_PATH) {
+                self.immutable_range_reads.fetch_add(1, Ordering::AcqRel);
+                let bytes = ranges
+                    .iter()
+                    .map(|range| range.end.saturating_sub(range.start))
+                    .sum::<u64>();
+                self.immutable_range_bytes
+                    .fetch_add(bytes, Ordering::AcqRel);
+            }
             self.maybe_block_read(location).await;
             self.inner.get_ranges(location, ranges).await
         }
