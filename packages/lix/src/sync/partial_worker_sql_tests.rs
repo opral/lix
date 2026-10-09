@@ -2,8 +2,8 @@ use super::*;
 use crate::sync::http::{HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse};
 use crate::sync::{SyncPushRequest, SyncTransportFuture};
 use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[derive(Clone)]
@@ -14,7 +14,7 @@ pub(super) struct AuthorityClient {
     pub(super) metadata: Arc<AtomicUsize>,
     pub(super) first_accepted: Arc<tokio::sync::Notify>,
     pub(super) block_first: bool,
-    offline: Arc<std::sync::atomic::AtomicBool>,
+    offline: Arc<AtomicBool>,
     offline_native_attempts: Arc<AtomicUsize>,
 }
 impl AuthorityClient {
@@ -158,8 +158,14 @@ impl RawHttpClient for AuthorityClient {
                 }
                 serde_json::to_value(receipt).unwrap()
             } else if request.method == http::Method::POST && url.path().ends_with("/sync/blobs") {
-                let manifests: Vec<crate::sync::SyncBlobManifest> = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-                serde_json::to_value(self.authority.register_sync_blob_manifests(&manifests).await?).unwrap()
+                let manifests: Vec<crate::sync::SyncBlobManifest> =
+                    serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                serde_json::to_value(
+                    self.authority
+                        .register_sync_blob_manifests(&manifests)
+                        .await?,
+                )
+                .unwrap()
             } else if request.method == http::Method::POST && url.path().ends_with("/sync/blob") {
                 let manifest = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 serde_json::to_value(
@@ -749,11 +755,37 @@ struct WatchingAuthorityClient {
     native_reads: Arc<AtomicUsize>,
     blocked: Arc<tokio::sync::Notify>,
     changed: Arc<tokio::sync::Notify>,
+    read_fulfillment_gate: Option<ReadFulfillmentGate>,
 }
+
+#[derive(Clone)]
+struct ReadFulfillmentGate {
+    started: Arc<AtomicUsize>,
+    working_diff_requests: Arc<AtomicUsize>,
+    selected_branch_id: String,
+    allow_first_response: Arc<AtomicBool>,
+    first_response: Arc<tokio::sync::Notify>,
+    started_notify: Arc<tokio::sync::Notify>,
+    semantic_requests: Arc<Mutex<Vec<String>>>,
+    release_started: Arc<AtomicUsize>,
+    release_started_notify: Arc<tokio::sync::Notify>,
+    allow_release_response: Arc<AtomicBool>,
+    release_response: Arc<tokio::sync::Notify>,
+    close_sessions: Arc<AtomicUsize>,
+    close_session_notify: Arc<tokio::sync::Notify>,
+}
+
 impl RawHttpClient for WatchingAuthorityClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             let url = url::Url::parse(&request.url).unwrap();
+            if request.method == http::Method::DELETE && url.path().ends_with("/session") {
+                if let Some(gate) = &self.read_fulfillment_gate {
+                    gate.close_sessions.fetch_add(1, Ordering::SeqCst);
+                    gate.close_session_notify.notify_one();
+                }
+                return self.base.send(request).await;
+            }
             let response = if url.path().ends_with("/sync/descriptor") {
                 self.watches.fetch_add(1, Ordering::SeqCst);
                 let branch = url
@@ -794,14 +826,76 @@ impl RawHttpClient for WatchingAuthorityClient {
                     .1
                     .as_str();
                 if url.path().ends_with("/sync/read-fulfillment") {
-                    let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-                    serde_json::to_value(
-                        self.base
-                            .authority
-                            .read_sync_fulfillment(&body, lease)
-                            .await?,
-                    )
-                    .unwrap()
+                    let body: crate::sync::read_fulfillment::ReadFulfillmentRequest =
+                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    let mut hold_first_response = false;
+                    if let Some(gate) = &self.read_fulfillment_gate {
+                        // A continuation page and an explicit release are part
+                        // of the same logical operation, not duplicate first
+                        // attempts. Compare the protocol's canonical recipe
+                        // digest, which also excludes attempt expiry/id fields.
+                        if !body.release && body.continuation.is_none() {
+                            gate.semantic_requests
+                                .lock()
+                                .unwrap()
+                                .push(body.digest().unwrap());
+                            if body.interests.iter().any(|interest| {
+                                matches!(
+                                    interest,
+                                    crate::hot_state::LogicalReadInterest::Diff {
+                                        branch_id: Some(branch_id),
+                                        relation,
+                                        from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                                        to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                                        ..
+                                    } if branch_id == &gate.selected_branch_id && relation == "lix_file"
+                                )
+                            }) {
+                                gate.working_diff_requests.fetch_add(1, Ordering::SeqCst);
+                            }
+                            match gate.started.fetch_add(1, Ordering::SeqCst) {
+                                0 => hold_first_response = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let response = self
+                        .base
+                        .authority
+                        .read_sync_fulfillment(&body, lease)
+                        .await?;
+                    if let Some(gate) = &self.read_fulfillment_gate {
+                        if body.release {
+                            gate.release_started.fetch_add(1, Ordering::SeqCst);
+                            gate.release_started_notify.notify_one();
+                        }
+                        if hold_first_response {
+                            assert_eq!(
+                                response.outcome,
+                                crate::sync::read_fulfillment::ReadFulfillmentOutcome::Complete,
+                                "the held response must own a live staged operation"
+                            );
+                            // The authority has accepted and materialized this
+                            // exact operation before the test can invalidate it.
+                            gate.started_notify.notify_one();
+                        }
+                        let (allowed, notify) = if body.release {
+                            (&gate.allow_release_response, &gate.release_response)
+                        } else if hold_first_response {
+                            (&gate.allow_first_response, &gate.first_response)
+                        } else {
+                            (
+                                /* no gate */ &gate.allow_first_response,
+                                &gate.first_response,
+                            )
+                        };
+                        if body.release || hold_first_response {
+                            while !allowed.load(Ordering::SeqCst) {
+                                notify.notified().await;
+                            }
+                        }
+                    }
+                    serde_json::to_value(response).unwrap()
                 } else if url.path().ends_with("/sync/native-objects") {
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
@@ -932,6 +1026,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
             native_reads: Arc::default(),
             blocked: Arc::default(),
             changed: Arc::default(),
+            read_fulfillment_gate: None,
         };
         let transport = HttpSyncTransport::connect_with(client.clone(), old.remote_id())
             .await
@@ -1029,6 +1124,516 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
     .expect("live partial worker publication timed out");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateTransferScenario {
+    RetainAcrossDemand,
+    RetireFairness,
+    ShutdownWhileRetiring,
+}
+
+async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let authority = Arc::new(open_lix().await.unwrap());
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('seed','before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let old = Arc::new(
+            PartialReplicaState::from_leased(
+                format!("https://example.test/lix/{}", authority.lix_id()),
+                authority.active_account_id().into(),
+                uuid::Uuid::now_v7().to_string(),
+                leased,
+            )
+            .unwrap(),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &old).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (engine, session) =
+            Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &old)
+                .await
+                .unwrap();
+        let engine = Arc::new(engine);
+        // Exercise the real working-diff replay branch with the same bounded
+        // moving file recipe emitted by `lix_diff('lix_file')`. Without it this
+        // fixture only needs ordinary metadata reads and never starts a
+        // read-fulfillment operation to retain across demands.
+        engine
+            .sync_mode()
+            .read_interests()
+            .unwrap()
+            .register(crate::hot_state::LogicalReadInterest::Diff {
+                branch_id: Some(old.descriptor().selected_branch.branch_id.clone()),
+                relation: "lix_file".into(),
+                from: crate::hot_state::DiffInterestEndpoint::WorkingCheckpoint,
+                to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+                filter: crate::tracked_state::TrackedStateFilter {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                retain_payloads: false,
+                projected_columns: vec!["id".into()],
+                limit: None,
+            })
+            .unwrap();
+        engine
+            .sync_mode()
+            .admit_partial_replica(old.clone(), crate::sync::partial_replica_write_capability());
+        storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+        crate::sync::partial_interest_journal::flush_partial_read_interests(
+            &storage,
+            &old,
+            &engine.sync_mode().read_interests().unwrap(),
+        )
+        .await
+        .unwrap();
+        let sql = "SELECT value FROM lix_key_value WHERE key='arrives-later'";
+        assert!(
+            execute_hydrating(
+                &session,
+                &storage,
+                &old,
+                &authority,
+                sql,
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+        );
+        let client = WatchingAuthorityClient {
+            base: AuthorityClient::new(authority.clone(), false),
+            watches: Arc::default(),
+            native_reads: Arc::default(),
+            blocked: Arc::default(),
+            changed: Arc::default(),
+            read_fulfillment_gate: Some(ReadFulfillmentGate {
+                started: Arc::default(),
+                working_diff_requests: Arc::default(),
+                selected_branch_id: old.descriptor().selected_branch.branch_id.clone(),
+                allow_first_response: Arc::new(AtomicBool::new(false)),
+                first_response: Arc::default(),
+                started_notify: Arc::default(),
+                semantic_requests: Arc::default(),
+                release_started: Arc::default(),
+                release_started_notify: Arc::default(),
+                allow_release_response: Arc::new(AtomicBool::new(false)),
+                release_response: Arc::default(),
+                close_sessions: Arc::default(),
+                close_session_notify: Arc::default(),
+            }),
+        };
+        let transport = HttpSyncTransport::connect_with(client.clone(), old.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(old.baseline_lease())
+            .unwrap();
+        let (shutdown, shutdown_rx) =
+            tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            old.clone(),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            Some(engine.sync_mode().change_watcher()),
+            Some(engine.clone()),
+        );
+        let (worker_finished, mut worker_finished_rx) = tokio::sync::oneshot::channel();
+        let worker = async move {
+            let result = worker.await;
+            let _ = worker_finished.send(());
+            result
+        };
+        let caller = async {
+            client.blocked.notified().await;
+            let resident_read_count = client.native_reads.load(Ordering::SeqCst);
+            for _ in 0..8 {
+                let (response, done) = tokio::sync::oneshot::channel();
+                sender
+                    .send(crate::sync::runtime::SyncDemand {
+                        request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                            vec![NativeMetadataRef::CommitStateHeader(
+                                old.descriptor().selected_branch.head.commit_id.clone(),
+                            )],
+                            LixError::unknown("resident foreground demand"),
+                        ),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), done)
+                    .await
+                    .expect("foreground demand must complete while the watch is blocked")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    client.watches.load(Ordering::SeqCst),
+                    1,
+                    "foreground work must retain the same descriptor request"
+                );
+            }
+            assert_eq!(
+                client.native_reads.load(Ordering::SeqCst),
+                resident_read_count,
+                "the first foreground demand batch must be served from local native state"
+            );
+            authority
+                .execute(
+                    "INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')",
+                    &[],
+                )
+                .await
+                .unwrap();
+            authority
+                .execute(
+                    "INSERT INTO lix_file (path,content) VALUES ($1,$2)",
+                    &[
+                        Value::Text("/worker-transfer.md".into()),
+                        Value::Blob(b"moving file diff transfer".to_vec().into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            let target_head = authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .head
+                .commit_id;
+            client.changed.notify_one();
+            let read_fulfillment_gate = client.read_fulfillment_gate.as_ref().unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_fulfillment_gate.started_notify.notified(),
+            )
+            .await
+            .expect("descriptor reconciliation should start a read-fulfillment transfer");
+            assert_eq!(
+                read_fulfillment_gate
+                    .working_diff_requests
+                    .load(Ordering::SeqCst),
+                1,
+                "the held transfer must contain the selected-branch moving file Diff recipe"
+            );
+            let held_digest = read_fulfillment_gate
+                .semantic_requests
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .expect("the held first page has a canonical recipe digest");
+            let resident_read_count = client.native_reads.load(Ordering::SeqCst);
+            for _ in 0..8 {
+                let (response, done) = tokio::sync::oneshot::channel();
+                sender
+                    .send(crate::sync::runtime::SyncDemand {
+                        request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                            vec![NativeMetadataRef::CommitStateHeader(
+                                old.descriptor().selected_branch.head.commit_id.clone(),
+                            )],
+                            LixError::unknown("resident demand during reconciliation transfer"),
+                        ),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), done)
+                    .await
+                    .expect("resident demand must complete during reconciliation transfer")
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                client.native_reads.load(Ordering::SeqCst),
+                resident_read_count,
+                "foreground demands during the transfer must remain locally resident"
+            );
+            if scenario == CandidateTransferScenario::RetainAcrossDemand {
+                read_fulfillment_gate
+                    .allow_first_response
+                    .store(true, Ordering::SeqCst);
+                read_fulfillment_gate.first_response.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let current = engine.sync_mode().partial_admission().unwrap();
+                        if current.descriptor().selected_branch.head.commit_id == target_head {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the retained same-target transfer must publish after foreground work");
+            } else {
+                // Model a real serving-admission update while the candidate RF
+                // response is held: renew the currently admitted lease through
+                // the authority, durably CAS the receipt, and only then expose
+                // that renewed admission to the worker.
+                let read = storage.begin_read(Default::default()).await.unwrap();
+                let (_, previous_receipt) =
+                    crate::sync::partial_state::load_partial_replica_state(&read)
+                        .await
+                        .unwrap()
+                        .expect("the partial state receipt is durable");
+                drop(read);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let renewed_lease = authority
+                    .renew_sync_native_baseline_lease(&old.baseline_lease().lease_id)
+                    .await
+                    .unwrap();
+                let renewed = Arc::new(old.with_renewed_baseline_lease(renewed_lease).unwrap());
+                assert_eq!(renewed.descriptor(), old.descriptor());
+                assert_eq!(
+                    renewed.baseline_lease().lease_id,
+                    old.baseline_lease().lease_id
+                );
+                assert!(
+                    renewed.baseline_lease().expires_at_ms > old.baseline_lease().expires_at_ms,
+                    "the re-admission uses a real authority-issued lease renewal"
+                );
+                let mut writes = storage.new_write_set();
+                let receipt_precondition = crate::sync::partial_state::stage_partial_replica_state(
+                    &mut writes,
+                    &renewed,
+                    Some(previous_receipt),
+                )
+                .unwrap();
+                storage
+                    .commit_write_set(
+                        writes,
+                        StorageWriteOptions {
+                            preconditions: vec![receipt_precondition],
+                            await_durable: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let read = storage.begin_read(Default::default()).await.unwrap();
+                let (stored, _) = crate::sync::partial_state::load_partial_replica_state(&read)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored, *renewed, "the renewed admission is durably stored");
+                drop(read);
+                engine.sync_mode().admit_partial_replica(
+                    renewed.clone(),
+                    crate::sync::partial_replica_write_capability(),
+                );
+                // Admission is the cause of retirement; the notification only
+                // wakes the worker to observe that actual source change.
+                engine.sync_mode().notify_sync_change();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    read_fulfillment_gate.release_started_notify.notified(),
+                )
+                .await
+                .expect("invalidated staged transfer must dispatch exact-operation release");
+                let read_count_during_release = client.native_reads.load(Ordering::SeqCst);
+                for _ in 0..8 {
+                    let (response, done) = tokio::sync::oneshot::channel();
+                    sender
+                        .send(crate::sync::runtime::SyncDemand {
+                            request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                                vec![NativeMetadataRef::CommitStateHeader(
+                                    old.descriptor().selected_branch.head.commit_id.clone(),
+                                )],
+                                LixError::unknown("resident demand during retired cleanup"),
+                            ),
+                            response,
+                        })
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(1), done)
+                        .await
+                        .expect("resident demand must not wait for remote release response")
+                        .unwrap()
+                        .unwrap();
+                }
+                assert_eq!(
+                    client.native_reads.load(Ordering::SeqCst),
+                    read_count_during_release,
+                    "no new native request may start while the old transfer is retiring"
+                );
+                assert_eq!(
+                    read_fulfillment_gate.started.load(Ordering::SeqCst),
+                    1,
+                    "the replacement candidate must wait for retired cleanup"
+                );
+                if scenario == CandidateTransferScenario::ShutdownWhileRetiring {
+                    let close_count_before_shutdown =
+                        read_fulfillment_gate.close_sessions.load(Ordering::SeqCst);
+                    shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(1_300),
+                        &mut worker_finished_rx,
+                    )
+                    .await
+                    .expect("shutdown must honor its outer bound while retired cleanup is held")
+                    .expect("worker completion signal should remain connected");
+                    assert_eq!(
+                        read_fulfillment_gate.close_sessions.load(Ordering::SeqCst),
+                        close_count_before_shutdown,
+                        "session close must wait until the dispatched release attempt settles"
+                    );
+                    read_fulfillment_gate
+                        .allow_release_response
+                        .store(true, Ordering::SeqCst);
+                    read_fulfillment_gate.release_response.notify_one();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while read_fulfillment_gate.close_sessions.load(Ordering::SeqCst)
+                            == close_count_before_shutdown
+                        {
+                            read_fulfillment_gate.close_session_notify.notified().await;
+                        }
+                    })
+                    .await
+                    .expect("deferred session close must run after release cleanup settles");
+                    return;
+                }
+                read_fulfillment_gate
+                    .allow_release_response
+                    .store(true, Ordering::SeqCst);
+                read_fulfillment_gate.release_response.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while read_fulfillment_gate.started.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("fresh candidate must resume after retired cleanup completes");
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let current = engine.sync_mode().partial_admission().unwrap();
+                        if current.descriptor().selected_branch.head.commit_id == target_head {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the fresh candidate must publish the authority head after cleanup");
+            }
+            let mut refreshed = session
+                .observe(sql, &[])
+                .unwrap()
+                .with_sync_demand_sender(Some(sender.clone()));
+            let rows = refreshed.next().await.unwrap().unwrap().rows;
+            assert!(value(rows).contains("remote"));
+            drop(refreshed);
+            let native_reads = client.native_reads.load(Ordering::SeqCst);
+            assert!(
+                native_reads > 0,
+                "the Diff candidate used native transfer work"
+            );
+            for _ in 0..10 {
+                assert!(value(session.execute(sql, &[]).await.unwrap()).contains("remote"));
+            }
+            assert_eq!(
+                client.native_reads.load(Ordering::SeqCst),
+                native_reads,
+                "warm direct SQL adds no native network requests"
+            );
+            assert_eq!(
+                client.base.pushes.load(Ordering::SeqCst),
+                0,
+                "remote read publication creates no local pending edit"
+            );
+            let matching_requests = read_fulfillment_gate
+                .semantic_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.as_str() == held_digest.as_str())
+                .count();
+            let expected_requests = if scenario == CandidateTransferScenario::RetireFairness {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                matching_requests,
+                expected_requests,
+                "retained completion reuses one recipe; retirement makes one replacement"
+            );
+            assert_eq!(
+                read_fulfillment_gate
+                    .working_diff_requests
+                    .load(Ordering::SeqCst),
+                expected_requests,
+                "every transfer preserves the selected-branch moving Diff recipe"
+            );
+            // Adoption changes the admission basis and must create a new watch.
+            while client.watches.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+            shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+        };
+        let (result, ()) = futures_util::join!(worker, caller);
+        result.unwrap();
+        if scenario != CandidateTransferScenario::ShutdownWhileRetiring {
+            assert!(client.watches.load(Ordering::SeqCst) >= 2);
+        }
+        let gate = client.read_fulfillment_gate.as_ref().unwrap();
+        let expected_requests = if scenario == CandidateTransferScenario::RetireFairness {
+            2
+        } else {
+            1
+        };
+        assert_eq!(gate.started.load(Ordering::SeqCst), expected_requests);
+        assert!(gate.close_sessions.load(Ordering::SeqCst) >= 1);
+    })
+    .await
+    .expect("candidate-transfer worker scenario timed out");
+}
+
+#[tokio::test]
+async fn engine_worker_retains_same_target_transfer_across_demands() {
+    run_candidate_transfer_scenario(CandidateTransferScenario::RetainAcrossDemand).await;
+}
+
+#[tokio::test]
+async fn engine_worker_serves_demands_while_retired_transfer_cleans_up() {
+    run_candidate_transfer_scenario(CandidateTransferScenario::RetireFairness).await;
+}
+
+#[tokio::test]
+async fn engine_worker_shutdown_bounds_pending_retired_cleanup() {
+    run_candidate_transfer_scenario(CandidateTransferScenario::ShutdownWhileRetiring).await;
+}
+
 #[derive(Clone)]
 struct ExpiredAuthorityClient {
     inner: WatchingAuthorityClient,
@@ -1120,7 +1725,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         );
         let storage = StorageAdapter::new(Memory::new());
         let read = storage.begin_read(Default::default()).await.unwrap();
-        let mut writes = storage.new_write_set();
+            let mut writes = storage.new_write_set();
         let preconditions = stage_partial_bootstrap(&read, &mut writes, &old).unwrap();
         crate::init::stage_partial_repository_protocol(&mut writes);
         drop(read);
@@ -1173,6 +1778,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
                 native_reads: Arc::default(),
                 blocked: Arc::default(),
                 changed: Arc::default(),
+                read_fulfillment_gate: None,
             },
             expired_lease: old.baseline_lease().lease_id.clone(),
             descriptors: Arc::default(),
@@ -1356,6 +1962,7 @@ async fn expired_background_renewal_refreshes_unchanged_authority_without_long_p
                 native_reads: Arc::default(),
                 blocked: Arc::default(),
                 changed: Arc::default(),
+                read_fulfillment_gate: None,
             },
             expired_lease: old.baseline_lease().lease_id.clone(),
             descriptors: Arc::default(),

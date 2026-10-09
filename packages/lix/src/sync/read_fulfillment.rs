@@ -955,7 +955,7 @@ impl ReadFulfillmentRequest {
         }
         Ok(())
     }
-    fn digest(&self) -> Result<String, LixError> {
+    pub(crate) fn digest(&self) -> Result<String, LixError> {
         let mut basis = self.clone();
         basis.continuation = None;
         basis.release = false;

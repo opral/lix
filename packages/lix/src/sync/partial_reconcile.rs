@@ -18,6 +18,7 @@ pub(super) enum PreparedDescriptor {
     Ready(super::partial_publication::PreparedPartialPublication),
 }
 
+#[cfg(test)]
 pub(super) async fn prepare_clean_descriptor<S, C>(
     engine: Arc<Engine<S>>,
     previous: Arc<PartialReplicaState>,
@@ -29,6 +30,40 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     C: RawHttpClient + Clone + 'static,
 {
+    let mut transfer = super::read_fulfillment::staging::CandidateReadTransfer::default();
+    let result = prepare_clean_descriptor_with_transfer(
+        engine,
+        previous,
+        transport,
+        wrapper,
+        recovery,
+        &mut transfer,
+    )
+    .await;
+    match (result, transfer.clear().await) {
+        (Err(error), Err(cleanup)) => {
+            tracing::warn!(code=%cleanup.code, "candidate transfer cleanup failed after descriptor preparation error");
+            Err(error)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(prepared), Ok(())) => Ok(prepared),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+pub(super) async fn prepare_clean_descriptor_with_transfer<S, C>(
+    engine: Arc<Engine<S>>,
+    previous: Arc<PartialReplicaState>,
+    transport: &HttpSyncTransport<C>,
+    wrapper: super::http::TimedLeasedPartialDescriptor,
+    recovery: super::partial_publication::PartialRecoveryPolicy,
+    transfer: &mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+) -> Result<PreparedDescriptor, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    transfer.ensure_target(&previous, &wrapper).await?;
     let deadline = wrapper.deadline;
     deadline.check(&wrapper.wire.lease.lease_id)?;
     if engine.sync_mode().partial_admission().as_deref() != Some(previous.as_ref()) {
@@ -115,7 +150,12 @@ where
             working_diff_attempted = true;
             use futures_util::FutureExt;
             let hydrate = super::working_diff_candidate::hydrate_working_diff_dependencies(
-                &engine, &previous, &next, &candidate,
+                &engine,
+                &previous,
+                &next,
+                &candidate,
+                transfer,
+                &deadline,
             )
             .fuse();
             let expires = super::platform::sleep(deadline.remaining()?).fuse();
@@ -142,13 +182,21 @@ where
         // hydration retry. Neither partial progress nor transport cancellation
         // renews authority retention for this candidate.
         use futures_util::FutureExt;
-        let hydrate =
-            super::partial_runtime::hydrate_demand(&storage, &previous, &candidate, demand).fuse();
+        let hydrate = super::partial_runtime::hydrate_candidate_demand(
+            &storage,
+            &previous,
+            &candidate,
+            demand,
+            transfer,
+            &next,
+            &deadline,
+        )
+        .fuse();
         let expires = super::platform::sleep(deadline.remaining()?).fuse();
         futures_util::pin_mut!(hydrate, expires);
         futures_util::select_biased! {
             _ = expires => return Err(LixError::new("LIX_PARTIAL_CANDIDATE_EXPIRED", "candidate hydration exceeded its original baseline deadline")),
-            result = hydrate => result?,
+            result = hydrate => { result?; },
         }
         deadline.check(&next.baseline_lease().lease_id)?;
     }

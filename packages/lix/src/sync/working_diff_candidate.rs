@@ -38,12 +38,15 @@ pub(super) async fn hydrate_working_diff_dependencies<S, C>(
     previous: &PartialReplicaState,
     next: &PartialReplicaState,
     transport: &HttpSyncTransport<C>,
+    transfer: &mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+    deadline: &super::http::CandidateBaselineDeadline,
 ) -> Result<bool, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
     C: RawHttpClient + Clone + 'static,
 {
     let Some(registry) = engine.sync_mode().read_interests() else {
+        transfer.retire()?;
         return Ok(false);
     };
     let snapshot = registry.moving_current_snapshot()?;
@@ -67,6 +70,7 @@ where
         )
         .is_err()
     {
+        transfer.retire()?;
         return Ok(false);
     }
     let request = ReadFulfillmentRequest {
@@ -84,19 +88,44 @@ where
         continuation: None,
     };
     if super::read_fulfillment::request_closure_is_ineligible(&request)? {
-        return Ok(false);
-    }
-    let storage = engine.storage();
-    let mut response =
-        super::read_fulfillment::staging::fetch_staged(&storage, previous, transport, &request)
-            .await?;
-    if response.outcome() != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
-        super::read_fulfillment::remember_request_closure_ineligible(&request, response.outcome())?;
+        transfer.retire()?;
         return Ok(false);
     }
     super::read_fulfillment::validate_candidate_basis(previous, next, &request)?;
-    response.promote(&request, true).await?;
-    Ok(true)
+    let storage = engine.storage();
+    match transfer
+        .fetch_or_wait(
+            &storage,
+            previous,
+            next,
+            deadline,
+            transport,
+            &request,
+            true,
+        )
+        .await?
+    {
+        super::read_fulfillment::staging::CandidateTransferResult::Ready => {
+            // Preserve the original post-fetch basis validation immediately
+            // before publishing any of the staged immutable dependencies.
+            super::read_fulfillment::validate_candidate_basis(previous, next, &request)?;
+            if engine.sync_mode().partial_admission().as_deref() != Some(previous) {
+                transfer.retire()?;
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "candidate source admission changed during dependency transfer",
+                ));
+            }
+            transfer
+                .promote(previous, next, deadline, &request, true)
+                .await?;
+            Ok(true)
+        }
+        super::read_fulfillment::staging::CandidateTransferResult::Fallback(outcome) => {
+            super::read_fulfillment::remember_request_closure_ineligible(&request, outcome)?;
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]

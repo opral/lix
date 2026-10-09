@@ -1,11 +1,9 @@
 use super::*;
+use std::future::Future;
 use std::sync::{
-    Arc,
-    Mutex,
-    OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::future::Future;
 
 static RETAINED_PAYLOAD_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -83,7 +81,11 @@ struct CommitAckGate {
 }
 
 impl CommitAckGate {
-    fn new() -> (Arc<Self>, tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+    fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let (committed_sender, committed_receiver) = tokio::sync::oneshot::channel();
         let (acknowledge_sender, acknowledge_receiver) = tokio::sync::oneshot::channel();
         (
@@ -105,8 +107,7 @@ struct CountedCommit {
 }
 
 fn is_canonical_test_key(space: StorageSpace, key: &StorageKey) -> bool {
-    space != STAGING_SPACE
-        && !is_non_content_revision_key(space.id.0, key.0.as_ref())
+    space != STAGING_SPACE && !is_non_content_revision_key(space.id.0, key.0.as_ref())
 }
 
 struct CountingWrite<W> {
@@ -134,41 +135,40 @@ fn note_scratch_ledger<W: StorageWrite>(write: &mut CountingWrite<W>, entries: &
             continue;
         }
         write.scratch_ledger_write = true;
-        write.scratch_ledger_owner_count = serde_json::from_slice::<serde_json::Value>(
-            entry.value.bytes.as_ref(),
-        )
-        .ok()
-        .and_then(|ledger| ledger.as_object().map(serde_json::Map::len));
+        write.scratch_ledger_owner_count =
+            serde_json::from_slice::<serde_json::Value>(entry.value.bytes.as_ref())
+                .ok()
+                .and_then(|ledger| ledger.as_object().map(serde_json::Map::len));
     }
 }
 
 impl Storage for CountingStorage {
-    type Read<'a> = <Memory as Storage>::Read<'a> where Self: 'a;
-    type Write<'a> = CountingWrite<<Memory as Storage>::Write<'a>> where Self: 'a;
+    type Read<'a>
+        = <Memory as Storage>::Read<'a>
+    where
+        Self: 'a;
+    type Write<'a>
+        = CountingWrite<<Memory as Storage>::Write<'a>>
+    where
+        Self: 'a;
 
     fn acquire_session(
         &self,
-    ) -> impl Future<
-        Output = Result<StorageSessionToken, StorageError>,
-    > + Send {
+    ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send {
         self.memory.acquire_session()
     }
 
     fn acquire_partial_replica_owner(
         &self,
         session: StorageSessionToken,
-    ) -> impl Future<
-        Output = Result<StorageOwnerLease, StorageError>,
-    > + Send {
+    ) -> impl Future<Output = Result<StorageOwnerLease, StorageError>> + Send {
         self.memory.acquire_partial_replica_owner(session)
     }
 
     fn begin_read(
         &self,
         opts: StorageReadOptions,
-    ) -> impl Future<
-        Output = Result<Self::Read<'_>, StorageError>,
-    > + Send {
+    ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         let memory = self.memory.clone();
         let closed = Arc::clone(&self.closed);
         async move {
@@ -182,9 +182,7 @@ impl Storage for CountingStorage {
     fn begin_write(
         &self,
         opts: StorageWriteOptions,
-    ) -> impl Future<
-        Output = Result<Self::Write<'_>, StorageError>,
-    > + Send {
+    ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         let await_durable = opts.await_durable;
         let write = self.memory.begin_write(opts);
         let canonical_commits = Arc::clone(&self.canonical_commits);
@@ -303,11 +301,7 @@ impl<W: StorageWrite> StorageWrite for CountingWrite<W> {
         self.inner.delete_range(space, range)
     }
 
-    fn commit(
-        self,
-    ) -> impl Future<
-        Output = Result<StorageCommitResult, StorageError>,
-    > + Send {
+    fn commit(self) -> impl Future<Output = Result<StorageCommitResult, StorageError>> + Send {
         async move {
             if self.canonical_write && self.scratch_ledger_write {
                 self.joined_commit_attempts.fetch_add(1, Ordering::Relaxed);
@@ -556,7 +550,9 @@ fn chunk(index: u32, bytes: usize) -> ReadInput {
 
 fn staged_ref(index: usize, len: usize) -> StagedInputRef {
     StagedInputRef {
-        address: ReadInputAddress::BlobChunk(*blake3::hash(&(index as u64).to_be_bytes()).as_bytes()),
+        address: ReadInputAddress::BlobChunk(
+            *blake3::hash(&(index as u64).to_be_bytes()).as_bytes(),
+        ),
         len,
         received: len,
         digest: [0; 32],
@@ -739,13 +735,15 @@ async fn promotion_preflights_oversized_owner_before_installing_earlier_valid_ch
             replacement: false,
         }),
     ];
-    stage.inputs.extend(large_members.into_iter().map(|address| StagedInputRef {
-        address,
-        len: 33 * 1024 * 1024,
-        received: 0,
-        digest: [0; 32],
-        frames: Vec::new(),
-    }));
+    stage
+        .inputs
+        .extend(large_members.into_iter().map(|address| StagedInputRef {
+            address,
+            len: 33 * 1024 * 1024,
+            received: 0,
+            digest: [0; 32],
+            frames: Vec::new(),
+        }));
     stage.validated = true;
 
     let error = stage.promote(&request, false).await.unwrap_err();
@@ -776,15 +774,12 @@ async fn promotion_co_packs_valid_change_locator_units_in_two_canonical_commits(
         let row_key = format!("batched-row-{index:02}");
         let row_pk = crate::row_pk::RowPk::single(row_key.clone());
         row_pks.push(row_pk.clone());
-        let change_id = crate::changelog::ChangeId::for_test_label(&format!(
-            "batched-change-{index:02}"
-        ));
-        let owner = crate::changelog::CommitId::for_test_label(&format!(
-            "batched-owner-{index:02}"
-        ));
-        let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(
-            100 + index as i64,
-        );
+        let change_id =
+            crate::changelog::ChangeId::for_test_label(&format!("batched-change-{index:02}"));
+        let owner =
+            crate::changelog::CommitId::for_test_label(&format!("batched-owner-{index:02}"));
+        let created_at =
+            crate::common::LixTimestamp::from_unix_millis_utc_lossy(100 + index as i64);
         let typed = crate::row_payload::TypedRow::from_builtin_json(
             "lix_key_value",
             &row_pk,
@@ -867,9 +862,12 @@ async fn promotion_co_packs_valid_change_locator_units_in_two_canonical_commits(
         .collect::<Vec<_>>();
     assert_eq!(promoted_commits.len(), 2);
     for (record, locator) in &expected_pairs {
-        assert!(promoted_commits.iter().any(|commit| {
-            commit.contains(record) && commit.contains(locator)
-        }), "selected payload and locator must publish atomically");
+        assert!(
+            promoted_commits
+                .iter()
+                .any(|commit| { commit.contains(record) && commit.contains(locator) }),
+            "selected payload and locator must publish atomically"
+        );
     }
     for input in &inputs {
         assert!(hydrated.keys.contains(&input.address.coordinate().unwrap()));
@@ -898,8 +896,15 @@ async fn final_install_claims_scratch_reaping_in_the_same_durable_commit() {
                     .any(|key| key.0.as_ref() == b"operations")
         })
         .collect::<Vec<_>>();
-    assert_eq!(joined.len(), 1, "final install and reaping claim share one commit");
-    assert!(joined[0].await_durable, "the joined commit remains strictly durable");
+    assert_eq!(
+        joined.len(),
+        1,
+        "final install and reaping claim share one commit"
+    );
+    assert!(
+        joined[0].await_durable,
+        "the joined commit remains strictly durable"
+    );
 }
 
 #[tokio::test]
@@ -932,32 +937,38 @@ async fn crash_after_joined_commit_keeps_install_and_resumes_scratch_cleanup() {
     reap_expired(&storage).await.unwrap();
 
     let read = storage.begin_read(Default::default()).await.unwrap();
-    assert!(PointReadPlan::new(coordinate.0, std::slice::from_ref(&coordinate.1))
-        .materialize(&read, Default::default())
-        .await
-        .unwrap()
-        .value
-        .pop()
-        .flatten()
-        .is_some());
+    assert!(
+        PointReadPlan::new(coordinate.0, std::slice::from_ref(&coordinate.1))
+            .materialize(&read, Default::default())
+            .await
+            .unwrap()
+            .value
+            .pop()
+            .flatten()
+            .is_some()
+    );
     let frame = &stage.inputs[0].frames[0];
-    assert!(PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(frame))
-        .materialize(&read, Default::default())
-        .await
-        .unwrap()
-        .value
-        .pop()
-        .flatten()
-        .is_none());
+    assert!(
+        PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(frame))
+            .materialize(&read, Default::default())
+            .await
+            .unwrap()
+            .value
+            .pop()
+            .flatten()
+            .is_none()
+    );
     let ledger_key = StorageKey(Bytes::from_static(b"operations"));
-    assert!(PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(&ledger_key))
-        .materialize(&read, Default::default())
-        .await
-        .unwrap()
-        .value
-        .pop()
-        .flatten()
-        .is_none());
+    assert!(
+        PointReadPlan::new(STAGING_SPACE, std::slice::from_ref(&ledger_key))
+            .materialize(&read, Default::default())
+            .await
+            .unwrap()
+            .value
+            .pop()
+            .flatten()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -971,7 +982,11 @@ async fn empty_finalization_uses_one_guarded_owner_claim_commit() {
     stage.promote(&request, false).await.unwrap();
 
     let commits = storage.storage().commits.lock().unwrap().clone();
-    assert_eq!(commits.len(), 3, "reserve, final owner claim, and ledger removal");
+    assert_eq!(
+        commits.len(),
+        3,
+        "reserve, final owner claim, and ledger removal"
+    );
     assert!(commits.iter().all(|commit| commit.await_durable));
     assert_eq!(
         commits
@@ -997,11 +1012,7 @@ async fn failed_last_install_never_claims_scratch_reaping() {
     let owner = stage.id;
     stage.header.closure_digest = input_digest(&request, std::slice::from_ref(&input)).unwrap();
     stage.append_page(vec![input]).await.unwrap();
-    *storage
-        .storage()
-        .conflict_on_joined_commit
-        .lock()
-        .unwrap() = Some((
+    *storage.storage().conflict_on_joined_commit.lock().unwrap() = Some((
         coordinate.0,
         coordinate.1,
         Bytes::from_static(b"racing conflicting immutable value"),
@@ -1051,11 +1062,7 @@ async fn final_install_retries_a_concurrent_scratch_ledger_renewal() {
         .as_u64()
         .unwrap();
     ledger[&owner.to_string()]["expires_at_ms"] = serde_json::json!(expires + 1);
-    *storage
-        .storage()
-        .conflict_on_joined_commit
-        .lock()
-        .unwrap() = Some((
+    *storage.storage().conflict_on_joined_commit.lock().unwrap() = Some((
         STAGING_SPACE,
         ledger_key,
         Bytes::from(serde_json::to_vec(&ledger).unwrap()),
@@ -1216,7 +1223,10 @@ async fn private_128_mib_closure_promotes_only_after_terminal_validation_and_rea
         .unwrap();
     let (rows, more) = cursor.next_page(32).await.unwrap().into_parts();
     assert!(!more);
-    assert!(rows.is_empty(), "completed ownership and its empty ledger are reaped");
+    assert!(
+        rows.is_empty(),
+        "completed ownership and its empty ledger are reaped"
+    );
 }
 
 #[tokio::test]
@@ -1529,7 +1539,11 @@ impl LifecycleReadClient {
         };
         let mut closure_digest = input_digest(request, closure_inputs).unwrap();
         if self.corrupt_closure_digest {
-            let replacement = if closure_digest.starts_with('0') { '1' } else { '0' };
+            let replacement = if closure_digest.starts_with('0') {
+                '1'
+            } else {
+                '0'
+            };
             closure_digest.replace_range(..1, &replacement.to_string());
         }
         let response = ReadFulfillmentResponse {
@@ -2133,7 +2147,11 @@ async fn retained_endpoint_closure_avoids_scratch_and_overflow_spills_exact_inpu
         .unwrap();
     let (scratch_rows, more) = scratch.next_page(32).await.unwrap().into_parts();
     assert!(!more);
-    assert!(scratch_rows.iter().all(|row| row.key.0.as_ref() == b"operations"));
+    assert!(
+        scratch_rows
+            .iter()
+            .all(|row| row.key.0.as_ref() == b"operations")
+    );
     for input in inputs {
         let coordinate = input.address.coordinate().unwrap();
         assert!(
@@ -2665,6 +2683,9 @@ struct HeldReadState {
     allow_response: AtomicBool,
     response_notify: tokio::sync::Notify,
     release_attempts: AtomicUsize,
+    release_entered_notify: tokio::sync::Notify,
+    allow_release_response: AtomicBool,
+    release_response_notify: tokio::sync::Notify,
     release_requests: AtomicUsize,
     fail_release_once: AtomicBool,
     release_has_tokio_runtime: AtomicBool,
@@ -2682,6 +2703,9 @@ impl HeldReadState {
             allow_response: AtomicBool::new(allow_response),
             response_notify: tokio::sync::Notify::new(),
             release_attempts: AtomicUsize::new(0),
+            release_entered_notify: tokio::sync::Notify::new(),
+            allow_release_response: AtomicBool::new(true),
+            release_response_notify: tokio::sync::Notify::new(),
             release_requests: AtomicUsize::new(0),
             fail_release_once: AtomicBool::new(false),
             release_has_tokio_runtime: AtomicBool::new(false),
@@ -2702,10 +2726,7 @@ struct HeldReadClient {
 }
 
 impl HeldReadClient {
-    fn response(
-        &self,
-        request: &ReadFulfillmentRequest,
-    ) -> crate::sync::http::RawHttpResponse {
+    fn response(&self, request: &ReadFulfillmentRequest) -> crate::sync::http::RawHttpResponse {
         let inputs = if request.release {
             Vec::new()
         } else {
@@ -2778,16 +2799,11 @@ impl crate::sync::http::RawHttpClient for HeldReadClient {
             }
             let request: ReadFulfillmentRequest =
                 serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
-            client
-                .state
-                .wire_events
-                .lock()
-                .unwrap()
-                .push((
-                    "POST".into(),
-                    session_id,
-                    Some(request.release),
-                ));
+            client.state.wire_events.lock().unwrap().push((
+                "POST".into(),
+                session_id,
+                Some(request.release),
+            ));
             let lease_id = raw
                 .headers
                 .iter()
@@ -2800,35 +2816,33 @@ impl crate::sync::http::RawHttpClient for HeldReadClient {
                 .unwrap()
                 .push((request.operation_id.clone(), request.release));
             if request.release {
-                client
-                    .state
-                    .release_attempts
-                    .fetch_add(1, Ordering::SeqCst);
+                client.state.release_attempts.fetch_add(1, Ordering::SeqCst);
+                client.state.release_entered_notify.notify_waiters();
                 client
                     .state
                     .release_lease_ids
                     .lock()
                     .unwrap()
                     .push(lease_id);
-                client
-                    .state
-                    .release_has_tokio_runtime
-                    .store(tokio::runtime::Handle::try_current().is_ok(), Ordering::SeqCst);
-                if client
-                    .state
-                    .fail_release_once
-                    .swap(false, Ordering::SeqCst)
-                {
+                client.state.release_has_tokio_runtime.store(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    Ordering::SeqCst,
+                );
+                if client.state.fail_release_once.swap(false, Ordering::SeqCst) {
                     return Err(LixError::new(
                         "LIX_TRANSPORT_NETWORK",
                         "simulated lost release request",
                     ));
                 }
+                loop {
+                    let notified = client.state.release_response_notify.notified();
+                    if client.state.allow_release_response.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                client
-                    .state
-                    .release_requests
-                    .fetch_add(1, Ordering::SeqCst);
+                client.state.release_requests.fetch_add(1, Ordering::SeqCst);
                 return Ok(client.response(&request));
             }
             client.state.entered.fetch_add(1, Ordering::SeqCst);
@@ -2870,12 +2884,97 @@ async fn held_read_transport(
     transport
 }
 
+#[tokio::test]
+async fn retired_candidate_cleanup_does_not_hold_the_next_transfer_slot() {
+    let (storage, source, request) = fixture().await;
+    let input = chunk(305, 1024);
+    let request = lifecycle_request(request, std::slice::from_ref(&input));
+    let mut next_descriptor = source.descriptor().clone();
+    next_descriptor.cursor += 1;
+    let target = source
+        .with_descriptor_and_fresh_generations(next_descriptor)
+        .unwrap();
+    let client_state = HeldReadState::new(true);
+    client_state
+        .allow_release_response
+        .store(false, Ordering::SeqCst);
+    let transport =
+        held_read_transport(&target, &request, vec![input], Arc::clone(&client_state)).await;
+    let deadline = super::super::super::http::CandidateBaselineDeadline::for_test(
+        &target.baseline_lease().lease_id,
+        std::time::Duration::from_secs(10),
+    );
+    let mut transfer = CandidateReadTransfer::default();
+    assert!(matches!(
+        transfer
+            .fetch_or_wait(
+                &storage, &source, &target, &deadline, &transport, &request, false,
+            )
+            .await
+            .unwrap(),
+        CandidateTransferResult::Ready
+    ));
+
+    // Invalidation queues release against the old operation, but does not
+    // make the caller wait for the remote response or local ledger ACK.
+    transfer.retire().unwrap();
+    wait_for_counter(&client_state.release_attempts, 1).await;
+
+    let mut next_request = request.clone();
+    next_request.operation_id = uuid::Uuid::now_v7().to_string();
+    let resumed = {
+        let next = transfer.fetch_or_wait(
+            &storage,
+            &source,
+            &target,
+            &deadline,
+            &transport,
+            &next_request,
+            false,
+        );
+        use futures_util::FutureExt;
+        let next = next.fuse();
+        let wait = crate::sync::platform::sleep(std::time::Duration::from_millis(50)).fuse();
+        futures_util::pin_mut!(next, wait);
+        futures_util::select_biased! {
+            _ = next => panic!("new candidate started before retired cleanup finished"),
+            _ = wait => {},
+        }
+        assert_eq!(
+            client_state.entered.load(Ordering::SeqCst),
+            1,
+            "a new read cannot consume a second transfer slot before old cleanup completes"
+        );
+
+        client_state
+            .allow_release_response
+            .store(true, Ordering::SeqCst);
+        client_state.release_response_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .expect("new candidate resumes after cleanup")
+            .unwrap()
+    };
+    assert!(matches!(resumed, CandidateTransferResult::Ready));
+    let hydrated = transfer
+        .promote(&source, &target, &deadline, &next_request, false)
+        .await
+        .unwrap();
+    assert!(!hydrated.keys.is_empty());
+    transfer.clear().await.unwrap();
+    assert_eq!(client_state.release_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(client_state.entered.load(Ordering::SeqCst), 2);
+}
+
 async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
     for attempt in 0..200 {
         if counter.load(Ordering::SeqCst) >= expected {
             return;
         }
-        assert!(attempt < 199, "staged cancellation fixture did not progress");
+        assert!(
+            attempt < 199,
+            "staged cancellation fixture did not progress"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
@@ -3103,16 +3202,10 @@ async fn closed_storage_hands_acknowledged_owner_to_reopen_reaper() {
     // The durable reservation commit has already returned. A closed adapter
     // cannot acknowledge local reaping, so cleanup retains the ledger record
     // for the next exclusive owner and releases its in-memory permit.
-    storage
-        .storage()
-        .closed
-        .store(true, Ordering::SeqCst);
+    storage.storage().closed.store(true, Ordering::SeqCst);
     staged.release_scratch().await.unwrap();
 
-    storage
-        .storage()
-        .closed
-        .store(false, Ordering::SeqCst);
+    storage.storage().closed.store(false, Ordering::SeqCst);
     assert_eq!(durable_scratch_owner_count(&storage).await, 1);
     reap_abandoned(&storage).await.unwrap();
     assert_eq!(durable_scratch_owner_count(&storage).await, 0);
@@ -3126,7 +3219,7 @@ async fn closed_storage_hands_acknowledged_owner_to_reopen_reaper() {
         .await
         .unwrap()
         .values[0]
-        .is_none()
+            .is_none()
     );
     drop(read);
 }
@@ -3137,6 +3230,9 @@ async fn repeated_http_cancellation_releases_exact_lease_on_tokio_and_holds_quot
     let input = chunk(302, 1024);
     let request = lifecycle_request(request, std::slice::from_ref(&input));
     let client_state = HeldReadState::new(false);
+    client_state
+        .allow_release_response
+        .store(false, Ordering::SeqCst);
     let transport = held_read_transport(
         &state,
         &request,
@@ -3146,6 +3242,7 @@ async fn repeated_http_cancellation_releases_exact_lease_on_tokio_and_holds_quot
     .await;
     let baseline_lease_id = state.baseline_lease().lease_id.clone();
 
+    let active_test_permits = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
     let mut operation_ids = Vec::new();
     for _ in 0..2 {
@@ -3155,37 +3252,74 @@ async fn repeated_http_cancellation_releases_exact_lease_on_tokio_and_holds_quot
         let task_storage = storage.clone();
         let task_state = state.clone();
         let task_transport = transport.clone();
+        let owner_permit = lifecycle::Permit::acquire_observed(Arc::clone(&active_test_permits))
+            .expect("two held operations fit the process quota");
         tasks.push(tokio::spawn(async move {
-            fetch_staged(
+            fetch_staged_with_permits(
                 &task_storage,
                 &task_state,
                 &task_transport,
                 &operation_request,
+                owner_permit,
+                None,
             )
             .await
         }));
     }
     wait_for_counter(&client_state.entered, 2).await;
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
-    assert_eq!(durable_scratch_owner_count(&storage).await, 2);
+    assert_eq!(active_test_permits.load(Ordering::SeqCst), 2);
 
+    // The repository operation limit is backed by the durable scratch ledger.
+    // Check it while both original raw requests still own their ledger entries;
+    // cancellation acknowledges local scratch before it waits for remote ACK.
     let mut denied_request = request.clone();
     denied_request.operation_id = uuid::Uuid::now_v7().to_string();
     let denied = fetch_staged(&storage, &state, &transport, &denied_request)
         .await
         .err()
-        .expect("the two owned operations retain the repository quota");
+        .expect("the two durable owners exhaust repository operation quota");
     assert_eq!(denied.code, "LIX_NATIVE_RECIPE_WORK_BOUND");
     assert_eq!(durable_scratch_owner_count(&storage).await, 2);
 
-    client_state.allow_response.store(true, Ordering::SeqCst);
-    client_state.response_notify.notify_waiters();
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_counter(&client_state.release_attempts, 2),
+    )
+    .await
+    .expect("cancellation reaches both exact-operation release attempts");
+    assert_eq!(
+        durable_scratch_owner_count(&storage).await,
+        0,
+        "local scratch ACK can finish while remote release ACK still holds the quota"
+    );
+    assert_eq!(
+        active_test_permits.load(Ordering::SeqCst),
+        2,
+        "each process permit remains owned until its remote release ACK"
+    );
+
+    client_state
+        .allow_release_response
+        .store(true, Ordering::SeqCst);
+    client_state.release_response_notify.notify_waiters();
     wait_for_counter(&client_state.release_requests, 2).await;
     wait_for_owner_count(&storage, 0).await;
-    assert!(client_state.release_has_tokio_runtime.load(Ordering::SeqCst));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while active_test_permits.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("remote release ACKs drop both process permits");
+    assert!(
+        client_state
+            .release_has_tokio_runtime
+            .load(Ordering::SeqCst)
+    );
     let released = client_state
         .operation_ids
         .lock()
@@ -3198,7 +3332,10 @@ async fn repeated_http_cancellation_releases_exact_lease_on_tokio_and_holds_quot
     assert!(operation_ids.iter().all(|id| released.contains(id)));
     assert_eq!(
         client_state.release_lease_ids.lock().unwrap().as_slice(),
-        &[Some(baseline_lease_id.clone()), Some(baseline_lease_id.clone())]
+        &[
+            Some(baseline_lease_id.clone()),
+            Some(baseline_lease_id.clone())
+        ]
     );
     let coordinate = input.address.coordinate().unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
@@ -3223,16 +3360,9 @@ async fn canceled_fetch_retries_one_lost_remote_release_with_the_same_operation_
     let input = chunk(304, 1024);
     let request = lifecycle_request(request, std::slice::from_ref(&input));
     let client_state = HeldReadState::new(false);
-    client_state
-        .fail_release_once
-        .store(true, Ordering::SeqCst);
-    let transport = held_read_transport(
-        &state,
-        &request,
-        vec![input],
-        Arc::clone(&client_state),
-    )
-    .await;
+    client_state.fail_release_once.store(true, Ordering::SeqCst);
+    let transport =
+        held_read_transport(&state, &request, vec![input], Arc::clone(&client_state)).await;
 
     let task_storage = storage.clone();
     let task_state = state.clone();
@@ -3245,6 +3375,12 @@ async fn canceled_fetch_retries_one_lost_remote_release_with_the_same_operation_
     task.abort();
     let _ = task.await;
 
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_counter(&client_state.release_attempts, 2),
+    )
+    .await
+    .expect("cancel must drop the held request and issue bounded exact-operation release");
     client_state.allow_response.store(true, Ordering::SeqCst);
     client_state.response_notify.notify_waiters();
     wait_for_counter(&client_state.release_requests, 1).await;
@@ -3259,7 +3395,10 @@ async fn canceled_fetch_retries_one_lost_remote_release_with_the_same_operation_
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     assert_eq!(client_state.release_attempts.load(Ordering::SeqCst), 2);
-    assert_eq!(release_ids, vec![request.operation_id.clone(), request.operation_id]);
+    assert_eq!(
+        release_ids,
+        vec![request.operation_id.clone(), request.operation_id]
+    );
 }
 
 #[tokio::test]
@@ -3268,13 +3407,8 @@ async fn close_defers_session_delete_until_original_operation_and_scratch_are_re
     let input = chunk(305, 1024);
     let request = lifecycle_request(request, std::slice::from_ref(&input));
     let client_state = HeldReadState::new(false);
-    let transport = held_read_transport(
-        &state,
-        &request,
-        vec![input],
-        Arc::clone(&client_state),
-    )
-    .await;
+    let transport =
+        held_read_transport(&state, &request, vec![input], Arc::clone(&client_state)).await;
 
     let task_storage = storage.clone();
     let task_state = state.clone();
@@ -3288,7 +3422,8 @@ async fn close_defers_session_delete_until_original_operation_and_scratch_are_re
     let _ = task.await;
 
     let canceled_close_transport = transport.clone();
-    let canceled_close = tokio::spawn(async move { canceled_close_transport.close_session().await });
+    let canceled_close =
+        tokio::spawn(async move { canceled_close_transport.close_session().await });
     tokio::task::yield_now().await;
     assert!(!canceled_close.is_finished());
     assert_eq!(client_state.close_requests.load(Ordering::SeqCst), 0);
@@ -3312,10 +3447,16 @@ async fn close_defers_session_delete_until_original_operation_and_scratch_are_re
     assert_eq!(events.len(), 4);
     assert_eq!(events[0], ("GET".into(), None, None));
     assert_eq!(events[1].0, "POST");
-    assert_eq!(events[1].1.as_deref(), Some("staged-cancellation-test-session"));
+    assert_eq!(
+        events[1].1.as_deref(),
+        Some("staged-cancellation-test-session")
+    );
     assert_eq!(events[1].2, Some(false));
     assert_eq!(events[2].0, "POST");
-    assert_eq!(events[2].1.as_deref(), Some("staged-cancellation-test-session"));
+    assert_eq!(
+        events[2].1.as_deref(),
+        Some("staged-cancellation-test-session")
+    );
     assert_eq!(events[2].2, Some(true));
     assert_eq!(
         events[3],
@@ -3326,7 +3467,10 @@ async fn close_defers_session_delete_until_original_operation_and_scratch_are_re
         )
     );
     assert_eq!(
-        events.iter().filter(|(method, _, _)| method == "GET").count(),
+        events
+            .iter()
+            .filter(|(method, _, _)| method == "GET")
+            .count(),
         1,
         "cleanup after close must not open or recover another auth session"
     );
@@ -3373,7 +3517,11 @@ impl ContinuationRecoveryClient {
         inputs: Vec<ReadInput>,
         continuation: Option<ReadContinuation>,
     ) -> crate::sync::http::RawHttpResponse {
-        let closure_inputs = if request.release { &[][..] } else { &self.inputs };
+        let closure_inputs = if request.release {
+            &[][..]
+        } else {
+            &self.inputs
+        };
         let response = ReadFulfillmentResponse {
             frame: None,
             lix_id: self.lix_id.clone(),
@@ -3421,12 +3569,12 @@ impl crate::sync::http::RawHttpClient for ContinuationRecoveryClient {
                 .map(|(_, value)| value.clone());
             if raw.method == http::Method::GET {
                 let handshake = client.state.handshakes.fetch_add(1, Ordering::SeqCst);
-                client.state.events.lock().unwrap().push((
-                    "GET".into(),
-                    None,
-                    None,
-                    false,
-                ));
+                client
+                    .state
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push(("GET".into(), None, None, false));
                 let session_id = if handshake == 0 {
                     "expired-read-session"
                 } else {
@@ -3502,11 +3650,7 @@ impl crate::sync::http::RawHttpClient for ContinuationRecoveryClient {
                 }
                 notified.await;
             }
-            Ok(client.response(
-                &request,
-                vec![client.inputs[1].clone()],
-                None,
-            ))
+            Ok(client.response(&request, vec![client.inputs[1].clone()], None))
         })
     }
 }
@@ -3541,13 +3685,8 @@ async fn continuation_session_recovery_releases_on_replacement_before_close() {
     let inputs = vec![chunk(306, 1024), chunk(307, 2048)];
     let request = lifecycle_request(request, &inputs);
     let client_state = ContinuationRecoveryState::new();
-    let transport = continuation_recovery_transport(
-        &state,
-        &request,
-        inputs,
-        Arc::clone(&client_state),
-    )
-    .await;
+    let transport =
+        continuation_recovery_transport(&state, &request, inputs, Arc::clone(&client_state)).await;
 
     let task_storage = storage.clone();
     let task_state = state.clone();
@@ -3567,7 +3706,9 @@ async fn continuation_session_recovery_releases_on_replacement_before_close() {
     assert_eq!(client_state.close_requests.load(Ordering::SeqCst), 0);
     assert_eq!(client_state.release_requests.load(Ordering::SeqCst), 0);
 
-    client_state.allow_continuation.store(true, Ordering::SeqCst);
+    client_state
+        .allow_continuation
+        .store(true, Ordering::SeqCst);
     client_state.allow_continuation_notify.notify_waiters();
     wait_for_counter(&client_state.release_requests, 1).await;
     wait_for_owner_count(&storage, 0).await;
@@ -3577,37 +3718,52 @@ async fn continuation_session_recovery_releases_on_replacement_before_close() {
     let events = client_state.events.lock().unwrap().clone();
     assert_eq!(events.len(), 7);
     assert_eq!(events[0], ("GET".into(), None, None, false));
-    assert_eq!(events[1], (
-        "POST".into(),
-        Some("expired-read-session".into()),
-        Some(false),
-        false,
-    ));
-    assert_eq!(events[2], (
-        "POST".into(),
-        Some("expired-read-session".into()),
-        Some(false),
-        true,
-    ));
+    assert_eq!(
+        events[1],
+        (
+            "POST".into(),
+            Some("expired-read-session".into()),
+            Some(false),
+            false,
+        )
+    );
+    assert_eq!(
+        events[2],
+        (
+            "POST".into(),
+            Some("expired-read-session".into()),
+            Some(false),
+            true,
+        )
+    );
     assert_eq!(events[3], ("GET".into(), None, None, false));
-    assert_eq!(events[4], (
-        "POST".into(),
-        Some("replacement-read-session".into()),
-        Some(false),
-        true,
-    ));
-    assert_eq!(events[5], (
-        "POST".into(),
-        Some("replacement-read-session".into()),
-        Some(true),
-        false,
-    ));
-    assert_eq!(events[6], (
-        "DELETE".into(),
-        Some("replacement-read-session".into()),
-        None,
-        false,
-    ));
+    assert_eq!(
+        events[4],
+        (
+            "POST".into(),
+            Some("replacement-read-session".into()),
+            Some(false),
+            true,
+        )
+    );
+    assert_eq!(
+        events[5],
+        (
+            "POST".into(),
+            Some("replacement-read-session".into()),
+            Some(true),
+            false,
+        )
+    );
+    assert_eq!(
+        events[6],
+        (
+            "DELETE".into(),
+            Some("replacement-read-session".into()),
+            None,
+            false,
+        )
+    );
     assert_eq!(client_state.handshakes.load(Ordering::SeqCst), 2);
     assert_eq!(client_state.release_requests.load(Ordering::SeqCst), 1);
     assert_eq!(client_state.close_requests.load(Ordering::SeqCst), 1);
@@ -3623,12 +3779,8 @@ async fn retry_reservation_failure_keeps_process_permit_until_remote_release_ack
     let input = chunk(308, 1024);
     let request = lifecycle_request(request, std::slice::from_ref(&input));
     let client_state = RetryReservationFailureState::new();
-    let transport = retry_reservation_failure_transport(
-        &state,
-        &request,
-        Arc::clone(&client_state),
-    )
-    .await;
+    let transport =
+        retry_reservation_failure_transport(&state, &request, Arc::clone(&client_state)).await;
     let active_test_permits = Arc::new(AtomicUsize::new(0));
     let permit = lifecycle::Permit::acquire_observed(Arc::clone(&active_test_permits)).unwrap();
 

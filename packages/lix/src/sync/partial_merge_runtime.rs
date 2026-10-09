@@ -367,6 +367,7 @@ where
 }
 
 // Erase this child operation before composing the worker select loop.
+#[cfg(test)]
 pub(super) fn prepare_descriptor_with_merge<'a, S, C>(
     engine: Arc<Engine<S>>,
     previous: Arc<PartialReplicaState>,
@@ -379,6 +380,42 @@ where
     C: RawHttpClient + Clone + 'static,
 {
     Box::pin(async move {
+        let mut transfer = super::read_fulfillment::staging::CandidateReadTransfer::default();
+        let result = prepare_descriptor_with_merge_and_transfer(
+            engine,
+            previous,
+            transport,
+            wrapper,
+            recovery,
+            &mut transfer,
+        )
+        .await;
+        match (result, transfer.clear().await) {
+            (Err(error), Err(cleanup)) => {
+                tracing::warn!(code=%cleanup.code, "candidate transfer cleanup failed after merge preparation error");
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(prepared), Ok(())) => Ok(prepared),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    })
+}
+
+pub(super) fn prepare_descriptor_with_merge_and_transfer<'a, S, C>(
+    engine: Arc<Engine<S>>,
+    previous: Arc<PartialReplicaState>,
+    transport: &'a HttpSyncTransport<C>,
+    wrapper: TimedLeasedPartialDescriptor,
+    recovery: super::partial_publication::PartialRecoveryPolicy,
+    transfer: &'a mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+) -> super::SyncTransportFuture<'a, PreparedDescriptor>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    Box::pin(async move {
+        transfer.ensure_target(&previous, &wrapper).await?;
         let storage = engine.storage();
         let branch = &previous.descriptor().selected_branch.branch_id;
         let mut seen = BTreeSet::new();
@@ -584,8 +621,8 @@ where
             .await;
             match result {
                 Ok(false) => {
-                    return super::partial_reconcile::prepare_clean_descriptor(
-                        engine, previous, transport, wrapper, recovery,
+                    return super::partial_reconcile::prepare_clean_descriptor_with_transfer(
+                        engine, previous, transport, wrapper, recovery, transfer,
                     )
                     .await;
                 }
@@ -691,12 +728,13 @@ where
             persist(&storage, writes, guards).await?;
         }
         let wrapper = transport.partial_replica_descriptor(Some(branch)).await?;
-        super::partial_reconcile::prepare_clean_descriptor(
+        super::partial_reconcile::prepare_clean_descriptor_with_transfer(
             engine,
             previous,
             transport,
             wrapper,
             super::partial_publication::PartialRecoveryPolicy::NativeMerge,
+            transfer,
         )
         .await
     })
