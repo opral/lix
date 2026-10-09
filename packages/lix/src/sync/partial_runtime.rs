@@ -565,6 +565,100 @@ pub(super) fn hydrate_demand_with_receipt<
     transport: &'a HttpSyncTransport<C>,
     request: SyncDemandRequest,
 ) -> super::SyncTransportFuture<'a, HydratedInputs> {
+    hydrate_demand_with_context(storage, state, transport, request, None)
+}
+
+struct CandidateTransferContext<'a, S: Storage + Clone + Send + Sync + 'static> {
+    transfer: &'a mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+    target: &'a PartialReplicaState,
+    deadline: &'a super::http::CandidateBaselineDeadline,
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> CandidateTransferContext<'_, S> {
+    fn reborrow(&mut self) -> CandidateTransferContext<'_, S> {
+        CandidateTransferContext {
+            transfer: self.transfer,
+            target: self.target,
+            deadline: self.deadline,
+        }
+    }
+}
+
+enum CandidateFetchResult<S: Storage + Clone + Send + Sync + 'static> {
+    OneShot(super::read_fulfillment::staging::StagedClosure<S>),
+    Retained(super::read_fulfillment::staging::CandidateTransferResult),
+}
+
+async fn fetch_candidate_or_one_shot<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    request: &super::read_fulfillment::ReadFulfillmentRequest,
+    candidate: Option<&mut CandidateTransferContext<'_, S>>,
+    immutable_only: bool,
+) -> Result<CandidateFetchResult<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    if let Some(candidate) = candidate {
+        candidate
+            .transfer
+            .fetch_or_wait(
+                storage,
+                state,
+                candidate.target,
+                candidate.deadline,
+                transport,
+                request,
+                immutable_only,
+            )
+            .await
+            .map(CandidateFetchResult::Retained)
+    } else {
+        super::read_fulfillment::staging::fetch_staged(storage, state, transport, request)
+            .await
+            .map(CandidateFetchResult::OneShot)
+    }
+}
+
+pub(super) fn hydrate_candidate_demand<'a, S, C>(
+    storage: &'a StorageAdapter<S>,
+    state: &'a PartialReplicaState,
+    transport: &'a HttpSyncTransport<C>,
+    request: SyncDemandRequest,
+    transfer: &'a mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+    target: &'a PartialReplicaState,
+    deadline: &'a super::http::CandidateBaselineDeadline,
+) -> super::SyncTransportFuture<'a, HydratedInputs>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    hydrate_demand_with_context(
+        storage,
+        state,
+        transport,
+        request,
+        Some(CandidateTransferContext {
+            transfer,
+            target,
+            deadline,
+        }),
+    )
+}
+
+fn hydrate_demand_with_context<
+    'a,
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+>(
+    storage: &'a StorageAdapter<S>,
+    state: &'a PartialReplicaState,
+    transport: &'a HttpSyncTransport<C>,
+    request: SyncDemandRequest,
+    mut candidate_transfer: Option<CandidateTransferContext<'a, S>>,
+) -> super::SyncTransportFuture<'a, HydratedInputs> {
     Box::pin(async move {
         let required = match &request {
             SyncDemandRequest::NativeObjects(addresses, error) => {
@@ -589,12 +683,16 @@ pub(super) fn hydrate_demand_with_receipt<
         };
         // Do not let an optional graph input launch another metadata prefetch.
         let allow_metadata_walk = required.is_none();
+        let transfer = candidate_transfer
+            .as_mut()
+            .map(CandidateTransferContext::reborrow);
         match hydrate_exact_demand_with_receipt(
             storage,
             state,
             transport,
             request,
             allow_metadata_walk,
+            transfer,
         )
         .await
         {
@@ -611,8 +709,18 @@ pub(super) fn hydrate_demand_with_receipt<
             }
             Err(error) => match required {
                 Some(required) => {
-                    hydrate_exact_demand_with_receipt(storage, state, transport, required, true)
-                        .await
+                    let transfer = candidate_transfer
+                        .as_mut()
+                        .map(CandidateTransferContext::reborrow);
+                    hydrate_exact_demand_with_receipt(
+                        storage,
+                        state,
+                        transport,
+                        required,
+                        true,
+                        transfer,
+                    )
+                    .await
                 }
                 None => Err(error),
             },
@@ -629,37 +737,75 @@ async fn hydrate_current_payload_after_native_fallback<
     transport: &HttpSyncTransport<C>,
     request: &super::read_fulfillment::ReadFulfillmentRequest,
     locator: &NativeMetadataRef,
+    mut candidate: Option<&mut CandidateTransferContext<'_, S>>,
 ) -> Result<Option<HydratedInputs>, LixError> {
     let Some(current_request) =
         super::read_fulfillment::current_payload_request_after_native_fallback(request, locator)
     else {
         return Ok(None);
     };
-    let mut response =
-        super::read_fulfillment::staging::fetch_staged(storage, state, transport, &current_request)
-            .await
-            .map_err(|error| {
-                super::read_fulfillment::annotate_client_failure(
-                    error,
-                    super::read_fulfillment::ClientFailurePhase::Validation,
+    match fetch_candidate_or_one_shot(
+        storage,
+        state,
+        transport,
+        &current_request,
+        candidate.as_mut().map(|candidate| &mut **candidate),
+        false,
+    )
+    .await
+    .map_err(|error| {
+        super::read_fulfillment::annotate_client_failure(
+            error,
+            super::read_fulfillment::ClientFailurePhase::Validation,
+        )
+    })? {
+        CandidateFetchResult::Retained(
+            super::read_fulfillment::staging::CandidateTransferResult::Ready,
+        ) => {
+            let candidate = candidate.ok_or_else(|| LixError::unknown("candidate transfer was lost"))?;
+            candidate
+                .transfer
+                .promote(
+                    state,
+                    candidate.target,
+                    candidate.deadline,
+                    &current_request,
+                    false,
                 )
-            })?;
-    if response.outcome() != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
-        return Err(LixError::new(
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Installation,
+                    )
+                })
+        }
+        CandidateFetchResult::Retained(
+            super::read_fulfillment::staging::CandidateTransferResult::Fallback(_),
+        ) => Err(LixError::new(
             "LIX_READ_FULFILLMENT_INVALID",
             "current payload recovery returned a read fallback",
-        ));
+        )),
+        CandidateFetchResult::OneShot(mut response) => {
+            if response.outcome() != super::read_fulfillment::ReadFulfillmentOutcome::Complete {
+                return Err(LixError::new(
+                    "LIX_READ_FULFILLMENT_INVALID",
+                    "current payload recovery returned a read fallback",
+                ));
+            }
+            response
+                .promote(&current_request, false)
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Installation,
+                    )
+                })
+        }
     }
-    response
-        .promote(&current_request, false)
-        .await
-        .map(Some)
-        .map_err(|error| {
-            super::read_fulfillment::annotate_client_failure(
-                error,
-                super::read_fulfillment::ClientFailurePhase::Installation,
-            )
-        })
 }
 
 // Erase this child operation before composing the worker select loop.
@@ -673,6 +819,7 @@ fn hydrate_exact_demand_with_receipt<
     transport: &'a HttpSyncTransport<C>,
     request: SyncDemandRequest,
     allow_metadata_walk: bool,
+    mut candidate_transfer: Option<CandidateTransferContext<'a, S>>,
 ) -> super::SyncTransportFuture<'a, HydratedInputs> {
     Box::pin(async move {
         let error = match &request {
@@ -817,41 +964,38 @@ fn hydrate_exact_demand_with_receipt<
                         transport,
                         &fulfillment,
                         locator,
+                        candidate_transfer
+                            .as_mut()
+                            .map(|candidate| &mut *candidate),
                     )
                     .await?
                 {
                     return Ok(hydrated);
                 }
             } else if fulfillment.validate(state.repository_id()).is_ok() {
-                match super::read_fulfillment::staging::fetch_staged(
+                let fetched = fetch_candidate_or_one_shot(
                     storage,
                     state,
                     transport,
                     &fulfillment,
+                    candidate_transfer
+                        .as_mut()
+                        .map(|candidate| &mut *candidate),
+                    false,
                 )
                 .await
-                {
-                    Ok(mut response) => {
+                .map_err(|error| {
+                    super::read_fulfillment::annotate_client_failure(
+                        error,
+                        super::read_fulfillment::ClientFailurePhase::Validation,
+                    )
+                })?;
+                let fallback = match fetched {
+                    CandidateFetchResult::OneShot(mut response) => {
                         if response.outcome()
                             != super::read_fulfillment::ReadFulfillmentOutcome::Complete
                         {
-                            super::read_fulfillment::remember_request_closure_ineligible(
-                                &fulfillment,
-                                response.outcome(),
-                            )?;
-                            if let Some(locator) = selected_payload_locator.as_ref()
-                                && let Some(hydrated) =
-                                    hydrate_current_payload_after_native_fallback(
-                                        storage,
-                                        state,
-                                        transport,
-                                        &fulfillment,
-                                        locator,
-                                    )
-                                    .await?
-                            {
-                                return Ok(hydrated);
-                            }
+                            Some(response.outcome())
                         } else {
                             return response
                                 .promote(&fulfillment, false)
@@ -864,11 +1008,54 @@ fn hydrate_exact_demand_with_receipt<
                                 });
                         }
                     }
-                    Err(error) => {
-                        return Err(super::read_fulfillment::annotate_client_failure(
-                            error,
-                            super::read_fulfillment::ClientFailurePhase::Validation,
-                        ));
+                    CandidateFetchResult::Retained(
+                        super::read_fulfillment::staging::CandidateTransferResult::Ready,
+                    ) => {
+                        let candidate = candidate_transfer
+                            .as_mut()
+                            .ok_or_else(|| LixError::unknown("candidate transfer was lost"))?;
+                        return candidate
+                            .transfer
+                            .promote(
+                                state,
+                                candidate.target,
+                                candidate.deadline,
+                                &fulfillment,
+                                false,
+                            )
+                            .await
+                            .map_err(|error| {
+                                super::read_fulfillment::annotate_client_failure(
+                                    error,
+                                    super::read_fulfillment::ClientFailurePhase::Installation,
+                                )
+                            });
+                    }
+                    CandidateFetchResult::Retained(
+                        super::read_fulfillment::staging::CandidateTransferResult::Fallback(
+                            outcome,
+                        ),
+                    ) => Some(outcome),
+                };
+                if let Some(outcome) = fallback {
+                    super::read_fulfillment::remember_request_closure_ineligible(
+                        &fulfillment,
+                        outcome,
+                    )?;
+                    if let Some(locator) = selected_payload_locator.as_ref()
+                        && let Some(hydrated) = hydrate_current_payload_after_native_fallback(
+                            storage,
+                            state,
+                            transport,
+                            &fulfillment,
+                            locator,
+                            candidate_transfer
+                                .as_mut()
+                                .map(|candidate| &mut *candidate),
+                        )
+                        .await?
+                    {
+                        return Ok(hydrated);
                     }
                 }
             }
@@ -1204,6 +1391,7 @@ fn prepare_reconciled_descriptor<'a, S, C>(
     transport: &'a HttpSyncTransport<C>,
     wrapper: super::http::TimedLeasedPartialDescriptor,
     policy: super::partial_publication::PartialRecoveryPolicy,
+    transfer: &'a mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
 ) -> super::SyncTransportFuture<'a, super::partial_reconcile::PreparedDescriptor>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1214,12 +1402,13 @@ where
         let retry_descriptor = wrapper.wire.descriptor.clone();
         let mut retry_allowed = true;
         let result =
-            match super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+            match super::partial_global_merge_runtime::prepare_descriptor_with_global_merge_and_transfer(
                 engine.clone(),
                 state.clone(),
                 transport,
                 wrapper,
                 policy,
+                transfer,
             )
             .await
             {
@@ -1253,12 +1442,13 @@ where
                         ))
                         .await?;
                     tracing::warn!(code=%error.code, "partial replica adopts authoritative state after unsupported reconciliation");
-                    super::partial_reconcile::prepare_clean_descriptor(
+                    super::partial_reconcile::prepare_clean_descriptor_with_transfer(
                         engine.clone(),
                         state.clone(),
                         transport,
                         wrapper,
                         super::partial_publication::PartialRecoveryPolicy::AuthorityWins,
+                        transfer,
                     )
                     .await
                 }
@@ -1361,11 +1551,35 @@ where
 
 /// The same owner drives foreground recovery and branch admission. Never wait
 /// for this worker's background loop from a demand: that would deadlock it.
+#[derive(Clone)]
+struct RetainedCandidate {
+    source: Arc<PartialReplicaState>,
+    wrapper: super::http::TimedLeasedPartialDescriptor,
+    refresh_generation: u64,
+}
+
+enum PartialWatchEvent {
+    Shutdown,
+    Demand(Option<SyncDemand>),
+    Change(bool),
+    Renewal,
+    Retry,
+    Reconciled(Result<(u64, super::partial_reconcile::PreparedDescriptor), LixError>),
+}
+
+fn request_fresh_descriptor(force: &mut bool, generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
+    *force = true;
+}
+
 async fn reconcile_partial<S, C, Connect>(
     engine: Arc<crate::engine::Engine<S>>,
     transport: &mut Option<HttpSyncTransport<C>>,
     connect: &mut Connect,
     settle: bool,
+    refresh_generation: u64,
+    transfer: &mut super::read_fulfillment::staging::CandidateReadTransfer<S>,
+    retained_candidate: &mut Option<RetainedCandidate>,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1384,6 +1598,8 @@ where
                 .await
                 .is_ok()
         {
+            retained_candidate.take();
+            transfer.retire()?;
             return Ok(());
         }
         if transport.is_none() {
@@ -1392,9 +1608,56 @@ where
             *transport = Some(connected);
         }
         let connected = transport.as_ref().expect("connected");
-        let wrapper = connected
-            .partial_replica_descriptor(Some(&state.descriptor().selected_branch.branch_id))
-            .await?;
+        let retained_transfer = transfer.retained_target();
+        let retained_generation_is_current = retained_candidate.as_ref().is_some_and(|candidate| {
+            candidate.source.as_ref() == state.as_ref()
+                && candidate.refresh_generation == refresh_generation
+        });
+        let transfer_target_is_current = retained_generation_is_current
+            && retained_transfer.as_ref().is_some_and(|(basis, wrapper)| {
+                basis == state.as_ref()
+                    && wrapper.deadline.check(&wrapper.wire.lease.lease_id).is_ok()
+            });
+        let retained_wrapper_is_current = retained_candidate.as_ref().is_some_and(|candidate| {
+            candidate.source.as_ref() == state.as_ref()
+                && candidate.refresh_generation == refresh_generation
+                && candidate
+                    .wrapper
+                    .deadline
+                    .check(&candidate.wrapper.wire.lease.lease_id)
+                    .is_ok()
+        });
+        let retained_is_current = if retained_transfer.is_some() {
+            transfer_target_is_current
+        } else {
+            retained_wrapper_is_current
+        };
+        let wrapper = if transfer_target_is_current {
+            retained_transfer
+                .as_ref()
+                .expect("retained transfer target was just checked")
+                .1
+                .clone()
+        } else if retained_is_current {
+            retained_candidate
+                .as_ref()
+                .expect("retained target was just checked")
+                .wrapper
+                .clone()
+        } else {
+            if retained_candidate.take().is_some() || retained_transfer.is_some() {
+                transfer.retire()?;
+            }
+            let wrapper = connected
+                .partial_replica_descriptor(Some(&state.descriptor().selected_branch.branch_id))
+                .await?;
+            *retained_candidate = Some(RetainedCandidate {
+                source: state.clone(),
+                wrapper: wrapper.clone(),
+                refresh_generation,
+            });
+            wrapper
+        };
         let candidate = connected.fork_native_baseline_lease(&wrapper.wire.lease)?;
         let result = prepare_reconciled_descriptor(
             engine.clone(),
@@ -1402,8 +1665,14 @@ where
             &candidate,
             wrapper,
             super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline,
+            transfer,
         )
         .await;
+        // A completed reconciliation result retires this precise target. If
+        // the caller cancels before here, both the descriptor and transfer
+        // remain in the worker-owned slots for the next pass.
+        *retained_candidate = None;
+        transfer.retire()?;
         match result {
             Ok(super::partial_reconcile::PreparedDescriptor::Ready(prepared)) => {
                 match super::partial_publication::publish_prepared_partial(engine.clone(), prepared)
@@ -1555,6 +1824,12 @@ where
         u64,
         super::SyncTransportFuture<'static, super::http::TimedLeasedPartialDescriptor>,
     )> = None;
+    // A resolved immutable target and its transfer owner outlive a foreground
+    // demand. Candidate-local read scopes are always rerun from current state.
+    let mut retained_candidate: Option<RetainedCandidate> = None;
+    let mut candidate_transfer =
+        super::read_fulfillment::staging::CandidateReadTransfer::default();
+    let mut descriptor_refresh_generation = 0u64;
     let mut watch_cursor = state.descriptor().cursor;
     let mut blocked_global_cursor: Option<u64> = None;
     let mut force_descriptor_refresh = false;
@@ -1587,6 +1862,8 @@ where
             })?;
             if current.as_ref() != state.as_ref() {
                 pending_descriptor = None;
+                retained_candidate = None;
+                candidate_transfer.retire()?;
                 authority_recovery_pending = false;
                 let lease_changed =
                     current.baseline_lease().lease_id != state.baseline_lease().lease_id;
@@ -1713,7 +1990,10 @@ where
                         if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                             baseline_expired = Some(error);
                             authority_recovery_pending = true;
-                            force_descriptor_refresh = true;
+                            request_fresh_descriptor(
+                                &mut force_descriptor_refresh,
+                                &mut descriptor_refresh_generation,
+                            );
                             watch_after = web_time::Instant::now();
                         } else {
                             renewal_deadline = web_time::Instant::now() + Duration::from_secs(5);
@@ -1736,6 +2016,15 @@ where
             && (!retry_upload || web_time::Instant::now() >= retry_deadline)
         {
             upload_due = false;
+            if retained_candidate.take().is_some() {
+                // Upload publication may move the authority basis. Retire the
+                // old candidate transfer before dispatching that write.
+                candidate_transfer.retire()?;
+                request_fresh_descriptor(
+                    &mut force_descriptor_refresh,
+                    &mut descriptor_refresh_generation,
+                );
+            }
             let upload = upload_pending_once(&storage, &state, &mut transport, &mut connect).fuse();
             let shutdown = shutdown_rx.changed().fuse();
             let demand = demand_rx.recv().fuse();
@@ -1751,7 +2040,10 @@ where
                     Ok(progress) => {
                         health.succeeded(SyncPhase::Upload);
                         if progress {
-                            force_descriptor_refresh=true;
+                            request_fresh_descriptor(
+                                &mut force_descriptor_refresh,
+                                &mut descriptor_refresh_generation,
+                            );
                             // Publication changed the authority basis. A prior
                             // pending-edit retry delay no longer applies.
                             watch_after=web_time::Instant::now();
@@ -1766,7 +2058,10 @@ where
                         if error.code == LixError::CODE_TRANSACTION_CONFLICT {
                             authority_recovery_pending = true;
                         }
-                        force_descriptor_refresh=true;
+                        request_fresh_descriptor(
+                            &mut force_descriptor_refresh,
+                            &mut descriptor_refresh_generation,
+                        );
                         health.failed(SyncPhase::Upload, &error);
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica upload retained for retry");
                         retry_upload = true;
@@ -1788,6 +2083,7 @@ where
             let after_cursor = watch_cursor;
             let blocked_cursor = blocked_global_cursor;
             let request_fresh = force_descriptor_refresh;
+            let refresh_generation = descriptor_refresh_generation;
             let recovery = if baseline_expired.is_some() {
                 super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline
             } else {
@@ -1797,116 +2093,202 @@ where
             // cancel the recovery that makes a rejected upload publishable.
             // Fresh discovery is part of recovery too: its HTTP response can
             // take longer than the capped upload backoff on a remote server.
-            let recovery_in_progress = AtomicBool::new(request_fresh);
-            let watch = async {
-                if transport.is_none() {
-                    let connected = connect().await?;
-                    validate_admission(&storage, &state, &connected).await?;
-                    transport = Some(connected);
-                }
-                let connected = transport.as_ref().expect("connected");
-                // Progress discovery has no query recipes or payload evaluation.
-                // Missing native inputs are fetched only by the client candidate
-                // evaluator below, under this descriptor's original lease.
-                let branch = &state.descriptor().selected_branch.branch_id;
-                let wrapper = if request_fresh {
-                    // Explicit refresh follows a known state/authority change.
-                    // Never reuse discovery across that invalidation boundary.
-                    pending_descriptor = None;
-                    connected.partial_replica_descriptor(Some(branch)).await?
-                } else {
-                    if pending_descriptor.as_ref().is_some_and(|(basis, after, _)| {
-                        basis.as_ref() != state.as_ref() || *after != after_cursor
-                    }) {
-                        pending_descriptor = None;
+            let event = {
+                let recovery_in_progress = AtomicBool::new(request_fresh);
+                let watch = async {
+                    if transport.is_none() {
+                        let connected = connect().await?;
+                        validate_admission(&storage, &state, &connected).await?;
+                        transport = Some(connected);
                     }
-                    if pending_descriptor.is_none() {
-                        let connected = connected.clone();
-                        let branch = branch.clone();
-                        pending_descriptor = Some((state.clone(), after_cursor, Box::pin(async move {
-                            connected.wait_partial_replica_descriptor(&branch, after_cursor).await
-                        })));
+                    let connected = transport.as_ref().expect("connected");
+                    // Progress discovery has no query recipes or payload evaluation.
+                    // Missing native inputs are fetched only by the client candidate
+                    // evaluator below, under this descriptor's original lease.
+                    let branch = &state.descriptor().selected_branch.branch_id;
+                    let retained_transfer = candidate_transfer.retained_target();
+                    let retained_generation_is_current = retained_candidate.as_ref().is_some_and(
+                        |candidate| {
+                            candidate.source.as_ref() == state.as_ref()
+                                && candidate.refresh_generation == refresh_generation
+                        },
+                    );
+                    let transfer_target_is_current = retained_generation_is_current
+                        && retained_transfer.as_ref().is_some_and(|(basis, wrapper)| {
+                            basis == state.as_ref()
+                                && wrapper
+                                    .deadline
+                                    .check(&wrapper.wire.lease.lease_id)
+                                    .is_ok()
+                        });
+                    let retained_wrapper_is_current = retained_candidate.as_ref().is_some_and(|candidate| {
+                            candidate.source.as_ref() == state.as_ref()
+                                && candidate.refresh_generation == refresh_generation
+                                && candidate
+                                    .wrapper
+                                    .deadline
+                                    .check(&candidate.wrapper.wire.lease.lease_id)
+                                    .is_ok()
+                        });
+                    let retained_is_current = if retained_transfer.is_some() {
+                        transfer_target_is_current
+                    } else {
+                        retained_wrapper_is_current
+                    };
+                    let mut fresh_descriptor_required =
+                        (request_fresh || authority_recovery_pending) && !retained_is_current;
+                    let wrapper = if transfer_target_is_current {
+                        retained_transfer
+                            .as_ref()
+                            .expect("retained transfer target was just checked")
+                            .1
+                            .clone()
+                    } else if retained_is_current {
+                        retained_candidate
+                            .as_ref()
+                            .expect("retained candidate was just checked")
+                            .wrapper
+                            .clone()
+                    } else {
+                        if retained_candidate.take().is_some() || retained_transfer.is_some() {
+                            // An expired or source-mismatched target cannot lend
+                            // its lease or staged payload to a later candidate.
+                            candidate_transfer.retire()?;
+                            fresh_descriptor_required = true;
+                        }
+                        if fresh_descriptor_required {
+                            // Explicit refresh follows a known state/authority
+                            // change. Never reuse discovery across that boundary.
+                            pending_descriptor = None;
+                            connected.partial_replica_descriptor(Some(branch)).await?
+                        } else {
+                            if pending_descriptor.as_ref().is_some_and(|(basis, after, _)| {
+                                basis.as_ref() != state.as_ref() || *after != after_cursor
+                            }) {
+                                pending_descriptor = None;
+                            }
+                            if pending_descriptor.is_none() {
+                                let connected = connected.clone();
+                                let branch = branch.clone();
+                                pending_descriptor = Some((state.clone(), after_cursor, Box::pin(async move {
+                                    connected.wait_partial_replica_descriptor(&branch, after_cursor).await
+                                })));
+                            }
+                            let response = pending_descriptor.as_mut().expect("descriptor request").2.as_mut().await;
+                            pending_descriptor = None;
+                            response?
+                        }
+                    };
+                    retained_candidate = Some(RetainedCandidate {
+                        source: state.clone(),
+                        wrapper: wrapper.clone(),
+                        refresh_generation,
+                    });
+                    recovery_in_progress.store(true, Ordering::Relaxed);
+                    wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
+                    let cursor = wrapper.wire.descriptor.cursor;
+                    engine.sync_mode().health().observed(cursor);
+                    if !request_fresh && blocked_cursor.is_some_and(|blocked| cursor <= blocked) {
+                        return Ok((
+                            cursor,
+                            super::partial_reconcile::PreparedDescriptor::NoChange,
+                        ));
                     }
-                    let response = pending_descriptor.as_mut().expect("descriptor request").2.as_mut().await;
-                    pending_descriptor = None;
-                    response?
-                };
-                recovery_in_progress.store(true, Ordering::Relaxed);
-                wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
-                let cursor = wrapper.wire.descriptor.cursor;
-                engine.sync_mode().health().observed(cursor);
-                if !request_fresh && blocked_cursor.is_some_and(|blocked| cursor <= blocked) {
-                    return Ok((
-                        cursor,
-                        super::partial_reconcile::PreparedDescriptor::NoChange,
-                    ));
-                }
 
-                let prepared =
-                    prepare_reconciled_descriptor(
-                        engine.clone(),
-                        state.clone(),
-                        connected,
-                        wrapper,
-                        recovery,
-                    )
-                    .await.map_err(|error| {
-                        if super::partial_global_merge_runtime::waits_for_state_change(&error) {
-                            error.with_details(serde_json::json!({"authorityCursor":cursor,"pendingPreserved":true,"waitForChange":true}))
-                        } else {error}
-                    })?;
-                Ok::<_, LixError>((cursor, prepared))
-            }
-            .fuse();
-            let shutdown = shutdown_rx.changed().fuse();
-            let demand = demand_rx.recv().fuse();
-            let renew_while_watching = changes.is_some() && baseline_expired.is_none();
-            let gate_local_changes =
-                authority_recovery_pending || retry_upload || baseline_expired.is_some();
-            let changed = async {
-                if gate_local_changes {
-                    // A fresh descriptor is a dependency of a rejected frozen
-                    // upload, and local notifications cannot bypass its retry
-                    // backoff. Preserve notifications until retry eligibility.
-                    futures_util::future::pending::<bool>().await
-                } else {
-                    match changes.as_mut() {
-                        Some(receiver) => receiver.changed().await.is_ok(),
-                        None => futures_util::future::pending::<bool>().await,
+                    let prepared =
+                        prepare_reconciled_descriptor(
+                            engine.clone(),
+                            state.clone(),
+                            connected,
+                            wrapper,
+                            recovery,
+                            &mut candidate_transfer,
+                        )
+                        .await.map_err(|error| {
+                            if super::partial_global_merge_runtime::waits_for_state_change(&error) {
+                                error.with_details(serde_json::json!({"authorityCursor":cursor,"pendingPreserved":true,"waitForChange":true}))
+                            } else {error}
+                        })?;
+                    Ok::<_, LixError>((cursor, prepared))
+                }
+                .fuse();
+                let shutdown = shutdown_rx.changed().fuse();
+                let demand = demand_rx.recv().fuse();
+                let renew_while_watching = changes.is_some() && baseline_expired.is_none();
+                let gate_local_changes =
+                    authority_recovery_pending || retry_upload || baseline_expired.is_some();
+                let changed = async {
+                    if gate_local_changes {
+                        // A fresh descriptor is a dependency of a rejected frozen
+                        // upload, and local notifications cannot bypass its retry
+                        // backoff. Preserve notifications until retry eligibility.
+                        futures_util::future::pending::<bool>().await
+                    } else {
+                        match changes.as_mut() {
+                            Some(receiver) => receiver.changed().await.is_ok(),
+                            None => futures_util::future::pending::<bool>().await,
+                        }
                     }
                 }
-            }
-            .fuse();
-            let renewal = async {
-                if renew_while_watching {
-                    sleep(renewal_deadline.saturating_duration_since(web_time::Instant::now()))
-                        .await;
-                } else {
-                    futures_util::future::pending::<()>().await;
-                }
-            }
-            .fuse();
-            let retry_enabled = retry_upload && !authority_recovery_pending;
-            let retry_at = retry_deadline;
-            let retry = async {
-                if retry_enabled {
-                    sleep(retry_at.saturating_duration_since(web_time::Instant::now())).await;
-                    if recovery_in_progress.load(Ordering::Relaxed) {
+                .fuse();
+                let renewal = async {
+                    if renew_while_watching {
+                        sleep(renewal_deadline.saturating_duration_since(web_time::Instant::now()))
+                            .await;
+                    } else {
                         futures_util::future::pending::<()>().await;
                     }
-                } else {
-                    futures_util::future::pending::<()>().await;
                 }
-            }
-            .fuse();
-            futures_util::pin_mut!(watch, shutdown, demand, changed, renewal, retry);
-            select_biased! {
-                _ = shutdown => break,
-                next = demand => { let Some(next) = next else { break }; queued_demand = Some(next); },
-                live = changed => { if !live { break; } upload_due = true; blocked_global_cursor=None; force_descriptor_refresh=true; },
-                _ = renewal => {},
-                _ = retry => { upload_due = true; },
-                result = watch => match result {
+                .fuse();
+                let retry_enabled = retry_upload && !authority_recovery_pending;
+                let retry_at = retry_deadline;
+                let retry = async {
+                    if retry_enabled {
+                        sleep(retry_at.saturating_duration_since(web_time::Instant::now())).await;
+                        if recovery_in_progress.load(Ordering::Relaxed) {
+                            futures_util::future::pending::<()>().await;
+                        }
+                    } else {
+                        futures_util::future::pending::<()>().await;
+                    }
+                }
+                .fuse();
+                futures_util::pin_mut!(watch, shutdown, demand, changed, renewal, retry);
+                select_biased! {
+                    _ = shutdown => PartialWatchEvent::Shutdown,
+                    next = demand => PartialWatchEvent::Demand(next),
+                    live = changed => PartialWatchEvent::Change(live),
+                    _ = renewal => PartialWatchEvent::Renewal,
+                    _ = retry => PartialWatchEvent::Retry,
+                    result = watch => PartialWatchEvent::Reconciled(result),
+                }
+            };
+            match event {
+                PartialWatchEvent::Shutdown => break,
+                PartialWatchEvent::Demand(next) => {
+                    let Some(next) = next else { break };
+                    queued_demand = Some(next);
+                }
+                PartialWatchEvent::Change(live) => {
+                    if !live {
+                        break;
+                    }
+                    upload_due = true;
+                    blocked_global_cursor = None;
+                    request_fresh_descriptor(
+                        &mut force_descriptor_refresh,
+                        &mut descriptor_refresh_generation,
+                    );
+                }
+                PartialWatchEvent::Renewal => {}
+                PartialWatchEvent::Retry => upload_due = true,
+                PartialWatchEvent::Reconciled(result) => {
+                    // The complete result (or error) ended this exact target.
+                    // Release it under the worker-owned retirement task so a
+                    // slow exact-operation cleanup cannot stall next demand.
+                    retained_candidate = None;
+                    candidate_transfer.retire()?;
+                    match result {
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::LocalProgress)) => {
                         health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
                         watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
@@ -1914,7 +2296,7 @@ where
                         // coordinates can be newer than the installed admission.
                         // Acquire one more descriptor before planning the next
                         // ordinary wave so its CAS basis is current.
-                        force_descriptor_refresh=true;upload_due=true;retry_upload=false;
+                        request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);upload_due=true;retry_upload=false;
                         retry_delay=Duration::from_millis(100);
                         watch_after=web_time::Instant::now();
                     },
@@ -1958,7 +2340,12 @@ where
                     },
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
                         health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
-                        force_descriptor_refresh=authority_recovery_pending; blocked_global_cursor=None;
+                        if authority_recovery_pending {
+                            request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
+                        } else {
+                            force_descriptor_refresh = false;
+                        }
+                        blocked_global_cursor=None;
                         upload_due |= baseline_expired.is_some();
                         publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
                     },
@@ -1983,7 +2370,7 @@ where
                                 // gated. Retry descriptor/reconciliation after the
                                 // existing backoff; never resend stale coordinates
                                 // just because local notifications accumulated.
-                                force_descriptor_refresh = true;
+                                request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
                                 upload_due = false;
                             } else if !retry_upload {
                                 upload_due = true;
@@ -1993,6 +2380,7 @@ where
 
                         watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
                     }
+                }
                 }
             }
             continue;
@@ -2050,7 +2438,7 @@ where
             select_biased! {
                 _ = shutdown => break,
                 demand = next => demand,
-                live = changed => { if live { upload_due = true; blocked_global_cursor=None; force_descriptor_refresh=true; } else { break; } continue; },
+                live = changed => { if live { upload_due = true; blocked_global_cursor=None; request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation); } else { break; } continue; },
                 _ = retry => { upload_due = true; continue; },
                 _ = renewal => { continue; },
                 _ = watch_ready => { continue; },
@@ -2082,7 +2470,15 @@ where
                     }
                     if matches!(demand.request, SyncDemandRequest::ReconcilePartial) {
                         let engine = engine.as_ref().ok_or_else(|| LixError::unknown("reconciliation requires an engine"))?;
-                        return Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, true))
+                        return Box::pin(reconcile_partial(
+                            engine.clone(),
+                            &mut transport,
+                            &mut connect,
+                            true,
+                            descriptor_refresh_generation,
+                            &mut candidate_transfer,
+                            &mut retained_candidate,
+                        ))
                             .await
                             .map(|_| HydratedInputs::default());
                     }
@@ -2112,24 +2508,37 @@ where
                         }
                         if let Some(engine) = &engine {
                             baseline_expired = result.as_ref().err().cloned();
+                            let recovery_was_already_pending = authority_recovery_pending;
                             authority_recovery_pending = true;
-                            force_descriptor_refresh = true;
+                            request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
                             watch_after = web_time::Instant::now();
-                            Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, false)).await?;
+                            Box::pin(reconcile_partial(
+                                engine.clone(),
+                                &mut transport,
+                                &mut connect,
+                                false,
+                                descriptor_refresh_generation,
+                                &mut candidate_transfer,
+                                &mut retained_candidate,
+                            ))
+                            .await?;
                             let current = engine.sync_mode().partial_admission().ok_or_else(|| LixError::unknown("recovery lost admission"))?;
-                            if current.as_ref() != state.as_ref() {
-                                // Recovery already fetched and published fresh coordinates.
-                                // Resume watching their cursor instead of fetching the same
-                                // descriptor again for every subsequent missing input.
-                                force_descriptor_refresh = false;
-                            }
                             if !super::partial_publication::same_serving_basis(state.descriptor(), current.descriptor())
                                 || state.serving_generation(&state.descriptor().selected_branch.branch_id)? != current.serving_generation(&current.descriptor().selected_branch.branch_id)?
                                 || state.serving_generation(&state.descriptor().global_branch.branch_id)? != current.serving_generation(&current.descriptor().global_branch.branch_id)? {
                                 return Err(LixError::new(super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
                                     "baseline recovery changed the serving basis; restart the local operation"));
                             }
-                            if current.as_ref() != state.as_ref() { continue; }
+                            if current.as_ref() != state.as_ref() {
+                                // This request itself proved a same-basis lease reacquisition.
+                                // Do not repeat discovery for later hydration, but preserve an
+                                // earlier upload-recovery reason that still needs reconciliation.
+                                force_descriptor_refresh = false;
+                                if !recovery_was_already_pending {
+                                    authority_recovery_pending = false;
+                                }
+                                continue;
+                            }
                         }
                     }
                     let admission_changed = engine.as_ref().is_some_and(|engine|
@@ -2152,7 +2561,7 @@ where
                 if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                     baseline_expired = Some(error.clone());
                     authority_recovery_pending = true;
-                    force_descriptor_refresh = true;
+                    request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
                     watch_after = web_time::Instant::now();
                 }
             }
@@ -2189,12 +2598,26 @@ where
     while let Some(demand) = demand_rx.recv().await {
         let _ = demand.response.send(Err(stopped.clone()));
     }
-    // Close the authenticated authority session without letting a disconnected
-    // network indefinitely delay local shutdown.
-    let Some(transport) = transport else {
-        return terminal_error.map_or(Ok(()), Err);
-    };
-    let close = transport.close_session().fuse();
+    // Join transfer cleanup with session close. The close future waits for any
+    // dispatched read owner, so a browser bridge stays alive until release
+    // attempts and local scratch cleanup have finished; remote release errors
+    // remain governed by the existing bounded retry policy. The shared outer
+    // bound still limits shutdown.
+    let close = async {
+        if let Some(transport) = transport {
+            let (cleanup, _close_result) = futures_util::future::join(
+                candidate_transfer.clear(),
+                transport.close_session(),
+            )
+            .await;
+            if let Err(error) = cleanup {
+                tracing::warn!(code=%error.code, "partial worker read-transfer cleanup did not complete cleanly during shutdown");
+            }
+        } else if let Err(error) = candidate_transfer.clear().await {
+            tracing::warn!(code=%error.code, "partial worker read-transfer cleanup did not complete cleanly during shutdown");
+        }
+    }
+    .fuse();
     let deadline = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, deadline);
     select_biased! { _ = close => {}, _ = deadline => {} }

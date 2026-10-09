@@ -107,7 +107,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
         transport: &super::super::http::HttpSyncTransport<C>,
         request: &ReadFulfillmentRequest,
         event: super::super::http::ReadSendEvent,
-        cancellation: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), LixError>
     where
         C: super::super::http::RawHttpClient + Clone + 'static,
@@ -127,9 +126,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> StagedClosure<S> {
                     session_id,
                 ));
             }
-        }
-        if cancellation_requested(cancellation) {
-            return Err(cancellation_error());
         }
         Ok(())
     }
@@ -910,16 +906,39 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     C: super::super::http::RawHttpClient + Clone + 'static,
 {
+    start_staged_fetch_with_permits(
+        storage,
+        state,
+        transport,
+        request,
+        owner_permit,
+        retained_payload_permit,
+    )?
+    .wait()
+    .await
+}
+
+fn start_staged_fetch_with_permits<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &super::super::http::HttpSyncTransport<C>,
+    request: &ReadFulfillmentRequest,
+    owner_permit: lifecycle::Permit,
+    retained_payload_permit: Option<super::super::transfer::RetainedPayloadPermit>,
+) -> Result<StagedFetchHandle<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
-    let mut cancellation = FetchCancellation(Some(cancel_sender));
     let owner_id = uuid::Uuid::now_v7();
     let read_operation_owner = transport.acquire_read_operation_owner()?;
     let storage = storage.clone();
     let state = state.clone();
     let transport = transport.clone();
     let request = request.clone();
-    crate::background_task::spawn_runtime_compatible(
+    if let Err(error) = crate::background_task::spawn_runtime_compatible(
         "read-operation-staged-fetch",
         move || async move {
             let result = fetch_staged_owned(
@@ -935,37 +954,431 @@ where
             .await;
             let _ = result_sender.send(result);
         },
-    )?;
+    ) {
+        return Err(error);
+    }
+    Ok(StagedFetchHandle {
+        result: Some(result_receiver),
+        cancellation: Some(cancel_sender),
+        cleanup: None,
+        finished: false,
+    })
+}
 
-    match result_receiver.await {
-        Ok(result) => {
-            cancellation.disarm();
-            result
-        }
-        Err(_) => {
-            cancellation.disarm();
-            Err(LixError::new(
+/// A staged network fetch whose owner can outlive an awaiting candidate pass.
+/// Dropping a waiter does not cancel this handle; the one transfer owner is
+/// canceled and joined only when the enclosing reconciliation target is
+/// invalidated.
+pub(crate) struct StagedFetchHandle<S: Storage + Clone + Send + Sync + 'static> {
+    result: Option<tokio::sync::oneshot::Receiver<Result<StagedClosure<S>, LixError>>>,
+    cancellation: Option<tokio::sync::oneshot::Sender<()>>,
+    cleanup: Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>,
+    finished: bool,
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> StagedFetchHandle<S> {
+    async fn wait(&mut self) -> Result<StagedClosure<S>, LixError> {
+        let result = self
+            .result
+            .as_mut()
+            .expect("staged fetch result is consumed once")
+            .await;
+        self.result.take();
+        self.cancellation.take();
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "staged fetch owner ended before returning a result",
-            ))
+            )),
         }
     }
-}
 
-struct FetchCancellation(Option<tokio::sync::oneshot::Sender<()>>);
+    async fn cancel_and_wait(&mut self) -> Result<(), LixError> {
+        if let Some(cancellation) = self.cancellation.take() {
+            let _ = cancellation.send(());
+        }
+        if let Some(result) = self.result.as_mut() {
+            let result = result.await;
+            self.result.take();
+            match result {
+                Ok(Ok(staged)) => match start_staged_cleanup(staged) {
+                    Ok(cleanup) => self.cleanup = Some(cleanup),
+                    Err(error) => {
+                        self.finished = true;
+                        return Err(error);
+                    }
+                },
+                Ok(Err(_)) | Err(_) => self.finished = true,
+            }
+        }
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            let result = cleanup.await;
+            self.cleanup.take();
+            self.finished = true;
+            return result.unwrap_or_else(|_| {
+                Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "staged cleanup owner ended before acknowledging release",
+                ))
+            });
+        }
+        Ok(())
+    }
 
-impl FetchCancellation {
-    fn disarm(&mut self) {
-        self.0.take();
+    fn finished(&self) -> bool {
+        self.finished
     }
 }
 
-impl Drop for FetchCancellation {
+impl<S: Storage + Clone + Send + Sync + 'static> Drop for StagedFetchHandle<S> {
     fn drop(&mut self) {
-        if let Some(sender) = self.0.take() {
-            let _ = sender.send(());
+        if let Some(cancellation) = self.cancellation.take() {
+            let _ = cancellation.send(());
         }
     }
+}
+
+struct CandidateTransferTarget {
+    source: PartialReplicaState,
+    descriptor: super::super::partial_replica::PartialReplicaDescriptor,
+    lease: crate::gc::NativeBaselineLease,
+    deadline: super::super::http::CandidateBaselineDeadline,
+}
+
+impl CandidateTransferTarget {
+    fn matches(
+        &self,
+        source: &PartialReplicaState,
+        target: &PartialReplicaState,
+        deadline: &super::super::http::CandidateBaselineDeadline,
+    ) -> bool {
+        self.source == *source
+            && self.descriptor == *target.descriptor()
+            && self.lease == *target.baseline_lease()
+            && self.deadline.same_window(deadline)
+    }
+}
+
+pub(crate) enum CandidateTransferResult {
+    Ready,
+    Fallback(ReadFulfillmentOutcome),
+}
+
+/// One candidate's immutable transfer can outlive an interrupted candidate
+/// evaluation, but only while the source admission and exact leased target
+/// remain unchanged. This owns no candidate read scope or prepared writes.
+pub(crate) struct CandidateReadTransfer<S: Storage + Clone + Send + Sync + 'static> {
+    target: Option<CandidateTransferTarget>,
+    request_digest: Option<String>,
+    immutable_only: Option<bool>,
+    fetch: Option<StagedFetchHandle<S>>,
+    staged: Option<StagedClosure<S>>,
+    cleanup: Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>,
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> Default for CandidateReadTransfer<S> {
+    fn default() -> Self {
+        Self {
+            target: None,
+            request_digest: None,
+            immutable_only: None,
+            fetch: None,
+            staged: None,
+            cleanup: None,
+        }
+    }
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> CandidateReadTransfer<S> {
+    /// Return the exact target currently owned by this transfer. Nested merge
+    /// reconciliation can replace the outer descriptor with a newer leased
+    /// target; the worker must resume that target after demand preemption.
+    pub(crate) fn retained_target(
+        &self,
+    ) -> Option<(
+        PartialReplicaState,
+        super::super::http::TimedLeasedPartialDescriptor,
+    )> {
+        if self.cleanup.is_some() {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        Some((
+            target.source.clone(),
+            super::super::http::TimedLeasedPartialDescriptor {
+                wire: super::super::LeasedPartialReplicaDescriptor {
+                    descriptor: target.descriptor.clone(),
+                    lease: target.lease.clone(),
+                },
+                deadline: target.deadline.clone(),
+            },
+        ))
+    }
+
+    pub(crate) async fn ensure_target(
+        &mut self,
+        source: &PartialReplicaState,
+        wrapper: &super::super::http::TimedLeasedPartialDescriptor,
+    ) -> Result<(), LixError> {
+        let target_matches = self.target.as_ref().is_none_or(|target| {
+            target.source == *source
+                && target.descriptor == wrapper.wire.descriptor
+                && target.lease == wrapper.wire.lease
+                && target.deadline.same_window(&wrapper.deadline)
+        });
+        if !target_matches || self.cleanup.is_some() {
+            self.clear().await?;
+        }
+        Ok(())
+    }
+
+    /// Retire this target without making the sync worker wait for remote
+    /// release retries or local scratch acknowledgement. The cleanup owner
+    /// retains the existing process permit and read-operation owner until the
+    /// same release/local-ledger sequence finishes. A later candidate must
+    /// join `cleanup` before acquiring another transfer slot.
+    pub(crate) fn retire(&mut self) -> Result<(), LixError> {
+        if self.cleanup.is_some() {
+            return Ok(());
+        }
+        if self.fetch.is_none() && self.staged.is_none() {
+            self.target.take();
+            self.request_digest.take();
+            self.immutable_only.take();
+            return Ok(());
+        }
+
+        let retiring = std::mem::take(self);
+        let (done_sender, done_receiver) = tokio::sync::oneshot::channel();
+        let owner = Arc::new(Mutex::new(Some(retiring)));
+        let task_owner = Arc::clone(&owner);
+        if let Err(error) = crate::background_task::spawn_runtime_compatible(
+            "candidate-read-transfer-retirement",
+            move || async move {
+                let mut retiring = task_owner
+                    .lock()
+                    .expect("candidate transfer retirement lock is not poisoned")
+                    .take()
+                    .expect("candidate transfer retirement has one owner");
+                let result = retiring.clear().await;
+                let _ = done_sender.send(result);
+            },
+        ) {
+            // Keep ownership if the shared executor cannot accept the task.
+            // The caller can fall back to its existing awaited cleanup path.
+            *self = owner
+                .lock()
+                .expect("candidate transfer retirement lock is not poisoned")
+                .take()
+                .expect("failed retirement returned its owner");
+            return Err(error);
+        }
+        self.cleanup = Some(done_receiver);
+        Ok(())
+    }
+
+    pub(crate) async fn fetch_or_wait<C>(
+        &mut self,
+        storage: &StorageAdapter<S>,
+        source: &PartialReplicaState,
+        target: &PartialReplicaState,
+        deadline: &super::super::http::CandidateBaselineDeadline,
+        transport: &super::super::http::HttpSyncTransport<C>,
+        request: &ReadFulfillmentRequest,
+        immutable_only: bool,
+    ) -> Result<CandidateTransferResult, LixError>
+    where
+        C: super::super::http::RawHttpClient + Clone + 'static,
+    {
+        if let Err(error) = deadline.check(&target.baseline_lease().lease_id) {
+            self.clear().await?;
+            return Err(error);
+        }
+        let request_digest = request.digest()?;
+        let target_matches = self
+            .target
+            .as_ref()
+            .is_some_and(|current| current.matches(source, target, deadline));
+        if !target_matches
+            || self.request_digest.as_deref() != Some(&request_digest)
+            || self.immutable_only != Some(immutable_only)
+            || self.cleanup.is_some()
+        {
+            self.clear().await?;
+            #[cfg(test)]
+            let retained_payload_permit = None;
+            #[cfg(not(test))]
+            let retained_payload_permit = super::super::transfer::RetainedPayloadPermit::try_acquire();
+            let fetch = match start_staged_fetch_with_permits(
+                storage,
+                source,
+                transport,
+                request,
+                lifecycle::Permit::acquire()?,
+                retained_payload_permit,
+            ) {
+                Ok(fetch) => fetch,
+                Err(error) => return Err(error),
+            };
+            self.target = Some(CandidateTransferTarget {
+                source: source.clone(),
+                descriptor: target.descriptor().clone(),
+                lease: target.baseline_lease().clone(),
+                deadline: deadline.clone(),
+            });
+            self.request_digest = Some(request_digest);
+            self.immutable_only = Some(immutable_only);
+            self.fetch = Some(fetch);
+        }
+        if let Err(error) = deadline.check(&target.baseline_lease().lease_id) {
+            self.clear().await?;
+            return Err(error);
+        }
+        if self.staged.is_none() {
+            let result = self
+                .fetch
+                .as_mut()
+                .expect("matching candidate transfer has an owner")
+                .wait()
+                .await;
+            self.fetch.take();
+            match result {
+                Ok(staged) => self.staged = Some(staged),
+                Err(error) => {
+                    self.target.take();
+                    self.request_digest.take();
+                    self.immutable_only.take();
+                    return Err(error);
+                }
+            }
+        }
+        if let Err(error) = deadline.check(&target.baseline_lease().lease_id) {
+            self.clear().await?;
+            return Err(error);
+        }
+        let outcome = self
+            .staged
+            .as_ref()
+            .expect("completed candidate transfer has staged closure")
+            .outcome();
+        if outcome != ReadFulfillmentOutcome::Complete {
+            self.clear().await?;
+            return Ok(CandidateTransferResult::Fallback(outcome));
+        }
+        Ok(CandidateTransferResult::Ready)
+    }
+
+    pub(crate) async fn promote(
+        &mut self,
+        source: &PartialReplicaState,
+        target: &PartialReplicaState,
+        deadline: &super::super::http::CandidateBaselineDeadline,
+        request: &ReadFulfillmentRequest,
+        immutable_only: bool,
+    ) -> Result<super::super::runtime::HydratedInputs, LixError> {
+        deadline.check(&target.baseline_lease().lease_id)?;
+        let request_digest = request.digest()?;
+        if !self.target.as_ref().is_some_and(|current| {
+            current.matches(source, target, deadline)
+        }) || self.request_digest.as_deref() != Some(&request_digest)
+            || self.immutable_only != Some(immutable_only)
+        {
+            return Err(invalid("candidate transfer changed before promotion"));
+        }
+        let expected_request_descriptor = if immutable_only {
+            target.descriptor()
+        } else {
+            source.descriptor()
+        };
+        if source.repository_id() != target.repository_id()
+            || source.remote_id() != target.remote_id()
+            || source.active_account_id() != target.active_account_id()
+            || source.epoch_id() != target.epoch_id()
+            || source.descriptor().selected_branch.branch_id
+                != target.descriptor().selected_branch.branch_id
+            || target.descriptor().cursor < source.descriptor().cursor
+            || request.epoch_id != target.epoch_id()
+            || request.descriptor != *expected_request_descriptor
+        {
+            return Err(invalid("candidate transfer crossed its admission basis"));
+        }
+        request.validate(target.repository_id())?;
+        let staged = self
+            .staged
+            .as_mut()
+            .ok_or_else(|| invalid("candidate transfer is not ready for promotion"))?;
+        let promoted = staged.promote(request, immutable_only).await?;
+        self.staged.take();
+        self.target.take();
+        self.request_digest.take();
+        self.immutable_only.take();
+        Ok(promoted)
+    }
+
+    pub(crate) async fn clear(&mut self) -> Result<(), LixError> {
+        let mut first_error = None;
+        if let Some(fetch) = self.fetch.as_mut() {
+            if let Err(error) = fetch.cancel_and_wait().await {
+                first_error = Some(error);
+            }
+            if fetch.finished() {
+                self.fetch.take();
+            }
+        }
+        if self.cleanup.is_none()
+            && let Some(staged) = self.staged.take()
+        {
+            match start_staged_cleanup(staged) {
+                Ok(cleanup) => self.cleanup = Some(cleanup),
+                Err(error) => {
+                    self.target.take();
+                    self.request_digest.take();
+                    self.immutable_only.take();
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            let result = cleanup.await;
+            self.cleanup.take();
+            if let Err(error) = result.unwrap_or_else(|_| {
+                Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "staged cleanup owner ended before acknowledging release",
+                ))
+            }) && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if self.fetch.is_none() && self.staged.is_none() && self.cleanup.is_none() {
+            self.target.take();
+            self.request_digest.take();
+            self.immutable_only.take();
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn start_staged_cleanup<S>(
+    mut staged: StagedClosure<S>,
+) -> Result<tokio::sync::oneshot::Receiver<Result<(), LixError>>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let (done_sender, done_receiver) = tokio::sync::oneshot::channel();
+    crate::background_task::spawn_runtime_compatible(
+        "candidate-read-transfer-cleanup",
+        move || async move {
+            let _ = done_sender.send(staged.release_scratch().await);
+        },
+    )?;
+    Ok(done_receiver)
 }
 
 fn cancellation_requested(receiver: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
@@ -977,6 +1390,32 @@ fn cancellation_requested(receiver: &mut tokio::sync::oneshot::Receiver<()>) -> 
 
 fn cancellation_error() -> LixError {
     LixError::new("LIX_READ_FULFILLMENT_CANCELED", "staged fetch was canceled")
+}
+
+async fn fulfill_read_cancellable<S, C>(
+    transport: &super::super::http::HttpSyncTransport<C>,
+    operation_request: &ReadFulfillmentRequest,
+    page_request: &ReadFulfillmentRequest,
+    stage: &mut StagedClosure<S>,
+    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Result<ReadFulfillmentResponse, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: super::super::http::RawHttpClient + Clone + 'static,
+{
+    let response = transport.fulfill_read_tracked(page_request, |event| {
+        stage.track_remote_operation_send(transport, operation_request, event)
+    });
+    // Poll the response first so an already-complete terminal fallback can
+    // disarm remote cleanup before cancellation is observed. Once raw handoff
+    // is reported, dropping the request future is safe: release is keyed by
+    // this exact operation and the authority records a cancellation tombstone
+    // if release reaches it before the original request.
+    tokio::select! {
+        biased;
+        result = response => result,
+        _ = cancellation => Err(cancellation_error()),
+    }
 }
 
 fn response_header(response: &ReadFulfillmentResponse) -> ReadFulfillmentResponse {
@@ -1243,24 +1682,20 @@ where
         return Err(stage.into_attempt_error(error).await);
     }
     let mut page_request = request.clone();
-    let mut page = match transport
-        .fulfill_read_tracked(&page_request, |event| {
-            // The first raw dispatch makes cancellation authority necessary.
-            // A canonical SESSION_GONE proves the authority rejected that
-            // attempt before execution, so discard it before recovery can
-            // fail or the replacement session can be closed.
-            stage.track_remote_operation_send(transport, request, event, cancellation)
-        })
-        .await
+    let mut page = match fulfill_read_cancellable(
+        transport,
+        request,
+        &page_request,
+        &mut stage,
+        cancellation,
+    )
+    .await
     {
         Ok(page) => page,
         Err(error) => {
             return Err(stage.into_attempt_error(error).await);
         }
     };
-    if cancellation_requested(cancellation) {
-        return Err(stage.into_attempt_error(cancellation_error()).await);
-    }
     stage.header = response_header(&page);
     if page.outcome != ReadFulfillmentOutcome::Complete {
         if let Err(error) = validate_complete(request, &page) {
@@ -1271,6 +1706,9 @@ where
         stage.remote_operation_cleanup.take();
         stage.release_scratch().await?;
         return Ok(stage);
+    }
+    if cancellation_requested(cancellation) {
+        return Err(stage.into_attempt_error(cancellation_error()).await);
     }
     let result = async {
         for _ in 0..MAX_PAGES {
@@ -1303,11 +1741,14 @@ where
                 return Ok(());
             };
             page_request.continuation = Some(next);
-            page = transport
-                .fulfill_read_tracked(&page_request, |event| {
-                    stage.track_remote_operation_send(transport, request, event, cancellation)
-                })
-                .await?;
+            page = fulfill_read_cancellable(
+                transport,
+                request,
+                &page_request,
+                &mut stage,
+                cancellation,
+            )
+            .await?;
             if cancellation_requested(cancellation) {
                 return Err(cancellation_error());
             }

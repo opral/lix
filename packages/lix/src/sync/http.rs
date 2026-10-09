@@ -109,7 +109,7 @@ struct ErrorBody {
 
 /// Fresh HTTP observation paired with a process-local publication deadline.
 /// The deadline is deliberately absent from the wire and durable replica state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TimedLeasedPartialDescriptor {
     pub(crate) wire: super::LeasedPartialReplicaDescriptor,
     pub(crate) deadline: CandidateBaselineDeadline,
@@ -148,6 +148,9 @@ impl CandidateBaselineDeadline {
                     "candidate baseline deadline elapsed; prepare a fresh leased candidate",
                 )
             })
+    }
+    pub(crate) fn same_window(&self, other: &Self) -> bool {
+        self.lease_id == other.lease_id && self.expires == other.expires
     }
     fn expired(message: &str) -> LixError {
         LixError::new("LIX_PARTIAL_CANDIDATE_EXPIRED", message)
