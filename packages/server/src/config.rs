@@ -33,6 +33,8 @@ pub struct Config {
     pub idle_timeout: Duration,
     pub protocol_timeout: Duration,
     pub recovery_close_timeout: Duration,
+    /// No completed work or phase transition for this long reports a nonterminal stall.
+    pub open_stall_timeout: Duration,
     pub(crate) storage: S3StorageConfig,
 }
 
@@ -82,6 +84,9 @@ impl Config {
             DEFAULT_RECOVERY_CLOSE_TIMEOUT_SECS,
         )?);
 
+        let open_stall_timeout =
+            Duration::from_secs(positive_u64_env("LIX_SERVER_OPEN_STALL_TIMEOUT_SECS", 300)?);
+
         let storage = S3StorageConfig {
             endpoint: required_env("S3_ENDPOINT")?,
             bucket: required_env("S3_BUCKET")?,
@@ -101,6 +106,7 @@ impl Config {
             idle_timeout,
             protocol_timeout,
             recovery_close_timeout,
+            open_stall_timeout,
             storage,
         })
     }
@@ -268,6 +274,7 @@ mod tests {
 
         assert_eq!(config.max_open_lixes, 32);
         assert_eq!(config.idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.open_stall_timeout, Duration::from_secs(300));
         assert_eq!(config.bind_addr, "0.0.0.0:8080");
         assert_eq!(config.internal_token.as_deref(), Some("test-token"));
         assert_eq!(config.storage.endpoint, "https://s3.example");
@@ -488,6 +495,7 @@ mod tests {
             "LIX_SERVER_IDLE_TIMEOUT_SECS",
             "LIX_SERVER_PROTOCOL_TIMEOUT_SECS",
             "LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS",
+            "LIX_SERVER_OPEN_STALL_TIMEOUT_SECS",
             "S3_ENDPOINT",
             "S3_BUCKET",
             "S3_ACCESS_KEY_ID",

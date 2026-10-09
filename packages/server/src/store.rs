@@ -12,8 +12,10 @@ mod auto_migration;
 mod inventory;
 #[cfg(test)]
 mod migration_profile;
+pub(crate) mod opening;
 mod request_budget;
 pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
+use opening::{OpenOperation, OpenPhase as OperationPhase, OpenSnapshot};
 
 use crate::{Config, config::SlateDBCacheConfig};
 use anyhow::{Context, Result};
@@ -114,6 +116,7 @@ pub struct LixRuntimeManager {
     pub(crate) public_url: String,
     max_open_lixes: usize,
     recovery_watchdog: RecoveryWatchdog,
+    open_stall_timeout: Duration,
     state: Mutex<ManagerState>,
     telemetry: Arc<dyn lix_sdk::telemetry::TelemetrySink>,
     #[cfg(test)]
@@ -262,6 +265,7 @@ impl Drop for CacheRootLeaseDropProbe {
 }
 
 struct RuntimeEntry {
+    operation: Arc<OpenOperation>,
     open_context: opentelemetry::trace::SpanContext,
     runtime: Arc<OnceCell<Arc<LixRuntime>>>,
     opened: watch::Receiver<RuntimeOpenState>,
@@ -277,6 +281,7 @@ struct CacheRootLease {
 struct CleanupTombstone {
     sequence: u64,
     done: watch::Receiver<CleanupState>,
+    failed_open: Option<OpenSnapshot>,
 }
 
 struct EvictedRuntime {
@@ -346,6 +351,7 @@ fn is_repository_upgrade_failure(error: &anyhow::Error) -> bool {
 }
 
 struct PendingRuntimeOpen {
+    operation: Arc<OpenOperation>,
     lifecycle: OwnedRwLockReadGuard<()>,
     lix_id: String,
     record: RepositoryRecord,
@@ -369,6 +375,7 @@ enum GetRuntimeAction {
         cleanup: watch::Receiver<CleanupState>,
     },
     WaitForOpen {
+        operation: Arc<OpenOperation>,
         runtime: Arc<OnceCell<Arc<LixRuntime>>>,
         opened: watch::Receiver<RuntimeOpenState>,
     },
@@ -378,12 +385,10 @@ enum GetRuntimeAction {
 pub(crate) enum LixRuntimeError {
     InvalidId,
     NotFound,
+    Opening(OpenSnapshot),
+    OpenDeadline(OpenSnapshot),
     AtCapacity {
         max: usize,
-    },
-    Migrating {
-        from_version: u32,
-        to_version: u32,
     },
     MigrationFailed {
         from_version: u32,
@@ -498,6 +503,7 @@ impl LixRuntimeManager {
             public_url: config.public_url.clone(),
             max_open_lixes: config.max_open_lixes,
             recovery_watchdog: RecoveryWatchdog::production(config.recovery_close_timeout),
+            open_stall_timeout: config.open_stall_timeout,
             state: Mutex::new(ManagerState::default()),
             telemetry,
             #[cfg(test)]
@@ -558,6 +564,7 @@ impl LixRuntimeManager {
             public_url: "http://localhost".to_owned(),
             max_open_lixes,
             recovery_watchdog: RecoveryWatchdog::test_default(),
+            open_stall_timeout: Duration::from_secs(300),
             state: Mutex::new(ManagerState::default()),
             telemetry,
             open_gate: None,
@@ -600,6 +607,9 @@ impl LixRuntimeManager {
                 if state.shutting_down {
                     return Err(LixRuntimeError::ShuttingDown);
                 } else if let Some(cleanup) = state.cleaning.get(lix_id) {
+                    if let Some(snapshot) = &cleanup.failed_open {
+                        return Err(LixRuntimeError::Opening(snapshot.clone()));
+                    }
                     GetRuntimeAction::WaitForCleanup(cleanup.done.clone())
                 } else if let Some(failure) = state.failed_upgrades.get(lix_id) {
                     return Err(runtime_error_from_failed_upgrade(*failure));
@@ -616,6 +626,7 @@ impl LixRuntimeManager {
                         tracing::Span::current().add_link(entry.open_context.clone());
                     }
                     GetRuntimeAction::WaitForOpen {
+                        operation: Arc::clone(&entry.operation),
                         runtime: Arc::clone(&entry.runtime),
                         opened: entry.opened.clone(),
                     }
@@ -662,10 +673,18 @@ impl LixRuntimeManager {
                     let now = state.clock;
                     let runtime = Arc::new(OnceCell::new());
                     let (done, opened) = watch::channel(RuntimeOpenState::Opening);
-                    let open_span = info_span!("lix.runtime.open", lix.id = %lix_id, storage.backend = STORAGE_BACKEND);
+                    let operation = OpenOperation::new(lix_id.to_owned(), self.open_stall_timeout);
+                    let open_span = info_span!("lix.runtime.open", lix.id = %lix_id, "lix.open.operation_id" = %operation.snapshot().operation_id, storage.backend = STORAGE_BACKEND);
+                    tokio::spawn(
+                        Arc::clone(&operation)
+                            .monitor()
+                            .instrument(open_span.clone())
+                            .with_current_subscriber(),
+                    );
                     state.entries.insert(
                         lix_id.to_string(),
                         RuntimeEntry {
+                            operation: Arc::clone(&operation),
                             open_context: open_span.context().span().span_context().clone(),
                             runtime: Arc::clone(&runtime),
                             opened: opened.clone(),
@@ -679,6 +698,7 @@ impl LixRuntimeManager {
                     self.spawn_runtime_open(
                         open_span,
                         PendingRuntimeOpen {
+                            operation: Arc::clone(&operation),
                             lifecycle: lifecycle_guard.take().expect("opener owns lifecycle guard"),
                             lix_id: lix_id.to_string(),
                             record: record
@@ -688,7 +708,11 @@ impl LixRuntimeManager {
                             done,
                         },
                     );
-                    GetRuntimeAction::WaitForOpen { runtime, opened }
+                    GetRuntimeAction::WaitForOpen {
+                        operation,
+                        runtime,
+                        opened,
+                    }
                 }
             };
 
@@ -712,9 +736,14 @@ impl LixRuntimeManager {
                         .await?;
                 }
                 GetRuntimeAction::WaitForOpen {
+                    operation,
                     runtime,
                     mut opened,
                 } => loop {
+                    let snapshot = operation.snapshot();
+                    if snapshot.stalled {
+                        return Err(LixRuntimeError::Opening(snapshot));
+                    }
                     let open_state = opened.borrow().clone();
                     match open_state {
                         RuntimeOpenState::Ready => break 'select_runtime runtime,
@@ -727,10 +756,10 @@ impl LixRuntimeManager {
                             from_version,
                             to_version,
                         } => {
-                            return Err(LixRuntimeError::Migrating {
-                                from_version,
-                                to_version,
-                            });
+                            let mut snapshot = operation.snapshot();
+                            snapshot.from_format = Some(from_version);
+                            snapshot.to_format = to_version;
+                            return Err(LixRuntimeError::Opening(snapshot));
                         }
                         RuntimeOpenState::MigrationFailed {
                             from_version,
@@ -747,15 +776,23 @@ impl LixRuntimeManager {
                             return Err(LixRuntimeError::UpgradeFailed(diagnostic));
                         }
                         RuntimeOpenState::Opening => {
-                            if opened
-                                .changed()
-                                .instrument(info_span!("lix.runtime.wait_open"))
-                                .await
-                                .is_err()
+                            if snapshot.phase == "failed" {
+                                return Err(LixRuntimeError::Opening(snapshot));
+                            }
+                            match tokio::time::timeout(
+                                Duration::from_secs(1).min(self.open_stall_timeout),
+                                opened
+                                    .changed()
+                                    .instrument(info_span!("lix.runtime.wait_open")),
+                            )
+                            .await
                             {
-                                return Err(LixRuntimeError::Open(anyhow::anyhow!(
-                                    "lix runtime opener stopped before completing"
-                                )));
+                                Ok(Err(_)) => {
+                                    return Err(LixRuntimeError::Open(anyhow::anyhow!(
+                                        "lix runtime opener stopped before completing"
+                                    )));
+                                }
+                                Ok(Ok(())) | Err(_) => {}
                             }
                         }
                     }
@@ -781,7 +818,12 @@ impl LixRuntimeManager {
             async move {
                 let _lifecycle = opener.lifecycle;
                 let opened = manager
-                    .open_lix_for_handler(opener.lix_id.clone(), opener.record, opener.done.clone())
+                    .open_lix_for_handler(
+                        opener.lix_id.clone(),
+                        opener.record,
+                        opener.done.clone(),
+                        Arc::clone(&opener.operation),
+                    )
                     .await;
                 match opened {
                     Ok(runtime) => {
@@ -789,9 +831,11 @@ impl LixRuntimeManager {
                             opener.runtime.set(runtime).is_ok(),
                             "managed opener is the sole OnceCell initializer"
                         );
+                        opener.operation.phase(OperationPhase::Ready, "none");
                         opener.done.send_replace(RuntimeOpenState::Ready);
                     }
                     Err(error) => {
+                        opener.operation.fail(&error);
                         let diagnostic = MigrationDiagnostic::from_error(&error);
                         let failed_upgrade = match opener.done.borrow().clone() {
                             RuntimeOpenState::Migrating {
@@ -820,21 +864,13 @@ impl LixRuntimeManager {
                                         error = %error,
                                         "Lix repository migration failed"
                                     );
-                                    opener.done.send_replace(RuntimeOpenState::MigrationFailed {
-                                        from_version: failure.from_version,
-                                        to_version: failure.to_version,
-                                        diagnostic: failure.diagnostic,
-                                    });
                                 }
-                                FailedUpgrade::Unversioned(diagnostic) => {
+                                FailedUpgrade::Unversioned(_) => {
                                     tracing::error!(
                                         lix_id = %opener.lix_id,
                                         error = %error,
                                         "Lix repository upgrade failed"
                                     );
-                                    opener
-                                        .done
-                                        .send_replace(RuntimeOpenState::UpgradeFailed(diagnostic));
                                 }
                             }
                         }
@@ -859,9 +895,21 @@ impl LixRuntimeManager {
                                 .finish_cleanup(&opener.lix_id, sequence, done, cleanup)
                                 .await;
                         }
-                        if failed_upgrade.is_none() {
-                            opener.done.send_replace(RuntimeOpenState::Failed(error));
-                        }
+                        // Shutdown uses this watch completion to wait for cleanup;
+                        // request waiters observe the terminal operation snapshot sooner.
+                        opener.done.send_replace(match failed_upgrade {
+                            Some(FailedUpgrade::Versioned(failure)) => {
+                                RuntimeOpenState::MigrationFailed {
+                                    from_version: failure.from_version,
+                                    to_version: failure.to_version,
+                                    diagnostic: failure.diagnostic,
+                                }
+                            }
+                            Some(FailedUpgrade::Unversioned(diagnostic)) => {
+                                RuntimeOpenState::UpgradeFailed(diagnostic)
+                            }
+                            None => RuntimeOpenState::Failed(error),
+                        });
                     }
                 }
             }
@@ -875,6 +923,7 @@ impl LixRuntimeManager {
         lix_id: String,
         record: RepositoryRecord,
         opened: watch::Sender<RuntimeOpenState>,
+        operation: Arc<OpenOperation>,
     ) -> Result<Arc<LixRuntime>> {
         #[cfg(test)]
         if let Some(gate) = &self.open_gate {
@@ -895,7 +944,11 @@ impl LixRuntimeManager {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                runtime.block_on(manager.open_lix(&lix_id, &record, &opened).instrument(span))
+                runtime.block_on(
+                    manager
+                        .open_lix(&lix_id, &record, &opened, operation)
+                        .instrument(span),
+                )
             })
         })
         .await
@@ -903,14 +956,31 @@ impl LixRuntimeManager {
     }
 
     fn open_storage(&self, lix_id: &str, io: SlateDBIoCounters) -> Result<SlateDB> {
+        self.open_storage_with_progress(lix_id, io, None)
+    }
+
+    fn open_storage_with_progress(
+        &self,
+        lix_id: &str,
+        io: SlateDBIoCounters,
+        operation: Option<Arc<OpenOperation>>,
+    ) -> Result<SlateDB> {
         info_span!("lix.storage.open", lix.id = lix_id).in_scope(|| match &self.backend {
             #[cfg(test)]
             StorageBackend::Memory { object_store } => {
-                SlateDB::open_object_store_with_options_and_io_counters(
+                SlateDB::open_object_store_with_options_and_io_counters_and_progress(
                     lix_id,
                     Arc::clone(object_store),
                     SlateDBObjectStoreOptions::default(),
                     io.clone(),
+                    {
+                        let op = operation.clone();
+                        move |event| {
+                            if let Some(op) = &op {
+                                op.storage_progress(event);
+                            }
+                        }
+                    },
                 )
                 .context("open in-memory Lix SlateDB storage")
             }
@@ -927,13 +997,21 @@ impl LixRuntimeManager {
                 let mut lix_cache = cache.clone();
                 lix_cache.root_folder = cache_child_path(&cache.root_folder, lix_id)
                     .expect("Lix IDs are validated before opening cached storage");
-                SlateDB::open_object_store_with_options_and_io_counters(
+                SlateDB::open_object_store_with_options_and_io_counters_and_progress(
                     storage_prefix,
                     Arc::clone(object_store),
                     SlateDBObjectStoreOptions {
                         cache: Some(lix_cache),
                     },
                     io.clone(),
+                    {
+                        let op = operation.clone();
+                        move |event| {
+                            if let Some(op) = &op {
+                                op.storage_progress(event);
+                            }
+                        }
+                    },
                 )
                 .context("open cached S3-backed Lix SlateDB storage")
             }
@@ -945,7 +1023,9 @@ impl LixRuntimeManager {
         lix_id: &str,
         record: &RepositoryRecord,
         opened: &watch::Sender<RuntimeOpenState>,
+        operation: Arc<OpenOperation>,
     ) -> Result<Arc<LixRuntime>> {
+        operation.phase(OperationPhase::CheckingSource, "catalog_source");
         debug_assert_eq!(record.state, "live");
         if !valid_lix_id(&record.storage_id) {
             anyhow::bail!("catalogued physical storage identifier is invalid");
@@ -953,8 +1033,14 @@ impl LixRuntimeManager {
         if !self.legacy_storage_present(&record.storage_id).await? {
             anyhow::bail!("catalogued repository physical storage is missing");
         }
-        self.open_storage_runtime(lix_id, &record.storage_id, opened, Some(&record))
-            .await
+        self.open_storage_runtime(
+            lix_id,
+            &record.storage_id,
+            opened,
+            Some(&record),
+            Some(operation),
+        )
+        .await
     }
 
     async fn open_storage_runtime(
@@ -963,23 +1049,38 @@ impl LixRuntimeManager {
         storage_id: &str,
         opened: &watch::Sender<RuntimeOpenState>,
         existing: Option<&RepositoryRecord>,
+        operation: Option<Arc<OpenOperation>>,
     ) -> Result<Arc<LixRuntime>> {
         let started = Instant::now();
         let io = SlateDBIoCounters::default();
         let storage_started = Instant::now();
-        let storage = self.open_storage(&storage_id, io.clone())?;
+        if let Some(op) = &operation {
+            op.phase(OperationPhase::StorageInitializing, "slatedb_open");
+        }
+        let storage =
+            self.open_storage_with_progress(&storage_id, io.clone(), operation.clone())?;
         let storage_open_ms = elapsed_millis(storage_started);
         if existing.is_some() {
+            if let Some(op) = &operation {
+                op.phase(OperationPhase::Validating, "authority_identity");
+            }
             self.validate_existing_authority(&storage).await?;
         }
 
+        if let Some(op) = &operation {
+            op.phase(OperationPhase::EngineInspecting, "engine");
+        }
         let engine_started = Instant::now();
         // The canonical protocol owns the repository engine directly. Server
         // admission creates no hidden application session; each successful
         // handshake owns exactly one client session.
         let open_state = opened.clone();
+        let engine_operation = operation.clone();
         let open_progress =
             lix_sdk::CallbackOpenProgressSink::new(move |progress: lix_sdk::OpenProgress| {
+                if let Some(op) = &engine_operation {
+                    op.engine_progress(progress);
+                }
                 if let Some(state) = runtime_open_state_from_progress(progress) {
                     open_state.send_replace(state);
                 }
@@ -997,6 +1098,9 @@ impl LixRuntimeManager {
         .instrument(info_span!("lix.engine.open", lix.id = lix_id))
         .await?;
         if let Some(record) = existing {
+            if let Some(op) = &operation {
+                op.phase(OperationPhase::Publishing, "catalog_cas");
+            }
             if let Err(error) = self.publish_open_admission(lix_id, record).await {
                 // Do not expose a runtime whose catalog identity changed while
                 // Rust was upgrading/opening its physical repository.
@@ -1292,9 +1396,17 @@ impl LixRuntimeManager {
         {
             return None;
         }
-        state.entries.remove(lix_id);
+        let failed_open = state
+            .entries
+            .remove(lix_id)
+            .map(|entry| entry.operation.snapshot());
         let cleanup = start_cleanup(&mut state, lix_id.to_string())
             .expect("an active opening cannot already be cleaning");
+        state
+            .cleaning
+            .get_mut(lix_id)
+            .expect("cleanup tombstone")
+            .failed_open = failed_open;
         info!(lix_id, "removed failed lix runtime opening");
         Some(cleanup)
     }
@@ -1462,8 +1574,24 @@ impl LixRuntimeManager {
         first_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) fn max_open_lixes(&self) -> usize {
-        self.max_open_lixes
+    pub(crate) async fn open_wait_error(&self, id: &str, deadline: bool) -> LixRuntimeError {
+        let state = self.state.lock().await;
+        if let Some(entry) = state.entries.get(id) {
+            let snapshot = entry.operation.snapshot();
+            if snapshot.phase == "failed" || snapshot.stalled || !deadline {
+                LixRuntimeError::Opening(snapshot)
+            } else {
+                LixRuntimeError::OpenDeadline(snapshot)
+            }
+        } else if let Some(snapshot) = state
+            .cleaning
+            .get(id)
+            .and_then(|cleanup| cleanup.failed_open.clone())
+        {
+            LixRuntimeError::Opening(snapshot)
+        } else {
+            LixRuntimeError::Recovering
+        }
     }
 
     #[cfg(test)]
@@ -1667,18 +1795,16 @@ async fn close_runtime_after_open(
 impl fmt::Display for LixRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Opening(s) | Self::OpenDeadline(s) => write!(
+                formatter,
+                "repository opening {} at {} ({} ms without progress)",
+                s.operation_id, s.phase, s.idle_ms
+            ),
             Self::InvalidId => write!(formatter, "invalid lix ID"),
             Self::NotFound => write!(formatter, "Lix not found"),
             Self::AtCapacity { max } => write!(
                 formatter,
                 "lix service is at its capacity of {max} active runtimes"
-            ),
-            Self::Migrating {
-                from_version,
-                to_version,
-            } => write!(
-                formatter,
-                "lix repository is migrating from v{from_version} to v{to_version}"
             ),
             Self::MigrationFailed {
                 from_version,
@@ -1963,6 +2089,7 @@ fn start_cleanup(
         CleanupTombstone {
             sequence,
             done: waiter,
+            failed_open: None,
         },
     );
     Some((sequence, done))
@@ -2425,6 +2552,7 @@ mod tests {
             public_url: "http://localhost".to_owned(),
             max_open_lixes,
             recovery_watchdog: RecoveryWatchdog::test_default(),
+            open_stall_timeout: Duration::from_secs(300),
             state: Mutex::new(ManagerState::default()),
             telemetry: test_telemetry_sink(),
             _cache_root_lease: None,
@@ -2603,6 +2731,7 @@ mod tests {
         manager.state.lock().await.entries.insert(
             LIX_A.to_string(),
             RuntimeEntry {
+                operation: OpenOperation::new("test".into(), Duration::from_secs(300)),
                 open_context: opentelemetry::trace::SpanContext::empty_context(),
                 runtime,
                 opened,
@@ -2614,13 +2743,59 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(25), manager.get(LIX_A))
             .await
             .expect("migration state must return without waiting for the opener");
-        assert!(matches!(
-            result,
-            Err(LixRuntimeError::Migrating {
-                from_version: 68,
-                to_version: 71,
-            })
-        ));
+        let Err(LixRuntimeError::Opening(snapshot)) = result else {
+            panic!("expected correlated opening progress")
+        };
+        assert_eq!(snapshot.from_format, Some(68));
+        assert_eq!(snapshot.to_format, 71);
+    }
+
+    #[tokio::test]
+    async fn deadline_reports_terminal_open_failure_through_cleanup() {
+        let manager = memory_manager(1).await;
+        let operation = OpenOperation::new(LIX_A.into(), Duration::from_secs(300));
+        operation.phase(
+            OperationPhase::StoragePublishing,
+            "migration_publication_write",
+        );
+        operation.fail(&anyhow::anyhow!("private storage error"));
+        let runtime = Arc::new(OnceCell::new());
+        let (_owner, opened) = watch::channel(RuntimeOpenState::Opening);
+        manager.state.lock().await.entries.insert(
+            LIX_A.into(),
+            RuntimeEntry {
+                operation,
+                open_context: opentelemetry::trace::SpanContext::empty_context(),
+                runtime: Arc::clone(&runtime),
+                opened,
+                last_used: 1,
+                idle_since: None,
+            },
+        );
+        for during_cleanup in [false, true] {
+            let cleanup = if during_cleanup {
+                manager.begin_failed_open_cleanup(LIX_A, &runtime).await
+            } else {
+                None
+            };
+            let Err(LixRuntimeError::Opening(snapshot)) = manager.get(LIX_A).await else {
+                panic!("request waiters must observe failure before cleanup completion");
+            };
+            assert_eq!(snapshot.phase, "failed");
+            for deadline in [false, true] {
+                let LixRuntimeError::Opening(snapshot) =
+                    manager.open_wait_error(LIX_A, deadline).await
+                else {
+                    panic!("terminal failure must take precedence over a request deadline");
+                };
+                assert_eq!(snapshot.phase, "failed");
+                assert_eq!(snapshot.failure_phase, Some("storage_publishing"));
+                assert_eq!(snapshot.details()["retryable"], false);
+            }
+            if let Some((sequence, done)) = cleanup {
+                manager.finish_cleanup(LIX_A, sequence, done, Ok(())).await;
+            }
+        }
     }
 
     #[test]
@@ -2873,6 +3048,7 @@ mod tests {
         manager.state.lock().await.entries.insert(
             LIX_A.to_owned(),
             RuntimeEntry {
+                operation: OpenOperation::new("test".into(), Duration::from_secs(300)),
                 open_context: opentelemetry::trace::SpanContext::empty_context(),
                 runtime,
                 opened,
@@ -3579,6 +3755,7 @@ mod tests {
             public_url: "http://localhost".to_owned(),
             max_open_lixes: 1,
             recovery_watchdog: RecoveryWatchdog::test_default(),
+            open_stall_timeout: Duration::from_secs(300),
             state: Mutex::new(ManagerState {
                 state_drop_probe: Some(CacheRootLeaseDropProbe {
                     root: root.0.clone(),
@@ -3818,6 +3995,7 @@ mod tests {
                 CleanupTombstone {
                     sequence: 1,
                     done: cleanup_waiter,
+                    failed_open: None,
                 },
             );
         }
@@ -4150,6 +4328,7 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             protocol_timeout: Duration::from_secs(10),
             recovery_close_timeout: Duration::from_secs(10),
+            open_stall_timeout: Duration::from_secs(300),
             storage: crate::config::S3StorageConfig {
                 endpoint,
                 bucket: "test-bucket".into(),
@@ -4391,11 +4570,9 @@ impl LixRuntimeManager {
             .min(Duration::from_secs(1));
         match tokio::time::timeout(opening_wait, self.get(id)).await {
             Ok(Ok(_)) => Ok(Some(AuthorityAdmission::current())),
-            Err(_) => Err(AuthorityAdmissionError::Catalog(LifecycleError::new(
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                "LIX_REPOSITORY_MIGRATING",
-                "The repository is being upgraded. Retry this request.",
-            ))),
+            Err(_) => Err(AuthorityAdmissionError::Runtime(
+                self.open_wait_error(id, false).await,
+            )),
             Ok(Err(LixRuntimeError::NotFound)) => Ok(None),
             // Keep the same typed cause/status/details as ordinary protocol
             // requests. A terminal migration is not transient unavailability.
@@ -4736,6 +4913,7 @@ impl LixRuntimeManager {
                     &storage_id,
                     &opened,
                     None,
+                    None,
                 )
                 .await?;
             let service = runtime
@@ -5054,6 +5232,7 @@ mod lifecycle_recovery_tests {
             public_url: "http://localhost".to_owned(),
             max_open_lixes: 4,
             recovery_watchdog: RecoveryWatchdog::test_default(),
+            open_stall_timeout: Duration::from_secs(300),
             state: Mutex::new(ManagerState::default()),
             telemetry: test_telemetry_sink(),
             open_gate: None,

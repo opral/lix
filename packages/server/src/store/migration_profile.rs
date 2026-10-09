@@ -389,7 +389,7 @@ async fn profile_server_v81_to_v82_migration_backend_calls() {
     let service = loop {
         match manager.get(PROFILE_ID).await {
             Ok(service) => break service,
-            Err(LixRuntimeError::Migrating { .. }) => {
+            Err(LixRuntimeError::Opening(_)) => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             Err(error) => panic!("profile migration failed: {error:?}"),

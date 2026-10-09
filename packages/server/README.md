@@ -73,6 +73,7 @@ and will remain red until that one-time setting is complete.
 | `LIX_SERVER_MAX_OPEN_LIXS` | `32` | Maximum retained Lix runtimes |
 | `LIX_SERVER_PROTOCOL_TIMEOUT_SECS` | `60` | Admission and request deadline |
 | `LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS` | `30` | Runtime recovery close deadline |
+| `LIX_SERVER_OPEN_STALL_TIMEOUT_SECS` | `300` | Report an opening stall after this many positive seconds without completed work or a phase transition; retain the owned opener |
 | `S3_ENDPOINT` | required | S3-compatible endpoint |
 | `S3_BUCKET` | required | Object-store bucket |
 | `S3_ACCESS_KEY_ID` | required | Object-store access key |

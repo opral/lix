@@ -1207,6 +1207,7 @@ where
                 from_format,
                 options,
                 Some(&original_marker),
+                progress,
             ))
             .await?
             {
@@ -1237,9 +1238,14 @@ where
                 ))
                 .await?;
             } else {
-                let _ =
-                    copy_repository(&migration_source, &target, (79..82).contains(&from_format))
-                        .await?;
+                let _ = copy_repository_with_progress(
+                    &migration_source,
+                    &target,
+                    (79..82).contains(&from_format),
+                    progress,
+                    from_format,
+                )
+                .await?;
                 write_candidate_page(
                     &target,
                     crate::init::REPOSITORY_PROTOCOL_SPACE,
@@ -1253,10 +1259,11 @@ where
                 // Keep the multi-version migration state machine off this
                 // candidate frame. Its inactive repair phases otherwise inflate
                 // the stack while an older migration runs ordinary SQL.
-                Box::pin(super::migrate_lix_with_adapter(
+                Box::pin(super::api::migrate_lix_with_adapter_and_progress(
                     storage.clone(),
                     target.clone(),
                     options,
+                    progress,
                 ))
                 .await?;
             }
@@ -1451,6 +1458,7 @@ where
                 from_format,
                 options,
                 None,
+                progress,
             ))
             .await?
             {
@@ -1481,16 +1489,22 @@ where
                 ))
                 .await?;
             } else {
-                let _ =
-                    copy_repository(&migration_source, &target, (79..82).contains(&from_format))
-                        .await?;
+                let _ = copy_repository_with_progress(
+                    &migration_source,
+                    &target,
+                    (79..82).contains(&from_format),
+                    progress,
+                    from_format,
+                )
+                .await?;
                 // Keep the multi-version migration state machine off this
                 // candidate frame. Its inactive repair phases otherwise inflate
                 // the stack while an older migration runs ordinary SQL.
-                Box::pin(super::migrate_lix_with_adapter(
+                Box::pin(super::api::migrate_lix_with_adapter_and_progress(
                     storage.clone(),
                     target.clone(),
                     options,
+                    progress,
                 ))
                 .await?;
             }
@@ -1888,6 +1902,7 @@ async fn migrate_sparse_candidate<S>(
     from_format: u32,
     options: super::MigrationOptions,
     source_marker_witness: Option<&Bytes>,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
 ) -> Result<bool, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1919,7 +1934,7 @@ where
         return Ok(false);
     }
     clear_bank(target).await?;
-    let _ = copy_repository(source, target, true).await?;
+    let _ = copy_repository_with_progress(source, target, true, progress, from_format).await?;
     // A pointerless legacy claim fences the source's live marker before copy.
     // Restore the captured role marker in the isolated candidate so the
     // partial migration steps and validator see the actual source layout.
@@ -1934,29 +1949,49 @@ where
         )
         .await?;
     }
+    let steps = super::api::MigrationStepProgress::new(progress, from_format);
+    use super::api::migration_step_with_progress as step;
     if from_format == 79 {
-        super::incorporation::migrate(target, options, true).await?;
+        step(&steps, || {
+            super::incorporation::migrate(target, options, true)
+        })
+        .await?;
     }
     if from_format <= 80 {
-        super::runtime_epoch::migrate(target, true).await?;
+        step(&steps, || super::runtime_epoch::migrate(target, true)).await?;
     }
     if from_format <= 81 {
-        super::hot_indexes::migrate(target, options, true).await?;
+        step(&steps, || {
+            super::hot_indexes::migrate(target, options, true)
+        })
+        .await?;
     }
     if from_format <= 82 {
-        super::author_storage::migrate(target, options, true).await?;
+        step(&steps, || {
+            super::author_storage::migrate(target, options, true)
+        })
+        .await?;
     }
     if from_format <= 83 {
-        super::first_parent_checkpoints::migrate(target, options, true).await?;
+        step(&steps, || {
+            super::first_parent_checkpoints::migrate(target, options, true)
+        })
+        .await?;
     }
     if from_format <= 84 {
-        super::semantic_fingerprint_format::migrate(target, true).await?;
+        step(&steps, || {
+            super::semantic_fingerprint_format::migrate(target, true)
+        })
+        .await?;
     }
     if from_format <= 85 {
-        super::api::migrate_v86_marker(target).await?;
+        step(&steps, || super::api::migrate_v86_marker(target)).await?;
     }
-    super::api::migrate_v87_marker(target).await?;
-    crate::sync::upgrade_owned_partial_receipt(target).await?;
+    step(&steps, || super::api::migrate_v87_marker(target)).await?;
+    step(&steps, || {
+        crate::sync::upgrade_owned_partial_receipt(target)
+    })
+    .await?;
     if let Some((key, bytes)) = crate::sync::legacy_read_interest_journal_upgrade(
         &target.begin_read(ReadOptions::default()).await?,
     )
@@ -1975,6 +2010,7 @@ where
         .await
         .map_err(storage_error)?;
     }
+    emit_validating(progress, from_format);
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
         Ok(crate::sync::load_partial_replica_state(&read)
@@ -2295,6 +2331,19 @@ async fn copy_repository<S>(
 where
     S: Storage,
 {
+    copy_repository_with_progress(source, target, skip_derived_index, None, 0).await
+}
+
+async fn copy_repository_with_progress<S>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    skip_derived_index: bool,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
+    from_format: u32,
+) -> Result<Option<Bytes>, LixError>
+where
+    S: Storage,
+{
     let read = source
         .begin_read(ReadOptions::default())
         .await
@@ -2307,6 +2356,7 @@ where
     // state. It is rebuilt from authoritative current rows below, so copying
     // the old index only adds a full scan and a write before publication
     // deletes it.
+    let mut copied_rows = 0_u64;
     for space in epoch_data_spaces()
         .filter(|space| !skip_derived_index || *space != crate::hot_state::INDEX_SPACE)
     {
@@ -2340,9 +2390,22 @@ where
                     value: StoredValue { bytes: value },
                 });
             }
+            let page_rows = batch.entries.len() as u64;
             write_candidate_page(target, space, batch)
                 .await
                 .map_err(|error| epoch_error(format!("copy target write failed: {error}")))?;
+            copied_rows = copied_rows.saturating_add(page_rows);
+            emit_open_progress(
+                progress,
+                OpenProgress {
+                    scope: crate::OpenScope::Local,
+                    phase: OpenPhase::Migrating,
+                    from_format: Some(from_format),
+                    to_format: crate::init::CURRENT_FORMAT_VERSION,
+                    completed: Some(copied_rows),
+                    total: None,
+                },
+            );
             if !has_more {
                 break;
             }
