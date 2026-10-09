@@ -70,6 +70,8 @@ const MAX_UNORDERED_LIMIT_PUSHDOWN: usize = 1024;
 const LIMIT_CANDIDATE_BUDGET: usize = 4096;
 const LIMIT_RECHECK_CHUNK_SIZE: usize = 512;
 const LIMIT_CANDIDATE_MINIMUM_PAGE: usize = MIN_UNORDERED_LIMIT_CANDIDATES;
+/// Rows one ordered primary-key window targets when no fetch bounds the scan.
+const ORDERED_PRIMARY_KEY_PAGE_ROWS: usize = 8192;
 
 pub(super) fn hidden_registered_schema_row(schema_key: &str, row_pk: &RowPk) -> bool {
     schema_key == "lix_registered_schema"
@@ -382,6 +384,44 @@ impl SchemaSpec {
         Ok((projected_schema, request, row_filters))
     }
 
+    /// Plans the ordered primary-key route for `planned_limit`, rebinding the
+    /// source whenever DataFusion pushes a fetch into the scan.
+    fn ordered_primary_key_scan(
+        &self,
+        column: String,
+        schema: SchemaRef,
+        request: HotStateScanRequest,
+        row_filters: Vec<RowFilter>,
+        batch_projection: RowBatchProjection,
+        planned_limit: Option<usize>,
+    ) -> PlannedScan {
+        let plan = OrderedPrimaryKeyScan {
+            reader: self.row_snapshot_reader.clone(),
+            hot_state: Arc::clone(&self.hot_state),
+            spec: Arc::clone(&self.spec),
+            schema: Arc::clone(&schema),
+            column: column.clone(),
+            request,
+            row_filters,
+            batch_projection,
+            write_ctx: self.write_ctx.clone(),
+        };
+        let build = move |fetch: Option<usize>| {
+            let fetch = match (planned_limit, fetch) {
+                (Some(planned), Some(fetch)) => Some(planned.min(fetch)),
+                (planned, None) => planned,
+                (None, fetch) => fetch,
+            };
+            ordered_primary_key_scan_source(plan.clone(), fetch)
+        };
+        let source = build(None).with_fetch_rebind(build);
+        PlannedScan {
+            schema,
+            source,
+            ordering: Some(column),
+        }
+    }
+
     fn returning_key_from_batch(
         &self,
         batch: &RecordBatch,
@@ -661,7 +701,14 @@ impl TableSpec for SchemaSpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = RowPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = RowFilterAnalyzer::new(&self.spec);
-        if ExactFileIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
+        if ExactFileIdFilterAnalyzer.supports(filter)
+            || primary_key_analyzer.supports(filter)
+            || exact_primary_key_range_filter(&self.spec, filter)
+        {
+            // A primary-key range is exact because every scan carrying one is
+            // planned on the ordered primary-key route, which reads the
+            // interval through the authoritative visibility path and also
+            // re-applies it as a row predicate.
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -728,6 +775,25 @@ impl TableSpec for SchemaSpec {
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
         let staged_read_context = self.write_ctx.clone();
+        // `filter_pushdown` reported this range as exact, so no route that may
+        // ignore primary-key bounds can serve the scan. The ordered route
+        // reads the interval exactly on every storage shape and declares the
+        // primary-key order it produces; the declaration depends only on the
+        // statement's filters.
+        if let Some(column) = ordered_primary_key_column(&self.spec)
+            && filters
+                .iter()
+                .any(|filter| exact_primary_key_range_filter(&self.spec, filter))
+        {
+            return Ok(self.ordered_primary_key_scan(
+                column.to_owned(),
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                limit,
+            ));
+        }
         let private_registry = self.spec.schema_key == "lix_registered_schema";
         // Older repositories contain private bootstrap registrations. Apply
         // their visibility policy before LIMIT, so a scan still returns the
@@ -3958,6 +4024,202 @@ fn exact_identity_residual<'a>(
         .iter()
         .filter(|filter| !analyzer.supports(filter))
         .collect()
+}
+
+/// The primary-key column whose order the ordered primary-key route can
+/// produce: one top-level string key component of a public, stored schema.
+/// SQL string comparison and the typed key order are both byte order there.
+fn ordered_primary_key_column(spec: &SchemaSurfaceSpec) -> Option<&str> {
+    if spec.schema_key == "lix_registered_schema"
+        || crate::hot_state::is_derived_schema(&spec.schema_key)
+    {
+        return None;
+    }
+    let columns = top_level_primary_key_columns(spec);
+    let [column] = columns.as_slice() else {
+        return None;
+    };
+    simple_string_primary_key_index(spec, column)?;
+    Some(column)
+}
+
+/// Whether `filter` is a range over exactly the ordered primary-key column
+/// (`id > $1`, `id <= $2`, `BETWEEN`, or a conjunction of those).
+fn exact_primary_key_range_filter(spec: &SchemaSurfaceSpec, filter: &Expr) -> bool {
+    fn primary_key_range_only(filter: &RowFilter, column: &str) -> bool {
+        match filter {
+            RowFilter::ColumnRange {
+                column: range_column,
+                value: RowFilterValue::String(_),
+                ..
+            } => range_column == column,
+            RowFilter::And(left, right) => {
+                primary_key_range_only(left, column) && primary_key_range_only(right, column)
+            }
+            _ => false,
+        }
+    }
+    let Some(column) = ordered_primary_key_column(spec) else {
+        return false;
+    };
+    RowFilterAnalyzer::new(spec)
+        .analyze(filter)
+        .is_some_and(|filter| primary_key_range_only(&filter, column))
+}
+
+/// Execution state of one planned ordered primary-key scan.
+#[derive(Clone)]
+struct OrderedPrimaryKeyScan {
+    reader: Option<Arc<dyn RowSnapshotReader>>,
+    hot_state: Arc<dyn HotStateReader>,
+    spec: Arc<SchemaSurfaceSpec>,
+    schema: SchemaRef,
+    column: String,
+    request: HotStateScanRequest,
+    row_filters: Vec<RowFilter>,
+    batch_projection: RowBatchProjection,
+    write_ctx: Option<SqlWriteContext>,
+}
+
+/// Reads a primary-key interval in key order as a sequence of disjoint,
+/// ascending windows, stopping once `fetch` rows have been produced.
+///
+/// Each window is an ordinary exact hot-state read of a narrower interval,
+/// so HOT overlays, packed and root bases, tombstones, untracked rows, file
+/// scopes, global fallback and transaction-staged rows resolve exactly as in
+/// any scan. The reader's page horizon only decides where a window ends;
+/// without one (transactions, partial replicas, layouts that cannot be
+/// narrowed) the first window is the whole interval. Every window is sorted
+/// by primary key before it is emitted, so the declared order holds on every
+/// path, and storage work is proportional to the windows read rather than to
+/// the collection.
+fn ordered_primary_key_scan_source(
+    plan: OrderedPrimaryKeyScan,
+    fetch: Option<usize>,
+) -> super::spec::ScanSource {
+    struct WindowState {
+        lower: Option<crate::tracked_state::RowPkRangeBound>,
+        emitted: usize,
+        done: bool,
+    }
+    let stream_schema = Arc::clone(&plan.schema);
+    batch_stream_source(Arc::clone(&plan.schema), 1, move |_partition, _context| {
+        let plan = plan.clone();
+        let initial = WindowState {
+            lower: plan.request.filter.row_pk_lower.clone(),
+            emitted: 0,
+            done: fetch == Some(0),
+        };
+        let windows = stream::try_unfold(initial, move |mut state| {
+            let plan = plan.clone();
+            async move {
+                loop {
+                    if state.done {
+                        return Ok(None);
+                    }
+                    let remaining = fetch.map(|fetch| fetch.saturating_sub(state.emitted));
+                    let target_rows = remaining.unwrap_or(ORDERED_PRIMARY_KEY_PAGE_ROWS);
+                    let mut request = plan.request.clone();
+                    request.filter.row_pk_lower = state.lower.clone();
+                    let horizon = match plan.reader.as_ref() {
+                        Some(reader) => reader
+                            .row_pk_page_horizon(request.clone(), target_rows)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        None => None,
+                    }
+                    // A horizon must advance past the lower bound and end
+                    // before the upper bound, or the window is the remainder.
+                    .filter(|horizon| {
+                        crate::tracked_state::row_pk_satisfies_bounds(
+                            horizon,
+                            request.filter.row_pk_lower.as_ref(),
+                            None,
+                        ) && request
+                            .filter
+                            .row_pk_upper
+                            .as_ref()
+                            .is_none_or(|upper| horizon < &upper.row_pk)
+                    });
+                    if let Some(horizon) = horizon.as_ref() {
+                        request.filter.row_pk_upper = Some(crate::tracked_state::RowPkRangeBound {
+                            row_pk: horizon.clone(),
+                            inclusive: true,
+                        });
+                    }
+                    let rows = plan
+                        .hot_state
+                        .scan_batch(&request)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    record_rows_examined(rows.len());
+                    let batch = Box::pin(row_record_batch_with_staged_schemas(
+                        plan.write_ctx.as_ref(),
+                        &plan.spec,
+                        Arc::clone(&plan.schema),
+                        rows,
+                        &plan.row_filters,
+                        plan.batch_projection,
+                    ))
+                    .await?;
+                    let batch = sort_record_batch_by_column(batch, &plan.column)?;
+                    let batch = match remaining {
+                        Some(remaining) if batch.num_rows() > remaining => {
+                            batch.slice(0, remaining)
+                        }
+                        _ => batch,
+                    };
+                    state.emitted = state.emitted.saturating_add(batch.num_rows());
+                    match horizon {
+                        Some(horizon) => {
+                            state.lower = Some(crate::tracked_state::RowPkRangeBound {
+                                row_pk: horizon,
+                                inclusive: false,
+                            });
+                        }
+                        None => state.done = true,
+                    }
+                    if fetch.is_some_and(|fetch| state.emitted >= fetch) {
+                        state.done = true;
+                    }
+                    if batch.num_rows() > 0 {
+                        return Ok(Some((batch, state)));
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&stream_schema),
+            windows,
+        )))
+    })
+}
+
+/// Orders one window by its primary-key column. Windows from the exact path
+/// are usually already ordered; only an unordered one pays for a sort. A
+/// projection without the column carries no ordering obligation.
+fn sort_record_batch_by_column(batch: RecordBatch, column: &str) -> Result<RecordBatch> {
+    let Ok(index) = batch.schema().index_of(column) else {
+        return Ok(batch);
+    };
+    let keys = batch.column(index);
+    let Some(strings) = keys.as_any().downcast_ref::<StringArray>() else {
+        return Err(DataFusionError::Internal(format!(
+            "ordered primary-key column '{column}' is not Utf8"
+        )));
+    };
+    if (1..datafusion::arrow::array::Array::len(strings))
+        .all(|row| strings.value(row - 1) <= strings.value(row))
+    {
+        return Ok(batch);
+    }
+    let indices = datafusion::arrow::compute::sort_to_indices(keys, None, None)?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| datafusion::arrow::compute::take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(DataFusionError::from)
 }
 
 fn direct_row_batch_eligible(

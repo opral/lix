@@ -6759,6 +6759,101 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
+    /// Sizes one ordered primary-key page over this branch generation: the
+    /// inclusive upper key through which a window read starting at
+    /// `window.lower` visits about `target_rows` stored rows.
+    ///
+    /// Packed current bases are counted from their part inventory and HOT
+    /// from a key-only read of at most `target_rows` keys per file scope.
+    /// Root-base tree leaves are narrowed by the same window on read but are
+    /// not counted, so a page can visit more rows than targeted. A base whose
+    /// layout cannot be narrowed would make every window a full read; it
+    /// answers `None` so the caller reads the remainder once instead.
+    /// `Some(None)` means the counted layers end before `target_rows`.
+    pub(crate) async fn row_pk_page_horizon(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+        window: &crate::tracked_state::RowPkWindow,
+        target_rows: usize,
+    ) -> Result<Option<Option<RowPk>>, LixError> {
+        let generation = control.tracked_generation;
+        let mut ends = Vec::new();
+        for base_ref in packed_current_base_refs(&self.store, branch_id, generation).await? {
+            let Some(spans) = crate::tracked_state::commit_delta_row_pk_window_part_spans(
+                &self.store,
+                base_ref.commit_id,
+                schema_key,
+                window,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            ends.extend(spans.into_iter().map(|span| {
+                (
+                    crate::tracked_state::row_pk_span_end(
+                        schema_key,
+                        window,
+                        &span.first_key,
+                        &span.last_key,
+                    ),
+                    span.rows as usize,
+                )
+            }));
+        }
+        let filter = TrackedStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            row_pk_lower: window.lower.clone(),
+            row_pk_upper: window.upper.clone(),
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let scope = hot_scope_prefix(branch_id, generation);
+        for prefix in
+            hot_row_pk_window_scope_prefixes(&self.store, branch_id, generation, &filter).await?
+        {
+            let Some(range) = hot_file_row_pk_range(prefix, &filter)? else {
+                continue;
+            };
+            let mut cursor = self
+                .store
+                .begin_scan(
+                    ROW_SPACE,
+                    range,
+                    StorageBeginScanOptions {
+                        projection: StorageCoreProjection::KeyOnly,
+                        ..StorageBeginScanOptions::default()
+                    },
+                )
+                .await?;
+            let mut keys = 0_usize;
+            while keys < target_rows {
+                // Deliberately bounded by the page target.
+                let (page, page_has_more) = cursor
+                    .next_page(
+                        (target_rows - keys).min(crate::storage_adapter::MAX_SCAN_PAGE_ROWS),
+                    )
+                    .await?
+                    .into_parts();
+                for entry in page {
+                    let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
+                    ends.push((Some(identity.row_pk), 1));
+                    keys += 1;
+                }
+                if !page_has_more {
+                    break;
+                }
+            }
+        }
+        Ok(Some(crate::tracked_state::row_pk_page_horizon(
+            window,
+            ends,
+            target_rows,
+        )))
+    }
+
     /// Reads a bounded set of candidate row keys from a durable current-base
     /// root or a small authenticated packed-leaf prefix. The caller must
     /// re-check every key through the authoritative hot-state reader before

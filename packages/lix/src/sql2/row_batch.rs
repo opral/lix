@@ -72,6 +72,20 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         Ok(None)
     }
 
+    /// Sizes one ordered primary-key page: an inclusive upper primary key such
+    /// that reading the request's interval from its lower bound through that
+    /// key visits about `target_rows` stored rows. A cost model only, never a
+    /// visibility claim — providers read the chosen interval through the
+    /// exact hot-state path. `None` reads the remainder of the interval at
+    /// once, which is always correct.
+    async fn row_pk_page_horizon(
+        &self,
+        _request: HotStateScanRequest,
+        _target_rows: usize,
+    ) -> Result<Option<RowPk>, LixError> {
+        Ok(None)
+    }
+
     /// Returns primary keys from the same committed direct-scan proof as raw
     /// snapshots. Providers use this only when every projected SQL field is
     /// an exact primary-key component, avoiding a redundant JSON decode while
@@ -241,6 +255,17 @@ where
         self.hot_state
             .reader(self.store.clone())
             .scan_direct_row_limit_candidates(&request, candidate_limit)
+            .await
+    }
+
+    async fn row_pk_page_horizon(
+        &self,
+        request: HotStateScanRequest,
+        target_rows: usize,
+    ) -> Result<Option<RowPk>, LixError> {
+        self.hot_state
+            .reader(self.store.clone())
+            .row_pk_page_horizon(&request, target_rows)
             .await
     }
 

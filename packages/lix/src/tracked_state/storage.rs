@@ -11609,6 +11609,114 @@ pub(crate) async fn load_commit_delta_members_with_payloads_in_row_pk_window(
     Ok(members)
 }
 
+/// One mutation part of a commit that may hold keys of a primary-key window:
+/// its boundary keys and member count, read from the part inventory alone.
+#[derive(Debug, Clone)]
+pub(crate) struct RowPkWindowPartSpan {
+    pub(crate) first_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
+    pub(crate) rows: u32,
+}
+
+/// Lists, without decoding any part, the mutation parts of one commit that
+/// [`load_commit_delta_members_with_payloads_in_row_pk_window`] would read for
+/// `schema_key` and `window`.
+///
+/// This is a cost model for sizing a window, not an answer: callers must read
+/// rows through the exact path. `None` means the commit has no bounded part
+/// inventory (complete-state fences, selected-source aliases, columnar or
+/// compact-replacement layouts), so a window read could not be narrowed.
+pub(crate) async fn commit_delta_row_pk_window_part_spans(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_key: &str,
+    window: &super::RowPkWindow,
+) -> Result<Option<Vec<RowPkWindowPartSpan>>, LixError> {
+    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
+        return Ok(None);
+    };
+    if state
+        .snapshot_root
+        .as_ref()
+        .is_some_and(|root| root.complete_state_fence)
+        || state.mutations.selected_source_commit_id().is_some()
+        || state.mutations.columnar_parts.is_some()
+    {
+        return Ok(None);
+    }
+    let default_rows = u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).unwrap_or(u32::MAX);
+    let Some(root) = state.mutation_directory_root.as_ref() else {
+        let manifest = commit_delta_manifest_from_commit_state(&state);
+        if manifest.inline_segment().is_some() {
+            // One bounded inline segment: read whole, never worth sizing.
+            return Ok(Some(Vec::new()));
+        }
+        let mut spans = Vec::new();
+        for (index, bounds) in manifest.segments.iter().enumerate() {
+            if bounds.first_key.is_empty() || bounds.last_key.is_empty() {
+                return Ok(None);
+            }
+            if !commit_delta_segment_overlaps_schema(bounds, schema_key)
+                || !window.span_may_intersect(&bounds.first_key, &bounds.last_key)
+            {
+                continue;
+            }
+            spans.push(RowPkWindowPartSpan {
+                first_key: bounds.first_key.clone(),
+                last_key: bounds.last_key.clone(),
+                rows: manifest
+                    .direct_segment_row_counts
+                    .get(index)
+                    .map_or(default_rows, |rows| u32::from(*rows)),
+            });
+        }
+        return Ok(Some(spans));
+    };
+    if root.layout != super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+        && root.layout != super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+    {
+        return Ok(None);
+    }
+    let ranges = window
+        .schema_key_ranges(schema_key)
+        .into_iter()
+        .map(|range| super::mutation_directory::MutationDirectoryKeyRange {
+            start: Bytes::from(range.start),
+            end: range.end.map(Bytes::from),
+        })
+        .collect::<Vec<_>>();
+    let runs = super::mutation_directory::load_mutation_part_read_plan(
+        store,
+        root,
+        super::mutation_directory::MutationDirectoryReadSelection::SortedRanges(&ranges),
+    )
+    .await?
+    .into_runs();
+    let mut spans = Vec::with_capacity(runs.len());
+    for run in runs {
+        let super::mutation_directory::MutationDirectoryEntry::Bounded {
+            part,
+            direct_row_count,
+        } = run.entry
+        else {
+            return Ok(None);
+        };
+        if !window.span_may_intersect(&part.first_key, &part.last_key) {
+            continue;
+        }
+        spans.push(RowPkWindowPartSpan {
+            first_key: part.first_key,
+            last_key: part.last_key,
+            rows: if direct_row_count == 0 {
+                default_rows
+            } else {
+                u32::from(direct_row_count)
+            },
+        });
+    }
+    Ok(Some(spans))
+}
+
 /// Loads a bounded window of authenticated mutation parts in one point-read
 /// batch. SlateDB's immutable-value reader groups locators by backing segment
 /// and coalesces adjacent ranges, avoiding repeated reads and hashes of the

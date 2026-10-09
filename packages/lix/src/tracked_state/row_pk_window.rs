@@ -177,6 +177,62 @@ pub(crate) fn span_may_intersect_row_pk_bounds(
         && row_pk_satisfies_bounds(&first.row_pk, None, upper)
 }
 
+/// The last primary key a stored span can hold in `schema_key`, when the
+/// span is confined to one `(schema, file)` scope and ends at or past the
+/// window's lower bound. A span crossing a scope boundary has no such key.
+pub(crate) fn row_pk_span_end(
+    schema_key: &str,
+    window: &RowPkWindow,
+    first_key: &[u8],
+    last_key: &[u8],
+) -> Option<crate::row_pk::RowPk> {
+    let (Ok(first), Ok(last)) = (decode_key_borrowed(first_key), decode_key_borrowed(last_key))
+    else {
+        return None;
+    };
+    (first.schema_key == schema_key
+        && last.schema_key == schema_key
+        && first.file_id == last.file_id
+        && row_pk_satisfies_bounds(&last.row_pk, window.lower.as_ref(), None))
+    .then_some(last.row_pk)
+}
+
+/// Chooses the inclusive upper primary key of one ordered page from stored
+/// spans a window read would visit — each given as the last primary key it
+/// can hold (see [`row_pk_span_end`]) and its member count — or `None` when
+/// those spans hold fewer than `target_rows` members.
+///
+/// A span holds no key beyond its end, so reading through the smallest end at
+/// which the cumulative count reaches `target_rows` visits about that many
+/// stored rows. Spans without an end can only complete the count. This is a
+/// cost estimate, never a visibility claim: callers read the chosen interval
+/// through the exact path.
+pub(crate) fn row_pk_page_horizon(
+    window: &RowPkWindow,
+    mut ends: Vec<(Option<crate::row_pk::RowPk>, usize)>,
+    target_rows: usize,
+) -> Option<crate::row_pk::RowPk> {
+    ends.sort_by(|left, right| match (&left.0, &right.0) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let mut covered = 0_usize;
+    for (end, rows) in ends {
+        covered = covered.saturating_add(rows);
+        if covered >= target_rows {
+            return end.filter(|end| {
+                window
+                    .upper
+                    .as_ref()
+                    .is_none_or(|upper| end < &upper.row_pk)
+            });
+        }
+    }
+    None
+}
+
 fn encode_unfiled_key(schema_key: &str, bound: &RowPkRangeBound) -> Vec<u8> {
     encode_key_ref(TrackedStateKeyRef {
         schema_key,
@@ -249,6 +305,36 @@ mod tests {
         assert!(window.span_may_intersect(&key("s", Some("f"), "x"), &key("s", Some("g"), "a")));
         assert!(window.span_may_intersect(&key("r", None, "x"), &key("t", None, "a")));
         assert!(window.span_may_intersect(b"not a key", b"not a key either"));
+    }
+
+    #[test]
+    fn page_horizon_reads_through_the_target_count_of_scope_local_spans() {
+        let spans = [
+            (key("s", None, "a"), key("s", None, "c"), 10_usize),
+            (key("s", None, "d"), key("s", None, "f"), 10),
+            (key("s", Some("x"), "b"), key("s", Some("x"), "e"), 10),
+            (key("s", None, "g"), key("t", None, "a"), 10),
+        ];
+        let horizon = |window: &RowPkWindow, target| {
+            row_pk_page_horizon(
+                window,
+                spans
+                    .iter()
+                    .map(|(first, last, rows)| (row_pk_span_end("s", window, first, last), *rows))
+                    .collect(),
+                target,
+            )
+        };
+        let open = window(None, None);
+        assert_eq!(horizon(&open, 5), Some(RowPk::single("c")));
+        assert_eq!(horizon(&open, 15), Some(RowPk::single("e")));
+        assert_eq!(horizon(&open, 30), Some(RowPk::single("f")));
+        // Only the schema-crossing span is left: no key bounds the page.
+        assert_eq!(horizon(&open, 31), None);
+        // A horizon at or past the upper bound is the remainder.
+        assert_eq!(horizon(&window(None, Some(("e", true))), 15), None);
+        // Spans that end before the lower bound cannot end a page.
+        assert_eq!(horizon(&window(Some(("c", false)), None), 5), Some(RowPk::single("e")));
     }
 
     #[test]

@@ -1005,6 +1005,78 @@ where
             .await
     }
 
+    /// Sizes one ordered primary-key page of a committed single-schema scan:
+    /// an inclusive upper primary key such that reading from the request's
+    /// lower bound through it visits about `target_rows` stored rows in every
+    /// branch the scan resolves (the requested branch and global fallback).
+    ///
+    /// This is a cost model for the caller's next exact read, never a
+    /// visibility claim. `None` asks the caller to read the remainder of the
+    /// interval at once: the counted layers hold fewer rows, some layer cannot
+    /// narrow a primary-key window, or the request is outside the committed
+    /// shape this model covers (partial replicas, file or identity filters,
+    /// retention or global selectors, derived schemas).
+    pub(crate) async fn row_pk_page_horizon(
+        &self,
+        request: &HotStateScanRequest,
+        target_rows: usize,
+    ) -> Result<Option<RowPk>, LixError> {
+        if target_rows == 0
+            || request.filter.global.is_some()
+            || request.filter.untracked.is_some()
+            || request.filter.include_tombstones
+            || !matches!(request.filter.rows, HotStateRowFilter::All)
+            || !request.filter.row_pks.is_empty()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.constraints.is_empty()
+            || request.filter.declared_column_eq.is_some()
+            || request.filter.declared_column_range.is_some()
+            || request_may_include_derived(request)
+            || self.partial_scope_policy.is_some()
+            || self.partial_scope_source.is_some()
+        {
+            return Ok(None);
+        }
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Ok(None);
+        };
+        let window = crate::tracked_state::RowPkWindow {
+            lower: request.filter.row_pk_lower.clone(),
+            upper: request.filter.row_pk_upper.clone(),
+        };
+        let scope = scan_scope(
+            &self.store,
+            request,
+            true,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
+        let mut horizon: Option<RowPk> = None;
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(None);
+            };
+            if !control.may_have_schema(schema_key) {
+                continue;
+            }
+            let Some(branch_horizon) = self
+                .tracked_head
+                .reader(&self.store)
+                .row_pk_page_horizon(branch_id, control, schema_key, &window, target_rows)
+                .await?
+            else {
+                return Ok(None);
+            };
+            if let Some(branch_horizon) = branch_horizon {
+                horizon = Some(match horizon {
+                    Some(current) if current <= branch_horizon => current,
+                    _ => branch_horizon,
+                });
+            }
+        }
+        Ok(horizon)
+    }
+
     pub(crate) async fn scan_direct_row_snapshots(
         &self,
         request: &HotStateScanRequest,

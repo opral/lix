@@ -1689,7 +1689,14 @@ impl std::fmt::Debug for SpecScanExec {
 
 impl DisplayAs for SpecScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SpecScanExec({})", self.table)
+        write!(f, "SpecScanExec({})", self.table)?;
+        if let Some(ordering) = self.properties.output_ordering() {
+            write!(f, ", output_ordering=[{ordering}]")?;
+        }
+        if let Some(fetch) = self.physical_cache_key.limit {
+            write!(f, ", fetch={fetch}")?;
+        }
+        Ok(())
     }
 }
 
