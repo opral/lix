@@ -2125,6 +2125,155 @@ pub(crate) async fn validate_certified_fresh_plugin_file_import(
     .await
 }
 
+#[cfg(test)]
+#[path = "insert_identity_empty_collection_tests.rs"]
+mod insert_identity_empty_collection_tests;
+
+/// Drops the INSERT identity checks whose committed collection is certified
+/// empty in the validation snapshot, so a first import into an empty schema
+/// neither sorts nor point-reads its identities.
+///
+/// The existence check reads, for every insert, the exact
+/// `(branch, file scope, schema, primary key)` slot with both lanes
+/// (`untracked: None`) and keeps a row only when it is live and
+/// `Domain::contains_canonical_ref` accepts it, i.e. the row is stored on the
+/// insert's own branch; rows of the global branch or of any other branch
+/// never conflict. The branch's schema-wide collection control bounds
+/// everything that check can find:
+///
+/// - It counts every live member of the schema in the branch's serving
+///   generation. Tracked and untracked rows share that generation, and every
+///   writer (incremental deltas, complete snapshots, packed and fresh-file
+///   bases) adjusts the schema-wide scope (`file_id: None`) for each row in
+///   addition to the row's file scope, so file-scoped rows are counted too.
+/// - Tombstones are not members; the check skips deleted rows as well.
+/// - Rows inherited from a root current base (a branch created from a
+///   commit, a checkpoint root) are never counted eagerly: such a scope
+///   reports `DEFERRED_LIVE_COUNT`, which is not zero. So does a collection
+///   behind a generation fence that is not yet re-certified, and a schema
+///   with an unproven sibling file fence.
+/// - Readers without a published tracked-head projection return `None`.
+///   Partial replicas keep the full check: their resident state is not
+///   evidence of absence at the authority.
+///
+/// The count and the point reads come from the same reader over the same
+/// storage snapshot, so the shortcut changes cost, never the verdict. A
+/// commit that lands after that snapshot is invisible to the full check as
+/// well; publication then fails its branch-head precondition, exactly as
+/// before.
+async fn drop_inserts_into_empty_collections<'a>(
+    hot_state: &dyn HotStateReader,
+    checks: &mut Vec<PreparedInsertRef<'a>>,
+) -> Result<(), LixError> {
+    if checks.is_empty() || hot_state.is_partial_replica() {
+        return Ok(());
+    }
+    let mut empty_collections = Vec::<((&'a str, &'a str), bool)>::new();
+    let mut previous: Option<(&'a str, &'a str)> = None;
+    for check in checks.iter() {
+        let collection = (check.row.branch_id.as_str(), check.row.schema_key.as_str());
+        // Inserts arrive in runs per collection; skip the lookup within a run.
+        if previous == Some(collection)
+            || empty_collections
+                .iter()
+                .any(|(known, _)| *known == collection)
+        {
+            previous = Some(collection);
+            continue;
+        }
+        previous = Some(collection);
+        let empty = hot_state
+            .collection_generation(
+                collection.0,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: collection.1,
+                    file_id: None,
+                },
+            )
+            .await?
+            .is_some_and(|generation| generation.live_count == 0);
+        empty_collections.push((collection, empty));
+    }
+    empty_collections.retain(|(_, empty)| *empty);
+    if empty_collections.is_empty() {
+        return Ok(());
+    }
+    let mut previous: Option<((&'a str, &'a str), bool)> = None;
+    checks.retain(|check| {
+        let collection = (check.row.branch_id.as_str(), check.row.schema_key.as_str());
+        let empty = match previous {
+            Some((known, empty)) if known == collection => empty,
+            _ => empty_collections
+                .iter()
+                .any(|(known, _)| *known == collection),
+        };
+        previous = Some((collection, empty));
+        !empty
+    });
+    #[cfg(test)]
+    record_committed_insert_identity_stats(
+        empty_collections.iter().map(|(collection, _)| *collection),
+        true,
+    );
+    Ok(())
+}
+
+/// Per-collection `(identities point-read, collections proven empty)`
+/// recorded by committed INSERT identity validation, keyed by
+/// `(branch, schema)`. Commits may run on the commit coordinator thread, so
+/// this is process-wide; each test's repository has its own branch ids.
+#[cfg(test)]
+static COMMITTED_INSERT_IDENTITY_STATS: std::sync::Mutex<
+    BTreeMap<(String, String), (usize, usize)>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn record_committed_insert_identity_stats<'a>(
+    collections: impl IntoIterator<Item = (&'a str, &'a str)>,
+    empty: bool,
+) {
+    let mut stats = COMMITTED_INSERT_IDENTITY_STATS.lock().unwrap();
+    for (branch_id, schema_key) in collections {
+        let entry = stats
+            .entry((branch_id.to_owned(), schema_key.to_owned()))
+            .or_default();
+        if empty {
+            entry.1 += 1;
+        } else {
+            entry.0 += 1;
+        }
+    }
+}
+
+/// Collections `(branch_id, schema_key)` proven empty since its last take.
+#[cfg(test)]
+pub(crate) fn peek_committed_insert_identity_empty_collections(
+    branch_id: &str,
+    schema_key: &str,
+) -> usize {
+    COMMITTED_INSERT_IDENTITY_STATS
+        .lock()
+        .unwrap()
+        .get(&(branch_id.to_owned(), schema_key.to_owned()))
+        .map_or(0, |stats| stats.1)
+}
+
+/// Takes `(identities point-read, collections proven empty)` of the
+/// `schema_keys` of `branch_id` since their last take.
+#[cfg(test)]
+pub(crate) fn take_committed_insert_identity_stats(
+    branch_id: &str,
+    schema_keys: &[&str],
+) -> (usize, usize) {
+    let mut stats = COMMITTED_INSERT_IDENTITY_STATS.lock().unwrap();
+    schema_keys.iter().fold((0, 0), |total, schema_key| {
+        let (probes, empty) = stats
+            .remove(&(branch_id.to_owned(), (*schema_key).to_owned()))
+            .unwrap_or_default();
+        (total.0 + probes, total.1 + empty)
+    })
+}
+
 async fn validate_committed_insert_identity_entries<'a, I>(
     hot_state: &dyn HotStateReader,
     entries: I,
@@ -2134,6 +2283,14 @@ where
     I: IntoIterator<Item = PreparedInsertRef<'a>>,
 {
     let mut checks = entries.into_iter().collect::<Vec<_>>();
+    drop_inserts_into_empty_collections(hot_state, &mut checks).await?;
+    #[cfg(test)]
+    record_committed_insert_identity_stats(
+        checks
+            .iter()
+            .map(|check| (check.row.branch_id.as_str(), check.row.schema_key.as_str())),
+        false,
+    );
     checks.sort_unstable_by(|left, right| {
         insert_scope_key(*left)
             .cmp(&insert_scope_key(*right))
