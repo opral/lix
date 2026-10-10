@@ -3937,6 +3937,18 @@ async fn scan_packed_current_base_rows(
 /// request and decoded change record per live row even though destructive
 /// reachability needs no payload. Preserve the normal winner rule while
 /// decoding each packed segment once and materializing only fixed provenance.
+#[cfg(test)]
+thread_local! {
+    static PACKED_IDENTITY_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Packed identity rows the payload-free scan visited on this thread since
+/// the last call.
+#[cfg(test)]
+pub(crate) fn take_packed_identity_rows_visited_for_test() -> usize {
+    PACKED_IDENTITY_ROWS_VISITED.replace(0)
+}
+
 async fn scan_packed_current_base_provenance_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -3946,7 +3958,69 @@ async fn scan_packed_current_base_provenance_rows(
 ) -> Result<MaterializedHotStateBatch, LixError> {
     let row_pks = crate::tracked_state::RowPkLookup::new(&request.filter.row_pks);
     let mut winners = BTreeMap::new();
+    let mut offer = |schema_key: &str,
+                     row_pk: &RowPk,
+                     file_id: Option<&str>,
+                     value: &crate::tracked_state::TrackedStateIndexValue| {
+        #[cfg(test)]
+        PACKED_IDENTITY_ROWS_VISITED.set(PACKED_IDENTITY_ROWS_VISITED.get() + 1);
+        if value.deleted
+            || !packed_identity_matches_filter(
+                schema_key,
+                row_pk,
+                file_id,
+                &request.filter,
+                &row_pks,
+            )
+        {
+            return;
+        }
+        let identity = (
+            schema_key.to_owned(),
+            row_pk.clone(),
+            file_id.map(str::to_owned),
+        );
+        match winners.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if entry.get().commit_id < value.commit_id =>
+            {
+                entry.insert(value.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    };
+    // A primary-key window of one schema reads only the mutation parts that
+    // can hold one of its keys, exactly like the payload route. Scanning the
+    // whole identity plane per window would make a windowed full scan
+    // quadratic in the collection size.
+    let row_pk_window = crate::tracked_state::RowPkWindow::from_bounds(
+        request.filter.row_pk_lower.as_ref(),
+        request.filter.row_pk_upper.as_ref(),
+    )
+    .filter(|_| request.filter.schema_keys.len() == 1);
     for base_ref in base_refs {
+        if let Some(window) = row_pk_window.as_ref() {
+            for member in
+                crate::tracked_state::load_commit_delta_members_with_payloads_in_row_pk_window(
+                    store,
+                    base_ref.commit_id,
+                    &request.filter.schema_keys[0],
+                    window,
+                )
+                .await?
+            {
+                offer(
+                    &member.key.schema_key,
+                    &member.key.row_pk,
+                    member.key.file_id.as_deref(),
+                    &member.value,
+                );
+            }
+            continue;
+        }
         let compact = crate::tracked_state::scan_commit_delta_values(
             store,
             base_ref.commit_id,
@@ -3955,34 +4029,7 @@ async fn scan_packed_current_base_provenance_rows(
         .await?;
         for row in compact.iter() {
             let key = row.key_ref();
-            let value = row.value();
-            if value.deleted
-                || !packed_identity_matches_filter(
-                    key.schema_key,
-                    key.row_pk,
-                    key.file_id,
-                    &request.filter,
-                    &row_pks,
-                )
-            {
-                continue;
-            }
-            let identity = (
-                key.schema_key.to_owned(),
-                key.row_pk.clone(),
-                key.file_id.map(str::to_owned),
-            );
-            match winners.entry(identity) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(value.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry.get().commit_id < value.commit_id =>
-                {
-                    entry.insert(value.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
+            offer(key.schema_key, key.row_pk, key.file_id, row.value());
         }
     }
 

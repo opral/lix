@@ -525,3 +525,65 @@ async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
     assert_eq!(after, expected);
     lix.close().await.unwrap();
 }
+
+/// Payload-free scans (`count(*)`, `SELECT 1`, system-column projections)
+/// read the packed identity plane. Each window must visit only the mutation
+/// parts that can hold its keys: the identity rows visited across all windows
+/// stay proportional to the collection, never windows x collection.
+#[tokio::test]
+async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
+    let lix = crate::open_lix().with_storage(Memory::new()).await.unwrap();
+    lix.execute(
+        &format!(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+             \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
+             {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB))"
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    const ROWS: u64 = 4000;
+    bulk_insert(
+        &lix,
+        &(0..ROWS)
+            .map(|index| (id(index), format!("v{index}"), None))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    for (sql, expected) in [
+        (
+            format!("SELECT count(*) FROM {SCHEMA}"),
+            vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])],
+        ),
+        (
+            format!("SELECT count(lixcol_change_id) FROM {SCHEMA}"),
+            vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])],
+        ),
+    ] {
+        let windows_before = primary_key_windows_read();
+        crate::hot_state::take_packed_identity_rows_visited_for_test();
+        let actual = rows_of(&lix, &sql, 64).await;
+        let visited = crate::hot_state::take_packed_identity_rows_visited_for_test();
+        let windows = primary_key_windows_read() - windows_before;
+        assert_eq!(actual, expected, "{sql}");
+        assert!(windows >= 5, "{sql}: {windows} windows");
+        assert!(
+            visited <= 2 * ROWS as usize,
+            "{sql}: {windows} windows visited {visited} packed identities for {ROWS} rows"
+        );
+    }
+    for sql in [
+        format!("SELECT 1 FROM {SCHEMA}"),
+        format!("SELECT lixcol_file_id, lixcol_change_id FROM {SCHEMA}"),
+    ] {
+        let expected = sorted(rows_of(&lix, &sql, ONE_WINDOW).await);
+        crate::hot_state::take_packed_identity_rows_visited_for_test();
+        let actual = sorted(rows_of(&lix, &sql, 64).await);
+        let visited = crate::hot_state::take_packed_identity_rows_visited_for_test();
+        assert_eq!(actual.len(), ROWS as usize, "{sql}");
+        assert_eq!(actual, expected, "{sql}");
+        assert!(visited <= 2 * ROWS as usize, "{sql}: visited {visited}");
+    }
+    lix.close().await.unwrap();
+}

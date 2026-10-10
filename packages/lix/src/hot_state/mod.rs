@@ -50,6 +50,8 @@ pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[cfg(test)]
 pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
+pub(crate) use tracked_head::take_packed_identity_rows_visited_for_test;
+#[cfg(test)]
 pub(crate) use tracked_head::stage_hot_collection_live_count_for_test;
 #[cfg(test)]
 pub(crate) use tracked_head::stage_hot_collection_control_for_test;
