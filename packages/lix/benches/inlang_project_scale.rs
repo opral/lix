@@ -18,13 +18,19 @@
 //! flat and joined shapes through `Lix::query_stream` with
 //! `LIX_INLANG_STREAM_PAGE_BYTES` pages (default 1 MiB). Every read phase
 //! reports `peak_rss_mib`, the process high-water mark reset at phase start
-//! (Linux only). `LIX_INLANG_BRANCH=1` runs the read phases on a branch
-//! created from the imported head, and `LIX_INLANG_FILES=k` stores the
-//! variants in `k` file scopes. Profile the built binary with
+//! (Linux only), and `peak_heap_mib`, the phase's live-heap high-water mark
+//! above its starting heap. The import frees gigabytes the allocator keeps
+//! resident, so a read phase can reuse them without raising the RSS at all;
+//! the heap mark measures what the phase itself holds at once.
+//! `LIX_INLANG_BRANCH=1` runs the read phases on a branch created from the
+//! imported head, and `LIX_INLANG_FILES=k` stores the variants in `k` file
+//! scopes. Profile the built binary with
 //! `samply record` or `perf record -g` using the same environment.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use lix::storage::Memory;
@@ -88,16 +94,81 @@ fn multi_row_insert(table: &str, columns: &[&str], rows: usize) -> String {
     sql
 }
 
+/// Tracks live heap bytes and their high-water mark for `peak_heap_mib`.
+struct PeakHeap;
+
+static LIVE_HEAP: AtomicUsize = AtomicUsize::new(0);
+static PEAK_HEAP: AtomicUsize = AtomicUsize::new(0);
+
+fn grow_heap(bytes: usize) {
+    let live = LIVE_HEAP.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK_HEAP.fetch_max(live, Ordering::Relaxed);
+}
+
+// SAFETY: every call delegates the unchanged layout to `System`; the
+// counters never influence allocation.
+unsafe impl GlobalAlloc for PeakHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            grow_heap(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            grow_heap(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+        LIVE_HEAP.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let resized = unsafe { System.realloc(pointer, layout, new_size) };
+        if !resized.is_null() {
+            if new_size >= layout.size() {
+                grow_heap(new_size - layout.size());
+            } else {
+                LIVE_HEAP.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+        }
+        resized
+    }
+}
+
+#[global_allocator]
+static GLOBAL: PeakHeap = PeakHeap;
+
+/// Starts a heap measurement: the high-water mark restarts at the live heap.
+fn reset_peak_heap() -> usize {
+    let live = LIVE_HEAP.load(Ordering::Relaxed);
+    PEAK_HEAP.store(live, Ordering::Relaxed);
+    live
+}
+
+/// The heap high-water mark above `start` since [`reset_peak_heap`].
+fn peak_heap_mib(start: usize) -> usize {
+    PEAK_HEAP.load(Ordering::Relaxed).saturating_sub(start) / (1024 * 1024)
+}
+
 async fn timed<T>(label: &str, rows: usize, operation: impl Future<Output = T>) -> T {
     let start_rss = reset_peak_rss();
+    let start_heap = reset_peak_heap();
     let started = Instant::now();
     let result = operation.await;
     let elapsed = started.elapsed();
     println!(
-        "inlang_project_scale phase={label} rows={rows} ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={}",
+        "inlang_project_scale phase={label} rows={rows} ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={} peak_heap_mib={}",
         elapsed.as_millis(),
         elapsed.as_secs_f64() * 1e6 / rows.max(1) as f64,
-        peak_rss_mib()
+        peak_rss_mib(),
+        peak_heap_mib(start_heap)
     );
     result
 }
@@ -136,6 +207,7 @@ fn status_mib(field: &str) -> String {
 /// Pulls every page of `sql`, touching each row the way a consumer would.
 async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes: usize) {
     let start_rss = reset_peak_rss();
+    let start_heap = reset_peak_heap();
     let started = Instant::now();
     let mut first_page_ms = None;
     let mut rows = 0usize;
@@ -157,11 +229,13 @@ async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes:
     match outcome {
         Ok(()) => println!(
             "inlang_project_scale phase={label} rows={rows} pages={pages} page_bytes={page_bytes} \
-             ms={} first_page_ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={}",
+             ms={} first_page_ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={} \
+             peak_heap_mib={}",
             elapsed.as_millis(),
             first_page_ms.unwrap_or_default(),
             elapsed.as_secs_f64() * 1e6 / rows.max(1) as f64,
-            peak_rss_mib()
+            peak_rss_mib(),
+            peak_heap_mib(start_heap)
         ),
         Err(error) => println!(
             "inlang_project_scale phase={label} error={} ms={}",
