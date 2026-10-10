@@ -526,12 +526,9 @@ async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
     lix.close().await.unwrap();
 }
 
-/// Payload-free scans (`count(*)`, `SELECT 1`, system-column projections)
-/// read the packed identity plane. Each window must visit only the mutation
-/// parts that can hold its keys: the identity rows visited across all windows
-/// stay proportional to the collection, never windows x collection.
-#[tokio::test]
-async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
+/// A repository whose `SCHEMA` is registered on the active branch only, so
+/// the global branch never holds a collection control for it.
+async fn open_local_schema_fixture() -> Lix<Memory> {
     let lix = crate::open_lix().with_storage(Memory::new()).await.unwrap();
     lix.execute(
         &format!(
@@ -543,6 +540,16 @@ async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
     )
     .await
     .unwrap();
+    lix
+}
+
+/// Payload-free scans (`count(*)`, `SELECT 1`, system-column projections)
+/// read the packed identity plane. Each window must visit only the mutation
+/// parts that can hold its keys: the identity rows visited across all windows
+/// stay proportional to the collection, never windows x collection.
+#[tokio::test]
+async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
+    let lix = open_local_schema_fixture().await;
     const ROWS: u64 = 4000;
     bulk_insert(
         &lix,
@@ -551,16 +558,24 @@ async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
             .collect::<Vec<_>>(),
     )
     .await;
-    for (sql, expected) in [
-        (
-            format!("SELECT count(*) FROM {SCHEMA}"),
-            vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])],
-        ),
-        (
-            format!("SELECT count(lixcol_change_id) FROM {SCHEMA}"),
-            vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])],
-        ),
-    ] {
+    // count(*) is answered by the collection controls: no window, no
+    // packed identity.
+    let windows_before = primary_key_windows_read();
+    crate::hot_state::take_packed_identity_rows_visited_for_test();
+    let actual = rows_of(&lix, &format!("SELECT count(*) FROM {SCHEMA}"), 64).await;
+    assert_eq!(
+        actual,
+        vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])]
+    );
+    assert_eq!(primary_key_windows_read() - windows_before, 0);
+    assert_eq!(
+        crate::hot_state::take_packed_identity_rows_visited_for_test(),
+        0
+    );
+    for (sql, expected) in [(
+        format!("SELECT count(lixcol_change_id) FROM {SCHEMA}"),
+        vec![format!("{:?}", [crate::Value::Integer(ROWS as i64)])],
+    )] {
         let windows_before = primary_key_windows_read();
         crate::hot_state::take_packed_identity_rows_visited_for_test();
         let actual = rows_of(&lix, &sql, 64).await;
@@ -585,5 +600,93 @@ async fn payload_free_windowed_scans_visit_each_packed_identity_about_once() {
         assert_eq!(actual, expected, "{sql}");
         assert!(visited <= 2 * ROWS as usize, "{sql}: visited {visited}");
     }
+    lix.close().await.unwrap();
+}
+
+/// `count(*)` over a schema the global branch never held is exact from the
+/// collection controls (the global branch is proven empty by a bounded HOT
+/// probe), and stays equal to the rows a full read returns as HOT updates,
+/// deletes, inserts, untracked rows and finally global rows change it.
+#[tokio::test]
+async fn count_star_is_exact_without_a_global_collection_control() {
+    let lix = open_local_schema_fixture().await;
+    bulk_insert(
+        &lix,
+        &(0..1500)
+            .map(|index| (id(index), format!("v{index}"), None))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let count_sql = format!("SELECT count(*) FROM {SCHEMA}");
+    let assert_count = async |context: &str, expect_exact: bool| {
+        let expected = lix
+            .execute(&format!("SELECT id, lixcol_file_id FROM {SCHEMA}"), &[])
+            .await
+            .unwrap()
+            .rows()
+            .len();
+        let windows_before = primary_key_windows_read();
+        let actual = rows_of(&lix, &count_sql, 64).await;
+        assert_eq!(
+            actual,
+            vec![format!("{:?}", [crate::Value::Integer(expected as i64)])],
+            "{context}"
+        );
+        let plan = lix
+            .execute(&format!("EXPLAIN {count_sql}"), &[])
+            .await
+            .unwrap()
+            .rows()
+            .iter()
+            .flat_map(|row| row.values().to_vec())
+            .map(|value| format!("{value:?}"))
+            .collect::<String>();
+        if expect_exact {
+            assert_eq!(primary_key_windows_read() - windows_before, 0, "{context}");
+            assert!(!plan.contains("AggregateExec"), "{context}: {plan}");
+        }
+    };
+    assert_count("packed base", true).await;
+    for statement in [
+        format!("DELETE FROM {SCHEMA} WHERE id >= 'k00100' AND id < 'k00200'"),
+        format!("UPDATE {SCHEMA} SET value = 'hot' WHERE id = 'k00300'"),
+        format!("INSERT INTO {SCHEMA} (id, value) VALUES ('k09999', 'new')"),
+        format!(
+            "INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES ('k00001', 'filed', '{FILE_A}')"
+        ),
+        format!("INSERT INTO {SCHEMA} (id, value, lixcol_untracked) VALUES ('k08888', 'u', TRUE)"),
+    ] {
+        if statement.contains(FILE_A) {
+            lix.execute(
+                &format!("INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/count-a')"),
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        lix.execute(&statement, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+        assert_count(&statement, false).await;
+    }
+    // A global row gives the global branch a collection control; the count
+    // must still see it exactly once.
+    lix.execute(
+        &format!(
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+             \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
+             {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB), TRUE)"
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        &format!("INSERT INTO {SCHEMA} (id, value, lixcol_global) VALUES ('k07777', 'g', TRUE)"),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_count("global row", false).await;
     lix.close().await.unwrap();
 }

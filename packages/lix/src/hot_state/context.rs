@@ -725,15 +725,50 @@ where
         else {
             return Ok(None);
         };
-        let Some(global_collection) = tracked
+        let global_collection = match tracked
             .stored_collection_generation(
                 GLOBAL_BRANCH_ID,
                 global_branch_control.tracked_generation,
                 collection_scope,
             )
             .await?
-        else {
-            return Ok(None);
+        {
+            Some(collection) => collection,
+            // A schema never written on the global branch has no collection
+            // control there. Prove that it holds no row with the bounded HOT
+            // identity probe (which declines for packed and root-backed
+            // layouts) rather than scanning the whole local collection.
+            None => {
+                let probe = TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key.to_owned()],
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["change_id".to_owned()],
+                    },
+                    limit: Some(1),
+                };
+                match tracked
+                    .try_scan_bounded_live_identities(
+                        GLOBAL_BRANCH_ID,
+                        global_branch_control,
+                        &probe,
+                        EXACT_COUNT_GLOBAL_MAX_ENTRIES,
+                        EXACT_COUNT_GLOBAL_MAX_BYTES,
+                    )
+                    .await?
+                {
+                    Some(scan) if scan.identities.is_empty() => {
+                        crate::collection_generation::CollectionGeneration {
+                            active_generation: global_branch_control.tracked_generation,
+                            live_count: 0,
+                            ordered_identity_digest: None,
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
         };
         if local_collection.active_generation != local_branch_control.tracked_generation
             || global_collection.active_generation != global_branch_control.tracked_generation
