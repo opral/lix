@@ -18,8 +18,10 @@
 //! flat and joined shapes through `Lix::query_stream` with
 //! `LIX_INLANG_STREAM_PAGE_BYTES` pages (default 1 MiB). Every read phase
 //! reports `peak_rss_mib`, the process high-water mark reset at phase start
-//! (Linux only). Profile the built binary with `samply record` or
-//! `perf record -g` using the same environment.
+//! (Linux only). `LIX_INLANG_BRANCH=1` runs the read phases on a branch
+//! created from the imported head, and `LIX_INLANG_FILES=k` stores the
+//! variants in `k` file scopes. Profile the built binary with
+//! `samply record` or `perf record -g` using the same environment.
 
 use std::future::Future;
 use std::hint::black_box;
@@ -195,6 +197,11 @@ async fn run() {
         "inlang_project_scale locales={locales} messages={messages} message_rows={rows} variant_rows={rows}"
     );
 
+    // LIX_INLANG_FILES=k spreads the variants over k files (round-robin by
+    // locale), the layout of a plugin that stores one file per locale group.
+    // Foreign keys resolve within one file scope, so this layout registers
+    // the schemas without them.
+    let files = env_usize("LIX_INLANG_FILES", 0);
     let session: Lix<Memory> = open_lix()
         .with_storage(Memory::new())
         .await
@@ -209,19 +216,35 @@ async fn run() {
             "inlang_message",
             "{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"bundle_id\",\"type\":\"text\",\"nullable\":false},\
              {\"name\":\"locale\",\"type\":\"text\",\"nullable\":false},{\"name\":\"selectors\",\"type\":\"jsonb\",\"nullable\":false,\"default_value\":[]}",
-            Some(("bundle_id", "inlang_bundle")),
+            (files == 0).then_some(("bundle_id", "inlang_bundle")),
         ),
         schema_sql(
             "inlang_variant",
             "{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"message_id\",\"type\":\"text\",\"nullable\":false},\
              {\"name\":\"matches\",\"type\":\"jsonb\",\"nullable\":false,\"default_value\":[]},{\"name\":\"pattern\",\"type\":\"jsonb\",\"nullable\":false,\"default_value\":[]}",
-            Some(("message_id", "inlang_message")),
+            (files == 0).then_some(("message_id", "inlang_message")),
         ),
     ] {
         session
             .execute(&sql, &[])
             .await
             .expect("register inlang schema");
+    }
+
+    let file_ids = (0..files)
+        .map(|index| format!("01920000-0000-7000-8000-{index:012x}"))
+        .collect::<Vec<_>>();
+    for (index, file_id) in file_ids.iter().enumerate() {
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Text(format!("/inlang/{index}.json")),
+                ],
+            )
+            .await
+            .expect("create inlang file");
     }
 
     // Same value shapes the message-format plugin produces.
@@ -244,7 +267,7 @@ async fn run() {
                 Value::Text(format!("l{locale}")),
                 Value::Text(message_id.clone()),
             ]);
-            variant_rows.push(vec![
+            let mut variant = vec![
                 Value::Text(format!("v-{locale}-{i}")),
                 Value::Text(message_id),
                 jsonb("[]"),
@@ -253,7 +276,11 @@ async fn run() {
                      {{\"type\":\"expression\",\"arg\":{{\"type\":\"variable-reference\",\"name\":\"name\"}}}},\
                      {{\"type\":\"text\",\"value\":\" and some text\"}}]"
                 )),
-            ]);
+            ];
+            if files > 0 {
+                variant.push(Value::Text(file_ids[locale % files].clone()));
+            }
+            variant_rows.push(variant);
         }
     }
 
@@ -289,7 +316,11 @@ async fn run() {
         insert_all(
             &mut transaction,
             "inlang_variant",
-            &["id", "message_id", "matches", "pattern"],
+            if files > 0 {
+                &["id", "message_id", "matches", "pattern", "lixcol_file_id"]
+            } else {
+                &["id", "message_id", "matches", "pattern"]
+            },
             variant_rows,
         ),
     )
