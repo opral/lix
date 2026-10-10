@@ -648,21 +648,20 @@ impl SchemaSpec {
         &self,
         batch: &RecordBatch,
         row_index: usize,
-    ) -> Result<RowReturningKey> {
-        let row_pk = row_pk_from_primary_key_columns(
+    ) -> Result<RowSlotKey> {
+        RowSlotKey::from_batch(
             batch,
             row_index,
             &self.spec,
+            &self.branch_binding,
             SchemaRowIdentityUse::UpdateReturning,
-        )?;
-        let branch_id = String::new();
-        Ok(RowReturningKey { row_pk, branch_id })
+        )
     }
 
     async fn returning_post_image(
         &self,
         write_ctx: &SqlWriteContext,
-        keys: &[RowReturningKey],
+        keys: &[RowSlotKey],
     ) -> Result<RecordBatch> {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
@@ -679,6 +678,20 @@ impl SchemaSpec {
             .map(|key| key.row_pk.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect();
+        // The same primary key exists once per file scope. Narrow the read to
+        // the file scopes this statement updated. The primary-key × file-scope
+        // request may still return untouched slots; the post-image is indexed
+        // by the complete slot below, so those rows are never selected.
+        request.filter.file_ids = keys
+            .iter()
+            .map(|key| key.file_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|file_id| match file_id {
+                None => crate::NullableKeyFilter::Null,
+                Some(file_id) => crate::NullableKeyFilter::Value(file_id),
+            })
             .collect();
         let rows = WriteContextHotStateReader::new(write_ctx.clone())
             .scan_batch(&request)
@@ -837,16 +850,69 @@ impl SchemaSpec {
     }
 }
 
+/// The live-state slot one visible row occupies.
+///
+/// A primary key identifies a row only within one lane and one file scope:
+/// the same primary key legitimately exists once unfiled and once in every
+/// file, and a global row is distinct from a branch-local one. The visible
+/// scan of one branch never yields two rows for one slot (a branch-local row
+/// shadows the global row of the same slot, and tracked and untracked rows
+/// cannot share a slot), so the slot is the identity every UPDATE handoff
+/// between its source scan and its staged write must key by.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RowReturningKey {
-    row_pk: RowPk,
+struct RowSlotKey {
     branch_id: String,
+    file_id: Option<String>,
+    row_pk: RowPk,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RowUpdateSnapshotKey {
-    row_pk: RowPk,
-    branch_id: String,
+impl RowSlotKey {
+    fn from_row(row: crate::hot_state::MaterializedHotStateRowRef<'_>) -> Self {
+        Self {
+            branch_id: if row.global() {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                row.branch_id().to_string()
+            },
+            file_id: row.file_id().map(str::to_owned),
+            row_pk: row.row_pk().clone(),
+        }
+    }
+
+    /// Reads the slot of a row the schema surface produced. The lane and file
+    /// scope columns are required: a batch without them cannot distinguish
+    /// rows that share a primary key, so it must not silently collapse them.
+    fn from_batch(
+        batch: &RecordBatch,
+        row_index: usize,
+        spec: &SchemaSurfaceSpec,
+        branch_binding: &BranchBinding,
+        purpose: SchemaRowIdentityUse,
+    ) -> Result<Self> {
+        let context = purpose.label();
+        for column in ["lixcol_global", "lixcol_file_id"] {
+            if batch.schema().index_of(column).is_err() {
+                return Err(DataFusionError::Execution(format!(
+                    "{context} source batch for schema '{}' is missing identity column '{column}'",
+                    spec.schema_key
+                )));
+            }
+        }
+        let global =
+            optional_bool_value(batch, row_index, "lixcol_global", context)?.unwrap_or(false);
+        Ok(Self {
+            branch_id: if global {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                branch_binding
+                    .active_branch_id()
+                    .expect("active row surface has an active branch")
+                    .to_owned()
+            },
+            file_id: optional_string_value(batch, row_index, "lixcol_file_id", context)?,
+            row_pk: row_pk_from_primary_key_columns(batch, row_index, spec, purpose)?,
+        })
+    }
 }
 
 /// A generic UPDATE source may already have a native row payload. Keep that
@@ -858,7 +924,7 @@ enum RowUpdateSnapshot {
     Typed(Arc<WasmTypedRow>),
 }
 
-type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowUpdateSnapshotKey, RowUpdateSnapshot>>>;
+type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowSlotKey, RowUpdateSnapshot>>>;
 
 fn capture_row_update_snapshots(
     rows: &MaterializedHotStateBatch,
@@ -890,15 +956,10 @@ fn capture_row_update_snapshots(
                 .into();
             RowUpdateSnapshot::Json(snapshot)
         };
-        let key = RowUpdateSnapshotKey {
-            row_pk: row.row_pk().clone(),
-            branch_id: if row.global() {
-                GLOBAL_BRANCH_ID.to_string()
-            } else {
-                row.branch_id().to_string()
-            },
-        };
-        if captured.insert(key, snapshot).is_some() {
+        if captured
+            .insert(RowSlotKey::from_row(row), snapshot)
+            .is_some()
+        {
             return Err(DataFusionError::Execution(
                 "UPDATE schema surface source contains duplicate row identity".to_string(),
             ));
@@ -2049,24 +2110,15 @@ fn row_update_stage_rows_from_batch(
     })?;
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
     for row_index in 0..batch.num_rows() {
-        let global =
-            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE schema surface")?
-                .unwrap_or(false);
-        let branch_id = if global {
-            GLOBAL_BRANCH_ID.to_string()
-        } else {
-            branch_binding
-                .active_branch_id()
-                .expect("active row surface has an active branch")
-                .to_owned()
-        };
-        let row_pk =
-            row_pk_from_primary_key_columns(batch, row_index, spec, SchemaRowIdentityUse::Update)?;
+        let slot = RowSlotKey::from_batch(
+            batch,
+            row_index,
+            spec,
+            branch_binding,
+            SchemaRowIdentityUse::Update,
+        )?;
         let snapshot = update_snapshots
-            .get(&RowUpdateSnapshotKey {
-                row_pk: row_pk.clone(),
-                branch_id: branch_id.clone(),
-            })
+            .get(&slot)
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "UPDATE schema surface is missing its source snapshot for schema '{}'",
@@ -2136,9 +2188,15 @@ fn row_update_stage_rows_from_batch(
                 Some(row_update_metadata(&raw, spec)?)
             }
         };
-        let file_id =
-            optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE schema surface")?
-                .map(Into::into);
+        let RowSlotKey {
+            branch_id,
+            file_id,
+            row_pk,
+        } = slot;
+        let global =
+            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE schema surface")?
+                .unwrap_or(false);
+        let file_id = file_id.map(Into::into);
         let untracked = optional_bool_value(
             batch,
             row_index,
@@ -5197,6 +5255,10 @@ fn jsonb_sql_equality_key(value: &str) -> Result<String> {
 #[cfg(test)]
 #[path = "schema_pk_window_tests.rs"]
 mod pk_window_tests;
+
+#[cfg(test)]
+#[path = "schema_file_scope_dml_tests.rs"]
+mod file_scope_dml_tests;
 
 #[cfg(test)]
 #[expect(trivial_casts)]
