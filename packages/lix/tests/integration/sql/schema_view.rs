@@ -450,8 +450,9 @@ simulation_test!(
             ],
         );
 
-        // An inexact residual predicate proves nothing about the scan output;
-        // ordering by an unpinned column must keep its physical sort.
+        // A committed full scan is read in ascending primary-key windows and
+        // declares that order; a residual predicate filters inside each
+        // window and keeps it, so ORDER BY the key needs no sort.
         let range_sql = "SELECT id FROM pushdown_note WHERE score > 0 ORDER BY id";
         let explain = session
             .execute(&format!("EXPLAIN {range_sql}"), &[])
@@ -459,8 +460,8 @@ simulation_test!(
             .expect("EXPLAIN should succeed");
         let plan = explain_plan_text(&explain);
         assert!(
-            plan.contains("SortExec"),
-            "range-filtered ORDER BY must keep its physical sort:\n{plan}"
+            !plan.contains("SortExec") && plan.contains("output_ordering=[id@0 ASC"),
+            "a windowed scan serves ORDER BY its key without a sort:\n{plan}"
         );
         let result = session
             .execute(range_sql, &[])
