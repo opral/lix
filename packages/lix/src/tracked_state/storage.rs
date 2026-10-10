@@ -13494,6 +13494,19 @@ async fn complete_state_fence_tree_diff(
     missing_parent_is_absent: bool,
     expand_standalone_complete_state: bool,
 ) -> Result<Option<(super::diff::TrackedStateTreeDiffBatch, bool)>, LixError> {
+    // Every packed read asks this question of every base it visits, and the
+    // answer is almost always no. The authenticated header alone carries the
+    // snapshot root, so decide from it and decode and validate the full
+    // mutation inventory only for an actual fence.
+    let Some(topology) = load_published_commit_state_topology(store, commit_id).await? else {
+        return Ok(None);
+    };
+    if !topology
+        .snapshot_root()
+        .is_some_and(|root| root.complete_state_fence)
+    {
+        return Ok(None);
+    }
     let Some(manifest) = load_commit_state_manifest(store, commit_id).await? else {
         return Ok(None);
     };
