@@ -2994,6 +2994,18 @@ fn push_root_current_base_row(
     );
 }
 
+/// Only unbounded root-base scans are memoized. A pushed-down LIMIT varies
+/// with the number of sparse candidates that could shadow a root row, so
+/// caching by it would churn the cache with near-duplicate entries for no
+/// reuse. A primary-key window is one page of a scan that moves on and never
+/// asks again; retaining it would keep up to the cache's row budget of
+/// finished windows resident behind a stream that holds one.
+fn root_base_request_is_memoized(request: &TrackedStateScanRequest) -> bool {
+    request.limit.is_none()
+        && request.filter.row_pk_lower.is_none()
+        && request.filter.row_pk_upper.is_none()
+}
+
 async fn scan_root_current_base_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -3009,10 +3021,7 @@ async fn scan_root_current_base_rows(
     else {
         return Ok(MaterializedHotStateBatch::default());
     };
-    // Only unbounded requests are memoized. A pushed-down LIMIT varies with the
-    // number of sparse candidates that could shadow a root row, so caching by
-    // it would churn the cache with near-duplicate entries for no reuse.
-    let cache = root_base_cache.filter(|_| request.limit.is_none());
+    let cache = root_base_cache.filter(|_| root_base_request_is_memoized(request));
     let tracked = match cache.and_then(|cache| cache.get(base_commit_id, request)) {
         Some(cached) => {
             #[cfg(feature = "storage-benches")]
@@ -14983,6 +14992,31 @@ mod tests {
                 .is_none(),
             "a different limit must miss"
         );
+    }
+
+    #[test]
+    fn root_base_cache_memoizes_whole_scans_but_not_windows_or_limits() {
+        let whole = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec!["schema".to_owned()],
+                ..TrackedStateFilter::default()
+            },
+            ..TrackedStateScanRequest::default()
+        };
+        assert!(root_base_request_is_memoized(&whole));
+        let bound = crate::tracked_state::RowPkRangeBound {
+            row_pk: RowPk::single("k"),
+            inclusive: false,
+        };
+        let mut window = whole.clone();
+        window.filter.row_pk_lower = Some(bound.clone());
+        assert!(!root_base_request_is_memoized(&window));
+        let mut window = whole.clone();
+        window.filter.row_pk_upper = Some(bound);
+        assert!(!root_base_request_is_memoized(&window));
+        let mut limited = whole;
+        limited.limit = Some(10);
+        assert!(!root_base_request_is_memoized(&limited));
     }
 
     /// The cache is bounded by entry count, so a rotated generation that is

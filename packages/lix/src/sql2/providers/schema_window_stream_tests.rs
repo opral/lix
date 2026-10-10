@@ -458,3 +458,70 @@ async fn non_string_primary_keys_are_read_in_windows() {
     }
     lix.close().await.unwrap();
 }
+
+/// DML sources are one read of the matched rows, never a windowed scan: an
+/// UPDATE or DELETE whose matched rows span many primary-key windows (with
+/// windows forced small) changes exactly the rows one full read selects, in
+/// every file scope it names.
+#[tokio::test]
+async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
+    let lix = layered_fixture(
+        43,
+        FixtureShape {
+            checkpoint: false,
+            branch: true,
+        },
+    )
+    .await;
+    let before = reference_rows(&lix).await;
+    let _window = set_primary_key_window_rows(3);
+    let in_range = |row: &Row| row.0.as_str() >= "k00100" && row.0.as_str() < "k01500";
+    let updated = lix
+        .execute(
+            &format!(
+                "UPDATE {SCHEMA} SET value = 'windowed' WHERE id >= 'k00100' AND id < 'k01500' \
+                 AND lixcol_file_id = '{FILE_A}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let expected_updates = before
+        .iter()
+        .filter(|row| in_range(row) && row.2.as_deref() == Some(FILE_A))
+        .count();
+    assert!(expected_updates > 20);
+    assert_eq!(updated.rows_affected(), expected_updates as u64);
+    let deleted = lix
+        .execute(
+            &format!(
+                "DELETE FROM {SCHEMA} WHERE id >= 'k02000' AND id < 'k03000' AND lixcol_file_id IS NULL"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let in_delete =
+        |row: &Row| row.0.as_str() >= "k02000" && row.0.as_str() < "k03000" && row.2.is_none();
+    assert_eq!(
+        deleted.rows_affected(),
+        before.iter().filter(|row| in_delete(row)).count() as u64
+    );
+    drop(_window);
+    let after = reference_rows(&lix).await;
+    let mut expected = before
+        .iter()
+        .filter(|row| !in_delete(row))
+        .cloned()
+        .map(|mut row| {
+            if in_range(&row) && row.2.as_deref() == Some(FILE_A) {
+                row.1 = "windowed".to_owned();
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(after.len(), expected.len());
+    assert_eq!(after, expected);
+    lix.close().await.unwrap();
+}
