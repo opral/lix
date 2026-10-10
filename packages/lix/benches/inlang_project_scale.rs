@@ -299,6 +299,25 @@ async fn run() {
     })
     .await;
 
+    // LIX_INLANG_BRANCH=1 continues on a fresh branch created from the
+    // imported head, so every read resolves the import through the branch's
+    // root current base instead of the main branch's packed base.
+    if std::env::var_os("LIX_INLANG_BRANCH").is_some() {
+        let branch = session
+            .create_branch(lix::CreateBranchOptions {
+                id: None,
+                name: "inlang-scale-branch".into(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create benchmark branch");
+        session
+            .switch_branch(lix::SwitchBranchOptions {
+                branch_id: branch.id,
+            })
+            .await
+            .expect("switch to benchmark branch");
+    }
     if phases.contains("flat") {
         let result = timed("flat_variants", rows, async {
             session

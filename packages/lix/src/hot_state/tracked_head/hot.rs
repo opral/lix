@@ -6763,12 +6763,12 @@ where
     /// inclusive upper key through which a window read starting at
     /// `window.lower` visits about `target_rows` stored rows.
     ///
-    /// Packed current bases are counted from their part inventory and HOT
-    /// from a key-only read of at most `target_rows` keys per file scope.
-    /// Root-base tree leaves are narrowed by the same window on read but are
-    /// not counted, so a page can visit more rows than targeted. A base whose
-    /// layout cannot be narrowed would make every window a full read; it
-    /// answers `None` so the caller reads the remainder once instead.
+    /// Packed current bases are counted from their mutation-part inventory,
+    /// a root current base from its tree's child summaries, and HOT from a
+    /// key-only read of at most `target_rows` keys per file scope. A layer
+    /// that cannot narrow a window read (a packed layout without part bounds,
+    /// a rootless root base) would make every window a full read; it answers
+    /// `None` so the caller reads the remainder once instead.
     /// `Some(None)` means the counted layers end before `target_rows`.
     pub(crate) async fn row_pk_page_horizon(
         &self,
@@ -6800,6 +6800,23 @@ where
                         &span.last_key,
                     ),
                     span.rows as usize,
+                )
+            }));
+        }
+        if let Some(base_commit_id) =
+            load_root_current_base_commit(&self.store, branch_id, generation).await?
+        {
+            let Some(spans) = crate::tracked_state::TrackedStateContext::new()
+                .reader(&self.store)
+                .row_pk_window_spans_at_commit(base_commit_id, schema_key, window, target_rows)
+                .await?
+            else {
+                return Ok(None);
+            };
+            ends.extend(spans.into_iter().map(|(first_key, last_key, rows)| {
+                (
+                    crate::tracked_state::row_pk_span_end(schema_key, window, &first_key, &last_key),
+                    usize::try_from(rows).unwrap_or(usize::MAX),
                 )
             }));
         }

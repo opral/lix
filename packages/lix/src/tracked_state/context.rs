@@ -1196,6 +1196,32 @@ where
             .await
     }
 
+    /// Counts the stored keys of `schema_key` inside a primary-key window at
+    /// `commit_id` as ordered spans `(first_key, last_key, entries)`, a cost
+    /// model for sizing ordered pages (see
+    /// [`super::tree::TrackedStateTree::row_pk_window_spans`]). `None` when
+    /// the state has no durable tree root: a rootless state resolves by
+    /// replay, which a window read cannot narrow.
+    pub(crate) async fn row_pk_window_spans_at_commit(
+        &mut self,
+        commit_id: CommitId,
+        schema_key: &str,
+        window: &super::RowPkWindow,
+        target_rows: usize,
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>, u64)>>, LixError> {
+        let Some(root_id) = self
+            .tree
+            .load_root(&self.store, &commit_id.to_string())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.tree
+            .row_pk_window_spans(&self.store, &root_id, schema_key, window, target_rows)
+            .await
+            .map(Some)
+    }
+
     /// Reads one bounded canonical page, excluding the complete identity in
     /// `exclusive_after`. Durable trees prune preceding subtrees before row
     /// materialization, making page cost proportional to the page plus tree

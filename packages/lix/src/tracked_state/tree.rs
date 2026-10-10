@@ -387,6 +387,134 @@ impl TrackedStateTree {
     ///
     /// The encoded lower bound is intersected with ordinary filter ranges so
     /// internal subtrees at or before the continuation are never loaded.
+    /// Counts the keys of `schema_key` inside a primary-key window as ordered
+    /// spans `(first_key, last_key, entries)`, read from child summaries
+    /// wherever possible, as a cost model for sizing ordered pages.
+    ///
+    /// Children are visited in key order. The walk descends only into a
+    /// child that crosses a file-scope boundary or holds more than an eighth
+    /// of `target_rows` entries, and it stops visiting a file scope once that
+    /// scope's spans reach `target_rows` entries, because the scope's later
+    /// spans end at larger keys. Counts include tombstones: the result is an
+    /// estimate, never a visibility claim.
+    pub(crate) async fn row_pk_window_spans(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        schema_key: &str,
+        window: &super::RowPkWindow,
+        target_rows: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64)>, LixError> {
+        let target_rows = u64::try_from(target_rows).unwrap_or(u64::MAX);
+        let mut walk = RowPkWindowSpanWalk {
+            schema_key,
+            window,
+            ranges: normalize_scan_ranges(
+                window
+                    .schema_key_ranges(schema_key)
+                    .into_iter()
+                    .map(|range| EncodedScanRange {
+                        start: range.start,
+                        end: range.end,
+                    })
+                    .collect(),
+            ),
+            granularity: (target_rows / 8).max(64),
+            target_rows,
+            scope_rows: BTreeMap::new(),
+            spans: Vec::new(),
+        };
+        self.row_pk_window_span_node(store, *root_id.as_bytes(), &mut walk)
+            .await?;
+        Ok(walk.spans)
+    }
+
+    fn row_pk_window_span_node<'a, 'w, S>(
+        &'a self,
+        store: &'a S,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        walk: &'a mut RowPkWindowSpanWalk<'w>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+        'w: 'a,
+    {
+        Box::pin(async move {
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
+                    for index in 0..leaf.len() {
+                        let entry = leaf.entry(index).ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                "tracked-state leaf entry disappeared during a span walk",
+                            )
+                        })?;
+                        if !encoded_key_in_scan_ranges(entry.key, &walk.ranges) {
+                            continue;
+                        }
+                        let key = decode_key_borrowed(entry.key)?;
+                        if key.schema_key != walk.schema_key || !walk.window.contains(&key.row_pk) {
+                            continue;
+                        }
+                        let rows = walk
+                            .scope_rows
+                            .entry(key.file_id.map(std::borrow::Cow::into_owned))
+                            .or_insert(0);
+                        if *rows >= walk.target_rows {
+                            continue;
+                        }
+                        *rows += 1;
+                        walk.spans.push((entry.key.to_vec(), entry.key.to_vec(), 1));
+                    }
+                }
+                DecodedNodeRef::Internal(internal) => {
+                    for child in internal.children() {
+                        if !child_summary_overlaps_scan_ranges(child, &walk.ranges)
+                            || !walk.window.span_may_intersect(&child.first_key, &child.last_key)
+                        {
+                            continue;
+                        }
+                        let scope = match (
+                            decode_key_borrowed(&child.first_key),
+                            decode_key_borrowed(&child.last_key),
+                        ) {
+                            (Ok(first), Ok(last))
+                                if first.schema_key == walk.schema_key
+                                    && last.schema_key == walk.schema_key
+                                    && first.file_id == last.file_id =>
+                            {
+                                Some(first.file_id.map(std::borrow::Cow::into_owned))
+                            }
+                            _ => None,
+                        };
+                        let Some(scope) = scope else {
+                            self.row_pk_window_span_node(store, child.child_hash, walk)
+                                .await?;
+                            continue;
+                        };
+                        let rows = walk.scope_rows.get(&scope).copied().unwrap_or(0);
+                        if rows >= walk.target_rows {
+                            continue;
+                        }
+                        if child.subtree_count > walk.granularity {
+                            self.row_pk_window_span_node(store, child.child_hash, walk)
+                                .await?;
+                            continue;
+                        }
+                        *walk.scope_rows.entry(scope).or_insert(0) += child.subtree_count;
+                        walk.spans.push((
+                            child.first_key.to_vec(),
+                            child.last_key.to_vec(),
+                            child.subtree_count,
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) async fn scan_after(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -3186,6 +3314,17 @@ fn push_level_summary(levels: &mut Vec<Vec<ChildSummary>>, level: usize, summary
     levels[level].push(summary);
 }
 
+/// Traversal state of [`TrackedStateTree::row_pk_window_spans`].
+struct RowPkWindowSpanWalk<'w> {
+    schema_key: &'w str,
+    window: &'w super::RowPkWindow,
+    ranges: Vec<EncodedScanRange>,
+    granularity: u64,
+    target_rows: u64,
+    scope_rows: BTreeMap<Option<String>, u64>,
+    spans: Vec<(Vec<u8>, Vec<u8>, u64)>,
+}
+
 fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
     if request.schema_keys.is_empty() {
         return Vec::new();
@@ -5216,6 +5355,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["row-a", "row-c"]
         );
+    }
+
+    #[tokio::test]
+    async fn row_pk_window_spans_size_a_page_without_walking_the_tail() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let file_id = "01920000-0000-7000-8000-0000000000a3";
+        let mut mutations = (0..3000)
+            .map(|index| {
+                mutation_owned(
+                    key("schema-s", None, &format!("r{index:05}")),
+                    value(&format!("span-null-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        mutations.extend((0..600).map(|index| {
+            mutation_owned(
+                key("schema-s", Some(file_id), &format!("r{:05}", index * 5)),
+                value(&format!("span-file-{index}"), Some("{}")),
+            )
+        }));
+        mutations.extend((0..1000).map(|index| {
+            mutation_owned(
+                key("schema-t", None, &format!("r{index:05}")),
+                value(&format!("span-other-{index}"), Some("{}")),
+            )
+        }));
+        let result = apply_mutations_for_test(&tree, &storage, None, mutations, None)
+            .await
+            .expect("span fixture should apply");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("span read should open");
+        let window = crate::tracked_state::RowPkWindow {
+            lower: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("r01000"),
+                inclusive: false,
+            }),
+            upper: None,
+        };
+        let target = 400;
+        let spans = tree
+            .row_pk_window_spans(&store, &result.root_id, "schema-s", &window, target)
+            .await
+            .expect("span walk should succeed");
+        let counted = spans.iter().map(|span| span.2).sum::<u64>();
+        // The unfiled scope is counted to the target and the file scope's
+        // 399 window keys in full: far fewer than the 2,398 keys of the tail.
+        assert!(counted >= target as u64 + 399, "counted {counted}");
+        assert!(counted < 1200, "the walk read the tail: counted {counted}");
+        let horizon = crate::tracked_state::row_pk_page_horizon(
+            &window,
+            spans
+                .iter()
+                .map(|(first, last, rows)| {
+                    (
+                        crate::tracked_state::row_pk_span_end("schema-s", &window, first, last),
+                        *rows as usize,
+                    )
+                })
+                .collect(),
+            target,
+        )
+        .expect("the tail holds more than one page");
+        let page = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-s".to_owned()],
+                    row_pk_lower: window.lower.clone(),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: horizon,
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("page scan should succeed");
+        // The window sized for 400 rows holds about that many: never fewer
+        // than one span short, never the whole tail.
+        assert!(page.len() >= target / 2, "page holds {}", page.len());
+        assert!(page.len() <= 3 * target, "page holds {}", page.len());
     }
 
     #[tokio::test]
