@@ -58,20 +58,6 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         Ok(None)
     }
 
-    /// Returns at most `candidate_limit` primary keys from a durable
-    /// current-base page or a bounded authenticated packed-leaf prefix. This
-    /// is a candidate source for unordered LIMIT only; providers re-read every
-    /// candidate through the current hot-state visibility path before exposing
-    /// it. `None` means no bounded candidate proof applies and the ordinary
-    /// scan must run.
-    async fn scan_row_limit_candidates(
-        &self,
-        _request: HotStateScanRequest,
-        _candidate_limit: usize,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
-        Ok(None)
-    }
-
     /// Sizes one ordered primary-key page: an inclusive upper primary key such
     /// that reading the request's interval from its lower bound through that
     /// key visits about `target_rows` stored rows. A cost model only, never a
@@ -244,17 +230,6 @@ where
         self.hot_state
             .reader(self.store.clone())
             .exact_count_with_bounded_global_overlay(&request)
-            .await
-    }
-
-    async fn scan_row_limit_candidates(
-        &self,
-        request: HotStateScanRequest,
-        candidate_limit: usize,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
-        self.hot_state
-            .reader(self.store.clone())
-            .scan_direct_row_limit_candidates(&request, candidate_limit)
             .await
     }
 

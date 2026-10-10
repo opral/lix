@@ -795,3 +795,59 @@ async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
     assert_eq!(id_sequence(&rows), id_sequence(&expected));
     lix.close().await.unwrap();
 }
+
+/// An unordered `LIMIT n` may return any qualifying rows, so a committed
+/// collection scan reads only the first primary-key windows. Every returned
+/// row must still be a distinct current row of the unrestricted scan, across
+/// packed bases, branch roots, HOT overlays, file scopes, untracked and
+/// global rows, and the fetch sits on the scan.
+#[tokio::test]
+async fn unordered_limits_read_the_first_primary_key_windows() {
+    for shape in [
+        FixtureShape {
+            checkpoint: false,
+            branch: false,
+        },
+        FixtureShape {
+            checkpoint: false,
+            branch: true,
+        },
+    ] {
+        let lix = layered_fixture(23, shape).await;
+        let reference = all_rows(&lix).await;
+        let current = reference.iter().collect::<BTreeSet<_>>();
+        for limit in [1_usize, 10, 777, 100_000] {
+            let result = lix
+                .execute(
+                    &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} LIMIT {limit}"),
+                    &[],
+                )
+                .await
+                .unwrap();
+            let rows = decode_rows(&result);
+            assert_eq!(rows.len(), limit.min(reference.len()), "{shape:?} {limit}");
+            assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), rows.len());
+            assert!(
+                rows.iter().all(|row| current.contains(row)),
+                "{shape:?} limit {limit} returned a row that is not current"
+            );
+        }
+        let ids = reference
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<BTreeSet<_>>();
+        let result = lix
+            .execute(&format!("SELECT id FROM {SCHEMA} LIMIT 50"), &[])
+            .await
+            .unwrap();
+        assert_eq!(result.rows().len(), 50);
+        assert!(result.rows().iter().all(|row| match row.get::<Value>("id").unwrap() {
+            Value::Text(id) => ids.contains(id.as_str()),
+            value => panic!("unexpected id {value:?}"),
+        }));
+        let plan = physical_plan(&lix, &format!("SELECT id, value FROM {SCHEMA} LIMIT 7"), &[]).await;
+        let physical = plan.split("physical_plan").nth(1).expect("physical plan");
+        assert!(physical.contains("fetch=7"), "{plan}");
+        lix.close().await.unwrap();
+    }
+}

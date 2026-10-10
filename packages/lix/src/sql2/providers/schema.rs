@@ -31,7 +31,7 @@ use crate::hot_state::MaterializedHotStateBatch;
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
-    HotStateReader, HotStateRowFilter, HotStateScanRequest, MIN_UNORDERED_LIMIT_CANDIDATES,
+    HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
@@ -66,10 +66,6 @@ use super::spec::{
 };
 use super::values::{optional_bool_value, optional_string_value, string_expr_literal};
 
-const MAX_UNORDERED_LIMIT_PUSHDOWN: usize = 1024;
-const LIMIT_CANDIDATE_BUDGET: usize = 4096;
-const LIMIT_RECHECK_CHUNK_SIZE: usize = 512;
-const LIMIT_CANDIDATE_MINIMUM_PAGE: usize = MIN_UNORDERED_LIMIT_CANDIDATES;
 /// Rows one ordered primary-key window targets when no fetch bounds the scan.
 const ORDERED_PRIMARY_KEY_PAGE_ROWS: usize = 8192;
 
@@ -388,7 +384,8 @@ impl SchemaSpec {
     /// source whenever DataFusion pushes a fetch into the scan.
     fn ordered_primary_key_scan(
         &self,
-        column: String,
+        column: Option<String>,
+        any_rows: bool,
         schema: SchemaRef,
         request: HotStateScanRequest,
         row_filters: Vec<RowFilter>,
@@ -401,6 +398,7 @@ impl SchemaSpec {
             spec: Arc::clone(&self.spec),
             schema: Arc::clone(&schema),
             column: column.clone(),
+            any_rows,
             request,
             row_filters,
             batch_projection,
@@ -418,7 +416,7 @@ impl SchemaSpec {
         PlannedScan {
             schema,
             source,
-            ordering: Some(column),
+            ordering: column,
         }
     }
 
@@ -446,21 +444,6 @@ impl SchemaSpec {
         let direct_primary_key_reader = direct_primary_key_projection
             .then(|| self.row_snapshot_reader.clone())
             .flatten();
-        // DataFusion supplies `limit` to a TableProvider scan only when its
-        // physical optimizer proves the fetch can cross the operators above
-        // this scan. A durable-root page may choose any valid rows only for
-        // this unordered shape; ORDER BY, residual predicates, and identity
-        // probes keep their ordinary plan and scan path.
-        let direct_limit_candidate_reader = unordered_limit_candidates_eligible(
-            &self.spec,
-            &schema,
-            &request,
-            filters,
-            &row_filters,
-            private_registry,
-        )
-        .then(|| self.row_snapshot_reader.clone())
-        .flatten();
         let direct_snapshot_reader = (!private_registry
             && direct_row_batch_eligible(&schema, &request, &row_filters))
         .then(|| self.row_snapshot_reader.clone())
@@ -560,7 +543,6 @@ impl SchemaSpec {
                     row_filters,
                     batch_projection,
                     direct_primary_key_reader,
-                    direct_limit_candidate_reader,
                     direct_snapshot_reader,
                     direct_snapshot_decoder,
                     direct_primary_key_projection,
@@ -574,45 +556,11 @@ impl SchemaSpec {
                     row_filters,
                     batch_projection,
                     direct_primary_key_reader,
-                    direct_limit_candidate_reader,
                     direct_snapshot_reader,
                     direct_snapshot_decoder,
                     direct_primary_key_projection,
                     staged_read_context,
                 )| async move {
-                    if let Some(reader) = direct_limit_candidate_reader.as_ref()
-                        && let Some(candidate_pks) = reader
-                            .scan_row_limit_candidates(request.clone(), LIMIT_CANDIDATE_BUDGET)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                        && let Some(rows) = recheck_unordered_limit_candidates(
-                            hot_state.as_ref(),
-                            &request,
-                            candidate_pks,
-                            request
-                                .limit
-                                .expect("candidate route requires a finite limit"),
-                        )
-                        .await?
-                    {
-                        record_rows_examined(rows.len());
-                        if direct_primary_key_projection {
-                            return row_primary_key_record_batch(
-                                &spec,
-                                schema,
-                                rows.iter().map(|row| row.row_pk().clone()).collect(),
-                            );
-                        }
-                        return Box::pin(row_record_batch_with_staged_schemas(
-                            staged_read_context.as_ref(),
-                            &spec,
-                            schema,
-                            rows,
-                            &row_filters,
-                            batch_projection,
-                        ))
-                        .await;
-                    }
                     if direct_primary_key_projection
                         && let Some(direct_primary_key_reader) = direct_primary_key_reader.as_ref()
                         && let Some(row_pks) = direct_primary_key_reader
@@ -1048,22 +996,44 @@ impl TableSpec for SchemaSpec {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
-        let Some(column) = ordered_primary_key_column(&self.spec) else {
-            return self
-                .plan_scan_routes(schema, request, row_filters, batch_projection, filters)
-                .await;
-        };
+        let ordered_column = ordered_primary_key_column(&self.spec);
         // `filter_pushdown` reported this range as exact, so no route that may
         // ignore primary-key bounds can serve the scan. The ordered route
         // reads the interval exactly on every storage shape and declares the
         // primary-key order it produces; the declaration depends only on the
         // statement's filters.
-        if filters
-            .iter()
-            .any(|filter| exact_primary_key_range_filter(&self.spec, filter))
+        if let Some(column) = ordered_column
+            && filters
+                .iter()
+                .any(|filter| exact_primary_key_range_filter(&self.spec, filter))
         {
             return Ok(self.ordered_primary_key_scan(
-                column.to_owned(),
+                Some(column.to_owned()),
+                false,
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                limit,
+            ));
+        }
+        // An unfiltered committed collection scan with a pushed-down LIMIT may
+        // return any rows, so it reads the first primary-key windows until the
+        // limit is met instead of resolving the whole collection. Windows exist
+        // for every primary-key type; only a string key also declares order.
+        // Transactions keep their limited staged scan: without a committed
+        // reader there is no window horizon.
+        if limit.is_some()
+            && filters.is_empty()
+            && self.row_snapshot_reader.is_some()
+            && primary_key_windows_eligible(&self.spec)
+            && collection_request(&request)
+        {
+            let mut request = request;
+            request.limit = None;
+            return Ok(self.ordered_primary_key_scan(
+                ordered_column.map(str::to_owned),
+                true,
                 schema,
                 request,
                 row_filters,
@@ -1077,18 +1047,20 @@ impl TableSpec for SchemaSpec {
         // so the ordering is still declared by query shape alone. Identity
         // sets keep their point-read route and DataFusion's sort: they are
         // already bounded, and sorting them is no scan work.
-        if !request.filter.row_pks.is_empty()
-            || !matches!(request.filter.rows, HotStateRowFilter::All)
-        {
+        let Some(column) = ordered_column.filter(|_| {
+            request.filter.row_pks.is_empty()
+                && matches!(request.filter.rows, HotStateRowFilter::All)
+        }) else {
             return self
                 .plan_scan_routes(schema, request, row_filters, batch_projection, filters)
                 .await;
-        }
+        };
         let mut ordered_request = request.clone();
         ordered_request.limit = None;
         let ordered = self
             .ordered_primary_key_scan(
-                column.to_owned(),
+                Some(column.to_owned()),
+                false,
                 Arc::clone(&schema),
                 ordered_request,
                 row_filters.clone(),
@@ -4079,9 +4051,7 @@ fn exact_identity_residual<'a>(
 /// produce: one top-level string key component of a public, stored schema.
 /// SQL string comparison and the typed key order are both byte order there.
 fn ordered_primary_key_column(spec: &SchemaSurfaceSpec) -> Option<&str> {
-    if spec.schema_key == "lix_registered_schema"
-        || crate::hot_state::is_derived_schema(&spec.schema_key)
-    {
+    if !primary_key_windows_eligible(spec) {
         return None;
     }
     let columns = top_level_primary_key_columns(spec);
@@ -4090,6 +4060,31 @@ fn ordered_primary_key_column(spec: &SchemaSurfaceSpec) -> Option<&str> {
     };
     simple_string_primary_key_index(spec, column)?;
     Some(column)
+}
+
+/// Whether primary-key windows can serve this schema: every public stored
+/// schema can; the private registry and derived schemas cannot.
+fn primary_key_windows_eligible(spec: &SchemaSurfaceSpec) -> bool {
+    spec.schema_key != "lix_registered_schema"
+        && !crate::hot_state::is_derived_schema(&spec.schema_key)
+}
+
+/// A scan of the whole collection of one schema in one branch: no identity,
+/// file, retention, global, constraint or declared-column selector.
+fn collection_request(request: &HotStateScanRequest) -> bool {
+    matches!(request.filter.rows, HotStateRowFilter::All)
+        && request.filter.schema_keys.len() == 1
+        && request.filter.branch_ids.len() == 1
+        && request.filter.row_pks.is_empty()
+        && request.filter.row_pk_lower.is_none()
+        && request.filter.row_pk_upper.is_none()
+        && request.filter.file_ids.is_empty()
+        && request.filter.untracked.is_none()
+        && request.filter.global.is_none()
+        && request.filter.constraints.is_empty()
+        && request.filter.declared_column_eq.is_none()
+        && request.filter.declared_column_range.is_none()
+        && !request.filter.include_tombstones
 }
 
 /// Whether `filter` is a range over exactly the ordered primary-key column
@@ -4123,7 +4118,11 @@ struct OrderedPrimaryKeyScan {
     hot_state: Arc<dyn HotStateReader>,
     spec: Arc<SchemaSurfaceSpec>,
     schema: SchemaRef,
-    column: String,
+    /// The string key column whose order is declared, when there is one.
+    column: Option<String>,
+    /// The statement accepts any `fetch` qualifying rows (an unordered
+    /// LIMIT), so a remainder window may let storage stop at the fetch.
+    any_rows: bool,
     request: HotStateScanRequest,
     row_filters: Vec<RowFilter>,
     batch_projection: RowBatchProjection,
@@ -4190,11 +4189,21 @@ fn ordered_primary_key_scan_source(
                             .as_ref()
                             .is_none_or(|upper| horizon < &upper.row_pk)
                     });
-                    if let Some(horizon) = horizon.as_ref() {
-                        request.filter.row_pk_upper = Some(crate::tracked_state::RowPkRangeBound {
-                            row_pk: horizon.clone(),
-                            inclusive: true,
-                        });
+                    match horizon.as_ref() {
+                        Some(horizon) => {
+                            request.filter.row_pk_upper =
+                                Some(crate::tracked_state::RowPkRangeBound {
+                                    row_pk: horizon.clone(),
+                                    inclusive: true,
+                                });
+                        }
+                        // The remainder in one read: an unordered LIMIT lets
+                        // storage stop at the fetch; an ordered read must
+                        // resolve the remainder before taking its prefix.
+                        None if plan.any_rows && plan.row_filters.is_empty() => {
+                            request.limit = remaining;
+                        }
+                        None => {}
                     }
                     let rows = plan
                         .hot_state
@@ -4211,7 +4220,10 @@ fn ordered_primary_key_scan_source(
                         plan.batch_projection,
                     ))
                     .await?;
-                    let batch = sort_record_batch_by_column(batch, &plan.column)?;
+                    let batch = match plan.column.as_deref() {
+                        Some(column) => sort_record_batch_by_column(batch, column)?,
+                        None => batch,
+                    };
                     let batch = match remaining {
                         Some(remaining) if batch.num_rows() > remaining => {
                             batch.slice(0, remaining)
@@ -4257,9 +4269,8 @@ fn sort_record_batch_by_column(batch: RecordBatch, column: &str) -> Result<Recor
             "ordered primary-key column '{column}' is not Utf8"
         )));
     };
-    if (1..datafusion::arrow::array::Array::len(strings))
-        .all(|row| strings.value(row - 1) <= strings.value(row))
-    {
+    use datafusion::arrow::array::Array as _;
+    if (1..strings.len()).all(|row| strings.value(row - 1) <= strings.value(row)) {
         return Ok(batch);
     }
     let indices = datafusion::arrow::compute::sort_to_indices(keys, None, None)?;
@@ -4485,97 +4496,6 @@ fn direct_primary_key_projection_eligible(
             .fields()
             .iter()
             .all(|field| simple_string_primary_key_index(spec, field.name()).is_some())
-}
-
-fn unordered_limit_candidates_eligible(
-    spec: &SchemaSurfaceSpec,
-    schema: &Schema,
-    request: &HotStateScanRequest,
-    filters: &[Expr],
-    row_filters: &[RowFilter],
-    private_registry: bool,
-) -> bool {
-    let Some(limit) = request.limit else {
-        return false;
-    };
-    !private_registry
-        && !crate::hot_state::is_derived_schema(&spec.schema_key)
-        && (1..=MAX_UNORDERED_LIMIT_PUSHDOWN).contains(&limit)
-        && !schema.fields().is_empty()
-        && filters.is_empty()
-        && row_filters.is_empty()
-        && matches!(request.filter.rows, HotStateRowFilter::All)
-        && request.filter.schema_keys.len() == 1
-        && request.filter.branch_ids.len() == 1
-        && request.filter.row_pks.is_empty()
-        && request.filter.row_pk_lower.is_none()
-        && request.filter.row_pk_upper.is_none()
-        && request.filter.file_ids.is_empty()
-        && request.filter.untracked.is_none()
-        && request.filter.global.is_none()
-        && request.filter.constraints.is_empty()
-        && request.filter.declared_column_eq.is_none()
-        && request.filter.declared_column_range.is_none()
-        && !request.filter.include_tombstones
-}
-
-async fn recheck_unordered_limit_candidates(
-    hot_state: &dyn HotStateReader,
-    original_request: &HotStateScanRequest,
-    mut candidate_pks: Vec<RowPk>,
-    limit: usize,
-) -> Result<Option<MaterializedHotStateBatch>> {
-    if !(1..=MAX_UNORDERED_LIMIT_PUSHDOWN).contains(&limit)
-        || candidate_pks.is_empty()
-        || candidate_pks.len() > LIMIT_CANDIDATE_BUDGET
-    {
-        return Ok(None);
-    }
-
-    // Candidate pages are key-unique by construction. Keep a defensive
-    // dedupe here so a malformed or future source cannot duplicate SQL rows.
-    let mut seen = HashSet::with_capacity(candidate_pks.len());
-    candidate_pks.retain(|row_pk| seen.insert(row_pk.clone()));
-    if candidate_pks.len() < limit.max(LIMIT_CANDIDATE_MINIMUM_PAGE) {
-        // Small scans are cheaper through the existing path, and an undersized
-        // candidate set cannot amortize visibility rechecks over stale keys.
-        return Ok(None);
-    }
-    let mut verified = Vec::with_capacity(limit);
-    let mut offset = 0;
-    let mut chunk_size = limit.min(LIMIT_RECHECK_CHUNK_SIZE).max(1);
-    while offset < candidate_pks.len() && verified.len() < limit {
-        let end = offset.saturating_add(chunk_size).min(candidate_pks.len());
-        let candidate_chunk = &candidate_pks[offset..end];
-        let mut request = original_request.clone();
-        request.filter.row_pks = candidate_chunk.to_vec();
-        request.filter.row_pk_lower = None;
-        request.filter.row_pk_upper = None;
-        request.filter.file_ids = vec![crate::NullableKeyFilter::Null];
-        request.limit = None;
-        let rows = hot_state
-            .scan_batch(&request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        let verified_before_chunk = verified.len();
-        for row in rows.iter() {
-            if !row.deleted() && row.file_id().is_none() {
-                verified.push(row.to_owned());
-                if verified.len() >= limit {
-                    verified.truncate(limit);
-                    return Ok(Some(MaterializedHotStateBatch::from_rows(verified)));
-                }
-            }
-        }
-        if verified.len() - verified_before_chunk < candidate_chunk.len() {
-            chunk_size = chunk_size.saturating_mul(2).min(LIMIT_RECHECK_CHUNK_SIZE);
-        }
-        offset = end;
-    }
-    // A stale/deleted/overridden prefix can consume the bounded candidate
-    // budget. In that case, run the original complete scan so the LIMIT still
-    // returns the same number of rows whenever enough current rows exist.
-    Ok(None)
 }
 
 fn simple_string_primary_key_index(spec: &SchemaSurfaceSpec, column_name: &str) -> Option<usize> {
@@ -5492,10 +5412,6 @@ mod tests {
 
     use super::super::spec::SpecTableProvider;
     use super::row_record_batch;
-    use super::{
-        LIMIT_CANDIDATE_MINIMUM_PAGE, LIMIT_RECHECK_CHUNK_SIZE, recheck_unordered_limit_candidates,
-        unordered_limit_candidates_eligible,
-    };
     use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
@@ -5513,13 +5429,6 @@ mod tests {
     struct EmptyHotStateReader;
     struct EmptyBranchRefReader;
     struct ActiveBranchRefReader;
-
-    struct LimitRecheckHotStateReader {
-        rows: Vec<MaterializedHotStateRow>,
-        requests: Mutex<Vec<HotStateScanRequest>>,
-    }
-
-    struct LimitCandidateCallCounter(Arc<AtomicUsize>);
 
     struct UnorderedSnapshotPages(Arc<AtomicUsize>);
 
@@ -5666,62 +5575,6 @@ mod tests {
             _request: &HotStateScanRequest,
         ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(vec![].into())
-        }
-    }
-
-    #[async_trait]
-    impl HotStateReader for LimitRecheckHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.requests
-                .lock()
-                .expect("limit recheck request lock")
-                .push(request.clone());
-            assert!(
-                request.limit.is_none(),
-                "candidate rechecks must be unbounded"
-            );
-            assert_eq!(
-                request.filter.file_ids,
-                vec![crate::NullableKeyFilter::Null]
-            );
-            assert!(request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE);
-            let rows = self
-                .rows
-                .iter()
-                .filter(|row| {
-                    row.schema_key == request.filter.schema_keys[0]
-                        && request.filter.row_pks.contains(&row.row_pk)
-                        && row.file_id.is_none()
-                })
-                .cloned()
-                .collect();
-            Ok(MaterializedHotStateBatch::from_rows(rows))
-        }
-    }
-
-    #[async_trait]
-    impl crate::sql2::RowSnapshotReader for LimitCandidateCallCounter {
-        async fn scan_row_limit_candidates(
-            &self,
-            _request: HotStateScanRequest,
-            _candidate_limit: usize,
-        ) -> Result<Option<Vec<TestRowPk>>, LixError> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(
-                (0..LIMIT_CANDIDATE_MINIMUM_PAGE)
-                    .map(|index| TestRowPk::single(format!("candidate-{index}")))
-                    .collect(),
-            ))
         }
     }
 
@@ -5906,143 +5759,6 @@ mod tests {
         MaterializedHotStateBatch::from_rows(rows)
     }
 
-    fn unordered_limit_request(limit: Option<usize>) -> HotStateScanRequest {
-        HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: vec!["project_message".to_owned()],
-                branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_owned()],
-                ..HotStateFilter::default()
-            },
-            projection: HotStateProjection {
-                columns: vec!["snapshot".to_owned()],
-            },
-            limit,
-        }
-    }
-
-    #[test]
-    fn candidate_limit_route_requires_an_unfiltered_finite_fetch() {
-        let spec = row_insert_spec_with_primary_key();
-        let schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
-        let request = unordered_limit_request(Some(100));
-        assert!(unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &request,
-            &[],
-            &[],
-            false,
-        ));
-
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &unordered_limit_request(None),
-            &[],
-            &[],
-            false,
-        ));
-        let mut exact_identity = request.clone();
-        exact_identity
-            .filter
-            .row_pks
-            .push(TestRowPk::single("point"));
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &exact_identity,
-            &[],
-            &[],
-            false,
-        ));
-        let mut file_filtered = request.clone();
-        file_filtered.filter.file_ids = vec![crate::NullableKeyFilter::Null];
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &file_filtered,
-            &[],
-            &[],
-            false,
-        ));
-        let mut global_filtered = request;
-        global_filtered.filter.global = Some(true);
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &global_filtered,
-            &[],
-            &[],
-            false,
-        ));
-    }
-
-    #[tokio::test]
-    async fn unordered_limit_projects_primary_keys_without_snapshot_payloads() {
-        let session = SessionContext::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut row = live_row();
-        row.row_pk = TestRowPk::single("candidate-0");
-        row.snapshot_content = None;
-        row.metadata = None;
-        let reader = Arc::new(LimitRecheckHotStateReader {
-            rows: vec![row],
-            requests: Mutex::new(Vec::new()),
-        });
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
-            row_insert_spec_with_primary_key(),
-            reader.clone(),
-            active_branch_ref(),
-            "branch-a".to_owned(),
-            Some(Arc::new(LimitCandidateCallCounter(Arc::clone(&calls)))),
-        )));
-        session
-            .register_table("project_message", Arc::new(provider))
-            .expect("register schema provider");
-        let batches = session
-            .sql("SELECT id FROM project_message LIMIT 1")
-            .await
-            .expect("plan key-only limit")
-            .collect()
-            .await
-            .expect("project identity without snapshot payload");
-        let values = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("primary key should be utf8");
-        assert_eq!(values.value(0), "candidate-0");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(reader.requests.lock().expect("request lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn ordered_limit_does_not_use_unordered_candidate_reader() {
-        let session = SessionContext::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
-            row_insert_spec_with_primary_key(),
-            Arc::new(EmptyHotStateReader),
-            active_branch_ref(),
-            "branch-a".to_owned(),
-            Some(Arc::new(LimitCandidateCallCounter(Arc::clone(&calls)))),
-        )));
-        session
-            .register_table("project_message", Arc::new(provider))
-            .expect("register schema provider");
-
-        let frame = session
-            .sql("SELECT body FROM project_message ORDER BY id LIMIT 3")
-            .await
-            .expect("plan ordered query");
-        frame.collect().await.expect("execute ordered query");
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            0,
-            "DataFusion must retain the sort above the full scan"
-        );
-    }
-
     #[tokio::test]
     async fn ordered_limit_sorts_across_unordered_snapshot_pages() {
         let session = SessionContext::new();
@@ -6080,144 +5796,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(values, ["candidate-4", "candidate-3", "candidate-2"]);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn candidate_limit_rechecks_global_staged_and_tombstone_winners_in_bounded_chunks() {
-        let mut global_winner = live_row();
-        global_winner.row_pk = TestRowPk::single("candidate-global");
-        global_winner.global = true;
-        global_winner.snapshot_content = Some(r#"{"body":"global winner"}"#.into());
-
-        let mut tombstone = live_row();
-        tombstone.row_pk = TestRowPk::single("candidate-deleted");
-        tombstone.deleted = true;
-
-        // This row stands for a transaction-local current winner. The helper
-        // sees it only through the authoritative HotStateReader recheck, never
-        // through the committed root candidate source.
-        let mut staged_winner = live_row();
-        staged_winner.row_pk = TestRowPk::single("candidate-staged");
-        staged_winner.snapshot_content = Some(r#"{"body":"staged winner"}"#.into());
-
-        let mut last_winner = live_row();
-        last_winner.row_pk = TestRowPk::single("candidate-last");
-        let reader = LimitRecheckHotStateReader {
-            rows: vec![global_winner, tombstone, staged_winner, last_winner],
-            requests: Mutex::new(Vec::new()),
-        };
-        let mut candidates = (0..512)
-            .map(|index| TestRowPk::single(format!("stale-{index}")))
-            .collect::<Vec<_>>();
-        candidates.extend([
-            TestRowPk::single("candidate-global"),
-            TestRowPk::single("candidate-deleted"),
-            TestRowPk::single("candidate-staged"),
-            TestRowPk::single("candidate-last"),
-        ]);
-
-        let rows = recheck_unordered_limit_candidates(
-            &reader,
-            &unordered_limit_request(Some(3)),
-            candidates.clone(),
-            3,
-        )
-        .await
-        .expect("recheck should succeed")
-        .expect("three authoritative live rows should fill LIMIT");
-        let keys = rows
-            .iter()
-            .map(|row| row.row_pk().clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                TestRowPk::single("candidate-global"),
-                TestRowPk::single("candidate-staged"),
-                TestRowPk::single("candidate-last"),
-            ]
-        );
-        assert!(rows.row(0).global());
-        assert_eq!(
-            rows.row(1)
-                .snapshot_content()
-                .expect("staged fixture has content")
-                .as_str(),
-            r#"{"body":"staged winner"}"#
-        );
-        {
-            let requests = reader.requests.lock().expect("request lock");
-            assert!(
-                requests.len() > 2,
-                "short pages should expand the next read"
-            );
-            assert_eq!(requests[0].filter.row_pks.len(), 3);
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE)
-            );
-            // The last chunk contains only the remaining keys and can be shorter
-            // than the preceding chunk, even though the adaptive target grows.
-            assert!(
-                requests[..requests.len() - 1]
-                    .windows(2)
-                    .all(|pair| { pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len() })
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request.filter.row_pks.len())
-                    .sum::<usize>(),
-                candidates.len()
-            );
-            assert!(requests.iter().all(|request| request.limit.is_none()));
-            assert!(requests.iter().all(|request| {
-                request.filter.file_ids == vec![crate::NullableKeyFilter::Null]
-            }));
-        }
-
-        let insufficient = recheck_unordered_limit_candidates(
-            &reader,
-            &unordered_limit_request(Some(2)),
-            vec![
-                TestRowPk::single("candidate-global"),
-                TestRowPk::single("candidate-deleted"),
-            ],
-            2,
-        )
-        .await
-        .expect("recheck should succeed");
-        assert!(
-            insufficient.is_none(),
-            "a short candidate result must request the complete fallback scan"
-        );
-
-        let small_reader = LimitRecheckHotStateReader {
-            rows: Vec::new(),
-            requests: Mutex::new(Vec::new()),
-        };
-        assert!(
-            recheck_unordered_limit_candidates(
-                &small_reader,
-                &unordered_limit_request(Some(1)),
-                (0..LIMIT_CANDIDATE_MINIMUM_PAGE - 1)
-                    .map(|index| TestRowPk::single(format!("small-{index}")))
-                    .collect(),
-                1,
-            )
-            .await
-            .expect("small candidate page should decline")
-            .is_none()
-        );
-        assert!(
-            small_reader
-                .requests
-                .lock()
-                .expect("request lock")
-                .is_empty(),
-            "small scans should decline before current-state hydration"
-        );
     }
 
     fn row_insert_spec_with_primary_key() -> Arc<SchemaSurfaceSpec> {

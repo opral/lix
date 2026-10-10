@@ -110,7 +110,7 @@ pub(crate) use storage::{
     load_published_commit_state_manifest, load_published_commit_state_topology,
     load_retained_commit_snapshots_for_schemas, resolve_authoritative_live_change_records,
     rewrite_commit_state_incorporation_for_migration, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, scan_commit_delta_limit_candidate_row_pks,
+    scan_commit_delta_inventory,
     scan_commit_delta_values, scan_commit_state_manifest_commit_ids,
     selected_change_selection_fingerprint, stage_addressable_commit_deltas,
     stage_addressable_commit_deltas_with_selected_source,
