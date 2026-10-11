@@ -58,7 +58,8 @@ async fn profile<S: Storage + Clone + Send + Sync + 'static>(
         // process/storage measurements, not cold disk or HTTP transfer timings.
         lix.query(READ).params(&params).all().await?;
         assert_eq!(
-            lix.execute(HASH).params(&params).await?.rows()[0].get::<String>("content_sha256")?,
+            lix.query(HASH).params(&params).all().await?.rows()[0]
+                .get::<String>("content_sha256")?,
             expected
         );
         for iteration in 0..20 {

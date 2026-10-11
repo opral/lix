@@ -960,8 +960,9 @@ where
     S: BenchmarkStorage,
 {
     let result = lix
-        .execute(sql)
+        .query(sql)
         .params(parameters)
+        .all()
         .await
         .expect("execute count query");
     let count = result
@@ -1356,8 +1357,9 @@ async fn row_count<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> usize
 where
     S: BenchmarkStorage,
 {
-    lix.execute(sql)
+    lix.query(sql)
         .params(parameters)
+        .all()
         .await
         .expect("execute row-count query")
         .rows()

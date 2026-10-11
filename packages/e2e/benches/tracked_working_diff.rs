@@ -979,8 +979,9 @@ where
         .get::<String>("commit_id")
         .expect("working-diff checkpoint ID");
     session
-        .execute(WORKING_DIFF_SQL)
+        .query(WORKING_DIFF_SQL)
         .params(&[Value::Text(checkpoint)])
+        .all()
         .await
         .expect("query populated working diff")
         .len()

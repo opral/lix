@@ -132,7 +132,7 @@ async fn measure<S: Storage + Clone + Send + Sync + 'static>(
     let mut rows = 0;
     for iteration in 0..24 {
         let started = Instant::now();
-        let result = lix.execute(sql).params(parameters).await?;
+        let result = lix.query(sql).params(parameters).all().await?;
         let elapsed = started.elapsed().as_micros();
         rows = result.len();
         if iteration >= 3 {

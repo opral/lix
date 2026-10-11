@@ -445,12 +445,14 @@ async fn profile_select(
 
     for _ in 0..warmups {
         session
-            .execute(sql)
+            .query(sql)
+            .all()
             .await
             .expect("profile select warmup should succeed");
     }
     let validation = session
-        .execute(sql)
+        .query(sql)
+        .all()
         .await
         .expect("profile select validation should succeed");
     validate_data(&validation, ids, &[0]);
@@ -479,7 +481,8 @@ async fn profile_select(
     for _ in 0..profile.iterations {
         final_result = Some(
             session
-                .execute(sql)
+                .query(sql)
+                .all()
                 .await
                 .expect("profile select should succeed"),
         );
@@ -513,7 +516,8 @@ async fn measure_select(
     let (storage, session) = open_case(seed_snapshot).await;
     for _ in 0..warmups {
         let result = session
-            .execute(sql)
+            .query(sql)
+            .all()
             .await
             .expect("select warmup should succeed");
         validate_data(&result, ids, &[0]);
@@ -524,7 +528,8 @@ async fn measure_select(
         let before = storage.stats();
         let started = Instant::now();
         let result = session
-            .execute(sql)
+            .query(sql)
+            .all()
             .await
             .expect("timed select should succeed");
         let duration_ns = elapsed_ns(started);

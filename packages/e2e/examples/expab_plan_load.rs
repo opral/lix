@@ -176,7 +176,7 @@ where
     ] {
         let _ = take_plan_load_attribution();
         let start = Instant::now();
-        let outcome = session.execute(sql).await;
+        let outcome = session.query(sql).all().await;
         let elapsed = start.elapsed();
         match outcome {
             Ok(result) => println!(

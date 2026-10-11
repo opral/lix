@@ -15,9 +15,9 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, 
     let lix = db::open_lix_at(&lix_path)?;
     // `sql execute` runs any single statement: reads through query(), writes
     // (and reads that call durable functions) through execute().
-    let read_only = lix::parse_sql_script(&sql, params.len())
-        .map(|plan| matches!(plan.statements.as_slice(), [statement] if statement.read_only))
-        .unwrap_or(false);
+    let plan = lix::parse_sql_script(&sql, params.len())
+        .map_err(|err| CliError::from_lix("sql execution failed", err))?;
+    let read_only = matches!(plan.statements.as_slice(), [statement] if statement.read_only);
     let result = if read_only {
         db::block_on(lix.query(&sql).params(&params).all()).map(lix::ExecuteResult::from)
     } else {

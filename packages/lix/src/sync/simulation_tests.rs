@@ -865,7 +865,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
 
     let selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -873,6 +873,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .expect("selected working diff should be hot")
         .rows()[0]
@@ -962,7 +963,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
 
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -970,6 +971,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .expect("unselected working diff should remain readable");
     assert_eq!(remaining.rows().len(), 1);
@@ -1026,7 +1028,7 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
     assert_eq!(checkpoint.rows_affected(), 1);
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1034,6 +1036,7 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
             )
             .await,
         )
+        .all()
         .await
         .expect("unselected snapshot-local diff should remain readable");
     assert_eq!(remaining.rows().len(), 49);
@@ -1078,7 +1081,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1086,6 +1089,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
             )
             .await,
         )
+        .all()
         .await
         .expect("working diff should already be HOT")
         .rows()[0]
@@ -1117,7 +1121,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1125,6 +1129,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
             )
             .await,
         )
+        .all()
         .await
         .expect("remaining working diff should load")
         .rows()[0]
@@ -1161,7 +1166,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let reopened_remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1169,6 +1174,7 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
             )
             .await,
         )
+        .all()
         .await
         .expect("reopened working diff should remain HOT")
         .rows()[0]
@@ -1373,7 +1379,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
     );
     let selected_remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1382,6 +1388,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1390,7 +1397,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
     assert_eq!(selected_remaining, 0);
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1399,6 +1406,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1409,7 +1417,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
     replica.restart().await;
     let reopened_remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1418,6 +1426,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(reopened_remaining.rows()[0].get::<i64>("count").unwrap(), 1);
@@ -1496,7 +1505,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
         crate::tracked_state::reset_commit_delta_scan_probe_for_test();
         let direct_file_diff = replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
@@ -1505,6 +1514,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 .await,
             )
             .params(&[Value::Text(selected_file_id.clone())])
+            .all()
             .await
             .expect("direct file-filtered packed diff should stay local");
         assert!(
@@ -1554,7 +1564,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
 
         let selected_remaining = replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
@@ -1563,6 +1573,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 .await,
             )
             .params(&[Value::Text(selected_file_id)])
+            .all()
             .await
             .expect("selected packed file diff should be cleared");
         assert_eq!(
@@ -1573,7 +1584,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
 
         let remaining = replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_file",
@@ -1581,6 +1592,7 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                 )
                 .await,
             )
+            .all()
             .await
             .expect("remaining packed working diff should stay locally readable")
             .rows()[0]
@@ -1605,7 +1617,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     replica.write("remaining", "local-remaining").await;
     let first_selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1613,6 +1625,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
             )
             .await,
         )
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1629,7 +1642,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     assert_eq!(
         replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_key_value",
@@ -1637,6 +1650,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                 )
                 .await
             )
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1652,7 +1666,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     replica.write("selected", "local-selected-again").await;
     let selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1660,6 +1674,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
             )
             .await,
         )
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1705,7 +1720,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
     assert_eq!(
         replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_key_value",
@@ -1713,6 +1728,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                 )
                 .await
             )
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1818,7 +1834,7 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
     );
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1826,6 +1842,7 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
             )
             .await,
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(remaining.rows().len(), 1);
@@ -1849,7 +1866,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     replica.pump().await.unwrap();
     let selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1857,6 +1874,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1876,7 +1894,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     );
     let remaining = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1884,6 +1902,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(remaining.rows().len(), 1);
@@ -1896,7 +1915,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     assert_eq!(
         replica
             .lix
-            .execute(
+            .query(
                 &working_diff_sql(
                     &replica.lix,
                     "lix_key_value",
@@ -1905,6 +1924,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                 )
                 .await
             )
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1939,7 +1959,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
     replica.write("remaining", "local-remaining").await;
     let selected_row_ref = replica
         .lix
-        .execute(
+        .query(
             &working_diff_sql(
                 &replica.lix,
                 "lix_key_value",
@@ -1947,6 +1967,7 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
             )
             .await,
         )
+        .all()
         .await
         .unwrap()
         .rows()[0]

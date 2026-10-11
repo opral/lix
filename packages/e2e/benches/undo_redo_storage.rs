@@ -758,7 +758,7 @@ async fn count_query<S>(session: &Lix<S>, sql: &str) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let result = session.execute(sql).await.expect("count undo rows");
+    let result = session.query(sql).all().await.expect("count undo rows");
     let count = result.rows()[0]
         .get::<i64>("count")
         .expect("decode undo row count");

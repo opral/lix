@@ -19,8 +19,8 @@ use lix::storage_adapter::{
 use lix::storage_bench::{layout_space_catalog, space_inventory};
 use lix::wasm::WasmLimits;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, MergeBranchOptions,
-    MergeBranchPreviewOptions, SwitchBranchOptions,
+    CreateBranchOptions, Lix, LixError, MergeBranchOptions, MergeBranchPreviewOptions,
+    SwitchBranchOptions,
 };
 use lix::{Value, open_lix};
 use lix_storage_filesystem::FilesystemStorage;
@@ -3303,8 +3303,8 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
         .await
         .unwrap();
     execute_atomically(&lix, &[
-        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_object_member WHERE key = 'new' AND lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
-        ExecuteBatchStatement { label: None, sql: "INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'renamed', 'ff', 'number', $1, $2)".into(), params: vec![Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())] },
+        ("DELETE FROM json_object_member WHERE key = 'new' AND lixcol_file_id = $1".into(), vec![Value::Text(file_id.clone())]),
+        ("INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'renamed', 'ff', 'number', $1, $2)".into(), vec![Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())]),
     ]).await.unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
@@ -3313,16 +3313,14 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
     execute_atomically(
         &lix,
         &[
-            ExecuteBatchStatement {
-                label: None,
-                sql: "DELETE FROM json_object_member WHERE lixcol_file_id = $1".into(),
-                params: vec![Value::Text(file_id.clone())],
-            },
-            ExecuteBatchStatement {
-                label: None,
-                sql: "UPDATE json_root SET kind = 'array' WHERE lixcol_file_id = $1".into(),
-                params: vec![Value::Text(file_id.clone())],
-            },
+            (
+                "DELETE FROM json_object_member WHERE lixcol_file_id = $1".into(),
+                vec![Value::Text(file_id.clone())],
+            ),
+            (
+                "UPDATE json_root SET kind = 'array' WHERE lixcol_file_id = $1".into(),
+                vec![Value::Text(file_id.clone())],
+            ),
         ],
     )
     .await
@@ -3371,10 +3369,25 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
             .is_err()
     );
     assert_eq!(read_file(&reopened, path).await.unwrap(), before);
-    execute_atomically(&reopened, &[
-        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_array_item WHERE lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
-        ExecuteBatchStatement { label: None, sql: "UPDATE json_root SET kind = 'boolean', scalar_json = $1 WHERE lixcol_file_id = $2".into(), params: vec![Value::Jsonb(serde_json::json!(true).into()), Value::Text(file_id)] },
-    ]).await.unwrap();
+    execute_atomically(
+        &reopened,
+        &[
+            (
+                "DELETE FROM json_array_item WHERE lixcol_file_id = $1".into(),
+                vec![Value::Text(file_id.clone())],
+            ),
+            (
+                "UPDATE json_root SET kind = 'boolean', scalar_json = $1 WHERE lixcol_file_id = $2"
+                    .into(),
+                vec![
+                    Value::Jsonb(serde_json::json!(true).into()),
+                    Value::Text(file_id),
+                ],
+            ),
+        ],
+    )
+    .await
+    .unwrap();
     assert_eq!(
         read_file(&reopened, path).await.unwrap(),
         Some(b"true".to_vec())
@@ -7344,25 +7357,23 @@ where
     let batch = execute_atomically(
         &lix,
         &[
-            ExecuteBatchStatement {
-                label: Some("write".to_string()),
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) RETURNING key, value"
+            (
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) RETURNING key, value"
                     .to_string(),
-                params: vec![
+                vec![
                     Value::Text(batch_key.clone()),
                     Value::Text("one".to_string()),
                 ],
-            },
-            ExecuteBatchStatement {
-                label: Some("upsert".to_string()),
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
+            ),
+            (
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
                       ON CONFLICT (key) DO UPDATE SET value = excluded.value RETURNING key, value"
                     .to_string(),
-                params: vec![
+                vec![
                     Value::Text(batch_key.clone()),
                     Value::Text("two".to_string()),
                 ],
-            },
+            ),
         ],
     )
     .await
@@ -8677,34 +8688,18 @@ async fn plugin_deletion_cascades_declared_dependents() {
     lix.close().await.unwrap();
 }
 
-/// Runs statements atomically in one transaction and returns each result:
-/// reads through `query`, writes through `execute`.
+/// Runs writes atomically in one transaction and returns each result.
 async fn execute_atomically<S>(
     lix: &Lix<S>,
-    statements: &[ExecuteBatchStatement],
+    statements: &[(String, Vec<Value>)],
 ) -> Result<Vec<lix::ExecuteResult>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let transaction = lix.begin_transaction().await?;
     let mut results = Vec::with_capacity(statements.len());
-    for statement in statements {
-        let read_only = lix::parse_sql_script(&statement.sql, statement.params.len())
-            .is_ok_and(|plan| plan.statements.iter().all(|statement| statement.read_only));
-        let result = if read_only {
-            transaction
-                .query(&statement.sql)
-                .params(&statement.params)
-                .all()
-                .await
-                .map(lix::ExecuteResult::from)
-        } else {
-            transaction
-                .execute(&statement.sql)
-                .params(&statement.params)
-                .await
-        };
-        match result {
+    for (sql, params) in statements {
+        match transaction.execute(sql).params(params).await {
             Ok(result) => results.push(result),
             Err(error) => {
                 let _ = transaction.rollback().await;

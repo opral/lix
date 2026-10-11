@@ -307,8 +307,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(sql)
+        .query(sql)
         .params(params)
+        .all()
         .await
         .expect("working-diff query should succeed")
         .len()

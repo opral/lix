@@ -1,4 +1,4 @@
-use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
+use lix::{Lix, Value, open_lix};
 use std::io::{Cursor, Write};
 
 async fn workspace() -> Lix {
@@ -478,19 +478,15 @@ async fn restored_plugin_file_accepts_semantic_edits_but_not_public_owner_writes
             .to_string()
             .contains("reserved for engine-managed plugin state")
     );
-    let batch_error = execute_atomically(
-        &lix,
-        &["lix_plugin_owner_v2", "lix_plugin_registry_v2"]
-            .into_iter()
-            .map(|key| ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_key_value(key,value) VALUES($1,$2)".into(),
-                params: vec![Value::Text(key.into()), Value::Text("{}".into())],
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await
-    .expect_err("optimized parameter batches must preserve reserved-key protection");
+    let batch_error = lix
+        .execute_many(
+            "INSERT INTO lix_key_value(key,value) VALUES($1,$2)",
+            ["lix_plugin_owner_v2", "lix_plugin_registry_v2"]
+                .into_iter()
+                .map(|key| [Value::Text(key.into()), Value::Text("{}".into())]),
+        )
+        .await
+        .expect_err("optimized parameter batches must preserve reserved-key protection");
     assert!(
         batch_error
             .to_string()
@@ -544,43 +540,4 @@ async fn apply_mixed_plugin_file_lifecycle_and_live_semantic_change() {
     assert_eq!(content(&lix, "/added.md").await, Some(b"added\n".to_vec()));
     assert_eq!(content(&lix, "/live.md").await, Some(b"after\n".to_vec()));
     lix.close().await.unwrap();
-}
-
-/// Runs statements atomically in one transaction and returns each result:
-/// reads through `query`, writes through `execute`.
-async fn execute_atomically<S>(
-    lix: &Lix<S>,
-    statements: &[ExecuteBatchStatement],
-) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
-where
-    S: lix::storage::Storage + Clone + Send + Sync + 'static,
-{
-    let transaction = lix.begin_transaction().await?;
-    let mut results = Vec::with_capacity(statements.len());
-    for statement in statements {
-        let read_only = lix::parse_sql_script(&statement.sql, statement.params.len())
-            .is_ok_and(|plan| plan.statements.iter().all(|statement| statement.read_only));
-        let result = if read_only {
-            transaction
-                .query(&statement.sql)
-                .params(&statement.params)
-                .all()
-                .await
-                .map(lix::ExecuteResult::from)
-        } else {
-            transaction
-                .execute(&statement.sql)
-                .params(&statement.params)
-                .await
-        };
-        match result {
-            Ok(result) => results.push(result),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        }
-    }
-    transaction.commit().await?;
-    Ok(results)
 }

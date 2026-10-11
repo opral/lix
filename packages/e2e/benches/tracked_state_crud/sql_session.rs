@@ -261,6 +261,11 @@ enum FixtureShape {
     Olap,
 }
 
+/// How `update_all` writes. The literal workloads once went through the
+/// removed `execute_batch` (one auto-commit batch that auto-parameterized
+/// literal UPDATEs); they now run in one explicit transaction, so their
+/// numbers are not comparable with results recorded before that API change.
+/// `execute_many` (bound parameters) keeps the batch fast path.
 enum UpdateWorkload {
     Transaction(Vec<String>),
     /// One literal UPDATE per row, in one transaction.

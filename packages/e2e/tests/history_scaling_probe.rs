@@ -171,7 +171,12 @@ async fn timed(
     let mut rows = 0;
     for _ in 0..samples {
         let t = Instant::now();
-        let result = lix.execute(sql).params(params).await.expect("probe query");
+        let result = lix
+            .query(sql)
+            .params(params)
+            .all()
+            .await
+            .expect("probe query");
         d.push(t.elapsed());
         rows = result.rows().len();
     }
@@ -292,14 +297,16 @@ async fn history_member_scan_census() {
             // Warm the caches, then clear the census so the reported numbers
             // belong to one steady-state read.
             let _ = lix
-                .execute(sql)
+                .query(sql)
                 .params(&[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .all()
                 .await
                 .expect("warm probe query");
             let _ = lix::storage_bench::take_commit_delta_member_scan_census();
             let rows = lix
-                .execute(sql)
+                .query(sql)
                 .params(&[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .all()
                 .await
                 .expect("probe query")
                 .rows()
