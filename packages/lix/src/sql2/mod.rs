@@ -47,7 +47,7 @@ pub(crate) use error::datafusion_error_to_lix_error;
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
-    statement_has_durable_runtime_function,
+    statement_has_durable_runtime_function, statement_has_returning,
 };
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
@@ -63,7 +63,9 @@ pub(crate) use context::{
     WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
-pub(crate) use exec::{ResultPager, execute_read_statement_in_session_with_batch_stream};
+pub(crate) use exec::{
+    PageLimits, ResultPager, execute_read_statement_in_session_with_batch_stream,
+};
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{

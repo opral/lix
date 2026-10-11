@@ -1,5 +1,6 @@
 mod partial;
 mod partial_merge;
+mod sql_targets;
 
 use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
@@ -30,7 +31,7 @@ use crate::open_types::{
 };
 
 use crate::session::SessionContext;
-use crate::session::{CoherentReadBatch, ExecuteOptions};
+use crate::session::ExecuteOptions;
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 
@@ -1293,76 +1294,6 @@ where
     }
 }
 
-/// Configures one streamed read. See [`Lix::query_stream`].
-#[expect(missing_debug_implementations)]
-pub struct QueryStreamBuilder<'a, StorageImpl = Memory>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    lix: &'a Lix<StorageImpl>,
-    sql: String,
-    params: Vec<Value>,
-    page_bytes: usize,
-}
-
-impl<StorageImpl> QueryStreamBuilder<'_, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    /// Caps each page's rows at `page_bytes` public value bytes (one `Value`
-    /// slot per cell plus text, JSON and blob payload bytes). A single row
-    /// larger than the cap is returned as a page of its own. Defaults to
-    /// [`crate::DEFAULT_QUERY_STREAM_PAGE_BYTES`].
-    pub fn with_page_bytes(mut self, page_bytes: usize) -> Self {
-        self.page_bytes = page_bytes;
-        self
-    }
-}
-
-impl<'a, StorageImpl> IntoFuture for QueryStreamBuilder<'a, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    type Output = Result<crate::QueryStream, LixError>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        // SAFETY: the builder owns its request values and borrows only the
-        // Sync Lix handle across suspension, as `ExecuteBuilder` does.
-        Box::pin(unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                let lix = self.lix;
-                let page_bytes = self.page_bytes;
-                let (_, route) = lix.session.query_stream_route(&self.sql, &self.params)?;
-                // A partial replica fetches missing inputs by restarting the
-                // whole statement after hydration, and may answer from its
-                // authority; neither can resume a stream that already handed
-                // out rows. Execute buffered and page the result instead.
-                if route == crate::session::QueryStreamRoute::Materialized
-                    || lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
-                {
-                    let buffered = lix.clone();
-                    let (sql, params) = (self.sql, self.params);
-                    // SAFETY: the future owns a Lix clone and its request
-                    // values; it is the same future `ExecuteBuilder` returns.
-                    let result = crate::session::AssumeSendFuture::new(async move {
-                        buffered.execute(&sql, &params).await
-                    });
-                    return lix
-                        .session
-                        .open_materialized_query_stream(result, page_bytes)
-                        .await;
-                }
-                lix.retry_sync_demands(|| {
-                    lix.session
-                        .query_stream(&self.sql, &self.params, page_bytes)
-                })
-                .await
-            })
-        })
-    }
-}
-
 /// Configures one atomic SQL batch execution.
 #[expect(missing_debug_implementations)]
 pub struct ExecuteBatchBuilder<'a, StorageImpl = Memory>
@@ -2150,32 +2081,6 @@ where
         }
     }
 
-    /// Streams one read statement in byte-bounded pages.
-    ///
-    /// The statement runs once against one storage snapshot that stays
-    /// pinned until the stream ends, is cancelled or dropped, or this handle
-    /// closes. Rows arrive through [`crate::QueryStream::next_page`] in the
-    /// same value representation as [`ExecuteResult`]. Unlike `execute()`,
-    /// the stream is not limited by the buffered read budget (64 MiB / 1M
-    /// rows) or the 30 s read deadline, so it suits bulk reads of any size.
-    ///
-    /// Streams are read-only: writes and runtime functions that persist
-    /// state are rejected. Reads of file content and reads on partial
-    /// replicas execute buffered (with the buffered limits) and are then
-    /// paged out. An idle stream never blocks writes on this handle.
-    pub fn query_stream<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> QueryStreamBuilder<'a, StorageImpl> {
-        QueryStreamBuilder {
-            lix: self,
-            sql: sql.to_owned(),
-            params: params.to_vec(),
-            page_bytes: crate::DEFAULT_QUERY_STREAM_PAGE_BYTES,
-        }
-    }
-
     /// Classifies one SQL execution for a caller that owns its transport
     /// lifecycle.
     ///
@@ -2349,57 +2254,6 @@ where
         }
     }
 
-    /// Executes read statements against one coherent storage snapshot and
-    /// returns the snapshot metadata required by official storage adapters.
-    #[doc(hidden)]
-    pub fn execute_coherent_read_batch(
-        &self,
-        statements: &[(&str, &[Value])],
-    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
-        let statements = Arc::new(
-            statements
-                .iter()
-                .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
-                .collect::<Vec<_>>(),
-        );
-        let routed = statements
-            .iter()
-            .map(|(sql, params)| ExecuteBatchStatement {
-                sql: sql.clone(),
-                params: params.clone(),
-                label: None,
-            })
-            .collect::<Vec<_>>();
-        let route = self.session.execute_batch_disposition(&routed);
-        let session = Arc::clone(&self.session);
-        let demand_tx = self.sync_demand_tx.clone();
-        // SAFETY: the future owns its local session and statement values, as
-        // do the ordinary execute builders. Each retry opens a complete new
-        // coherent snapshot after hydration releases the old read scope.
-        unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                if route? == ExecutionDisposition::Durable {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch only accepts read statements without durable runtime functions",
-                    ));
-                }
-                let mut retry = crate::sync::SyncDemandRetry::default();
-                loop {
-                    let result = retry_expired_read(|| {
-                        Arc::clone(&session)
-                            .execute_coherent_read_batch_owned(Arc::clone(&statements))
-                    })
-                    .await;
-                    match result {
-                        Ok(result) => return Ok(result),
-                        Err(error) => retry.hydrate_for_retry(demand_tx.as_ref(), error).await?,
-                    }
-                }
-            })
-        }
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     pub(crate) fn execute_batch_disposition(
@@ -2460,20 +2314,20 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
-        self.session.running_query_stream_count_for_test()
-    }
-
-    #[cfg(test)]
     pub(crate) fn query_stream_route_for_test(
         &self,
         sql: &str,
         params: &[Value],
     ) -> Result<crate::session::QueryStreamRoute, LixError> {
-        self.session
-            .query_stream_route(sql, params)
-            .map(|(_, route)| route)
+        let statement = self.session.parse_read_only_statement(sql, params)?;
+        Ok(self.session.query_stream_route(&statement, params))
     }
+
+    #[cfg(test)]
+    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
+        self.session.running_query_stream_count_for_test()
+    }
+
 
     #[cfg(test)]
     pub(crate) fn clear_sync_demand_sender_for_test(&mut self) {
@@ -2534,8 +2388,10 @@ where
             })
             .await?;
         Ok(LixTransaction {
-            _lifecycle: lifecycle,
-            inner: Some(inner),
+            shared: Arc::new(TransactionShared {
+                inner: tokio::sync::Mutex::new(Some(inner)),
+                _lifecycle: lifecycle,
+            }),
         })
     }
 
@@ -2825,12 +2681,28 @@ where
     }
 }
 
+/// An explicit transaction: reads see its own writes, and nothing is visible
+/// to others until [`Self::commit`].
+///
+/// `query` and `execute` take `&self` and return owned builders; calls on one
+/// transaction run one at a time, in call order. Dropping the transaction
+/// without committing rolls it back.
 #[expect(missing_debug_implementations)]
 pub struct LixTransaction<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: Option<lix::SessionTransaction<StorageSession<StorageImpl>>>,
+    shared: Arc<TransactionShared<StorageImpl>>,
+}
+
+/// State shared by a transaction handle and the builders it hands out.
+pub(crate) struct TransactionShared<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    inner: tokio::sync::Mutex<Option<lix::SessionTransaction<StorageSession<StorageImpl>>>>,
+    /// Released with the last reference, so the handle's close waits for
+    /// in-flight builders too.
     _lifecycle: PublicTransactionLease,
 }
 
@@ -2840,7 +2712,7 @@ pub struct TransactionExecuteBuilder<'a, StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    transaction: &'a mut LixTransaction<StorageImpl>,
+    transaction: &'a LixTransaction<StorageImpl>,
     sql: &'a str,
     params: &'a [Value],
     options: ExecuteOptions,
@@ -2867,18 +2739,12 @@ where
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                {
-                    self.transaction
-                        .inner
-                        .as_mut()
-                        .ok_or_else(closed_transaction_error)?
-                        .execute_with_options(
-                            self.sql.to_owned(),
-                            self.params.to_vec(),
-                            self.options,
-                        )
-                        .await
-                }
+                let mut inner = self.transaction.shared.inner.lock().await;
+                inner
+                    .as_mut()
+                    .ok_or_else(closed_transaction_error)?
+                    .execute_with_options(self.sql.to_owned(), self.params.to_vec(), self.options)
+                    .await
             })
         })
     }
@@ -2905,6 +2771,12 @@ where
         }
     }
 
+    /// Starts a read that sees this transaction's own staged writes.
+    pub fn query(&self, sql: &str) -> crate::Query {
+        let target: Arc<dyn crate::query::SqlTarget> = self.shared.clone();
+        crate::Query::new(target, sql)
+    }
+
     /// Executes one SQL statement inside this transaction with explicit options.
     ///
     /// Protocol handlers use this instead of the builder so they stay on the
@@ -2917,13 +2789,12 @@ where
     ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                {
-                    self.inner
-                        .as_mut()
-                        .ok_or_else(closed_transaction_error)?
-                        .execute_with_options(sql, params, options)
-                        .await
-                }
+                let mut inner = self.shared.inner.lock().await;
+                inner
+                    .as_mut()
+                    .ok_or_else(closed_transaction_error)?
+                    .execute_with_options(sql, params, options)
+                    .await
             })
         }
     }
@@ -2933,7 +2804,10 @@ where
         &mut self,
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
-        self.inner
+        self.shared
+            .inner
+            .lock()
+            .await
             .as_mut()
             .ok_or_else(closed_transaction_error)?
             .stage_test_row(row)
@@ -2947,27 +2821,46 @@ where
         expected_head_commit_id: &str,
         target_commit_id: &str,
     ) -> Result<(), LixError> {
-        self.inner
+        self.shared
+            .inner
+            .lock()
+            .await
             .as_mut()
             .ok_or_else(closed_transaction_error)?
             .restore_branch_ref_for_test(branch_id, expected_head_commit_id, target_commit_id)
             .await
     }
 
-    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
-        self.inner
-            .take()
-            .ok_or_else(closed_transaction_error)?
-            .commit()
+    async fn take_inner(
+        &self,
+    ) -> Result<lix::SessionTransaction<StorageSession<StorageImpl>>, LixError> {
+        self.shared
+            .inner
+            .lock()
             .await
+            .take()
+            .ok_or_else(closed_transaction_error)
     }
 
-    pub async fn rollback(mut self) -> Result<(), LixError> {
-        self.inner
-            .take()
-            .ok_or_else(closed_transaction_error)?
-            .rollback()
-            .await
+    pub async fn commit(self) -> Result<crate::CommitReceipt, LixError> {
+        self.take_inner().await?.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), LixError> {
+        self.take_inner().await?.rollback().await
+    }
+}
+
+impl<StorageImpl> Drop for LixTransaction<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        // Roll back now unless a call is still running; that call holds the
+        // shared state and rolls back when it releases it.
+        if let Ok(mut inner) = self.shared.inner.try_lock() {
+            drop(inner.take());
+        }
     }
 }
 
@@ -3903,7 +3796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_history_and_mixed_coherent_reads_use_local_state() {
+    async fn replica_history_and_current_state_share_a_local_snapshot() {
         let lix = open_lix().await.expect("open Lix");
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('local-history', 'value')",
@@ -3922,24 +3815,27 @@ mod tests {
             .await
             .expect("cached history is local");
         assert_eq!(local.rows().len(), 1);
-        let batch = lix
-            .execute_coherent_read_batch(&[
-                (
-                    "SELECT value FROM lix_key_value WHERE key = 'local-history'",
-                    &[],
-                ),
-                (sql, &params),
-            ])
+        let snapshot = lix.snapshot().await.expect("open replica snapshot");
+        let current = snapshot
+            .query("SELECT value FROM lix_key_value WHERE key = 'local-history'")
+            .all()
             .await
-            .expect("current state and history share a local snapshot");
-        assert_eq!(batch.results[0].rows().len(), 1);
-        assert_eq!(batch.results[1].rows().len(), 1);
-        assert!(batch.storage_mutation_revision.is_some());
+            .expect("current state reads from the local snapshot");
+        let history = snapshot
+            .query(sql)
+            .params(&params)
+            .all()
+            .await
+            .expect("history reads from the same local snapshot");
+        assert_eq!(current.len(), 1);
+        assert_eq!(history.len(), 1);
+        assert!(snapshot.storage_mutation_revision().is_some());
+        snapshot.close().await.expect("close snapshot");
         lix.close().await.expect("close replica");
     }
 
     #[tokio::test]
-    async fn replica_coherent_reads_reject_mutations_before_execution() {
+    async fn replica_snapshot_reads_reject_mutations_before_execution() {
         let lix = open_lix().await.expect("open Lix");
         lix.set_sync_role(crate::sync::SyncRole::Replica)
             .expect("mark replica");
@@ -3948,25 +3844,34 @@ mod tests {
             "SELECT uuidv7()",
             "SELECT current_timestamp",
         ] {
-            let error = lix
-                .execute_coherent_read_batch(&[("SELECT * FROM lix_checkpoint", &[]), (sql, &[])])
+            let snapshot = lix.snapshot().await.expect("open replica snapshot");
+            snapshot
+                .query("SELECT 1 AS value")
+                .all()
                 .await
-                .expect_err("coherent reads cannot mutate either engine");
-            assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+                .expect("snapshot reads work on a replica");
+            let error = snapshot
+                .query(sql)
+                .all()
+                .await
+                .expect_err("snapshot reads cannot mutate either engine");
+            assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
         }
         lix.close().await.expect("close replica");
     }
 
     #[tokio::test]
-    async fn replica_coherent_hot_read_without_authority_does_not_panic() {
+    async fn replica_snapshot_hot_read_without_authority_does_not_panic() {
         let lix = open_lix().await.expect("open Lix");
         lix.set_sync_role(crate::sync::SyncRole::Replica)
             .expect("mark replica");
-        let batch = lix
-            .execute_coherent_read_batch(&[("SELECT 1 AS value", &[])])
+        let snapshot = lix.snapshot().await.expect("open replica snapshot");
+        let row = snapshot
+            .query("SELECT 1 AS value")
+            .one()
             .await
             .expect("a local read does not require a connected authority client");
-        assert_eq!(batch.results[0].rows()[0].get::<i64>("value").unwrap(), 1);
+        assert_eq!(row.get::<i64>("value").unwrap(), 1);
         lix.close().await.expect("close replica");
     }
 

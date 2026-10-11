@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use super::pk_window_tests::{
-    FILE_A, FILE_B, FixtureShape, Lcg, Row, SCHEMA, SELECT_COLUMNS, bulk_insert, decode_rows, id,
+    FILE_A, FILE_B, FixtureShape, Lcg, Row, SCHEMA, SELECT_COLUMNS, bulk_insert, decode_page, decode_rows, id,
     layered_fixture, open_fixture,
 };
 use super::{primary_key_windows_read, set_primary_key_window_rows};
@@ -39,7 +39,7 @@ fn sorted(mut rows: Vec<String>) -> Vec<String> {
     rows
 }
 
-/// Drains `sql` through `query_stream` with `page_bytes` pages. Returns the
+/// Drains `sql` through `Query::stream` with `page_bytes` pages. Returns the
 /// decoded rows in stream order and the windows read before the first page.
 async fn stream_rows(
     lix: &Lix<Memory>,
@@ -50,15 +50,20 @@ async fn stream_rows(
     let _window = set_primary_key_window_rows(window_rows);
     let windows_before = primary_key_windows_read();
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(page_bytes)
+        .query(sql)
+        .page_limits(crate::session::PageLimits {
+            first_rows: usize::MAX,
+            rows: usize::MAX,
+            bytes: page_bytes,
+        })
+        .stream()
         .await
         .unwrap();
     let mut rows = Vec::new();
     let mut windows_at_first_page = None;
     while let Some(page) = stream.next_page().await.unwrap() {
         windows_at_first_page.get_or_insert(primary_key_windows_read() - windows_before);
-        rows.extend(decode_rows(&page));
+        rows.extend(decode_page(&page));
     }
     (rows, windows_at_first_page.unwrap_or_default())
 }
@@ -178,11 +183,16 @@ async fn stream_windows_read_the_pinned_snapshot_across_writes_between_pulls() {
         let before = reference_rows(&lix).await;
         let _window = set_primary_key_window_rows(29);
         let mut stream = lix
-            .query_stream(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
-            .with_page_bytes(512)
+            .query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+            .page_limits(crate::session::PageLimits {
+                first_rows: usize::MAX,
+                rows: usize::MAX,
+                bytes: 512,
+            })
+            .stream()
             .await
             .unwrap();
-        let mut streamed = decode_rows(&stream.next_page().await.unwrap().unwrap());
+        let mut streamed = decode_page(&stream.next_page().await.unwrap().unwrap());
         let first_page_end = streamed.last().unwrap().0.clone();
         let streamed_scope = streamed[0].2.as_ref().map_or_else(
             || "lixcol_file_id IS NULL".to_owned(),
@@ -221,7 +231,7 @@ async fn stream_windows_read_the_pinned_snapshot_across_writes_between_pulls() {
                 .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
         }
         while let Some(page) = stream.next_page().await.unwrap() {
-            streamed.extend(decode_rows(&page));
+            streamed.extend(decode_page(&page));
         }
         assert_id_order(&streamed, &format!("{shape:?}"));
         streamed.sort();

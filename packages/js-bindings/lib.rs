@@ -18,6 +18,22 @@ mod js_storage;
 #[cfg(all(not(target_family = "wasm"), lix_filesystem_native))]
 mod napi;
 mod session;
+
+/// Pulls one stream page in the execute-result shape the JS bindings still
+/// hand to the SDK.
+#[allow(dead_code)]
+pub(crate) async fn next_stream_page(
+    stream: &mut lix::RowStream,
+) -> Result<Option<lix::ExecuteResult>, lix::LixError> {
+    let Some(rows) = stream.next_page().await? else {
+        return Ok(None);
+    };
+    let rows = rows.into_iter().map(|row| row.values().to_vec()).collect();
+    Ok(Some(lix::ExecuteResult::from_rows(
+        stream.columns().to_vec(),
+        rows,
+    )))
+}
 mod telemetry;
 #[cfg(target_family = "wasm")]
 mod wasm;

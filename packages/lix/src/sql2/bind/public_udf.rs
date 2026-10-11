@@ -261,3 +261,17 @@ mod tests {
 
 
 }
+
+/// Whether a write statement returns rows.
+pub(crate) fn statement_has_returning(statement: &DataFusionStatement) -> bool {
+    use datafusion::sql::sqlparser::ast::Statement;
+    let DataFusionStatement::Statement(statement) = statement else {
+        return false;
+    };
+    match statement.as_ref() {
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
+}

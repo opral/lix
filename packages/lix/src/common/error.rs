@@ -138,6 +138,9 @@ impl LixError {
     /// A SQL column name could not be resolved in the available projection.
     pub const CODE_COLUMN_NOT_FOUND: &'static str = "LIX_COLUMN_NOT_FOUND";
 
+    /// A row lookup by name matched several result columns.
+    pub const CODE_AMBIGUOUS_COLUMN: &'static str = "LIX_AMBIGUOUS_COLUMN";
+
     /// A SQL write violated a primary-key, unique, NOT NULL, or other
     /// relational constraint.
     pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";

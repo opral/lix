@@ -33,6 +33,28 @@ async fn install_markdown<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<
     .unwrap();
 }
 
+/// Runs read statements in order against one snapshot.
+async fn snapshot_reads<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &Lix<S>,
+    statements: &[(&str, &[Value])],
+) -> Vec<Vec<lix::Row>> {
+    let snapshot = lix.snapshot().await.unwrap();
+    let mut results = Vec::new();
+    for (sql, params) in statements {
+        results.push(
+            snapshot
+                .query(sql)
+                .params(*params)
+                .all()
+                .await
+                .unwrap()
+                .into_rows(),
+        );
+    }
+    snapshot.close().await.unwrap();
+    results
+}
+
 async fn semantic_edit<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S>, text: &str) {
     lix.execute(
         "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph'",
@@ -473,10 +495,7 @@ async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
                 statements.reverse();
             }
             if coherent {
-                backing
-                    .execute_coherent_read_batch(&statements)
-                    .await
-                    .unwrap();
+                snapshot_reads(&backing, &statements).await;
             } else {
                 backing
                     .execute_batch(
@@ -577,10 +596,7 @@ async fn mixed_read_batches_do_not_acknowledge_aggregate_file_bytes() {
             statements.reverse();
         }
         if coherent {
-            backing
-                .execute_coherent_read_batch(&statements)
-                .await
-                .unwrap();
+            snapshot_reads(&backing, &statements).await;
         } else {
             backing
                 .execute_batch(
@@ -645,11 +661,7 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                     statements.reverse();
                 }
                 let results = if coherent {
-                    backing
-                        .execute_coherent_read_batch(&statements)
-                        .await
-                        .unwrap()
-                        .results
+                    snapshot_reads(&backing, &statements).await
                 } else {
                     backing
                         .execute_batch(
@@ -665,11 +677,14 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                         .await
                         .unwrap()
                         .results
+                        .into_iter()
+                        .map(|result| result.rows().to_vec())
+                        .collect()
                 };
                 let result = &results[usize::from(!files_first)];
                 assert_eq!(result.len(), 1);
                 assert_eq!(
-                    result.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                    result[0].get::<Vec<u8>>("content").unwrap(),
                     b"primary edit\n"
                 );
                 backing

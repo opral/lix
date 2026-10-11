@@ -1,22 +1,28 @@
 //! Pull-based streaming reads.
 //!
-//! A [`QueryStream`] runs one read statement once against one pinned storage
-//! snapshot and hands its rows out in byte-bounded pages. The snapshot, the
+//! A [`RowStream`] runs one read statement once against one pinned storage
+//! snapshot and hands its rows out in bounded pages. The snapshot, the
 //! DataFusion plan and its batch stream live inside a *producer* future: the
 //! producer owns everything it borrows, so no self-referential handle escapes
-//! the scoped read. The producer is only polled while the caller awaits
-//! [`QueryStream::next_page`], and it parks on a one-page channel, so an idle
-//! stream does no work and holds at most one finished page plus the batch
-//! it is cutting.
+//! the scoped read. The producer is only polled while the consumer pulls, and
+//! it parks on a one-page channel, so an idle stream does no work and holds at
+//! most one finished page plus the batch it is cutting.
+//!
+//! Opening a stream pulls until the producer has planned the statement and
+//! delivered its first page (at most [`PageLimits::first_rows`] rows), so
+//! planning errors surface at open. The stream ends normally only after the
+//! producer confirms the end of the result; a producer that stops without that
+//! confirmation surfaces an error instead of a silently truncated result.
 //!
 //! Lifecycle:
-//! - an idle stream holds no session operation guard, so writes on the same
-//!   session are never blocked by it; each pull takes the guard only while it
-//!   produces a page, exactly like a buffered read;
-//! - [`QueryStream::cancel`], dropping the stream and closing its session all
-//!   drop the producer, which releases the read snapshot synchronously.
+//! - an idle stream holds no session operation guard and never expires, so
+//!   a slow consumer neither blocks writes nor loses its snapshot;
+//! - [`RowStream::close`], dropping the stream, and closing its session or
+//!   snapshot all drop the producer, which stops the engine and releases the
+//!   read snapshot synchronously. The engine runs no detached tasks for a
+//!   stream (single-partition plans), so a dropped producer has stopped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -26,24 +32,9 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 use crate::common::public_row_bytes;
-use crate::{ExecuteResult, LixError, LixNotice, ResultColumnType, Value};
+use crate::{ExecuteResult, LixError, LixNotice, ResultColumnType, Row};
 
-/// Page size used when the caller does not choose one.
-pub const DEFAULT_QUERY_STREAM_PAGE_BYTES: usize = 1024 * 1024;
-/// Largest accepted page size: one page never exceeds the buffered budget.
-pub const MAX_QUERY_STREAM_PAGE_BYTES: usize = crate::common::DEFAULT_MAX_RESULT_BYTES;
-
-pub(crate) fn validate_page_bytes(page_bytes: usize) -> Result<usize, LixError> {
-    if page_bytes == 0 || page_bytes > MAX_QUERY_STREAM_PAGE_BYTES {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!(
-                "query stream page size must be between 1 and {MAX_QUERY_STREAM_PAGE_BYTES} bytes"
-            ),
-        ));
-    }
-    Ok(page_bytes)
-}
+pub(crate) use crate::sql2::PageLimits;
 
 type Producer = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -67,7 +58,10 @@ pub(crate) struct QueryStreamHeader {
 
 pub(crate) enum QueryStreamMessage {
     Header(QueryStreamHeader),
-    Page(ExecuteResult),
+    Page(Vec<Row>),
+    /// The producer reached the end of the result. Only this ends a stream
+    /// normally.
+    End,
     Error(LixError),
 }
 
@@ -209,36 +203,55 @@ impl Drop for QueryStreamRegistration {
     }
 }
 
-/// A read statement streamed in byte-bounded pages from one pinned snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    Open,
+    /// The producer confirmed the end of the result.
+    Ended,
+    /// An error, close or cancellation ended the stream.
+    Stopped,
+}
+
+/// A read statement streamed in bounded pages from one pinned snapshot.
 ///
-/// Created by [`crate::Lix::query_stream`]. Pages use the same row and value
-/// representation as [`ExecuteResult`]. Streams are read-only and are not
-/// subject to the buffered read budget or the buffered read deadline.
-pub struct QueryStream {
+/// Created by [`crate::Query::stream`]. The stream is a
+/// [`futures_core::Stream`] of rows; [`RowStream::next_page`] pulls the same
+/// cursor a page at a time. It never expires: a slow consumer keeps its
+/// snapshot for as long as it holds the stream. Errors after the first page
+/// (for example a runtime error on a later row) surface from a later pull and
+/// end the stream.
+pub struct RowStream {
     header: QueryStreamHeader,
     receiver: mpsc::Receiver<QueryStreamMessage>,
     producer: Arc<ProducerSlot>,
     admission: Option<QueryStreamPullAdmission>,
-    _registration: QueryStreamRegistration,
-    done: bool,
+    pending_admission: Option<PullAdmissionFuture>,
+    pull_guard: Option<QueryStreamPullGuard>,
+    _registrations: Vec<QueryStreamRegistration>,
+    buffered: VecDeque<Row>,
+    state: StreamState,
 }
 
-impl fmt::Debug for QueryStream {
+type PullAdmissionFuture =
+    Pin<Box<dyn Future<Output = Result<QueryStreamPullGuard, LixError>> + Send>>;
+
+impl fmt::Debug for RowStream {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("QueryStream")
+            .debug_struct("RowStream")
             .field("columns", &self.header.columns)
-            .field("done", &self.done)
+            .field("buffered_rows", &self.buffered.len())
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
-impl QueryStream {
-    /// Registers `producer` and pulls until it reports the result header.
-    /// Planning and setup errors are returned here rather than from the first
-    /// page.
+impl RowStream {
+    /// Registers `producer` with every registry that may cancel it, then
+    /// pulls until the producer has reported its columns and first page.
+    /// Planning, setup and first-page errors are returned here.
     pub(crate) async fn open(
-        registry: &Arc<QueryStreamRegistry>,
+        registries: &[&Arc<QueryStreamRegistry>],
         ensure_open: impl FnOnce() -> Result<(), LixError>,
         receiver: mpsc::Receiver<QueryStreamMessage>,
         producer: impl Future<Output = ()> + Send + 'static,
@@ -247,10 +260,13 @@ impl QueryStream {
         let producer = Arc::new(ProducerSlot {
             state: Mutex::new(ProducerState::Running(Box::pin(producer))),
         });
-        let registration = registry.register(&producer);
-        // Close transitions the session before it cancels registered streams,
-        // so a stream registered while the session was still open is either
-        // rejected here or cancelled by that close.
+        let registrations = registries
+            .iter()
+            .map(|registry| registry.register(&producer))
+            .collect();
+        // Close transitions the session (or snapshot) before it cancels
+        // registered streams, so a stream registered while it was still open
+        // is either rejected here or cancelled by that close.
         ensure_open()?;
         let mut stream = Self {
             header: QueryStreamHeader {
@@ -261,20 +277,30 @@ impl QueryStream {
             receiver,
             producer,
             admission,
-            _registration: registration,
-            done: false,
+            pending_admission: None,
+            pull_guard: None,
+            _registrations: registrations,
+            buffered: VecDeque::new(),
+            state: StreamState::Open,
         };
-        match stream.next_message().await? {
-            Some(QueryStreamMessage::Header(header)) => {
-                stream.header = header;
-                Ok(stream)
+        match poll_fn(|cx| stream.poll_message(cx)).await? {
+            QueryStreamMessage::Header(header) => stream.header = header,
+            QueryStreamMessage::Error(error) => {
+                stream.stop();
+                return Err(error);
             }
-            Some(QueryStreamMessage::Error(error)) => Err(error),
-            Some(QueryStreamMessage::Page(_)) | None => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "query stream producer ended before reporting its columns",
-            )),
+            QueryStreamMessage::Page(_) | QueryStreamMessage::End => {
+                stream.stop();
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "query stream producer ended before reporting its columns",
+                ));
+            }
         }
+        if let Some(page) = poll_fn(|cx| stream.poll_page(cx)).await? {
+            stream.buffered.extend(page);
+        }
+        Ok(stream)
     }
 
     /// Result-set column names, in row value order.
@@ -292,86 +318,141 @@ impl QueryStream {
         &self.header.notices
     }
 
-    /// Returns the next page, or `None` once the result is exhausted.
-    ///
-    /// Pages are never empty. Each page's rows occupy at most the stream's
-    /// page size in public value bytes, unless a single row is larger. An
-    /// error ends the stream; errors after the first page are never retried.
-    pub async fn next_page(&mut self) -> Result<Option<ExecuteResult>, LixError> {
-        match self.next_message().await? {
-            Some(QueryStreamMessage::Page(page)) => Ok(Some(page)),
-            Some(QueryStreamMessage::Error(error)) => {
-                self.finish();
-                Err(error)
-            }
-            Some(QueryStreamMessage::Header(_)) => {
-                self.finish();
-                Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "query stream producer reported its columns twice",
-                ))
-            }
-            None => Ok(None),
+    /// Returns the next row, or `None` once the producer confirmed the end
+    /// of the result. Cancel-safe: dropping the future loses no row.
+    pub async fn try_next(&mut self) -> Result<Option<Row>, LixError> {
+        poll_fn(|cx| self.poll_row(cx)).await.transpose()
+    }
+
+    /// Returns the rest of the current page, or the next page; `None` once
+    /// the result is exhausted. Pages are never empty. The first page holds
+    /// at most 64 rows, later pages at most 4096 rows and 1 MiB of values
+    /// (a single larger row is a page of its own).
+    pub async fn next_page(&mut self) -> Result<Option<Vec<Row>>, LixError> {
+        if !self.buffered.is_empty() {
+            return Ok(Some(self.buffered.drain(..).collect()));
         }
+        poll_fn(|cx| self.poll_page(cx)).await
     }
 
-    /// Stops the stream and releases its read snapshot. Later pulls return
-    /// `None`. Dropping the stream has the same effect.
-    pub fn cancel(&mut self) {
-        self.finish();
+    /// Stops the stream, waiting until the engine has stopped producing and
+    /// the read snapshot is released. Dropping the stream also stops it.
+    pub async fn close(mut self) -> Result<(), LixError> {
+        self.stop();
+        Ok(())
     }
 
-    fn finish(&mut self) {
-        self.done = true;
+    fn stop(&mut self) {
+        if self.state == StreamState::Open {
+            self.state = StreamState::Stopped;
+        }
+        self.buffered.clear();
+        self.pending_admission = None;
+        self.pull_guard = None;
         self.producer.cancel(LixError::new(
             LixError::CODE_CLOSED,
-            "query stream was cancelled",
+            "query stream was closed",
         ));
         self.receiver.close();
     }
 
-    async fn next_message(&mut self) -> Result<Option<QueryStreamMessage>, LixError> {
-        if self.done {
-            return Ok(None);
-        }
-        let _guard = match &self.admission {
-            Some(admission) => match admission().await {
-                Ok(guard) => Some(guard),
-                Err(error) => {
-                    self.finish();
-                    return Err(error);
-                }
-            },
-            None => None,
-        };
-        let message = poll_fn(|cx| self.poll_message(cx)).await;
-        match message {
-            Ok(Some(message)) => Ok(Some(message)),
-            Ok(None) => {
-                self.done = true;
-                Ok(None)
+    fn poll_row(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Row, LixError>>> {
+        loop {
+            if let Some(row) = self.buffered.pop_front() {
+                return Poll::Ready(Some(Ok(row)));
             }
-            Err(error) => {
-                self.finish();
-                Err(error)
+            match std::task::ready!(self.poll_page(cx)) {
+                Ok(Some(page)) => self.buffered.extend(page),
+                Ok(None) => return Poll::Ready(None),
+                Err(error) => return Poll::Ready(Some(Err(error))),
             }
         }
     }
 
-    fn poll_message(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<QueryStreamMessage>, LixError>> {
+    /// Pulls one page from the producer, ignoring buffered rows.
+    fn poll_page(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Vec<Row>>, LixError>> {
+        if self.state != StreamState::Open {
+            return Poll::Ready(Ok(None));
+        }
+        loop {
+            let message = match std::task::ready!(self.poll_message(cx)) {
+                Ok(message) => message,
+                Err(error) => {
+                    self.stop();
+                    return Poll::Ready(Err(error));
+                }
+            };
+            return match message {
+                // Producers never send empty pages; skip one if they do.
+                QueryStreamMessage::Page(rows) if rows.is_empty() => continue,
+                QueryStreamMessage::Page(rows) => Poll::Ready(Ok(Some(rows))),
+                QueryStreamMessage::End => {
+                    self.state = StreamState::Ended;
+                    self.producer.cancel(LixError::new(
+                        LixError::CODE_CLOSED,
+                        "query stream finished",
+                    ));
+                    Poll::Ready(Ok(None))
+                }
+                QueryStreamMessage::Error(error) => {
+                    self.stop();
+                    Poll::Ready(Err(error))
+                }
+                QueryStreamMessage::Header(_) => {
+                    self.stop();
+                    Poll::Ready(Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "query stream producer reported its columns twice",
+                    )))
+                }
+            };
+        }
+    }
+
+    /// Admits the pull (taking the session operation guard), drives the
+    /// producer and receives its next message. The guard is held only while a
+    /// message is outstanding, so an idle stream blocks nothing.
+    fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<Result<QueryStreamMessage, LixError>> {
+        if self.pull_guard.is_none()
+            && let Some(admission) = &self.admission
+        {
+            let pending = self.pending_admission.get_or_insert_with(|| admission());
+            let guard = std::task::ready!(pending.as_mut().poll(cx));
+            self.pending_admission = None;
+            self.pull_guard = Some(guard?);
+        }
         // Drive the producer first: it is the only thing that fills the
         // channel, and it parks once the one-page window is full.
         if let Err(reason) = self.producer.poll(cx) {
+            self.pull_guard = None;
             return Poll::Ready(Err(reason));
         }
-        self.receiver.poll_recv(cx).map(Ok)
+        let message = std::task::ready!(self.receiver.poll_recv(cx));
+        self.pull_guard = None;
+        Poll::Ready(message.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "query stream producer stopped without confirming the end of the result",
+            )
+        }))
     }
 }
 
-impl Drop for QueryStream {
+impl futures_core::Stream for RowStream {
+    type Item = Result<Row, LixError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().poll_row(cx)
+    }
+}
+
+impl futures_core::FusedStream for RowStream {
+    fn is_terminated(&self) -> bool {
+        self.state != StreamState::Open && self.buffered.is_empty()
+    }
+}
+
+impl Drop for RowStream {
     fn drop(&mut self) {
         self.producer.cancel(LixError::new(
             LixError::CODE_CLOSED,
@@ -394,13 +475,15 @@ pub(crate) fn query_stream_channel() -> (QueryStreamSender, mpsc::Receiver<Query
     mpsc::channel(1)
 }
 
+
 /// Pages an already materialized result. Used for statements whose execution
 /// must finish before rows exist (filesystem content hydration, partial
-/// replica demand hydration): they keep the buffered budget and deadline, and
-/// the stream only bounds how much the caller receives at once.
+/// replica demand hydration, transaction overlays): the read runs buffered
+/// under the default byte cap, and the stream only bounds how much the
+/// caller receives at once.
 pub(crate) async fn produce_materialized_pages(
     result: impl Future<Output = Result<ExecuteResult, LixError>>,
-    page_bytes: usize,
+    limits: PageLimits,
     sender: QueryStreamSender,
 ) {
     let result = match result.await {
@@ -421,37 +504,34 @@ pub(crate) async fn produce_materialized_pages(
     {
         return;
     }
-    let columns = result.columns().to_vec();
-    let column_types = result.column_types().to_vec();
     let mut page = Vec::new();
-    let mut page_row_bytes = 0usize;
-    for row in result.rows() {
-        let values = row.values();
-        let bytes = public_row_bytes(values);
-        if !page.is_empty() && page_row_bytes.saturating_add(bytes) > page_bytes {
-            let rows = std::mem::take(&mut page);
-            page_row_bytes = 0;
-            let page = materialized_page(&columns, &column_types, rows);
-            if send_query_stream_message(&sender, QueryStreamMessage::Page(page))
+    let mut page_bytes = 0usize;
+    let mut page_index = 0usize;
+    for row in result.into_rows() {
+        let bytes = public_row_bytes(row.values());
+        if !page.is_empty()
+            && (page_bytes.saturating_add(bytes) > limits.bytes
+                || page.len() >= limits.rows_for_page(page_index))
+        {
+            page_bytes = 0;
+            page_index += 1;
+            let full = std::mem::take(&mut page);
+            if send_query_stream_message(&sender, QueryStreamMessage::Page(full))
                 .await
                 .is_err()
             {
                 return;
             }
         }
-        page_row_bytes = page_row_bytes.saturating_add(bytes);
-        page.push(values.to_vec());
+        page_bytes = page_bytes.saturating_add(bytes);
+        page.push(row);
     }
-    if !page.is_empty() {
-        let page = materialized_page(&columns, &column_types, page);
-        let _ = send_query_stream_message(&sender, QueryStreamMessage::Page(page)).await;
+    if !page.is_empty()
+        && send_query_stream_message(&sender, QueryStreamMessage::Page(page))
+            .await
+            .is_err()
+    {
+        return;
     }
-}
-
-fn materialized_page(
-    columns: &[String],
-    column_types: &[ResultColumnType],
-    rows: Vec<Vec<Value>>,
-) -> ExecuteResult {
-    ExecuteResult::from_typed_rows(columns.to_vec(), column_types.to_vec(), rows)
+    let _ = send_query_stream_message(&sender, QueryStreamMessage::End).await;
 }

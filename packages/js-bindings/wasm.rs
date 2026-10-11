@@ -257,13 +257,13 @@ impl Drop for WasmSnapshotExport {
 /// release the stream's read snapshot.
 #[wasm_bindgen]
 pub struct WasmQueryStream {
-    inner: RefCell<Option<lix::QueryStream>>,
+    inner: RefCell<Option<lix::RowStream>>,
     finished: Cell<bool>,
     next_abort: RefCell<Option<AbortHandle>>,
 }
 
 impl WasmQueryStream {
-    pub(crate) fn new(stream: lix::QueryStream) -> Self {
+    pub(crate) fn new(stream: lix::RowStream) -> Self {
         Self {
             inner: RefCell::new(Some(stream)),
             finished: Cell::new(false),
@@ -292,7 +292,7 @@ impl WasmQueryStream {
         })?;
         let (abort, registration) = AbortHandle::new_pair();
         self.next_abort.borrow_mut().replace(abort);
-        let result = Abortable::new(stream.next_page(), registration).await;
+        let result = Abortable::new(crate::next_stream_page(&mut stream), registration).await;
         self.next_abort.borrow_mut().take();
         let page = match result {
             Ok(Ok(Some(page))) if !self.finished.get() => page,
@@ -304,7 +304,7 @@ impl WasmQueryStream {
             // stream here releases its snapshot.
             Ok(_) | Err(_) => {
                 self.finished.set(true);
-                stream.cancel();
+                drop(stream);
                 return Ok(JsValue::UNDEFINED);
             }
         };
@@ -320,9 +320,7 @@ impl WasmQueryStream {
         if let Some(abort) = self.next_abort.borrow_mut().take() {
             abort.abort();
         }
-        if let Some(mut stream) = self.inner.borrow_mut().take() {
-            stream.cancel();
-        }
+        drop(self.inner.borrow_mut().take());
     }
 }
 

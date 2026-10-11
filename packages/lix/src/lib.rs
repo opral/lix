@@ -115,6 +115,7 @@ pub(crate) mod order_preserving_key;
 // nothing.
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
+mod query;
 mod schema;
 pub mod snapshot;
 #[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
@@ -166,7 +167,6 @@ pub use handle::{
     Durability,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
-    QueryStreamBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
     RemoteLix, RemoteExecuteBuilder, RemoteLixTransaction, RemoteObserveEvents,
     RemoteOpenAnotherSessionBuilder, RemoteTransactionExecuteBuilder, RemoteExecuteBatchBuilder, open_lix,
@@ -205,12 +205,10 @@ pub use session::{
     MergeChangeStats, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{
-    CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
-    TryFromValue,
+    ColumnIndex, CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult,
+    ObserveEvent, QueryResult, ResultRowRef, Row, RowStream, TryFromValue,
 };
-pub use session::{DEFAULT_QUERY_STREAM_PAGE_BYTES, MAX_QUERY_STREAM_PAGE_BYTES, QueryStream};
-#[doc(hidden)]
-pub use session::CoherentReadBatch;
+pub use query::{Execute, ExecuteMany, Query, Snapshot};
 pub(crate) use session::{
     ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,
     FileUploadProgress,

@@ -316,6 +316,14 @@ struct LixRevision {
     storage_mutation_revision: Option<Vec<u8>>,
 }
 
+fn lix_revision(snapshot: &lix::Snapshot) -> LixRevision {
+    LixRevision {
+        active_branch_id: snapshot.active_branch_id().to_owned(),
+        active_branch_commit_id: snapshot.commit_id().to_owned(),
+        storage_mutation_revision: snapshot.storage_mutation_revision().map(<[u8]>::to_vec),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LixSnapshotRead {
     snapshot: Snapshot,
@@ -945,20 +953,17 @@ impl FilesystemState {
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
-        let statements: [(&str, &[Value]); 2] = [
-            ("SELECT path FROM lix_directory ORDER BY path", &[]),
-            ("SELECT path, content FROM lix_file ORDER BY path", &[]),
-        ];
-        let batch = self.lix.execute_coherent_read_batch(&statements).await?;
-        let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "coherent filesystem snapshot read returned {} result sets",
-                    results.len()
-                ),
-            )
-        })?;
+        // Both reads and the revision come from one pinned Lix state.
+        let lix_snapshot = self.lix.snapshot().await?;
+        let directories = lix_snapshot
+            .query("SELECT path FROM lix_directory ORDER BY path")
+            .all()
+            .await?;
+        let files = lix_snapshot
+            .query("SELECT path, content FROM lix_file ORDER BY path")
+            .max_bytes(usize::MAX)
+            .all()
+            .await?;
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
@@ -967,24 +972,16 @@ impl FilesystemState {
             let data = row.get::<Vec<u8>>("content")?;
             snapshot.files.insert(path, data);
         }
-
-        Ok(LixSnapshotRead {
-            snapshot,
-            revision: LixRevision {
-                active_branch_id: batch.active_branch_id,
-                active_branch_commit_id: batch.active_branch_commit_id,
-                storage_mutation_revision: batch.storage_mutation_revision,
-            },
-        })
+        let revision = lix_revision(&lix_snapshot);
+        lix_snapshot.close().await?;
+        Ok(LixSnapshotRead { snapshot, revision })
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let batch = self.lix.execute_coherent_read_batch(&[]).await?;
-        Ok(LixRevision {
-            active_branch_id: batch.active_branch_id,
-            active_branch_commit_id: batch.active_branch_commit_id,
-            storage_mutation_revision: batch.storage_mutation_revision,
-        })
+        let lix_snapshot = self.lix.snapshot().await?;
+        let revision = lix_revision(&lix_snapshot);
+        lix_snapshot.close().await?;
+        Ok(revision)
     }
 
     async fn apply_local_snapshot_to_lix_with_filter(

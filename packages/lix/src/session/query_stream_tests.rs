@@ -1,4 +1,4 @@
-//! Behavior of `Lix::query_stream` against the buffered `execute` path.
+//! Behavior of `Query::stream` against the buffered read path.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +10,8 @@ use crate::storage::{
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, StorageSessionToken, StorageSpace,
     WriteOptions,
 };
-use crate::{ExecuteResult, Lix, LixError, Memory, QueryStream, Value, open_lix};
+use crate::session::PageLimits;
+use crate::{Lix, LixError, Memory, Row, RowStream, Value, open_lix};
 
 /// Memory storage that counts live read views, so tests can prove a stream
 /// releases its pinned snapshot.
@@ -239,7 +240,16 @@ where
     }
 }
 
-async fn drain(stream: &mut QueryStream) -> Result<Vec<ExecuteResult>, LixError> {
+/// Pages cut only by `bytes`, so small fixtures still span many pages.
+fn byte_pages(bytes: usize) -> PageLimits {
+    PageLimits {
+        first_rows: usize::MAX,
+        rows: usize::MAX,
+        bytes,
+    }
+}
+
+async fn drain(stream: &mut RowStream) -> Result<Vec<Vec<Row>>, LixError> {
     let mut pages = Vec::new();
     while let Some(page) = stream.next_page().await? {
         pages.push(page);
@@ -247,10 +257,10 @@ async fn drain(stream: &mut QueryStream) -> Result<Vec<ExecuteResult>, LixError>
     Ok(pages)
 }
 
-fn page_rows(pages: &[ExecuteResult]) -> Vec<Vec<Value>> {
+fn page_rows(pages: &[Vec<Row>]) -> Vec<Vec<Value>> {
     pages
         .iter()
-        .flat_map(|page| page.rows().iter().map(|row| row.values().to_vec()))
+        .flat_map(|page| page.iter().map(|row| row.values().to_vec()))
         .collect()
 }
 
@@ -317,8 +327,7 @@ async fn streamed_pages_match_buffered_execute_across_query_shapes() {
     for (sql, params) in shapes {
         let buffered = lix.execute(sql, params).await.expect(sql);
         let mut stream = lix
-            .query_stream(sql, params)
-            .with_page_bytes(4 * 1024)
+            .query(sql).params(params).page_limits(byte_pages(4 * 1024)).stream()
             .await
             .expect(sql);
         assert_eq!(stream.columns(), buffered.columns(), "{sql}");
@@ -328,7 +337,7 @@ async fn streamed_pages_match_buffered_execute_across_query_shapes() {
         assert!(
             pages
                 .iter()
-                .all(|page| page.columns() == buffered.columns()),
+                .all(|page| page[0].columns() == buffered.columns()),
             "{sql}"
         );
         let mut streamed = page_rows(&pages);
@@ -354,15 +363,13 @@ async fn pages_stay_within_the_page_byte_bound() {
     let lix = seeded(Memory::new()).await;
     for page_bytes in [1, 700, 16 * 1024] {
         let mut stream = lix
-            .query_stream("SELECT id, grp, label FROM stream_item ORDER BY id", &[])
-            .with_page_bytes(page_bytes)
+            .query("SELECT id, grp, label FROM stream_item ORDER BY id").page_limits(byte_pages(page_bytes)).stream()
             .await
             .unwrap();
         let pages = drain(&mut stream).await.unwrap();
         assert_eq!(page_rows(&pages).len(), ITEMS);
         for page in &pages {
             let bytes = page
-                .rows()
                 .iter()
                 .map(|row| public_row_bytes(row.values()))
                 .sum::<usize>();
@@ -376,14 +383,6 @@ async fn pages_stay_within_the_page_byte_bound() {
             assert_eq!(pages.len(), ITEMS, "every row is its own page");
         }
     }
-    for page_bytes in [0, crate::MAX_QUERY_STREAM_PAGE_BYTES + 1] {
-        let error = lix
-            .query_stream("SELECT id FROM stream_item", &[])
-            .with_page_bytes(page_bytes)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-    }
 }
 
 #[tokio::test]
@@ -394,21 +393,18 @@ async fn cancel_drop_and_exhaustion_release_the_pinned_snapshot() {
     let sql = "SELECT id, label FROM stream_item ORDER BY id";
 
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(512)
+        .query(sql).page_limits(byte_pages(512)).stream()
         .await
         .unwrap();
     assert!(stream.next_page().await.unwrap().is_some());
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
     assert_eq!(lix.running_query_stream_count_for_test(), 1);
-    stream.cancel();
+    stream.close().await.unwrap();
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
     assert_eq!(lix.running_query_stream_count_for_test(), 0);
-    assert!(stream.next_page().await.unwrap().is_none());
 
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(512)
+        .query(sql).page_limits(byte_pages(512)).stream()
         .await
         .unwrap();
     assert!(stream.next_page().await.unwrap().is_some());
@@ -416,15 +412,15 @@ async fn cancel_drop_and_exhaustion_release_the_pinned_snapshot() {
     drop(stream);
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
 
-    // Opening alone pins the snapshot; dropping before the first page frees it.
-    let stream = lix.query_stream(sql, &[]).await.unwrap();
+    // Opening pins the snapshot (the first page is already buffered);
+    // dropping the stream frees it.
+    let stream = lix.query(sql).stream().await.unwrap();
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
     drop(stream);
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
 
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(512)
+        .query(sql).page_limits(byte_pages(512)).stream()
         .await
         .unwrap();
     drain(&mut stream).await.unwrap();
@@ -437,8 +433,7 @@ async fn idle_stream_does_not_block_writes_and_keeps_its_snapshot() {
     let lix = seeded(Memory::new()).await;
     let other = lix.open_another_session().await.unwrap();
     let mut stream = lix
-        .query_stream("SELECT id, grp, label FROM stream_item ORDER BY id", &[])
-        .with_page_bytes(1024)
+        .query("SELECT id, grp, label FROM stream_item ORDER BY id").page_limits(byte_pages(1024)).stream()
         .await
         .unwrap();
     let first = stream.next_page().await.unwrap().expect("first page");
@@ -489,13 +484,12 @@ async fn closing_the_handle_cancels_open_streams() {
     let lix = seeded(storage.clone()).await;
     let idle = storage.live_reads.load(Ordering::SeqCst);
     let mut started = lix
-        .query_stream("SELECT id FROM stream_item ORDER BY id", &[])
-        .with_page_bytes(256)
+        .query("SELECT id FROM stream_item ORDER BY id").page_limits(byte_pages(256)).stream()
         .await
         .unwrap();
     assert!(started.next_page().await.unwrap().is_some());
     let mut unstarted = lix
-        .query_stream("SELECT id FROM stream_tag", &[])
+        .query("SELECT id FROM stream_tag").stream()
         .await
         .unwrap();
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 2);
@@ -503,12 +497,20 @@ async fn closing_the_handle_cancels_open_streams() {
     with_timeout("close", lix.close()).await.unwrap();
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
     for stream in [&mut started, &mut unstarted] {
-        let error = stream.next_page().await.unwrap_err();
+        // Rows already delivered to the stream may still be read; the stream
+        // then fails instead of ending normally.
+        let error = loop {
+            match stream.next_page().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("a cancelled stream must not end normally"),
+                Err(error) => break error,
+            }
+        };
         assert_eq!(error.code, LixError::CODE_CLOSED);
         assert!(stream.next_page().await.unwrap().is_none());
     }
     let error = lix
-        .query_stream("SELECT id FROM stream_item", &[])
+        .query("SELECT id FROM stream_item").stream()
         .await
         .unwrap_err();
     assert_eq!(error.code, LixError::CODE_CLOSED);
@@ -524,7 +526,7 @@ async fn streams_are_read_only() {
         "SELECT uuidv7() AS id",
         "SELECT current_timestamp() AS now",
     ] {
-        let error = lix.query_stream(sql, &[]).await.unwrap_err();
+        let error = lix.query(sql).stream().await.unwrap_err();
         assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
     }
     let count = lix
@@ -533,7 +535,7 @@ async fn streams_are_read_only() {
         .unwrap();
     assert_eq!(count.rows()[0].values(), &[Value::Integer(TAGS as i64)]);
     let error = lix
-        .query_stream("SELECT nope FROM stream_item", &[])
+        .query("SELECT nope FROM stream_item").stream()
         .await
         .unwrap_err();
     assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
@@ -563,8 +565,7 @@ async fn file_content_reads_are_paged_from_a_buffered_result() {
     ] {
         let buffered = lix.execute(sql, &params).await.unwrap();
         let mut stream = lix
-            .query_stream(sql, &params)
-            .with_page_bytes(4_000)
+            .query(sql).params(&params).page_limits(byte_pages(4_000)).stream()
             .await
             .unwrap();
         assert_eq!(stream.columns(), buffered.columns());
@@ -588,13 +589,13 @@ async fn streams_exceed_the_buffered_read_budget() {
     let rows = 1_001_000;
     let sql = format!("SELECT value FROM generate_series(1, {rows})");
     assert_eq!(lix.execute(&sql, &[]).await.unwrap().len(), rows);
-    let mut stream = lix.query_stream(&sql, &[]).await.unwrap();
+    let mut stream = lix.query(&sql).stream().await.unwrap();
     let mut seen = 0usize;
     let mut pages = 0usize;
     let mut last = 0i64;
     while let Some(page) = stream.next_page().await.unwrap() {
         pages += 1;
-        for row in page.rows() {
+        for row in &page {
             let Value::Integer(value) = row.values()[0] else {
                 panic!("unexpected value {:?}", row.values());
             };
@@ -610,7 +611,7 @@ async fn streams_exceed_the_buffered_read_budget() {
     let big = "SELECT id, repeat('x', 1048576) AS blob FROM stream_item ORDER BY id LIMIT 70";
     let error = lix.execute(big, &[]).await.unwrap_err();
     assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
-    let mut stream = lix.query_stream(big, &[]).await.unwrap();
+    let mut stream = lix.query(big).stream().await.unwrap();
     let pages = drain(&mut stream).await.unwrap();
     let rows = page_rows(&pages);
     assert_eq!(rows.len(), 70);
@@ -629,8 +630,7 @@ async fn expiry_before_the_first_page_retries_and_after_it_surfaces() {
     storage.expiring_requests.store(1, Ordering::SeqCst);
     let opened = storage.opened_reads.load(Ordering::SeqCst);
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(2048)
+        .query(sql).page_limits(byte_pages(2048)).stream()
         .await
         .unwrap();
     let pages = drain(&mut stream).await.unwrap();
@@ -652,8 +652,7 @@ async fn expiry_before_the_first_page_retries_and_after_it_surfaces() {
     // Once a page was handed out, expiry ends the stream instead of silently
     // restarting it (which could duplicate rows the caller already holds).
     let mut stream = lix
-        .query_stream(sql, &[])
-        .with_page_bytes(256)
+        .query(sql).page_limits(byte_pages(256)).stream()
         .await
         .unwrap();
     assert!(stream.next_page().await.unwrap().is_some());

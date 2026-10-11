@@ -1594,7 +1594,7 @@ impl NativeLixInner {
         sql: &str,
         params: &[Value],
         page_bytes: Option<usize>,
-    ) -> std::result::Result<lix::QueryStream, LixError> {
+    ) -> std::result::Result<lix::RowStream, LixError> {
         match self {
             Self::Memory(lix) => {
                 crate::session::SessionOperations::query_stream(lix, sql, params, page_bytes).await
@@ -2992,7 +2992,7 @@ enum QueryStreamCommand {
 
 #[napi]
 impl NativeQueryStream {
-    fn new(stream: lix::QueryStream) -> Result<Self> {
+    fn new(stream: lix::RowStream) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (cancel_signal, actor_cancel_signal) = watch::channel(false);
@@ -3067,12 +3067,13 @@ fn cancel_query_stream(
 }
 
 fn run_query_stream_actor(
-    mut stream: lix::QueryStream,
+    stream: lix::RowStream,
     receiver: mpsc::Receiver<QueryStreamCommand>,
     cancelled: Arc<AtomicBool>,
     mut cancel_signal: watch::Receiver<bool>,
     completion: Arc<NativeObserveCompletion>,
 ) {
+    let mut stream = Some(stream);
     let rt = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(error) => {
@@ -3095,9 +3096,13 @@ fn run_query_stream_actor(
             settle_deferred(deferred, Ok(None));
             break;
         }
+        let Some(open) = stream.as_mut() else {
+            settle_deferred(deferred, Ok(None));
+            break;
+        };
         let result: QueryStreamNextResult = rt.block_on(async {
             tokio::select! {
-                page = stream.next_page() => page,
+                page = crate::next_stream_page(open) => page,
                 _ = cancel_signal.changed() => Ok(None),
             }
         });
@@ -3110,7 +3115,7 @@ fn run_query_stream_actor(
         if terminal {
             // Release the snapshot before the caller observes the end.
             cancelled.store(true, Ordering::SeqCst);
-            stream.cancel();
+            stream = None;
         }
         settle_deferred(
             deferred,

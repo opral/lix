@@ -988,35 +988,41 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         "SELECT uuidv7()",
         "SELECT current_timestamp",
     ] {
-        let error = replica
-            .execute_coherent_read_batch(&[
-                ("SELECT * FROM lix_log() WHERE is_checkpoint", &[]),
-                (sql, &[]),
-            ])
+        let snapshot = replica.snapshot().await.expect("open replica snapshot");
+        let error = snapshot
+            .query(sql)
+            .all()
             .await
-            .expect_err("connected coherent batches must reject mutations");
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+            .expect_err("snapshot reads must reject mutations");
+        assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
+        snapshot.close().await.expect("close snapshot");
     }
     assert_eq!(protocol_authority.read_value("coherent-write").await, None);
     // The history query above hydrated its immutable inputs. Background upload
     // acknowledgments may independently issue finite pulls, so verify local
     // completion with the authority unavailable instead of counting those pulls.
     probe.set_offline(true);
-    let coherent_history_statements: [(&str, &[Value]); 1] =
-        [("SELECT * FROM lix_history('lix_key_value')", &[])];
     let coherent_history = replica
-        .execute_coherent_read_batch(&coherent_history_statements)
+        .snapshot()
         .await
-        .expect("cached coherent history completes without the authority");
-    assert!(!coherent_history.results[0].rows().is_empty());
+        .expect("open a local snapshot without the authority");
+    assert!(
+        !coherent_history
+            .query("SELECT * FROM lix_history('lix_key_value')")
+            .all()
+            .await
+            .expect("cached history completes without the authority")
+            .is_empty()
+    );
     assert_eq!(
-        coherent_history.active_branch_id,
+        coherent_history.active_branch_id(),
         replica.active_branch_id().await.expect("active branch"),
     );
     assert!(
-        coherent_history.storage_mutation_revision.is_some(),
+        coherent_history.storage_mutation_revision().is_some(),
         "hydrated history shares a local adapter snapshot",
     );
+    coherent_history.close().await.expect("close snapshot");
     probe.set_offline(false);
     let mut snapshot = Vec::new();
     replica
@@ -1037,13 +1043,14 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         .await
         .expect("open persisted replica without a server");
     let offline_read = reopened_without_server
-        .execute_coherent_read_batch(&[(
-            "SELECT value FROM lix_key_value WHERE key = 'after-abandoned'",
-            &[],
-        )])
+        .snapshot()
+        .await
+        .expect("open a snapshot without a server")
+        .query("SELECT value FROM lix_key_value WHERE key = 'after-abandoned'")
+        .all()
         .await
         .expect("a persisted certified HOT cache remains readable without a server");
-    assert_eq!(offline_read.results[0].rows().len(), 1);
+    assert_eq!(offline_read.len(), 1);
     let mut offline_snapshot = Vec::new();
     reopened_without_server
         .export_snapshot()

@@ -187,6 +187,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) query_streams: Arc<super::query_stream::QueryStreamRegistry>,
+    pub(super) read_snapshots: Arc<super::read_snapshot::ReadSnapshotRegistry>,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -289,6 +290,7 @@ where
             plugin_host,
             telemetry,
             query_streams: Arc::default(),
+            read_snapshots: Arc::default(),
             transaction_manager,
         }
     }
@@ -318,6 +320,7 @@ where
         // the manager rejects that check from here on, so every stream that
         // could still pull is cancelled now and releases its read snapshot.
         self.query_streams.cancel_all(closed_error);
+        self.read_snapshots.close_all();
         self.observe_invalidation.bump();
         Ok(())
     }

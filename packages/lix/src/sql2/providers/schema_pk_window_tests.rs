@@ -106,9 +106,11 @@ pub(super) async fn bulk_insert(lix: &Lix<Memory>, rows: &[(String, String, Opti
 }
 
 pub(super) fn decode_rows(result: &crate::ExecuteResult) -> Vec<Row> {
-    result
-        .rows()
-        .iter()
+    decode_page(result.rows())
+}
+
+pub(super) fn decode_page(rows: &[crate::Row]) -> Vec<Row> {
+    rows.iter()
         .map(|row| {
             let text = |column: &str| match row.get::<Value>(column).unwrap() {
                 Value::Text(value) => value,

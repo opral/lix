@@ -81,7 +81,7 @@ pub(crate) use datafusion::{
     execute_transaction_read_statement_from_parsed, prepare_read_session,
     prepare_read_session_at_head, query_result_from_batches, query_values_from_batches,
 };
-pub(crate) use result_pages::ResultPager;
+pub(crate) use result_pages::{PageLimits, ResultPager};
 #[cfg(test)]
 pub(crate) use write::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,

@@ -686,7 +686,7 @@ async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
 }
 
 #[tokio::test]
-async fn coherent_read_batch_restarts_as_one_snapshot_after_expiry() {
+async fn snapshot_open_restarts_after_expiry_and_serves_every_read() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
         .with_storage(storage.clone())
@@ -694,17 +694,11 @@ async fn coherent_read_batch_restarts_as_one_snapshot_after_expiry() {
         .expect("open Lix");
 
     storage.expire_next_read_call();
-    let empty_params: &[Value] = &[];
-    let statements = [
-        ("SELECT 1 AS value", empty_params),
-        ("SELECT 2 AS value", empty_params),
-    ];
-    let batch = lix
-        .execute_coherent_read_batch(&statements)
-        .await
-        .expect("the coherent batch should restart");
+    let snapshot = lix.snapshot().await.expect("the snapshot open should restart");
+    let first = snapshot.query("SELECT 1 AS value").one().await.unwrap();
+    let second = snapshot.query("SELECT 2 AS value").one().await.unwrap();
 
-    assert_eq!(batch.results[0].rows()[0].get::<i64>("value").unwrap(), 1);
-    assert_eq!(batch.results[1].rows()[0].get::<i64>("value").unwrap(), 2);
+    assert_eq!(first.get::<i64>("value").unwrap(), 1);
+    assert_eq!(second.get::<i64>("value").unwrap(), 2);
     assert_eq!(storage.expired_calls(), 1);
 }

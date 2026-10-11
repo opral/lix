@@ -10,7 +10,7 @@ mod read_budget;
 pub(crate) mod read_retry;
 pub(crate) use read_budget::{
     DEFAULT_MAX_RESULT_BYTES, ReadLimits, ReadResultBudget, current_read_limits, not_unique,
-    public_row_bytes, result_too_large, with_read_limits,
+    public_row_bytes, with_read_limits,
 };
 pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;

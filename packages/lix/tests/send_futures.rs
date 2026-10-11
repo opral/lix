@@ -35,6 +35,12 @@ async fn public_execution_and_observation_futures_are_send() {
         params: Vec::new(),
     }]));
     assert_send(lix.begin_transaction());
+    assert_send(lix.query("SELECT 1").all());
+    assert_send(lix.query("SELECT 1").stream());
+    assert_send(lix.snapshot());
+    let snapshot = lix.snapshot().await.expect("open snapshot");
+    assert_send(snapshot.query("SELECT 1").all());
+    assert_send(snapshot.close());
     assert_send(lix.switch_branch(SwitchBranchOptions {
         branch_id: lix.active_branch_id().await.expect("active branch"),
     }));
@@ -44,6 +50,7 @@ async fn public_execution_and_observation_futures_are_send() {
 
     let mut transaction = lix.begin_transaction().await.expect("begin transaction");
     assert_send(transaction.execute("SELECT 1", &[]));
+    assert_send(transaction.query("SELECT 1").one());
     assert_send(transaction.commit());
 }
 

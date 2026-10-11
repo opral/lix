@@ -40,7 +40,7 @@ pub(crate) trait SessionOperations: Sized {
         sql: &str,
         params: &[Value],
         page_bytes: Option<usize>,
-    ) -> Result<lix::QueryStream, LixError>;
+    ) -> Result<lix::RowStream, LixError>;
     async fn close(&self) -> Result<(), LixError>;
     async fn execute(
         &self,
@@ -112,12 +112,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         sql: &str,
         params: &[Value],
         page_bytes: Option<usize>,
-    ) -> Result<lix::QueryStream, LixError> {
-        let stream = Lix::query_stream(self, sql, params);
-        match page_bytes {
-            Some(page_bytes) => stream.with_page_bytes(page_bytes).await,
-            None => stream.await,
-        }
+    ) -> Result<lix::RowStream, LixError> {
+        // Pages are sized by the engine; the JS option is accepted and ignored.
+        let _ = page_bytes;
+        Lix::query(self, sql).params(params).stream().await
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -337,7 +335,7 @@ mod remote {
             _sql: &str,
             _params: &[Value],
             _page_bytes: Option<usize>,
-        ) -> Result<lix::QueryStream, LixError> {
+        ) -> Result<lix::RowStream, LixError> {
             // Remote reads run behind the protocol's buffered execute; a
             // stream would need a server-held snapshot spanning requests.
             Err(ClientCore::unsupported(self, "stream"))

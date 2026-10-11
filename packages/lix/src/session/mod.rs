@@ -26,9 +26,12 @@ pub(crate) mod idempotency;
 pub(crate) mod media_upload;
 mod merge;
 pub(crate) mod observe;
+#[cfg(test)]
+mod query_api_tests;
 pub(crate) mod query_stream;
 #[cfg(test)]
 mod query_stream_tests;
+pub(crate) mod read_snapshot;
 mod switch_branch;
 mod transaction;
 
@@ -47,10 +50,13 @@ pub use context::SessionContext;
 pub(crate) use context::{SessionBranch, load_default_branch_id_from_index};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
-    CoherentReadBatch, CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement,
-    ExecuteOptions, ExecuteResult, ResultRowRef, Row, TryFromValue,
+    ColumnIndex, CommitReceipt, CommitSpan, ExecuteBatchResult,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, QueryResult, ResultRowRef, Row,
+    TryFromValue,
 };
-pub(crate) use execute::{ExecutionDisposition, FileRead, QueryStreamRoute};
+pub(crate) use execute::{
+    ExecutionDisposition, FileRead, QueryStreamRoute, charge_execute_result,
+};
 pub(crate) use idempotency::ExecuteIdempotency;
 pub(crate) use idempotency::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotencyReceipt, encode_receipt,
@@ -62,7 +68,9 @@ pub use merge::{
 };
 pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;
-pub use query_stream::{DEFAULT_QUERY_STREAM_PAGE_BYTES, MAX_QUERY_STREAM_PAGE_BYTES, QueryStream};
+pub(crate) use query_stream::PageLimits;
+pub use query_stream::RowStream;
+pub(crate) use read_snapshot::ReadSnapshot;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
 

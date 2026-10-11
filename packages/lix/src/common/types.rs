@@ -541,6 +541,96 @@ pub enum Value {
     Blob(Blob),
 }
 
+impl From<&Value> for Value {
+    fn from(value: &Value) -> Self {
+        value.clone()
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Self::Integer(value.into())
+    }
+}
+
+impl From<u32> for Value {
+    fn from(value: u32) -> Self {
+        Self::Integer(value.into())
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Self::Real(value)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
+
+impl From<&String> for Value {
+    fn from(value: &String) -> Self {
+        Self::Text(value.clone())
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(value: &[u8]) -> Self {
+        Self::Blob(value.into())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Blob(value.into())
+    }
+}
+
+impl From<Blob> for Value {
+    fn from(value: Blob) -> Self {
+        Self::Blob(value)
+    }
+}
+
+impl From<Json> for Value {
+    fn from(value: Json) -> Self {
+        Self::Jsonb(value)
+    }
+}
+
+impl From<RowRef> for Value {
+    fn from(value: RowRef) -> Self {
+        Self::RowRef(value)
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Null, Into::into)
+    }
+}
+
 /// Stable SQL result type exposed at language and protocol boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -193,6 +193,45 @@ where
             .await
     }
 
+    /// Parses a statement for a read-only call inside this transaction.
+    pub(crate) fn parse_read_only_statement(
+        &self,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> Result<(), LixError> {
+        self.ensure_session_open()?;
+        if let Some(operation) = &self.session.account_insertion {
+            operation.ensure_sql(sql, params)?;
+        }
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        super::execute::reject_non_read(&statement)
+    }
+
+    /// Classifies one statement as a pure read or a durable operation.
+    pub(crate) fn execution_disposition(
+        &self,
+        sql: &str,
+    ) -> Result<super::ExecutionDisposition, LixError> {
+        self.session.execution_disposition(sql)
+    }
+
+    /// Pages a result this transaction already read. Transaction streams see
+    /// the transaction's state when they open, including its staged writes.
+    pub(crate) async fn open_materialized_stream(
+        &self,
+        result: crate::ExecuteResult,
+        limits: super::PageLimits,
+    ) -> Result<super::RowStream, LixError> {
+        self.session
+            .open_materialized_query_stream(
+                std::future::ready(Ok(result)),
+                limits,
+                None,
+                || Ok(()),
+            )
+            .await
+    }
+
     pub fn active_branch_id(&self) -> Result<&str, LixError> {
         self.ensure_session_open()?;
         self.transaction

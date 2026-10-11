@@ -1,10 +1,11 @@
-//! Byte-bounded pages over a live DataFusion result.
+//! Bounded pages over a live DataFusion result.
 //!
 //! A streamed read never collects its whole result. The pager receives each
-//! DataFusion batch as it is produced and cuts it into pages whose public row
-//! bytes (see [`crate::common::public_row_bytes`]) stay within the caller's
-//! page size. Batches larger than a page are split by zero-copy row slices; a
-//! single row larger than the page becomes a page of its own.
+//! DataFusion batch as it is produced and cuts it into pages whose row count
+//! and public row bytes (see [`crate::common::public_row_bytes`]) stay within
+//! the stream's [`PageLimits`]. Batches larger than a page are split by
+//! zero-copy row slices; a single row larger than the byte limit becomes a
+//! page of its own.
 
 use std::mem::size_of;
 
@@ -16,19 +17,52 @@ use crate::{LixError, LixNotice, Value};
 
 use super::datafusion::{SessionReadResult, session_read_result_from_batches};
 
+/// How a stream cuts its result into pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PageLimits {
+    /// Rows in the first page. Small, so opening a stream is cheap.
+    pub(crate) first_rows: usize,
+    /// Rows in every later page.
+    pub(crate) rows: usize,
+    /// Public value bytes per page; a single larger row gets its own page.
+    pub(crate) bytes: usize,
+}
+
+impl Default for PageLimits {
+    fn default() -> Self {
+        Self {
+            first_rows: 64,
+            rows: 4096,
+            bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl PageLimits {
+    pub(crate) fn rows_for_page(&self, page_index: usize) -> usize {
+        if page_index == 0 {
+            self.first_rows.max(1)
+        } else {
+            self.rows.max(1)
+        }
+    }
+}
+
 pub(crate) struct ResultPager {
     fields: Vec<Field>,
-    page_bytes: usize,
+    limits: PageLimits,
+    pages_emitted: usize,
     pending: Vec<RecordBatch>,
     pending_bytes: usize,
     pending_rows: usize,
 }
 
 impl ResultPager {
-    pub(crate) fn new(fields: Vec<Field>, page_bytes: usize) -> Self {
+    pub(crate) fn new(fields: Vec<Field>, limits: PageLimits) -> Self {
         Self {
             fields,
-            page_bytes: page_bytes.max(1),
+            limits,
+            pages_emitted: 0,
             pending: Vec::new(),
             pending_bytes: 0,
             pending_rows: 0,
@@ -49,7 +83,10 @@ impl ResultPager {
         let mut pages = Vec::new();
         let mut slice_start = 0;
         for (row, bytes) in row_bytes.into_iter().enumerate() {
-            if self.pending_rows > 0 && self.pending_bytes.saturating_add(bytes) > self.page_bytes {
+            if self.pending_rows > 0
+                && (self.pending_bytes.saturating_add(bytes) > self.limits.bytes
+                    || self.pending_rows >= self.limits.rows_for_page(self.pages_emitted))
+            {
                 if row > slice_start {
                     self.pending
                         .push(batch.slice(slice_start, row - slice_start));
@@ -79,6 +116,7 @@ impl ResultPager {
         let batches = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
         self.pending_rows = 0;
+        self.pages_emitted += 1;
         session_read_result_from_batches(self.fields.clone(), batches, Vec::<LixNotice>::new())
     }
 }
@@ -191,7 +229,14 @@ mod tests {
     #[test]
     fn pages_respect_the_byte_bound_and_preserve_row_order() {
         let page_bytes = 300;
-        let mut pager = ResultPager::new(fields(), page_bytes);
+        let mut pager = ResultPager::new(
+            fields(),
+            PageLimits {
+                first_rows: usize::MAX,
+                rows: usize::MAX,
+                bytes: page_bytes,
+            },
+        );
         let mut pages = Vec::new();
         for (index, rows) in [5usize, 40, 1, 0, 23].into_iter().enumerate() {
             pages.extend(pager.push(batch(index as i64 * 100, rows, 20)).unwrap());
@@ -216,7 +261,14 @@ mod tests {
 
     #[test]
     fn a_row_larger_than_the_page_is_its_own_page() {
-        let mut pager = ResultPager::new(fields(), 16);
+        let mut pager = ResultPager::new(
+            fields(),
+            PageLimits {
+                first_rows: usize::MAX,
+                rows: usize::MAX,
+                bytes: 16,
+            },
+        );
         let pages = pager.push(batch(0, 4, 100)).unwrap();
         let last = pager.finish().unwrap();
         let sizes = pages
@@ -225,5 +277,24 @@ mod tests {
             .map(|page| page_rows(page).len())
             .collect::<Vec<_>>();
         assert_eq!(sizes, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn the_first_page_is_small_and_later_pages_are_row_bounded() {
+        let mut pager = ResultPager::new(
+            fields(),
+            PageLimits {
+                first_rows: 3,
+                rows: 5,
+                bytes: usize::MAX,
+            },
+        );
+        let mut pages = pager.push(batch(0, 14, 1)).unwrap();
+        pages.extend(pager.finish().unwrap());
+        let sizes = pages
+            .into_iter()
+            .map(|page| page_rows(page).len())
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![3, 5, 5, 1]);
     }
 }
