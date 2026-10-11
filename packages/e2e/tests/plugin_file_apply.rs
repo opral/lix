@@ -549,8 +549,8 @@ async fn apply_mixed_plugin_file_lifecycle_and_live_semantic_change() {
 /// Runs statements atomically in one transaction and returns each result:
 /// reads through `query`, writes through `execute`.
 async fn execute_atomically<S>(
-    lix: &lix::Lix<S>,
-    statements: &[lix::ExecuteBatchStatement],
+    lix: &Lix<S>,
+    statements: &[ExecuteBatchStatement],
 ) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
 where
     S: lix::storage::Storage + Clone + Send + Sync + 'static,

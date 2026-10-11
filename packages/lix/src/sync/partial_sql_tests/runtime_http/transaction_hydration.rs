@@ -14,7 +14,7 @@ async fn explicit_transaction_hydrates_cold_write_and_commits_once() {
 /// how many demands it served.
 async fn answer_pinned_demands(
     receiver: &mut tokio::sync::mpsc::Receiver<crate::sync::SyncDemand>,
-    storage: &crate::storage_adapter::StorageAdapter<Memory>,
+    storage: &StorageAdapter<Memory>,
     old: &Arc<PartialReplicaState>,
     authority: &Lix<Memory>,
     served: &std::sync::atomic::AtomicUsize,
@@ -36,7 +36,7 @@ async fn answer_pinned_demands(
                         .unwrap();
                 }
                 count += 1;
-                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                served.fetch_add(1, Ordering::SeqCst);
                 demand
                     .response
                     .send(Ok(crate::sync::runtime::HydratedInputs::default()))
@@ -53,7 +53,7 @@ async fn answer_pinned_demands(
             .unwrap();
         }
         count += 1;
-        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        served.fetch_add(1, Ordering::SeqCst);
         demand
             .response
             .send(Ok(crate::sync::runtime::HydratedInputs::default()))
@@ -79,7 +79,7 @@ async fn snapshot_hydrates_native_inputs_without_moving_its_state() {
                 }
             };
             drop(sender);
-            let after_open = served.load(std::sync::atomic::Ordering::SeqCst);
+            let after_open = served.load(Ordering::SeqCst);
             let value = |result: ExecuteResult| {
                 result.rows()[0]
                     .get::<serde_json::Value>("value")
@@ -87,7 +87,7 @@ async fn snapshot_hydrates_native_inputs_without_moving_its_state() {
             };
             assert_eq!(value(snapshot.query(sql, &[]).await.unwrap()), "before");
             assert!(
-                served.load(std::sync::atomic::Ordering::SeqCst) > after_open,
+                served.load(Ordering::SeqCst) > after_open,
                 "the cold read hydrated through the snapshot"
             );
             let outside = engine

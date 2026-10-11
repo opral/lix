@@ -8,7 +8,7 @@
     clippy::unnecessary_wraps
 )]
 
-use crate::branch::BranchHead;
+
 use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{
     BoundBinaryOperator, BoundCastType, BoundColumnRef, BoundExpr, BoundLiteral, ReturningImage,
@@ -68,7 +68,7 @@ use crate::sql2::result_metadata::{
     field_is_row_ref,
 };
 use crate::sql2::session::{
-    SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
+    SqlWriteSessionOptions, build_read_session,
     build_transaction_read_session, build_write_session_with_options,
 };
 use crate::sql2::write_normalization::lix_file_content_type_lix_error;
@@ -206,22 +206,6 @@ where
     let planning_environment = ctx.sql_planning_environment(statements).await?;
     Ok(ReadSqlSession {
         session: Some(build_read_session(ctx, statements).await?),
-        planning_environment,
-        _context: PhantomData,
-    })
-}
-
-pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
-    ctx: &'ctx C,
-    active_head: BranchHead,
-    statements: &[DataFusionStatement],
-) -> Result<ReadSqlSession<'ctx>, LixError>
-where
-    C: SqlExecutionContext + ?Sized,
-{
-    let planning_environment = ctx.sql_planning_environment(statements).await?;
-    Ok(ReadSqlSession {
-        session: Some(build_read_session_at_head(ctx, active_head, statements).await?),
         planning_environment,
         _context: PhantomData,
     })

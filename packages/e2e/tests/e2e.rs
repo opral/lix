@@ -8680,11 +8680,11 @@ async fn plugin_deletion_cascades_declared_dependents() {
 /// Runs statements atomically in one transaction and returns each result:
 /// reads through `query`, writes through `execute`.
 async fn execute_atomically<S>(
-    lix: &lix::Lix<S>,
-    statements: &[lix::ExecuteBatchStatement],
-) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
+    lix: &Lix<S>,
+    statements: &[ExecuteBatchStatement],
+) -> Result<Vec<lix::ExecuteResult>, LixError>
 where
-    S: lix::storage::Storage + Clone + Send + Sync + 'static,
+    S: Storage + Clone + Send + Sync + 'static,
 {
     let transaction = lix.begin_transaction().await?;
     let mut results = Vec::with_capacity(statements.len());

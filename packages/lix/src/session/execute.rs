@@ -406,14 +406,6 @@ impl ExecuteResult {
         Self::from_query_parts(columns, Vec::new(), rows, 0, Vec::new())
     }
 
-    pub(crate) fn from_typed_rows(
-        columns: Vec<String>,
-        column_types: Vec<ResultColumnType>,
-        rows: Vec<Vec<Value>>,
-    ) -> Self {
-        Self::from_query_parts(columns, column_types, rows, 0, Vec::new())
-    }
-
     pub(crate) fn from_idempotency_parts(
         columns: Vec<String>,
         column_types: Vec<ResultColumnType>,
