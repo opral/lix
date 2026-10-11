@@ -2649,7 +2649,7 @@ where
                     if result.as_ref().is_err_and(|error| error.code == "LIX_PARTIAL_BASELINE_EXPIRED") {
                         if matches!(demand.request, SyncDemandRequest::Pinned(_)) {
                             return Err(LixError::new(LixError::CODE_TRANSACTION_CONFLICT,
-                                "transaction snapshot expired before its missing inputs were fetched"));
+                                "the pinned snapshot expired on the authority before its missing inputs were fetched"));
                         }
                         if let Some(engine) = &engine {
                             baseline_expired = result.as_ref().err().cloned();

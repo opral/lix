@@ -455,6 +455,15 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
     }
 }
 
+/// The longest a foreground operation waits for one sync demand. User reads
+/// have no deadline, but an engine-internal wait for the network must not hold
+/// session guards forever when the worker or transport hangs.
+const SYNC_DEMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often one operation may restart because the replica published a new
+/// serving basis while it waited.
+const MAX_ADMISSION_RESTARTS: u32 = 16;
+
 async fn send_sync_demand(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
     request: SyncDemandRequest,
@@ -465,6 +474,33 @@ async fn send_sync_demand(
         .await
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
     done.await.map_err(|_| stopped_error())?
+}
+
+/// Sends a hydration demand on behalf of a foreground SQL operation, which
+/// waits at most [`SYNC_DEMAND_TIMEOUT`].
+async fn send_hydration_demand(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    request: SyncDemandRequest,
+) -> Result<HydratedInputs, LixError> {
+    use futures_util::FutureExt as _;
+    let (response, done) = tokio::sync::oneshot::channel();
+    demand_tx
+        .send(SyncDemand { request, response })
+        .await
+        .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
+    let timeout = super::platform::executor_neutral_sleep(SYNC_DEMAND_TIMEOUT).fuse();
+    let done = done.fuse();
+    futures_util::pin_mut!(timeout, done);
+    futures_util::select_biased! {
+        result = done => result.map_err(|_| stopped_error())?,
+        () = timeout => Err(LixError::new(
+            SYNC_DEMAND_STALLED_CODE,
+            format!(
+                "sync demand did not complete within {} s",
+                SYNC_DEMAND_TIMEOUT.as_secs()
+            ),
+        )),
+    }
 }
 
 pub(crate) async fn reconcile_partial_before_branch_switch(
@@ -497,6 +533,7 @@ fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct SyncDemandRetry {
     seen: BTreeSet<String>,
+    admission_restarts: u32,
 }
 
 impl SyncDemandRetry {
@@ -530,7 +567,7 @@ impl SyncDemandRetry {
             return Err(error);
         };
         let request = self.admit(error)?;
-        send_sync_demand(demand_tx, SyncDemandRequest::Pinned(Box::new(request))).await
+        send_hydration_demand(demand_tx, SyncDemandRequest::Pinned(Box::new(request))).await
     }
 
     pub(crate) async fn hydrate_for_retry(
@@ -542,7 +579,7 @@ impl SyncDemandRetry {
             return Err(error);
         };
         let request = self.admit(error)?;
-        match send_sync_demand(demand_tx, request).await {
+        match send_hydration_demand(demand_tx, request).await {
             Err(error)
                 if error.code == PARTIAL_ADMISSION_CHANGED_CODE
                     && !error.automatic_retry_is_forbidden() =>
@@ -552,7 +589,16 @@ impl SyncDemandRetry {
                 // SQL operation so it derives its inputs from that new basis.
                 // Each signal follows an actual admitted basis change. A long
                 // operation may cross more than one publication; none of those
-                // internal transitions belongs in the application API.
+                // internal transitions belongs in the application API. A
+                // basis that keeps changing must not restart forever.
+                self.admission_restarts += 1;
+                if self.admission_restarts > MAX_ADMISSION_RESTARTS {
+                    return Err(LixError::new(
+                        SYNC_DEMAND_STALLED_CODE,
+                        "the partial replica's serving basis kept changing while this \
+                         operation loaded its inputs",
+                    ));
+                }
                 self.seen.clear();
                 Ok(())
             }
