@@ -56,6 +56,7 @@ pub(crate) fn unsupported_remote_operation(operation: &str) -> LixError {
         "LIX_UNSUPPORTED_REMOTE_OPERATION",
         format!("{operation} is not supported on a remote Lix handle"),
     )
+    .with_details(serde_json::json!({ "operation": operation }))
     .with_hint("Use query() for reads on a remote handle, or open the repository locally.")
 }
 
@@ -113,9 +114,11 @@ impl Query {
         self
     }
 
-    /// Caps the encoded bytes [`Self::all`] may buffer. Defaults to 64 MiB;
-    /// `usize::MAX` opts out. A larger result fails with
+    /// Caps the bytes [`Self::all`] may buffer (row and value memory).
+    /// Defaults to 64 MiB; `usize::MAX` opts out. A larger result fails with
     /// `LIX_RESULT_TOO_LARGE` and returns nothing; it is never truncated.
+    /// [`Self::stream`] applies it only to statements it has to buffer;
+    /// [`Self::one`] and [`Self::optional`] read at most one row and ignore it.
     pub fn max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
         self
@@ -168,9 +171,17 @@ impl Query {
 
     /// Opens a stream over the result. Resolves once the statement is
     /// planned and its first page (at most 64 rows) has arrived, so planning
-    /// errors fail here. Bounded memory, no size cap, no deadline.
+    /// errors fail here. No size cap and no deadline.
+    ///
+    /// Most reads stream with bounded memory. A few statement shapes cannot
+    /// stream incrementally and are buffered in full before the first page:
+    /// reads of `lix_file.content` (and other plugin-rendered file bytes),
+    /// reads inside a transaction, and reads on a partial replica. Those
+    /// buffers are capped by [`Self::max_bytes`] (64 MiB by default) and fail
+    /// with `LIX_RESULT_TOO_LARGE` beyond it.
     pub async fn stream(self) -> Result<RowStream, LixError> {
-        let (target, request) = self.request(ReadLimits::bytes(usize::MAX));
+        let limits = ReadLimits::bytes(self.max_bytes);
+        let (target, request) = self.request(limits);
         target.stream(request).await
     }
 }
@@ -318,9 +329,6 @@ impl IntoFuture for ExecuteMany {
     type IntoFuture = SqlFuture<u64>;
 
     fn into_future(self) -> Self::IntoFuture {
-        if self.request.param_sets.is_empty() {
-            return Box::pin(std::future::ready(Ok(0)));
-        }
         self.target.execute_many(self.request)
     }
 }
@@ -330,7 +338,7 @@ pub(crate) trait SnapshotTarget: SqlTarget {
     fn active_branch_id(&self) -> &str;
     fn commit_id(&self) -> &str;
     fn storage_mutation_revision(&self) -> Option<&[u8]>;
-    fn close(&self);
+    fn close(self: Arc<Self>) -> SqlFuture<()>;
 }
 
 /// One pinned repository state: every read and stream through it sees the
@@ -382,12 +390,11 @@ impl Snapshot {
         self.inner.storage_mutation_revision()
     }
 
-    /// Closes the snapshot for every clone: its streams stop, later reads fail
-    /// with `LIX_SNAPSHOT_CLOSED`, and the pinned state is released once reads
-    /// already running finish. Idempotent.
+    /// Closes the snapshot for every clone: its streams stop and later reads
+    /// fail with `LIX_SNAPSHOT_CLOSED`. Resolves once reads that were already
+    /// running have finished and the pinned state is released. Idempotent.
     pub async fn close(&self) -> Result<(), LixError> {
-        self.inner.close();
-        Ok(())
+        self.inner.clone().close().await
     }
 }
 

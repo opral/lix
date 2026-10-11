@@ -632,17 +632,51 @@ impl ExecuteResult {
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.
-    pub fn get<'a>(&self, row: &'a Row, column_name: &str) -> Option<&'a Value> {
-        let index = self.column_index(column_name)?;
-        row.get_index(index)
+    /// Fails when the name is absent or shared by several columns.
+    pub fn get<'a>(&self, row: &'a Row, column_name: &str) -> Result<&'a Value, LixError> {
+        row.value(column_name)
     }
 
-    /// Returns the index for a column name.
-    pub fn column_index(&self, column_name: &str) -> Option<usize> {
-        self.columns()
-            .iter()
-            .position(|column| column == column_name)
+    /// Returns the position of a column name. Fails when the name is absent
+    /// or shared by several columns.
+    pub fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
+        resolve_column(self.columns(), column_name)
     }
+}
+
+/// Resolves a column name to its position. Every name lookup (rows, results)
+/// goes through this, so a name shared by several result columns fails the
+/// same way everywhere.
+pub(crate) fn resolve_column(columns: &[String], column_name: &str) -> Result<usize, LixError> {
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.as_str() == column_name)
+        .map(|(index, _)| index);
+    let index = matches.next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_COLUMN_NOT_FOUND,
+            format!(
+                "column '{}' does not exist; available columns: {}",
+                column_name,
+                if columns.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    columns.join(", ")
+                }
+            ),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_AMBIGUOUS_COLUMN,
+            format!(
+                "column '{column_name}' appears more than once in the result; \
+                 alias the columns or read it by position"
+            ),
+        ));
+    }
+    Ok(index)
 }
 
 /// The rows a read returned: see [`crate::Query::all`].
@@ -699,8 +733,9 @@ impl QueryResult {
         self.inner.notices()
     }
 
-    /// Returns the position of a column name.
-    pub fn column_index(&self, column_name: &str) -> Option<usize> {
+    /// Returns the position of a column name. Fails when the name is absent
+    /// or shared by several columns.
+    pub fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
         self.inner.column_index(column_name)
     }
 }
@@ -878,33 +913,7 @@ impl Row {
     }
 
     fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
-        let mut matches = self
-            .backing
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.as_str() == column_name)
-            .map(|(index, _)| index);
-        let index = matches.next().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_COLUMN_NOT_FOUND,
-                format!(
-                    "column '{}' does not exist; available columns: {}",
-                    column_name,
-                    self.available_columns()
-                ),
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(LixError::new(
-                LixError::CODE_AMBIGUOUS_COLUMN,
-                format!(
-                    "column '{column_name}' appears more than once in the result; \
-                     alias the columns or read it by position"
-                ),
-            ));
-        }
-        Ok(index)
+        resolve_column(&self.backing.columns, column_name)
     }
 
     fn available_columns(&self) -> String {
@@ -1102,13 +1111,16 @@ impl ResultRowRef<'_> {
         self.values
     }
 
-    /// Returns the value for `column_name`.
-    pub fn get(&self, column_name: &str) -> Option<&Value> {
-        let index = self
-            .columns
-            .iter()
-            .position(|column| column == column_name)?;
-        self.values.get(index)
+    /// Returns the value for `column_name`. Fails when the name is absent or
+    /// shared by several columns.
+    pub fn get(&self, column_name: &str) -> Result<&Value, LixError> {
+        let index = resolve_column(self.columns, column_name)?;
+        self.values.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_COLUMN_NOT_FOUND,
+                format!("column '{column_name}' points past the row width"),
+            )
+        })
     }
 
     /// Returns the value at `index`.
@@ -1414,6 +1426,13 @@ where
     /// Parses a statement for a read-only API (`query`, `stream`, snapshot
     /// reads). Writes and durable runtime functions are rejected with
     /// `LIX_ERROR_READ_ONLY`: they go through `execute`.
+    /// Parses and checks the statement of an `execute_many` call.
+    pub(crate) fn check_execute_many_statement(&self, sql: &str) -> Result<(), LixError> {
+        self.ensure_open()?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        check_execute_many_statement(&statement)
+    }
+
     pub(crate) fn parse_read_only_statement(
         &self,
         sql: &str,
@@ -1435,7 +1454,10 @@ where
         params: &[Value],
     ) -> QueryStreamRoute {
         let read_plan = sql2::plan_read_statement(statement, params);
+        // Runtime functions read and advance their state through the
+        // buffered read path, which owns that bookkeeping.
         let materialized = matches!(read_plan.native, Some(sql2::NativeReadPlan::Filesystem(_)))
+            || sql2::statement_has_durable_runtime_function(statement)
             || read_plan.late_content.is_some()
             || read_plan.acknowledge_file_views
             || self.hot_state.capture_foreground_read_interests().is_some();
@@ -4446,25 +4468,50 @@ pub(crate) fn check_returning_cap(result: &ExecuteResult) -> Result<(), LixError
     charge_execute_result(&mut crate::common::ReadResultBudget::default(), result)
 }
 
-/// Rejects statements a read-only API must not run.
-pub(crate) fn reject_non_read(statement: &DataFusionStatement) -> Result<(), LixError> {
-    if sql2::bind_statement_route(statement)? == sql2::BoundStatementRoute::Write {
-        return Err(LixError::new(
-            LixError::CODE_READ_ONLY,
-            "query() and stream() only run reads",
-        )
-        .with_hint("Use execute() for statements that write."));
+/// Checks the statement of an `execute_many` call: it must write and must not
+/// return rows (execute_many reports only the affected row count).
+pub(crate) fn check_execute_many_statement(
+    statement: &DataFusionStatement,
+) -> Result<(), LixError> {
+    if execution_disposition(statement)? != ExecutionDisposition::Durable {
+        return Err(not_a_write());
     }
-    if sql2::statement_has_durable_runtime_function(statement) {
+    if sql2::statement_has_returning(statement) {
         return Err(LixError::new(
-            LixError::CODE_READ_ONLY,
-            "query() and stream() cannot call runtime functions that persist state",
+            LixError::CODE_INVALID_PARAM,
+            "execute_many() reports only the affected row count and cannot return rows",
         )
-        .with_hint(
-            "Use execute() for statements that call lix_uuid_v7(), lix_timestamp() or similar functions.",
-        ));
+        .with_hint("Drop RETURNING, or run execute() per parameter set inside a transaction."));
     }
     Ok(())
+}
+
+pub(crate) fn not_a_write() -> LixError {
+    LixError::new(
+        LixError::CODE_NOT_A_WRITE,
+        "execute() only runs statements that write; this statement only reads",
+    )
+    .with_hint("Use query(sql).all(), one(), optional() or stream() for reads.")
+}
+
+/// Rejects statements a read-only API must not run.
+///
+/// Reads that call `uuidv7()` or `current_timestamp` are reads: outside
+/// deterministic mode those functions persist nothing, and in deterministic
+/// mode they only advance the engine's private sequence bookkeeping.
+pub(crate) fn reject_non_read(statement: &DataFusionStatement) -> Result<(), LixError> {
+    if sql2::bind_statement_route(statement)? == sql2::BoundStatementRoute::Write {
+        return Err(reject_non_read_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_non_read_error() -> LixError {
+    LixError::new(
+        LixError::CODE_READ_ONLY,
+        "query() and stream() only run reads; this statement changes the repository",
+    )
+    .with_hint("Use execute() for INSERT, UPDATE, DELETE, DDL and checkpoint functions.")
 }
 
 fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), LixError> {
@@ -4503,7 +4550,7 @@ fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), 
                 )?;
             }
             for batch in batches.iter() {
-                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+                budget.charge(sql2::batch_public_bytes(batch), batch.num_rows())?;
             }
         }
     }
@@ -4532,7 +4579,7 @@ pub(crate) fn charge_execute_result(
             .unwrap_or_else(|error| error.into_inner());
         if let Some(columnar) = columnar.as_ref() {
             for batch in columnar.batches.iter() {
-                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+                budget.charge(sql2::batch_public_bytes(batch), batch.num_rows())?;
             }
         } else if let Some(rows) = backing.rows.get() {
             for row in rows {
@@ -4843,6 +4890,42 @@ where
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
+    }
+
+    /// Runs one write statement once per parameter set. All sets stage or
+    /// none do: a failure rolls back the sets already staged by this call.
+    pub(crate) async fn execute_many_atomically(
+        &mut self,
+        sql: &str,
+        param_sets: Vec<Vec<Value>>,
+        options: ExecuteOptions,
+    ) -> Result<u64, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        check_execute_many_statement(&statement)?;
+        if param_sets.is_empty() {
+            return Ok(0);
+        }
+        Box::pin(self.flush_prepared_mutations_with_sync()).await?;
+        let checkpoint = self.transaction_mut()?.begin_sql_statement_checkpoint()?;
+        let mut rows_affected = 0;
+        for params in param_sets {
+            match self
+                .execute_with_options(sql.to_owned(), params, options.clone())
+                .await
+            {
+                Ok(result) => rows_affected += result.rows_affected(),
+                Err(error) => {
+                    Box::pin(self.flush_prepared_mutations_with_sync()).await?;
+                    Box::pin(
+                        self.transaction_mut()?
+                            .rollback_sql_statement_checkpoint(checkpoint),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(rows_affected)
     }
 
     /// Executes one statement, failing (and discarding the statement's

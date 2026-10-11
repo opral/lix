@@ -20,12 +20,75 @@ use super::{
     closed_transaction_error,
 };
 
-fn not_a_write() -> LixError {
-    LixError::new(
-        LixError::CODE_NOT_A_WRITE,
-        "execute() only runs statements that write; this statement only reads",
+use crate::session::not_a_write;
+
+/// A stream that has to buffer its statement reports the cap in stream terms.
+pub(crate) fn buffered_stream_error(error: LixError) -> LixError {
+    if error.code != LixError::CODE_RESULT_TOO_LARGE {
+        return error;
+    }
+    let mut error = error;
+    error.message = format!(
+        "{} (this statement cannot stream incrementally, so it is buffered before its \
+         first page)",
+        error.message
+    );
+    error.with_hint(
+        "File content, transaction and partial-replica reads are buffered. Raise the buffer \
+         with .max_bytes(n) before .stream() (JS: { maxBytes }), or select fewer rows.",
     )
-    .with_hint("Use query(sql).all(), one(), optional() or stream() for reads.")
+}
+
+fn retries_in_transaction() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "with_max_auto_commit_retries does not apply inside a transaction",
+    )
+    .with_hint("Transactions never replay; retry the whole transaction instead.")
+}
+
+/// Remote handles check the read/write split locally, with the engine's own
+/// parser, before any SQL reaches the server.
+fn remote_class(sql: &str) -> Result<crate::sql2::StatementClass, LixError> {
+    crate::sql2::classify_statement(sql)
+}
+
+fn remote_read_only(sql: &str) -> Result<(), LixError> {
+    if !remote_class(sql)?.read_only {
+        return Err(crate::session::reject_non_read_error());
+    }
+    Ok(())
+}
+
+fn remote_write(request: &ExecuteRequest) -> Result<(), LixError> {
+    if remote_class(&request.sql)?.read_only {
+        return Err(not_a_write());
+    }
+    if request.max_bytes != crate::common::DEFAULT_MAX_RESULT_BYTES {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "max_bytes is not supported for remote writes",
+        )
+        .with_hint(
+            "The server caps RETURNING rows at its default before it commits; a client-side \
+             check would only fail after the write was published.",
+        ));
+    }
+    Ok(())
+}
+
+fn remote_write_many(request: &ExecuteManyRequest) -> Result<(), LixError> {
+    let class = remote_class(&request.sql)?;
+    if class.read_only {
+        return Err(not_a_write());
+    }
+    if class.returning {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "execute_many() reports only the affected row count and cannot return rows",
+        ));
+    }
+    Ok(())
 }
 
 fn snapshot_read_only() -> LixError {
@@ -138,7 +201,7 @@ where
             sql,
             params,
             page_limits,
-            ..
+            limits,
         } = request;
         let statement = self.session.parse_read_only_statement(&sql, &params)?;
         // A partial replica fetches missing inputs by restarting the whole
@@ -155,7 +218,9 @@ where
             // the future `query().all()` returns.
             let result = unsafe {
                 AssumeSendFuture::new(async move {
-                    with_read_limits(ReadLimits::default(), lix.read_latest(&sql, &params)).await
+                    with_read_limits(limits, lix.read_latest(&sql, &params))
+                        .await
+                        .map_err(buffered_stream_error)
                 })
             };
             return self
@@ -209,8 +274,9 @@ where
             param_sets,
             options,
         } = request;
-        if self.session.execution_disposition(&sql)? != ExecutionDisposition::Durable {
-            return Err(not_a_write());
+        self.session.check_execute_many_statement(&sql)?;
+        if param_sets.is_empty() {
+            return Ok(0);
         }
         let statements = param_sets
             .into_iter()
@@ -342,7 +408,12 @@ where
         unsafe {
             boxed(async move {
                 self.snapshot
-                    .stream(&request.sql, &request.params, request.page_limits)
+                    .stream(
+                        &request.sql,
+                        &request.params,
+                        request.page_limits,
+                        request.limits,
+                    )
                     .await
             })
         }
@@ -373,8 +444,14 @@ where
         self.snapshot.storage_mutation_revision()
     }
 
-    fn close(&self) {
-        self.snapshot.close();
+    fn close(self: Arc<Self>) -> SqlFuture<()> {
+        // SAFETY: the future owns the snapshot Arc.
+        unsafe {
+            boxed(async move {
+                self.snapshot.close().await;
+                Ok(())
+            })
+        }
     }
 }
 
@@ -396,14 +473,15 @@ where
         let transaction = inner.as_mut().ok_or_else(closed_transaction_error)?;
         transaction.parse_read_only_statement(&request.sql, &request.params)?;
         let result = with_read_limits(
-            ReadLimits::default(),
+            request.limits,
             transaction.execute_with_options(
                 request.sql,
                 request.params,
                 ExecuteOptions::default(),
             ),
         )
-        .await?;
+        .await
+        .map_err(buffered_stream_error)?;
         transaction
             .open_materialized_stream(result, request.page_limits)
             .await
@@ -411,11 +489,7 @@ where
 
     async fn write(&self, request: ExecuteRequest) -> Result<ExecuteResult, LixError> {
         if request.options.max_auto_commit_retries.is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "with_max_auto_commit_retries does not apply inside a transaction",
-            )
-            .with_hint("Transactions never replay; retry the whole transaction instead."));
+            return Err(retries_in_transaction());
         }
         let mut inner = self.inner.lock().await;
         let transaction = inner.as_mut().ok_or_else(closed_transaction_error)?;
@@ -429,24 +503,13 @@ where
 
     async fn write_many(&self, request: ExecuteManyRequest) -> Result<u64, LixError> {
         if request.options.max_auto_commit_retries.is_some() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "with_max_auto_commit_retries does not apply inside a transaction",
-            ));
+            return Err(retries_in_transaction());
         }
         let mut inner = self.inner.lock().await;
         let transaction = inner.as_mut().ok_or_else(closed_transaction_error)?;
-        if transaction.execution_disposition(&request.sql)? != ExecutionDisposition::Durable {
-            return Err(not_a_write());
-        }
-        let mut rows_affected = 0;
-        for params in request.param_sets {
-            rows_affected += transaction
-                .execute_with_options(request.sql.clone(), params, request.options.clone())
-                .await?
-                .rows_affected();
-        }
-        Ok(rows_affected)
+        transaction
+            .execute_many_atomically(&request.sql, request.param_sets, request.options)
+            .await
     }
 }
 
@@ -494,6 +557,7 @@ where
 impl SqlTarget for RemoteLix {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
+            remote_read_only(&request.sql)?;
             let result = self
                 .client
                 .execute(&request.sql, &request.params, None)
@@ -511,8 +575,8 @@ impl SqlTarget for RemoteLix {
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
         Box::pin(async move {
-            let result = self
-                .client
+            remote_write(&request)?;
+            self.client
                 .execute(
                     &request.sql,
                     &request.params,
@@ -522,14 +586,16 @@ impl SqlTarget for RemoteLix {
                         ..Default::default()
                     }),
                 )
-                .await?;
-            enforce_limits(&result, ReadLimits::bytes(request.max_bytes))?;
-            Ok(result)
+                .await
         })
     }
 
     fn execute_many(self: Arc<Self>, request: ExecuteManyRequest) -> SqlFuture<u64> {
         Box::pin(async move {
+            remote_write_many(&request)?;
+            if request.param_sets.is_empty() {
+                return Ok(0);
+            }
             let statements = request
                 .param_sets
                 .into_iter()
@@ -560,22 +626,29 @@ impl SqlTarget for RemoteLix {
 }
 
 /// SQL inside a [`super::RemoteLixTransaction`].
-pub(super) struct RemoteTransactionTarget(
-    pub(super) Option<Arc<crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>>>,
-);
+pub(super) struct RemoteTransactionTarget {
+    pub(super) transaction:
+        Option<Arc<crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>>>,
+    /// Set when an `execute_many` failed after staging some parameter sets:
+    /// the server cannot undo them, so the transaction may only roll back.
+    pub(super) rollback_only: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl RemoteTransactionTarget {
     fn transaction(
         &self,
     ) -> Result<&crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>, LixError>
     {
-        self.0.as_deref().ok_or_else(closed_transaction_error)
+        self.transaction
+            .as_deref()
+            .ok_or_else(closed_transaction_error)
     }
 }
 
 impl SqlTarget for RemoteTransactionTarget {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
+            remote_read_only(&request.sql)?;
             let result = self
                 .transaction()?
                 .execute(&request.sql, &request.params, None)
@@ -593,8 +666,11 @@ impl SqlTarget for RemoteTransactionTarget {
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
         Box::pin(async move {
-            let result = self
-                .transaction()?
+            if request.options.max_auto_commit_retries.is_some() {
+                return Err(retries_in_transaction());
+            }
+            remote_write(&request)?;
+            self.transaction()?
                 .execute(
                     &request.sql,
                     &request.params,
@@ -603,18 +679,20 @@ impl SqlTarget for RemoteTransactionTarget {
                         ..Default::default()
                     }),
                 )
-                .await?;
-            enforce_limits(&result, ReadLimits::bytes(request.max_bytes))?;
-            Ok(result)
+                .await
         })
     }
 
     fn execute_many(self: Arc<Self>, request: ExecuteManyRequest) -> SqlFuture<u64> {
         Box::pin(async move {
+            if request.options.max_auto_commit_retries.is_some() {
+                return Err(retries_in_transaction());
+            }
+            remote_write_many(&request)?;
             let transaction = self.transaction()?;
             let mut rows_affected = 0;
-            for params in request.param_sets {
-                rows_affected += transaction
+            for (index, params) in request.param_sets.into_iter().enumerate() {
+                match transaction
                     .execute(
                         &request.sql,
                         &params,
@@ -623,8 +701,17 @@ impl SqlTarget for RemoteTransactionTarget {
                             ..Default::default()
                         }),
                     )
-                    .await?
-                    .rows_affected();
+                    .await
+                {
+                    Ok(result) => rows_affected += result.rows_affected(),
+                    Err(error) => {
+                        if index > 0 {
+                            self.rollback_only
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        return Err(error);
+                    }
+                }
             }
             Ok(rows_affected)
         })

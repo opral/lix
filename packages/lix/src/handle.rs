@@ -1,6 +1,7 @@
 mod partial;
 mod partial_merge;
 mod sql_targets;
+pub(crate) use sql_targets::buffered_stream_error;
 
 use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
@@ -795,6 +796,7 @@ impl RemoteLix {
         // Own the session before awaiting begin so failure or cancellation
         // schedules closure of any transaction the server may have started.
         let mut opened = RemoteLixTransaction {
+            rollback_only: Arc::default(),
             transaction: None,
             client: Some(client),
         };
@@ -845,14 +847,18 @@ impl RemoteLix {
 /// Call [`Self::rollback`] to await rollback and session closure explicitly.
 #[derive(Debug)]
 pub struct RemoteLixTransaction {
+    /// Set when a failed `execute_many` left part of its parameter sets
+    /// staged: commit then rolls back and fails.
+    rollback_only: Arc<AtomicBool>,
     transaction: Option<Arc<ProtocolTransaction<crate::sync::AuthorityHttp>>>,
     client: Option<ProtocolClient<crate::sync::AuthorityHttp>>,
 }
 impl RemoteLixTransaction {
     fn sql_target(&self) -> Arc<dyn crate::query::SqlTarget> {
-        Arc::new(sql_targets::RemoteTransactionTarget(
-            self.transaction.clone(),
-        ))
+        Arc::new(sql_targets::RemoteTransactionTarget {
+            transaction: self.transaction.clone(),
+            rollback_only: Arc::clone(&self.rollback_only),
+        })
     }
 
     /// Starts a read inside this remote transaction.
@@ -876,6 +882,14 @@ impl RemoteLixTransaction {
     }
 
     pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
+        if self.rollback_only.load(Ordering::Acquire) {
+            let _ = self.rollback().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_TRANSACTION_STATE,
+                "an execute_many() in this transaction failed after staging part of its \
+                 parameter sets; the transaction was rolled back",
+            ));
+        }
         let result = self
             .transaction
             .as_ref()
@@ -2487,8 +2501,9 @@ where
 /// to others until [`Self::commit`].
 ///
 /// `query` and `execute` take `&self` and return owned builders; calls on one
-/// transaction run one at a time, in call order. Dropping the transaction
-/// without committing rolls it back.
+/// transaction run one at a time, in the order their futures are first
+/// polled (awaiting them in sequence runs them in that order). Dropping the
+/// transaction without committing rolls it back.
 #[expect(missing_debug_implementations)]
 pub struct LixTransaction<StorageImpl = Memory>
 where
@@ -3601,8 +3616,7 @@ mod tests {
             .expect("mark replica");
         for sql in [
             "INSERT INTO lix_key_value (key, value) VALUES ('read-only', 'unexpected')",
-            "SELECT uuidv7()",
-            "SELECT current_timestamp",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
         ] {
             let snapshot = lix.snapshot().await.expect("open replica snapshot");
             snapshot

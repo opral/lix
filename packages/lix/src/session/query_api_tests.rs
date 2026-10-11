@@ -52,9 +52,9 @@ async fn buffered_reads_bind_parameters_and_cap_bytes() {
     assert_eq!(rows.columns(), ["id", "label"]);
     assert_eq!(
         rows.iter()
-            .map(|row| row.get("id").cloned())
+            .map(|row| row.get("id").unwrap().clone())
             .collect::<Vec<_>>(),
-        [3, 5, 6, 7, 8, 9].map(|id| Some(Value::Integer(id)))
+        [3, 5, 6, 7, 8, 9].map(Value::Integer)
     );
     let first = &rows.rows()[0];
     assert_eq!(first.get::<i64>(0).unwrap(), 3);
@@ -87,6 +87,23 @@ async fn buffered_reads_bind_parameters_and_cap_bytes() {
             .len(),
         10
     );
+}
+
+#[tokio::test]
+async fn narrow_and_null_columns_are_charged_for_their_rows() {
+    let lix = seeded(1).await;
+    for sql in [
+        "SELECT true AS flag FROM generate_series(1, 100000)",
+        "SELECT NULL AS nothing FROM generate_series(1, 100000)",
+    ] {
+        let error = lix
+            .query(sql)
+            .max_bytes(1024 * 1024)
+            .all()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE, "{sql}");
+    }
 }
 
 #[tokio::test]
@@ -155,7 +172,7 @@ async fn reads_reject_writes_and_durable_functions() {
     for sql in [
         "INSERT INTO api_item (id, label) VALUES (5, 'x')",
         "DELETE FROM api_item",
-        "SELECT uuidv7() AS id",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
     ] {
         assert_eq!(
             lix.query(sql).all().await.unwrap_err().code,
@@ -169,6 +186,44 @@ async fn reads_reject_writes_and_durable_functions() {
         );
     }
     assert_eq!(count(&lix).await, 1);
+}
+
+#[tokio::test]
+async fn runtime_functions_are_reads() {
+    let lix = seeded(1).await;
+    let sql = "SELECT uuidv7() AS id, current_timestamp AS now";
+    let first = lix.query(sql).one().await.unwrap();
+    let second = lix.query(sql).one().await.unwrap();
+    assert_ne!(first.get::<String>("id"), second.get::<String>("id"));
+    let mut stream = lix.query(sql).stream().await.unwrap();
+    assert!(stream.try_next().await.unwrap().is_some());
+    let snapshot = lix.snapshot().await.unwrap();
+    assert!(snapshot.query(sql).optional().await.unwrap().is_some());
+    let transaction = lix.begin_transaction().await.unwrap();
+    assert!(transaction.query(sql).optional().await.unwrap().is_some());
+    transaction.rollback().await.unwrap();
+    // execute() also accepts them.
+    assert_eq!(lix.execute(sql).await.unwrap().len(), 1);
+
+    // Deterministic mode advances a persisted sequence: the live handle
+    // advances it, a pinned snapshot refuses rather than reusing values.
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+         VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
+    )
+    .await
+    .unwrap();
+    let first = lix.query("SELECT uuidv7() AS id").one().await.unwrap();
+    let second = lix.query("SELECT uuidv7() AS id").one().await.unwrap();
+    assert_ne!(first.get::<String>("id"), second.get::<String>("id"));
+    let snapshot = lix.snapshot().await.unwrap();
+    let error = snapshot
+        .query("SELECT uuidv7() AS id")
+        .all()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_READ_ONLY);
+    assert!(error.hint.unwrap().contains("Lix::query()"));
 }
 
 #[tokio::test]
@@ -297,15 +352,11 @@ async fn closing_a_snapshot_stops_its_streams_and_later_reads() {
     assert_eq!(lix.running_query_stream_count_for_test(), 1);
     clone.close().await.unwrap();
     assert_eq!(lix.running_query_stream_count_for_test(), 0);
-    // The buffered first page is gone with the stream.
-    let error = loop {
-        match stream.try_next().await {
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("a closed snapshot's stream must not end normally"),
-            Err(error) => break error,
-        }
-    };
-    assert_eq!(error.code, LixError::CODE_SNAPSHOT_CLOSED);
+    // The next pull fails although the first page was already buffered.
+    assert_eq!(
+        stream.try_next().await.unwrap_err().code,
+        LixError::CODE_SNAPSHOT_CLOSED
+    );
     for result in [
         snapshot.query("SELECT 1").all().await.map(|_| ()),
         snapshot.query("SELECT 1").stream().await.map(|_| ()),
@@ -329,7 +380,7 @@ async fn snapshot_reads_and_streams_reject_writes() {
     let snapshot = lix.snapshot().await.unwrap();
     for sql in [
         "INSERT INTO api_item (id, label) VALUES (7, 'x')",
-        "SELECT uuidv7() AS id",
+        "UPDATE api_item SET label = 'y'",
     ] {
         assert_eq!(
             snapshot.query(sql).all().await.unwrap_err().code,
@@ -391,4 +442,209 @@ fn query_types_are_send_and_static() {
     assert_sync::<crate::LixTransaction>();
     fn assert_stream<T: futures_core::stream::FusedStream + Unpin>() {}
     assert_stream::<crate::RowStream>();
+}
+
+#[tokio::test]
+async fn transaction_execute_many_is_all_or_nothing() {
+    let lix = seeded(3).await;
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO api_item (id, label) VALUES (100, 'kept')")
+        .await
+        .unwrap();
+    let error = transaction
+        .execute_many(
+            "INSERT INTO api_item (id, label) VALUES ($1, $2)",
+            [
+                [Value::Integer(200), Value::from("first")],
+                [Value::from("not a number"), Value::from("bad")],
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_ne!(error.code, LixError::CODE_INTERNAL_ERROR);
+    // The failed call staged nothing; earlier writes in the transaction stay.
+    assert!(
+        transaction
+            .query("SELECT id FROM api_item WHERE id = 200")
+            .optional()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        transaction
+            .execute_many(
+                "INSERT INTO api_item (id, label) VALUES ($1, $2)",
+                [[Value::Integer(201), Value::from("ok")]],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    // The statement is checked even without parameter sets.
+    assert_eq!(
+        transaction
+            .execute_many("SELECT $1", Vec::<[Value; 1]>::new())
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_NOT_A_WRITE
+    );
+    assert_eq!(
+        transaction
+            .execute_many(
+                "INSERT INTO api_item (id, label) VALUES ($1, 'r') RETURNING id",
+                [[Value::Integer(300)]],
+            )
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_INVALID_PARAM
+    );
+    transaction.commit().await.unwrap();
+    let ids = lix
+        .query("SELECT id FROM api_item WHERE id >= 100 ORDER BY id")
+        .all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<i64>(0).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [100, 201]);
+    assert_eq!(
+        lix.execute_many("SELECT $1", Vec::<[Value; 1]>::new())
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_NOT_A_WRITE
+    );
+}
+
+#[tokio::test]
+async fn returning_rows_over_the_cap_fail_without_committing() {
+    let lix = seeded(50).await;
+    let error = lix
+        .execute("UPDATE api_item SET label = 'capped' RETURNING id, label")
+        .max_bytes(256)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+    assert_eq!(
+        lix.query("SELECT count(*) AS n FROM api_item WHERE label = 'capped'")
+            .one()
+            .await
+            .unwrap()
+            .get::<i64>("n")
+            .unwrap(),
+        0,
+        "an auto-commit write over the cap must not commit"
+    );
+
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO api_item (id, label) VALUES (500, 'kept')")
+        .await
+        .unwrap();
+    let error = transaction
+        .execute("UPDATE api_item SET label = 'capped' RETURNING id, label")
+        .max_bytes(256)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+    transaction.commit().await.unwrap();
+    assert_eq!(count(&lix).await, 51, "the earlier transaction write commits");
+    assert_eq!(
+        lix.query("SELECT count(*) AS n FROM api_item WHERE label = 'capped'")
+            .one()
+            .await
+            .unwrap()
+            .get::<i64>("n")
+            .unwrap(),
+        0,
+        "the capped statement was rolled back inside the transaction"
+    );
+    // Within the cap, RETURNING rows come back.
+    let returned = lix
+        .execute("UPDATE api_item SET label = 'small' WHERE id = 1 RETURNING id")
+        .await
+        .unwrap();
+    assert_eq!(returned.len(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_and_transaction_reads_are_capped() {
+    let lix = seeded(100).await;
+    let snapshot = lix.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot
+            .query("SELECT id, label FROM api_item")
+            .max_bytes(128)
+            .all()
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_RESULT_TOO_LARGE
+    );
+    assert_eq!(
+        snapshot
+            .query("SELECT id, label FROM api_item")
+            .max_bytes(usize::MAX)
+            .all()
+            .await
+            .unwrap()
+            .len(),
+        100
+    );
+    let transaction = lix.begin_transaction().await.unwrap();
+    assert_eq!(
+        transaction
+            .query("SELECT id, label FROM api_item")
+            .max_bytes(128)
+            .all()
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_RESULT_TOO_LARGE
+    );
+    transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn buffered_streams_use_the_query_byte_cap() {
+    let lix = seeded(1).await;
+    for index in 0..3 {
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .bind(format!("/big-{index}.bin"))
+            .bind(vec![7_u8; 10_000])
+            .await
+            .unwrap();
+    }
+    let sql = "SELECT path, content FROM lix_file ORDER BY path";
+    let error = lix
+        .query(sql)
+        .max_bytes(4096)
+        .stream()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+    assert!(error.message.contains("buffered"), "{}", error.message);
+    for stream in [
+        lix.query(sql).stream().await.unwrap(),
+        lix.snapshot()
+            .await
+            .unwrap()
+            .query(sql)
+            .max_bytes(usize::MAX)
+            .stream()
+            .await
+            .unwrap(),
+    ] {
+        let mut stream = stream;
+        let mut rows = 0;
+        while stream.try_next().await.unwrap().is_some() {
+            rows += 1;
+        }
+        assert!(rows >= 3);
+    }
 }

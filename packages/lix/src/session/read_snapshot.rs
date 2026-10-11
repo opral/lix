@@ -8,8 +8,13 @@
 //!
 //! Lifetime: the view is released when the snapshot is closed, or once its
 //! last handle and its last stream are dropped (a stream keeps reading after
-//! the handle that opened it is gone). Nothing expires while it is held.
-//! Closing the session closes its snapshots.
+//! the handle that opened it is gone). Closing waits until reads in flight
+//! have dropped the view. Closing the session closes its snapshots.
+//!
+//! Nothing in the engine expires a snapshot. Two storage-level exceptions:
+//! a backend may expire a long-held read view, and on a partial replica the
+//! authority may stop retaining inputs the snapshot still has to fetch. Both
+//! surface as `LIX_STORAGE_READ_EXPIRED`; open a new snapshot to continue.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -34,6 +39,10 @@ use super::{SessionBranch, SessionContext};
 pub(crate) struct PinnedRead<StorageImpl: Storage + 'static> {
     pub(crate) read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
     storage: Arc<StorageAdapter<StorageImpl>>,
+    /// Which extension of the snapshot's view this is (partial replicas
+    /// layer hydrated inputs over the pinned view).
+    generation: u64,
+    _in_flight: InFlight,
 }
 
 impl<StorageImpl: Storage + 'static> Clone for PinnedRead<StorageImpl> {
@@ -41,6 +50,45 @@ impl<StorageImpl: Storage + 'static> Clone for PinnedRead<StorageImpl> {
         Self {
             read: self.read.clone(),
             storage: Arc::clone(&self.storage),
+            generation: self.generation,
+            _in_flight: self._in_flight.clone(),
+        }
+    }
+}
+
+/// Counts live holders of a snapshot's view, so close can wait for them.
+#[derive(Default)]
+struct InFlightReads {
+    count: std::sync::atomic::AtomicUsize,
+    released: tokio::sync::Notify,
+}
+
+struct InFlight(Arc<InFlightReads>);
+
+impl InFlight {
+    fn new(reads: &Arc<InFlightReads>) -> Self {
+        reads
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(reads))
+    }
+}
+
+impl Clone for InFlight {
+    fn clone(&self) -> Self {
+        Self::new(&self.0)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.released.notify_waiters();
         }
     }
 }
@@ -59,6 +107,7 @@ pub(crate) struct ReadSnapshot<StorageImpl: Storage + 'static> {
     commit_id: String,
     storage_mutation_revision: Option<Vec<u8>>,
     streams: Arc<QueryStreamRegistry>,
+    in_flight: Arc<InFlightReads>,
     /// Partial replicas fetch missing immutable inputs through this channel
     /// and layer them over the pinned view; the pinned state never moves.
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
@@ -102,8 +151,16 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     fn close_snapshot(&self) {
-        self.close();
+        self.begin_close();
     }
+}
+
+fn snapshot_inputs_expired() -> LixError {
+    LixError::new(
+        LixError::CODE_STORAGE_READ_EXPIRED,
+        "the authority no longer retains inputs this snapshot still has to fetch",
+    )
+    .with_hint("Open a new snapshot to read the current state.")
 }
 
 pub(crate) fn snapshot_closed() -> LixError {
@@ -125,6 +182,7 @@ where
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let branch_id = self.bound_branch_id()?;
         let storage = Arc::new(self.storage.clone());
+        let in_flight = Arc::new(InFlightReads::default());
         let mut retries = crate::common::ExpiredReadRetryState::default();
         let (pinned, commit_id, storage_mutation_revision) = loop {
             let attempt = async {
@@ -136,6 +194,8 @@ where
                 let pinned = PinnedRead {
                     read: SharedStorageAdapterRead::new(read),
                     storage: Arc::clone(&storage),
+                    generation: 0,
+                    _in_flight: InFlight::new(&in_flight),
                 };
                 let head = self
                     .branch_ctx
@@ -178,6 +238,7 @@ where
             commit_id,
             storage_mutation_revision,
             streams: Arc::default(),
+            in_flight,
             sync_demand_tx: sync_demand_tx
                 .filter(|_| self.sync_mode.role() == crate::sync::SyncRole::PartialReplica),
         });
@@ -187,7 +248,7 @@ where
         // A close that ran while this snapshot was opening has already
         // drained the registry; do not hand out a snapshot it missed.
         if let Err(error) = self.ensure_open() {
-            snapshot.close();
+            snapshot.begin_close();
             return Err(error);
         }
         Ok(snapshot)
@@ -240,10 +301,10 @@ where
         }
     }
 
-    /// Closes the snapshot for every clone: its streams stop, later reads
-    /// fail with `LIX_SNAPSHOT_CLOSED`, and its read view is released once
-    /// reads already in flight finish.
-    pub(crate) fn close(&self) {
+    /// Closes the snapshot for every clone: its streams stop and later reads
+    /// fail with `LIX_SNAPSHOT_CLOSED`. Reads already running keep their view
+    /// until they finish.
+    fn begin_close(&self) {
         let previous = std::mem::replace(
             &mut *self
                 .state
@@ -255,6 +316,26 @@ where
         drop(previous);
     }
 
+    /// Closes the snapshot and waits until every read that was in flight has
+    /// released the view. Idempotent.
+    pub(crate) async fn close(&self) {
+        self.begin_close();
+        loop {
+            let released = self.in_flight.released.notified();
+            futures_util::pin_mut!(released);
+            released.as_mut().enable();
+            if self
+                .in_flight
+                .count
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                return;
+            }
+            released.await;
+        }
+    }
+
     /// Runs one buffered read against the pinned state, under the read
     /// limits of the calling scope.
     pub(crate) async fn query(
@@ -264,9 +345,13 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let session = &self.session;
         let statement = session.parse_read_only_statement(sql, params)?;
-        let _operation_guard = session.begin_waitable_session_operation().await?;
+        let has_runtime_function = crate::sql2::statement_has_durable_runtime_function(&statement);
         let mut retry = crate::sync::SyncDemandRetry::default();
         let (read_result, file_view_mutations, _, captured_interests) = loop {
+            // Hold the session guard only while reading, never across the
+            // network wait of a hydration, which would stall writers and
+            // close behind a slow transport.
+            let operation_guard = session.begin_waitable_session_operation().await?;
             let pinned = self.pinned()?;
             let read_plan = crate::sql2::plan_read_statement(&statement, params);
             let acknowledge_file_views = read_plan.acknowledge_file_views;
@@ -278,20 +363,42 @@ where
                     params,
                     acknowledge_file_views,
                     read_plan,
-                    false,
+                    has_runtime_function,
                 )
                 .await
             {
                 Ok(result) => break result,
                 Err(error) => error,
             };
-            if !self.extend_with_hydrated_inputs(&pinned, &error, &mut retry).await? {
+            drop(operation_guard);
+            if !self
+                .extend_with_hydrated_inputs(&pinned, &error, &mut retry)
+                .await?
+            {
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
+        // Outside deterministic mode uuidv7() and current_timestamp use the
+        // system clock and persist nothing. Deterministic mode advances a
+        // persisted sequence, which a pinned snapshot cannot do without
+        // reusing values; such reads belong on the live handle.
+        if read_result
+            .runtime_functions
+            .as_ref()
+            .is_some_and(crate::functions::FunctionContext::deterministic_mode_enabled)
+        {
+            return Err(LixError::new(
+                LixError::CODE_READ_ONLY,
+                "in deterministic mode, uuidv7() and current_timestamp advance a persisted \
+                 sequence that a pinned snapshot cannot advance",
+            )
+            .with_hint("Call them through Lix::query() or execute() instead of a snapshot."));
+        }
         if let Some(capture) = captured_interests {
             capture.publish_capture()?;
         }
+        let mut read_result = read_result;
+        read_result.runtime_functions = None;
         let result = ExecuteResult::from_session_read_result(read_result)
             .with_file_view_mutations(file_view_mutations);
         session
@@ -321,40 +428,50 @@ where
         }
         let hydrated = retry
             .hydrate_pinned_for_retry(Some(sender), error.clone())
-            .await?;
-        let Some(read) = crate::transaction::extend_pinned_read_with_hydrated_inputs(
-            &pinned.storage,
-            &pinned.read,
-            error,
-            &hydrated,
-            |manifests| Ok(vec![false; manifests.len()]),
-            || {
-                LixError::new(
-                    LixError::CODE_STORAGE_READ_EXPIRED,
-                    "the authority no longer retains this snapshot's inputs",
-                )
-                .with_hint("Open a new snapshot.")
-            },
-        )
-        .await?
-        else {
-            return Ok(false);
-        };
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &mut *state {
-            SnapshotState::Open(current) => {
-                // SAFETY of the widened read: it borrows the same storage Arc
-                // the pinned read keeps alive.
-                *current = PinnedRead {
-                    read,
-                    storage: Arc::clone(&pinned.storage),
-                };
-                Ok(true)
+            .await
+            .map_err(|error| {
+                if error.code == LixError::CODE_TRANSACTION_CONFLICT {
+                    snapshot_inputs_expired()
+                } else {
+                    error
+                }
+            })?;
+        // Layer the hydrated inputs over the snapshot's current view. When a
+        // concurrent read extended the view meanwhile, extend that extension
+        // instead of replacing it, so neither read's inputs are lost.
+        let mut base = pinned.clone();
+        loop {
+            let Some(read) = crate::transaction::extend_pinned_read_with_hydrated_inputs(
+                &base.storage,
+                &base.read,
+                error,
+                &hydrated,
+                |manifests| Ok(vec![false; manifests.len()]),
+                snapshot_inputs_expired,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut *state {
+                SnapshotState::Open(current) if current.generation == base.generation => {
+                    // The extension borrows the same storage Arc the pinned
+                    // read keeps alive.
+                    *current = PinnedRead {
+                        read,
+                        storage: Arc::clone(&base.storage),
+                        generation: base.generation + 1,
+                        _in_flight: InFlight::new(&self.in_flight),
+                    };
+                    return Ok(true);
+                }
+                SnapshotState::Open(current) => base = current.clone(),
+                SnapshotState::Closed => return Err(snapshot_closed()),
             }
-            SnapshotState::Closed => Err(snapshot_closed()),
         }
     }
 
@@ -366,6 +483,7 @@ where
         sql: &str,
         params: &[Value],
         limits: PageLimits,
+        buffer_limits: crate::common::ReadLimits,
     ) -> Result<RowStream, LixError> {
         let session = &self.session;
         let statement = session.parse_read_only_statement(sql, params)?;
@@ -379,7 +497,12 @@ where
                 // like the producer of a live stream.
                 let result = unsafe {
                     super::AssumeSendFuture::new(async move {
-                        snapshot.query(&sql, &params).await
+                        crate::common::with_read_limits(
+                            buffer_limits,
+                            snapshot.query(&sql, &params),
+                        )
+                        .await
+                        .map_err(crate::handle::buffered_stream_error)
                     })
                 };
                 session

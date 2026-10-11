@@ -101,6 +101,11 @@ impl ResultPager {
             self.pending
                 .push(batch.slice(slice_start, rows - slice_start));
         }
+        // Hand a full page out now rather than when the next row arrives, so
+        // a small first page is not held back by a slow scan.
+        if self.pending_rows >= self.limits.rows_for_page(self.pages_emitted) {
+            pages.push(self.take_page()?);
+        }
         Ok(pages)
     }
 
@@ -161,6 +166,49 @@ pub(crate) fn batch_public_row_bytes(batch: &RecordBatch) -> Vec<usize> {
         }
     }
     bytes
+}
+
+/// Public value bytes of a whole batch: the sum of [`batch_public_row_bytes`]
+/// computed per column, without a per-row vector for offset-encoded columns.
+pub(crate) fn batch_public_bytes(batch: &RecordBatch) -> usize {
+    fn span<O: Copy + TryInto<usize>>(offsets: &[O]) -> usize {
+        match (offsets.first(), offsets.last()) {
+            (Some(first), Some(last)) => {
+                let first = (*first).try_into().unwrap_or(0);
+                (*last).try_into().unwrap_or(first).saturating_sub(first)
+            }
+            _ => 0,
+        }
+    }
+    let mut total = batch
+        .num_rows()
+        .saturating_mul(batch.num_columns())
+        .saturating_mul(size_of::<Value>());
+    for array in batch.columns() {
+        let payload = match array.data_type() {
+            DataType::Utf8 => span(array.as_string::<i32>().value_offsets()),
+            DataType::LargeUtf8 => span(array.as_string::<i64>().value_offsets()),
+            DataType::Binary => span(array.as_binary::<i32>().value_offsets()),
+            DataType::LargeBinary => span(array.as_binary::<i64>().value_offsets()),
+            DataType::Utf8View => {
+                let array = array.as_string_view();
+                (0..array.len())
+                    .filter(|row| array.is_valid(*row))
+                    .map(|row| array.value(row).len())
+                    .sum()
+            }
+            DataType::BinaryView => {
+                let array = array.as_binary_view();
+                (0..array.len())
+                    .filter(|row| array.is_valid(*row))
+                    .map(|row| array.value(row).len())
+                    .sum()
+            }
+            _ => 0,
+        };
+        total = total.saturating_add(payload);
+    }
+    total
 }
 
 fn add_offset_lengths<O>(bytes: &mut [usize], offsets: &[O])
@@ -296,5 +344,20 @@ mod tests {
             .map(|page| page_rows(page).len())
             .collect::<Vec<_>>();
         assert_eq!(sizes, vec![3, 5, 5, 1]);
+    }
+
+    #[test]
+    fn a_full_page_is_emitted_without_waiting_for_the_next_row() {
+        let mut pager = ResultPager::new(
+            fields(),
+            PageLimits {
+                first_rows: 4,
+                rows: 8,
+                bytes: usize::MAX,
+            },
+        );
+        let pages = pager.push(batch(0, 4, 1)).unwrap();
+        assert_eq!(pages.len(), 1, "the first page is complete at four rows");
+        assert!(pager.finish().unwrap().is_none());
     }
 }

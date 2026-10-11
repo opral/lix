@@ -23,15 +23,39 @@ struct CountingStorage {
     /// Point and scan requests fail with `ReadExpired` while this is nonzero;
     /// each failure consumes one.
     expiring_requests: Arc<AtomicUsize>,
+    /// While set, point and scan requests of read views opened before
+    /// `stall_before` wait; newer views (other operations) are unaffected.
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    stall_before: Arc<AtomicUsize>,
+}
+
+impl CountingStorage {
+    /// Stalls every read view opened so far.
+    fn stall_open_reads(&self) {
+        self.stall_before
+            .store(self.opened_reads.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.stalled.store(true, Ordering::SeqCst);
+    }
 }
 
 struct CountingRead {
     inner: MemoryRead,
     live_reads: Arc<AtomicUsize>,
     expiring_requests: Arc<AtomicUsize>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    stall_before: Arc<AtomicUsize>,
+    ordinal: usize,
 }
 
 impl CountingRead {
+    async fn stall(&self) {
+        while self.stalled.load(Ordering::SeqCst)
+            && self.ordinal < self.stall_before.load(Ordering::SeqCst)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     fn expire(&self) -> Result<(), StorageError> {
         let expired = self
             .expiring_requests
@@ -61,6 +85,7 @@ impl StorageRead for CountingRead {
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
+        self.stall().await;
         self.expire()?;
         self.inner.get_many(requests).await
     }
@@ -91,6 +116,7 @@ impl StorageRead for CountingRead {
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> Result<ScanCursor<'_>, StorageError> {
+        self.stall().await;
         self.expire()?;
         self.inner.begin_scan(space, range, opts).await
     }
@@ -120,11 +146,14 @@ impl Storage for CountingStorage {
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         let inner = self.inner.begin_read(opts).await?;
         self.live_reads.fetch_add(1, Ordering::SeqCst);
-        self.opened_reads.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.opened_reads.fetch_add(1, Ordering::SeqCst);
         Ok(CountingRead {
             inner,
             live_reads: Arc::clone(&self.live_reads),
             expiring_requests: Arc::clone(&self.expiring_requests),
+            stalled: Arc::clone(&self.stalled),
+            stall_before: Arc::clone(&self.stall_before),
+            ordinal,
         })
     }
 
@@ -510,17 +539,14 @@ async fn closing_the_handle_cancels_open_streams() {
     with_timeout("close", lix.close()).await.unwrap();
     assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
     for stream in [&mut started, &mut unstarted] {
-        // Rows already delivered to the stream may still be read; the stream
-        // then fails instead of ending normally.
-        let error = loop {
-            match stream.next_page().await {
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("a cancelled stream must not end normally"),
-                Err(error) => break error,
-            }
-        };
+        // The next pull fails, even though rows of the first page were
+        // already buffered, and every later pull fails the same way.
+        let error = stream.next_page().await.unwrap_err();
         assert_eq!(error.code, LixError::CODE_CLOSED);
-        assert!(stream.next_page().await.unwrap().is_none());
+        assert_eq!(
+            stream.try_next().await.unwrap_err().code,
+            LixError::CODE_CLOSED
+        );
     }
     let error = lix
         .query("SELECT id FROM stream_item")
@@ -537,8 +563,6 @@ async fn streams_are_read_only() {
         "INSERT INTO stream_tag (id, item_id, name) VALUES ('x', 'item-00001', 'x')",
         "UPDATE stream_item SET grp = 0",
         "DELETE FROM stream_tag",
-        "SELECT uuidv7() AS id",
-        "SELECT current_timestamp() AS now",
     ] {
         let error = lix.query(sql).stream().await.unwrap_err();
         assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
@@ -602,10 +626,19 @@ async fn file_content_reads_are_paged_from_a_buffered_result() {
 #[tokio::test]
 async fn streams_exceed_the_buffered_read_budget() {
     let lix = seeded(Memory::new()).await;
-    // More than a million rows: buffered reads have no row budget, only bytes.
+    // More than a million rows: buffered reads have no row budget, only a
+    // byte cap (which charges each row's cost) that callers may lift.
     let rows = 1_001_000;
     let sql = format!("SELECT value FROM generate_series(1, {rows})");
-    assert_eq!(lix.query(&sql).all().await.unwrap().len(), rows);
+    assert_eq!(
+        lix.query(&sql)
+            .max_bytes(usize::MAX)
+            .all()
+            .await
+            .unwrap()
+            .len(),
+        rows
+    );
     let mut stream = lix.query(&sql).stream().await.unwrap();
     let mut seen = 0usize;
     let mut pages = 0usize;
@@ -695,7 +728,11 @@ async fn expiry_before_the_first_page_retries_and_after_it_surfaces() {
         opened,
         "no retry after a page"
     );
-    assert!(stream.next_page().await.unwrap().is_none());
+    // The error is latched: later pulls fail the same way.
+    assert_eq!(
+        stream.next_page().await.unwrap_err().code,
+        LixError::CODE_STORAGE_READ_EXPIRED
+    );
     assert_eq!(lix.running_query_stream_count_for_test(), 0);
 }
 
@@ -716,4 +753,149 @@ async fn only_statements_that_need_the_whole_result_are_paged_from_a_buffer() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_cancelled_pull_releases_its_session_guard() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    // Consume the buffered first page so the next pull needs the producer.
+    stream.next_page().await.unwrap().expect("first page");
+    storage.stall_open_reads();
+    // Rows already produced keep flowing; pull until one parks on storage.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), stream.try_next()).await {
+            Ok(Ok(Some(_))) => {}
+            Ok(other) => panic!("the stream must park on stalled storage: {other:?}"),
+            Err(_) => break,
+        }
+    }
+    // The abandoned pull must not keep writers or close waiting.
+    with_timeout(
+        "write after a cancelled pull",
+        lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1"),
+    )
+    .await
+    .unwrap();
+    storage.stalled.store(false, Ordering::SeqCst);
+    // The stream still works and still reads its own snapshot.
+    assert!(stream.try_next().await.unwrap().is_some());
+    drop(stream);
+    with_timeout("close after a cancelled pull", lix.close())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_abandoned_stream_poll_releases_its_session_guard() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    stream.next_page().await.unwrap().expect("first page");
+    storage.stall_open_reads();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
+            Ok(Some(Ok(_))) => {}
+            Ok(other) => panic!("the stream must park on stalled storage: {other:?}"),
+            Err(_) => break,
+        }
+    }
+    with_timeout(
+        "write after an abandoned Stream poll",
+        lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1"),
+    )
+    .await
+    .unwrap();
+    storage.stalled.store(false, Ordering::SeqCst);
+    assert!(stream.next().await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn a_stream_error_is_latched() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let sql = "SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag";
+    let open = || {
+        lix.query(sql)
+            .page_limits(byte_pages(256))
+            .stream()
+    };
+    let mut stream = open().await.unwrap();
+    storage
+        .expiring_requests
+        .store(usize::MAX, Ordering::SeqCst);
+    let error = loop {
+        match stream.next_page().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("an error must not end the stream normally"),
+            Err(error) => break error,
+        }
+    };
+    for _ in 0..2 {
+        assert_eq!(stream.next_page().await.unwrap_err().code, error.code);
+        assert_eq!(stream.try_next().await.unwrap_err().code, error.code);
+    }
+    storage.expiring_requests.store(0, Ordering::SeqCst);
+
+    // The Stream impl yields the error once, then ends.
+    let mut stream = open().await.unwrap();
+    storage
+        .expiring_requests
+        .store(usize::MAX, Ordering::SeqCst);
+    let mut errors = 0;
+    while let Some(item) = stream.next().await {
+        errors += usize::from(item.is_err());
+    }
+    storage.expiring_requests.store(0, Ordering::SeqCst);
+    assert_eq!(errors, 1);
+}
+
+#[tokio::test]
+async fn closing_or_dropping_a_snapshot_releases_its_read_view() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let idle = storage.live_reads.load(Ordering::SeqCst);
+
+    let snapshot = lix.snapshot().await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    let stream = snapshot
+        .query("SELECT id FROM stream_item")
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    snapshot.close().await.unwrap();
+    assert_eq!(
+        storage.live_reads.load(Ordering::SeqCst),
+        idle,
+        "close releases the view, including the one its stream was reading"
+    );
+    drop(stream);
+
+    // Without close: the view lives while a handle or stream holds it.
+    let snapshot = lix.snapshot().await.unwrap();
+    let mut stream = snapshot
+        .query("SELECT id FROM stream_item")
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    drop(snapshot);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    while stream.try_next().await.unwrap().is_some() {}
+    drop(stream);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
 }

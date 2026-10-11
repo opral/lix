@@ -1681,6 +1681,13 @@ async fn rs_sdk_writes_return_the_commit_span_they_published() {
         .all()
         .await
         .unwrap();
-    assert!(!read.is_empty(), "reads carry rows and no commit span");
+    // A read reports rows only: QueryResult has no commit span to carry.
+    assert_eq!(
+        read.rows()
+            .iter()
+            .map(|row| row.get::<serde_json::Value>("value").unwrap())
+            .collect::<Vec<_>>(),
+        [serde_json::json!("one")]
+    );
     lix.close().await.unwrap();
 }

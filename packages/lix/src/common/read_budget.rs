@@ -110,8 +110,13 @@ impl ReadResultBudget {
         }
     }
 
+    /// Charges `bytes` of public values plus the fixed cost of `rows` rows,
+    /// so the cap tracks the memory the buffered `Row`s will take.
     pub(crate) fn charge(&mut self, bytes: usize, rows: usize) -> Result<(), LixError> {
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.bytes = self
+            .bytes
+            .saturating_add(bytes)
+            .saturating_add(rows.saturating_mul(size_of::<crate::Row>()));
         self.rows = self.rows.saturating_add(rows);
         if self.limits.max_rows.is_some_and(|max_rows| self.rows > max_rows) {
             return Err(not_unique());
@@ -150,13 +155,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_budget_caps_bytes_but_not_rows() {
+    fn default_budget_caps_bytes_including_per_row_cost() {
         let mut budget = ReadResultBudget::default();
-        budget.charge(DEFAULT_MAX_RESULT_BYTES, usize::MAX / 2).unwrap();
+        budget.charge(DEFAULT_MAX_RESULT_BYTES, 0).unwrap();
         let error = budget.charge(1, 0).unwrap_err();
         assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
         assert!(error.hint.as_deref().unwrap_or_default().contains("stream()"));
         assert!(budget.charge(usize::MAX, usize::MAX).is_err());
+        // Rows of empty values still cost their row and slot memory.
+        let mut budget = ReadResultBudget::new(ReadLimits::bytes(1024));
+        assert_eq!(
+            budget.charge(0, 1024).unwrap_err().code,
+            LixError::CODE_RESULT_TOO_LARGE
+        );
     }
 
     #[tokio::test]
@@ -173,7 +184,7 @@ mod tests {
         assert_eq!(tight.unwrap_err().code, LixError::CODE_RESULT_TOO_LARGE);
         let single = with_read_limits(ReadLimits::single_row(), async {
             let mut budget = ReadResultBudget::default();
-            budget.charge(usize::MAX / 2, 1)?;
+            budget.charge(usize::MAX / 4, 1)?;
             budget.charge(1, 1)
         })
         .await;

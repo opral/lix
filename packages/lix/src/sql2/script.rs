@@ -13,9 +13,8 @@ pub struct SqlScriptStatement {
     pub sql: String,
     /// The request-wide parameter range to bind to this statement.
     pub params: Range<usize>,
-    /// Whether the statement is a pure read: run it with `query`. Otherwise
-    /// it writes (or calls a durable runtime function): run it with
-    /// `execute`.
+    /// Whether the statement is a read: run it with `query`. Otherwise it
+    /// writes: run it with `execute`.
     pub read_only: bool,
 }
 
@@ -97,6 +96,28 @@ pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScr
     };
 
     build_atomic_plan(executable, provided_param_count)
+}
+
+/// How a single statement may be run: what remote handles check before
+/// sending SQL to the server, with the parser and routing the engine uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatementClass {
+    pub(crate) read_only: bool,
+    pub(crate) returning: bool,
+}
+
+pub(crate) fn classify_statement(sql: &str) -> Result<StatementClass, LixError> {
+    let statements = parse_statements(sql)?;
+    let [statement] = statements.as_slice() else {
+        return Err(LixError::new(
+            LixError::CODE_PARSE_ERROR,
+            "Lix SQL only supports one statement per call",
+        ));
+    };
+    Ok(StatementClass {
+        read_only: super::read_only_statement(&statement.statement),
+        returning: super::statement_has_returning(&statement.statement),
+    })
 }
 
 fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>, LixError> {
@@ -323,7 +344,7 @@ mod tests {
                 .iter()
                 .map(|statement| statement.read_only)
                 .collect::<Vec<_>>(),
-            [true, false, false, false]
+            [true, false, true, false]
         );
     }
 

@@ -44,14 +44,15 @@ mod value_contract;
 mod write_normalization;
 
 pub(crate) use error::datafusion_error_to_lix_error;
+pub(crate) use script::{StatementClass, classify_statement};
 
-/// Whether `query()` accepts the statement: a bound read that calls no
-/// runtime function whose state persists.
+/// Whether `query()` accepts the statement: a bound read. Reads that call
+/// `uuidv7()` or `current_timestamp` are reads too.
 pub(crate) fn read_only_statement(statement: &datafusion::sql::parser::Statement) -> bool {
     matches!(
         bind_statement_route(statement),
         Ok(BoundStatementRoute::Read)
-    ) && !statement_has_durable_runtime_function(statement)
+    )
 }
 
 #[cfg(test)]
@@ -75,7 +76,8 @@ pub(crate) use context::{
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 pub(crate) use exec::{
-    PageLimits, ResultPager, execute_read_statement_in_session_with_batch_stream,
+    PageLimits, ResultPager, batch_public_bytes,
+    execute_read_statement_in_session_with_batch_stream,
 };
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]

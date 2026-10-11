@@ -173,7 +173,7 @@ simulation_test!(
             .await
             .expect("partial relation-row checkpoint should succeed");
         let checkpoint_commit_id = match checkpointed.get(&checkpointed.rows()[0], "commit_id") {
-            Some(Value::Text(commit_id)) => commit_id.clone(),
+            Ok(Value::Text(commit_id)) => commit_id.clone(),
             value => panic!("checkpoint RETURNING should contain a commit ID, got {value:?}"),
         };
         let child_head = engine
@@ -399,7 +399,7 @@ simulation_test!(
             .expect("checkpoint of the delete should succeed");
         let checkpoint_id = match deleted_checkpoint.get(&deleted_checkpoint.rows()[0], "commit_id")
         {
-            Some(Value::Text(commit_id)) => commit_id.clone(),
+            Ok(Value::Text(commit_id)) => commit_id.clone(),
             value => panic!("checkpoint must return commit id, got {value:?}"),
         };
         session

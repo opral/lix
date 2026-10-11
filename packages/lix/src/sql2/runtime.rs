@@ -587,7 +587,7 @@ async fn collect_bounded_read_stream(
 ) -> Result<()> {
     while let Some(batch) = stream.try_next().await? {
         budget
-            .charge(batch.get_array_memory_size(), batch.num_rows())
+            .charge(super::batch_public_bytes(&batch), batch.num_rows())
             .map_err(super::error::lix_error_to_datafusion_error)?;
         batches.push(batch);
     }
@@ -610,7 +610,7 @@ mod read_output_tests {
             vec![Arc::new(Int64Array::from_iter_values(0..1_000))],
         )
         .unwrap();
-        let batch_bytes = batch.get_array_memory_size();
+        let batch_bytes = crate::sql2::batch_public_bytes(&batch);
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = polls.clone();
         let stream = RecordBatchStreamAdapter::new(

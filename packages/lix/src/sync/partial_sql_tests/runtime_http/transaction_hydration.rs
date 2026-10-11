@@ -113,7 +113,7 @@ async fn snapshot_hydrates_native_inputs_without_moving_its_state() {
                 "before",
                 "hydration must not advance the snapshot"
             );
-            snapshot.close();
+            snapshot.close().await;
         };
         let hydrate = async {
             let count =

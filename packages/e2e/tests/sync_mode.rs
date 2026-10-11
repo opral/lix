@@ -24,8 +24,8 @@ use lix::server_protocol::{
 };
 use lix::storage::Storage;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, ServerOptions,
-    SwitchBranchOptions, Value, WireValue, open_lix,
+    CreateBranchOptions, Lix, LixError, Memory, ServerOptions, SwitchBranchOptions, Value,
+    WireValue, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use serde_json::{Value as JsonValue, json};
@@ -388,19 +388,17 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
         execute_atomically(
             &authority,
             &[
-                ExecuteBatchStatement {
-                    label: None,
-                    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
-                    params: vec![
+                (
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
+                    vec![
                         Value::Text(path.clone()),
                         Value::Blob(b"temporary".to_vec().into()),
                     ],
-                },
-                ExecuteBatchStatement {
-                    label: None,
-                    sql: "DELETE FROM lix_file WHERE path = $1".to_owned(),
-                    params: vec![Value::Text(path)],
-                },
+                ),
+                (
+                    "DELETE FROM lix_file WHERE path = $1".to_owned(),
+                    vec![Value::Text(path)],
+                ),
             ],
         )
         .await
@@ -499,17 +497,18 @@ async fn profile_certified_hot_case(
         .await
         .expect("checkpoint HOT profile baseline");
     let updates = (0..dirty_rows)
-        .map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_owned(),
-            params: vec![
-                Value::Blob(if index == 0 {
-                    vec![b'x'; 1024 * 1024].into()
-                } else {
-                    format!("dirty-{index:05}").into_bytes().into()
-                }),
-                Value::Text(format!("/hot-profile-row-{index:05}.txt")),
-            ],
+        .map(|index| {
+            (
+                "UPDATE lix_file SET content = $1 WHERE path = $2".to_owned(),
+                vec![
+                    Value::Blob(if index == 0 {
+                        vec![b'x'; 1024 * 1024].into()
+                    } else {
+                        format!("dirty-{index:05}").into_bytes().into()
+                    }),
+                    Value::Text(format!("/hot-profile-row-{index:05}.txt")),
+                ],
+            )
         })
         .collect::<Vec<_>>();
     execute_atomically(&authority, &updates)
@@ -619,13 +618,14 @@ async fn seed_hot_profile_rows(authority: &Lix<Memory>, live_rows: usize) {
     for batch_start in (0..live_rows).step_by(BATCH_ROWS) {
         let batch_end = (batch_start + BATCH_ROWS).min(live_rows);
         let statements = (batch_start..batch_end)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
-                params: vec![
-                    Value::Text(format!("/hot-profile-row-{index:05}.txt")),
-                    Value::Blob(format!("baseline-{index:05}").into_bytes().into()),
-                ],
+            .map(|index| {
+                (
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)".to_owned(),
+                    vec![
+                        Value::Text(format!("/hot-profile-row-{index:05}.txt")),
+                        Value::Blob(format!("baseline-{index:05}").into_bytes().into()),
+                    ],
+                )
             })
             .collect::<Vec<_>>();
         execute_atomically(&authority, &statements)
@@ -947,8 +947,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     assert!(!history.rows().is_empty());
     for sql in [
         "INSERT INTO lix_key_value (key, value) VALUES ('coherent-write', 'must-not-exist')",
-        "SELECT uuidv7()",
-        "SELECT current_timestamp",
+        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
     ] {
         let snapshot = replica.snapshot().await.expect("open replica snapshot");
         let error = snapshot
@@ -1141,13 +1140,14 @@ impl HttpProbe {
 async fn fresh_open_defers_rows_and_point_reads_hydrate_native_inputs() {
     let (authority_storage, authority) = open_authority().await;
     let statements = (0..BOOTSTRAP_ROW_COUNT)
-        .map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
-            params: vec![
-                Value::Text(format!("snapshot-page-{index:04}")),
-                Value::Text(format!("value-{index}")),
-            ],
+        .map(|index| {
+            (
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
+                vec![
+                    Value::Text(format!("snapshot-page-{index:04}")),
+                    Value::Text(format!("value-{index}")),
+                ],
+            )
         })
         .collect::<Vec<_>>();
     execute_atomically(&authority, &statements)
@@ -1454,19 +1454,16 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
     execute_atomically(
         &authority,
         &[
-            ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_file (path, content) VALUES ('/inherited-head.bin', $1)"
+            (
+                "INSERT INTO lix_file (path, content) VALUES ('/inherited-head.bin', $1)"
                     .to_owned(),
-                params: vec![Value::Blob(inherited_head.clone().into())],
-            },
-            ExecuteBatchStatement {
-                label: None,
-                sql:
-                    "INSERT INTO lix_file (path, content) VALUES ('/inherited-checkpoint.bin', $1)"
-                        .to_owned(),
-                params: vec![Value::Blob(inherited_checkpoint.clone().into())],
-            },
+                vec![Value::Blob(inherited_head.clone().into())],
+            ),
+            (
+                "INSERT INTO lix_file (path, content) VALUES ('/inherited-checkpoint.bin', $1)"
+                    .to_owned(),
+                vec![Value::Blob(inherited_checkpoint.clone().into())],
+            ),
         ],
     )
     .await
@@ -2413,10 +2410,24 @@ async fn partial_replica_open_profile() {
             } else {
                 Vec::new()
             };
+            let read_only = lix::parse_sql_script(sql, parameters.len())
+                .unwrap()
+                .statements[0]
+                .read_only;
             let before = probe.attempted_requests.load(Ordering::Relaxed);
             let bytes_before = probe.response_body_bytes.load(Ordering::Relaxed);
             let started = Instant::now();
-            let result = replica.execute(sql).params(&parameters).await.unwrap();
+            let result: lix::ExecuteResult = if read_only {
+                replica
+                    .query(sql)
+                    .params(&parameters)
+                    .all()
+                    .await
+                    .unwrap()
+                    .into()
+            } else {
+                replica.execute(sql).params(&parameters).await.unwrap()
+            };
             if operation == "read_own_write" {
                 let value = result.rows()[0].get::<Value>("value").unwrap();
                 let value = match value {
@@ -2494,12 +2505,21 @@ async fn local_first_foreground_profile_scorecard() {
                     "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
                 ),
             ] {
+                let read_only = lix::parse_sql_script(sql, 0).unwrap().statements[0].read_only;
                 let scope = AllocationScope::start();
                 let start = Instant::now();
-                replica
-                    .execute(sql)
-                    .await
-                    .expect("profile foreground operation");
+                if read_only {
+                    replica
+                        .query(sql)
+                        .all()
+                        .await
+                        .expect("profile foreground operation");
+                } else {
+                    replica
+                        .execute(sql)
+                        .await
+                        .expect("profile foreground operation");
+                }
                 let elapsed = start.elapsed();
                 let allocation = scope.finish();
                 records.push(json!({"live_rows": width, "rtt_ms": rtt_ms,
@@ -3762,34 +3782,18 @@ async fn content_only_path_read_prepares_offline_update(scalar_expression: bool)
     stop_server(server).await;
 }
 
-/// Runs statements atomically in one transaction and returns each result:
-/// reads through `query`, writes through `execute`.
+/// Runs writes atomically in one transaction and returns each result.
 async fn execute_atomically<S>(
     lix: &Lix<S>,
-    statements: &[ExecuteBatchStatement],
+    statements: &[(String, Vec<Value>)],
 ) -> Result<Vec<lix::ExecuteResult>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let transaction = lix.begin_transaction().await?;
     let mut results = Vec::with_capacity(statements.len());
-    for statement in statements {
-        let read_only = lix::parse_sql_script(&statement.sql, statement.params.len())
-            .is_ok_and(|plan| plan.statements.iter().all(|statement| statement.read_only));
-        let result = if read_only {
-            transaction
-                .query(&statement.sql)
-                .params(&statement.params)
-                .all()
-                .await
-                .map(lix::ExecuteResult::from)
-        } else {
-            transaction
-                .execute(&statement.sql)
-                .params(&statement.params)
-                .await
-        };
-        match result {
+    for (sql, params) in statements {
+        match transaction.execute(sql).params(params).await {
             Ok(result) => results.push(result),
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -3799,4 +3803,122 @@ where
     }
     transaction.commit().await?;
     Ok(results)
+}
+
+#[tokio::test]
+async fn remote_handles_enforce_the_read_write_split() {
+    let (authority_storage, authority) = open_authority().await;
+    authority.close().await.expect("close authority setup");
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let remote = open_lix()
+        .with_server(ServerOptions::new(&url))
+        .await
+        .expect("open remote handle");
+
+    let error = remote
+        .query("INSERT INTO lix_key_value (key, value) VALUES ('remote-q', 'x')")
+        .all()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_READ_ONLY);
+    let error = remote
+        .execute("SELECT key FROM lix_key_value")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_NOT_A_WRITE);
+    let error = remote
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('remote-cap', 'x')")
+        .max_bytes(1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(
+        remote.query("SELECT 1").stream().await.unwrap_err().code,
+        "LIX_UNSUPPORTED_REMOTE_OPERATION"
+    );
+    assert_eq!(
+        remote.snapshot().await.unwrap_err().code,
+        "LIX_UNSUPPORTED_REMOTE_OPERATION"
+    );
+    assert!(
+        remote
+            .query("SELECT key FROM lix_key_value WHERE key = 'remote-q'")
+            .optional()
+            .await
+            .unwrap()
+            .is_none(),
+        "the rejected query wrote nothing"
+    );
+
+    let inserted = remote
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            [["remote-a", "1"], ["remote-b", "2"]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(inserted, 2);
+    assert_eq!(
+        remote
+            .execute_many("SELECT $1", Vec::<[Value; 1]>::new())
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_NOT_A_WRITE
+    );
+
+    // A remote transaction: reads see staged writes; a failed execute_many
+    // that staged part of its sets makes the transaction roll back.
+    let transaction = remote.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('remote-tx', 'x')")
+        .await
+        .unwrap();
+    assert!(
+        transaction
+            .query("SELECT key FROM lix_key_value WHERE key = 'remote-tx'")
+            .optional()
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        transaction
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('r', 'x')")
+            .with_max_auto_commit_retries(1)
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_INVALID_PARAM
+    );
+    let error = transaction
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            [
+                [Value::from("remote-tx-many"), Value::from("1")],
+                [Value::Null, Value::from("a key must not be null")],
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_ne!(error.code, "LIX_INTERNAL_ERROR");
+    assert_eq!(
+        transaction.commit().await.unwrap_err().code,
+        LixError::CODE_INVALID_TRANSACTION_STATE
+    );
+    for key in ["remote-tx", "remote-tx-many"] {
+        assert!(
+            remote
+                .query("SELECT key FROM lix_key_value WHERE key = $1")
+                .bind(key)
+                .optional()
+                .await
+                .unwrap()
+                .is_none(),
+            "{key} must have been rolled back"
+        );
+    }
+    remote.close().await.unwrap();
+    stop_server(server_task).await;
 }
