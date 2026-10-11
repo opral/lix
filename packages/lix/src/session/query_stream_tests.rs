@@ -584,10 +584,10 @@ async fn file_content_reads_are_paged_from_a_buffered_result() {
 #[tokio::test]
 async fn streams_exceed_the_buffered_read_budget() {
     let lix = seeded(Memory::new()).await;
-    let rows = crate::common::MAX_READ_RESULT_ROWS + 1_000;
+    // More than a million rows: buffered reads have no row budget, only bytes.
+    let rows = 1_001_000;
     let sql = format!("SELECT value FROM generate_series(1, {rows})");
-    let error = lix.execute(&sql, &[]).await.unwrap_err();
-    assert_eq!(error.code, "LIX_READ_RESOURCE_EXHAUSTED");
+    assert_eq!(lix.execute(&sql, &[]).await.unwrap().len(), rows);
     let mut stream = lix.query_stream(&sql, &[]).await.unwrap();
     let mut seen = 0usize;
     let mut pages = 0usize;
@@ -609,7 +609,7 @@ async fn streams_exceed_the_buffered_read_budget() {
     // 70 rows of ~1 MiB text exceed the 64 MiB byte budget.
     let big = "SELECT id, repeat('x', 1048576) AS blob FROM stream_item ORDER BY id LIMIT 70";
     let error = lix.execute(big, &[]).await.unwrap_err();
-    assert_eq!(error.code, "LIX_READ_RESOURCE_EXHAUSTED");
+    assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
     let mut stream = lix.query_stream(big, &[]).await.unwrap();
     let pages = drain(&mut stream).await.unwrap();
     let rows = page_rows(&pages);

@@ -31,7 +31,7 @@ use crate::{ExecuteResult, LixError, LixNotice, ResultColumnType, Value};
 /// Page size used when the caller does not choose one.
 pub const DEFAULT_QUERY_STREAM_PAGE_BYTES: usize = 1024 * 1024;
 /// Largest accepted page size: one page never exceeds the buffered budget.
-pub const MAX_QUERY_STREAM_PAGE_BYTES: usize = crate::common::MAX_READ_RESULT_BYTES;
+pub const MAX_QUERY_STREAM_PAGE_BYTES: usize = crate::common::DEFAULT_MAX_RESULT_BYTES;
 
 pub(crate) fn validate_page_bytes(page_bytes: usize) -> Result<usize, LixError> {
     if page_bytes == 0 || page_bytes > MAX_QUERY_STREAM_PAGE_BYTES {

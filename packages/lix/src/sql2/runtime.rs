@@ -600,18 +600,17 @@ mod read_output_tests {
     #[tokio::test]
     async fn result_collection_stops_polling_before_retaining_oversized_batch() {
         use datafusion::arrow::{
-            array::NullArray,
+            array::Int64Array,
             datatypes::{DataType, Field, Schema},
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Null, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(NullArray::new(
-                crate::common::MAX_READ_RESULT_ROWS + 1,
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(0..1_000))],
         )
         .unwrap();
+        let batch_bytes = batch.get_array_memory_size();
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = polls.clone();
         let stream = RecordBatchStreamAdapter::new(
@@ -622,13 +621,15 @@ mod read_output_tests {
             }),
         );
         let mut result = Vec::new();
-        let error =
-            collect_bounded_read_stream(Box::pin(stream), &mut Default::default(), &mut result)
-                .await
-                .unwrap_err();
+        let mut budget = crate::common::ReadResultBudget::new(crate::common::ReadLimits::bytes(
+            batch_bytes - 1,
+        ));
+        let error = collect_bounded_read_stream(Box::pin(stream), &mut budget, &mut result)
+            .await
+            .unwrap_err();
         assert_eq!(
             crate::sql2::error::datafusion_error_to_lix_error(error).code,
-            "LIX_READ_RESOURCE_EXHAUSTED"
+            crate::LixError::CODE_RESULT_TOO_LARGE
         );
         assert!(result.is_empty());
         assert_eq!(polls.load(Ordering::SeqCst), 1);

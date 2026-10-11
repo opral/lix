@@ -1,66 +1,135 @@
-//! Bounds for buffered foreground reads. Durable execution never enters the
-//! cancellable deadline; timeout must not obscure an accepted commit.
+//! The byte cap on buffered reads.
+//!
+//! A buffered read (`query().all()`, `execute()` RETURNING rows) collects its
+//! whole result in memory. The cap turns an accidental huge result into a loud
+//! `LIX_RESULT_TOO_LARGE` error instead of an out-of-memory crash, and the
+//! collection aborts as soon as the cap is crossed. Streams are not capped.
+//!
+//! The cap travels with the read as a task-local [`ReadLimits`] so every
+//! buffered collection point charges against the caller's choice without
+//! threading a parameter through the SQL runtime. There is no row budget and
+//! no deadline: callers cancel a read by dropping it.
 use crate::{LixError, Value};
-use std::time::Duration;
 
-pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(30);
-pub(crate) const MAX_READ_RESULT_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_READ_RESULT_ROWS: usize = 1_000_000;
+/// Default cap on the encoded bytes of one buffered result.
+pub(crate) const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) fn with_read_deadline<T>(
-    operation: impl Future<Output = Result<T, LixError>>,
-) -> impl Future<Output = Result<T, LixError>> {
-    // Keep the SQL operation out of the deadline future's inline state. Large
-    // provider futures otherwise multiply through each async wrapper and can
-    // overflow ordinary executor stacks even for small query results.
-    read_deadline(Box::pin(operation), READ_DEADLINE)
+/// The limits one buffered read collects under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadLimits {
+    /// Encoded result bytes; `usize::MAX` opts out.
+    pub(crate) max_bytes: usize,
+    /// Rows the caller accepts (single-row reads); `None` is unlimited.
+    pub(crate) max_rows: Option<usize>,
 }
 
-async fn read_deadline<T>(
-    operation: impl Future<Output = Result<T, LixError>>,
-    duration: Duration,
-) -> Result<T, LixError> {
-    use futures_util::{FutureExt, select_biased};
-    // Native callers may use any executor, including futures_lite without a
-    // Tokio reactor. A shared timer service preserves that public contract.
-    #[cfg(not(target_family = "wasm"))]
-    let deadline = futures_timer::Delay::new(duration).fuse();
-    #[cfg(target_family = "wasm")]
-    let deadline = crate::sync::sleep(duration).fuse();
-    let operation = operation.fuse();
-    futures_util::pin_mut!(deadline, operation);
-    select_biased! {
-        result = operation => result,
-        _ = deadline => Err(LixError::new("LIX_READ_DEADLINE_EXCEEDED",
-            "read preparation and execution exceeded the operation deadline")
-            .with_details(serde_json::json!({"deadlineMs":duration.as_millis()}))),
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_MAX_RESULT_BYTES,
+            max_rows: None,
+        }
     }
 }
 
-#[derive(Default)]
+impl ReadLimits {
+    pub(crate) fn bytes(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            max_rows: None,
+        }
+    }
+
+    /// At most one row, of any size.
+    pub(crate) fn single_row() -> Self {
+        Self {
+            max_bytes: usize::MAX,
+            max_rows: Some(1),
+        }
+    }
+}
+
+tokio::task_local! {
+    static READ_LIMITS: ReadLimits;
+}
+
+/// Runs `operation` with `limits` applied to every buffered collection inside it.
+pub(crate) fn with_read_limits<F: Future>(
+    limits: ReadLimits,
+    operation: F,
+) -> impl Future<Output = F::Output> {
+    READ_LIMITS.scope(limits, operation)
+}
+
+/// The limits of the read being executed, or the defaults outside any scope.
+pub(crate) fn current_read_limits() -> ReadLimits {
+    READ_LIMITS.try_with(|limits| *limits).unwrap_or_default()
+}
+
+pub(crate) fn result_too_large(max_bytes: usize) -> LixError {
+    LixError::new(
+        LixError::CODE_RESULT_TOO_LARGE,
+        format!(
+            "query result exceeds the {max_bytes}-byte buffered read cap; nothing was returned"
+        ),
+    )
+    .with_hint(
+        "Use stream() to read large results incrementally, or opt out of the cap \
+         (Rust: .max_bytes(usize::MAX), JS: { maxBytes: Infinity }).",
+    )
+    .with_details(serde_json::json!({ "maxBytes": max_bytes }))
+}
+
+pub(crate) fn not_unique() -> LixError {
+    LixError::new(
+        LixError::CODE_NOT_UNIQUE,
+        "query returned more than one row where at most one was expected",
+    )
+    .with_hint("Add a WHERE or LIMIT clause, or use query() / all() for several rows.")
+}
+
+/// Charges one buffered result against the current [`ReadLimits`].
 pub(crate) struct ReadResultBudget {
     bytes: usize,
     rows: usize,
+    limits: ReadLimits,
 }
+
+impl Default for ReadResultBudget {
+    fn default() -> Self {
+        Self::new(current_read_limits())
+    }
+}
+
 impl ReadResultBudget {
+    pub(crate) fn new(limits: ReadLimits) -> Self {
+        Self {
+            bytes: 0,
+            rows: 0,
+            limits,
+        }
+    }
+
     pub(crate) fn charge(&mut self, bytes: usize, rows: usize) -> Result<(), LixError> {
         self.bytes = self.bytes.saturating_add(bytes);
         self.rows = self.rows.saturating_add(rows);
-        if self.bytes > MAX_READ_RESULT_BYTES || self.rows > MAX_READ_RESULT_ROWS {
-            return Err(LixError::new("LIX_READ_RESOURCE_EXHAUSTED",
-                "buffered read result exceeds its byte or row budget")
-                .with_details(serde_json::json!({"maxBytes":MAX_READ_RESULT_BYTES,"maxRows":MAX_READ_RESULT_ROWS})));
+        if self.limits.max_rows.is_some_and(|max_rows| self.rows > max_rows) {
+            return Err(not_unique());
+        }
+        if self.bytes > self.limits.max_bytes {
+            return Err(result_too_large(self.limits.max_bytes));
         }
         Ok(())
     }
+
     pub(crate) fn charge_values(&mut self, values: &[Value]) -> Result<(), LixError> {
         self.charge(public_row_bytes(values), 1)
     }
 }
 
 /// Bytes one public result row occupies: one `Value` slot per cell plus its
-/// variable-length payload. Buffered budgets and streamed page sizes share
-/// this measure so a page size means the same thing on every read path.
+/// variable-length payload. Buffered caps and streamed page sizes share
+/// this measure so a byte limit means the same thing on every read path.
 pub(crate) fn public_row_bytes(values: &[Value]) -> usize {
     values.iter().fold(0usize, |bytes, value| {
         bytes.saturating_add(
@@ -79,53 +148,47 @@ pub(crate) fn public_row_bytes(values: &[Value]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn read_deadline_cancels_pending_preparation() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-        struct ReadGuard(Arc<AtomicBool>);
-        impl Drop for ReadGuard {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let released = Arc::new(AtomicBool::new(false));
-        let observed = released.clone();
-        let operation = async move {
-            let _guard = ReadGuard(observed);
-            futures_util::future::pending::<Result<(), LixError>>().await
-        };
-        let error = read_deadline(operation, Duration::from_millis(1))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "LIX_READ_DEADLINE_EXCEEDED");
-        assert!(
-            released.load(Ordering::SeqCst),
-            "deadline must drop the pending read scope"
-        );
-    }
+
     #[test]
-    fn read_deadline_works_without_a_tokio_reactor() {
-        assert!(tokio::runtime::Handle::try_current().is_err());
-        let result = futures_lite::future::block_on(read_deadline(
-            futures_util::future::pending::<Result<(), LixError>>(),
-            Duration::from_millis(1),
-        ));
-        assert_eq!(result.unwrap_err().code, "LIX_READ_DEADLINE_EXCEEDED");
+    fn default_budget_caps_bytes_but_not_rows() {
+        let mut budget = ReadResultBudget::default();
+        budget.charge(DEFAULT_MAX_RESULT_BYTES, usize::MAX / 2).unwrap();
+        let error = budget.charge(1, 0).unwrap_err();
+        assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+        assert!(error.hint.as_deref().unwrap_or_default().contains("stream()"));
+        assert!(budget.charge(usize::MAX, usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn scoped_limits_reach_budgets_created_inside_the_read() {
+        let opted_out = with_read_limits(ReadLimits::bytes(usize::MAX), async {
+            ReadResultBudget::default().charge(DEFAULT_MAX_RESULT_BYTES * 4, 1)
+        })
+        .await;
+        assert!(opted_out.is_ok());
+        let tight = with_read_limits(ReadLimits::bytes(8), async {
+            ReadResultBudget::default().charge(9, 1)
+        })
+        .await;
+        assert_eq!(tight.unwrap_err().code, LixError::CODE_RESULT_TOO_LARGE);
+        let single = with_read_limits(ReadLimits::single_row(), async {
+            let mut budget = ReadResultBudget::default();
+            budget.charge(usize::MAX / 2, 1)?;
+            budget.charge(1, 1)
+        })
+        .await;
+        assert_eq!(single.unwrap_err().code, LixError::CODE_NOT_UNIQUE);
+        // Outside a scope the defaults apply again.
+        assert_eq!(current_read_limits(), ReadLimits::default());
     }
 
     #[test]
-    fn result_budget_bounds_whole_operation_and_integer_overflow() {
-        let mut budget = ReadResultBudget::default();
-        budget
-            .charge(MAX_READ_RESULT_BYTES, MAX_READ_RESULT_ROWS)
-            .unwrap();
-        assert_eq!(
-            budget.charge(1, 0).unwrap_err().code,
-            "LIX_READ_RESOURCE_EXHAUSTED"
-        );
-        assert!(budget.charge(usize::MAX, usize::MAX).is_err());
+    fn scoped_limits_work_without_a_tokio_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let result = futures_lite::future::block_on(with_read_limits(
+            ReadLimits::bytes(1),
+            async { ReadResultBudget::default().charge(2, 1) },
+        ));
+        assert_eq!(result.unwrap_err().code, LixError::CODE_RESULT_TOO_LARGE);
     }
 }

@@ -2384,23 +2384,18 @@ where
                         "execute_coherent_read_batch only accepts read statements without durable runtime functions",
                     ));
                 }
-                crate::common::with_read_deadline(async {
-                    let mut retry = crate::sync::SyncDemandRetry::default();
-                    loop {
-                        let result = retry_expired_read(|| {
-                            Arc::clone(&session)
-                                .execute_coherent_read_batch_owned(Arc::clone(&statements))
-                        })
-                        .await;
-                        match result {
-                            Ok(result) => return Ok(result),
-                            Err(error) => {
-                                retry.hydrate_for_retry(demand_tx.as_ref(), error).await?
-                            }
-                        }
+                let mut retry = crate::sync::SyncDemandRetry::default();
+                loop {
+                    let result = retry_expired_read(|| {
+                        Arc::clone(&session)
+                            .execute_coherent_read_batch_owned(Arc::clone(&statements))
+                    })
+                    .await;
+                    match result {
+                        Ok(result) => return Ok(result),
+                        Err(error) => retry.hydrate_for_retry(demand_tx.as_ref(), error).await?,
                     }
-                })
-                .await
+                }
             })
         }
     }
@@ -2742,19 +2737,14 @@ where
         if route == ExecutionDisposition::Durable {
             return operation().await;
         }
-        // Includes typed input preparation/hydration between complete local
-        // attempts. The deadline never wraps a durable operation.
-        crate::common::with_read_deadline(async {
-            if matches!(
-                self.engine.sync_mode().role(),
-                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
-            ) {
-                retry_expired_read(operation).await
-            } else {
-                operation().await
-            }
-        })
-        .await
+        if matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
+            retry_expired_read(operation).await
+        } else {
+            operation().await
+        }
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

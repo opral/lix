@@ -4745,11 +4745,7 @@ where
             }
         }
     });
-    if replayable {
-        crate::common::with_read_deadline(operation).await
-    } else {
-        operation.await
-    }
+    operation.await
 }
 
 /// Runs one session SQL read using a widened storage-read lifetime.
@@ -5821,12 +5817,19 @@ mod tests {
         Engine::initialize(storage.clone()).await.unwrap();
         let engine = Engine::new(storage).await.unwrap();
         let session = engine.open_session().await.unwrap();
-        let value = Value::Text("x".repeat(crate::common::MAX_READ_RESULT_BYTES + 1));
+        let value = Value::Text("x".repeat(crate::common::DEFAULT_MAX_RESULT_BYTES + 1));
         let error = session
-            .execute("SELECT $1 AS value", &[value])
+            .execute("SELECT $1 AS value", &[value.clone()])
             .await
             .unwrap_err();
-        assert_eq!(error.code, "LIX_READ_RESOURCE_EXHAUSTED");
+        assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+        let opted_out = crate::common::with_read_limits(
+            crate::common::ReadLimits::bytes(usize::MAX),
+            session.execute("SELECT $1 AS value", &[value]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opted_out.len(), 1);
         assert_eq!(
             session
                 .execute("SELECT 1 AS value", &[])

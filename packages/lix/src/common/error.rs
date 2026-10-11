@@ -142,8 +142,24 @@ impl LixError {
     /// relational constraint.
     pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";
 
-    /// A SQL write targeted a read-only internal/component surface.
+    /// A SQL write targeted a read-only internal/component surface, or a
+    /// statement that writes was passed to a read API (`query`, `stream`).
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
+
+    /// A pure read was passed to `execute`; reads go through `query`.
+    pub const CODE_NOT_A_WRITE: &'static str = "LIX_NOT_A_WRITE";
+
+    /// A buffered result exceeded its byte cap. Nothing was returned.
+    pub const CODE_RESULT_TOO_LARGE: &'static str = "LIX_RESULT_TOO_LARGE";
+
+    /// A single-row read matched more than one row.
+    pub const CODE_NOT_UNIQUE: &'static str = "LIX_NOT_UNIQUE";
+
+    /// A single-row read that requires a row matched none.
+    pub const CODE_NO_ROWS: &'static str = "LIX_NO_ROWS";
+
+    /// The snapshot was closed; it serves no further reads.
+    pub const CODE_SNAPSHOT_CLOSED: &'static str = "LIX_SNAPSHOT_CLOSED";
 
     /// A partial replica cannot prove completeness for a global history surface.
     /// Single read statements may be retried against the configured authority.
