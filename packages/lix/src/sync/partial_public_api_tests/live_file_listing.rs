@@ -44,12 +44,12 @@ async fn background_reconciliation_refreshes_warm_file_listing_after_conflicting
         );
         let caller = async {
             let sql = "SELECT path,name FROM lix_file WHERE path LIKE '/gtm/%' ORDER BY path LIMIT 100";
-            let initial = lix.execute(sql, &[]).await.unwrap();
+            let initial = lix.query(sql).all().await.unwrap();
             assert_eq!(initial.rows().len(), 2);
             let initial_fetches = client.fetches.load(Ordering::SeqCst);
-            assert_eq!(format!("{:?}", lix.execute(sql, &[]).await.unwrap().rows()), format!("{:?}", initial.rows()));
+            assert_eq!(format!("{:?}", lix.query(sql).all().await.unwrap().rows()), format!("{:?}", initial.rows()));
             assert_eq!(client.fetches.load(Ordering::SeqCst), initial_fetches);
-            lix.execute("UPDATE lix_file SET path='/gtm/local.txt' WHERE path='/gtm/edit.txt'", &[]).await.unwrap();
+            lix.execute("UPDATE lix_file SET path='/gtm/local.txt' WHERE path='/gtm/edit.txt'").await.unwrap();
             authority_sql(&client.server, authority.lix_id(), None,
                 "UPDATE lix_file SET path='/gtm/remote.txt' WHERE path='/gtm/edit.txt'").await;
             authority_sql(&client.server, authority.lix_id(), None,
@@ -69,13 +69,13 @@ async fn background_reconciliation_refreshes_warm_file_listing_after_conflicting
                 crate::sync::platform::sleep(std::time::Duration::from_millis(2)).await;
             }
             let expected = authority_sql(&client.server, authority.lix_id(), None, sql).await;
-            let actual = lix.execute(sql, &[]).await.unwrap();
+            let actual = lix.query(sql).all().await.unwrap();
             assert_eq!(actual.rows().len(), 2, "remote add/delete changes must invalidate the warm listing");
             assert_eq!(format!("{:?}", actual.rows()), format!("{:?}", expected.rows()),
                 "settled local and authoritative ordered file cells must agree");
             let fetched = client.fetches.load(Ordering::SeqCst);
             for _ in 0..3 {
-                assert_eq!(format!("{:?}", lix.execute(sql, &[]).await.unwrap().rows()), format!("{:?}", expected.rows()));
+                assert_eq!(format!("{:?}", lix.query(sql).all().await.unwrap().rows()), format!("{:?}", expected.rows()));
             }
             assert_eq!(client.fetches.load(Ordering::SeqCst), fetched,
                 "valid warmed file listing must perform no native fetches");

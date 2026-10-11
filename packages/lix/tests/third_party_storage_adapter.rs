@@ -41,7 +41,9 @@ async fn a_third_party_storage_adapter_needs_only_lix() {
         .expect("open Lix with external storage adapter");
 
     let result = lix
-        .execute("SELECT $1 AS value", &[Value::Integer(42)])
+        .query("SELECT $1 AS value")
+        .params(&[Value::Integer(42)])
+        .all()
         .await
         .unwrap();
     assert_eq!(result.rows()[0].get::<i64>("value").unwrap(), 42);

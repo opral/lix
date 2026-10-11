@@ -44,11 +44,11 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
                 .execute(
                     "INSERT INTO lix_file (content, path) VALUES ($1, $2) \
                      ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[
-                        Value::Blob(bytes.to_vec().into()),
-                        Value::Text(path.to_owned()),
-                    ],
                 )
+                .params(&[
+                    Value::Blob(bytes.to_vec().into()),
+                    Value::Text(path.to_owned()),
+                ])
                 .await
                 .expect("same-base Markdown edit should stage");
         }
@@ -86,8 +86,8 @@ async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('ordinary', $1) \
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                &[Value::Text("first".to_owned())],
             )
+            .params(&[Value::Text("first".to_owned())])
             .await
     };
     let second_write = async {
@@ -95,18 +95,16 @@ async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('ordinary', $1) \
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                &[Value::Text("second".to_owned())],
             )
+            .params(&[Value::Text("second".to_owned())])
             .await
     };
     let (first_result, second_result) = tokio::join!(first_write, second_write);
     first_result.unwrap();
     second_result.unwrap();
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'ordinary'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'ordinary'")
+        .all()
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
@@ -133,16 +131,16 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                     let mut transactions = Vec::new();
                     for value in 0..3 {
                         let peer = lix.open_another_session().await.unwrap();
-                        let mut transaction = peer.begin_transaction().await.unwrap();
+                        let transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
                                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                                &[
-                                    Value::Text(path.to_owned()),
-                                    Value::Blob(format!(r#"{{"v":{value}}}"#).into_bytes().into()),
-                                ],
                             )
+                            .params(&[
+                                Value::Text(path.to_owned()),
+                                Value::Blob(format!(r#"{{"v":{value}}}"#).into_bytes().into()),
+                            ])
                             .await
                             .unwrap();
                         peers.push(peer);
@@ -179,11 +177,11 @@ fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
                         .execute(
                             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
-                            &[
-                                Value::Jsonb(serde_json::json!(99).into()),
-                                Value::Text(file_id),
-                            ],
                         )
+                        .params(&[
+                            Value::Jsonb(serde_json::json!(99).into()),
+                            Value::Text(file_id),
+                        ])
                         .await
                         .unwrap();
                     let converged = read_file(&lix, path).await;
@@ -229,21 +227,20 @@ fn serialized_leader_forces_stale_followers_to_reconcile_without_losing_writes()
                     let mut transactions = Vec::new();
                     for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
                         let peer = lix.open_another_session().await.unwrap();
-                        let mut transaction = peer.begin_transaction().await.unwrap();
+                        let transaction = peer.begin_transaction().await.unwrap();
                         transaction
                             .execute(
                                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                                &[
-                                    Value::Text(path.to_owned()),
-                                    Value::Blob({
-                                        let mut document =
-                                            serde_json::json!({"a": 0, "b": 0, "c": 0});
-                                        document[key] = serde_json::json!(value);
-                                        serde_json::to_vec(&document).unwrap().into()
-                                    }),
-                                ],
                             )
+                            .params(&[
+                                Value::Text(path.to_owned()),
+                                Value::Blob({
+                                    let mut document = serde_json::json!({"a": 0, "b": 0, "c": 0});
+                                    document[key] = serde_json::json!(value);
+                                    serde_json::to_vec(&document).unwrap().into()
+                                }),
+                            ])
                             .await
                             .unwrap();
                         peers.push(peer);
@@ -310,10 +307,8 @@ async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
         (&mut second_transaction, br#"{"winner":2}"#.as_slice()),
     ] {
         transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/unique-path.json', $1)",
-                &[Value::Blob(bytes.to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ('/unique-path.json', $1)")
+            .params(&[Value::Blob(bytes.to_vec().into())])
             .await
             .unwrap();
     }
@@ -354,15 +349,13 @@ async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive:
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("reference plugin should install");
+        ])
+        .await
+        .expect("reference plugin should install");
 }
 
 async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, bytes: &[u8])
@@ -372,11 +365,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_owned()),
-            Value::Blob(bytes.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_owned()),
+        Value::Blob(bytes.to_vec().into()),
+    ])
     .await
     .expect("benchmark file should write");
 }
@@ -385,13 +378,12 @@ async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("benchmark file should read")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("benchmark file should read")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("benchmark file data should be bytes")
 }
@@ -400,13 +392,12 @@ async fn file_id<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> String
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT id FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("benchmark file id should query")
-    .rows()[0]
+    lix.query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("benchmark file id should query")
+        .rows()[0]
         .get::<String>("id")
         .expect("benchmark file id should be text")
 }
@@ -415,7 +406,8 @@ async fn commit_count<StorageImpl>(lix: &Lix<StorageImpl>) -> i64
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
+    lix.query("SELECT COUNT(*) AS count FROM lix_commit")
+        .all()
         .await
         .expect("benchmark commit count should query")
         .rows()[0]
@@ -434,12 +426,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let forks = lix
-        .execute(
+        .query(
             "SELECT parent_commit_ids ->> 0 AS parent_id, COUNT(*) AS children \
              FROM lix_commit WHERE parent_commit_ids ->> 0 IS NOT NULL \
              GROUP BY parent_commit_ids ->> 0 HAVING COUNT(*) > 1",
-            &[],
         )
+        .all()
         .await
         .expect("first-parent fork query should run");
     let forks = forks

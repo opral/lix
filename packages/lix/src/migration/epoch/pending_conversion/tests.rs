@@ -131,10 +131,7 @@ async fn run_pending_native_conversion_inner(
         .await
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('local','B'),('remote','B')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('local','B'),('remote','B')")
         .await
         .unwrap();
     if with_files {
@@ -148,17 +145,12 @@ async fn run_pending_native_conversion_inner(
             .unwrap();
         let schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"migration_custom_note","columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],"primary_key":["id"],"unique":[["value"]]});
         authority
-            .execute(
-                "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-                &[crate::Value::Text(schema.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+            .params(&[crate::Value::Text(schema.to_string())])
             .await
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO migration_custom_note(id,value) VALUES('local','before')",
-                &[],
-            )
+            .execute("INSERT INTO migration_custom_note(id,value) VALUES('local','before')")
             .await
             .unwrap();
     }
@@ -197,7 +189,7 @@ async fn run_pending_native_conversion_inner(
         confirmed.insert(branch,serde_json::json!({"state":"headed","headCommitId":control.head_commit_id.to_string(),"checkpointCommitId":control.working_diff_checkpoint_commit_id.unwrap().to_string(),"authorId":control.author_id_string(),"refChangeId":control.ref_change_id.to_string()}));
     }
     local
-        .execute("UPDATE lix_key_value SET value='L' WHERE key='local'", &[])
+        .execute("UPDATE lix_key_value SET value='L' WHERE key='local'")
         .await
         .unwrap();
     if with_files {
@@ -213,10 +205,7 @@ async fn run_pending_native_conversion_inner(
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE migration_custom_note SET value='after' WHERE id='local'",
-                &[],
-            )
+            .execute("UPDATE migration_custom_note SET value='after' WHERE id='local'")
             .await
             .unwrap();
     }
@@ -227,7 +216,7 @@ async fn run_pending_native_conversion_inner(
             .await
             .unwrap();
         other
-            .execute("UPDATE lix_key_value SET value='XL' WHERE key='local'", &[])
+            .execute("UPDATE lix_key_value SET value='XL' WHERE key='local'")
             .await
             .unwrap();
         other.close().await.unwrap();
@@ -257,10 +246,7 @@ async fn run_pending_native_conversion_inner(
             .checkpoint
             .commit_id;
         other
-            .execute(
-                "UPDATE lix_key_value SET value='NEW' WHERE key='local'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='NEW' WHERE key='local'")
             .await
             .unwrap();
         let head = other
@@ -293,7 +279,7 @@ async fn run_pending_native_conversion_inner(
     drop(local);
     drop(adapter);
     authority
-        .execute("UPDATE lix_key_value SET value='R' WHERE key='remote'", &[])
+        .execute("UPDATE lix_key_value SET value='R' WHERE key='remote'")
         .await
         .unwrap();
     if with_files {
@@ -309,10 +295,7 @@ async fn run_pending_native_conversion_inner(
             .await
             .unwrap();
         other
-            .execute(
-                "UPDATE lix_key_value SET value='XR' WHERE key='remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='XR' WHERE key='remote'")
             .await
             .unwrap();
         other.close().await.unwrap();
@@ -723,7 +706,8 @@ async fn run_pending_native_conversion_inner(
             .await
             .unwrap();
         let result = session
-            .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+            .query("SELECT value FROM lix_key_value WHERE key='local'")
+            .all()
             .await
             .unwrap();
         assert!(format!("{result:?}").contains("NEW"));
@@ -737,10 +721,8 @@ async fn run_pending_native_conversion_inner(
         .await
         .unwrap();
     let rows = verification
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key IN ('local','remote')",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key IN ('local','remote')")
+        .all()
         .await
         .unwrap();
     verification.close().await.unwrap();
@@ -815,10 +797,8 @@ async fn run_pending_native_conversion_inner(
             &[5, 6, 7]
         );
         let result = authority
-            .execute(
-                "SELECT value FROM migration_custom_note WHERE id='local'",
-                &[],
-            )
+            .query("SELECT value FROM migration_custom_note WHERE id='local'")
+            .all()
             .await
             .unwrap();
         assert_eq!(result.rows()[0].get::<String>("value").unwrap(), "after");
@@ -830,10 +810,8 @@ async fn run_pending_native_conversion_inner(
             .await
             .unwrap();
         let rows = other
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key IN ('local','remote')",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key IN ('local','remote')")
+            .all()
             .await
             .unwrap();
         let values = format!("{rows:?}");

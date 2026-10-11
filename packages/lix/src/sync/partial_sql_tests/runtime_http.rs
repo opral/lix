@@ -145,10 +145,7 @@ async fn advance_unrelated_global(authority: &Lix<Memory>) {
         .with_branch(crate::GLOBAL_BRANCH_ID)
         .await
         .unwrap()
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')")
         .await
         .unwrap();
 }
@@ -164,10 +161,7 @@ async fn lost_wave_with_pending_edit(
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('local','B'),('remote','B')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('local','B'),('remote','B')")
         .await
         .unwrap();
     let server = open_lix()
@@ -280,7 +274,7 @@ async fn lost_wave_with_pending_edit(
         .await
         .unwrap();
     authority
-        .execute("UPDATE lix_key_value SET value='R' WHERE key='remote'", &[])
+        .execute("UPDATE lix_key_value SET value='R' WHERE key='remote'")
         .await
         .unwrap();
     let captured_descriptor = transport.partial_replica_descriptor(None).await.unwrap();
@@ -295,10 +289,7 @@ async fn lost_wave_with_pending_edit(
         // Capture R, then accept R2 before the first retained wave reaches the
         // authority. Its otherwise valid immutable request must restart.
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='R2' WHERE key='remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='R2' WHERE key='remote'")
             .await
             .unwrap();
     }
@@ -338,13 +329,10 @@ async fn lost_wave_with_pending_edit(
     }
     let remote_checkpoint = if advance_after_descriptor {
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='R3' WHERE key='remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='R3' WHERE key='remote'")
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         Some(
             authority
                 .partial_replica_descriptor(None)
@@ -473,7 +461,8 @@ async fn lost_wave_with_pending_edit(
                 .unwrap()
                 .rows(),
             authority
-                .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='local'")
+                .all()
                 .await
                 .unwrap()
                 .rows(),
@@ -549,18 +538,13 @@ async fn file_checkpoint_upload_case(
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/checkpoint.bin',$1)",
-            &[Value::Blob(vec![17u8; 96 * 1024].into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/checkpoint.bin',$1)")
+        .params(&[Value::Blob(vec![17u8; 96 * 1024].into())])
         .await
         .unwrap();
     if paging {
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('checkpoint-excluded','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('checkpoint-excluded','before')")
             .await
             .unwrap();
     }
@@ -568,10 +552,8 @@ async fn file_checkpoint_upload_case(
     let cold_id = crate::binary_cas::CanonicalBlobManifest::from_bytes(&cold_content).blob_id;
     if cold_blob.is_some() {
         authority
-            .execute(
-                "INSERT INTO lix_file(path,content) VALUES('/cold.bin',$1)",
-                &[Value::Blob(cold_content.clone().into())],
-            )
+            .execute("INSERT INTO lix_file(path,content) VALUES('/cold.bin',$1)")
+            .params(&[Value::Blob(cold_content.clone().into())])
             .await
             .unwrap();
     }
@@ -934,10 +916,8 @@ async fn file_checkpoint_upload_case(
                 Err(error) => panic!("paged checkpoint upload: {error}"),
             }
             let excluded = authority
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key='checkpoint-excluded'",
-                    &[],
-                )
+                .query("SELECT value FROM lix_key_value WHERE key='checkpoint-excluded'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -994,16 +974,15 @@ async fn file_checkpoint_upload_case(
         settled.confirmed.checkpoint
     );
     let result = authority
-        .execute(
-            "SELECT content FROM lix_file WHERE path='/checkpoint.bin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path='/checkpoint.bin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
     if let Some(deferred) = cold_blob {
         let cold = authority
-            .execute("SELECT content FROM lix_file WHERE path='/cold.bin'", &[])
+            .query("SELECT content FROM lix_file WHERE path='/cold.bin'")
+            .all()
             .await
             .unwrap();
         assert_eq!(

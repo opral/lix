@@ -32,7 +32,7 @@
 //!    green.
 
 use lix::storage_bench::certified_current_state_publication_counters;
-use lix::{ExecuteBatchStatement, Value, open_lix};
+use lix::{Value, open_lix};
 
 /// Must stay at or above `TYPED_CERTIFIED_INSERT_MIN_ROWS`. Below it the
 /// columnar arm is not reached and half 1 of this test cannot pass.
@@ -58,12 +58,10 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
         ],
         "primary_key": ["id"],
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
-    .await
-    .expect("register the scoped-root probe schema");
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
+        .await
+        .expect("register the scoped-root probe schema");
 
     // The counters are process-global and read without reset, so every
     // assertion below is a threshold on a snapshot delta rather than an exact
@@ -73,24 +71,20 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
     let before_bulk = certified_current_state_publication_counters();
 
     let insert_sql = format!("INSERT INTO {SCHEMA_KEY} (id, value) VALUES ($1, $2)");
-    let statements = (0..BULK_ROWS)
-        .map(|row| ExecuteBatchStatement {
-            label: None,
-            sql: insert_sql.clone(),
-            params: vec![
-                Value::Text(format!("bulk-{row:08}")),
-                Value::Text(format!("value-{row}")),
-            ],
-        })
-        .collect::<Vec<_>>();
-    let results = lix
-        .execute_batch(&statements)
+    let inserted = lix
+        .execute_many(
+            &insert_sql,
+            (0..BULK_ROWS).map(|row| {
+                [
+                    Value::Text(format!("bulk-{row:08}")),
+                    Value::Text(format!("value-{row}")),
+                ]
+            }),
+        )
         .await
-        .expect("bulk typed INSERT batch")
-        .results;
+        .expect("bulk typed INSERT batch");
     assert_eq!(
-        results.len(),
-        BULK_ROWS,
+        inserted, BULK_ROWS as u64,
         "the batch must carry at least TYPED_CERTIFIED_INSERT_MIN_ROWS rows, \
          or the columnar arm is never reached"
     );
@@ -110,15 +104,13 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
     // published; a commit in a *different* scope would legitimately drop the
     // accelerator, because roots are per-scope.
     for round in 0..FOLLOW_UP_COMMITS {
-        lix.execute(
-            &insert_sql,
-            &[
+        lix.execute(&insert_sql)
+            .params(&[
                 Value::Text(format!("follow-{round:08}")),
                 Value::Text(format!("follow-value-{round}")),
-            ],
-        )
-        .await
-        .expect("same-scope follow-up insert");
+            ])
+            .await
+            .expect("same-scope follow-up insert");
     }
 
     let after_follow_ups = certified_current_state_publication_counters();
@@ -133,7 +125,8 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
     );
 
     let count = lix
-        .execute(&format!("SELECT COUNT(*) AS count FROM {SCHEMA_KEY}"), &[])
+        .query(&format!("SELECT COUNT(*) AS count FROM {SCHEMA_KEY}"))
+        .all()
         .await
         .expect("read the probe collection back");
     assert_eq!(

@@ -689,28 +689,22 @@ mod tests {
 
     async fn fixture_with_revisions(revisions: usize) -> (Lix<Memory>, NativeMetadataWalkRequest) {
         let lix = open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path,content) VALUES ('/walk.txt',$1)",
-            &[Value::Blob(b"initial".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file (path,content) VALUES ('/walk.txt',$1)")
+            .params(&[Value::Blob(b"initial".to_vec().into())])
+            .await
+            .unwrap();
         for index in 0..revisions {
-            lix.execute(
-                "UPDATE lix_file SET content=$1 WHERE path='/walk.txt'",
-                &[Value::Blob(format!("revision {index}").into_bytes().into())],
-            )
-            .await
-            .unwrap();
-            lix.execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
-            .await
-            .unwrap();
+            lix.execute("UPDATE lix_file SET content=$1 WHERE path='/walk.txt'")
+                .params(&[Value::Blob(format!("revision {index}").into_bytes().into())])
+                .await
+                .unwrap();
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
+                .await
+                .unwrap();
         }
         let anchor = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -942,11 +936,11 @@ mod tests {
                     std::slice::from_ref(&damaged),
                     MAX_NATIVE_METADATA_PAYLOAD_BYTES,
                 )
-                    .await
-                    .unwrap()
-                    .values
-                    .remove(0)
-                    .is_err()
+                .await
+                .unwrap()
+                .values
+                .remove(0)
+                .is_err()
             );
             if !corrupt_header {
                 request.anchor = damaged.id().to_owned();

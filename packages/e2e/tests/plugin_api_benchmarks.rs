@@ -83,7 +83,7 @@ async fn point_edit_workflows(count: usize, samples: usize) {
         } else {
             "SELECT id, content FROM text_line ORDER BY order_key, id"
         };
-        let rows = lix.execute(selection, &[]).await.unwrap();
+        let rows = lix.query(selection).all().await.unwrap();
         assert_eq!(rows.rows().len(), count);
         let row = &rows.rows()[count / 2];
         let id: Value = row.get("id").unwrap();
@@ -119,7 +119,8 @@ async fn point_edit_workflows(count: usize, samples: usize) {
             };
             let scope = AllocationScope::start();
             let started = Instant::now();
-            lix.execute(sql, &[value.clone(), id.clone()])
+            lix.execute(sql)
+                .params(&[value.clone(), id.clone()])
                 .await
                 .unwrap();
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
@@ -157,13 +158,17 @@ async fn point_edit_workflows(count: usize, samples: usize) {
         } else {
             Value::Text(content.into())
         };
-        reopened.execute(sql, &[value, id.clone()]).await.unwrap();
+        reopened
+            .execute(sql)
+            .params(&[value, id.clone()])
+            .await
+            .unwrap();
         let mut paragraphs = vec!["Ordinary paragraph text."; count];
         paragraphs[count / 2] = content;
         expected = format!("{}\n", paragraphs.join(separator)).into_bytes();
         assert_eq!(read_file(&reopened, path).await, expected);
         assert_eq!(
-            reopened.execute(selection, &[]).await.unwrap().rows().len(),
+            reopened.query(selection).all().await.unwrap().rows().len(),
             count
         );
         reopened.close().await.unwrap();
@@ -427,13 +432,10 @@ async fn stage_file_update<StorageImpl>(
     // Unconditional file upserts retain plugin reconciliation; SQL UPDATE
     // decisions instead reject stale snapshots and require a caller retry.
     transaction
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
+        .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content").params(&[
                 Value::Text(path.to_owned()),
                 Value::Blob(bytes.to_vec().into()),
-            ],
-        )
+            ])
         .await
         .expect("file update should stage");
 }
@@ -442,15 +444,13 @@ async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive:
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("benchmark plugin should install");
+        ])
+        .await
+        .expect("benchmark plugin should install");
 }
 
 async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, bytes: &[u8])
@@ -460,11 +460,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_owned()),
-            Value::Blob(bytes.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_owned()),
+        Value::Blob(bytes.to_vec().into()),
+    ])
     .await
     .expect("benchmark file should write");
 }
@@ -473,13 +473,12 @@ async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("benchmark file should read")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("benchmark file should read")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("benchmark file content should be bytes")
 }
@@ -793,15 +792,13 @@ async fn excalidraw_point_workflow(count: usize, attachment: usize, samples: usi
             let scope = AllocationScope::start();
             let started = Instant::now();
             if sql {
-                lix.execute(
-                    "UPDATE excalidraw_element SET element_json=$1 WHERE id=$2",
-                    &[
+                lix.execute("UPDATE excalidraw_element SET element_json=$1 WHERE id=$2")
+                    .params(&[
                         Value::Jsonb(payload.into()),
                         Value::Text(format!("e{ordinal:08}")),
-                    ],
-                )
-                .await
-                .unwrap();
+                    ])
+                    .await
+                    .unwrap();
             } else {
                 write_file(&lix, path, &next).await;
             }
@@ -836,7 +833,7 @@ async fn excalidraw_point_workflow(count: usize, attachment: usize, samples: usi
     let append_ms = start.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(read_file(&lix, path).await, next);
     let start = Instant::now();
-    lix.execute("DELETE FROM excalidraw_element WHERE id='appended'", &[])
+    lix.execute("DELETE FROM excalidraw_element WHERE id='appended'")
         .await
         .unwrap();
     let delete_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -859,13 +856,11 @@ async fn excalidraw_point_workflow(count: usize, attachment: usize, samples: usi
     expected["elements"][count / 2]["x"] = serde_json::json!(987654);
     let start = Instant::now();
     reopened
-        .execute(
-            "UPDATE excalidraw_element SET element_json=$1 WHERE id=$2",
-            &[
-                Value::Jsonb(expected["elements"][count / 2].clone().into()),
-                Value::Text(format!("e{:08}", count / 2)),
-            ],
-        )
+        .execute("UPDATE excalidraw_element SET element_json=$1 WHERE id=$2")
+        .params(&[
+            Value::Jsonb(expected["elements"][count / 2].clone().into()),
+            Value::Text(format!("e{:08}", count / 2)),
+        ])
         .await
         .unwrap();
     let edit_ms = start.elapsed().as_secs_f64() * 1000.0;

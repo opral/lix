@@ -367,21 +367,15 @@ where
         .expect("open checkpoint-query setup session");
     for index in 0..additional_checkpoints {
         session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-query-history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                &[lix::Value::Text(index.to_string())],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-query-history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value").params(&[lix::Value::Text(index.to_string())])
             .await
             .expect("seed checkpoint-query key history");
         session
-            .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ('01940000-0000-7000-8000-000000000002', '/checkpoint-query-history.txt', $1) ON CONFLICT (id) DO UPDATE SET content = excluded.content",
-                &[lix::Value::Blob(index.to_string().into_bytes().into())],
-            )
+            .execute("INSERT INTO lix_file (id, path, content) VALUES ('01940000-0000-7000-8000-000000000002', '/checkpoint-query-history.txt', $1) ON CONFLICT (id) DO UPDATE SET content = excluded.content").params(&[lix::Value::Blob(index.to_string().into_bytes().into())])
             .await
             .expect("seed checkpoint-query file history");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("create checkpoint-query fixture checkpoint");
     }
@@ -472,7 +466,8 @@ async fn measure_query<StorageImpl>(
         .await
         .expect("open checkpoint-query session");
     let anchor = session
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("read checkpoint-query anchor")
         .rows()[0]
@@ -496,7 +491,9 @@ async fn measure_query<StorageImpl>(
         let expected_rows = expected_checkpoints.min(20);
         for _ in 0..warmups {
             let rows = session
-                .execute(query, &parameters)
+                .query(query)
+                .params(&parameters)
+                .all()
                 .await
                 .expect("warm checkpoint query");
             assert_eq!(rows.len(), expected_rows, "query={name}");
@@ -508,7 +505,9 @@ async fn measure_query<StorageImpl>(
         for _ in 0..samples {
             let started = Instant::now();
             let rows = session
-                .execute(query, &parameters)
+                .query(query)
+                .params(&parameters)
+                .all()
                 .await
                 .expect("measure checkpoint query");
             timings.push(started.elapsed());

@@ -24,10 +24,7 @@ async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool)
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('same','B'),('newer','B')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('same','B'),('newer','B')")
         .await
         .unwrap();
     if !upload_accepted {
@@ -35,10 +32,8 @@ async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool)
         // sufficient to reject a competing upload without reading this history.
         for index in 0..8 {
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value=$1 WHERE key='newer'",
-                    &[Value::Text(format!("historical-{index}"))],
-                )
+                .execute("UPDATE lix_key_value SET value=$1 WHERE key='newer'")
+                .params(&[Value::Text(format!("historical-{index}"))])
                 .await
                 .unwrap();
         }
@@ -138,18 +133,12 @@ async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool)
         .await
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='R-later' WHERE key='same'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='R-later' WHERE key='same'")
         .await
         .unwrap();
     if checkpoint_authority {
         authority
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))")
             .await
             .unwrap();
     }
@@ -357,7 +346,8 @@ async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool)
     assert_eq!(
         value(
             authority
-                .execute("SELECT value FROM lix_key_value WHERE key='same'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='same'")
+                .all()
                 .await
                 .unwrap()
         ),

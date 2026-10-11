@@ -130,11 +130,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_string()),
-            Value::Blob(data.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_string()),
+        Value::Blob(data.to_vec().into()),
+    ])
     .await
     .unwrap();
 }
@@ -143,13 +143,12 @@ async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_string())],
-    )
-    .await
-    .unwrap()
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
+        .await
+        .unwrap()
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .unwrap()
 }

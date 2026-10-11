@@ -22,7 +22,7 @@ fn diff_command_benches(c: &mut Criterion) {
         b.iter_batched(
             || runtime.block_on(seeded_session(1_000)),
             |session| {
-                runtime.block_on(execute(
+                runtime.block_on(read(
                     &session,
                     &format!("SELECT COUNT(*) FROM {WORKING_SOURCE}"),
                 ));
@@ -99,13 +99,13 @@ async fn profile_sample(rows: usize, sample: usize) {
     let selected = (rows / 10).max(1);
 
     let scan = elapsed(async {
-        execute(&session, &format!("SELECT COUNT(*) FROM {WORKING_SOURCE}")).await;
+        read(&session, &format!("SELECT COUNT(*) FROM {WORKING_SOURCE}")).await;
     })
     .await;
     emit("working_diff", rows, rows, sample, scan);
 
     let atelier_count = elapsed(async {
-        execute(
+        read(
             &session,
             &format!(
                 "SELECT COUNT(*) AS change_count, SUM(row_count) AS atom_count \
@@ -256,7 +256,8 @@ fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usi
 
 async fn active_commit(session: &Lix<Memory>) -> String {
     let result = session
-        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .query("SELECT lix_active_branch_commit_id()")
+        .all()
         .await
         .expect("read active commit");
     let Value::Text(commit_id) = &result.rows()[0].values()[0] else {
@@ -268,7 +269,17 @@ async fn active_commit(session: &Lix<Memory>) -> String {
 async fn execute(session: &Lix<Memory>, sql: &str) {
     black_box(
         session
-            .execute(sql, &[])
+            .execute(sql)
+            .await
+            .unwrap_or_else(|error| panic!("benchmark SQL failed: {error:?}\nSQL: {sql}")),
+    );
+}
+
+async fn read(session: &Lix<Memory>, sql: &str) {
+    black_box(
+        session
+            .query(sql)
+            .all()
             .await
             .unwrap_or_else(|error| panic!("benchmark SQL failed: {error:?}\nSQL: {sql}")),
     );

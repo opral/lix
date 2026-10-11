@@ -168,7 +168,6 @@ async fn run_concurrent_global_creation(newer_global: bool) {
     authority
         .execute(
             "INSERT INTO lix_key_value(key,value) VALUES('resident','unchanged'),('race','before')",
-            &[],
         )
         .await
         .unwrap();

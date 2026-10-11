@@ -115,7 +115,8 @@ mod tests {
                 .with_telemetry(Arc::new(sink))
                 .await
                 .expect("open engine");
-            lix.execute("SELECT 'private-value' AS value, 42 AS number", &[])
+            lix.query("SELECT 'private-value' AS value, 42 AS number")
+                .all()
                 .await
                 .expect("execute query");
             lix.close().await.expect("close engine");

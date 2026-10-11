@@ -21,10 +21,9 @@ async fn descriptor_only_upload_retries_at_width(widths: &[usize]) {
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key,value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key,value) VALUES {values}"
+            ))
             .await
             .unwrap();
         let state = PartialReplicaState::new(
@@ -177,7 +176,14 @@ async fn descriptor_only_upload_retries_at_width(widths: &[usize]) {
             "newer"
         );
         assert_eq!(
-            value(authority.execute(select, &[key.clone()]).await.unwrap()),
+            value(
+                authority
+                    .query(select)
+                    .params(&[key.clone()])
+                    .all()
+                    .await
+                    .unwrap()
+            ),
             "uploaded"
         );
         assert!(
@@ -198,15 +204,13 @@ async fn descriptor_only_upload_retries_at_width(widths: &[usize]) {
             .unwrap()
         );
         assert_eq!(
-            value(authority.execute(select, &[key]).await.unwrap()),
+            value(authority.query(select).params(&[key]).all().await.unwrap()),
             "newer"
         );
         assert_eq!(
             authority
-                .execute(
-                    "SELECT key FROM lix_key_value WHERE key LIKE 'upload-%'",
-                    &[]
-                )
+                .query("SELECT key FROM lix_key_value WHERE key LIKE 'upload-%'")
+                .all()
                 .await
                 .unwrap()
                 .rows()

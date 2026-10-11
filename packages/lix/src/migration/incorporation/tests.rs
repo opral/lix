@@ -64,25 +64,20 @@ async fn full_and_sparse_migrations_produce_identical_headers_and_accept_native_
     };
     let authority = crate::open_lix().await.unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('selected','one'),('other','two')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('selected','one'),('other','two')")
         .await
         .unwrap();
     let source = authority
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='ordinary' WHERE key='other'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='ordinary' WHERE key='other'")
         .await
         .unwrap();
     let state = crate::sync::PartialReplicaState::new(

@@ -138,17 +138,15 @@ async fn seed<S>(session: &Lix<S>, population: usize, untracked: bool)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin seed");
+    let transaction = session.begin_transaction().await.expect("begin seed");
     for index in 0..population {
         transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ($1, $2, $3)",
-                &[
-                    Value::Text(format!("expY_{index:08}")),
-                    Value::Text(format!("seed-{index}")),
-                    Value::Boolean(untracked),
-                ],
-            )
+            .execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ($1, $2, $3)")
+            .params(&[
+                Value::Text(format!("expY_{index:08}")),
+                Value::Text(format!("seed-{index}")),
+                Value::Boolean(untracked),
+            ])
             .await
             .expect("seed row");
     }
@@ -160,13 +158,11 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "UPDATE lix_key_value SET value = $1 WHERE key = $2",
-            &[
-                Value::Text(format!("rev-{revision}")),
-                Value::Text(format!("expY_{target:08}")),
-            ],
-        )
+        .execute("UPDATE lix_key_value SET value = $1 WHERE key = $2")
+        .params(&[
+            Value::Text(format!("rev-{revision}")),
+            Value::Text(format!("expY_{target:08}")),
+        ])
         .await
         .expect("mutate row");
 }

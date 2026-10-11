@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lix::Value;
 use lix::storage::Storage;
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
@@ -27,7 +28,6 @@ use lix::storage_bench::{
     take_crud_commit_state_manifest_bytes, take_crud_ownership_accounting,
     take_crud_physical_write_accounting,
 };
-use lix::{ExecuteBatchStatement, Value};
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
@@ -471,7 +471,7 @@ where
             .expect("inspect transition undo benchmark root");
     if matches!(ready, ReadyState::Redo) {
         session
-            .execute("SELECT commit_id FROM lix_undo()", &[])
+            .execute("SELECT commit_id FROM lix_undo()")
             .await
             .expect("prepare redo-ready fixture");
     }
@@ -504,10 +504,7 @@ where
         "primary_key": ["id"],
     });
     let result = session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register undo benchmark schema");
     assert_eq!(result.rows_affected(), 1);
@@ -518,7 +515,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     const PAGE: usize = 1_000;
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin undo benchmark seed transaction");
@@ -537,7 +534,8 @@ where
             params.push(Value::Text("before".to_string()));
         }
         let result = transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("seed undo benchmark rows");
         assert_eq!(result.rows_affected() as usize, end - start);
@@ -554,29 +552,25 @@ where
 {
     if width == rows {
         let result = session
-            .execute("UPDATE undo_bench_row SET value = 'after'", &[])
+            .execute("UPDATE undo_bench_row SET value = 'after'")
             .await
             .expect("stage full undo benchmark transition");
         assert_eq!(result.rows_affected() as usize, rows);
         return;
     }
-    let statements = (0..width)
-        .map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "UPDATE undo_bench_row SET value = $1 WHERE id = $2".to_string(),
-            params: vec![
-                Value::Text("after".to_string()),
-                Value::Text(format!("row-{index:08}")),
-            ],
-        })
-        .collect::<Vec<_>>();
-    let results = session
-        .execute_batch(&statements)
+    let affected = session
+        .execute_many(
+            "UPDATE undo_bench_row SET value = $1 WHERE id = $2",
+            (0..width).map(|index| {
+                [
+                    Value::Text("after".to_string()),
+                    Value::Text(format!("row-{index:08}")),
+                ]
+            }),
+        )
         .await
-        .expect("stage sparse undo benchmark transition")
-        .results;
-    assert_eq!(results.len(), width);
-    assert!(results.iter().all(|result| result.rows_affected() == 1));
+        .expect("stage sparse undo benchmark transition");
+    assert_eq!(affected as usize, width);
 }
 
 async fn measure<S>(
@@ -623,13 +617,13 @@ async fn measure<S>(
     match operation {
         Operation::Undo => {
             session
-                .execute("SELECT commit_id FROM lix_undo()", &[])
+                .execute("SELECT commit_id FROM lix_undo()")
                 .await
                 .expect("measure undo");
         }
         Operation::Redo => {
             session
-                .execute("SELECT commit_id FROM lix_redo()", &[])
+                .execute("SELECT commit_id FROM lix_redo()")
                 .await
                 .expect("measure redo");
         }
@@ -637,12 +631,12 @@ async fn measure<S>(
             for index in 0..steps {
                 if index.is_multiple_of(2) {
                     session
-                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                        .execute("SELECT commit_id FROM lix_undo()")
                         .await
                         .expect("measure chained undo");
                 } else {
                     session
-                        .execute("SELECT commit_id FROM lix_redo()", &[])
+                        .execute("SELECT commit_id FROM lix_redo()")
                         .await
                         .expect("measure chained redo");
                 }
@@ -740,7 +734,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+        .query("SELECT commit_id FROM lix_branch WHERE name = 'main'")
+        .all()
         .await
         .expect("load main branch head")
         .rows()[0]
@@ -763,7 +758,7 @@ async fn count_query<S>(session: &Lix<S>, sql: &str) -> usize
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let result = session.execute(sql, &[]).await.expect("count undo rows");
+    let result = session.execute(sql).await.expect("count undo rows");
     let count = result.rows()[0]
         .get::<i64>("count")
         .expect("decode undo row count");

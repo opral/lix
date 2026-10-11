@@ -15,24 +15,21 @@ async fn packed_indexes_survive_checkpoint_fork_and_snapshot_reopen() {
         ],
         "primary_key": ["id"], "unique": [["label"]]
     });
-    db.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-        &[Value::Jsonb(schema.into())],
-    )
-    .await
-    .unwrap();
+    db.execute("INSERT INTO lix_registered_schema (value) VALUES ($1)")
+        .params(&[Value::Jsonb(schema.into())])
+        .await
+        .unwrap();
     let values = (0..513)
         .map(|i| format!("('n{i:03}', 'v{i:03}')"))
         .collect::<Vec<_>>()
         .join(",");
-    db.execute(
-        &format!("INSERT INTO lifecycle_note (id, label) VALUES {values}"),
-        &[],
-    )
+    db.execute(&format!(
+        "INSERT INTO lifecycle_note (id, label) VALUES {values}"
+    ))
     .await
     .unwrap();
     assert_index_matches_scan(&db, "insert", "v", 1).await;
-    db.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    db.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     assert_index_matches_scan(&db, "checkpoint", "v", 1).await;
@@ -50,19 +47,16 @@ async fn packed_indexes_survive_checkpoint_fork_and_snapshot_reopen() {
     .await
     .unwrap();
     assert_index_matches_scan(&db, "fork", "v", 1).await;
-    db.execute(
-        "UPDATE lifecycle_note SET label = concat('new_', label)",
-        &[],
-    )
-    .await
-    .unwrap();
+    db.execute("UPDATE lifecycle_note SET label = concat('new_', label)")
+        .await
+        .unwrap();
     assert_index_matches_scan(&db, "replacement", "new_v", 1).await;
     assert_index_matches_scan(&db, "stale entries", "v", 0).await;
-    db.execute("SELECT commit_id FROM lix_undo()", &[])
+    db.execute("SELECT commit_id FROM lix_undo()")
         .await
         .unwrap();
     assert_index_matches_scan(&db, "undo", "v", 1).await;
-    db.execute("SELECT commit_id FROM lix_redo()", &[])
+    db.execute("SELECT commit_id FROM lix_redo()")
         .await
         .unwrap();
     assert_index_matches_scan(&db, "redo", "new_v", 1).await;
@@ -97,18 +91,16 @@ async fn assert_index_matches_scan(db: &lix::Lix, stage: &str, prefix: &str, cou
     for id in [0, 63, 64, 511, 512] {
         let params = [Value::Text(format!("{prefix}{id:03}"))];
         let scan = db
-            .execute(
-                "SELECT id FROM lifecycle_note WHERE concat(label, '') = $1 ORDER BY id",
-                &params,
-            )
+            .query("SELECT id FROM lifecycle_note WHERE concat(label, '') = $1 ORDER BY id")
+            .params(&params)
+            .all()
             .await
             .unwrap();
         assert_eq!(scan.len(), count, "oracle at {stage}, {prefix}{id}");
         let indexed = db
-            .execute(
-                "SELECT id FROM lifecycle_note WHERE label = $1 ORDER BY id",
-                &params,
-            )
+            .query("SELECT id FROM lifecycle_note WHERE label = $1 ORDER BY id")
+            .params(&params)
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -131,39 +123,34 @@ async fn compatible_schema_amendment_revalidates_existing_rows_for_reads_and_upd
             ],
             "primary_key": ["id"], "unique": [["label"]]
         });
-        db.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-            &[Value::Jsonb(schema.clone().into())],
-        )
-        .await
-        .unwrap();
+        db.execute("INSERT INTO lix_registered_schema (value) VALUES ($1)")
+            .params(&[Value::Jsonb(schema.clone().into())])
+            .await
+            .unwrap();
         let values = (0..513)
             .map(|i| format!("('n{i:03}', 'v{i:03}', {untracked})"))
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(
-            &format!("INSERT INTO amended_note (id, label, lixcol_untracked) VALUES {values}"),
-            &[],
-        )
+        db.execute(&format!(
+            "INSERT INTO amended_note (id, label, lixcol_untracked) VALUES {values}"
+        ))
         .await
         .unwrap();
         schema["description"] = serde_json::json!("Updated documentation");
-        db.execute(
-            "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_note'",
-            &[Value::Jsonb(schema.clone().into())],
-        )
-        .await
-        .unwrap();
+        db.execute("UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_note'")
+            .params(&[Value::Jsonb(schema.clone().into())])
+            .await
+            .unwrap();
         for predicate in [
             "id = 'n000'",
             "label = 'v000'",
             "concat(label, '') = 'v000'",
         ] {
             let result = db
-                .execute(
-                    &format!("SELECT id, label FROM amended_note WHERE {predicate}"),
-                    &[],
-                )
+                .query(&format!(
+                    "SELECT id, label FROM amended_note WHERE {predicate}"
+                ))
+                .all()
                 .await
                 .unwrap();
             super::assert_rows_eq(
@@ -174,12 +161,10 @@ async fn compatible_schema_amendment_revalidates_existing_rows_for_reads_and_upd
         let columns = schema["columns"].as_array_mut().unwrap();
         columns.push(serde_json::json!({"name": "optional", "type": "text", "nullable": true}));
         columns.push(serde_json::json!({"name": "priority", "type": "int8", "nullable": false, "default_value": 7}));
-        db.execute(
-            "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_note'",
-            &[Value::Jsonb(schema.into())],
-        )
-        .await
-        .unwrap();
+        db.execute("UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_note'")
+            .params(&[Value::Jsonb(schema.into())])
+            .await
+            .unwrap();
         let query =
             "SELECT id, optional, priority FROM amended_note WHERE priority = 7 AND id = 'n000'";
         let expected = vec![vec![
@@ -187,16 +172,14 @@ async fn compatible_schema_amendment_revalidates_existing_rows_for_reads_and_upd
             Value::Null,
             Value::Integer(7),
         ]];
-        super::assert_rows_eq(db.execute(query, &[]).await.unwrap(), expected.clone());
-        db.execute(
-            "UPDATE amended_note SET label = 'changed' WHERE id = 'n000'",
-            &[],
-        )
-        .await
-        .unwrap();
-        super::assert_rows_eq(db.execute(query, &[]).await.unwrap(), expected.clone());
+        super::assert_rows_eq(db.query(query).all().await.unwrap(), expected.clone());
+        db.execute("UPDATE amended_note SET label = 'changed' WHERE id = 'n000'")
+            .await
+            .unwrap();
+        super::assert_rows_eq(db.query(query).all().await.unwrap(), expected.clone());
         let all = db
-            .execute("SELECT id FROM amended_note WHERE priority = 7", &[])
+            .query("SELECT id FROM amended_note WHERE priority = 7")
+            .all()
             .await
             .unwrap();
         assert_eq!(all.len(), 513);
@@ -206,10 +189,11 @@ async fn compatible_schema_amendment_revalidates_existing_rows_for_reads_and_upd
             .from_snapshot(Cursor::new(snapshot))
             .await
             .unwrap();
-        super::assert_rows_eq(reopened.execute(query, &[]).await.unwrap(), expected);
+        super::assert_rows_eq(reopened.query(query).all().await.unwrap(), expected);
         assert_eq!(
             reopened
-                .execute("SELECT id FROM amended_note WHERE priority = 7", &[])
+                .query("SELECT id FROM amended_note WHERE priority = 7")
+                .all()
                 .await
                 .unwrap()
                 .len(),
@@ -230,59 +214,53 @@ async fn amended_defaults_are_visible_to_write_predicates_and_expressions() {
             {"name": "value", "type": "int8", "nullable": false}
         ], "primary_key": ["id"]
     });
-    db.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES ($1)",
-        &[Value::Jsonb(schema.clone().into())],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO amended_write (id, value) VALUES ('a', 1), ('b', 1), ('c', 1)",
-        &[],
-    )
-    .await
-    .unwrap();
+    db.execute("INSERT INTO lix_registered_schema (value) VALUES ($1)")
+        .params(&[Value::Jsonb(schema.clone().into())])
+        .await
+        .unwrap();
+    db.execute("INSERT INTO amended_write (id, value) VALUES ('a', 1), ('b', 1), ('c', 1)")
+        .await
+        .unwrap();
     schema["columns"].as_array_mut().unwrap().push(serde_json::json!({"name": "priority", "type": "int8", "nullable": false, "default_value": 7}));
-    db.execute(
-        "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_write'",
-        &[Value::Jsonb(schema.into())],
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        db.execute("SELECT id FROM amended_write WHERE priority = 7", &[])
-            .await
-            .unwrap()
-            .len(),
-        3
-    );
-    db.execute("UPDATE amended_write SET value = 2 WHERE priority = 7", &[])
+    db.execute("UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_write'")
+        .params(&[Value::Jsonb(schema.into())])
         .await
         .unwrap();
     assert_eq!(
-        db.execute("SELECT id FROM amended_write WHERE value = 2", &[])
+        db.query("SELECT id FROM amended_write WHERE priority = 7")
+            .all()
             .await
             .unwrap()
             .len(),
         3
     );
-    db.execute(
-        "UPDATE amended_write SET priority = priority + 1 WHERE id = 'a'",
-        &[],
-    )
-    .await
-    .unwrap();
+    db.execute("UPDATE amended_write SET value = 2 WHERE priority = 7")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT id FROM amended_write WHERE value = 2")
+            .all()
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    db.execute("UPDATE amended_write SET priority = priority + 1 WHERE id = 'a'")
+        .await
+        .unwrap();
     super::assert_rows_eq(
-        db.execute("SELECT priority FROM amended_write WHERE id = 'a'", &[])
+        db.query("SELECT priority FROM amended_write WHERE id = 'a'")
+            .all()
             .await
             .unwrap(),
         vec![vec![Value::Integer(8)]],
     );
-    db.execute("DELETE FROM amended_write WHERE priority = 7", &[])
+    db.execute("DELETE FROM amended_write WHERE priority = 7")
         .await
         .unwrap();
     super::assert_rows_eq(
-        db.execute("SELECT id FROM amended_write ORDER BY id", &[])
+        db.query("SELECT id FROM amended_write ORDER BY id")
+            .all()
             .await
             .unwrap(),
         vec![vec![Value::Text("a".into())]],

@@ -87,7 +87,7 @@ where
         .await
         .expect("open benchmark session");
 
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin exact-file benchmark seed transaction");
@@ -105,14 +105,12 @@ where
         ),
     ] {
         inserted += transaction
-            .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-                &[
-                    Value::Text(file_id),
-                    Value::Text(path.to_string()),
-                    Value::Blob(bytes.into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+            .params(&[
+                Value::Text(file_id),
+                Value::Text(path.to_string()),
+                Value::Blob(bytes.into()),
+            ])
             .await
             .expect("seed benchmark special file")
             .rows_affected();
@@ -132,7 +130,7 @@ where
             .expect("format corpus file insert");
         }
         inserted += transaction
-            .execute(&sql, &[])
+            .execute(&sql)
             .await
             .expect("seed benchmark corpus files")
             .rows_affected();
@@ -205,7 +203,8 @@ where
         for _ in 0..WARMUPS {
             black_box(
                 session
-                    .execute(sql, &params)
+                    .execute(sql)
+                    .params(&params)
                     .await
                     .expect("warm exact read"),
             );
@@ -215,7 +214,8 @@ where
         for _ in 0..ROUNDS {
             let started = Instant::now();
             let result = session
-                .execute(sql, &params)
+                .execute(sql)
+                .params(&params)
                 .await
                 .expect("execute exact read");
             black_box(&result);
@@ -236,7 +236,8 @@ where
     for _ in 0..WARMUPS {
         black_box(
             session
-                .execute(root_listing_sql, &[])
+                .query(root_listing_sql)
+                .all()
                 .await
                 .expect("warm root listing"),
         );
@@ -245,7 +246,8 @@ where
     for _ in 0..ROUNDS {
         let started = Instant::now();
         let result = session
-            .execute(root_listing_sql, &[])
+            .query(root_listing_sql)
+            .all()
             .await
             .expect("execute root listing");
         black_box(&result);
@@ -265,13 +267,15 @@ where
     for _ in 0..WARMUPS {
         black_box(
             session
-                .execute(root_directory_sql, &[])
+                .query(root_directory_sql)
+                .all()
                 .await
                 .expect("warm root directories"),
         );
         black_box(
             session
-                .execute(root_listing_sql, &[])
+                .query(root_listing_sql)
+                .all()
                 .await
                 .expect("warm root files"),
         );
@@ -280,11 +284,13 @@ where
     for _ in 0..ROUNDS {
         let started = Instant::now();
         let directories = session
-            .execute(root_directory_sql, &[])
+            .query(root_directory_sql)
+            .all()
             .await
             .expect("execute root directories");
         let files = session
-            .execute(root_listing_sql, &[])
+            .query(root_listing_sql)
+            .all()
             .await
             .expect("execute root files");
         black_box((&directories, &files));

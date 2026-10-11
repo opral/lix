@@ -13,8 +13,17 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, 
     let (sql, params) = resolve_sql_and_params(&args)?;
     let lix_path = db::resolve_db_path(context)?;
     let lix = db::open_lix_at(&lix_path)?;
-    let result = db::block_on(lix.execute(&sql, &params))
-        .map_err(|err| CliError::from_lix("sql execution failed", err))?;
+    // `sql execute` runs any single statement: reads through query(), writes
+    // (and reads that call durable functions) through execute().
+    let read_only = lix::parse_sql_script(&sql, params.len())
+        .map(|plan| matches!(plan.statements.as_slice(), [statement] if statement.read_only))
+        .unwrap_or(false);
+    let result = if read_only {
+        db::block_on(lix.query(&sql).params(&params).all()).map(lix::ExecuteResult::from)
+    } else {
+        db::block_on(lix.execute(&sql).params(&params))
+    }
+    .map_err(|err| CliError::from_lix("sql execution failed", err))?;
 
     match args.format {
         SqlOutputFormat::Json => output::print_execute_result_json(&result),

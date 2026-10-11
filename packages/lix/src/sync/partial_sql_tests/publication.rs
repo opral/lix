@@ -23,28 +23,28 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
         .unwrap();
     for index in 0..2 {
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
-                &[Value::Text(format!("history-{index}"))],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ($1,'history')")
+            .params(&[Value::Text(format!("history-{index}"))])
             .await
             .unwrap();
     }
     authority.create_checkpoint().await.unwrap();
     for index in 2..4 {
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ($1,'history')",
-                &[Value::Text(format!("history-{index}"))],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ($1,'history')")
+            .params(&[Value::Text(format!("history-{index}"))])
             .await
             .unwrap();
     }
     authority.create_checkpoint().await.unwrap();
     let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
     let sql = "SELECT commit_id, parent_commit_id, created_at, is_checkpoint, position FROM lix_log() WHERE is_checkpoint = true ORDER BY position ASC";
-    let expected = authority.execute(sql, &[]).await.unwrap();
-    assert_eq!(expected.rows().len(), 2, "fixture has sparse checkpoint history");
+    let expected = authority.query(sql).all().await.unwrap();
+    assert_eq!(
+        expected.rows().len(),
+        2,
+        "fixture has sparse checkpoint history"
+    );
     let mut fetches = Fetches::default();
     let actual = execute_hydrating(
         &session,
@@ -76,10 +76,8 @@ async fn active_checkpoint_retirement_interest_rebases_authority_state() {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path, content) VALUES ('/retirement-rebase.md', $1)",
-            &[Value::Blob(b"before".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file(path, content) VALUES ('/retirement-rebase.md', $1)")
+        .params(&[Value::Blob(b"before".to_vec().into())])
         .await
         .unwrap();
     let checkpoint_id = authority.create_checkpoint().await.unwrap().commit_id;
@@ -111,32 +109,35 @@ async fn active_checkpoint_retirement_interest_rebases_authority_state() {
     };
     let registry = engine.sync_mode().read_interests().unwrap();
     let contains_retirement_interest = |snapshot: &crate::hot_state::ReadInterestSnapshot| {
-        snapshot.interests.iter().any(|interest| match interest.as_ref() {
-            crate::hot_state::LogicalReadInterest::Exact { rows, .. } => rows.iter().any(|row| {
-                row.schema_key == key.schema_key
-                    && row.branch_id == old.descriptor().selected_branch.branch_id
-                    && row.row_pk == key.row_pk
-            }),
-            _ => false,
-        })
+        snapshot
+            .interests
+            .iter()
+            .any(|interest| match interest.as_ref() {
+                crate::hot_state::LogicalReadInterest::Exact { rows, .. } => {
+                    rows.iter().any(|row| {
+                        row.schema_key == key.schema_key
+                            && row.branch_id == old.descriptor().selected_branch.branch_id
+                            && row.row_pk == key.row_pk
+                    })
+                }
+                _ => false,
+            })
     };
     assert!(contains_retirement_interest(&registry.snapshot().unwrap()));
-    crate::sync::partial_interest_journal::flush_partial_read_interests(
-        &storage, &old, &registry,
-    )
-    .await
-    .unwrap();
+    crate::sync::partial_interest_journal::flush_partial_read_interests(&storage, &old, &registry)
+        .await
+        .unwrap();
 
     authority
-        .execute(
-            "SELECT commit_id FROM lix_undo($1)",
-            &[Value::Text(checkpoint_id.clone())],
-        )
+        .execute("SELECT commit_id FROM lix_undo($1)")
+        .params(&[Value::Text(checkpoint_id.clone())])
         .await
         .unwrap();
     assert!(
         authority
-            .execute(query, &[Value::Text(checkpoint_id.clone())])
+            .query(query)
+            .params(&[Value::Text(checkpoint_id.clone())])
+            .all()
             .await
             .unwrap()
             .is_empty(),
@@ -170,9 +171,7 @@ async fn active_checkpoint_retirement_interest_rebases_authority_state() {
         .load_projected_batch_at_commit(
             &next.descriptor().selected_branch.head.commit_id,
             std::slice::from_ref(&key),
-            &crate::changelog::ChangeRecordProjection::from_columns(&[
-                "snapshot_content".into(),
-            ]),
+            &crate::changelog::ChangeRecordProjection::from_columns(&["snapshot_content".into()]),
         )
         .await
         .unwrap();
@@ -196,19 +195,17 @@ async fn joined_checkpoint_history_hydrates_active_selection_and_replays_offline
         .unwrap();
     let mut checkpoints = Vec::new();
     for index in 0..4 {
-        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('joined-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value", &[Value::Text(index.to_string())]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('joined-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value").params(&[Value::Text(index.to_string())]).await.unwrap();
         checkpoints.push(authority.create_checkpoint().await.unwrap().commit_id);
     }
     authority
-        .execute(
-            "SELECT commit_id FROM lix_undo($1)",
-            &[Value::Text(checkpoints[3].clone())],
-        )
+        .execute("SELECT commit_id FROM lix_undo($1)")
+        .params(&[Value::Text(checkpoints[3].clone())])
         .await
         .unwrap();
     let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
     let sql = "SELECT l.commit_id, h.diff_type FROM lix_log() l JOIN lix_history('lix_key_value') h ON h.lixcol_to_commit_id=l.commit_id WHERE l.is_checkpoint AND h.key='joined-history' ORDER BY l.position";
-    let expected = authority.execute(sql, &[]).await.unwrap();
+    let expected = authority.query(sql).all().await.unwrap();
     assert_eq!(expected.len(), 3);
     let actual = execute_hydrating(
         &session,
@@ -247,10 +244,7 @@ async fn fixture_with_account(
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('resident','before')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('resident','before')")
         .await
         .unwrap();
     fixture_from_authority(authority, account).await
@@ -326,28 +320,22 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES ('undo-target','before'), ('undo-unrelated','keep')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES ('undo-target','before'), ('undo-unrelated','keep')")
         .await
         .unwrap();
     let before_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='after' WHERE key='undo-target'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='after' WHERE key='undo-target'")
         .await
         .unwrap();
     let target_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
@@ -480,7 +468,10 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
     {
         let mut writes = storage.new_write_set();
         let mut keys = Vec::new();
-        for branch in [&state.descriptor().selected_branch, &state.descriptor().global_branch] {
+        for branch in [
+            &state.descriptor().selected_branch,
+            &state.descriptor().global_branch,
+        ] {
             let key = StorageKey(bytes::Bytes::copy_from_slice(
                 uuid::Uuid::parse_str(&branch.branch_id).unwrap().as_bytes(),
             ));
@@ -540,10 +531,16 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     assert!(
-        value(migrated_session.execute(
-            "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
-            &[],
-        ).await.unwrap()).contains("pending")
+        value(
+            migrated_session
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
+                    &[],
+                )
+                .await
+                .unwrap()
+        )
+        .contains("pending")
     );
     drop(migrated);
     assert!(matches!(
@@ -666,7 +663,10 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
     )
     .unwrap();
     use crate::storage_adapter::StorageWrite as _;
-    let mut migration = storage.begin_migration_write(Default::default()).await.unwrap();
+    let mut migration = storage
+        .begin_migration_write(Default::default())
+        .await
+        .unwrap();
     seed.lower_into(&mut migration).await.unwrap();
     migration.commit().await.unwrap();
     let mut retire = storage.new_write_set();
@@ -703,10 +703,8 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
     assert!(
         value(
             authority
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key='undo-target'",
-                    &[],
-                )
+                .query("SELECT value FROM lix_key_value WHERE key='undo-target'")
+                .all()
                 .await
                 .unwrap(),
         )
@@ -734,31 +732,26 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
     .unwrap();
 
     let baseline = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='checkpoint-after' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='checkpoint-after' WHERE key='resident'")
         .await
         .unwrap();
     let target = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute(
-            "SELECT commit_id FROM lix_undo($1)",
-            &[Value::Text(target.clone())],
-        )
+        .execute("SELECT commit_id FROM lix_undo($1)")
+        .params(&[Value::Text(target.clone())])
         .await
         .unwrap();
 
@@ -864,25 +857,23 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
     .unwrap();
 
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='unavailable-after' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='unavailable-after' WHERE key='resident'")
         .await
         .unwrap();
     let target = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute("SELECT commit_id FROM lix_undo($1)", &[Value::Text(target)])
+        .execute("SELECT commit_id FROM lix_undo($1)")
+        .params(&[Value::Text(target)])
         .await
         .unwrap();
 
@@ -930,7 +921,9 @@ async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchang
     );
 }
 
-pub(super) async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
+pub(super) async fn prepare_hydrating<
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+>(
     engine: &Engine<S>,
     old: &PartialReplicaState,
     next: Arc<PartialReplicaState>,
@@ -1077,7 +1070,6 @@ async fn unavailable_historical_recipe_does_not_block_moving_negative_scope() {
     authority
         .execute(
             "INSERT INTO lix_key_value (key,value) VALUES ('future-history-independent','arrived')",
-            &[],
         )
         .await
         .unwrap();
@@ -1134,10 +1126,7 @@ async fn unavailable_moving_recipe_does_not_block_unrelated_publication() {
         .await
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='independent' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='independent' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1189,10 +1178,7 @@ async fn remote_publication_prepares_previously_read_scope_before_adoption() {
         .is_empty()
     );
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('future','arrived')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('future','arrived')")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1242,10 +1228,7 @@ async fn remote_publication_rejects_new_interest_after_candidate_preparation() {
     .await
     .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1322,10 +1305,7 @@ async fn remote_publication_cas_rejects_interest_journal_changed_by_another_regi
     .await
     .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1420,10 +1400,7 @@ async fn remote_publication_rejects_racing_local_write_without_losing_pending_ed
     .await
     .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1485,10 +1462,7 @@ async fn remote_publication_preserves_local_untracked_rows_in_fresh_generation()
     // Never select the private rows before preparation: copying locally owned
     // state cannot depend on whether their content was a successful read scope.
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1533,12 +1507,7 @@ async fn remote_publication_preserves_local_untracked_rows_in_fresh_generation()
             .contains(expected)
         );
         assert!(
-            authority
-                .execute(&sql, &[])
-                .await
-                .unwrap()
-                .rows()
-                .is_empty(),
+            authority.query(&sql).all().await.unwrap().rows().is_empty(),
             "local untracked state must not be uploaded"
         );
     }
@@ -1639,10 +1608,7 @@ async fn prepared_update_remains_local_after_remote_baseline_publication() {
         }
     }
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote-next' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote-next' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1688,7 +1654,8 @@ async fn prepared_update_remains_local_after_remote_baseline_publication() {
     assert!(
         value(
             authority
-                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='resident'")
+                .all()
                 .await
                 .unwrap()
         )
@@ -1712,10 +1679,7 @@ async fn prepared_publication_cannot_be_submitted_to_a_copied_storage_owner() {
     .await
     .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1815,10 +1779,7 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
         .await
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_directory (path) VALUES ('/appeared-dir')",
-            &[],
-        )
+        .execute("INSERT INTO lix_directory (path) VALUES ('/appeared-dir')")
         .await
         .unwrap();
     let next = Arc::new(
@@ -1955,10 +1916,8 @@ async fn remote_global_publication_invalidates_active_account_proof() {
         &account
     ));
     authority
-        .execute(
-            "UPDATE lix_account SET status='disabled' WHERE id=$1",
-            &params,
-        )
+        .execute("UPDATE lix_account SET status='disabled' WHERE id=$1")
+        .params(&params)
         .await
         .unwrap();
     let next = Arc::new(
@@ -2111,10 +2070,8 @@ async fn remote_global_publication_prepares_global_session_sql_and_catalog_befor
         retained.interests
     );
     authority
-        .execute(
-            "UPDATE lix_account SET name='global-domain-after' WHERE id=$1",
-            &params,
-        )
+        .execute("UPDATE lix_account SET name='global-domain-after' WHERE id=$1")
+        .params(&params)
         .await
         .unwrap();
     let next = Arc::new(
@@ -2469,10 +2426,7 @@ async fn existing_branch_admission_publishes_matching_native_controls_and_retain
 async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     let authority = open_lix().await.unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('receipt-pending','before')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('receipt-pending','before')")
         .await
         .unwrap();
     let state = PartialReplicaState::new(
@@ -2622,10 +2576,9 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
         .unwrap()
         .unwrap();
     drop(read);
-    let mut legacy: serde_json::Value = serde_json::from_slice(
-        &crate::sync::released_v2_receipt_bytes_for_test(&state, 1),
-    )
-    .unwrap();
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&crate::sync::released_v2_receipt_bytes_for_test(&state, 1))
+            .unwrap();
     legacy.as_object_mut().unwrap().remove("archivedBranchIds");
     legacy["version"] = serde_json::json!(1);
     let mut writes = storage.new_write_set();
@@ -2701,7 +2654,10 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     // promote that historical lease to the current version.
     let mut expected_state = serde_json::to_value(&state).unwrap();
     expected_state["baselineLease"]["version"] = serde_json::json!(1);
-    assert_eq!(serde_json::to_value(&admitted.state).unwrap(), expected_state);
+    assert_eq!(
+        serde_json::to_value(&admitted.state).unwrap(),
+        expected_state
+    );
     let migrated_state = admitted.state.clone();
     assert_eq!(
         admitted_controls(&admitted.adapter, &migrated_state)
@@ -2789,10 +2745,7 @@ async fn scoped_file_index_publication_prepares_renamed_ancestors_and_new_matche
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
-    authority.execute(
-        "INSERT INTO lix_file (id,path,content) VALUES ('aaaaaaaa-0000-8000-8000-000000000001','/old/nested/selected.bin',CAST('one' AS BYTEA)), ('cccccccc-0000-8000-8000-000000000003','/unrelated/file.bin',CAST('other' AS BYTEA))",
-        &[],
-    ).await.unwrap();
+    authority.execute("INSERT INTO lix_file (id,path,content) VALUES ('aaaaaaaa-0000-8000-8000-000000000001','/old/nested/selected.bin',CAST('one' AS BYTEA)), ('cccccccc-0000-8000-8000-000000000003','/unrelated/file.bin',CAST('other' AS BYTEA))").await.unwrap();
     let (authority, engine, session, old) = fixture_from_authority(authority, None).await;
     let storage = engine.storage();
     let ids = vec![
@@ -2867,13 +2820,10 @@ async fn scoped_file_index_publication_prepares_renamed_ancestors_and_new_matche
         "partial-replica directory listing should retain a directory-only path-index interest"
     );
     authority
-        .execute(
-            "UPDATE lix_directory SET path='/moved' WHERE path='/old'",
-            &[],
-        )
+        .execute("UPDATE lix_directory SET path='/moved' WHERE path='/old'")
         .await
         .unwrap();
-    authority.execute("INSERT INTO lix_file (id,path,content) VALUES ('bbbbbbbb-0000-8000-8000-000000000002','/new/appeared.bin',CAST('two' AS BYTEA))", &[]).await.unwrap();
+    authority.execute("INSERT INTO lix_file (id,path,content) VALUES ('bbbbbbbb-0000-8000-8000-000000000002','/new/appeared.bin',CAST('two' AS BYTEA))").await.unwrap();
     let next = Arc::new(
         old.with_descriptor_and_fresh_generations(
             authority.partial_replica_descriptor(None).await.unwrap(),

@@ -213,18 +213,13 @@ async fn competing_partial_some_and_null_imports_cannot_publish_both_facts() {
 async fn existing_full_checkpoint_null_cannot_be_rewritten_by_import() {
     let authority = open_lix().await.unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key, value) VALUES ('description-proof', 'seed')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key, value) VALUES ('description-proof', 'seed')")
         .await
         .unwrap();
     authority.create_checkpoint().await.unwrap();
     let result = authority
-        .execute(
-            "SELECT commit_id FROM lix_log() WHERE is_checkpoint LIMIT 1",
-            &[],
-        )
+        .query("SELECT commit_id FROM lix_log() WHERE is_checkpoint LIMIT 1")
+        .all()
         .await
         .unwrap();
     let id = CommitId::parse(&result.rows()[0].get::<String>("commit_id").unwrap()).unwrap();

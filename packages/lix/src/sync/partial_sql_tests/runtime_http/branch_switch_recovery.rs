@@ -36,10 +36,7 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('local','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('local','before')")
             .await
             .unwrap();
         let target = authority
@@ -224,7 +221,8 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
                 "expired descriptor is replaced within the original switch"
             );
             let confirmed = authority
-                .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='local'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(

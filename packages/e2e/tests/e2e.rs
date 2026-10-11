@@ -261,12 +261,12 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
     lix.execute(
         "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Jsonb(serde_json::json!(["row", "second"]).into()),
-            Value::Text(edited_row_id),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!(["row", "second"]).into()),
+        Value::Text(edited_row_id),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("sparse semantic edit should materialize durable bytes");
     assert_eq!(
@@ -277,12 +277,12 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
     );
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('history-sidecar', 'later commit')",
-        &[],
     )
     .await
     .expect("sidecar commit should advance history depth");
     let head = lix
-        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .expect("active branch head should load")
         .rows()[0]
@@ -298,22 +298,18 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
         .await
         .expect("workspace should reopen without compiling installed plugins");
     let events = history_lix
-        .execute(
-            "SELECT lixcol_to_commit_id FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_position LIMIT 2",
-            &[Value::Text(head), Value::Text(file_id.clone())],
-        )
+        .query("SELECT lixcol_to_commit_id FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_position LIMIT 2").params(&[Value::Text(head), Value::Text(file_id.clone())]).all()
         .await
         .expect("file endpoint history should load");
     assert_eq!(events.len(), 2);
     for (event, expected) in events.rows().iter().zip([second, first]) {
         let result = history_lix
-            .execute(
-                "SELECT content FROM lix_as_of('lix_file', $1) WHERE id = $2",
-                &[
-                    Value::Text(event.get("lixcol_to_commit_id").unwrap()),
-                    Value::Text(file_id.clone()),
-                ],
-            )
+            .query("SELECT content FROM lix_as_of('lix_file', $1) WHERE id = $2")
+            .params(&[
+                Value::Text(event.get("lixcol_to_commit_id").unwrap()),
+                Value::Text(file_id.clone()),
+            ])
+            .all()
             .await
             .expect("historical snapshot should read durable materialized bytes");
         assert_eq!(result.rows()[0].values(), &[Value::Blob(expected.into())]);
@@ -343,16 +339,13 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
     )
     .await;
 
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("mixed-batch transaction should open");
     assert_eq!(
         transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('mixed-order', 'before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('mixed-order', 'before')")
             .await
             .expect("row before file-data batch should stage")
             .rows_affected(),
@@ -360,14 +353,12 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
     );
     assert_eq!(
         transaction
-            .execute(
-                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-                &[
-                    Value::Text(FILE_ID.to_owned()),
-                    Value::Text(PATH.to_owned()),
-                    Value::Blob(br#"{"alpha":"plugin"}"#.to_vec().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+            .params(&[
+                Value::Text(FILE_ID.to_owned()),
+                Value::Text(PATH.to_owned()),
+                Value::Blob(br#"{"alpha":"plugin"}"#.to_vec().into()),
+            ])
             .await
             .expect("file-data batch should stage")
             .rows_affected(),
@@ -375,10 +366,7 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
     );
     assert_eq!(
         transaction
-            .execute(
-                "UPDATE lix_key_value SET value = 'after' WHERE key = 'mixed-order'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'mixed-order'")
             .await
             .expect("row after file-data batch should stage")
             .rows_affected(),
@@ -390,10 +378,8 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
         .expect("mixed row and file-data batches should commit");
 
     let sidecar = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'mixed-order'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'mixed-order'")
+        .all()
         .await
         .expect("mixed-batch sidecar should query");
     assert_eq!(sidecar.len(), 1);
@@ -403,11 +389,12 @@ async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
         "the row staged after RowsWithFileContent must remain the final replacement"
     );
     let member = lix
-        .execute(
+        .query(
             "SELECT scalar_json FROM json_object_member \
              WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
-            &[Value::Text(FILE_ID.to_owned())],
         )
+        .params(&[Value::Text(FILE_ID.to_owned())])
+        .all()
         .await
         .expect("plugin-derived row should query");
     assert_eq!(member.len(), 1);
@@ -454,24 +441,22 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
     )
     .await;
 
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text(TRACKED_FILE_ID.to_owned()),
             Value::Text(TRACKED_PATH.to_owned()),
             Value::Blob(CONTENT.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("tracked json file should write");
+        ])
+        .await
+        .expect("tracked json file should write");
     lix.execute(
         "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
-        &[
-            Value::Text(UNTRACKED_FILE_ID.to_owned()),
-            Value::Text(UNTRACKED_PATH.to_owned()),
-            Value::Blob(CONTENT.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(UNTRACKED_FILE_ID.to_owned()),
+        Value::Text(UNTRACKED_PATH.to_owned()),
+        Value::Blob(CONTENT.to_vec().into()),
+    ])
     .await
     .expect("untracked json file should write");
 
@@ -487,12 +472,13 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
 
     let member_row = async |file_id: &str| {
         let result = lix
-            .execute(
+            .query(
                 "SELECT scalar_json, lixcol_untracked, lixcol_change_id, lixcol_commit_id \
                  FROM json_object_member \
                  WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
-                &[Value::Text(file_id.to_owned())],
             )
+            .params(&[Value::Text(file_id.to_owned())])
+            .all()
             .await
             .expect("plugin-derived rows should query");
         let [row] = result.rows() else {
@@ -572,11 +558,11 @@ async fn untracked_json_file_produces_the_same_plugin_rows_as_a_tracked_one() {
         lix.execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("edited").into()),
-                Value::Text(file_id.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("edited").into()),
+            Value::Text(file_id.to_owned()),
+        ])
         .await
         .unwrap_or_else(|error| panic!("row edit on '{path}' should commit: {error:?}"));
         assert_eq!(
@@ -617,24 +603,22 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
     )
     .await;
 
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text(TRACKED_FILE_ID.to_owned()),
             Value::Text("/fk-tracked.md".to_owned()),
             Value::Blob(CONTENT.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("tracked markdown file should write");
+        ])
+        .await
+        .expect("tracked markdown file should write");
     lix.execute(
         "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
-        &[
-            Value::Text(UNTRACKED_FILE_ID.to_owned()),
-            Value::Text("/fk-untracked.md".to_owned()),
-            Value::Blob(CONTENT.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(UNTRACKED_FILE_ID.to_owned()),
+        Value::Text("/fk-untracked.md".to_owned()),
+        Value::Blob(CONTENT.to_vec().into()),
+    ])
     .await
     .expect("untracked markdown file should write");
 
@@ -646,7 +630,7 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
     // to a lost row or a reparented one.
     let shape = async |file_id: &str| {
         let result = lix
-            .execute(
+            .query(
                 "SELECT child.kind AS kind, parent.kind AS parent_kind \
                  FROM markdown_node AS child \
                  LEFT JOIN markdown_node AS parent \
@@ -654,8 +638,9 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
                   AND parent.id = child.parent_id \
                  WHERE child.lixcol_file_id = $1 \
                  ORDER BY child.kind, parent.kind",
-                &[Value::Text(file_id.to_owned())],
             )
+            .params(&[Value::Text(file_id.to_owned())])
+            .all()
             .await
             .expect("markdown nodes should query");
         result
@@ -684,14 +669,15 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
     // dangling parent_id is exactly what weaker validation would let through.
     for file_id in [TRACKED_FILE_ID, UNTRACKED_FILE_ID] {
         let dangling = lix
-            .execute(
+            .query(
                 "SELECT child.id FROM markdown_node AS child \
                  WHERE child.lixcol_file_id = $1 AND child.parent_id IS NOT NULL \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM markdown_node AS parent \
                      WHERE parent.lixcol_file_id = $1 AND parent.id = child.parent_id)",
-                &[Value::Text(file_id.to_owned())],
             )
+            .params(&[Value::Text(file_id.to_owned())])
+            .all()
             .await
             .expect("foreign-key resolution should query");
         assert_eq!(
@@ -705,26 +691,25 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
     // deleting a referenced parent has to be rejected on both lanes alike.
     let delete_parent = async |file_id: &str| {
         let parents = lix
-            .execute(
+            .query(
                 "SELECT DISTINCT parent_id FROM markdown_node \
                  WHERE lixcol_file_id = $1 AND parent_id IS NOT NULL LIMIT 1",
-                &[Value::Text(file_id.to_owned())],
             )
+            .params(&[Value::Text(file_id.to_owned())])
+            .all()
             .await
             .expect("parent lookup should query");
         let parent_id = parents.rows()[0]
             .get::<String>("parent_id")
             .expect("a referenced parent id");
-        lix.execute(
-            "DELETE FROM markdown_node WHERE lixcol_file_id = $1 AND id = $2",
-            &[
+        lix.execute("DELETE FROM markdown_node WHERE lixcol_file_id = $1 AND id = $2")
+            .params(&[
                 Value::Text(file_id.to_owned()),
                 Value::Text(parent_id.clone()),
-            ],
-        )
-        .await
-        .err()
-        .map(|error| error.code)
+            ])
+            .await
+            .err()
+            .map(|error| error.code)
     };
     let tracked_delete = delete_parent(TRACKED_FILE_ID).await;
     let untracked_delete = delete_parent(UNTRACKED_FILE_ID).await;
@@ -741,7 +726,9 @@ async fn recursive_cte_walks_markdown_plugin_parent_tree() {
     const FILE_ID: &str = "01900000-0000-7000-8000-0000000008b3";
     const CONTENT: &[u8] = b"# Title\n\nA paragraph with *emphasis*.\n\n- one\n- two\n";
 
-    let lix = open_lix().await.expect("recursive CTE workspace should open");
+    let lix = open_lix()
+        .await
+        .expect("recursive CTE workspace should open");
     install_reference_plugin_in_blank_registry(
         &lix,
         "plugin_markdown",
@@ -749,19 +736,17 @@ async fn recursive_cte_walks_markdown_plugin_parent_tree() {
         &["markdown_node"],
     )
     .await;
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text(FILE_ID.to_owned()),
             Value::Text("/recursive-tree.md".to_owned()),
             Value::Blob(CONTENT.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("markdown tree should be parsed into plugin rows");
+        ])
+        .await
+        .expect("markdown tree should be parsed into plugin rows");
 
     let ancestors = lix
-        .execute(
+        .query(
             "WITH RECURSIVE up AS ( \
                  SELECT id, parent_id, lixcol_file_id \
                  FROM markdown_node \
@@ -774,8 +759,9 @@ async fn recursive_cte_walks_markdown_plugin_parent_tree() {
                   AND parent.id = child.parent_id \
              ) \
              SELECT COUNT(*) AS count FROM up",
-            &[Value::Text(FILE_ID.to_owned())],
         )
+        .params(&[Value::Text(FILE_ID.to_owned())])
+        .all()
         .await
         .expect("recursive CTE should walk the markdown plugin's parent tree");
     assert_eq!(
@@ -820,24 +806,23 @@ async fn a_fresh_reparse_after_ownership_loss_replaces_untracked_rows_like_track
             "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content"
         };
-        lix.execute(
-            sql,
-            &[
+        lix.execute(sql)
+            .params(&[
                 Value::Text(file_id.to_owned()),
                 Value::Text(path.to_owned()),
                 Value::Blob(body.as_bytes().to_vec().into()),
-            ],
-        )
-        .await
-        .expect("json file should write");
+            ])
+            .await
+            .expect("json file should write");
     };
     let member_keys = async |file_id: &str| {
         let result = lix
-            .execute(
+            .query(
                 "SELECT key FROM json_object_member \
                  WHERE lixcol_file_id = $1 ORDER BY key",
-                &[Value::Text(file_id.to_owned())],
             )
+            .params(&[Value::Text(file_id.to_owned())])
+            .all()
             .await
             .expect("members should query");
         result
@@ -863,12 +848,9 @@ async fn a_fresh_reparse_after_ownership_loss_replaces_untracked_rows_like_track
 
     // Dropping the archive retires the owner and tombstones the prior rows, so
     // the next write parses each file fresh again with history behind it.
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_json.lixplugin'",
-        &[],
-    )
-    .await
-    .expect("plugin uninstall should commit");
+    lix.execute("DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_json.lixplugin'")
+        .await
+        .expect("plugin uninstall should commit");
     install_plugin(&lix, "plugin_json", &build_json_plugin_archive())
         .await
         .expect("plugin reinstall should commit");
@@ -916,22 +898,21 @@ async fn untracked_file_matching_no_plugin_is_unaffected_by_reconciliation() {
 
     lix.execute(
         "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
-        &[
-            Value::Text(FILE_ID.to_owned()),
-            Value::Text(PATH.to_owned()),
-            Value::Blob(CONTENT.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(FILE_ID.to_owned()),
+        Value::Text(PATH.to_owned()),
+        Value::Blob(CONTENT.to_vec().into()),
+    ])
     .await
     .expect("an untracked file matching no plugin must still write");
 
     assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(CONTENT.to_vec()));
 
     let untracked = lix
-        .execute(
-            "SELECT lixcol_untracked FROM lix_file WHERE id = $1",
-            &[Value::Text(FILE_ID.to_owned())],
-        )
+        .query("SELECT lixcol_untracked FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(FILE_ID.to_owned())])
+        .all()
         .await
         .expect("descriptor should query");
     assert_eq!(untracked.len(), 1);
@@ -956,10 +937,9 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let initial = b"first,one\nsecond,two\nthird,three\n".to_vec();
     write_file(&lix, path, initial.clone()).await.unwrap();
     let _file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1061,15 +1041,13 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         read_file(&rollback_session, path).await.unwrap(),
         Some(one_row.clone())
     );
-    let mut transaction = rollback_session.begin_transaction().await.unwrap();
+    let transaction = rollback_session.begin_transaction().await.unwrap();
     transaction
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
-            &[
-                Value::Blob(b"first,ROLLED-BACK\ninserted,ROLLBACK\n".to_vec().into()),
-                Value::Text(path.to_string()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .params(&[
+            Value::Blob(b"first,ROLLED-BACK\ninserted,ROLLBACK\n".to_vec().into()),
+            Value::Text(path.to_string()),
+        ])
         .await
         .unwrap();
     transaction.rollback().await.unwrap();
@@ -1127,10 +1105,9 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
     let initial = b"first,one\n".to_vec();
     write_file(&lix, path, initial.clone()).await.unwrap();
     let _file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1185,16 +1162,14 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
     let first_id = csv_row_id(&initial, &["short", "x"]);
     let second_id = csv_row_id(&initial, &["second", "y"]);
 
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["much-longer", "x"]).into()),
             Value::Text(first_id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     let after_semantic = b"much-longer,x\nsecond,y\n".to_vec();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
@@ -1272,16 +1247,14 @@ async fn csv_quoted_and_empty_cell_edits_survive_reopen() {
         ),
         (csv_row_id(&rows, &["last"]), serde_json::json!([""])),
     ] {
-        lix.execute(
-            "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-            &[
+        lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+            .params(&[
                 Value::Jsonb(cells.into()),
                 Value::Text(id),
                 Value::Text(file_id.clone()),
-            ],
-        )
-        .await
-        .unwrap();
+            ])
+            .await
+            .unwrap();
     }
     let expected = b"\"alpha,changed\",one\r\n\"\"".to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(expected.clone()));
@@ -1349,26 +1322,22 @@ async fn csv_bom_stays_a_file_prefix_through_row_edits_and_reopen() {
     let file_id = file_id_at_path(&lix, path).await;
     let rows = active_csv_rows(&lix, &file_id).await;
     let first_id = csv_row_id(&rows, &["alpha,one", "x"]);
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["alpha,changed", "x"]).into()),
             Value::Text(first_id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"\xef\xbb\xbf\"alpha,changed\",x\r\nbeta,y".to_vec())
     );
-    lix.execute(
-        "DELETE FROM csv_row WHERE id = $1 AND lixcol_file_id = $2",
-        &[Value::Text(first_id), Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM csv_row WHERE id = $1 AND lixcol_file_id = $2")
+        .params(&[Value::Text(first_id), Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"\xef\xbb\xbfbeta,y".to_vec())
@@ -1423,16 +1392,14 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
     write_file(&lix, path, b"new,zero\nold,one\nlast,two\n".to_vec())
         .await
         .expect("prepending a row should use structural reconciliation");
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["old", "ONE"]).into()),
             Value::Text(old_id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .expect("semantic update after structural insert must use durable row identities");
+        ])
+        .await
+        .expect("semantic update after structural insert must use durable row identities");
     let after_semantic = active_csv_rows(&lix, &file_id).await;
     assert_eq!(csv_row_id(&after_semantic, &["old", "ONE"]), old_id);
     assert!(
@@ -1466,10 +1433,8 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(source));
 
     let nodes = lix
-        .execute(
-            "SELECT id, kind, payload_json FROM markdown_node ORDER BY kind",
-            &[],
-        )
+        .query("SELECT id, kind, payload_json FROM markdown_node ORDER BY kind")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1511,12 +1476,10 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
         }]
     })
     .to_string();
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
-        &[Value::Text(payload_json), Value::Text(paragraph_id)],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2")
+        .params(&[Value::Text(payload_json), Value::Text(paragraph_id)])
+        .await
+        .unwrap();
     let after_semantic = b"# Heading\n\nEdited paragraph with a much longer tail.\n".to_vec();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
@@ -1531,15 +1494,13 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_row_edit() {
         .expect("a byte edit after semantic rendering must not use stale Markdown spans");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
     assert!(
-        lix.execute(
-            "SELECT payload_json FROM markdown_node WHERE kind = 'paragraph'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .rows()
-        .first()
-        .is_some_and(|row| jsonb_column_contains(row, "payload_json", "TAIL"))
+        lix.query("SELECT payload_json FROM markdown_node WHERE kind = 'paragraph'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .first()
+            .is_some_and(|row| jsonb_column_contains(row, "payload_json", "TAIL"))
     );
 
     lix.close().await.unwrap();
@@ -1566,10 +1527,8 @@ async fn markdown_equal_length_overlay_is_cleared_after_rebuild() {
             .unwrap();
     }
     let rows = lix
-        .execute(
-            "SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'",
-            &[],
-        )
+        .query("SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'")
+        .all()
         .await
         .unwrap();
     let target = rows
@@ -1577,17 +1536,15 @@ async fn markdown_equal_length_overlay_is_cleared_after_rebuild() {
         .iter()
         .find(|row| jsonb_column_contains(row, "payload_json", "Bravo"))
         .unwrap();
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
-        &[
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2")
+        .params(&[
             Value::Text(
                 serde_json::json!({"inline": [{"type": "text", "value": "BRAVO"}]}).to_string(),
             ),
             Value::Text(target.get::<String>("id").unwrap()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"Delta\n\nBRAVO\n\nCharlie\n".to_vec())
@@ -1610,14 +1567,12 @@ async fn markdown_semantic_edit_retains_unrelated_literal_source() {
     write_file(&lix, path, source.as_bytes().to_vec())
         .await
         .unwrap();
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE kind = 'paragraph'",
-        &[Value::Text(
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE kind = 'paragraph'")
+        .params(&[Value::Text(
             serde_json::json!({"inline": [{"type": "text", "value": "Edited"}]}).to_string(),
-        )],
-    )
-    .await
-    .unwrap();
+        )])
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(source.replace("Target", "Edited").into_bytes())
@@ -1644,7 +1599,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(before));
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM markdown_node", &[])
+        lix.query("SELECT COUNT(*) AS count FROM markdown_node")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1656,7 +1612,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     let after = b"# Heading\n\nParagraph with **bold** text and a tail.\n".to_vec();
 
     let opening_commit: String = lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1666,10 +1623,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
-        .execute(
-            "SELECT kind, payload_json FROM markdown_node ORDER BY kind",
-            &[],
-        )
+        .query("SELECT kind, payload_json FROM markdown_node ORDER BY kind")
+        .all()
         .await
         .unwrap();
     assert_eq!(current.rows().len(), 3);
@@ -1681,10 +1636,9 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
         "the sparse successor must overlay the immutable opening segment"
     );
     let historical = lix
-        .execute(
-            "SELECT kind, payload_json FROM lix_as_of('markdown_node', $1) ORDER BY kind",
-            &[Value::Text(opening_commit)],
-        )
+        .query("SELECT kind, payload_json FROM lix_as_of('markdown_node', $1) ORDER BY kind")
+        .params(&[Value::Text(opening_commit)])
+        .all()
         .await
         .unwrap();
     assert_eq!(historical.rows().len(), 3);
@@ -1705,7 +1659,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
     assert_eq!(
         reopened
-            .execute("SELECT COUNT(*) AS count FROM markdown_node", &[])
+            .query("SELECT COUNT(*) AS count FROM markdown_node")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1742,11 +1697,12 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
         .unwrap();
     let file_id = file_id_at_path(&lix, path).await;
     let original = lix
-        .execute(
+        .query(
             "SELECT id FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1757,11 +1713,12 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
         .await
         .unwrap();
     let rows = lix
-        .execute(
+        .query(
             "SELECT id, payload_json FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     let inserted = rows
@@ -1784,17 +1741,17 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     lix.execute(
         "UPDATE markdown_node SET payload_json = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Text(
-                serde_json::json!({
-                    "inline": [{"type": "text", "value": "Edited after hydration."}]
-                })
-                .to_string(),
-            ),
-            Value::Text(inserted.clone()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Text(
+            serde_json::json!({
+                "inline": [{"type": "text", "value": "Edited after hydration."}]
+            })
+            .to_string(),
+        ),
+        Value::Text(inserted.clone()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("semantic edit must address the hydrated later-namespace identity");
     assert_eq!(
@@ -1810,11 +1767,12 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     .await
     .expect("full file reconciliation must reuse the hydrated identity graph");
     let retained = lix
-        .execute(
+        .query(
             "SELECT id, payload_json FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     let retained_id = retained
@@ -1868,10 +1826,8 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
         b"---\nDateApproved: 6/10/2020\n---\n\n\n# Title\n\nA large untouched suffix.\n".to_vec();
     write_file(&lix, path, before.clone()).await.unwrap();
     let document = lix
-        .execute(
-            "SELECT format_json FROM markdown_node WHERE kind = 'document'",
-            &[],
-        )
+        .query("SELECT format_json FROM markdown_node WHERE kind = 'document'")
+        .all()
         .await
         .unwrap();
     assert_eq!(document.rows().len(), 1);
@@ -1924,11 +1880,12 @@ where
     let path = "/company/competitors.md";
     let file_id = file_id_at_path(lix, path).await;
     let paragraphs = lix
-        .execute(
+        .query(
             "SELECT id, payload_json FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .expect("restored Markdown paragraphs should query");
     let paragraph_count = paragraphs.rows().len();
@@ -1941,20 +1898,20 @@ where
     lix.execute(
         "UPDATE markdown_node SET payload_json = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Text(
-                serde_json::json!({
-                    "inline": [{
-                        "type": "text",
-                        "value": "Peer 12 was edited after durable restore."
-                    }]
-                })
-                .to_string(),
-            ),
-            Value::Text(edited_id),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Text(
+            serde_json::json!({
+                "inline": [{
+                    "type": "text",
+                    "value": "Peer 12 was edited after durable restore."
+                }]
+            })
+            .to_string(),
+        ),
+        Value::Text(edited_id),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("semantic child edit after durable restore should commit");
 
@@ -1973,11 +1930,12 @@ where
         );
     }
     let successor_count = lix
-        .execute(
+        .query(
             "SELECT COUNT(*) AS count FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .expect("successor Markdown paragraphs should query")
         .rows()[0]
@@ -2063,7 +2021,7 @@ where
         .await
         .expect("main Markdown branch should reactivate");
     }
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("Markdown checkpoint should commit");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2080,19 +2038,17 @@ where
             (path, content)
         })
         .collect::<Vec<_>>();
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("17-file Markdown transaction should open");
     for (path, content) in &batch {
         transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(path.clone()),
-                    Value::Blob(content.clone().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(path.clone()),
+                Value::Blob(content.clone().into()),
+            ])
             .await
             .expect("17-file Markdown batch row should stage");
     }
@@ -2196,7 +2152,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
         Some(expected.clone())
     );
     qualify_markdown_server_style_branch(&lix, &expected).await;
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("server-style SlateDB branch checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2228,7 +2184,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_checkpoint_guard() {
     write_file(&lix, "/company/competitors.md", expected.clone())
         .await
         .expect("server-style SlateDB Markdown write");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("server-style SlateDB Markdown checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2263,7 +2219,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_batch_guard() {
     write_file(&lix, "/company/competitors.md", expected)
         .await
         .expect("server-style SlateDB Markdown write");
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for index in 0..17 {
         let path = format!("/batch/peer-{index}.md");
         let content = format!(
@@ -2271,10 +2227,8 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_batch_guard() {
             index + 1
         );
         transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[Value::Text(path), Value::Blob(content.into_bytes().into())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[Value::Text(path), Value::Blob(content.into_bytes().into())])
             .await
             .unwrap();
     }
@@ -2303,10 +2257,8 @@ async fn v2_markdown_merges_unrelated_rows_and_regenerates_derived_bytes() {
     .await
     .unwrap();
     let paragraphs = lix
-        .execute(
-            "SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'",
-            &[],
-        )
+        .query("SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'")
+        .all()
         .await
         .unwrap();
     let paragraph_id = |needle: &str| {
@@ -2329,35 +2281,31 @@ async fn v2_markdown_merges_unrelated_rows_and_regenerates_derived_bytes() {
         .await
         .unwrap();
 
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
-        &[
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2")
+        .params(&[
             Value::Text(
                 serde_json::json!({"inline":[{"type":"text","value":"First from target."}]})
                     .to_string(),
             ),
             Value::Text(first_id),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: source.id.clone(),
     })
     .await
     .unwrap();
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
-        &[
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2")
+        .params(&[
             Value::Text(
                 serde_json::json!({"inline":[{"type":"text","value":"Second from source."}]})
                     .to_string(),
             ),
             Value::Text(second_id),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: main_branch_id,
     })
@@ -2690,11 +2638,11 @@ async fn v2_json_unrelated_row_branch_merge_accepts_typed_rows() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("target").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("target").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("target JSON member should update");
     lix.switch_branch(SwitchBranchOptions {
@@ -2705,11 +2653,11 @@ async fn v2_json_unrelated_row_branch_merge_accepts_typed_rows() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("source").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("source").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("source JSON member should update");
     lix.switch_branch(SwitchBranchOptions {
@@ -2732,12 +2680,13 @@ async fn v2_json_unrelated_row_branch_merge_accepts_typed_rows() {
     .expect("typed JSON rows must remain native while fingerprinting the merge batch");
 
     let merged = lix
-        .execute(
+        .query(
             "SELECT key, scalar_json FROM json_object_member \
              WHERE parent_id = 'root' AND key IN ('left', 'right') \
              AND lixcol_file_id = $1 ORDER BY key",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .expect("merged JSON rows should query");
     assert_eq!(merged.len(), 2);
@@ -2782,11 +2731,11 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_typed_rows() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("target").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("target").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .unwrap();
     lix.switch_branch(SwitchBranchOptions {
@@ -2797,11 +2746,11 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_typed_rows() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("source").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("source").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .unwrap();
     lix.switch_branch(SwitchBranchOptions {
@@ -2817,11 +2766,12 @@ async fn v2_json_same_row_branch_merge_runs_static_resolver_on_typed_rows() {
     .expect("the JSON static resolver should accept typed rows");
 
     let merged = lix
-        .execute(
+        .query(
             "SELECT scalar_json FROM json_object_member \
              WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(merged.len(), 1);
@@ -2862,11 +2812,11 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("target").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("target").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .unwrap();
     lix.switch_branch(SwitchBranchOptions {
@@ -2877,11 +2827,11 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("source").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("source").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .unwrap();
     lix.switch_branch(SwitchBranchOptions {
@@ -2897,11 +2847,12 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
     .expect("the v3 JSON resolver and renderer should complete atomically");
 
     let merged = lix
-        .execute(
+        .query(
             "SELECT scalar_json FROM json_object_member \
              WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(merged.len(), 1);
@@ -3095,12 +3046,10 @@ async fn v2_csv_incoming_edit_restores_deleted_file_and_semantic_rows() {
         .await
         .unwrap();
 
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("target file deletion should commit");
+    lix.execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .await
+        .expect("target file deletion should commit");
     lix.switch_branch(SwitchBranchOptions {
         branch_id: source.id.clone(),
     })
@@ -3109,12 +3058,12 @@ async fn v2_csv_incoming_edit_restores_deleted_file_and_semantic_rows() {
     lix.execute(
         "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Jsonb(serde_json::json!(["alpha", "ONE", "red"]).into()),
-            Value::Text(row_id.clone()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!(["alpha", "ONE", "red"]).into()),
+        Value::Text(row_id.clone()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("source semantic row edit should commit");
     lix.switch_branch(SwitchBranchOptions {
@@ -3186,40 +3135,34 @@ async fn v2_csv_format_change_and_same_row_edit_requires_explicit_migration() {
         .await
         .unwrap();
 
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["TARGET", "one", "red"]).into()),
             Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .expect("target same-row edit should commit");
+        ])
+        .await
+        .expect("target same-row edit should commit");
     lix.switch_branch(SwitchBranchOptions {
         branch_id: source.id.clone(),
     })
     .await
     .unwrap();
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
+    lix.execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
             Value::Text(tsv_path.to_owned()),
             Value::Text(csv_path.to_owned()),
-        ],
-    )
-    .await
-    .expect("source descriptor rename should commit");
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+        ])
+        .await
+        .expect("source descriptor rename should commit");
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["SOURCE", "one", "red"]).into()),
             Value::Text(row_id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .expect("source same-row edit should commit under the TSV descriptor");
+        ])
+        .await
+        .expect("source same-row edit should commit under the TSV descriptor");
     assert_eq!(
         read_file(&lix, tsv_path).await.unwrap(),
         Some(b"SOURCE\tone\tred\n".to_vec()),
@@ -3281,40 +3224,34 @@ async fn v2_csv_rename_and_disjoint_row_edits_materialize_the_merged_file() {
         })
         .await
         .unwrap();
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["TARGET", "one"]).into()),
             Value::Text(first_id),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: source.id.clone(),
     })
     .await
     .unwrap();
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
+    lix.execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
             Value::Text(after_path.to_owned()),
             Value::Text(before_path.to_owned()),
-        ],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+        ])
+        .await
+        .unwrap();
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(serde_json::json!(["SOURCE", "two"]).into()),
             Value::Text(second_id),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, after_path).await.unwrap(),
         Some(b"alpha,one\nSOURCE,two\n".to_vec())
@@ -3360,14 +3297,12 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
         .await
         .unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    lix.execute("INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'new', 'ff', 'number', $1, $2)", &[Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())]).await.unwrap();
-    lix.execute(
-        "DELETE FROM json_object_member WHERE key = 'remove' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
-    lix.execute_batch(&[
+    lix.execute("INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'new', 'ff', 'number', $1, $2)").params(&[Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())]).await.unwrap();
+    lix.execute("DELETE FROM json_object_member WHERE key = 'remove' AND lixcol_file_id = $1")
+        .params(&[Value::Text(file_id.clone())])
+        .await
+        .unwrap();
+    execute_atomically(&lix, &[
         ExecuteBatchStatement { label: None, sql: "DELETE FROM json_object_member WHERE key = 'new' AND lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
         ExecuteBatchStatement { label: None, sql: "INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', 'renamed', 'ff', 'number', $1, $2)".into(), params: vec![Value::Jsonb(serde_json::json!(9).into()), Value::Text(file_id.clone())] },
     ]).await.unwrap();
@@ -3375,32 +3310,35 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
         read_file(&lix, path).await.unwrap(),
         Some(br#"{"keep":1.2300e+04,"renamed":9}"#.to_vec())
     );
-    lix.execute_batch(&[
-        ExecuteBatchStatement {
-            label: None,
-            sql: "DELETE FROM json_object_member WHERE lixcol_file_id = $1".into(),
-            params: vec![Value::Text(file_id.clone())],
-        },
-        ExecuteBatchStatement {
-            label: None,
-            sql: "UPDATE json_root SET kind = 'array' WHERE lixcol_file_id = $1".into(),
-            params: vec![Value::Text(file_id.clone())],
-        },
-    ])
+    execute_atomically(
+        &lix,
+        &[
+            ExecuteBatchStatement {
+                label: None,
+                sql: "DELETE FROM json_object_member WHERE lixcol_file_id = $1".into(),
+                params: vec![Value::Text(file_id.clone())],
+            },
+            ExecuteBatchStatement {
+                label: None,
+                sql: "UPDATE json_root SET kind = 'array' WHERE lixcol_file_id = $1".into(),
+                params: vec![Value::Text(file_id.clone())],
+            },
+        ],
+    )
     .await
     .expect("SQL projects each statement, so remove children before converting the root");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(b"[]".to_vec()));
-    let inserted = lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '80', 'number', $1, $2) RETURNING id", &[Value::Jsonb(serde_json::json!(1).into()), Value::Text(file_id.clone())]).await.unwrap();
+    let inserted = lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '80', 'number', $1, $2) RETURNING id").params(&[Value::Jsonb(serde_json::json!(1).into()), Value::Text(file_id.clone())]).await.unwrap();
     let inserted_id = inserted.rows()[0].get::<Value>("id").unwrap();
-    lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '40', 'number', $1, $2)", &[Value::Jsonb(serde_json::json!(2).into()), Value::Text(file_id.clone())]).await.unwrap();
+    lix.execute("INSERT INTO json_array_item (parent_id, order_key, kind, scalar_json, lixcol_file_id) VALUES ('root', '40', 'number', $1, $2)").params(&[Value::Jsonb(serde_json::json!(2).into()), Value::Text(file_id.clone())]).await.unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"[2,1]".to_vec())
     );
     lix.execute(
         "UPDATE json_array_item SET order_key = '20' WHERE id = $1 AND lixcol_file_id = $2",
-        &[inserted_id.clone(), Value::Text(file_id.clone())],
     )
+    .params(&[inserted_id.clone(), Value::Text(file_id.clone())])
     .await
     .unwrap();
     assert_eq!(
@@ -3412,12 +3350,12 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
     reopened
         .execute(
             "UPDATE json_array_item SET scalar_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
-            &[
-                Value::Jsonb(serde_json::json!(100).into()),
-                inserted_id,
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!(100).into()),
+            inserted_id,
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     assert_eq!(
@@ -3427,15 +3365,13 @@ async fn json_structural_sql_edits_and_root_conversion_survive_reopen() {
     let before = read_file(&reopened, path).await.unwrap();
     assert!(
         reopened
-            .execute(
-                "DELETE FROM json_root WHERE lixcol_file_id = $1",
-                &[Value::Text(file_id.clone())]
-            )
+            .execute("DELETE FROM json_root WHERE lixcol_file_id = $1")
+            .params(&[Value::Text(file_id.clone())])
             .await
             .is_err()
     );
     assert_eq!(read_file(&reopened, path).await.unwrap(), before);
-    reopened.execute_batch(&[
+    execute_atomically(&reopened, &[
         ExecuteBatchStatement { label: None, sql: "DELETE FROM json_array_item WHERE lixcol_file_id = $1".into(), params: vec![Value::Text(file_id.clone())] },
         ExecuteBatchStatement { label: None, sql: "UPDATE json_root SET kind = 'boolean', scalar_json = $1 WHERE lixcol_file_id = $2".into(), params: vec![Value::Jsonb(serde_json::json!(true).into()), Value::Text(file_id)] },
     ]).await.unwrap();
@@ -3460,7 +3396,7 @@ async fn json_structural_sql_rejects_orphans_and_accepts_subtree_deletion() {
     let original = br#"{"box":{"x":1},"keep":2}"#;
     write_file(&lix, path, original.to_vec()).await.unwrap();
     assert!(
-        lix.execute("DELETE FROM json_object_member WHERE key = 'box'", &[])
+        lix.execute("DELETE FROM json_object_member WHERE key = 'box'")
             .await
             .is_err()
     );
@@ -3469,18 +3405,16 @@ async fn json_structural_sql_rejects_orphans_and_accepts_subtree_deletion() {
         Some(original.to_vec())
     );
     assert_eq!(
-        lix.execute("SELECT key FROM json_object_member", &[])
+        lix.query("SELECT key FROM json_object_member")
+            .all()
             .await
             .unwrap()
             .len(),
         3
     );
-    lix.execute(
-        "DELETE FROM json_object_member WHERE key IN ('box', 'x')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM json_object_member WHERE key IN ('box', 'x')")
+        .await
+        .unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(br#"{"keep":2}"#.to_vec())
@@ -3509,10 +3443,8 @@ async fn json_scalar_spelling_survives_row_edits_and_cold_reopen() {
 
     let reopened = open_rocksdb_lix(root.path()).await;
     reopened
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'edit'",
-            &[Value::Jsonb(serde_json::json!("longer").into())],
-        )
+        .execute("UPDATE json_object_member SET scalar_json = $1 WHERE key = 'edit'")
+        .params(&[Value::Jsonb(serde_json::json!("longer").into())])
         .await
         .unwrap();
     let edited = original.replace("old", "longer");
@@ -3526,10 +3458,8 @@ async fn json_scalar_spelling_survives_row_edits_and_cold_reopen() {
         .await
         .unwrap();
     reopened
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'number'",
-            &[Value::Jsonb(serde_json::json!(7).into())],
-        )
+        .execute("UPDATE json_object_member SET scalar_json = $1 WHERE key = 'number'")
+        .params(&[Value::Jsonb(serde_json::json!(7).into())])
         .await
         .unwrap();
     let expected = file_edited.replace("1.2300e+04", "7");
@@ -3561,17 +3491,16 @@ async fn json_repeated_array_insertions_keep_inserted_rows_writable() {
     write_file(&lix, path, b"[1,2]".to_vec()).await.unwrap();
     write_file(&lix, path, b"[0,1,2]".to_vec()).await.unwrap();
     let rows = lix
-        .execute("SELECT id FROM json_array_item ORDER BY order_key", &[])
+        .query("SELECT id FROM json_array_item ORDER BY order_key")
+        .all()
         .await
         .unwrap();
     let inserted_id = rows.rows()[0].get::<Value>("id").unwrap();
     write_file(&lix, path, b"[0,1,2,3]".to_vec()).await.unwrap();
-    lix.execute(
-        "UPDATE json_array_item SET scalar_json = $1 WHERE id = $2",
-        &[Value::Jsonb(serde_json::json!(100).into()), inserted_id],
-    )
-    .await
-    .expect("an inserted row must remain writable after another insertion");
+    lix.execute("UPDATE json_array_item SET scalar_json = $1 WHERE id = $2")
+        .params(&[Value::Jsonb(serde_json::json!(100).into()), inserted_id])
+        .await
+        .expect("an inserted row must remain writable after another insertion");
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"[100,1,2,3]".to_vec())
@@ -3596,11 +3525,12 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
         .unwrap();
     let file_id = file_id_at_path(&lix, path).await;
     let before = lix
-        .execute(
+        .query(
             "SELECT id, scalar_json FROM json_array_item \
              WHERE lixcol_file_id = $1 ORDER BY order_key",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     let alpha_id = before.rows()[1].get::<String>("id").unwrap();
@@ -3610,11 +3540,12 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
         .await
         .expect("the first structural fallback should preserve accepted identities");
     let after = lix
-        .execute(
+        .query(
             "SELECT id, scalar_json FROM json_array_item \
              WHERE lixcol_file_id = $1 ORDER BY order_key",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(after.rows().len(), 2);
@@ -3628,12 +3559,12 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
     lix.execute(
         "UPDATE json_array_item SET scalar_json = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Jsonb(serde_json::json!("BETA").into()),
-            Value::Text(beta_id),
-            Value::Text(file_id),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("BETA").into()),
+        Value::Text(beta_id),
+        Value::Text(file_id),
+    ])
     .await
     .expect("the preserved durable identity should remain semantically writable");
     assert_eq!(
@@ -3668,10 +3599,8 @@ async fn json_scalar_to_container_edit_uses_full_reconciliation() {
         Some(br#"{"value":{}}"#.to_vec())
     );
     let member = lix
-        .execute(
-            "SELECT kind, scalar_json FROM json_object_member WHERE key = 'value'",
-            &[],
-        )
+        .query("SELECT kind, scalar_json FROM json_object_member WHERE key = 'value'")
+        .all()
         .await
         .unwrap();
     assert_eq!(member.len(), 1);
@@ -3706,10 +3635,8 @@ async fn json_scalar_boundary_insert_adds_sibling_through_full_reconciliation() 
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
     let members = lix
-        .execute(
-            "SELECT key, scalar_json FROM json_object_member ORDER BY key",
-            &[],
-        )
+        .query("SELECT key, scalar_json FROM json_object_member ORDER BY key")
+        .all()
         .await
         .unwrap();
     assert_eq!(members.len(), 2);
@@ -3746,11 +3673,11 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(source.clone()));
 
     let members = lix
-        .execute(
+        .query(
             "SELECT key, kind, scalar_json FROM json_object_member \
              WHERE key = 'name'",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(members.len(), 1);
@@ -3769,12 +3696,10 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(edited.clone()));
 
-    lix.execute(
-        "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'name'",
-        &[Value::Jsonb(serde_json::json!("Grace").into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE json_object_member SET scalar_json = $1 WHERE key = 'name'")
+        .params(&[Value::Jsonb(serde_json::json!("Grace").into())])
+        .await
+        .unwrap();
     let rendered = String::from_utf8(read_file(&lix, path).await.unwrap().unwrap()).unwrap();
     assert_eq!(
         rendered,
@@ -3815,22 +3740,22 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("ONE-A").into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("ONE-A").into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     right_writer
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("TWO-B").into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("TWO-B").into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     let composed = b"{\"left\":\"ONE-A\",\"right\":\"TWO-B\",\"gone\":\"three\"}".to_vec();
@@ -3848,32 +3773,29 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("LWW-A").into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("LWW-A").into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     second_lww
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("LWW-B").into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("LWW-B").into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     let lww = b"{\"left\":\"LWW-B\",\"right\":\"TWO-B\",\"gone\":\"three\"}".to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww.clone()));
 
     // Structural deletion updates both the file and durable rows.
-    lix.execute(
-        "DELETE FROM json_object_member WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
-    ).await.unwrap();
+    lix.execute("DELETE FROM json_object_member WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1").params(&[Value::Text(file_id.clone())]).await.unwrap();
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(br#"{"left":"LWW-B","right":"TWO-B"}"#.to_vec())
@@ -3882,11 +3804,11 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("AFTER-DELETE").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("AFTER-DELETE").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .unwrap();
     let scalar_after_delete =
@@ -3898,11 +3820,11 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("BULK").into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("BULK").into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("a direct JSON semantic transition accepts an existing-scalar batch");
     assert_eq!(
@@ -3939,11 +3861,12 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
     .expect("a later row upsert can recreate a deleted key");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(restored));
     let gone = lix
-        .execute(
+        .query(
             "SELECT key FROM json_object_member \
              WHERE parent_id = 'root' AND key = 'gone' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -3956,11 +3879,11 @@ async fn v2_json_scalar_lww_and_structural_upserts_compose() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("AFTER-FENCE").into()),
-            Value::Text(file_id),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("AFTER-FENCE").into()),
+        Value::Text(file_id),
+    ])
     .await
     .unwrap();
     assert_eq!(
@@ -4028,29 +3951,25 @@ async fn v2_json_ten_mib_unrelated_row_merge_benchmark() {
         let target_value = format!("target-{sample}");
         let source_value = format!("source-{sample}");
 
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-            &[
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[
                 Value::Text(target_key.clone()),
                 Value::Text(target_value.clone()),
-            ],
-        )
-        .await
-        .expect("target merge control row should insert");
+            ])
+            .await
+            .expect("target merge control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: source.id.clone(),
         })
         .await
         .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-            &[
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[
                 Value::Text(source_key.clone()),
                 Value::Text(source_value.clone()),
-            ],
-        )
-        .await
-        .expect("source merge control row should insert");
+            ])
+            .await
+            .expect("source merge control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: target_branch_id.clone(),
         })
@@ -4099,13 +4018,12 @@ async fn v2_json_ten_mib_unrelated_row_merge_benchmark() {
         );
 
         let merged = lix
-            .execute(
-                "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2)",
-                &[
-                    Value::Text(target_key.clone()),
-                    Value::Text(source_key.clone()),
-                ],
-            )
+            .query("SELECT key, value FROM lix_key_value WHERE key IN ($1, $2)")
+            .params(&[
+                Value::Text(target_key.clone()),
+                Value::Text(source_key.clone()),
+            ])
+            .all()
             .await
             .expect("merged control rows should query");
         let values = merged
@@ -4204,23 +4122,19 @@ async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
         let key = format!("batch-merge-conflict-{sample}");
         let target_value = format!("target-{sample}");
         let source_value = format!("source-{sample}");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-            &[Value::Text(key.clone()), Value::Text(target_value.clone())],
-        )
-        .await
-        .expect("target conflict control row should insert");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[Value::Text(key.clone()), Value::Text(target_value.clone())])
+            .await
+            .expect("target conflict control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: source.id.clone(),
         })
         .await
         .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-            &[Value::Text(key.clone()), Value::Text(source_value.clone())],
-        )
-        .await
-        .expect("source conflict control row should insert");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[Value::Text(key.clone()), Value::Text(source_value.clone())])
+            .await
+            .expect("source conflict control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: target_branch_id.clone(),
         })
@@ -4246,10 +4160,9 @@ async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
             measurement,
         );
         let target = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = $1",
-                &[Value::Text(key)],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text(key)])
+            .all()
             .await
             .expect("target control row should remain queryable after merge");
         assert_eq!(target.len(), 1);
@@ -4306,10 +4219,8 @@ async fn v3_json_reopen_uses_one_export_for_cold_successor() {
 
     assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(after));
     let rows = reopened
-        .execute(
-            "SELECT scalar_json FROM json_object_member WHERE key = 'edit'",
-            &[],
-        )
+        .query("SELECT scalar_json FROM json_object_member WHERE key = 'edit'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -4337,10 +4248,8 @@ async fn universal_row_page_streams_oversized_jsonb_value() {
     write_file(&lix, PATH, bytes.clone()).await.unwrap();
     assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(bytes.clone()));
     let rows = lix
-        .execute(
-            "SELECT scalar_json FROM json_object_member WHERE key = 'large'",
-            &[],
-        )
+        .query("SELECT scalar_json FROM json_object_member WHERE key = 'large'")
+        .all()
         .await
         .unwrap();
     let Value::Jsonb(scalar) = rows.rows()[0].get::<Value>("scalar_json").unwrap() else {
@@ -4369,7 +4278,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     let before = br#"{"a":"one","b":"two"}"#.to_vec();
     write_file(&lix, path, before.clone()).await.unwrap();
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+        lix.query("SELECT COUNT(*) AS count FROM json_object_member")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -4380,7 +4290,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
 
     let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
     let opening_commit: String = lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -4389,10 +4300,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     write_file(&lix, path, after.clone()).await.unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
-        .execute(
-            "SELECT key, scalar_json FROM json_object_member ORDER BY key",
-            &[],
-        )
+        .query("SELECT key, scalar_json FROM json_object_member ORDER BY key")
+        .all()
         .await
         .unwrap();
     assert_eq!(current.rows().len(), 2);
@@ -4404,10 +4313,9 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     assert_eq!(current.rows()[1].get::<String>("key").unwrap(), "b");
 
     let historical = lix
-        .execute(
-            "SELECT key, scalar_json FROM lix_as_of('json_object_member', $1) ORDER BY key",
-            &[Value::Text(opening_commit)],
-        )
+        .query("SELECT key, scalar_json FROM lix_as_of('json_object_member', $1) ORDER BY key")
+        .params(&[Value::Text(opening_commit)])
+        .all()
         .await
         .unwrap();
     assert_eq!(historical.rows().len(), 2);
@@ -4450,13 +4358,11 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
 
     assert_eq!(
-        lix.execute(
-            "SELECT scalar_json FROM json_object_member WHERE key = 'a'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .rows()[0]
+        lix.query("SELECT scalar_json FROM json_object_member WHERE key = 'a'")
+            .all()
+            .await
+            .unwrap()
+            .rows()[0]
             .get::<Value>("scalar_json")
             .unwrap(),
         Value::Jsonb(serde_json::json!("ONE").into())
@@ -4476,10 +4382,8 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
     );
     assert_eq!(
         reopened
-            .execute(
-                "SELECT scalar_json FROM json_object_member WHERE key = 'b'",
-                &[],
-            )
+            .query("SELECT scalar_json FROM json_object_member WHERE key = 'b'")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -4507,7 +4411,8 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         .await
         .unwrap();
     let first_id = lix
-        .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[])
+        .query("SELECT id FROM csv_row ORDER BY order_key LIMIT 1")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -4528,7 +4433,8 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     write_file(&lix, path, after_eviction).await.unwrap();
 
     assert_eq!(
-        lix.execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[],)
+        lix.query("SELECT id FROM csv_row ORDER BY order_key LIMIT 1")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -4551,7 +4457,8 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     );
     assert_eq!(
         reopened
-            .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[],)
+            .query("SELECT id FROM csv_row ORDER BY order_key LIMIT 1")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -4850,11 +4757,11 @@ async fn v2_json_cold_row_write_is_scoped_by_file_despite_shared_root_keys() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("FIRST").into()),
-            Value::Text(first_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("FIRST").into()),
+        Value::Text(first_id.clone()),
+    ])
     .await
     .unwrap();
 
@@ -4864,11 +4771,12 @@ async fn v2_json_cold_row_write_is_scoped_by_file_despite_shared_root_keys() {
     );
     assert_eq!(read_file(&lix, second_path).await.unwrap(), Some(second));
     let untouched = lix
-        .execute(
+        .query(
             "SELECT scalar_json FROM json_object_member \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $1",
-            &[Value::Text(second_id)],
         )
+        .params(&[Value::Text(second_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -4895,23 +4803,22 @@ async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
     write_file(&lix, path, original.clone()).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
 
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("rolled-back").into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("rolled-back").into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     let staged = transaction
-        .execute(
-            "SELECT content FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -4925,11 +4832,11 @@ async fn v2_json_row_write_rollback_keeps_original_bytes_and_actor() {
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(serde_json::json!("after").into()),
-            Value::Text(file_id),
-        ],
     )
+    .params(&[
+        Value::Jsonb(serde_json::json!("after").into()),
+        Value::Text(file_id),
+    ])
     .await
     .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(committed));
@@ -4978,8 +4885,8 @@ async fn json_branch_transactions_resolve_overlap_and_converge() {
             .execute(
                 "UPDATE json_object_member SET scalar_json = $1 \
                  WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-                &[Value::Jsonb(value.into()), Value::Text(file_id.clone())],
             )
+            .params(&[Value::Jsonb(value.into()), Value::Text(file_id.clone())])
             .await
             .unwrap();
     }
@@ -5027,29 +4934,29 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
         .await
         .unwrap();
     let second = first.open_another_session().await.unwrap();
-    let mut first_transaction = first.begin_transaction().await.unwrap();
-    let mut second_transaction = second.begin_transaction().await.unwrap();
+    let first_transaction = first.begin_transaction().await.unwrap();
+    let second_transaction = second.begin_transaction().await.unwrap();
     // Unconditional file upserts use the native content-edit merge semantics.
     first_transaction
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Blob(b"{\"a\":\"first\",\"b\":\"base\"}\n".to_vec().into()),
-                Value::Text(path.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Blob(b"{\"a\":\"first\",\"b\":\"base\"}\n".to_vec().into()),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
     second_transaction
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Blob(b"{\"a\":\"base\",\"b\":\"second\"}\n".to_vec().into()),
-                Value::Text(path.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Blob(b"{\"a\":\"base\",\"b\":\"second\"}\n".to_vec().into()),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
 
@@ -5085,15 +4992,13 @@ async fn json_transaction_inherits_parent_acknowledged_file_view() {
         .unwrap();
     // Begin after the peer's commit. The editor still submits bytes derived
     // from the parent's earlier observation, not the latest repository bytes.
-    let mut transaction = parent.begin_transaction().await.unwrap();
+    let transaction = parent.begin_transaction().await.unwrap();
     transaction
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
-            &[
-                Value::Blob(br#"{"mine":"transaction"}"#.to_vec().into()),
-                Value::Text(path.to_owned()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .params(&[
+            Value::Blob(br#"{"mine":"transaction"}"#.to_vec().into()),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
     transaction.commit().await.unwrap();
@@ -5123,23 +5028,20 @@ async fn json_transaction_rollback_preserves_parent_acknowledged_view() {
     write_file(&parent, path, original.clone()).await.unwrap();
     assert_eq!(read_file(&parent, path).await.unwrap(), Some(original));
 
-    let mut transaction = parent.begin_transaction().await.unwrap();
+    let transaction = parent.begin_transaction().await.unwrap();
     let submitted = br#"{"mine":"rolled-back","next":"base"}"#.to_vec();
     transaction
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
-            &[
-                Value::Blob(submitted.clone().into()),
-                Value::Text(path.to_owned()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .params(&[
+            Value::Blob(submitted.clone().into()),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
     let staged = transaction
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -5197,36 +5099,36 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
     .await
     .unwrap();
     let winner_client = stale_client.open_another_session().await.unwrap();
-    let mut stale = stale_client.begin_transaction().await.unwrap();
-    let mut winner = winner_client.begin_transaction().await.unwrap();
+    let stale = stale_client.begin_transaction().await.unwrap();
+    let winner = winner_client.begin_transaction().await.unwrap();
     stale
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Blob(
-                    b"{\"overlap\":\"stale\",\"retained\":\"stale\"}\n"
-                        .to_vec()
-                        .into(),
-                ),
-                Value::Text(path.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Blob(
+                b"{\"overlap\":\"stale\",\"retained\":\"stale\"}\n"
+                    .to_vec()
+                    .into(),
+            ),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
     winner
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Blob(
-                    b"{\"overlap\":\"winner\",\"retained\":\"base\"}\n"
-                        .to_vec()
-                        .into(),
-                ),
-                Value::Text(path.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Blob(
+                b"{\"overlap\":\"winner\",\"retained\":\"base\"}\n"
+                    .to_vec()
+                    .into(),
+            ),
+            Value::Text(path.to_owned()),
+        ])
         .await
         .unwrap();
 
@@ -5280,15 +5182,15 @@ async fn stale_json_transaction_batches_conflicts_into_one_render_transition() {
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Blob(
-                        serde_json::to_vec(&changed)
-                            .expect("changed JSON should encode")
-                            .into(),
-                    ),
-                    Value::Text(path.to_owned()),
-                ],
             )
+            .params(&[
+                Value::Blob(
+                    serde_json::to_vec(&changed)
+                        .expect("changed JSON should encode")
+                        .into(),
+                ),
+                Value::Text(path.to_owned()),
+            ])
             .await
             .unwrap();
     }
@@ -5362,8 +5264,8 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
                 .execute(
                     "INSERT INTO lix_file (path, content) VALUES ($2, $1) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[Value::Blob(bytes.into()), Value::Text(path.clone())],
                 )
+                .params(&[Value::Blob(bytes.into()), Value::Text(path.clone())])
                 .await
                 .unwrap();
         }
@@ -5404,26 +5306,24 @@ async fn v2_json_rejects_mixed_byte_and_row_transitions_in_one_transaction() {
     write_file(&lix, path, first).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
 
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2",
-            &[
-                Value::Blob(bytes_only.clone().into()),
-                Value::Text(path.to_string()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .params(&[
+            Value::Blob(bytes_only.clone().into()),
+            Value::Text(path.to_string()),
+        ])
         .await
         .unwrap();
     let error = transaction
         .execute(
             "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
-            &[
-                Value::Jsonb(serde_json::json!("row").into()),
-                Value::Text(file_id),
-            ],
         )
+        .params(&[
+            Value::Jsonb(serde_json::json!("row").into()),
+            Value::Text(file_id),
+        ])
         .await
         .expect_err("one transaction must choose byte or semantic authority per file");
     assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
@@ -5456,22 +5356,18 @@ async fn excalidraw_row_edits_preserve_unrelated_source_and_embedded_files() {
     );
     write_file(&lix, path, source.into_bytes()).await.unwrap();
     let result = lix
-        .execute(
-            "SELECT element_json FROM excalidraw_element WHERE id = 'b'",
-            &[],
-        )
+        .query("SELECT element_json FROM excalidraw_element WHERE id = 'b'")
+        .all()
         .await
         .unwrap();
     let mut element = result.rows()[0]
         .get::<serde_json::Value>("element_json")
         .unwrap();
     element["x"] = serde_json::json!(1234);
-    lix.execute(
-        "UPDATE excalidraw_element SET element_json = $1 WHERE id = 'b'",
-        &[Value::Jsonb(element.into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE excalidraw_element SET element_json = $1 WHERE id = 'b'")
+        .params(&[Value::Jsonb(element.into())])
+        .await
+        .unwrap();
     let rendered = String::from_utf8(read_file(&lix, path).await.unwrap().unwrap()).unwrap();
     assert!(
         rendered.contains(untouched),
@@ -5497,10 +5393,8 @@ async fn excalidraw_row_edits_preserve_unrelated_source_and_embedded_files() {
         Some(edited.into_bytes())
     );
     let result = reopened
-        .execute(
-            "SELECT file_json FROM excalidraw_file WHERE id = 'img'",
-            &[],
-        )
+        .query("SELECT file_json FROM excalidraw_file WHERE id = 'img'")
+        .all()
         .await
         .unwrap();
     let mut file_json = result.rows()[0]
@@ -5508,10 +5402,8 @@ async fn excalidraw_row_edits_preserve_unrelated_source_and_embedded_files() {
         .unwrap();
     file_json["future"] = serde_json::json!({"preserved": true});
     reopened
-        .execute(
-            "UPDATE excalidraw_file SET file_json = $1 WHERE id = 'img'",
-            &[Value::Jsonb(file_json.into())],
-        )
+        .execute("UPDATE excalidraw_file SET file_json = $1 WHERE id = 'img'")
+        .params(&[Value::Jsonb(file_json.into())])
         .await
         .unwrap();
     let rendered = String::from_utf8(read_file(&reopened, path).await.unwrap().unwrap()).unwrap();
@@ -5559,10 +5451,10 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(source.clone()));
 
     let elements = lix
-        .execute(
+        .query(
             "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(elements.len(), 2);
@@ -5580,10 +5472,8 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     write_file(&lix, path, geometry_edit.clone()).await.unwrap();
 
     let element = lix
-        .execute(
-            "SELECT element_json FROM excalidraw_element WHERE id = 'b'",
-            &[],
-        )
+        .query("SELECT element_json FROM excalidraw_element WHERE id = 'b'")
+        .all()
         .await
         .unwrap();
     let mut element_json = element.rows()[0]
@@ -5594,8 +5484,8 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         "UPDATE excalidraw_element \
          SET element_json = $1 \
          WHERE id = 'b'",
-        &[Value::Jsonb(element_json.into())],
     )
+    .params(&[Value::Jsonb(element_json.into())])
     .await
     .unwrap();
 
@@ -5608,22 +5498,18 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     );
 
     let mut first_element = lix
-        .execute(
-            "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
-            &[],
-        )
+        .query("SELECT element_json FROM excalidraw_element WHERE id = 'a'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get::<serde_json::Value>("element_json")
         .unwrap();
     first_element["x"] = serde_json::json!(123456.75);
-    lix.execute(
-        "UPDATE excalidraw_element SET element_json = $1 WHERE id = 'a'",
-        &[Value::Jsonb(first_element.into())],
-    )
-    .await
-    .expect("semantic element growth should render");
+    lix.execute("UPDATE excalidraw_element SET element_json = $1 WHERE id = 'a'")
+        .params(&[Value::Jsonb(first_element.into())])
+        .await
+        .expect("semantic element growth should render");
     let after_semantic = read_file(&lix, path).await.unwrap().unwrap();
     let after_followup = String::from_utf8(after_semantic)
         .unwrap()
@@ -5637,10 +5523,8 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         Some(after_followup.clone())
     );
     let elements = lix
-        .execute(
-            "SELECT id, element_json FROM excalidraw_element ORDER BY id",
-            &[],
-        )
+        .query("SELECT id, element_json FROM excalidraw_element ORDER BY id")
+        .all()
         .await
         .unwrap();
     assert!(
@@ -5666,7 +5550,8 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         .await
         .expect("an element ID edit must use full Excalidraw reconciliation");
     let ids = lix
-        .execute("SELECT id FROM excalidraw_element ORDER BY id", &[])
+        .query("SELECT id FROM excalidraw_element ORDER BY id")
+        .all()
         .await
         .unwrap()
         .rows()
@@ -5735,10 +5620,10 @@ async fn excalidraw_element_boundary_insert_adds_element_through_full_reconcilia
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
     let elements = lix
-        .execute(
+        .query(
             "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(elements.len(), 2);
@@ -5785,7 +5670,8 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(before.clone()));
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+        lix.query("SELECT COUNT(*) AS count FROM excalidraw_element")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -5800,7 +5686,8 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .into_bytes();
 
     let opening_commit: String = lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -5810,26 +5697,23 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     assert!(
-        lix.execute(
-            "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .rows()[0]
+        lix.query("SELECT element_json FROM excalidraw_element WHERE id = 'a'")
+            .all()
+            .await
+            .unwrap()
+            .rows()[0]
             .get::<serde_json::Value>("element_json")
             .unwrap()
             .to_string()
             .contains("123.5")
     );
     assert!(
-        lix.execute(
-            "SELECT element_json FROM lix_as_of('excalidraw_element', $1) WHERE id = 'a'",
-            &[Value::Text(opening_commit)],
-        )
-        .await
-        .unwrap()
-        .rows()[0]
+        lix.query("SELECT element_json FROM lix_as_of('excalidraw_element', $1) WHERE id = 'a'")
+            .params(&[Value::Text(opening_commit)])
+            .all()
+            .await
+            .unwrap()
+            .rows()[0]
             .get::<serde_json::Value>("element_json")
             .unwrap()
             .to_string()
@@ -5841,7 +5725,8 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     assert_eq!(read_file(&reopened, path).await.unwrap(), Some(after));
     assert_eq!(
         reopened
-            .execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+            .query("SELECT COUNT(*) AS count FROM excalidraw_element")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -5929,7 +5814,8 @@ where
         Some(CEB2_FIXTURE_BYTES.to_vec())
     );
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+        lix.query("SELECT COUNT(*) AS count FROM excalidraw_element")
+            .all()
             .await
             .expect("read CEB2 semantic row")
             .rows()[0]
@@ -5969,7 +5855,8 @@ where
         Some(CEB2_FIXTURE_BYTES.to_vec())
     );
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+        lix.query("SELECT COUNT(*) AS count FROM excalidraw_element")
+            .all()
             .await
             .expect("read reopened CEB2 semantic row")
             .rows()[0]
@@ -6019,7 +5906,8 @@ where
         .await
         .expect("reopen corrupt CEB2 workspace");
     let error = lix
-        .execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+        .query("SELECT COUNT(*) AS count FROM excalidraw_element")
+        .all()
         .await
         .expect_err("corrupt CEB2 page must fail closed");
     assert!(
@@ -6110,10 +5998,8 @@ async fn v3_ceb2_certified_row_read_benchmark() {
         let started = Instant::now();
         for _ in 0..READS_PER_SAMPLE {
             let result = lix
-                .execute(
-                    "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
-                    &[],
-                )
+                .query("SELECT element_json FROM excalidraw_element WHERE id = 'a'")
+                .all()
                 .await
                 .expect("read one certified CEB2 row");
             black_box(
@@ -6184,11 +6070,12 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     .expect("base Excalidraw scene should import");
     let file_id = file_id_at_path(&lix, path).await;
     let original = lix
-        .execute(
+        .query(
             "SELECT element_json FROM excalidraw_element \
              WHERE id = 'shape' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -6209,11 +6096,11 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(target_json.into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(target_json.into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("target element edit should commit");
     let target_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
@@ -6228,11 +6115,11 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(source_json.into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(source_json.into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("source element edit should commit");
     let source_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
@@ -6288,11 +6175,12 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     .expect("base Excalidraw scene should import");
     let file_id = file_id_at_path(&lix, path).await;
     let original = lix
-        .execute(
+        .query(
             "SELECT element_json FROM excalidraw_element \
              WHERE id = 'shape' AND lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -6313,11 +6201,11 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(target_json.into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(target_json.into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("target element edit should commit");
     let target_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
@@ -6332,11 +6220,11 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 \
          WHERE id = 'shape' AND lixcol_file_id = $2",
-        &[
-            Value::Jsonb(source_json.into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Jsonb(source_json.into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("source element edit should commit");
     let source_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
@@ -6396,7 +6284,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .await
     .unwrap();
     let baseline_checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
@@ -6420,15 +6308,16 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .await
     .unwrap();
     let selected_diff_count = lix
-        .execute(
+        .query(
             "SELECT count(*) AS count \
              FROM lix_diff('csv_row', $2, lix_active_branch_commit_id()) \
              WHERE to_lixcol_file_id = $1",
-            &[
-                Value::Text(selected_file_id.clone()),
-                Value::Text(baseline_checkpoint),
-            ],
         )
+        .params(&[
+            Value::Text(selected_file_id.clone()),
+            Value::Text(baseline_checkpoint),
+        ])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -6441,25 +6330,26 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
          SELECT row_ref \
          FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
          WHERE id = $1))",
-            &[Value::Text(selected_file_id.clone())],
         )
+        .params(&[Value::Text(selected_file_id.clone())])
         .await
         .expect("checkpoint all selected plugin rows");
 
     assert_eq!(
-        lix.execute(
+        lix.query(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE id = $1",
-            &[
-                Value::Text(selected_file_id.clone()),
-                Value::Text(
-                    selected_checkpoint.rows()[0]
-                        .get::<String>("commit_id")
-                        .unwrap()
-                ),
-            ],
+             WHERE id = $1"
         )
+        .params(&[
+            Value::Text(selected_file_id.clone()),
+            Value::Text(
+                selected_checkpoint.rows()[0]
+                    .get::<String>("commit_id")
+                    .unwrap()
+            ),
+        ])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -6468,19 +6358,20 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         0,
     );
     assert!(
-        lix.execute(
+        lix.query(
             "SELECT COUNT(*) AS count \
              FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE id = $1",
-            &[
-                Value::Text(remaining_file_id),
-                Value::Text(
-                    selected_checkpoint.rows()[0]
-                        .get::<String>("commit_id")
-                        .unwrap()
-                ),
-            ],
+             WHERE id = $1"
         )
+        .params(&[
+            Value::Text(remaining_file_id),
+            Value::Text(
+                selected_checkpoint.rows()[0]
+                    .get::<String>("commit_id")
+                    .unwrap()
+            ),
+        ])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -6654,23 +6545,19 @@ async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recrea
     let stale = lix.open_another_session().await.unwrap();
     assert_eq!(read_file(&stale, path).await.unwrap(), Some(old_bytes));
 
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .await
+        .unwrap();
     let new_bytes = b"new,incarnation\n".to_vec();
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text(old_file_id.clone()),
             Value::Text(path.to_string()),
             Value::Blob(new_bytes.clone().into()),
-        ],
-    )
-    .await
-    .expect("recreation should deliberately reuse the durable file identity");
+        ])
+        .await
+        .expect("recreation should deliberately reuse the durable file identity");
     let new_file_id = file_id_at_path(&lix, path).await;
     assert_eq!(old_file_id, new_file_id);
 
@@ -6701,13 +6588,13 @@ async fn csv_sql_insert_materializes_nullable_typed_null_and_reopens() {
 
     lix.execute(
         "INSERT INTO csv_row (id, order_key, cells, lixcol_file_id) VALUES ($1, $2, $3, $4)",
-        &[
-            Value::Text("019c6b89-bb18-77a8-9164-000000000001".to_string()),
-            Value::Text("fffffffffffffff0".to_string()),
-            Value::Jsonb(serde_json::json!(["created", "without-layout"]).into()),
-            Value::Text(file_id.clone()),
-        ],
     )
+    .params(&[
+        Value::Text("019c6b89-bb18-77a8-9164-000000000001".to_string()),
+        Value::Text("fffffffffffffff0".to_string()),
+        Value::Jsonb(serde_json::json!(["created", "without-layout"]).into()),
+        Value::Text(file_id.clone()),
+    ])
     .await
     .expect("omitted nullable layout should materialize as native SQL NULL");
     assert_query_count(
@@ -6987,15 +6874,13 @@ async fn v4_csv_dialect_rename_after_eviction_uses_predecessor_descriptor() {
         .unwrap();
     }
 
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
+    lix.execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
             Value::Text(after_path.to_owned()),
             Value::Text(before_path.to_owned()),
-        ],
-    )
-    .await
-    .expect("an evicted CSV actor must observe the CSV to TSV descriptor transition");
+        ])
+        .await
+        .expect("an evicted CSV actor must observe the CSV to TSV descriptor transition");
 
     assert_eq!(read_file(&lix, before_path).await.unwrap(), None);
     assert_eq!(read_file(&lix, after_path).await.unwrap(), Some(source));
@@ -7021,10 +6906,9 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
         .await
         .unwrap();
     let file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(before_path.to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(before_path.to_string())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -7044,13 +6928,11 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     // empty-splice descriptor transition.
     let renamer = lix.open_another_session().await.unwrap();
     let renamed = renamer
-        .execute(
-            "UPDATE lix_file SET path = $1 WHERE path = $2",
-            &[
-                Value::Text(after_path.to_string()),
-                Value::Text(before_path.to_string()),
-            ],
-        )
+        .execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
+            Value::Text(after_path.to_string()),
+            Value::Text(before_path.to_string()),
+        ])
         .await
         .unwrap();
     assert_eq!(renamed.rows_affected(), 1);
@@ -7061,13 +6943,11 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     );
 
     let stale_error = stale
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE id = $2",
-            &[
-                Value::Blob(b"first,STALE\nsecond,two\n".to_vec().into()),
-                Value::Text(file_id.clone()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE id = $2")
+        .params(&[
+            Value::Blob(b"first,STALE\nsecond,two\n".to_vec().into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .expect_err("the old-path observation must fail closed after actor rekey");
     assert_eq!(stale_error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
@@ -7086,39 +6966,36 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     // Moving outside the plugin's matcher removes semantic state/ownership
     // while retaining the exact validated materialized blob as a raw file.
     let unselected = renamer
-        .execute(
-            "UPDATE lix_file SET path = $1 WHERE path = $2",
-            &[
-                Value::Text(raw_path.to_string()),
-                Value::Text(after_path.to_string()),
-            ],
-        )
+        .execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
+            Value::Text(raw_path.to_string()),
+            Value::Text(after_path.to_string()),
+        ])
         .await
         .unwrap();
     assert_eq!(unselected.rows_affected(), 1);
     assert_eq!(read_file(&lix, after_path).await.unwrap(), None);
     assert_eq!(read_file(&lix, raw_path).await.unwrap(), Some(edited));
     let active_table_rows = lix
-        .execute(
-            "SELECT lixcol_file_id FROM csv_table WHERE lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT lixcol_file_id FROM csv_table WHERE lixcol_file_id = $1")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     let active_plugin_rows = lix
-        .execute(
-            "SELECT lixcol_file_id FROM csv_row WHERE lixcol_file_id = $1",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT lixcol_file_id FROM csv_row WHERE lixcol_file_id = $1")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(active_table_rows.len() + active_plugin_rows.len(), 0);
     let active_owner_rows = lix
-        .execute(
+        .query(
             "SELECT key FROM lix_key_value \
              WHERE lixcol_file_id = $1 AND key = 'lix_plugin_owner_v2'",
-            &[Value::Text(file_id)],
         )
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(active_owner_rows.len(), 0);
@@ -7144,22 +7021,20 @@ async fn transaction_lix_file_content_uses_session_plugin_runtime() {
         .await
         .unwrap();
     let file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text("/tx-plugin.csv".to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text("/tx-plugin.csv".to_string())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("id")
         .unwrap();
 
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     let files = tx
-        .execute(
-            "SELECT content FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id)],
-        )
+        .query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
 
@@ -7220,10 +7095,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "expected one file at {path}");
@@ -7235,11 +7109,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let rows = lix
-        .execute(
+        .query(
             "SELECT id, order_key, cells FROM csv_row \
              WHERE lixcol_file_id = $1",
-            &[Value::Text(file_id.to_string())],
         )
+        .params(&[Value::Text(file_id.to_string())])
+        .all()
         .await
         .unwrap();
     let mut rows = rows
@@ -7280,14 +7155,15 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
+        .query(
             "SELECT lixcol_updated_at, lixcol_change_id FROM csv_row \
              WHERE lixcol_file_id = $1 AND id = $2",
-            &[
-                Value::Text(file_id.to_owned()),
-                Value::Text(row_id.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Text(file_id.to_owned()),
+            Value::Text(row_id.to_owned()),
+        ])
+        .all()
         .await
         .expect("CSV row version should query");
     assert_eq!(result.len(), 1, "expected one CSV row version");
@@ -7312,13 +7188,10 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT lixcol_updated_at, lixcol_change_id FROM excalidraw_element WHERE lixcol_file_id = $1 AND id = $2",
-            &[
+        .query("SELECT lixcol_updated_at, lixcol_change_id FROM excalidraw_element WHERE lixcol_file_id = $1 AND id = $2").params(&[
                 Value::Text(file_id.to_owned()),
                 Value::Text(element_id.to_owned()),
-            ],
-        )
+            ]).all()
         .await
         .expect("Excalidraw element version should query");
     assert_eq!(result.len(), 1, "expected one Excalidraw element version");
@@ -7396,33 +7269,25 @@ async fn qualify_lix_owned_sql_write_semantics<S>(lix: &Lix<S>, prefix: &str)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))").params(&[Value::Text(
             r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_task","columns":[{"name":"id","type":"uuid","nullable":false,"default_expression":"uuidv7()"},{"name":"title","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
-        )],
-    )
+        )])
     .await
     .expect("register generated-default write-owner schema");
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB)), (CAST($2 AS JSONB))",
-        &[
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB)), (CAST($2 AS JSONB))").params(&[
             Value::Text(
                 r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}"#.to_string(),
             ),
             Value::Text(
                 r#"{"$schema":"https://lix.dev/schema-v1.json","key":"write_owner_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"write_owner_parent","columns":["id"]}}]}"#.to_string(),
             ),
-        ],
-    )
+        ])
     .await
     .expect("register foreign-key write-owner schemas");
 
     let inserted = lix
-        .execute(
-            "INSERT INTO write_owner_task (title) VALUES ($1) RETURNING id, title",
-            &[Value::Text(format!("{prefix}-inserted"))],
-        )
+        .execute("INSERT INTO write_owner_task (title) VALUES ($1) RETURNING id, title")
+        .params(&[Value::Text(format!("{prefix}-inserted"))])
         .await
         .expect("INSERT RETURNING with generated default");
     assert_eq!(inserted.rows_affected(), 1);
@@ -7431,13 +7296,11 @@ where
         .expect("generated RETURNING id");
 
     let updated = lix
-        .execute(
-            "UPDATE write_owner_task SET title = $1 WHERE id = $2 RETURNING id, title",
-            &[
-                Value::Text(format!("{prefix}-updated")),
-                Value::Text(id.clone()),
-            ],
-        )
+        .execute("UPDATE write_owner_task SET title = $1 WHERE id = $2 RETURNING id, title")
+        .params(&[
+            Value::Text(format!("{prefix}-updated")),
+            Value::Text(id.clone()),
+        ])
         .await
         .expect("UPDATE RETURNING");
     assert_eq!(updated.rows_affected(), 1);
@@ -7446,11 +7309,11 @@ where
         .execute(
             "INSERT INTO write_owner_task (id, title) VALUES ($1, $2) \
              ON CONFLICT (id) DO UPDATE SET title = excluded.title RETURNING id, title",
-            &[
-                Value::Text(id.clone()),
-                Value::Text(format!("{prefix}-upserted")),
-            ],
         )
+        .params(&[
+            Value::Text(id.clone()),
+            Value::Text(format!("{prefix}-upserted")),
+        ])
         .await
         .expect("ON CONFLICT RETURNING");
     assert_eq!(upserted.rows_affected(), 1);
@@ -7460,30 +7323,27 @@ where
     );
 
     let deleted = lix
-        .execute(
-            "DELETE FROM write_owner_task WHERE id = $1 RETURNING id, title",
-            &[Value::Text(id)],
-        )
+        .execute("DELETE FROM write_owner_task WHERE id = $1 RETURNING id, title")
+        .params(&[Value::Text(id)])
         .await
         .expect("DELETE RETURNING");
     assert_eq!(deleted.rows_affected(), 1);
     assert_eq!(deleted.rows().len(), 1);
 
     let fk_error = lix
-        .execute(
-            "INSERT INTO write_owner_child (id, parent_id) VALUES ($1, $2)",
-            &[
-                Value::Text(format!("{prefix}-child")),
-                Value::Text(format!("{prefix}-missing-parent")),
-            ],
-        )
+        .execute("INSERT INTO write_owner_child (id, parent_id) VALUES ($1, $2)")
+        .params(&[
+            Value::Text(format!("{prefix}-child")),
+            Value::Text(format!("{prefix}-missing-parent")),
+        ])
         .await
         .expect_err("missing foreign-key owner must fail");
     assert_eq!(fk_error.code, LixError::CODE_FOREIGN_KEY);
 
     let batch_key = format!("{prefix}-batch");
-    let batch = lix
-        .execute_batch(&[
+    let batch = execute_atomically(
+        &lix,
+        &[
             ExecuteBatchStatement {
                 label: Some("write".to_string()),
                 sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) RETURNING key, value"
@@ -7503,23 +7363,17 @@ where
                     Value::Text("two".to_string()),
                 ],
             },
-        ])
-        .await
-        .expect("execute_batch write semantics")
-        .results;
+        ],
+    )
+    .await
+    .expect("execute_batch write semantics");
     assert_eq!(batch.len(), 2);
-    assert_eq!(batch[0].statement_index(), Some(0));
-    assert_eq!(batch[0].label(), Some("write"));
-    assert_eq!(batch[1].statement_index(), Some(1));
-    assert_eq!(batch[1].label(), Some("upsert"));
 
     let rollback_key = format!("{prefix}-rollback");
-    let mut rollback = lix.begin_transaction().await.expect("begin rollback tx");
+    let rollback = lix.begin_transaction().await.expect("begin rollback tx");
     rollback
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'rollback') RETURNING key",
-            &[Value::Text(rollback_key.clone())],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, 'rollback') RETURNING key")
+        .params(&[Value::Text(rollback_key.clone())])
         .await
         .expect("stage rollback RETURNING");
     rollback
@@ -7527,13 +7381,12 @@ where
         .await
         .expect("rollback write transaction");
     assert!(
-        lix.execute(
-            "SELECT key FROM lix_key_value WHERE key = $1",
-            &[Value::Text(rollback_key)],
-        )
-        .await
-        .unwrap()
-        .is_empty()
+        lix.query("SELECT key FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text(rollback_key)])
+            .all()
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -7542,19 +7395,15 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let stale_key = format!("{prefix}-stale");
-    let mut stale = stale_lix.begin_transaction().await.expect("begin stale tx");
+    let stale = stale_lix.begin_transaction().await.expect("begin stale tx");
     stale
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'stale')",
-            &[Value::Text(stale_key.clone())],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, 'stale')")
+        .params(&[Value::Text(stale_key.clone())])
         .await
         .expect("stage stale owner");
     winner_lix
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, 'winner')",
-            &[Value::Text(stale_key.clone())],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, 'winner')")
+        .params(&[Value::Text(stale_key.clone())])
         .await
         .expect("publish winner owner");
     stale
@@ -7562,10 +7411,9 @@ where
         .await
         .expect("same-row stale inserts resolve by deterministic row-existence LWW");
     let result = stale_lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(stale_key)],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(stale_key)])
+        .all()
         .await
         .expect("read reconciled owner");
     assert_eq!(result.len(), 1);
@@ -7587,10 +7435,8 @@ async fn lix_owned_sql_write_semantics_rocksdb_reopen() {
     lix.close().await.expect("close SQL write-owner RocksDB");
     let reopened = open_rocksdb_lix(root.path()).await;
     let result = reopened
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'rocks-batch'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'rocks-batch'")
+        .all()
         .await
         .expect("read SQL write-owner RocksDB after reopen");
     assert_eq!(
@@ -7622,10 +7468,8 @@ async fn lix_owned_sql_write_semantics_slatedb_reopen() {
     lix.close().await.expect("close SQL write-owner SlateDB");
     let reopened = open_slatedb_lix(root.path()).await;
     let result = reopened
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'slate-batch'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'slate-batch'")
+        .all()
         .await
         .expect("read SQL write-owner SlateDB after reopen");
     assert_eq!(
@@ -7754,8 +7598,8 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
+    .params(&[Value::Text(path.to_string()), Value::Blob(data.into())])
     .await?;
     Ok(())
 }
@@ -7768,10 +7612,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await?;
     result
         .rows()
@@ -7789,7 +7632,9 @@ async fn assert_query_count<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(sql, params)
+        .query(sql)
+        .params(params)
+        .all()
         .await
         .expect("count query should execute");
     assert_eq!(
@@ -7811,7 +7656,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let archives = lix
-        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
+        .query("SELECT path, content FROM lix_file ORDER BY path")
+        .all()
         .await
         .unwrap();
     archives
@@ -8031,7 +7877,7 @@ where
     // Deliberately register only the public JSON schema surfaces. The direct
     // control must exercise normal SQL/transaction/RocksDB work without
     // installing a component that would reconcile or render the rows.
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("open JSON control schema transaction");
@@ -8044,8 +7890,8 @@ where
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (CAST($1 AS JSONB), false, false)",
-                &[Value::Text(schema.to_owned())],
             )
+            .params(&[Value::Text(schema.to_owned())])
             .await
             .expect("register JSON control schema");
         assert_eq!(inserted.rows_affected(), 1);
@@ -8060,7 +7906,7 @@ async fn register_native_csv_control_schemas<StorageImpl>(lix: &Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("open CSV control schema transaction");
@@ -8072,9 +7918,9 @@ where
             transaction
                 .execute(
                     "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                     VALUES (CAST($1 AS JSONB), false, false)",
-                    &[Value::Text(schema.to_owned())],
+                     VALUES (CAST($1 AS JSONB), false, false)"
                 )
+                .params(&[Value::Text(schema.to_owned())])
                 .await
                 .expect("register CSV control schema")
                 .rows_affected(),
@@ -8445,12 +8291,9 @@ async fn json_structural_qa_stale_subtree_upsert_rejects_atomically_and_reopens(
     write_file(&lix, path, initial.clone()).await.unwrap();
     let stale = lix.open_another_session().await.unwrap();
     assert_eq!(read_file(&stale, path).await.unwrap(), Some(initial));
-    lix.execute(
-        "DELETE FROM json_object_member WHERE key IN ('box', 'nested', 'leaf')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM json_object_member WHERE key IN ('box', 'nested', 'leaf')")
+        .await
+        .unwrap();
     let accepted = br#"{"keep":2}"#.to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(accepted.clone()));
     // Only the leaf and keep differ from the stale observation. The leaf cannot
@@ -8465,7 +8308,8 @@ async fn json_structural_qa_stale_subtree_upsert_rejects_atomically_and_reopens(
     assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN, "{error:?}");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(accepted.clone()));
     let rows = lix
-        .execute("SELECT key, scalar_json FROM json_object_member", &[])
+        .query("SELECT key, scalar_json FROM json_object_member")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -8480,17 +8324,16 @@ async fn json_structural_qa_stale_subtree_upsert_rejects_atomically_and_reopens(
     assert_eq!(read_file(&reopened, path).await.unwrap(), Some(accepted));
     assert_eq!(
         reopened
-            .execute("SELECT key FROM json_object_member", &[])
+            .query("SELECT key FROM json_object_member")
+            .all()
             .await
             .unwrap()
             .len(),
         1
     );
     reopened
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'keep'",
-            &[Value::Jsonb(serde_json::json!(3).into())],
-        )
+        .execute("UPDATE json_object_member SET scalar_json = $1 WHERE key = 'keep'")
+        .params(&[Value::Jsonb(serde_json::json!(3).into())])
         .await
         .unwrap();
     assert_eq!(
@@ -8520,7 +8363,7 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
         Some(initial.clone())
     );
     assert_eq!(read_file(&second, path).await.unwrap(), Some(initial));
-    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'", &[])
+    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'")
         .await
         .unwrap();
     write_file(
@@ -8557,7 +8400,8 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     assert_eq!(rendered_json["beta"], 4);
     assert!(String::from_utf8(rendered).unwrap().contains("1.2300e+04"));
     let rows = lix
-        .execute("SELECT key FROM json_object_member ORDER BY key", &[])
+        .query("SELECT key FROM json_object_member ORDER BY key")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.len(), 3);
@@ -8569,16 +8413,13 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
         vec!["alpha", "beta", "keep"]
     );
     // Both inserted keys remain directly writable after the merged rebuilds.
-    lix.execute(
-        "UPDATE json_object_member SET scalar_json = $1 WHERE key IN ('alpha', 'beta')",
-        &[Value::Jsonb(serde_json::json!(5).into())],
-    )
-    .await
-    .unwrap();
-    let updated_json = serde_json::from_slice::<serde_json::Value>(
-        &read_file(&lix, path).await.unwrap().unwrap(),
-    )
-    .unwrap();
+    lix.execute("UPDATE json_object_member SET scalar_json = $1 WHERE key IN ('alpha', 'beta')")
+        .params(&[Value::Jsonb(serde_json::json!(5).into())])
+        .await
+        .unwrap();
+    let updated_json =
+        serde_json::from_slice::<serde_json::Value>(&read_file(&lix, path).await.unwrap().unwrap())
+            .unwrap();
     assert_eq!(updated_json["keep"].as_f64(), Some(12_300.0));
     assert_eq!(updated_json["alpha"], 5);
     assert_eq!(updated_json["beta"], 5);
@@ -8606,7 +8447,7 @@ async fn json_structural_qa_multi_parent_file_updates_are_deterministic() {
     .unwrap();
     let stale = lix.open_another_session().await.unwrap();
     read_file(&stale, path).await.unwrap();
-    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'", &[])
+    lix.execute("DELETE FROM json_object_member WHERE key = 'gone'")
         .await
         .unwrap();
     write_file(
@@ -8628,10 +8469,8 @@ async fn json_structural_qa_multi_parent_file_updates_are_deterministic() {
             .expect("valid changes under different parents must be accepted");
         assert_eq!(read_file(&lix, path).await.unwrap(), Some(source));
         let rows = lix
-            .execute(
-                "SELECT scalar_json FROM json_object_member WHERE key IN ('leaf', 'keep')",
-                &[],
-            )
+            .query("SELECT scalar_json FROM json_object_member WHERE key IN ('leaf', 'keep')")
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -8661,7 +8500,7 @@ async fn json_decimal_spelling_survives_structural_rebuild_and_reopen() {
     lix.close().await.unwrap();
     let reopened = open_rocksdb_lix(root.path()).await;
     reopened
-        .execute("DELETE FROM json_object_member WHERE key = 'remove'", &[])
+        .execute("DELETE FROM json_object_member WHERE key = 'remove'")
         .await
         .unwrap();
     let expected = br#"{"one":1.0,"hundred":100.0,"array":[1.0,-0.0]}"#;
@@ -8676,10 +8515,8 @@ async fn json_decimal_spelling_survives_structural_rebuild_and_reopen() {
         Some(expected.to_vec())
     );
     reopened
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 WHERE key = 'hundred'",
-            &[Value::Jsonb(serde_json::json!(7).into())],
-        )
+        .execute("UPDATE json_object_member SET scalar_json = $1 WHERE key = 'hundred'")
+        .params(&[Value::Jsonb(serde_json::json!(7).into())])
         .await
         .unwrap();
     assert_eq!(
@@ -8708,46 +8545,38 @@ async fn excalidraw_sql_defaults_metadata_ordering_and_cold_edits() {
     for id in ["c", "d"] {
         lix.execute(
             "INSERT INTO excalidraw_element (id,element_json,lixcol_file_id) VALUES ($1,$2,$3)",
-            &[
-                Value::Text(id.into()),
-                Value::Jsonb(serde_json::json!({"id":id,"type":"ellipse"}).into()),
-                Value::Text(file_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Text(id.into()),
+            Value::Jsonb(serde_json::json!({"id":id,"type":"ellipse"}).into()),
+            Value::Text(file_id.clone()),
+        ])
         .await
         .unwrap();
     }
-    lix.execute(
-        "UPDATE excalidraw_element SET order_key='f0' WHERE id='a' AND lixcol_file_id=$1",
-        &[Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE excalidraw_element SET order_key='f0' WHERE id='a' AND lixcol_file_id=$1")
+        .params(&[Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     let before_image = read_file(&lix, path).await.unwrap().unwrap();
-    lix.execute(
-        "INSERT INTO excalidraw_file (id,file_json,lixcol_file_id) VALUES ('img',$1,$2)",
-        &[
+    lix.execute("INSERT INTO excalidraw_file (id,file_json,lixcol_file_id) VALUES ('img',$1,$2)")
+        .params(&[
             Value::Jsonb(serde_json::json!({"dataURL":"data:image/png;base64,AAAA"}).into()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "DELETE FROM excalidraw_file WHERE id='img' AND lixcol_file_id=$1",
-        &[Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
+    lix.execute("DELETE FROM excalidraw_file WHERE id='img' AND lixcol_file_id=$1")
+        .params(&[Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap().unwrap(), before_image);
     let metadata =
         serde_json::json!({"appState":{"zoom":2,"theme":"dark"},"unknown":{"keep":[null,true]}});
-    lix.execute(
-        "UPDATE excalidraw_scene SET scene_json=$1 WHERE lixcol_file_id=$2",
-        &[Value::Jsonb(metadata.into()), Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE excalidraw_scene SET scene_json=$1 WHERE lixcol_file_id=$2")
+        .params(&[Value::Jsonb(metadata.into()), Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     let accepted = read_file(&lix, path).await.unwrap().unwrap();
     let mut expected: serde_json::Value = serde_json::from_slice(&accepted).unwrap();
     assert_eq!(
@@ -8773,32 +8602,28 @@ async fn excalidraw_sql_defaults_metadata_ordering_and_cold_edits() {
         .unwrap();
     a["x"] = serde_json::json!(12345);
     a["isDeleted"] = serde_json::json!(true);
-    lix.execute(
-        "UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2",
-        &[Value::Jsonb(a.clone().into()), Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2")
+        .params(&[Value::Jsonb(a.clone().into()), Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     let accepted = read_file(&lix, path).await.unwrap().unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&accepted).unwrap(),
         expected
     );
     let error = lix
-        .execute(
-            "UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2",
-            &[
-                Value::Jsonb(serde_json::json!({"id":"wrong","type":"text"}).into()),
-                Value::Text(file_id.clone()),
-            ],
-        )
+        .execute("UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2")
+        .params(&[
+            Value::Jsonb(serde_json::json!({"id":"wrong","type":"text"}).into()),
+            Value::Text(file_id.clone()),
+        ])
         .await;
     assert!(error.is_err());
     assert_eq!(read_file(&lix, path).await.unwrap().unwrap(), accepted);
     lix.close().await.unwrap();
     let reopened = open_lix().with_storage(storage).await.unwrap();
     assert_eq!(read_file(&reopened, path).await.unwrap().unwrap(), accepted);
-    reopened.execute("UPDATE excalidraw_element SET element_json=element_json WHERE id='a' AND lixcol_file_id=$1",&[Value::Text(file_id)]).await.unwrap();
+    reopened.execute("UPDATE excalidraw_element SET element_json=element_json WHERE id='a' AND lixcol_file_id=$1").params(&[Value::Text(file_id)]).await.unwrap();
     assert_eq!(read_file(&reopened, path).await.unwrap().unwrap(), accepted);
     reopened.close().await.unwrap();
 }
@@ -8808,20 +8633,85 @@ async fn excalidraw_sql_defaults_metadata_ordering_and_cold_edits() {
 async fn plugin_deletion_cascades_declared_dependents() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
-        &lix, "plugin_markdown", &build_markdown_plugin_archive(), &["markdown_node"],
-    ).await;
-    lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Jsonb(serde_json::json!({
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)").params(&[Value::Jsonb(serde_json::json!({
         "$schema":"https://lix.dev/schema-v1.json", "key":"node_annotation",
         "columns":[{"name":"id","type":"text","nullable":false},{"name":"node_id","type":"uuid","nullable":false}],
         "primary_key":["id"], "foreign_keys":[{"columns":["node_id"],"references":{"schema_key":"markdown_node","columns":["id"]},"on_delete":"cascade"}]
     }).into())]).await.unwrap();
-    lix.execute("INSERT INTO lix_file(path,content) VALUES ('/cascade.md',$1)", &[Value::Blob(b"# Title\n\nDelete this paragraph.\n".to_vec().into())]).await.unwrap();
-    let nodes = lix.execute("SELECT id,lixcol_file_id FROM markdown_node WHERE kind='paragraph'", &[]).await.unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES ('/cascade.md',$1)")
+        .params(&[Value::Blob(
+            b"# Title\n\nDelete this paragraph.\n".to_vec().into(),
+        )])
+        .await
+        .unwrap();
+    let nodes = lix
+        .query("SELECT id,lixcol_file_id FROM markdown_node WHERE kind='paragraph'")
+        .all()
+        .await
+        .unwrap();
     let node = nodes.rows().first().expect("paragraph node");
     let id = node.get::<String>("id").unwrap();
     let file = node.get::<String>("lixcol_file_id").unwrap();
-    lix.execute("INSERT INTO node_annotation(id,node_id,lixcol_file_id) VALUES ('note',$1,$2)", &[Value::Text(id), Value::Text(file)]).await.unwrap();
-    lix.execute("UPDATE lix_file SET content=$1 WHERE path='/cascade.md'", &[Value::Blob(b"# Title\n".to_vec().into())]).await.unwrap();
-    assert!(lix.execute("SELECT id FROM node_annotation", &[]).await.unwrap().rows().is_empty());
+    lix.execute("INSERT INTO node_annotation(id,node_id,lixcol_file_id) VALUES ('note',$1,$2)")
+        .params(&[Value::Text(id), Value::Text(file)])
+        .await
+        .unwrap();
+    lix.execute("UPDATE lix_file SET content=$1 WHERE path='/cascade.md'")
+        .params(&[Value::Blob(b"# Title\n".to_vec().into())])
+        .await
+        .unwrap();
+    assert!(
+        lix.query("SELECT id FROM node_annotation")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
     lix.close().await.unwrap();
+}
+
+/// Runs statements atomically in one transaction and returns each result:
+/// reads through `query`, writes through `execute`.
+async fn execute_atomically<S>(
+    lix: &lix::Lix<S>,
+    statements: &[lix::ExecuteBatchStatement],
+) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
+where
+    S: lix::storage::Storage + Clone + Send + Sync + 'static,
+{
+    let transaction = lix.begin_transaction().await?;
+    let mut results = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let read_only = lix::parse_sql_script(&statement.sql, statement.params.len())
+            .is_ok_and(|plan| plan.statements.iter().all(|statement| statement.read_only));
+        let result = if read_only {
+            transaction
+                .query(&statement.sql)
+                .params(&statement.params)
+                .all()
+                .await
+                .map(lix::ExecuteResult::from)
+        } else {
+            transaction
+                .execute(&statement.sql)
+                .params(&statement.params)
+                .await
+        };
+        match result {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+    transaction.commit().await?;
+    Ok(results)
 }

@@ -6,14 +6,14 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::Engine;
 use crate::storage::Memory;
 use crate::support::fuzz_seeds;
 use crate::support::simulation_test::engine::{Simulation, SimulationMode, SimulationOptions};
-use crate::{open_lix, ExecuteBatchStatement, Lix, LixError, Value};
+use crate::{ExecuteBatchStatement, Lix, LixError, Value, open_lix};
 
 use super::runtime::{
     fetch_repository_snapshot, hydrate_error_for_test, register_blob_manifests, sync_iteration,
@@ -166,7 +166,7 @@ impl SyncTransport for AuthorityTransport {
                 .invalidate_inventory_once
                 .swap(false, Ordering::SeqCst)
             {
-                self.authority.execute("INSERT INTO lix_key_value (key, value) VALUES ('inventory-race', 'concurrent')", &[]).await?;
+                self.authority.execute("INSERT INTO lix_key_value (key, value) VALUES ('inventory-race', 'concurrent')").await?;
             }
             self.authority
                 .sync_checkpoint_inventory(cursor, after, limit)
@@ -344,14 +344,16 @@ impl Replica {
     async fn hydrate_and_retry(&self, sql: &str) {
         let error = self
             .lix
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect_err("sparse read should request hydration");
         hydrate_error_for_test(&self.lix, &self.transport, error)
             .await
             .expect("simulation demand should hydrate");
         self.lix
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect("hydrated read should succeed");
     }
@@ -365,14 +367,15 @@ async fn write_key_value(lix: &Lix<Memory>, key: &str, value: &str) {
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        &[Value::Text(key.to_owned()), Value::Text(value.to_owned())],
     )
+    .params(&[Value::Text(key.to_owned()), Value::Text(value.to_owned())])
     .await
     .expect("simulation write should commit");
 }
 
 async fn current_branch_head(lix: &Lix<Memory>) -> String {
-    lix.execute("SELECT lix_active_branch_commit_id() AS id", &[])
+    lix.query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("active branch head should load")
         .rows()[0]
@@ -398,11 +401,11 @@ async fn reset_branch_for_test(lix: &Lix<Memory>, target_commit_id: &str) {
 }
 
 async fn hot_digest(lix: &Lix<Memory>) -> Vec<(String, String)> {
-    lix.execute(
+    lix.query(
         "SELECT key, value FROM lix_key_value \
          WHERE lixcol_global = false ORDER BY key",
-        &[],
     )
+    .all()
     .await
     .expect("simulation digest should query")
     .rows()
@@ -567,7 +570,6 @@ async fn checkpoint_reconciliation_keeps_builtin_file_schemas(_sim: Simulation) 
     left.lix
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/shared.md', CAST('base' AS BYTEA))",
-            &[],
         )
         .await
         .expect("left file creation should use the engine catalog");
@@ -585,10 +587,7 @@ async fn checkpoint_reconciliation_keeps_builtin_file_schemas(_sim: Simulation) 
         .expect("right should receive the checkpoint");
 
     right.lix
-        .execute(
-            "UPDATE lix_file SET content = CAST('after-checkpoint' AS BYTEA) WHERE path = '/shared.md'",
-            &[],
-        )
+        .execute("UPDATE lix_file SET content = CAST('after-checkpoint' AS BYTEA) WHERE path = '/shared.md'")
         .await
         .expect("post-checkpoint file edit should commit");
     right
@@ -600,17 +599,13 @@ async fn checkpoint_reconciliation_keeps_builtin_file_schemas(_sim: Simulation) 
         .expect("left should receive the remote edit");
 
     left.lix
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/left.md', CAST('left' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/left.md', CAST('left' AS BYTEA))")
         .await
         .expect("left divergent file should commit");
     right
         .lix
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/right.csv', CAST('right' AS BYTEA))",
-            &[],
         )
         .await
         .expect("right divergent file should commit");
@@ -629,7 +624,8 @@ async fn checkpoint_reconciliation_keeps_builtin_file_schemas(_sim: Simulation) 
 
     for repository in [&authority, &left.lix, &right.lix] {
         let files = repository
-            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .query("SELECT path FROM lix_file ORDER BY path")
+            .all()
             .await
             .expect("all file descriptors should remain readable")
             .rows()
@@ -644,7 +640,8 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     let authority = authority_for_simulation(&sim).await;
     write_key_value(&authority, "history-0", "0").await;
     let cold_commit_id = authority
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("cold history coordinate should load")
         .rows()[0]
@@ -659,13 +656,11 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
         .expect("authority checkpoint should commit");
     let bytes = vec![b'x'; 96 * 1024];
     authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[
-                Value::Text("/large.bin".to_owned()),
-                Value::Blob(bytes.clone().into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
+            Value::Text("/large.bin".to_owned()),
+            Value::Blob(bytes.clone().into()),
+        ])
         .await
         .expect("large binary file should commit");
 
@@ -677,10 +672,8 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
         .await;
     let result = replica
         .lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/large.bin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/large.bin'")
+        .all()
         .await
         .expect("hydrated binary read should succeed");
     assert_eq!(
@@ -691,7 +684,8 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     );
     let checkpoints = replica
         .lix
-        .execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[])
+        .query("SELECT commit_id FROM lix_log() WHERE is_checkpoint")
+        .all()
         .await
         .expect("checkpoint rows should remain visible");
     assert!(!checkpoints.rows().is_empty());
@@ -712,10 +706,7 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
     let authority = fresh_authority().await;
     write_key_value(&authority, "modified", "before").await;
     authority
-        .execute(
-            "INSERT INTO lix_directory (path) VALUES ('/docs/original')",
-            &[],
-        )
+        .execute("INSERT INTO lix_directory (path) VALUES ('/docs/original')")
         .await
         .expect("baseline directory should insert");
     let checkpoint = authority
@@ -729,12 +720,13 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
         "UPDATE lix_directory SET path = '/docs/renamed' WHERE path = '/docs/original'",
     ] {
         authority
-            .execute(sql, &[])
+            .execute(sql)
             .await
             .expect("working edit should commit");
         authored_commits.push(
             authority
-                .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+                .query("SELECT lix_active_branch_commit_id() AS id")
+                .all()
                 .await
                 .expect("authored owner should resolve")
                 .rows()[0]
@@ -749,7 +741,8 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
     replica.transport.set_offline(true);
     let head = replica
         .lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("replica head should resolve")
         .rows()[0]
@@ -768,10 +761,8 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let identities = replica
         .lix
-        .execute(
-            "SELECT key FROM lix_diff('lix_key_value') WHERE key = 'modified'",
-            &[],
-        )
+        .query("SELECT key FROM lix_diff('lix_key_value') WHERE key = 'modified'")
+        .all()
         .await
         .expect("identity-only working diff should remain local");
     assert_eq!(identities.rows().len(), 1);
@@ -783,10 +774,8 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let values = replica
         .lix
-        .execute(
-            "SELECT from_value, to_value FROM lix_diff('lix_key_value') WHERE key = 'modified'",
-            &[],
-        )
+        .query("SELECT from_value, to_value FROM lix_diff('lix_key_value') WHERE key = 'modified'")
+        .all()
         .await
         .expect("working values should use snapshot-local payloads while offline");
     assert_eq!(values.rows().len(), 1);
@@ -810,10 +799,8 @@ async fn sparse_working_diff_retains_payloads_without_authored_history(_sim: Sim
 
     let directories = replica
         .lix
-        .execute(
-            "SELECT from_name, to_name, from_path, to_path FROM lix_diff('lix_directory')",
-            &[],
-        )
+        .query("SELECT from_name, to_name, from_path, to_path FROM lix_diff('lix_directory')")
+        .all()
         .await
         .expect("working directory paths should use local endpoint snapshots while offline");
     assert_eq!(directories.rows().len(), 1);
@@ -885,7 +872,6 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected'",
             )
             .await,
-            &[],
         )
         .await
         .expect("selected working diff should be hot")
@@ -894,7 +880,8 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
         .expect("selected row reference should decode");
     let head_commit_id_text = replica
         .lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("working head coordinate should load")
         .rows()[0]
@@ -931,10 +918,8 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
 
     let checkpoint = replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(selected_row_ref)])
         .await
         .expect("partial checkpoint should use the hot working-diff authority");
     assert_eq!(
@@ -952,13 +937,11 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
 
     let checkpoint_state = replica
         .lix
-        .execute(
-            &format!(
-                "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
+        .query(&format!(
+            "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
                  WHERE lixcol_depth = 0 ORDER BY key"
-            ),
-            &[],
-        )
+        ))
+        .all()
         .await
         .expect("partial checkpoint state should remain readable");
     let checkpoint_values = checkpoint_state
@@ -986,7 +969,6 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
                 "SELECT key FROM __LIX_RELATION_DIFF__ ORDER BY key",
             )
             .await,
-            &[],
         )
         .await
         .expect("unselected working diff should remain readable");
@@ -1038,7 +1020,6 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
 				 SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'working-00'))",
             )
             .await,
-            &[],
         )
         .await
         .expect("partial checkpoint should use the snapshot-local selected payload");
@@ -1052,7 +1033,6 @@ async fn snapshot_partial_checkpoint_uses_local_selected_payloads(_sim: Simulati
                 "SELECT key FROM __LIX_RELATION_DIFF__ ORDER BY key",
             )
             .await,
-            &[],
         )
         .await
         .expect("unselected snapshot-local diff should remain readable");
@@ -1105,7 +1085,6 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'owner-00'",
             )
             .await,
-            &[],
         )
         .await
         .expect("working diff should already be HOT")
@@ -1120,10 +1099,8 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     let checkpoint = replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(selected_row_ref)])
         .await
         .expect("checkpoint should use the exact selected HOT payload");
     let authority_batches =
@@ -1147,7 +1124,6 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__",
             )
             .await,
-            &[],
         )
         .await
         .expect("remaining working diff should load")
@@ -1162,13 +1138,11 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
 
     let checkpoint_state = replica
         .lix
-        .execute(
-            &format!(
-                "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
+        .query(&format!(
+            "SELECT key, value FROM lix_history('lix_key_value', '{checkpoint_commit_id}') \
                  WHERE lixcol_depth = 0"
-            ),
-            &[],
-        )
+        ))
+        .all()
         .await
         .expect("partial checkpoint state should remain readable");
     assert_eq!(checkpoint_state.rows().len(), 1);
@@ -1194,7 +1168,6 @@ async fn partial_checkpoint_rebases_hot_epoch_without_cold_history(_sim: Simulat
                 "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__",
             )
             .await,
-            &[],
         )
         .await
         .expect("reopened working diff should remain HOT")
@@ -1212,13 +1185,11 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
     let authority = fresh_authority().await;
     for path in ["/selected.md", "/remaining.md"] {
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(path.to_owned()),
-                    Value::Blob(b"baseline".to_vec().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(path.to_owned()),
+                Value::Blob(b"baseline".to_vec().into()),
+            ])
             .await
             .expect("baseline file should commit");
     }
@@ -1233,13 +1204,11 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
         ("/remaining.md", b"remaining update".as_slice()),
     ] {
         authority
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = $2",
-                &[
-                    Value::Blob(content.to_vec().into()),
-                    Value::Text(path.to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+            .params(&[
+                Value::Blob(content.to_vec().into()),
+                Value::Text(path.to_owned()),
+            ])
             .await
             .expect("file update should commit");
     }
@@ -1250,7 +1219,8 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
 
     let selected_file_id = replica
         .lix
-        .execute("SELECT id FROM lix_file WHERE path = '/selected.md'", &[])
+        .query("SELECT id FROM lix_file WHERE path = '/selected.md'")
+        .all()
         .await
         .expect("selected file should load")
         .rows()[0]
@@ -1267,8 +1237,8 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
                  SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE id = $1))",
             )
             .await,
-            &[Value::Text(selected_file_id)],
         )
+        .params(&[Value::Text(selected_file_id)])
         .await
         .expect("partial file checkpoint should stay snapshot-local");
     assert_eq!(checkpoint.rows_affected(), 1);
@@ -1281,7 +1251,8 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
 
     let files = replica
         .lix
-        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
+        .query("SELECT path, content FROM lix_file ORDER BY path")
+        .all()
         .await
         .expect("files should remain readable after checkpoint");
     assert_eq!(
@@ -1294,15 +1265,12 @@ async fn partial_file_checkpoint_rebases_hot_epoch(_sim: Simulation) {
     );
     let remaining_paths = replica
         .lix
-        .execute(
-            &working_diff_sql(
+        .execute(&working_diff_sql(
                 &replica.lix,
                 "lix_file",
                 "SELECT coalesce(to_path, from_path) AS path FROM __LIX_RELATION_DIFF__ ORDER BY path",
             )
-            .await,
-            &[],
-        )
+            .await)
         .await
         .expect("remaining file diff should load");
     assert_eq!(remaining_paths.rows().len(), 1);
@@ -1325,10 +1293,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
 
     replica
         .lix
-        .execute(
-            "DELETE FROM lix_key_value WHERE key = 'selected-recreate'",
-            &[],
-        )
+        .execute("DELETE FROM lix_key_value WHERE key = 'selected-recreate'")
         .await
         .expect("selected row should leave a HOT checkpoint baseline");
     replica.write("remaining", "working").await;
@@ -1352,7 +1317,7 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
     );
     replica
         .lix
-        .execute_batch(&packed_rows)
+        .execute_batch_for_test(&packed_rows)
         .await
         .expect("recreate batch should publish a packed current base");
     replica.restart().await;
@@ -1387,7 +1352,6 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                  SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected-recreate'))",
             )
             .await,
-            &[],
         )
         .await
         .expect("packed recreate partial checkpoint should stay HOT");
@@ -1417,7 +1381,6 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                  WHERE key = 'selected-recreate'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap()
@@ -1435,7 +1398,6 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                  WHERE key = 'remaining'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap();
@@ -1455,7 +1417,6 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
                  WHERE key = 'remaining'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap();
@@ -1481,13 +1442,11 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
     }
     for index in 0..FILE_COUNT {
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/packed-{index:02}.md")),
-                    Value::Blob(format!("packed-{index:02}").into_bytes().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/packed-{index:02}.md")),
+                Value::Blob(format!("packed-{index:02}").into_bytes().into()),
+            ])
             .await
             .expect("post-checkpoint file should commit");
     }
@@ -1504,20 +1463,18 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
         .collect::<Vec<_>>();
     replica
         .lix
-        .execute_batch(&packed_rows)
+        .execute_batch_for_test(&packed_rows)
         .await
         .expect("large post-checkpoint batch should publish a packed current base");
     replica
         .lix
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/packed-02.md'",
-            &[Value::Blob(b"hot update".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/packed-02.md'")
+        .params(&[Value::Blob(b"hot update".to_vec().into())])
         .await
         .expect("packed snapshot should accept a HOT file update");
     replica
         .lix
-        .execute("DELETE FROM lix_file WHERE path = '/packed-03.md'", &[])
+        .execute("DELETE FROM lix_file WHERE path = '/packed-03.md'")
         .await
         .expect("packed snapshot should accept a HOT file delete");
 
@@ -1528,10 +1485,9 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
     ] {
         let selected_file_id = replica
             .lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1",
-                &[Value::Text(selected_path.to_owned())],
-            )
+            .query("SELECT id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(selected_path.to_owned())])
+            .all()
             .await
             .expect("selected packed file should be locally readable")
             .rows()[0]
@@ -1547,8 +1503,8 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                     "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE id = $1",
                 )
                 .await,
-                &[Value::Text(selected_file_id.clone())],
             )
+            .params(&[Value::Text(selected_file_id.clone())])
             .await
             .expect("direct file-filtered packed diff should stay local");
         assert!(
@@ -1573,8 +1529,8 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                      SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE id = $1))",
                 )
                 .await,
-                &[Value::Text(selected_file_id.clone())],
             )
+            .params(&[Value::Text(selected_file_id.clone())])
             .await
             .expect("packed partial checkpoint should stay local");
         assert!(checkpoint.rows_affected() > 0);
@@ -1605,8 +1561,8 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                     "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__ WHERE id = $1",
                 )
                 .await,
-                &[Value::Text(selected_file_id)],
             )
+            .params(&[Value::Text(selected_file_id)])
             .await
             .expect("selected packed file diff should be cleared");
         assert_eq!(
@@ -1624,7 +1580,6 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
                     "SELECT count(*) AS count FROM __LIX_RELATION_DIFF__",
                 )
                 .await,
-                &[],
             )
             .await
             .expect("remaining packed working diff should stay locally readable")
@@ -1657,7 +1612,6 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap()
@@ -1666,10 +1620,8 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
         .unwrap();
     replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(first_selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(first_selected_row_ref)])
         .await
         .unwrap();
     replica.pump().await.unwrap();
@@ -1683,8 +1635,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                     "lix_key_value",
                     "SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__",
                 )
-                .await,
-                &[],
+                .await
             )
             .await
             .unwrap()
@@ -1708,7 +1659,6 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap()
@@ -1717,7 +1667,8 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
         .unwrap();
     let head_commit_id = replica
         .lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1742,10 +1693,8 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
 
     replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(selected_row_ref)])
         .await
         .unwrap();
     assert_eq!(
@@ -1762,8 +1711,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
                     "lix_key_value",
                     "SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__",
                 )
-                .await,
-                &[],
+                .await
             )
             .await
             .unwrap()
@@ -1853,7 +1801,6 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
                  WHERE coalesce(key, '') = 'selected'))",
             )
             .await,
-            &[],
         )
         .await
         .expect("HOT primary fallback must retain complete lifecycle publication");
@@ -1878,7 +1825,6 @@ async fn partial_checkpoint_uncertified_index_uses_hot_primary_fallback(_sim: Si
                 "SELECT key FROM __LIX_RELATION_DIFF__",
             )
             .await,
-            &[],
         )
         .await
         .unwrap();
@@ -1897,7 +1843,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority.clone())).await;
     write_key_value(&authority, "selected", "selected-update").await;
     authority
-        .execute("DELETE FROM lix_key_value WHERE key = 'removed'", &[])
+        .execute("DELETE FROM lix_key_value WHERE key = 'removed'")
         .await
         .unwrap();
     replica.pump().await.unwrap();
@@ -1910,7 +1856,6 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap()
@@ -1921,10 +1866,8 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
     crate::tracked_state::arm_point_replay_authority_batch_probe_for_test();
     replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(selected_row_ref)])
         .await
         .unwrap();
     assert!(
@@ -1940,7 +1883,6 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                 "SELECT diff_type, key FROM __LIX_RELATION_DIFF__",
             )
             .await,
-            &[],
         )
         .await
         .unwrap();
@@ -1961,8 +1903,7 @@ async fn partial_checkpoint_rebases_unselected_tombstone(_sim: Simulation) {
                     "SELECT COUNT(*) AS count FROM __LIX_RELATION_DIFF__ \
                      WHERE diff_type = 'removed'",
                 )
-                .await,
-                &[],
+                .await
             )
             .await
             .unwrap()
@@ -2005,7 +1946,6 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
                 "SELECT row_ref FROM __LIX_RELATION_DIFF__ WHERE key = 'selected'",
             )
             .await,
-            &[],
         )
         .await
         .unwrap()
@@ -2014,10 +1954,8 @@ async fn pre_v75_partial_checkpoint_repository_is_rejected(_sim: Simulation) {
         .unwrap();
     replica
         .lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])",
-            &[Value::RowRef(selected_row_ref)],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[$1])")
+        .params(&[Value::RowRef(selected_row_ref)])
         .await
         .unwrap();
     replica.pump().await.unwrap();
@@ -2116,18 +2054,12 @@ async fn deterministic_sync_command_traces(_sim: Simulation) {
 async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulation) {
     let authority = fresh_authority().await;
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('inventory', 'first')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('inventory', 'first')")
         .await
         .unwrap();
     let first = authority.create_checkpoint().await.unwrap().commit_id;
     authority
-        .execute(
-            "UPDATE lix_key_value SET value = 'abandoned' WHERE key = 'inventory'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value = 'abandoned' WHERE key = 'inventory'")
         .await
         .unwrap();
     let abandoned = authority.create_checkpoint().await.unwrap().commit_id;
@@ -2178,16 +2110,17 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
         .invalidate_inventory_once
         .store(true, Ordering::SeqCst);
     let replica = Replica::bootstrap(transport.clone()).await;
-    assert!(!transport
-        .script
-        .invalidate_inventory_once
-        .load(Ordering::SeqCst));
+    assert!(
+        !transport
+            .script
+            .invalidate_inventory_once
+            .load(Ordering::SeqCst)
+    );
     let flags = replica
         .lix
-        .execute(
-            "SELECT id FROM lix_commit WHERE id = $1 OR id = $2 ORDER BY id",
-            &[Value::Text(first.clone()), Value::Text(abandoned.clone())],
-        )
+        .query("SELECT id FROM lix_commit WHERE id = $1 OR id = $2 ORDER BY id")
+        .params(&[Value::Text(first.clone()), Value::Text(abandoned.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(flags.len(), 2);
@@ -2241,10 +2174,9 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
     replica.hydrate_and_retry(&query).await;
     let old = replica
         .lix
-        .execute(
-            "SELECT value FROM lix_as_of('lix_key_value', $1) WHERE key = 'inventory'",
-            &[Value::Text(abandoned)],
-        )
+        .query("SELECT value FROM lix_as_of('lix_key_value', $1) WHERE key = 'inventory'")
+        .params(&[Value::Text(abandoned)])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -2298,7 +2230,10 @@ async fn ordinary_history_gap_uses_bounded_checkpoint_log(_sim: Simulation) {
         .await
         .expect("persistent authority main-branch session should open");
     let first_checkpoint = session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap()
         .rows()[0]
@@ -2312,7 +2247,10 @@ async fn ordinary_history_gap_uses_bounded_checkpoint_log(_sim: Simulation) {
         .await
         .expect("second checkpoint seed row should commit");
     let second_checkpoint = session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap()
         .rows()[0]
@@ -2468,7 +2406,10 @@ async fn inventory_then_hydrate_enriches_ordinary_history_summary(_sim: Simulati
         .await
         .expect("second checkpoint seed row should commit");
     let second_checkpoint = session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .unwrap()
         .rows()[0]
@@ -2672,14 +2613,16 @@ async fn inventory_then_hydrate_enriches_ordinary_history_summary(_sim: Simulati
     crate::sql2::take_mainline_work();
     let fast = replica
         .lix
-        .execute(fast_sql, &[])
+        .query(fast_sql)
+        .all()
         .await
         .expect("hydrated ordinary-head log should use its summary");
     let (fast_graph_reads, _) = crate::sql2::take_mainline_work();
     crate::sql2::take_mainline_work();
     let scan = replica
         .lix
-        .execute(scan_sql, &[])
+        .query(scan_sql)
+        .all()
         .await
         .expect("ordinary log scan should remain the correctness oracle");
     let (scan_graph_reads, _) = crate::sql2::take_mainline_work();
@@ -2769,39 +2712,29 @@ async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
     // unmarked history outside inventory.
     for generation in 0..32 {
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("sparse-{generation}")),
-                    Value::Text("before".into()),
-                ],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("sparse-{generation}")),
+                Value::Text("before".into()),
+            ])
             .await
             .unwrap();
     }
     let automatic = authority
-        .execute(
-            "SELECT commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-            &[],
-        )
+        .query("SELECT commit_id FROM lix_branch WHERE id = lix_active_branch_id()")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'")
         .await
         .unwrap();
     reset_branch_for_test(&authority, &automatic).await;
     authority
-        .execute(
-            "UPDATE lix_key_value SET value = 'after' WHERE key = 'sparse-0'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'sparse-0'")
         .await
         .unwrap();
     let abandoned = authority.create_checkpoint().await.unwrap().commit_id;
@@ -2833,26 +2766,20 @@ async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
         "SELECT value FROM lix_as_of('lix_key_value', '{abandoned}') WHERE key = 'sparse-0'"
     );
     replica.hydrate_and_retry(&query).await;
-    let result = replica.lix.execute(&query, &[]).await.unwrap();
+    let result = replica.lix.query(&query).all().await.unwrap();
     assert_eq!(
         result.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!("after")
     );
     replica
         .lix
-        .execute(
-            "UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value = 'temporary' WHERE key = 'sparse-0'")
         .await
         .unwrap();
     reset_branch_for_test(&replica.lix, &abandoned).await;
     replica
         .lix
-        .execute(
-            "UPDATE lix_key_value SET value = 'restored-write' WHERE key = 'sparse-0'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value = 'restored-write' WHERE key = 'sparse-0'")
         .await
         .unwrap();
     replica.lix.create_checkpoint().await.unwrap();

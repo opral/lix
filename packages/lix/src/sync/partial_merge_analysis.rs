@@ -436,7 +436,7 @@ mod tests {
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
-        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base'),('merge-b','base')",&[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base'),('merge-b','base')").await.unwrap();
         let old = PartialReplicaState::new(
             format!("https://example.test/lix/{}", authority.lix_id()),
             authority.active_account_id().into(),
@@ -449,10 +449,7 @@ mod tests {
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='local' WHERE key='merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='local' WHERE key='merge-a'")
             .await
             .unwrap();
         let remote_sql = if same_identity {
@@ -460,7 +457,7 @@ mod tests {
         } else {
             "UPDATE lix_key_value SET value='remote' WHERE key='merge-b'"
         };
-        authority.execute(remote_sql, &[]).await.unwrap();
+        authority.execute(remote_sql).await.unwrap();
         let candidate = old
             .with_descriptor_and_fresh_generations(
                 authority.partial_replica_descriptor(None).await.unwrap(),
@@ -485,7 +482,7 @@ mod tests {
             .await
             .unwrap();
         if checkpoint {
-            local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+            local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         }
         let storage = local.storage_adapter();
         let mut writes = storage.new_write_set();
@@ -504,7 +501,8 @@ mod tests {
     async fn legacy_unknown_sql_checkpoint_does_not_certify_nonincorporation() {
         let (local, _, candidate) = divergent_fixture_with_checkpoint(false, true).await;
         let checkpoint = local
-            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS commit_id")
+            .all()
             .await
             .unwrap()
             .rows()[0]

@@ -100,10 +100,8 @@ where
 
     for schema in schemas() {
         session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-                &[Value::Text(schema.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+            .params(&[Value::Text(schema.to_string())])
             .await
             .expect("register schema");
     }
@@ -112,10 +110,8 @@ where
     // not depend on how many parents exist, only on the child collection size.
     if lane == Lane::ForeignKey {
         session
-            .execute(
-                "INSERT INTO w_fk_parent (id) VALUES ($1)",
-                &[Value::Text("parent-0".into())],
-            )
+            .execute("INSERT INTO w_fk_parent (id) VALUES ($1)")
+            .params(&[Value::Text("parent-0".into())])
             .await
             .expect("insert parent");
     }
@@ -149,37 +145,31 @@ where
     match lane {
         Lane::PkOnly => {
             session
-                .execute(
-                    "INSERT INTO w_pk_only (id, payload) VALUES ($1, $2)",
-                    &[
-                        Value::Text(format!("row-{index}")),
-                        Value::Text(format!("payload-{index}")),
-                    ],
-                )
+                .execute("INSERT INTO w_pk_only (id, payload) VALUES ($1, $2)")
+                .params(&[
+                    Value::Text(format!("row-{index}")),
+                    Value::Text(format!("payload-{index}")),
+                ])
                 .await
                 .expect("insert pk_only row");
         }
         Lane::Unique => {
             session
-                .execute(
-                    "INSERT INTO w_unique (id, slug) VALUES ($1, $2)",
-                    &[
-                        Value::Text(format!("row-{index}")),
-                        Value::Text(format!("slug-{index}")),
-                    ],
-                )
+                .execute("INSERT INTO w_unique (id, slug) VALUES ($1, $2)")
+                .params(&[
+                    Value::Text(format!("row-{index}")),
+                    Value::Text(format!("slug-{index}")),
+                ])
                 .await
                 .expect("insert unique row");
         }
         Lane::ForeignKey => {
             session
-                .execute(
-                    r#"INSERT INTO w_fk_child (id, "parent_id") VALUES ($1, $2)"#,
-                    &[
-                        Value::Text(format!("row-{index}")),
-                        Value::Text("parent-0".into()),
-                    ],
-                )
+                .execute(r#"INSERT INTO w_fk_child (id, "parent_id") VALUES ($1, $2)"#)
+                .params(&[
+                    Value::Text(format!("row-{index}")),
+                    Value::Text("parent-0".into()),
+                ])
                 .await
                 .expect("insert fk row");
         }

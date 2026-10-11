@@ -1,8 +1,8 @@
 use lix::storage::Storage;
 use lix::telemetry::{CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryValue};
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions,
-    MergeBranchOutcome, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, Lix, LixError, Memory, MergeBranchOptions, MergeBranchOutcome,
+    SwitchBranchOptions, Value, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use std::ops::Deref;
@@ -19,7 +19,8 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
     }));
     let lix = open_lix().with_telemetry(telemetry).await.unwrap();
 
-    lix.execute("SELECT 'private-value' AS value, 42 AS number", &[])
+    lix.query("SELECT 'private-value' AS value, 42 AS number")
+        .all()
         .await
         .unwrap();
 
@@ -55,16 +56,13 @@ async fn rs_sdk_telemetry_is_explicit_and_redacts_sql_literals() {
 #[tokio::test]
 async fn rs_sdk_sql_checkpoint_returns_the_new_active_head() {
     let lix = open_lix().await.unwrap();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-test', 'working')")
+        .await
+        .unwrap();
     let before = active_head_commit_id(&lix).await;
 
     let checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
@@ -85,21 +83,20 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 
     lix.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("task-1".to_string()),
-            Value::Text("Draft RS SDK flow".to_string()),
-            Value::Boolean(false),
-            Value::Text(r#"{"priority":"high","tags":["sdk","json"]}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("task-1".to_string()),
+        Value::Text("Draft RS SDK flow".to_string()),
+        Value::Boolean(false),
+        Value::Text(r#"{"priority":"high","tags":["sdk","json"]}"#.to_string()),
+    ])
     .await
     .unwrap();
 
     let projected = lix
-        .execute(
-            "SELECT title, done, meta FROM crm_task WHERE id = $1",
-            &[Value::Text("task-1".to_string())],
-        )
+        .query("SELECT title, done, meta FROM crm_task WHERE id = $1")
+        .params(&[Value::Text("task-1".to_string())])
+        .all()
         .await
         .unwrap();
     assert_crm_task_projection(&projected);
@@ -124,12 +121,10 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     .await
     .unwrap();
 
-    lix.execute(
-        "UPDATE crm_task SET done = $1 WHERE id = $2",
-        &[Value::Boolean(true), Value::Text("task-1".to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2")
+        .params(&[Value::Boolean(true), Value::Text("task-1".to_string())])
+        .await
+        .unwrap();
 
     assert!(task_done(&lix, "task-1").await);
 
@@ -160,7 +155,8 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 
 async fn active_head_commit_id(lix: &Lix<Memory>) -> String {
     let result = lix
-        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .unwrap();
     match &result.rows()[0].values()[0] {
@@ -177,7 +173,8 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     lix.close().await.unwrap();
 
     let error = lix
-        .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
+        .query("SELECT value FROM lix_key_value WHERE key = 'lix_id'")
+        .all()
         .await
         .expect_err("execute after close should fail");
     assert_closed(error);
@@ -195,29 +192,21 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     let first = open_lix().with_storage(storage.clone()).await.unwrap();
 
     first
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('close-key', 'close-value')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('close-key', 'close-value')")
         .await
         .unwrap();
     first.close().await.unwrap();
 
     let error = first
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'close-key'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'close-key'")
+        .all()
         .await
         .expect_err("closed handle should not be usable");
     assert_closed(error);
 
     let second = open_lix().with_storage(storage).await.unwrap();
     let result = second
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key = 'close-key' AND value = CAST('\"close-value\"' AS JSONB)",
-            &[],
-        )
+        .query("SELECT key FROM lix_key_value WHERE key = 'close-key' AND value = CAST('\"close-value\"' AS JSONB)").all()
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
@@ -235,31 +224,27 @@ async fn failed_write_validation_does_not_poison_storage_transaction() {
     register_poison_task_schema(&lix).await;
 
     let error = lix
-        .execute(
-            "INSERT INTO poison_task (id, title) VALUES ($1, $2)",
-            &[
-                Value::Text("bad-task".to_string()),
-                Value::Text("missing meta".to_string()),
-            ],
-        )
+        .execute("INSERT INTO poison_task (id, title) VALUES ($1, $2)")
+        .params(&[
+            Value::Text("bad-task".to_string()),
+            Value::Text("missing meta".to_string()),
+        ])
         .await
         .expect_err("schema validation should reject missing required field");
     assert_eq!(error.code, "LIX_ERROR_SCHEMA_VALIDATION");
 
-    let result = lix.execute("SELECT 1 AS ok", &[]).await.unwrap();
+    let result = lix.query("SELECT 1 AS ok").all().await.unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Integer(1)]);
 
-    lix.execute(
-        "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, CAST($3 AS JSONB))",
-        &[
+    lix.execute("INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, CAST($3 AS JSONB))")
+        .params(&[
             Value::Text("good-task".to_string()),
             Value::Text("valid".to_string()),
             Value::Text(r#"{"priority":"high"}"#.to_string()),
-        ],
-    )
-    .await
-    .expect("valid write after failed write should succeed");
+        ])
+        .await
+        .expect("valid write after failed write should succeed");
 
     lix.close().await.unwrap();
 }
@@ -269,38 +254,37 @@ async fn transaction_commits_multiple_statements_together() {
     let lix = open_lix().await.unwrap();
     register_crm_task_schema(&lix).await;
 
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     tx.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("tx-task-1".to_string()),
-            Value::Text("First".to_string()),
-            Value::Boolean(false),
-            Value::Text(r#"{"batch":1}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("tx-task-1".to_string()),
+        Value::Text("First".to_string()),
+        Value::Boolean(false),
+        Value::Text(r#"{"batch":1}"#.to_string()),
+    ])
     .await
     .unwrap();
     tx.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("tx-task-2".to_string()),
-            Value::Text("Second".to_string()),
-            Value::Boolean(true),
-            Value::Text(r#"{"batch":1}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("tx-task-2".to_string()),
+        Value::Text("Second".to_string()),
+        Value::Boolean(true),
+        Value::Text(r#"{"batch":1}"#.to_string()),
+    ])
     .await
     .unwrap();
 
     let staged = tx
-        .execute(
-            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
-            &[
-                Value::Text("tx-task-1".to_string()),
-                Value::Text("tx-task-2".to_string()),
-            ],
-        )
+        .query("SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id")
+        .params(&[
+            Value::Text("tx-task-1".to_string()),
+            Value::Text("tx-task-2".to_string()),
+        ])
+        .all()
         .await
         .unwrap();
     assert_eq!(staged.len(), 2);
@@ -308,13 +292,12 @@ async fn transaction_commits_multiple_statements_together() {
     tx.commit().await.unwrap();
 
     let committed = lix
-        .execute(
-            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
-            &[
-                Value::Text("tx-task-1".to_string()),
-                Value::Text("tx-task-2".to_string()),
-            ],
-        )
+        .query("SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id")
+        .params(&[
+            Value::Text("tx-task-1".to_string()),
+            Value::Text("tx-task-2".to_string()),
+        ])
+        .all()
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
@@ -325,7 +308,8 @@ async fn transaction_commits_multiple_statements_together() {
 async fn execute_rejects_multi_statement_scripts() {
     let lix = open_lix().await.unwrap();
     let error = lix
-        .execute("SELECT 1; SELECT 2", &[])
+        .query("SELECT 1; SELECT 2")
+        .all()
         .await
         .expect_err("execute is one statement, not a script splitter");
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -337,170 +321,146 @@ async fn execute_rejects_multi_statement_scripts() {
 }
 
 #[tokio::test]
-async fn execute_batch_is_atomic_and_returns_ordered_results() {
+async fn execute_many_is_atomic_and_counts_rows() {
     let lix = open_lix().await.unwrap();
-    let results = lix
-        .execute_batch(&[
-            ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-                params: vec![
-                    Value::Text("batch-rs-a".to_string()),
-                    Value::Text("first".to_string()),
-                ],
-            },
-            ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-                params: vec![
-                    Value::Text("batch-rs-b".to_string()),
-                    Value::Text("second".to_string()),
-                ],
-            },
-            ExecuteBatchStatement {
-                label: None,
-                sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key"
-                    .to_string(),
-                params: vec![
-                    Value::Text("batch-rs-a".to_string()),
-                    Value::Text("batch-rs-b".to_string()),
-                ],
-            },
-        ])
+    let inserted = lix
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            (0..18).map(|index| [format!("many-{index}"), index.to_string()]),
+        )
         .await
-        .unwrap()
-        .results;
-    assert_eq!(results.len(), 3);
+        .unwrap();
+    assert_eq!(inserted, 18);
     assert_eq!(
-        results
-            .iter()
-            .map(|result| result.statement_index())
-            .collect::<Vec<_>>(),
-        vec![Some(0), Some(1), Some(2)]
+        lix.query("SELECT count(*) AS n FROM lix_key_value WHERE key LIKE 'many-%'")
+            .one()
+            .await
+            .unwrap()
+            .get::<i64>("n")
+            .unwrap(),
+        18
     );
-    assert_eq!(results[0].label(), None);
-    assert_eq!(results[0].rows_affected(), 1);
-    assert_eq!(results[1].rows_affected(), 1);
+
+    // One failing parameter set rolls back every set.
+    let error = lix
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            [["many-rollback", "first"], ["many-0", "duplicate"]],
+        )
+        .await
+        .expect_err("a duplicate key fails the whole call");
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert!(
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'many-rollback'")
+            .optional()
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     assert_eq!(
-        results[2]
+        lix.execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            Vec::<[Value; 2]>::new(),
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let error = lix
+        .execute_many("SELECT $1", [[1_i64]])
+        .await
+        .expect_err("execute_many only runs writes");
+    assert_eq!(error.code, LixError::CODE_NOT_A_WRITE);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transactions_run_mixed_statements_atomically() {
+    let lix = open_lix().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .bind("tx-a")
+        .bind("first")
+        .await
+        .unwrap();
+    transaction
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .bind("tx-b")
+        .bind("second")
+        .await
+        .unwrap();
+    let staged = transaction
+        .query("SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key")
+        .bind("tx-a")
+        .bind("tx-b")
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
             .rows()
             .iter()
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>(),
         vec![
             vec![
-                Value::Text("batch-rs-a".to_string()),
+                Value::Text("tx-a".to_string()),
                 Value::Jsonb(serde_json::json!("first").into()),
             ],
             vec![
-                Value::Text("batch-rs-b".to_string()),
+                Value::Text("tx-b".to_string()),
                 Value::Jsonb(serde_json::json!("second").into()),
             ],
         ]
     );
+    transaction.commit().await.unwrap();
 
-    let error = lix
-        .execute_batch(&[
-            ExecuteBatchStatement {
-                label: None,
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-                params: vec![
-                    Value::Text("batch-rs-rollback".to_string()),
-                    Value::Text("before failure".to_string()),
-                ],
-            },
-            ExecuteBatchStatement {
-                label: None,
-                sql: "SELECT id FROM lix_history('lix_file', 'one', 'two')".to_string(),
-                params: Vec::new(),
-            },
-        ])
-        .await
-        .expect_err("middle batch statement should fail");
-    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
-    assert!(
-        error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("statementIndex"))
-            .is_some_and(|value| value.as_u64() == Some(1)),
-    );
-
-    let rolled_back = lix
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key = $1",
-            &[Value::Text("batch-rs-rollback".to_string())],
-        )
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('tx-rollback', 'x')")
         .await
         .unwrap();
-    assert!(rolled_back.is_empty());
-
-    let empty_error = lix
-        .execute_batch(&[])
+    let error = transaction
+        .query("SELECT id FROM lix_history('lix_file', 'one', 'two')")
+        .all()
         .await
-        .expect_err("empty batch should be rejected");
-    assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn execute_batch_indexes_all_eighteen_writes_and_echoes_labels() {
-    let lix = open_lix().await.unwrap();
-    let statements = (0..18)
-        .map(|index| ExecuteBatchStatement {
-            label: Some(format!("file-{index}")),
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-            params: vec![
-                Value::Text(format!("batch-eighteen-{index}")),
-                Value::Text(index.to_string()),
-            ],
-        })
-        .collect::<Vec<_>>();
-
-    let results = lix.execute_batch(&statements).await.unwrap().results;
-    assert_eq!(results.len(), 18);
-    assert_eq!(
-        results
-            .iter()
-            .map(|result| result.statement_index())
-            .collect::<Vec<_>>(),
-        (0..18).map(Some).collect::<Vec<_>>()
+        .expect_err("invalid statement fails");
+    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+    transaction.rollback().await.unwrap();
+    assert!(
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'tx-rollback'")
+            .optional()
+            .await
+            .unwrap()
+            .is_none()
     );
-    let expected_labels = (0..18)
-        .map(|index| format!("file-{index}"))
-        .collect::<Vec<_>>();
-    for (index, result) in results.iter().enumerate() {
-        assert_eq!(result.label(), Some(expected_labels[index].as_str()));
-    }
-    assert!(results.iter().all(|result| result.rows_affected() == 1));
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn transaction_lix_file_content_reads_staged_file_bytes() {
     let lix = open_lix().await.unwrap();
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     let path = "/tx-file-data.bin".to_string();
     let original = b"staged bytes before commit".to_vec();
 
-    tx.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(path.clone()),
             Value::Blob(original.clone().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
 
     let selected = tx
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
-            &[
-                Value::Text(path.clone()),
-                Value::Blob(original.clone().into()),
-            ],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1 AND content = $2")
+        .params(&[
+            Value::Text(path.clone()),
+            Value::Blob(original.clone().into()),
+        ])
+        .all()
         .await
         .unwrap();
     assert_eq!(selected.len(), 1);
@@ -511,26 +471,23 @@ async fn transaction_lix_file_content_reads_staged_file_bytes() {
 
     let updated = b"updated bytes before commit".to_vec();
     let update = tx
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = $2 AND content = $3",
-            &[
-                Value::Blob(updated.clone().into()),
-                Value::Text(path.clone()),
-                Value::Blob(original.into()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = $2 AND content = $3")
+        .params(&[
+            Value::Blob(updated.clone().into()),
+            Value::Text(path.clone()),
+            Value::Blob(original.into()),
+        ])
         .await
         .unwrap();
     assert_eq!(update.rows_affected(), 1);
 
     let after_update = tx
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
-            &[
-                Value::Text(path.clone()),
-                Value::Blob(updated.clone().into()),
-            ],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1 AND content = $2")
+        .params(&[
+            Value::Text(path.clone()),
+            Value::Blob(updated.clone().into()),
+        ])
+        .all()
         .await
         .unwrap();
     assert_eq!(after_update.len(), 1);
@@ -540,19 +497,16 @@ async fn transaction_lix_file_content_reads_staged_file_bytes() {
     );
 
     let delete = tx
-        .execute(
-            "DELETE FROM lix_file WHERE path = $1 AND content = $2",
-            &[Value::Text(path.clone()), Value::Blob(updated.into())],
-        )
+        .execute("DELETE FROM lix_file WHERE path = $1 AND content = $2")
+        .params(&[Value::Text(path.clone()), Value::Blob(updated.into())])
         .await
         .unwrap();
     assert_eq!(delete.rows_affected(), 1);
 
     let after_delete = tx
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path)],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path)])
+        .all()
         .await
         .unwrap();
     assert_eq!(after_delete.len(), 0);
@@ -566,25 +520,24 @@ async fn transaction_rollback_discards_staged_writes() {
     let lix = open_lix().await.unwrap();
     register_crm_task_schema(&lix).await;
 
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     tx.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("rolled-back-task".to_string()),
-            Value::Text("Rollback".to_string()),
-            Value::Boolean(false),
-            Value::Text(r#"{"batch":1}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("rolled-back-task".to_string()),
+        Value::Text("Rollback".to_string()),
+        Value::Boolean(false),
+        Value::Text(r#"{"batch":1}"#.to_string()),
+    ])
     .await
     .unwrap();
     tx.rollback().await.unwrap();
 
     let result = lix
-        .execute(
-            "SELECT id FROM crm_task WHERE id = $1",
-            &[Value::Text("rolled-back-task".to_string())],
-        )
+        .query("SELECT id FROM crm_task WHERE id = $1")
+        .params(&[Value::Text("rolled-back-task".to_string())])
+        .all()
         .await
         .unwrap();
     assert_eq!(result.len(), 0);
@@ -596,33 +549,34 @@ async fn transaction_keeps_same_handle_reads_and_writes_outside_its_snapshot() {
     let lix = open_lix().await.unwrap();
     register_crm_task_schema(&lix).await;
 
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     tx.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("tx-only-task".to_string()),
-            Value::Text("Inside tx".to_string()),
-            Value::Boolean(false),
-            Value::Text(r#"{"batch":1}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("tx-only-task".to_string()),
+        Value::Text("Inside tx".to_string()),
+        Value::Boolean(false),
+        Value::Text(r#"{"batch":1}"#.to_string()),
+    ])
     .await
     .unwrap();
 
     lix.execute(
         "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-        &[
-            Value::Text("outside-task".to_string()),
-            Value::Text("Outside tx".to_string()),
-            Value::Boolean(false),
-            Value::Text(r#"{"batch":1}"#.to_string()),
-        ],
     )
+    .params(&[
+        Value::Text("outside-task".to_string()),
+        Value::Text("Outside tx".to_string()),
+        Value::Boolean(false),
+        Value::Text(r#"{"batch":1}"#.to_string()),
+    ])
     .await
     .expect("parent writes commit independently while the transaction is active");
 
     let parent_read = lix
-        .execute("SELECT id FROM crm_task ORDER BY id", &[])
+        .query("SELECT id FROM crm_task ORDER BY id")
+        .all()
         .await
         .expect("parent reads see committed data during the transaction");
     assert_eq!(parent_read.rows().len(), 1);
@@ -632,7 +586,8 @@ async fn transaction_keeps_same_handle_reads_and_writes_outside_its_snapshot() {
     );
 
     let tx_read = tx
-        .execute("SELECT id FROM crm_task ORDER BY id", &[])
+        .query("SELECT id FROM crm_task ORDER BY id")
+        .all()
         .await
         .expect("transaction reads retain their own snapshot and staged data");
     assert_eq!(tx_read.rows().len(), 1);
@@ -647,34 +602,34 @@ async fn transaction_keeps_same_handle_reads_and_writes_outside_its_snapshot() {
         .expect_err("the explicit read guards the opening snapshot");
     assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
     // Retry the complete read/write operation against the fresh snapshot.
-    let mut retry = lix.begin_transaction().await.unwrap();
+    let retry = lix.begin_transaction().await.unwrap();
     let fresh = retry
-        .execute("SELECT id FROM crm_task ORDER BY id", &[])
+        .query("SELECT id FROM crm_task ORDER BY id")
+        .all()
         .await
         .unwrap();
     assert_eq!(fresh.rows().len(), 1);
     retry
         .execute(
             "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
-            &[
-                Value::Text("tx-only-task".to_string()),
-                Value::Text("Inside tx".to_string()),
-                Value::Boolean(false),
-                Value::Text(r#"{"batch":1}"#.to_string()),
-            ],
         )
+        .params(&[
+            Value::Text("tx-only-task".to_string()),
+            Value::Text("Inside tx".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ])
         .await
         .unwrap();
     assert!(retry.commit().await.unwrap().commit.is_some());
 
     let committed = lix
-        .execute(
-            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
-            &[
-                Value::Text("outside-task".to_string()),
-                Value::Text("tx-only-task".to_string()),
-            ],
-        )
+        .query("SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id")
+        .params(&[
+            Value::Text("outside-task".to_string()),
+            Value::Text("tx-only-task".to_string()),
+        ])
+        .all()
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
@@ -877,10 +832,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await?;
     result
         .rows()
@@ -900,8 +854,8 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
+    .params(&[Value::Text(path.to_string()), Value::Blob(data.into())])
     .await?;
     Ok(())
 }
@@ -910,11 +864,9 @@ async fn mkdir<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), Li
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-        &[Value::Text(path.to_string())],
-    )
-    .await?;
+    lix.execute("INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING")
+        .params(&[Value::Text(path.to_string())])
+        .await?;
     Ok(())
 }
 
@@ -922,11 +874,9 @@ async fn rm<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Result<(), LixEr
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "DELETE FROM lix_directory WHERE path = $1",
-        &[Value::Text(path.to_string())],
-    )
-    .await?;
+    lix.execute("DELETE FROM lix_directory WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .await?;
     Ok(())
 }
 
@@ -939,13 +889,13 @@ where
 {
     if path == "/" {
         let entries = lix
-            .execute(
+            .query(
                 "SELECT name FROM lix_directory WHERE parent_id IS NULL \
                  UNION ALL \
                  SELECT name FROM lix_file WHERE directory_id IS NULL \
                  ORDER BY name",
-                &[],
             )
+            .all()
             .await?;
         return Ok(Some(
             entries
@@ -957,23 +907,23 @@ where
     }
 
     let directory = lix
-        .execute(
-            "SELECT id FROM lix_directory WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT id FROM lix_directory WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await?;
     let Some(directory) = directory.rows().first() else {
         return Ok(None);
     };
     let directory_id = directory.get::<String>("id")?;
     let entries = lix
-        .execute(
+        .query(
             "SELECT name FROM lix_directory WHERE parent_id = $1 \
              UNION ALL \
              SELECT name FROM lix_file WHERE directory_id = $1 \
              ORDER BY name",
-            &[Value::Text(directory_id)],
         )
+        .params(&[Value::Text(directory_id)])
+        .all()
         .await?;
     Ok(Some(
         entries
@@ -1093,48 +1043,40 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     mkdir(&lix, "/empty-sdk").await.unwrap();
     assert!(tempdir.path().join("empty-sdk").is_dir());
 
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text("/sql.txt".to_string()),
             Value::Blob(b"sql".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"sql"));
 
-    lix.execute(
-        "UPDATE lix_file SET content = $1 WHERE path = $2",
-        &[
+    lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .params(&[
             Value::Blob(b"updated".to_vec().into()),
             Value::Text("/sql.txt".to_string()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"updated"));
 
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text("/tx.txt".to_string()),
             Value::Blob(b"tx".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert!(!tempdir.path().join("tx.txt").exists());
     tx.commit().await.unwrap();
     wait_for_disk_file(&tempdir.path().join("tx.txt"), Some(b"tx"));
 
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text("/sql.txt".to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text("/sql.txt".to_string())])
+        .await
+        .unwrap();
     wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
 
     rm(&lix, "/empty-sdk").await.unwrap();
@@ -1185,12 +1127,10 @@ async fn on_demand_filesystem_lix_delete_removes_path_from_active_imports() {
     let deleted_path = tempdir.path().join("new-file.md");
     wait_for_disk_file(&deleted_path, Some(b"new"));
 
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text("/new-file.md".to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text("/new-file.md".to_string())])
+        .await
+        .unwrap();
     wait_for_disk_file(&deleted_path, None);
 
     std::fs::write(&deleted_path, b"recreated").unwrap();
@@ -1206,15 +1146,13 @@ async fn on_demand_filesystem_lix_rename_replaces_tracked_path() {
     std::fs::write(tempdir.path().join("old.md"), b"old").unwrap();
     let lix = open_on_demand_filesystem_lix(tempdir.path(), &["old.md"]).await;
 
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
+    lix.execute("UPDATE lix_file SET path = $1 WHERE path = $2")
+        .params(&[
             Value::Text("/nested/renamed.md".to_string()),
             Value::Text("/old.md".to_string()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
 
     let old_path = tempdir.path().join("old.md");
     let renamed_path = tempdir.path().join("nested/renamed.md");
@@ -1235,12 +1173,12 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
 
     lix.execute(
         "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
-        &[
-            Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
-            Value::Text("/untracked.txt".to_string()),
-            Value::Blob(b"untracked".to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
+        Value::Text("/untracked.txt".to_string()),
+        Value::Blob(b"untracked".to_vec().into()),
+    ])
     .await
     .unwrap();
     assert_eq!(
@@ -1248,15 +1186,13 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
         b"untracked"
     );
 
-    lix.execute(
-        "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
-        &[
+    lix.execute("INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)")
+        .params(&[
             Value::Text("01920000-0000-7000-8000-000000000512".to_string()),
             Value::Text("/untracked-dir".to_string()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert!(tempdir.path().join("untracked-dir").is_dir());
 
     lix.close().await.unwrap();
@@ -1429,7 +1365,8 @@ async fn filesystem_ignores_special_and_invalid_utf8_entries() {
 
     assert_eq!(read_file(&lix, "/socket").await.unwrap(), None);
     let files = lix
-        .execute("SELECT path FROM lix_file ORDER BY path", &[])
+        .query("SELECT path FROM lix_file ORDER BY path")
+        .all()
         .await
         .unwrap();
     assert_eq!(files.len(), 1, "only the bootstrap README is tracked");
@@ -1650,15 +1587,13 @@ async fn register_crm_task_schema(lix: &Lix) {
         "primary_key": ["id"]
     }"#;
 
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
+        .await
+        .unwrap();
 }
 
-fn assert_crm_task_projection(result: &lix::ExecuteResult) {
+fn assert_crm_task_projection(result: &lix::QueryResult) {
     assert_eq!(result.len(), 1);
     let row = &result.rows()[0];
     assert_eq!(
@@ -1701,20 +1636,17 @@ async fn register_poison_task_schema(lix: &Lix) {
         "primary_key": ["id"]
     }"#;
 
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
+        .await
+        .unwrap();
 }
 
 async fn task_done(lix: &Lix, task_id: &str) -> bool {
     let result = lix
-        .execute(
-            "SELECT done FROM crm_task WHERE id = $1",
-            &[Value::Text(task_id.to_string())],
-        )
+        .query("SELECT done FROM crm_task WHERE id = $1")
+        .params(&[Value::Text(task_id.to_string())])
+        .all()
         .await
         .unwrap();
 
@@ -1736,10 +1668,7 @@ async fn rs_sdk_writes_return_the_commit_span_they_published() {
     let lix = open_lix().await.unwrap();
     let before = active_head_commit_id(&lix).await;
     let written = lix
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('span-rs', 'one')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('span-rs', 'one')")
         .await
         .unwrap();
     let span = written.commit().expect("a write carries its commit span");
@@ -1748,9 +1677,10 @@ async fn rs_sdk_writes_return_the_commit_span_they_published() {
     assert_ne!(span.before(), span.after());
 
     let read = lix
-        .execute("SELECT value FROM lix_key_value WHERE key = 'span-rs'", &[])
+        .query("SELECT value FROM lix_key_value WHERE key = 'span-rs'")
+        .all()
         .await
         .unwrap();
-    assert_eq!(read.commit(), None);
+    assert!(!read.is_empty(), "reads carry rows and no commit span");
     lix.close().await.unwrap();
 }

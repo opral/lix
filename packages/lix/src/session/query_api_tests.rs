@@ -7,12 +7,9 @@ use crate::{Lix, LixError, Value, open_lix};
 
 async fn seeded(rows: usize) -> Lix {
     let lix = open_lix().await.expect("open lix");
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
          \"key\":\"api_item\",\"columns\":[{\"name\":\"id\",\"type\":\"int8\",\"nullable\":false},\
-         {\"name\":\"label\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))",
-        &[],
-    )
+         {\"name\":\"label\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))")
     .await
     .expect("register schema");
     insert(&lix, 0..rows).await;
@@ -27,7 +24,7 @@ async fn insert(lix: &Lix, range: std::ops::Range<usize>) {
             .map(|id| format!("({id}, 'label-{id}')"))
             .collect::<Vec<_>>()
             .join(", ");
-        lix.execute(&format!("INSERT INTO api_item (id, label) VALUES {values}"), &[])
+        lix.execute(&format!("INSERT INTO api_item (id, label) VALUES {values}"))
             .await
             .expect("insert rows");
     }
@@ -241,7 +238,7 @@ async fn snapshots_read_one_state_across_reads_and_concurrent_streams() {
         .await
         .unwrap();
     insert(&lix, 300..400).await;
-    lix.execute("DELETE FROM api_item WHERE id < 50", &[])
+    lix.execute("DELETE FROM api_item WHERE id < 50")
         .await
         .unwrap();
     let mut right = snapshot
@@ -345,9 +342,9 @@ async fn snapshot_reads_and_streams_reject_writes() {
 #[tokio::test]
 async fn transaction_reads_and_streams_see_their_own_writes() {
     let lix = seeded(3).await;
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute("INSERT INTO api_item (id, label) VALUES (10, 'staged')", &[])
+        .execute("INSERT INTO api_item (id, label) VALUES (10, 'staged')")
         .await
         .unwrap();
     let staged = transaction

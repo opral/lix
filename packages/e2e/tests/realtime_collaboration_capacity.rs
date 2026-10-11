@@ -250,20 +250,17 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
     async fn stage_wave(&mut self, wave: &WavePlan, base: &[u8]) -> Self::StagedWave {
         let mut transactions = Vec::with_capacity(wave.edits.len());
         for edit in &wave.edits {
-            let mut transaction = self.peers[edit.operation % self.peers.len()]
+            let transaction = self.peers[edit.operation % self.peers.len()]
                 .begin_transaction()
                 .await
                 .expect("wave transaction should open");
             // Model native file saves with unconditional upserts so plugin
             // reconciliation composes edits rather than retrying SQL decisions.
             transaction
-                .execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[
+                .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content").params(&[
                         Value::Text(self.path.clone()),
                         Value::Blob(self.format.edit(base, edit.slot, &edit.token).into()),
-                    ],
-                )
+                    ])
                 .await
                 .expect("wave edit should stage");
             transactions.push(transaction);
@@ -418,19 +415,16 @@ async fn abandoned_transactions_and_sessions_release_resources() {
                 .open_another_session()
                 .await
                 .expect("soak session should open");
-            let mut transaction = peer
+            let transaction = peer
                 .begin_transaction()
                 .await
                 .expect("soak transaction should open");
             let edit = format!("{{\"value\":\"round-{round}-client-{client}\"}}\n");
             transaction
-                .execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[
+                .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content").params(&[
                         Value::Text(path.to_owned()),
                         Value::Blob(edit.into_bytes().into()),
-                    ],
-                )
+                    ])
                 .await
                 .expect("abandoned edit should stage");
             peers.push(peer);
@@ -535,43 +529,38 @@ async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive:
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("reference plugin should install");
+        ])
+        .await
+        .expect("reference plugin should install");
 }
 
 async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, bytes: &[u8])
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(path.to_owned()),
             Value::Blob(bytes.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("capacity document should write");
+        ])
+        .await
+        .expect("capacity document should write");
 }
 
 async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("capacity document should read")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("capacity document should read")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("capacity document should contain bytes")
 }

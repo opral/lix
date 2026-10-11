@@ -35,9 +35,9 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
         for path in ["/gtm/edit.txt", "/gtm/delete.txt", "/elsewhere/keep.txt"] {
             authority.upsert_file_content(path, b"before".to_vec()).await.unwrap();
         }
-        let before = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let before = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)").await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         authority.upsert_file_content("/gtm/edit.txt", b"historical change".to_vec()).await.unwrap();
-        let after = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let after = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)").await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         let historical_sql = format!("SELECT diff_type, from_path, to_path FROM lix_diff('lix_file', '{before}', '{after}') ORDER BY to_path");
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
         let enabled = Arc::new(AtomicBool::new(false));
@@ -77,13 +77,13 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
         );
         let caller = async {
             let sql = "SELECT path,name FROM lix_file ORDER BY path";
-            let initial = lix.execute(sql, &[]).await.unwrap();
+            let initial = lix.query(sql).all().await.unwrap();
             let initial_authority = authority_sql(&client.server, authority.lix_id(), None, sql).await;
             assert_eq!(initial.rows(), initial_authority.rows());
             let initial_fetches = client.fetches.load(Ordering::SeqCst);
-            assert_eq!(lix.execute(sql, &[]).await.unwrap().rows(), initial.rows());
+            assert_eq!(lix.query(sql).all().await.unwrap().rows(), initial.rows());
             assert_eq!(client.fetches.load(Ordering::SeqCst), initial_fetches);
-            let historical = lix.execute(&historical_sql, &[]).await.unwrap();
+            let historical = lix.query(&historical_sql).all().await.unwrap();
             assert_eq!(historical.rows().len(), 1);
             // Model a restored journal entry whose immutable commit has since
             // been pruned remotely. It must remain retained, never subscribed.
@@ -110,8 +110,8 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
             assert!(stalled.failures.contains_key(&crate::sync::SyncPhase::Descriptor));
             let during_outage = client.fetches.load(Ordering::SeqCst);
             for _ in 0..3 {
-                assert_eq!(lix.execute(sql, &[]).await.unwrap().rows(), initial.rows());
-                assert_eq!(lix.execute(&historical_sql, &[]).await.unwrap().rows(), historical.rows());
+                assert_eq!(lix.query(sql).all().await.unwrap().rows(), initial.rows());
+                assert_eq!(lix.query(&historical_sql).all().await.unwrap().rows(), historical.rows());
                 assert_eq!(lix.sync_health(), stalled, "successful local SQL must not hide the HTTP outage");
             }
             assert_eq!(client.fetches.load(Ordering::SeqCst), during_outage);
@@ -131,19 +131,19 @@ async fn unavailable_retained_history_does_not_block_background_file_updates() {
             assert_eq!(lix.sync_health().state, crate::sync::SyncHealthState::Running);
             assert!(lix.sync_health().failures.is_empty(), "successful descriptor recovery must clear the outage");
             let expected = authority_sql(&client.server, authority.lix_id(), None, sql).await;
-            let actual = lix.execute(sql, &[]).await.unwrap();
+            let actual = lix.query(sql).all().await.unwrap();
             assert_eq!(actual.rows().len(), initial.rows().len() + 1, "remote insertion must invalidate the warm listing");
             assert_eq!(actual.rows(), expected.rows(),
                 "settled local and authoritative ordered file cells must agree");
             let history_fetches = client.fetches.load(Ordering::SeqCst);
-            assert_eq!(lix.execute(&historical_sql, &[]).await.unwrap().rows(), historical.rows(),
+            assert_eq!(lix.query(&historical_sql).all().await.unwrap().rows(), historical.rows(),
                 "cached immutable history must survive unrelated descriptor advancement");
             assert_eq!(client.fetches.load(Ordering::SeqCst), history_fetches,
                 "already retained immutable inputs must remain locally readable");
             let fetched = client.fetches.load(Ordering::SeqCst);
             for _ in 0..3 {
-                assert_eq!(lix.execute(&historical_sql, &[]).await.unwrap().rows(), historical.rows());
-                assert_eq!(lix.execute(sql, &[]).await.unwrap().rows(), expected.rows());
+                assert_eq!(lix.query(&historical_sql).all().await.unwrap().rows(), historical.rows());
+                assert_eq!(lix.query(sql).all().await.unwrap().rows(), expected.rows());
             }
             assert_eq!(client.fetches.load(Ordering::SeqCst), fetched,
                 "valid warmed file listing must perform no native fetches");

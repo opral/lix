@@ -8,10 +8,7 @@ async fn observer_receives_prepared_current_basis_after_publication() {
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('resident','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('resident','before')")
             .await
             .unwrap();
         let server = open_lix()
@@ -103,10 +100,7 @@ async fn observer_receives_prepared_current_basis_after_publication() {
             .await
             .unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='after' WHERE key='resident'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='after' WHERE key='resident'")
             .await
             .unwrap();
         let wrapper = transport.partial_replica_descriptor(None).await.unwrap();

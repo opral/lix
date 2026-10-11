@@ -36,8 +36,7 @@ use lix::storage_adapter::StorageAdapter;
 use lix::storage_bench::diff_tracked_commits_for_bench;
 use lix::tracked_state::bench::seed_packed_history;
 use lix::{
-    CreateBranchOptions, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, Value,
+    CreateBranchOptions, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreviewOptions, Value,
 };
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
@@ -418,7 +417,7 @@ async fn setup<StorageImpl>(
     let seed_elapsed = seed_start.elapsed();
     let initial_checkpoint_start = Instant::now();
     let initial_checkpoint = session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("create tracked-working-diff initial checkpoint")
         .rows()[0]
@@ -442,10 +441,9 @@ async fn setup<StorageImpl>(
         .await
         .expect("load tracked-working-diff branch id");
     let head_commit_id = lix
-        .execute(
-            "SELECT commit_id FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id)],
-        )
+        .query("SELECT commit_id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id)])
+        .all()
         .await
         .expect("load tracked-working-diff branch head")
         .rows()
@@ -597,7 +595,7 @@ where
     assert!(before > 0, "fixture has no populated working diffs");
     let start = Instant::now();
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint populated working-diff fixture");
     let elapsed = start.elapsed();
@@ -642,7 +640,7 @@ async fn measure_merge_preview<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint merge-preview base");
     target
@@ -740,7 +738,7 @@ async fn measure_merge_commit<StorageImpl>(
     register_schema(&target).await;
     seed_rows(&target, row_count).await;
     target
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint merge-commit base");
 
@@ -862,8 +860,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register tracked-working-diff schema")
         .rows_affected();
@@ -874,7 +872,7 @@ async fn seed_rows<StorageImpl>(session: &Lix<StorageImpl>, row_count: usize)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin tracked-working-diff seed transaction");
@@ -893,7 +891,8 @@ where
             params.push(Value::Text("baseline".to_string()));
         }
         let affected = transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("seed tracked-working-diff rows")
             .rows_affected();
@@ -915,29 +914,25 @@ async fn update_commit<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let statements = (0..changes_per_commit)
-        .map(|offset| {
-            let row_index = match shape {
-                Shape::Repeated => offset,
-                Shape::Disjoint => (commit_index * changes_per_commit + offset) % row_count,
-            };
-            ExecuteBatchStatement {
-                label: None,
-                sql: "UPDATE working_diff_row SET value = $1 WHERE id = $2".to_string(),
-                params: vec![
-                    Value::Text(format!("commit-{commit_index:05}")),
-                    Value::Text(row_id(row_index)),
-                ],
-            }
-        })
-        .collect::<Vec<_>>();
-    let results = session
-        .execute_batch(&statements)
+    let param_sets = (0..changes_per_commit).map(|offset| {
+        let row_index = match shape {
+            Shape::Repeated => offset,
+            Shape::Disjoint => (commit_index * changes_per_commit + offset) % row_count,
+        };
+        [
+            Value::Text(format!("commit-{commit_index:05}")),
+            Value::Text(row_id(row_index)),
+        ]
+    });
+    let affected = session
+        .execute_many(
+            "UPDATE working_diff_row SET value = $1 WHERE id = $2",
+            param_sets,
+        )
         .await
-        .expect("update tracked-working-diff commit")
-        .results;
-    assert!(
-        results.iter().all(|result| result.rows_affected() == 1),
+        .expect("update tracked-working-diff commit");
+    assert_eq!(
+        affected as usize, changes_per_commit,
         "every working-diff update must affect exactly one row"
     );
 }
@@ -951,26 +946,22 @@ async fn update_commit_range<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let statements = (0..changes_per_commit)
-        .map(|offset| {
-            let row_index = row_offset + commit_index * changes_per_commit + offset;
-            ExecuteBatchStatement {
-                label: None,
-                sql: "UPDATE working_diff_row SET value = $1 WHERE id = $2".to_string(),
-                params: vec![
-                    Value::Text(format!("{value_prefix}-{commit_index:05}")),
-                    Value::Text(row_id(row_index)),
-                ],
-            }
-        })
-        .collect::<Vec<_>>();
-    let results = session
-        .execute_batch(&statements)
+    let param_sets = (0..changes_per_commit).map(|offset| {
+        let row_index = row_offset + commit_index * changes_per_commit + offset;
+        [
+            Value::Text(format!("{value_prefix}-{commit_index:05}")),
+            Value::Text(row_id(row_index)),
+        ]
+    });
+    let affected = session
+        .execute_many(
+            "UPDATE working_diff_row SET value = $1 WHERE id = $2",
+            param_sets,
+        )
         .await
-        .expect("update merge-preview rows")
-        .results;
-    assert!(
-        results.iter().all(|result| result.rows_affected() == 1),
+        .expect("update merge-preview rows");
+    assert_eq!(
+        affected as usize, changes_per_commit,
         "every merge-preview update must affect exactly one row"
     );
 }
@@ -981,17 +972,15 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let checkpoint = session
-        .execute(
-            "SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-            &[],
-        )
+        .query("SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
         .await
         .expect("query current working-diff checkpoint")
         .rows()[0]
         .get::<String>("commit_id")
         .expect("working-diff checkpoint ID");
     session
-        .execute(WORKING_DIFF_SQL, &[Value::Text(checkpoint)])
+        .execute(WORKING_DIFF_SQL)
+        .params(&[Value::Text(checkpoint)])
         .await
         .expect("query populated working diff")
         .len()

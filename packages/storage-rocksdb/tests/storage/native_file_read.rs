@@ -28,24 +28,22 @@ async fn public_file_read_works_with_rocksdb() {
         .execute(
             "INSERT INTO lix_file (id, path, content, lixcol_global) \
          VALUES ($1, $2, $3, true)",
-            &[
-                Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
-                Value::Text("/native/overlap.bin".to_owned()),
-                Value::Blob(b"global".to_vec().into()),
-            ],
         )
+        .params(&[
+            Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
+            Value::Text("/native/overlap.bin".to_owned()),
+            Value::Blob(b"global".to_vec().into()),
+        ])
         .await
         .expect("insert global overlap fixture");
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_owned()),
             Value::Text("/native/overlap.bin".to_owned()),
             Value::Blob(b"local".to_vec().into()),
-        ],
-    )
-    .await
-    .expect("insert local overlap fixture");
+        ])
+        .await
+        .expect("insert local overlap fixture");
     assert_file_content(&lix, "/native/overlap.bin", Some(b"local")).await;
 }
 
@@ -56,11 +54,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_owned()),
-            Value::Blob(content.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_owned()),
+        Value::Blob(content.to_vec().into()),
+    ])
     .await
     .expect("upsert file through SQL");
 }
@@ -70,10 +68,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("read file through SQL");
     let actual = result

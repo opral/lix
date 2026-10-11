@@ -1015,10 +1015,8 @@ impl FilesystemState {
                 }
                 needs_fresh_lix_read = true;
                 self.lix
-                    .execute(
-                        "DELETE FROM lix_file WHERE path = $1",
-                        &[Value::Text(path.clone())],
-                    )
+                    .execute("DELETE FROM lix_file WHERE path = $1")
+                    .params(&[Value::Text(path.clone())])
                     .await?;
             }
         }
@@ -1050,10 +1048,8 @@ impl FilesystemState {
             for path in directories_to_remove {
                 needs_fresh_lix_read = true;
                 self.lix
-                    .execute(
-                        "DELETE FROM lix_directory WHERE path = $1",
-                        &[Value::Text(path)],
-                    )
+                    .execute("DELETE FROM lix_directory WHERE path = $1")
+                    .params(&[Value::Text(path)])
                     .await?;
             }
         }
@@ -1075,8 +1071,8 @@ impl FilesystemState {
             self.lix
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-                    &[Value::Text(path)],
                 )
+                .params(&[Value::Text(path)])
                 .await?;
         }
 
@@ -1123,7 +1119,7 @@ impl FilesystemState {
                 params.push(Value::Text((*path).to_string()));
                 params.push(Value::Blob((*data).to_vec().into()));
             }
-            self.lix.execute(&sql, &params).await?;
+            self.lix.execute(&sql).params(&params).await?;
             start = end;
         }
         Ok(())
@@ -2531,10 +2527,9 @@ mod tests {
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         let result = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text(path.to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(path.to_string())])
+            .all()
             .await?;
         result
             .rows()
@@ -2554,8 +2549,8 @@ mod tests {
         lix.execute(
             "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[Value::Text(path.to_string()), Value::Blob(data.into())],
         )
+        .params(&[Value::Text(path.to_string()), Value::Blob(data.into())])
         .await?;
         Ok(())
     }
@@ -3015,10 +3010,8 @@ mod tests {
 
         state
             .lix
-            .execute(
-                "DELETE FROM lix_file WHERE path = $1",
-                &[Value::Text("/sql.txt".to_string())],
-            )
+            .execute("DELETE FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/sql.txt".to_string())])
             .await
             .unwrap();
         state.sync_disk_to_lix(true).await.unwrap();
@@ -3026,10 +3019,9 @@ mod tests {
         assert!(!tempdir.path().join("sql.txt").exists());
         let rows = state
             .lix
-            .execute(
-                "SELECT path FROM lix_file WHERE path = $1",
-                &[Value::Text("/sql.txt".to_string())],
-            )
+            .query("SELECT path FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/sql.txt".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.len(), 0);
@@ -3131,10 +3123,9 @@ mod tests {
         storage.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/tracked.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/tracked.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -3148,10 +3139,9 @@ mod tests {
         );
 
         let ignored = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/ignored.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/ignored.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -3183,10 +3173,9 @@ mod tests {
 
         let lix = open_lix().with_storage(storage).await.unwrap();
         let tracked = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/tracked.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/tracked.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(

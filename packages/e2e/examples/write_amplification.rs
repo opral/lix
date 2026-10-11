@@ -43,11 +43,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use lix::Value;
 use lix::open_lix;
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{layout_accounting, space_inventory};
-use lix::{ExecuteBatchStatement, Value};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -171,34 +171,28 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register json_pointer schema");
 
     let mut inserted = 0_usize;
     while inserted < rows {
         let chunk = seed_width.max(1).min(rows - inserted);
-        let statements = (inserted..inserted + chunk)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: SEED_SQL.to_owned(),
-                params: vec![
-                    Value::Text(format!("/fixture/path/{index:08}")),
-                    Value::Text(format!(
-                        "{{\"ordinal\":{index},\"payload\":\"row-{index:08}\"}}"
-                    )),
-                ],
-            })
-            .collect::<Vec<_>>();
         let affected = session
-            .execute_batch(&statements)
+            .execute_many(
+                SEED_SQL,
+                (inserted..inserted + chunk).map(|index| {
+                    [
+                        Value::Text(format!("/fixture/path/{index:08}")),
+                        Value::Text(format!(
+                            "{{\"ordinal\":{index},\"payload\":\"row-{index:08}\"}}"
+                        )),
+                    ]
+                }),
+            )
             .await
-            .expect("insert seed chunk")
-            .results
-            .iter()
-            .map(lix::ExecuteResult::rows_affected)
-            .sum::<u64>();
+            .expect("insert seed chunk");
         assert_eq!(affected as usize, chunk);
         inserted += chunk;
     }
@@ -228,21 +222,17 @@ async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, disti
 
     let mut applied = 0_usize;
     while applied < updates {
-        let statements = (applied..applied + width)
-            .map(|index| {
-                let target = index % distinct;
-                ExecuteBatchStatement {
-                    label: None,
-                    sql: UPDATE_SQL.to_owned(),
-                    params: vec![
+        session
+            .execute_many(
+                UPDATE_SQL,
+                (applied..applied + width).map(|index| {
+                    let target = index % distinct;
+                    [
                         Value::Text(format!("{{\"ordinal\":{target},\"revision\":{index}}}")),
                         Value::Text(format!("/fixture/path/{target:08}")),
-                    ],
-                }
-            })
-            .collect::<Vec<_>>();
-        session
-            .execute_batch(&statements)
+                    ]
+                }),
+            )
             .await
             .expect("apply update commit");
         applied += width;
@@ -271,10 +261,9 @@ async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
     // Warm the plan cache so the measurement is the read, not planning.
     for index in 0..distinct.min(16) {
         session
-            .execute(
-                READ_SQL,
-                &[Value::Text(format!("/fixture/path/{index:08}"))],
-            )
+            .query(READ_SQL)
+            .params(&[Value::Text(format!("/fixture/path/{index:08}"))])
+            .all()
             .await
             .expect("warm read");
     }
@@ -284,10 +273,9 @@ async fn read_rows<S: BenchStorage>(storage: S, reads: usize, distinct: usize) {
     for index in 0..reads {
         let target = index % distinct;
         let result = session
-            .execute(
-                READ_SQL,
-                &[Value::Text(format!("/fixture/path/{target:08}"))],
-            )
+            .query(READ_SQL)
+            .params(&[Value::Text(format!("/fixture/path/{target:08}"))])
+            .all()
             .await
             .expect("point read");
         rows_seen += result.len() as u64;

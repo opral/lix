@@ -12,11 +12,9 @@ async fn collection_census(
         "columns":[{"name":"id","type":"int8","nullable":false}],
         "primary_key":["id"]
     });
-    db.execute(
-        "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-        &[Value::Text(schema.to_string())],
-    )
-    .await?;
+    db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+        .params(&[Value::Text(schema.to_string())])
+        .await?;
     if mode == "empty_row_ref" {
         let schema = serde_json::json!({
             "$schema":"https://lix.dev/schema-v1.json", "key":"audit_empty_refs",
@@ -24,35 +22,34 @@ async fn collection_census(
                 {"name":"target","type":"row_ref","nullable":true}],
             "primary_key":["id"]
         });
-        db.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-            &[Value::Text(schema.to_string())],
-        )
-        .await?;
+        db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(schema.to_string())])
+            .await?;
     }
     for start in (0..n).step_by(1000) {
         let values = (start..(start + 1000).min(n))
             .map(|i| format!("({i})"))
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(&format!("INSERT INTO audit_plain(id) VALUES {values}"), &[])
+        db.execute(&format!("INSERT INTO audit_plain(id) VALUES {values}"))
             .await?;
     }
     let before = db
-        .execute("SELECT count(*) AS n FROM audit_plain", &[])
+        .query("SELECT count(*) AS n FROM audit_plain")
+        .all()
         .await?
         .rows()[0]
         .get::<i64>("n")?;
     assert_eq!(before, n as i64);
     let started = Instant::now();
     let (result, reads) =
-        measure_checkpoint_foreground(async { db.execute("DELETE FROM audit_plain", &[]).await })
-            .await;
+        measure_checkpoint_foreground(async { db.execute("DELETE FROM audit_plain").await }).await;
     let result = result?;
     let elapsed = started.elapsed();
     assert_eq!(result.rows_affected(), n as u64);
     let after = db
-        .execute("SELECT count(*) AS n FROM audit_plain", &[])
+        .query("SELECT count(*) AS n FROM audit_plain")
+        .all()
         .await?
         .rows()[0]
         .get::<i64>("n")?;

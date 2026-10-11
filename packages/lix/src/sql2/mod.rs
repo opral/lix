@@ -19,9 +19,11 @@ mod plan;
 mod planning_cache;
 mod providers;
 #[cfg(test)]
-pub(crate) use providers::{take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work};
-#[cfg(test)]
 pub(crate) use providers::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
+#[cfg(test)]
+pub(crate) use providers::{
+    take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work,
+};
 mod read_only;
 mod result_metadata;
 mod row_batch;
@@ -42,6 +44,15 @@ mod value_contract;
 mod write_normalization;
 
 pub(crate) use error::datafusion_error_to_lix_error;
+
+/// Whether `query()` accepts the statement: a bound read that calls no
+/// runtime function whose state persists.
+pub(crate) fn read_only_statement(statement: &datafusion::sql::parser::Statement) -> bool {
+    matches!(
+        bind_statement_route(statement),
+        Ok(BoundStatementRoute::Read)
+    ) && !statement_has_durable_runtime_function(statement)
+}
 
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
@@ -101,14 +112,12 @@ pub(crate) use planning_cache::{
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
-    ProviderSelection, read_provider_selection, register_read_table_functions,
-    register_write_read_relations,
-    execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
+    ProviderSelection, execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_exact_lix_file_size_batch_read,
-    execute_exact_schema_batch_read,
-    execute_exact_schema_point_read, execute_fast_lix_file_path_writes,
-    execute_fast_lix_file_prepared_path_write,
+    execute_exact_schema_batch_read, execute_exact_schema_point_read,
+    execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
+    read_provider_selection, register_read_table_functions, register_write_read_relations,
 };
 pub(crate) use result_metadata::result_column_type;
 pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
@@ -125,20 +134,17 @@ mod aggregate_statistics;
 pub(crate) use plan::read::execute_native_read;
 pub(crate) use plan::read::statement::ExactFilesystemRead;
 pub(crate) use plan::read::statement::{
-    exact_file_content_id_read, exact_file_content_id_uses_nonfull_content,
-    exact_filesystem_read_interest_route,
-    exact_filesystem_read_route,
-};
-pub(crate) use plan::read::statement::{
     ExactFileContentIdRead, LateLixFileProjection, NativeReadPlan, StatementReadPlan,
     is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read,
     plan_read_statement,
 };
+pub(crate) use plan::read::statement::{
+    exact_file_content_id_read, exact_file_content_id_uses_nonfull_content,
+    exact_filesystem_read_interest_route, exact_filesystem_read_route,
+};
 
 pub(crate) use providers::{
-    exact_id_file_content_interest, lix_file_content_scan_request,
-    prepare_native_diff_interest, validate_bounded_history_recipe_shape,
-    prepare_native_file_content_inputs,
-    prepare_native_file_content_interest,
-    prepare_native_file_metadata_interest,
+    exact_id_file_content_interest, lix_file_content_scan_request, prepare_native_diff_interest,
+    prepare_native_file_content_inputs, prepare_native_file_content_interest,
+    prepare_native_file_metadata_interest, validate_bounded_history_recipe_shape,
 };

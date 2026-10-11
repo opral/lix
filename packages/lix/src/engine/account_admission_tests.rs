@@ -169,22 +169,19 @@ async fn existing_account_admission_is_read_only_and_disabled_accounts_fail() {
     assert_eq!(counts.writes, 0);
     assert_eq!(counts.scans, 0);
     let rows = lix
-        .execute(
-            "SELECT name FROM lix_account WHERE id=$1",
-            &[crate::Value::Text(id.clone())],
-        )
+        .query("SELECT name FROM lix_account WHERE id=$1")
+        .params(&[crate::Value::Text(id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
         rows.rows()[0].get::<String>("name").unwrap(),
         "Original name"
     );
-    lix.execute(
-        "UPDATE lix_account SET status='disabled' WHERE id=$1",
-        &[crate::Value::Text(id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE lix_account SET status='disabled' WHERE id=$1")
+        .params(&[crate::Value::Text(id.clone())])
+        .await
+        .unwrap();
     store.reset();
     assert_eq!(
         lix.ensure_account(&id, "Name", "human")
@@ -275,7 +272,7 @@ async fn authenticated_account_admission_profile() {
                 } else {
                     format!("INSERT INTO lix_key_value (key,value,lixcol_global) VALUES {values}")
                 };
-                lix.execute(&sql, &[]).await.unwrap();
+                lix.execute(&sql).await.unwrap();
             }
             // Match the authority role that authenticated server handshakes use.
             let adapter = lix.storage_adapter();
@@ -320,10 +317,9 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
             "columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]});
         format!("(CAST('{}' AS JSONB),true)",schema)
     }).collect::<Vec<_>>().join(",");
-    lix.execute(
-        &format!("INSERT INTO lix_registered_schema (value,lixcol_global) VALUES {schemas}"),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_registered_schema (value,lixcol_global) VALUES {schemas}"
+    ))
     .await
     .unwrap();
     let global = lix
@@ -332,19 +328,13 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
         .await
         .unwrap();
     global
-        .execute(
-            "INSERT INTO account_scope_31 (id) VALUES ('global-before')",
-            &[],
-        )
+        .execute("INSERT INTO account_scope_31 (id) VALUES ('global-before')")
         .await
         .unwrap();
-    lix.execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",&[crate::Value::Text(serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"account_local_scope","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}).to_string())]).await.unwrap();
-    lix.execute(
-        "INSERT INTO account_local_scope(id) VALUES('local-before')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))").params(&[crate::Value::Text(serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"account_local_scope","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}).to_string())]).await.unwrap();
+    lix.execute("INSERT INTO account_local_scope(id) VALUES('local-before')")
+        .await
+        .unwrap();
     store.reset();
     let id = uuid::Uuid::now_v7().to_string();
     lix.ensure_account(&id, "bounded principal", "human")
@@ -357,29 +347,25 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
     );
     // A normal session still sees and validates the complete custom catalog.
     global
-        .execute(
-            "INSERT INTO account_scope_31 (id) VALUES ('custom-visible')",
-            &[],
-        )
+        .execute("INSERT INTO account_scope_31 (id) VALUES ('custom-visible')")
         .await
         .unwrap();
     assert_eq!(
         global
-            .execute("SELECT id FROM account_scope_31", &[])
+            .query("SELECT id FROM account_scope_31")
+            .all()
             .await
             .unwrap()
             .rows()
             .len(),
         2
     );
-    lix.execute(
-        "INSERT INTO account_local_scope(id) VALUES('local-after')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO account_local_scope(id) VALUES('local-after')")
+        .await
+        .unwrap();
     assert_eq!(
-        lix.execute("SELECT id FROM account_local_scope", &[])
+        lix.query("SELECT id FROM account_local_scope")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -396,7 +382,8 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
         .unwrap();
     assert_eq!(
         reopened
-            .execute("SELECT id FROM account_local_scope", &[])
+            .query("SELECT id FROM account_local_scope")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -405,7 +392,8 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
     );
     assert_eq!(
         global
-            .execute("SELECT id FROM account_scope_31", &[])
+            .query("SELECT id FROM account_scope_31")
+            .all()
             .await
             .unwrap()
             .rows()

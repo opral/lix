@@ -240,10 +240,7 @@ async fn changed_basis_recovery_prepares_previously_negative_scope() {
         .is_empty()
     );
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('future-recovery','arrived')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('future-recovery','arrived')")
         .await
         .unwrap();
     let (next, prepared) = recovery_candidate(&engine, &old, &authority).await;
@@ -543,10 +540,7 @@ async fn authority_recovery_replaces_conflicting_suffix_and_accepts_new_writes()
     };
     assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='authority-wins' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='authority-wins' WHERE key='resident'")
         .await
         .unwrap();
     let (next, prepared) = recovery_candidate_with_policy(

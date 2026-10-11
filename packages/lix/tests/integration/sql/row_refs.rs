@@ -1598,37 +1598,28 @@ simulation_test!(
             .await
             .unwrap();
         workspace
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-                &[Value::Blob(
+            .execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)").params(&[Value::Blob(
                     include_bytes!("../../fixtures/plugin-api/v2/plugin_csv.lixplugin")
                         .to_vec()
                         .into(),
-                )],
-            )
+                )])
             .await
             .unwrap();
         workspace
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-                &[Value::Blob(b"name,age\nAda,36\nGrace,37\n".to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+            .params(&[Value::Blob(b"name,age\nAda,36\nGrace,37\n".to_vec().into())])
             .await
             .unwrap();
         let value = row_ref_child_schema("rr_plugin_link", "cascade");
         workspace
-            .execute(
-                "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-                &[Value::Text(value.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(value.to_string())])
             .await
             .unwrap();
 
         let rows = workspace
-            .execute(
-                "SELECT id, lixcol_file_id FROM csv_row ORDER BY order_key",
-                &[],
-            )
+            .query("SELECT id, lixcol_file_id FROM csv_row ORDER BY order_key")
+            .all()
             .await
             .unwrap();
         assert!(
@@ -1639,10 +1630,7 @@ simulation_test!(
         let target_id = target.get::<String>("id").unwrap();
         let file_id = target.get::<String>("lixcol_file_id").unwrap();
         workspace
-            .execute(
-                "INSERT INTO rr_plugin_link(id,target) VALUES ('link', lix_row_ref('csv_row',$1,$2))",
-                &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
-            )
+            .execute("INSERT INTO rr_plugin_link(id,target) VALUES ('link', lix_row_ref('csv_row',$1,$2))").params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
             .await
             .unwrap();
 
@@ -1650,25 +1638,23 @@ simulation_test!(
         // as a generated state write. The row-reference cascade must consume
         // that generated deletion in the same publication.
         workspace
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
-                &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
-            )
+            .execute("UPDATE lix_file SET content = $1 WHERE path = '/people.csv'")
+            .params(&[Value::Blob(b"name,age\nAda,36\n".to_vec().into())])
             .await
             .unwrap();
         assert_rows_eq(
             workspace
-                .execute(
-                    "SELECT id FROM csv_row WHERE id = $1",
-                    &[Value::Text(target_id)],
-                )
+                .query("SELECT id FROM csv_row WHERE id = $1")
+                .params(&[Value::Text(target_id)])
+                .all()
                 .await
                 .unwrap(),
             vec![],
         );
         assert_rows_eq(
             workspace
-                .execute("SELECT id FROM rr_plugin_link", &[])
+                .query("SELECT id FROM rr_plugin_link")
+                .all()
                 .await
                 .unwrap(),
             vec![],
@@ -1743,33 +1729,31 @@ async fn assert_row_ref_plugin_file_delete(
         .execute(
             "INSERT INTO rr_plugin_file_delete_link(id,target) \
              VALUES ('link', lix_row_ref('csv_row',$1,$2))",
-            &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
         .await
         .unwrap();
 
     let delete = workspace
-        .execute(
-            "DELETE FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
+        .execute("DELETE FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file_id.clone())])
         .await;
     if expect_restriction {
         let error = delete.expect_err("no_action must block deleting a referenced file");
         assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
         assert_rows_eq(
             workspace
-                .execute("SELECT id FROM rr_plugin_file_delete_link", &[])
+                .query("SELECT id FROM rr_plugin_file_delete_link")
+                .all()
                 .await
                 .unwrap(),
             vec![vec![Value::Text("link".into())]],
         );
         assert_rows_eq(
             workspace
-                .execute(
-                    "SELECT id FROM csv_row WHERE id = $1",
-                    &[Value::Text(target_id.clone())],
-                )
+                .query("SELECT id FROM csv_row WHERE id = $1")
+                .params(&[Value::Text(target_id.clone())])
+                .all()
                 .await
                 .unwrap(),
             vec![vec![Value::Text(target_id)]],
@@ -1778,17 +1762,17 @@ async fn assert_row_ref_plugin_file_delete(
         delete.expect("cascade should allow deleting the file and remove its target");
         assert_rows_eq(
             workspace
-                .execute("SELECT id FROM rr_plugin_file_delete_link", &[])
+                .query("SELECT id FROM rr_plugin_file_delete_link")
+                .all()
                 .await
                 .unwrap(),
             Vec::<Vec<Value>>::new(),
         );
         assert_rows_eq(
             workspace
-                .execute(
-                    "SELECT id FROM csv_row WHERE id = $1",
-                    &[Value::Text(target_id)],
-                )
+                .query("SELECT id FROM csv_row WHERE id = $1")
+                .params(&[Value::Text(target_id)])
+                .all()
                 .await
                 .unwrap(),
             Vec::<Vec<Value>>::new(),
@@ -1808,39 +1792,30 @@ async fn open_row_ref_plugin_workspace(
         .await
         .unwrap();
     workspace
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-            &[Value::Blob(
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)").params(&[Value::Blob(
                 include_bytes!("../../fixtures/plugin-api/v2/plugin_csv.lixplugin")
                     .to_vec()
                     .into(),
-            )],
-        )
+            )])
         .await
         .unwrap();
     workspace
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-            &[Value::Blob(b"name,age\nAda,36\nGrace,37\n".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+        .params(&[Value::Blob(b"name,age\nAda,36\nGrace,37\n".to_vec().into())])
         .await
         .unwrap();
     if register_schema {
         let value = row_ref_child_schema(schema_key, on_delete);
         workspace
-            .execute(
-                "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-                &[Value::Text(value.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(value.to_string())])
             .await
             .unwrap();
     }
 
     let rows = workspace
-        .execute(
-            "SELECT id, lixcol_file_id FROM csv_row ORDER BY order_key",
-            &[],
-        )
+        .query("SELECT id, lixcol_file_id FROM csv_row ORDER BY order_key")
+        .all()
         .await
         .unwrap();
     assert!(rows.rows().len() >= 3, "the CSV plugin should produce rows");
@@ -1878,26 +1853,24 @@ async fn assert_row_ref_plugin_file_delete_merge(
         "INSERT INTO rr_plugin_merge_link(id,target) VALUES ('link', lix_row_ref('csv_row',$1,$2))";
     if deletion_on_destination {
         workspace
-            .execute(delete_sql, &[Value::Text(file_id.clone())])
+            .execute(delete_sql)
+            .params(&[Value::Text(file_id.clone())])
             .await
             .unwrap();
         source
-            .execute(
-                insert_sql,
-                &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
-            )
+            .execute(insert_sql)
+            .params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
             .await
             .unwrap();
     } else {
         source
-            .execute(delete_sql, &[Value::Text(file_id.clone())])
+            .execute(delete_sql)
+            .params(&[Value::Text(file_id.clone())])
             .await
             .unwrap();
         workspace
-            .execute(
-                insert_sql,
-                &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
-            )
+            .execute(insert_sql)
+            .params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
             .await
             .unwrap();
     }
@@ -1920,27 +1893,26 @@ async fn assert_row_ref_plugin_file_delete_merge(
         if deletion_on_destination {
             assert_rows_eq(
                 workspace
-                    .execute(
-                        "SELECT id FROM lix_file WHERE id = $1",
-                        &[Value::Text(file_id)],
-                    )
+                    .query("SELECT id FROM lix_file WHERE id = $1")
+                    .params(&[Value::Text(file_id)])
+                    .all()
                     .await
                     .unwrap(),
                 vec![],
             );
             assert_rows_eq(
                 workspace
-                    .execute("SELECT id FROM rr_plugin_merge_link", &[])
+                    .query("SELECT id FROM rr_plugin_merge_link")
+                    .all()
                     .await
                     .unwrap(),
                 vec![],
             );
             assert_rows_eq(
                 workspace
-                    .execute(
-                        "SELECT id FROM csv_row WHERE id = $1",
-                        &[Value::Text(target_id.clone())],
-                    )
+                    .query("SELECT id FROM csv_row WHERE id = $1")
+                    .params(&[Value::Text(target_id.clone())])
+                    .all()
                     .await
                     .unwrap(),
                 vec![],
@@ -1948,27 +1920,26 @@ async fn assert_row_ref_plugin_file_delete_merge(
         } else {
             assert_rows_eq(
                 workspace
-                    .execute(
-                        "SELECT id FROM lix_file WHERE id = $1",
-                        &[Value::Text(file_id.clone())],
-                    )
+                    .query("SELECT id FROM lix_file WHERE id = $1")
+                    .params(&[Value::Text(file_id.clone())])
+                    .all()
                     .await
                     .unwrap(),
                 vec![vec![Value::Text(file_id)]],
             );
             assert_rows_eq(
                 workspace
-                    .execute("SELECT id FROM rr_plugin_merge_link", &[])
+                    .query("SELECT id FROM rr_plugin_merge_link")
+                    .all()
                     .await
                     .unwrap(),
                 vec![vec![Value::Text("link".into())]],
             );
             assert_rows_eq(
                 workspace
-                    .execute(
-                        "SELECT id FROM csv_row WHERE id = $1",
-                        &[Value::Text(target_id.clone())],
-                    )
+                    .query("SELECT id FROM csv_row WHERE id = $1")
+                    .params(&[Value::Text(target_id.clone())])
+                    .all()
                     .await
                     .unwrap(),
                 vec![vec![Value::Text(target_id)]],
@@ -1986,17 +1957,17 @@ async fn assert_row_ref_plugin_file_delete_merge(
     assert_eq!(preview.change_stats, receipt.change_stats);
     assert_rows_eq(
         workspace
-            .execute(
-                "SELECT id FROM csv_row WHERE id = $1",
-                &[Value::Text(target_id)],
-            )
+            .query("SELECT id FROM csv_row WHERE id = $1")
+            .params(&[Value::Text(target_id)])
+            .all()
             .await
             .unwrap(),
         vec![],
     );
     assert_rows_eq(
         workspace
-            .execute("SELECT id FROM rr_plugin_merge_link", &[])
+            .query("SELECT id FROM rr_plugin_merge_link")
+            .all()
             .await
             .unwrap(),
         vec![],
@@ -2030,34 +2001,34 @@ async fn assert_row_ref_plugin_file_delete_merge_incoming_schema(
 
     if deletion_on_destination {
         workspace
-            .execute(delete_sql, &[Value::Text(file_id.clone())])
+            .execute(delete_sql)
+            .params(&[Value::Text(file_id.clone())])
             .await
             .unwrap();
         source
-            .execute(register_sql, &[Value::Text(schema_value.to_string())])
+            .execute(register_sql)
+            .params(&[Value::Text(schema_value.to_string())])
             .await
             .unwrap();
         source
-            .execute(
-                insert_sql,
-                &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
-            )
+            .execute(insert_sql)
+            .params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
             .await
             .unwrap();
     } else {
         source
-            .execute(delete_sql, &[Value::Text(file_id.clone())])
+            .execute(delete_sql)
+            .params(&[Value::Text(file_id.clone())])
             .await
             .unwrap();
         workspace
-            .execute(register_sql, &[Value::Text(schema_value.to_string())])
+            .execute(register_sql)
+            .params(&[Value::Text(schema_value.to_string())])
             .await
             .unwrap();
         workspace
-            .execute(
-                insert_sql,
-                &[Value::Text(file_id.clone()), Value::Text(target_id.clone())],
-            )
+            .execute(insert_sql)
+            .params(&[Value::Text(file_id.clone()), Value::Text(target_id.clone())])
             .await
             .unwrap();
     }
@@ -2077,17 +2048,17 @@ async fn assert_row_ref_plugin_file_delete_merge_incoming_schema(
     assert_eq!(preview.change_stats, receipt.change_stats);
     assert_rows_eq(
         workspace
-            .execute(
-                "SELECT id FROM csv_row WHERE id = $1",
-                &[Value::Text(target_id)],
-            )
+            .query("SELECT id FROM csv_row WHERE id = $1")
+            .params(&[Value::Text(target_id)])
+            .all()
             .await
             .unwrap(),
         vec![],
     );
     assert_rows_eq(
         workspace
-            .execute("SELECT id FROM rr_plugin_incoming_link", &[])
+            .query("SELECT id FROM rr_plugin_incoming_link")
+            .all()
             .await
             .unwrap(),
         vec![],

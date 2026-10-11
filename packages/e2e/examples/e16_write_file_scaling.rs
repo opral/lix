@@ -319,41 +319,35 @@ where
     let started = Instant::now();
     match shape {
         "insert_file_80line" => {
-            lix.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
+            lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&[
                     Value::Text(format!("/probe/big-{probe:05}.txt")),
                     Value::Blob(document(LINES_PER_FILE, probe).into()),
-                ],
-            )
-            .await
-            .expect("insert 80-line probe file");
+                ])
+                .await
+                .expect("insert 80-line probe file");
         }
         "insert_file_1line" => {
-            lix.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
+            lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&[
                     Value::Text(format!("/probe/small-{probe:05}.txt")),
                     Value::Blob(document(1, probe).into()),
-                ],
-            )
-            .await
-            .expect("insert 1-line probe file");
+                ])
+                .await
+                .expect("insert 1-line probe file");
         }
         "insert_10files_1txn" => {
-            let mut transaction = lix
+            let transaction = lix
                 .begin_transaction()
                 .await
                 .expect("begin write-scaling transaction");
             for offset in 0..10 {
                 transaction
-                    .execute(
-                        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                        &[
-                            Value::Text(format!("/probe/t1-{probe:05}-{offset:04}.txt")),
-                            Value::Blob(document(1, probe + offset).into()),
-                        ],
-                    )
+                    .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                    .params(&[
+                        Value::Text(format!("/probe/t1-{probe:05}-{offset:04}.txt")),
+                        Value::Blob(document(1, probe + offset).into()),
+                    ])
                     .await
                     .expect("stage write-scaling transaction row");
             }
@@ -364,15 +358,13 @@ where
         }
         "insert_10files_10txn" => {
             for offset in 0..10 {
-                lix.execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                    &[
+                lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                    .params(&[
                         Value::Text(format!("/probe/tN-{probe:05}-{offset:04}.txt")),
                         Value::Blob(document(1, probe + offset).into()),
-                    ],
-                )
-                .await
-                .expect("insert autocommit write-scaling row");
+                    ])
+                    .await
+                    .expect("insert autocommit write-scaling row");
             }
         }
         "insert_10files_1stmt" => {
@@ -382,25 +374,23 @@ where
             insert_many(lix, "b100", probe, 100).await;
         }
         "insert_root_file" => {
-            lix.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
+            lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&[
                     Value::Text(format!("/root-ins-{probe:05}.txt")),
                     Value::Blob(document(1, probe).into()),
-                ],
-            )
-            .await
-            .expect("insert root probe file");
+                ])
+                .await
+                .expect("insert root probe file");
         }
         "upsert_root_file" => {
             lix.execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Text(format!("/root-ups-{probe:05}.txt")),
-                    Value::Blob(document(1, probe).into()),
-                ],
             )
+            .params(&[
+                Value::Text(format!("/root-ups-{probe:05}.txt")),
+                Value::Blob(document(1, probe).into()),
+            ])
             .await
             .expect("upsert root probe file");
         }
@@ -409,11 +399,11 @@ where
             lix.execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Text(seed_path(target)),
-                    Value::Blob(document(1, probe).into()),
-                ],
             )
+            .params(&[
+                Value::Text(seed_path(target)),
+                Value::Blob(document(1, probe).into()),
+            ])
             .await
             .expect("upsert resident probe file");
         }
@@ -421,11 +411,11 @@ where
             lix.execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Text(format!("/probe/upsert-{probe:05}.txt")),
-                    Value::Blob(document(1, probe).into()),
-                ],
             )
+            .params(&[
+                Value::Text(format!("/probe/upsert-{probe:05}.txt")),
+                Value::Blob(document(1, probe).into()),
+            ])
             .await
             .expect("upsert 1-line probe file");
         }
@@ -434,26 +424,22 @@ where
             let target = probe % files.max(1);
             let mut body = document_string(LINES_PER_FILE, target);
             body.push_str(&format!("edit {probe}\n"));
-            lix.execute(
-                "UPDATE lix_file SET content = $2 WHERE path = $1",
-                &[
+            lix.execute("UPDATE lix_file SET content = $2 WHERE path = $1")
+                .params(&[
                     Value::Text(seed_path(target)),
                     Value::Blob(body.into_bytes().into()),
-                ],
-            )
-            .await
-            .expect("update resident probe file");
+                ])
+                .await
+                .expect("update resident probe file");
         }
         "key_value_write" => {
-            lix.execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
+            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))")
+                .params(&[
                     Value::Text(format!("e16-probe-{probe:05}")),
                     Value::Text(format!("\"{probe}\"")),
-                ],
-            )
-            .await
-            .expect("insert key-value probe row");
+                ])
+                .await
+                .expect("insert key-value probe row");
         }
         other => panic!("unknown probe shape {other}"),
     }
@@ -520,15 +506,13 @@ async fn install_text_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text("/.lix/plugins/plugin_text.lixplugin".to_owned()),
             Value::Blob(build_text_plugin_archive().into()),
-        ],
-    )
-    .await
-    .expect("install write-scaling text plugin");
+        ])
+        .await
+        .expect("install write-scaling text plugin");
 }
 
 async fn seed_files<StorageImpl>(lix: &Lix<StorageImpl>, files: usize)
@@ -550,7 +534,8 @@ where
             params.push(Value::Text(seed_path(index)));
             params.push(Value::Blob(document(LINES_PER_FILE, index).into()));
         }
-        lix.execute(&sql, &params)
+        lix.execute(&sql)
+            .params(&params)
             .await
             .expect("seed write-scaling files");
         written += batch;
@@ -574,7 +559,8 @@ where
         )));
         params.push(Value::Blob(document(1, probe + offset).into()));
     }
-    lix.execute(&sql, &params)
+    lix.execute(&sql)
+        .params(&params)
         .await
         .unwrap_or_else(|error| panic!("insert {count} probe files: {error:?}"));
 }

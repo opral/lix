@@ -1368,7 +1368,7 @@ mod ancestor_restore_tests {
     #[tokio::test]
     async fn file_restore_stops_at_unchanged_effective_target_directory() {
         let target = open_lix().await.unwrap();
-        target.execute("INSERT INTO lix_file(path,content) VALUES('/old/child/note.txt',CAST('base' AS BYTEA))", &[]).await.unwrap();
+        target.execute("INSERT INTO lix_file(path,content) VALUES('/old/child/note.txt',CAST('base' AS BYTEA))").await.unwrap();
         let branch = target
             .create_branch(CreateBranchOptions {
                 id: None,
@@ -1382,13 +1382,13 @@ mod ancestor_restore_tests {
             .with_branch(branch.id.clone())
             .await
             .unwrap();
-        source.execute("UPDATE lix_file SET content=CAST('restored' AS BYTEA) WHERE path='/old/child/note.txt'", &[]).await.unwrap();
+        source.execute("UPDATE lix_file SET content=CAST('restored' AS BYTEA) WHERE path='/old/child/note.txt'").await.unwrap();
         for sql in [
             "DELETE FROM lix_file WHERE path='/old/child/note.txt'",
             "UPDATE lix_directory SET path='/moved' WHERE path='/old/child'",
             "DELETE FROM lix_directory WHERE path='/old'",
         ] {
-            target.execute(sql, &[]).await.unwrap();
+            target.execute(sql).await.unwrap();
         }
         target
             .merge_branch(MergeBranchOptions {
@@ -1396,10 +1396,11 @@ mod ancestor_restore_tests {
             })
             .await
             .unwrap();
-        let restored = target.execute("SELECT id FROM lix_file WHERE path='/moved/note.txt' AND content=CAST('restored' AS BYTEA)", &[]).await.unwrap();
+        let restored = target.query("SELECT id FROM lix_file WHERE path='/moved/note.txt' AND content=CAST('restored' AS BYTEA)").all().await.unwrap();
         assert_eq!(restored.rows().len(), 1);
         let obsolete = target
-            .execute("SELECT id FROM lix_directory WHERE path='/old'", &[])
+            .query("SELECT id FROM lix_directory WHERE path='/old'")
+            .all()
             .await
             .unwrap();
         assert!(
@@ -1411,9 +1412,9 @@ mod ancestor_restore_tests {
     #[tokio::test]
     async fn incoming_directory_pick_retains_its_required_source_parent() {
         let target = open_lix().await.unwrap();
-        target.execute("INSERT INTO lix_file(path,content) VALUES('/old/child/note.txt',CAST('base' AS BYTEA))", &[]).await.unwrap();
+        target.execute("INSERT INTO lix_file(path,content) VALUES('/old/child/note.txt',CAST('base' AS BYTEA))").await.unwrap();
         target
-            .execute("INSERT INTO lix_directory(path) VALUES('/new')", &[])
+            .execute("INSERT INTO lix_directory(path) VALUES('/new')")
             .await
             .unwrap();
         let branch = target
@@ -1430,19 +1431,16 @@ mod ancestor_restore_tests {
             .await
             .unwrap();
         source
-            .execute(
-                "UPDATE lix_directory SET path='/new/child' WHERE path='/old/child'",
-                &[],
-            )
+            .execute("UPDATE lix_directory SET path='/new/child' WHERE path='/old/child'")
             .await
             .unwrap();
-        source.execute("UPDATE lix_file SET content=CAST('restored' AS BYTEA) WHERE path='/new/child/note.txt'", &[]).await.unwrap();
+        source.execute("UPDATE lix_file SET content=CAST('restored' AS BYTEA) WHERE path='/new/child/note.txt'").await.unwrap();
         target
-            .execute("DELETE FROM lix_file WHERE path='/old/child/note.txt'", &[])
+            .execute("DELETE FROM lix_file WHERE path='/old/child/note.txt'")
             .await
             .unwrap();
         target
-            .execute("DELETE FROM lix_directory WHERE path='/new'", &[])
+            .execute("DELETE FROM lix_directory WHERE path='/new'")
             .await
             .unwrap();
         target
@@ -1451,7 +1449,7 @@ mod ancestor_restore_tests {
             })
             .await
             .unwrap();
-        let restored = target.execute("SELECT id FROM lix_file WHERE path='/new/child/note.txt' AND content=CAST('restored' AS BYTEA)", &[]).await.unwrap();
+        let restored = target.query("SELECT id FROM lix_file WHERE path='/new/child/note.txt' AND content=CAST('restored' AS BYTEA)").all().await.unwrap();
         assert_eq!(restored.rows().len(), 1);
     }
 }

@@ -78,7 +78,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let r = lix
-        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .query("SELECT lix_active_branch_commit_id()")
+        .all()
         .await
         .expect("active commit");
     match &r.rows()[0].values()[0] {
@@ -119,7 +120,10 @@ async fn seed(
             params.push(Value::Blob(payload_for(i + k, file_bytes).into()));
         }
         sql.push_str(" ON CONFLICT (path) DO UPDATE SET content = excluded.content");
-        lix.execute(&sql, &params).await.expect("probe insert");
+        lix.execute(&sql)
+            .params(&params)
+            .await
+            .expect("probe insert");
         i += n;
     }
 
@@ -130,11 +134,11 @@ async fn seed(
         lix.execute(
             "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Text(edit_path.to_string()),
-                Value::Blob(body.clone().into()),
-            ],
         )
+        .params(&[
+            Value::Text(edit_path.to_string()),
+            Value::Blob(body.clone().into()),
+        ])
         .await
         .expect("probe edit");
     }
@@ -167,7 +171,7 @@ async fn timed(
     let mut rows = 0;
     for _ in 0..samples {
         let t = Instant::now();
-        let result = lix.execute(sql, params).await.expect("probe query");
+        let result = lix.execute(sql).params(params).await.expect("probe query");
         d.push(t.elapsed());
         rows = result.rows().len();
     }
@@ -196,10 +200,9 @@ async fn history_files_at_fixed_commits() {
 
         let head = active_commit(&lix).await;
         let file_id: String = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1",
-                &[Value::Text(probe_path.clone())],
-            )
+            .query("SELECT id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(probe_path.clone())])
+            .all()
             .await
             .expect("probe file id")
             .rows()[0]
@@ -264,10 +267,9 @@ async fn history_member_scan_census() {
 
         let head = active_commit(&lix).await;
         let file_id: String = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1",
-                &[Value::Text(probe_path.clone())],
-            )
+            .query("SELECT id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(probe_path.clone())])
+            .all()
             .await
             .expect("probe file id")
             .rows()[0]
@@ -290,12 +292,14 @@ async fn history_member_scan_census() {
             // Warm the caches, then clear the census so the reported numbers
             // belong to one steady-state read.
             let _ = lix
-                .execute(sql, &[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .execute(sql)
+                .params(&[Value::Text(head.clone()), Value::Text(arg.clone())])
                 .await
                 .expect("warm probe query");
             let _ = lix::storage_bench::take_commit_delta_member_scan_census();
             let rows = lix
-                .execute(sql, &[Value::Text(head.clone()), Value::Text(arg.clone())])
+                .execute(sql)
+                .params(&[Value::Text(head.clone()), Value::Text(arg.clone())])
                 .await
                 .expect("probe query")
                 .rows()
@@ -335,12 +339,16 @@ async fn history_path_filter_latency() {
         );
         let params = [Value::Text(head.clone()), Value::Text(probe_path.clone())];
         let _ = lix
-            .execute(&by_path, &params)
+            .query(&by_path)
+            .params(&params)
+            .all()
             .await
             .expect("warm probe query");
         let started = Instant::now();
         let rows = lix
-            .execute(&by_path, &params)
+            .query(&by_path)
+            .params(&params)
+            .all()
             .await
             .expect("probe query")
             .rows()
@@ -383,21 +391,20 @@ async fn history_commits_at_fixed_files() {
             lix.execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Text(noise_path.clone()),
-                    Value::Blob(noise.clone().into()),
-                ],
             )
+            .params(&[
+                Value::Text(noise_path.clone()),
+                Value::Blob(noise.clone().into()),
+            ])
             .await
             .expect("noise commit");
         }
 
         let head = active_commit(&lix).await;
         let file_id: String = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1",
-                &[Value::Text(probe_path.clone())],
-            )
+            .query("SELECT id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(probe_path.clone())])
+            .all()
             .await
             .expect("probe file id")
             .rows()[0]
@@ -470,7 +477,9 @@ async fn history_commits_at_fixed_files() {
             let projection = "SELECT id, coalesce(to_path, from_path) AS path, lixcol_position, lixcol_to_commit_id \
                               FROM lix_history('lix_file', $1)";
             let all = lix
-                .execute(projection, &[Value::Text(head.clone())])
+                .query(projection)
+                .params(&[Value::Text(head.clone())])
+                .all()
                 .await
                 .expect("unfiltered history");
             for target in [&probe_path, &noise_path] {
@@ -481,10 +490,10 @@ async fn history_commits_at_fixed_files() {
                     .map(row_key)
                     .collect();
                 let actual: BTreeSet<String> = lix
-                    .execute(
-                        &format!("{projection} WHERE coalesce(to_path, from_path) = $2"),
-                        &[Value::Text(head.clone()), Value::Text(target.clone())],
-                    )
+                    .execute(&format!(
+                        "{projection} WHERE coalesce(to_path, from_path) = $2"
+                    ))
+                    .params(&[Value::Text(head.clone()), Value::Text(target.clone())])
                     .await
                     .expect("filtered history")
                     .rows()

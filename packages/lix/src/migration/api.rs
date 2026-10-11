@@ -2212,7 +2212,6 @@ mod tests {
             .unwrap();
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('migration-chronology-head', 'rooted')",
-            &[],
         )
         .await
         .unwrap();
@@ -2220,7 +2219,6 @@ mod tests {
             "INSERT INTO lix_file (id, path) VALUES \
              ('01920000-0000-7000-8000-0000000000a1', '/migration-a'), \
              ('01920000-0000-7000-8000-0000000000a2', '/migration-b')",
-            &[],
         )
         .await
         .unwrap();
@@ -2228,7 +2226,6 @@ mod tests {
             "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES \
              ('migration-shared-pk', 'a', '01920000-0000-7000-8000-0000000000a1'), \
              ('migration-shared-pk', 'b', '01920000-0000-7000-8000-0000000000a2')",
-            &[],
         )
         .await
         .unwrap();

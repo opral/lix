@@ -129,15 +129,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let _ = options.idempotency_key;
-        let execution = Lix::execute(self, sql, params);
-        let execution = match options.max_auto_commit_retries {
-            Some(limit) => execution.with_max_auto_commit_retries(limit),
-            None => execution,
-        };
-        match options.origin_key {
-            Some(origin_key) => execution.with_origin_key(origin_key).await,
-            None => execution.await,
+        // The JS surface still takes reads and writes through one call; run
+        // it as a read and fall back to a write when the engine says so.
+        match Lix::query(self, sql).params(params).all().await {
+            Err(error) if error.code == LixError::CODE_READ_ONLY => {}
+            result => return result.map(Into::into),
         }
+        let mut execution = Lix::execute(self, sql).params(params);
+        if let Some(limit) = options.max_auto_commit_retries {
+            execution = execution.with_max_auto_commit_retries(limit);
+        }
+        if let Some(origin_key) = options.origin_key {
+            execution = execution.with_origin_key(origin_key);
+        }
+        execution.await
     }
 
     async fn execute_batch(
@@ -145,15 +150,41 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError> {
-        let execution = Lix::execute_batch(self, statements);
-        let execution = match options.max_auto_commit_retries {
-            Some(limit) => execution.with_max_auto_commit_retries(limit),
-            None => execution,
-        };
-        match options.origin_key {
-            Some(origin_key) => execution.with_origin_key(origin_key).await,
-            None => execution.await,
+        // Atomic multi-statement batches run as one transaction.
+        let _ = options.max_auto_commit_retries;
+        let transaction = Lix::begin_transaction(self).await?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let read = transaction
+                .query(&statement.sql)
+                .params(&statement.params)
+                .all()
+                .await;
+            let result = match read {
+                Err(error) if error.code == LixError::CODE_READ_ONLY => {
+                    let mut execution = transaction
+                        .execute(&statement.sql)
+                        .params(&statement.params);
+                    if let Some(origin_key) = &options.origin_key {
+                        execution = execution.with_origin_key(origin_key.clone());
+                    }
+                    execution.await
+                }
+                read => read.map(Into::into),
+            };
+            match result {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
         }
+        let receipt = transaction.commit().await?;
+        Ok(lix::ExecuteBatchResult {
+            results,
+            commit: receipt.commit,
+        })
     }
 
     async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
@@ -227,11 +258,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> TransactionOperations
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let transaction = self.as_mut().ok_or_else(transaction_closed_error)?;
-        let execution = transaction.execute(sql, params);
-        match options.origin_key {
-            Some(origin_key) => execution.with_origin_key(origin_key).await,
-            None => execution.await,
+        match transaction.query(sql).params(params).all().await {
+            Err(error) if error.code == LixError::CODE_READ_ONLY => {}
+            result => return result.map(Into::into),
         }
+        let mut execution = transaction.execute(sql).params(params);
+        if let Some(origin_key) = options.origin_key {
+            execution = execution.with_origin_key(origin_key);
+        }
+        execution.await
     }
 
     async fn commit(&mut self) -> Result<lix::CommitReceipt, LixError> {

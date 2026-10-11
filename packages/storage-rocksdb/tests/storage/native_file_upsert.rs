@@ -1,7 +1,7 @@
 //! RocksDB coverage for public SQL file writes and atomic batches.
 
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, GLOBAL_BRANCH_ID, Lix, Value, open_lix};
+use lix::{GLOBAL_BRANCH_ID, Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
 #[tokio::test]
@@ -60,24 +60,22 @@ async fn public_file_upsert_works_with_rocksdb() {
         .execute(
             "INSERT INTO lix_file (id, path, content, lixcol_global) \
          VALUES ($1, $2, $3, true)",
-            &[
-                Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
-                Value::Text("/native/overlap.bin".to_owned()),
-                Value::Blob(b"g".to_vec().into()),
-            ],
         )
+        .params(&[
+            Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
+            Value::Text("/native/overlap.bin".to_owned()),
+            Value::Blob(b"g".to_vec().into()),
+        ])
         .await
         .expect("insert global overlap fixture");
-    lix.execute(
-        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-        &[
+    lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_owned()),
             Value::Text("/native/overlap.bin".to_owned()),
             Value::Blob(b"l".to_vec().into()),
-        ],
-    )
-    .await
-    .expect("insert active overlap fixture");
+        ])
+        .await
+        .expect("insert active overlap fixture");
     execute_file_batch(
         &lix,
         &[
@@ -98,45 +96,37 @@ async fn upsert_file<S>(lix: &Lix<S>, path: &str, content: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        UPSERT_SQL,
-        &[
+    lix.execute(UPSERT_SQL)
+        .params(&[
             Value::Text(path.to_owned()),
             Value::Blob(content.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("upsert file through SQL");
+        ])
+        .await
+        .expect("upsert file through SQL");
 }
 
-async fn execute_file_batch<S>(
-    lix: &Lix<S>,
-    files: &[(&str, &[u8])],
-) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
+async fn execute_file_batch<S>(lix: &Lix<S>, files: &[(&str, &[u8])]) -> Result<u64, lix::LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let statements = files
-        .iter()
-        .map(|(path, content)| ExecuteBatchStatement {
-            sql: UPSERT_SQL.to_owned(),
-            params: vec![
+    lix.execute_many(
+        UPSERT_SQL,
+        files.iter().map(|(path, content)| {
+            [
                 Value::Text((*path).to_owned()),
                 Value::Blob((*content).to_vec().into()),
-            ],
-            label: None,
-        })
-        .collect::<Vec<_>>();
-    lix.execute_batch(&statements)
-        .await
-        .map(|batch| batch.results)
+            ]
+        }),
+    )
+    .await
 }
 
 async fn active_branch_commit_id<S>(lix: &Lix<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+    lix.query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .expect("read active branch commit id")
         .rows()[0]
@@ -150,10 +140,9 @@ where
 {
     let head = active_branch_commit_id(lix).await;
     let result = lix
-        .execute(
-            "SELECT parent_commit_ids ->> 0 AS parent_id FROM lix_commit WHERE id = $1",
-            &[Value::Text(head)],
-        )
+        .query("SELECT parent_commit_ids ->> 0 AS parent_id FROM lix_commit WHERE id = $1")
+        .params(&[Value::Text(head)])
+        .all()
         .await
         .expect("read first commit parent");
     assert_eq!(result.rows().len(), 1);
@@ -170,10 +159,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("read file absence");
     assert!(result.rows().is_empty());
@@ -184,10 +172,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("read file");
     assert_eq!(
@@ -203,10 +190,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE id = $1",
-            &[Value::Text(id.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(id.to_owned())])
+        .all()
         .await
         .expect("read branch file");
     assert_eq!(

@@ -139,22 +139,19 @@ async fn synthetic_markdown_path_versus_id_probe() {
             ));
         }
         authority
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file (path, content) VALUES {}",
-                    values.join(",")
-                ),
-                &params,
-            )
+            .execute(&format!(
+                "INSERT INTO lix_file (path, content) VALUES {}",
+                values.join(",")
+            ))
+            .params(&params)
             .await
             .unwrap();
     }
     let target_path = "/docs/file-123.md";
     let row = authority
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(target_path.into())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(target_path.into())])
+        .all()
         .await
         .unwrap();
     target_id.push_str(&row.rows()[0].get::<String>("id").unwrap());
@@ -366,7 +363,7 @@ async fn attached_snapshot_file_open_probe() {
         .await
         .unwrap();
     let sql = format!("SELECT content FROM lix_file WHERE id = '{file_id}'");
-    let expected = authority.execute(&sql, &[]).await.unwrap().rows()[0]
+    let expected = authority.query(&sql).all().await.unwrap().rows()[0]
         .get::<Vec<u8>>("content")
         .unwrap();
     for mode in ["object", "operation"] {
@@ -501,11 +498,11 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
     authority
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ('/target.bin', $1), ('/other.bin', $2)",
-            &[
-                Value::Blob(vec![17; 140_000].into()),
-                Value::Blob(vec![23; 1024 * 1024].into()),
-            ],
         )
+        .params(&[
+            Value::Blob(vec![17; 140_000].into()),
+            Value::Blob(vec![23; 1024 * 1024].into()),
+        ])
         .await
         .unwrap();
     // Keep the cold fixture's plugin dependency explicit and in a separate
@@ -595,7 +592,7 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
     log.lock().unwrap().clear();
     let sql = "SELECT content FROM lix_file WHERE path = '/target.bin'";
     assert_eq!(
-        replica.execute(sql, &[]).await.unwrap().rows()[0]
+        replica.query(sql).all().await.unwrap().rows()[0]
             .get::<Vec<u8>>("content")
             .unwrap(),
         vec![17; 140_000]
@@ -619,7 +616,7 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
     );
     log.lock().unwrap().clear();
     assert_eq!(
-        replica.execute(sql, &[]).await.unwrap().rows()[0]
+        replica.query(sql).all().await.unwrap().rows()[0]
             .get::<Vec<u8>>("content")
             .unwrap(),
         vec![17; 140_000]
@@ -629,10 +626,8 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
         "warm read must work without network"
     );
     replica
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/target.bin'",
-            &[Value::Blob(b"local pending edit".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/target.bin'")
+        .params(&[Value::Blob(b"local pending edit".to_vec().into())])
         .await
         .unwrap();
     authority_execute(
@@ -644,14 +639,15 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
     .await;
     assert!(
         replica
-            .execute("SELECT id FROM lix_file WHERE path = '/absent.bin'", &[])
+            .query("SELECT id FROM lix_file WHERE path = '/absent.bin'")
+            .all()
             .await
             .unwrap()
             .rows()
             .is_empty()
     );
     assert_eq!(
-        replica.execute(sql, &[]).await.unwrap().rows()[0]
+        replica.query(sql).all().await.unwrap().rows()[0]
             .get::<Vec<u8>>("content")
             .unwrap(),
         b"local pending edit"

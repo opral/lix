@@ -65,15 +65,12 @@ async fn register<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S>) {
             schema_sql(CHILD, &child_columns, Some(("parent_id", PARENT)), global),
             schema_sql(ITEM, &format!("{ID_COLUMN},{VALUE_COLUMN}"), None, global),
         ] {
-            lix.execute(&sql, &[]).await.unwrap();
+            lix.execute(&sql).await.unwrap();
         }
     }
-    lix.execute(
-        &format!(
-            "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/eci-a'), ('{FILE_B}','/eci-b')"
-        ),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/eci-a'), ('{FILE_B}','/eci-b')"
+    ))
     .await
     .unwrap();
 }
@@ -97,14 +94,11 @@ async fn insert_item<S: Storage + Clone + Send + Sync + 'static>(
     untracked: bool,
     global: bool,
 ) -> Result<(), LixError> {
-    lix.execute(
-        &format!(
-            "INSERT INTO {ITEM} (id, value, lixcol_file_id, lixcol_untracked, lixcol_global) \
+    lix.execute(&format!(
+        "INSERT INTO {ITEM} (id, value, lixcol_file_id, lixcol_untracked, lixcol_global) \
              VALUES ('{id}', '{value}', {}, {untracked}, {global})",
-            file_sql(file_id)
-        ),
-        &[],
-    )
+        file_sql(file_id)
+    ))
     .await
     .map(drop)
 }
@@ -114,13 +108,11 @@ async fn items<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
 ) -> Vec<(String, String, Option<String>, bool, bool)> {
     let result = lix
-        .execute(
-            &format!(
-                "SELECT id, value, lixcol_file_id, lixcol_untracked, lixcol_global FROM {ITEM} \
+        .query(&format!(
+            "SELECT id, value, lixcol_file_id, lixcol_untracked, lixcol_global FROM {ITEM} \
                  ORDER BY id, lixcol_file_id"
-            ),
-            &[],
-        )
+        ))
+        .all()
         .await
         .unwrap();
     result
@@ -173,9 +165,9 @@ async fn first_import_into_empty_collections_skips_identity_reads() {
     for (round, offset) in [0, 300].into_iter().enumerate() {
         let (parents, children) = import(offset);
         stats(&lix).await;
-        let mut transaction = lix.begin_transaction().await.unwrap();
-        transaction.execute(&parents, &[]).await.unwrap();
-        transaction.execute(&children, &[]).await.unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
+        transaction.execute(&parents).await.unwrap();
+        transaction.execute(&children).await.unwrap();
         transaction.commit().await.unwrap();
         let (probes, empty_collections) = stats(&lix).await;
         if round == 0 {
@@ -186,22 +178,22 @@ async fn first_import_into_empty_collections_skips_identity_reads() {
     }
     for (schema, expected) in [(PARENT, 600), (CHILD, 600)] {
         let result = lix
-            .execute(&format!("SELECT COUNT(*) AS n FROM {schema}"), &[])
+            .query(&format!("SELECT COUNT(*) AS n FROM {schema}"))
+            .all()
             .await
             .unwrap();
         assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected);
     }
     // A duplicate in the same shape is still rejected by the full check.
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute(&format!("INSERT INTO {PARENT} (id) VALUES ('p9999')"), &[])
+        .execute(&format!("INSERT INTO {PARENT} (id) VALUES ('p9999')"))
         .await
         .unwrap();
     transaction
-        .execute(
-            &format!("INSERT INTO {CHILD} (id, parent_id) VALUES ('c0001', 'p9999')"),
-            &[],
-        )
+        .execute(&format!(
+            "INSERT INTO {CHILD} (id, parent_id) VALUES ('c0001', 'p9999')"
+        ))
         .await
         .unwrap();
     let error = transaction.commit().await.unwrap_err();
@@ -318,10 +310,9 @@ async fn first_file_scoped_import_into_an_empty_schema_skips_identity_reads() {
         .map(|index| format!("('f{index:03}', 'v', '{FILE_A}')"))
         .collect::<Vec<_>>()
         .join(", ");
-    lix.execute(
-        &format!("INSERT INTO {ITEM} (id, value, lixcol_file_id) VALUES {values}"),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO {ITEM} (id, value, lixcol_file_id) VALUES {values}"
+    ))
     .await
     .unwrap();
     assert_eq!(stats(&lix).await, (0, 1));
@@ -409,13 +400,10 @@ async fn insert_child<S: Storage + Clone + Send + Sync + 'static>(
     parent_id: &str,
     untracked: bool,
 ) -> Result<(), LixError> {
-    lix.execute(
-        &format!(
-            "INSERT INTO {CHILD} (id, parent_id, lixcol_untracked) \
+    lix.execute(&format!(
+        "INSERT INTO {CHILD} (id, parent_id, lixcol_untracked) \
              VALUES ('{id}', '{parent_id}', {untracked})"
-        ),
-        &[],
-    )
+    ))
     .await
     .map(drop)
 }
@@ -425,10 +413,10 @@ async fn children<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
 ) -> Vec<(String, String, bool)> {
     let result = lix
-        .execute(
-            &format!("SELECT id, parent_id, lixcol_untracked FROM {CHILD} ORDER BY id"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT id, parent_id, lixcol_untracked FROM {CHILD} ORDER BY id"
+        ))
+        .all()
         .await
         .unwrap();
     result
@@ -451,21 +439,15 @@ async fn children<S: Storage + Clone + Send + Sync + 'static>(
 #[tokio::test]
 async fn tombstoned_identities_can_be_inserted_again() {
     let lix = open().await;
-    lix.execute(
-        &format!("INSERT INTO {PARENT} (id) VALUES ('p1'), ('p2')"),
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute(&format!("INSERT INTO {PARENT} (id) VALUES ('p1'), ('p2')"))
+        .await
+        .unwrap();
     for id in ["c1", "c2"] {
         insert_child(&lix, id, "p1", false).await.unwrap();
     }
-    lix.execute(
-        &format!("DELETE FROM {CHILD} WHERE id IN ('c1', 'c2')"),
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute(&format!("DELETE FROM {CHILD} WHERE id IN ('c1', 'c2')"))
+        .await
+        .unwrap();
     stats(&lix).await;
     insert_child(&lix, "c1", "p2", false).await.unwrap();
     assert_eq!(stats(&lix).await, (0, 1));
@@ -482,9 +464,7 @@ async fn tombstoned_identities_can_be_inserted_again() {
             .await
             .unwrap();
     }
-    lix.execute(&format!("DELETE FROM {ITEM}"), &[])
-        .await
-        .unwrap();
+    lix.execute(&format!("DELETE FROM {ITEM}")).await.unwrap();
     stats(&lix).await;
     insert_item(&lix, "f1", "second", Some(FILE_A), false, false)
         .await
@@ -621,19 +601,18 @@ async fn concurrent_insert_racing_the_commit_is_not_overwritten() {
             .await
             .unwrap();
         register(&lix).await;
-        lix.execute(&format!("INSERT INTO {PARENT} (id) VALUES ('p1')"), &[])
+        lix.execute(&format!("INSERT INTO {PARENT} (id) VALUES ('p1')"))
             .await
             .unwrap();
         *storage.branch_id.lock().unwrap() = lix.active_branch_id().await.unwrap();
         stats(&lix).await;
         let racer = crate::open_lix().with_storage(memory).await.unwrap();
 
-        let mut transaction = lix.begin_transaction().await.unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
         transaction
-            .execute(
-                &format!("INSERT INTO {CHILD} (id, parent_id) VALUES ('c1', 'p1')"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO {CHILD} (id, parent_id) VALUES ('c1', 'p1')"
+            ))
             .await
             .unwrap();
         let racer_id = racing_id.to_owned();

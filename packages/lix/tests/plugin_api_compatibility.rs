@@ -21,25 +21,22 @@ async fn archive_edits_merges_and_reopens(archive: &[u8]) {
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-        &[Value::Blob(archive.to_vec().into())],
     )
+    .params(&[Value::Blob(archive.to_vec().into())])
     .await
     .unwrap();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-        &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+        .params(&[Value::Blob(b"name,age\nAda,36\n".to_vec().into())])
+        .await
+        .unwrap();
     // Both detection and a subsequent file update must call the frozen guest.
-    lix.execute(
-        "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
-        &[Value::Blob(b"name,age\nAda,37\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE lix_file SET content = $1 WHERE path = '/people.csv'")
+        .params(&[Value::Blob(b"name,age\nAda,37\n".to_vec().into())])
+        .await
+        .unwrap();
     let rows = lix
-        .execute("SELECT id FROM csv_row ORDER BY order_key", &[])
+        .query("SELECT id FROM csv_row ORDER BY order_key")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.rows().len(), 2);
@@ -58,37 +55,31 @@ async fn archive_edits_merges_and_reopens(archive: &[u8]) {
     })
     .await
     .unwrap();
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2")
+        .params(&[
             Value::Jsonb(serde_json::json!(["Ada Lovelace", "37"]).into()),
             id.clone(),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.switch_branch(SwitchBranchOptions { branch_id: main })
         .await
         .unwrap();
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2")
+        .params(&[
             Value::Jsonb(serde_json::json!(["Ada", "38"]).into()),
             id.clone(),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: draft.id,
     })
     .await
     .unwrap();
     let file = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -103,20 +94,16 @@ async fn archive_edits_merges_and_reopens(archive: &[u8]) {
         .await
         .unwrap();
     reopened
-        .execute(
-            "UPDATE csv_row SET cells = $1 WHERE id = $2",
-            &[
-                Value::Jsonb(serde_json::json!(["Ada Lovelace", "39"]).into()),
-                id,
-            ],
-        )
+        .execute("UPDATE csv_row SET cells = $1 WHERE id = $2")
+        .params(&[
+            Value::Jsonb(serde_json::json!(["Ada Lovelace", "39"]).into()),
+            id,
+        ])
         .await
         .unwrap();
     let file = reopened
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -139,28 +126,24 @@ async fn owned_plugin_upgrade_amends_descriptions_and_rejects_incompatible_schem
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-        &[Value::Blob(archive.to_vec().into())],
     )
+    .params(&[Value::Blob(archive.to_vec().into())])
     .await
     .unwrap();
     let content = Value::Blob(b"name,age\nAda,36\n".to_vec().into());
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-        std::slice::from_ref(&content),
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+        .params(std::slice::from_ref(&content))
+        .await
+        .unwrap();
     lix.execute(
         "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-        &[Value::Blob(upgraded.clone().into())],
     )
+    .params(&[Value::Blob(upgraded.clone().into())])
     .await
     .expect("a documentation-only upgrade must preserve the owned file");
     let definition = lix
-        .execute(
-            "SELECT value FROM lix_registered_schema WHERE schema_key = 'csv_row'",
-            &[],
-        )
+        .query("SELECT value FROM lix_registered_schema WHERE schema_key = 'csv_row'")
+        .all()
         .await
         .unwrap();
     let Value::Jsonb(definition) = &definition.rows()[0].values()[0] else {
@@ -174,15 +157,13 @@ async fn owned_plugin_upgrade_amends_descriptions_and_rejects_incompatible_schem
     );
     lix.execute(
         "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-        &[Value::Blob(incompatible.into())],
     )
+    .params(&[Value::Blob(incompatible.into())])
     .await
     .expect_err("changing the cells type must reject the upgrade");
     let installed = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -190,10 +171,8 @@ async fn owned_plugin_upgrade_amends_descriptions_and_rejects_incompatible_schem
         Value::Blob(upgraded.into())
     );
     let file = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(file.rows()[0].values()[0], content);
@@ -207,10 +186,8 @@ async fn owned_plugin_upgrade_amends_descriptions_and_rejects_incompatible_schem
     // The accepted generation must remain usable after an incompatible attempt
     // and reopening, not merely leave the materialized bytes readable.
     reopened
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
-            &[Value::Blob(b"name,age\nAda,37\n".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/people.csv'")
+        .params(&[Value::Blob(b"name,age\nAda,37\n".to_vec().into())])
         .await
         .unwrap();
     reopened.close().await.unwrap();
@@ -251,16 +228,10 @@ async fn schema_only_plugin_upgrade_materializes_added_column_defaults_once() {
         "columns": [{"name": "id", "type": "text", "nullable": false}],
         "primary_key": ["id"]
     });
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_amendment.lixplugin', $1)",
-        &[Value::Blob(schema_only_archive(&schema).into())],
-    ).await.unwrap();
-    lix.execute(
-        "INSERT INTO plugin_amendment_note (id) VALUES ('existing')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_amendment.lixplugin', $1)").params(&[Value::Blob(schema_only_archive(&schema).into())]).await.unwrap();
+    lix.execute("INSERT INTO plugin_amendment_note (id) VALUES ('existing')")
+        .await
+        .unwrap();
     schema["columns"].as_array_mut().unwrap().extend([
         serde_json::json!({"name": "optional", "type": "text", "nullable": true}),
         serde_json::json!({"name": "label", "type": "text", "nullable": false, "default_value": "new"}),
@@ -268,15 +239,13 @@ async fn schema_only_plugin_upgrade_materializes_added_column_defaults_once() {
     ]);
     lix.execute(
         "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_amendment.lixplugin'",
-        &[Value::Blob(schema_only_archive(&schema).into())],
     )
+    .params(&[Value::Blob(schema_only_archive(&schema).into())])
     .await
     .expect("compatible added columns should materialize defaults for existing rows");
     let result = lix
-        .execute(
-            "SELECT optional, label, generated FROM plugin_amendment_note WHERE id = 'existing'",
-            &[],
-        )
+        .query("SELECT optional, label, generated FROM plugin_amendment_note WHERE id = 'existing'")
+        .all()
         .await
         .unwrap();
     let values = result.rows()[0].values().to_vec();
@@ -291,10 +260,8 @@ async fn schema_only_plugin_upgrade_materializes_added_column_defaults_once() {
         .await
         .unwrap();
     let result = reopened
-        .execute(
-            "SELECT optional, label, generated FROM plugin_amendment_note WHERE id = 'existing'",
-            &[],
-        )
+        .query("SELECT optional, label, generated FROM plugin_amendment_note WHERE id = 'existing'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -337,54 +304,49 @@ async fn edit_after_plugin_upgrade_in_same_transaction(semantic: bool) {
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-        &[Value::Blob(
-            include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
-                .to_vec()
-                .into(),
-        )],
     )
+    .params(&[Value::Blob(
+        include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
+            .to_vec()
+            .into(),
+    )])
     .await
     .unwrap();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-        &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+        .params(&[Value::Blob(b"name,age\nAda,36\n".to_vec().into())])
+        .await
+        .unwrap();
     let rows = lix
-        .execute("SELECT id FROM csv_row ORDER BY order_key", &[])
+        .query("SELECT id FROM csv_row ORDER BY order_key")
+        .all()
         .await
         .unwrap();
     let id = rows.rows()[1].values()[0].clone();
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
         .execute(
             "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-            &[Value::Blob(
-                include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
-                    .to_vec()
-                    .into(),
-            )],
         )
+        .params(&[Value::Blob(
+            include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
+                .to_vec()
+                .into(),
+        )])
         .await
         .unwrap();
     let content = Value::Blob(b"name,age\nAda,37\n".to_vec().into());
     if semantic {
         transaction
-            .execute(
-                "UPDATE csv_row SET cells = $1 WHERE id = $2",
-                &[Value::Jsonb(serde_json::json!(["Ada", "37"]).into()), id],
-            )
+            .execute("UPDATE csv_row SET cells = $1 WHERE id = $2")
+            .params(&[Value::Jsonb(serde_json::json!(["Ada", "37"]).into()), id])
             .await
             .expect("semantic writes must use the staged plugin schema");
     } else {
         // The upgrade preserves the bytes visible inside this transaction.
         // This read must not publish an uncommitted session observation.
         let observed = transaction
-            .execute(
-                "SELECT content FROM lix_file WHERE path = '/people.csv'",
-                &[],
-            )
+            .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+            .all()
             .await
             .expect("read exact bytes under the staged plugin generation");
         assert_eq!(
@@ -392,18 +354,14 @@ async fn edit_after_plugin_upgrade_in_same_transaction(semantic: bool) {
             Value::Blob(b"name,age\nAda,36\n".to_vec().into())
         );
         transaction
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
-                std::slice::from_ref(&content),
-            )
+            .execute("UPDATE lix_file SET content = $1 WHERE path = '/people.csv'")
+            .params(std::slice::from_ref(&content))
             .await
             .expect("file writes must use the staged plugin schema");
     }
     let file = transaction
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(file.rows()[0].values()[0], content);
@@ -416,10 +374,8 @@ async fn edit_after_plugin_upgrade_in_same_transaction(semantic: bool) {
         .await
         .unwrap();
     let file = reopened
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(file.rows()[0].values()[0], content);
@@ -431,58 +387,51 @@ async fn plugin_upgrade_does_not_bridge_an_observation_before_another_sessions_e
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
-        &[Value::Blob(
-            include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
-                .to_vec()
-                .into(),
-        )],
     )
+    .params(&[Value::Blob(
+        include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
+            .to_vec()
+            .into(),
+    )])
     .await
     .unwrap();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
-        &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = '/people.csv'",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)")
+        .params(&[Value::Blob(b"name,age\nAda,36\n".to_vec().into())])
+        .await
+        .unwrap();
+    lix.query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
     let rows = other
-        .execute("SELECT id FROM csv_row ORDER BY order_key", &[])
+        .query("SELECT id FROM csv_row ORDER BY order_key")
+        .all()
         .await
         .unwrap();
     other
-        .execute(
-            "UPDATE csv_row SET cells = $1 WHERE id = $2",
-            &[
-                Value::Jsonb(serde_json::json!(["Ada", "38"]).into()),
-                rows.rows()[1].values()[0].clone(),
-            ],
-        )
+        .execute("UPDATE csv_row SET cells = $1 WHERE id = $2")
+        .params(&[
+            Value::Jsonb(serde_json::json!(["Ada", "38"]).into()),
+            rows.rows()[1].values()[0].clone(),
+        ])
         .await
         .unwrap();
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
         .execute(
             "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-            &[Value::Blob(
-                include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
-                    .to_vec()
-                    .into(),
-            )],
         )
+        .params(&[Value::Blob(
+            include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
+                .to_vec()
+                .into(),
+        )])
         .await
         .unwrap();
     let error = transaction
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
-            &[Value::Blob(b"name,age\nAda,37\n".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/people.csv'")
+        .params(&[Value::Blob(b"name,age\nAda,37\n".to_vec().into())])
         .await
         .expect_err(
             "own plugin upgrade must not authorize stale bytes over another session's edit",
@@ -490,10 +439,8 @@ async fn plugin_upgrade_does_not_bridge_an_observation_before_another_sessions_e
     assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
     transaction.rollback().await.unwrap();
     let file = other
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/people.csv'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/people.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(

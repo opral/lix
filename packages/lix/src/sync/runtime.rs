@@ -2987,14 +2987,12 @@ mod tests {
     ) {
         let authority = open_lix().await.expect("authority opens");
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('history-a', 'a')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('history-a', 'a')")
             .await
             .expect("first history commit");
         let parent = authority
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("parent head")
             .rows()[0]
@@ -3002,13 +3000,11 @@ mod tests {
             .expect("parent id");
         for index in 0..commits_after_parent {
             authority
-                .execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                    &[
-                        Value::Text(format!("history-{index}")),
-                        Value::Text(index.to_string()),
-                    ],
-                )
+                .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+                .params(&[
+                    Value::Text(format!("history-{index}")),
+                    Value::Text(index.to_string()),
+                ])
                 .await
                 .expect("extend history fixture");
         }
@@ -3065,7 +3061,8 @@ mod tests {
             boundaries: Vec::new(),
         };
         let all_commit_ids = authority
-            .execute("SELECT id FROM lix_commit", &[])
+            .query("SELECT id FROM lix_commit")
+            .all()
             .await
             .expect("authority commit ids")
             .rows()
@@ -3286,18 +3283,17 @@ mod tests {
         let authority = open_lix().await.expect("authority opens");
         for index in 0..32 {
             authority
-                .execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                    &[
-                        Value::Text(format!("deep-{index}")),
-                        Value::Text(index.to_string()),
-                    ],
-                )
+                .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+                .params(&[
+                    Value::Text(format!("deep-{index}")),
+                    Value::Text(index.to_string()),
+                ])
                 .await
                 .expect("extend deep history");
         }
         let head = authority
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("read deep head")
             .rows()[0]
@@ -4066,10 +4062,9 @@ mod tests {
         let (replica, parent, head, commits, commit_headers, history_boundaries, boundary_rows) =
             history_fixture().await;
         let error = replica
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-                &[Value::Text(parent.clone()), Value::Text(head.clone())],
-            )
+            .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+            .params(&[Value::Text(parent.clone()), Value::Text(head.clone())])
+            .all()
             .await
             .expect_err("deferred parent must demand history");
         assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED", "{error:?}");
@@ -4149,10 +4144,9 @@ mod tests {
         );
 
         replica
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-                &[Value::Text(parent), Value::Text(head)],
-            )
+            .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+            .params(&[Value::Text(parent), Value::Text(head)])
+            .all()
             .await
             .expect("same SQL succeeds after history hydration");
     }
@@ -4297,10 +4291,9 @@ mod tests {
             "sync history publication must wait behind read quiescence",
         );
         let error = replica
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-                &[Value::Text(parent.clone()), Value::Text(head.clone())],
-            )
+            .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+            .params(&[Value::Text(parent.clone()), Value::Text(head.clone())])
+            .all()
             .await
             .expect_err("history remains deferred while publication is gated");
         assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");
@@ -4313,10 +4306,9 @@ mod tests {
             .expect("history demand response arrives")
             .expect("history demand succeeds");
         replica
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-                &[Value::Text(parent), Value::Text(head)],
-            )
+            .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+            .params(&[Value::Text(parent), Value::Text(head)])
+            .all()
             .await
             .expect("history read succeeds after serialized publication");
     }
@@ -4453,7 +4445,6 @@ mod tests {
         replica
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('rejected-local-work', 'keep me')",
-                &[],
             )
             .await
             .unwrap();
@@ -4487,10 +4478,8 @@ mod tests {
         );
         assert_eq!(
             replica
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'rejected-local-work'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'rejected-local-work'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -4629,7 +4618,8 @@ mod tests {
                    LEFT JOIN lix_history('lix_file') AS history \
                      ON history.lixcol_to_commit_id = checkpoint.commit_id WHERE checkpoint.is_checkpoint";
         let mut error = replica
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect_err("the sparse graph boundary is initially absent");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND, "{error:?}");
@@ -4663,7 +4653,7 @@ mod tests {
             };
             let (retry_result, _hydration_result) = tokio::join!(hydrate, serve);
             retry_result.expect("shared retry accepts the graph miss");
-            match replica.execute(sql, &[]).await {
+            match replica.query(sql).all().await {
                 Ok(_) => break,
                 Err(next) => error = next,
             }
@@ -4699,7 +4689,8 @@ mod tests {
         drop(read);
 
         replica
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect("Atelier History query reconstructs from hydrated cold commits");
     }
@@ -4764,15 +4755,14 @@ mod tests {
     async fn explicit_transaction_surfaces_structured_history_demand() {
         let (replica, parent, head, _commits, _commit_headers, _history_boundaries, _boundary_rows) =
             history_fixture().await;
-        let mut transaction = replica
+        let transaction = replica
             .begin_transaction()
             .await
             .expect("transaction begins");
         let error = transaction
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-                &[Value::Text(parent.clone()), Value::Text(head)],
-            )
+            .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+            .params(&[Value::Text(parent.clone()), Value::Text(head)])
+            .all()
             .await
             .expect_err("explicit transactions do not retry against a pinned snapshot");
         assert_eq!(error.code, "LIX_SYNC_HISTORY_REQUIRED");

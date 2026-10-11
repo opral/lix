@@ -218,16 +218,14 @@ async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin commit");
+    let transaction = session.begin_transaction().await.expect("begin commit");
     for index in 0..rows {
         transaction
-            .execute(
-                "INSERT INTO e53_locality (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text(format!("/row/{batch:08}/{index:08}")),
-                    Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
-                ],
-            )
+            .execute("INSERT INTO e53_locality (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text(format!("/row/{batch:08}/{index:08}")),
+                Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
+            ])
             .await
             .expect("insert row");
     }
@@ -248,10 +246,7 @@ where
         "primary_key": ["path"],
     });
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register schema");
 }

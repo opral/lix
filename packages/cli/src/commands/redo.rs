@@ -11,7 +11,7 @@ pub fn run(context: &AppContext, command: RedoCommand) -> Result<CommandOutput, 
         crate::db::block_on(lix.switch_branch(lix::SwitchBranchOptions { branch_id }))
             .map_err(|error| CliError::msg(error.to_string()))?;
     }
-    let result = crate::db::block_on(lix.execute("SELECT commit_id FROM lix_redo()", &[]))
+    let result = crate::db::block_on(lix.execute("SELECT commit_id FROM lix_redo()"))
         .map_err(|error| CliError::msg(error.to_string()))?;
     let commit_id = result
         .rows()

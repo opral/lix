@@ -47,21 +47,22 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
     let lix = open_lix().with_storage(memory.clone()).await.unwrap();
     write_file(&lix, "/history.txt", b"before gc").await;
     let file_id = lix
-        .execute("SELECT id FROM lix_file WHERE path = '/history.txt'", &[])
+        .query("SELECT id FROM lix_file WHERE path = '/history.txt'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("id")
         .unwrap();
     let historical_checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     write_file(&lix, "/history.txt", b"after gc").await;
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
 
@@ -79,11 +80,12 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
     );
 
     let history = lix
-        .execute(
+        .query(
             "SELECT content FROM lix_as_of('lix_file', $1) \
              WHERE id = $2",
-            &[Value::Text(historical_checkpoint), Value::Text(file_id)],
         )
+        .params(&[Value::Text(historical_checkpoint), Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -110,13 +112,10 @@ async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases()
         })
         .await
         .unwrap();
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
-        &[],
-    )
-    .await
-    .unwrap();
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("DELETE FROM lix_file WHERE path = '/.lix/plugins/plugin_csv.lixplugin'")
+        .await
+        .unwrap();
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     collect_repository_gc_for_bench(&storage).await.unwrap();
@@ -127,12 +126,10 @@ async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases()
             .is_some()
     );
 
-    lix.execute(
-        "DELETE FROM lix_branch WHERE id = $1",
-        &[Value::Text(branch.id)],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch.id)])
+        .await
+        .unwrap();
     collect_repository_gc_for_bench(&storage).await.unwrap();
     assert!(
         read_binary_cas_for_bench(&storage, &wasm_hash)
@@ -157,11 +154,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_owned()),
-            Value::Blob(content.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_owned()),
+        Value::Blob(content.to_vec().into()),
+    ])
     .await
     .unwrap();
 }
@@ -170,13 +167,12 @@ async fn read_file<S>(lix: &lix::Lix<S>, path: &str) -> Vec<u8>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .unwrap()
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .unwrap()
+        .rows()[0]
         .get("content")
         .unwrap()
 }

@@ -14,22 +14,36 @@ async fn checkpoint_creates_canonical_zettel_conversation() {
             "children": [{"_type": "zettel_span", "_key": "summary", "text": "Changed validation to reject malformed rows; retries still use the old policy.", "marks": []}]
         }]
     });
-    let checkpoint = lix.execute(
-        "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
-        &[Value::Text("Validate imports".into()), Value::Jsonb(body.clone().into())],
-    ).await.expect("described checkpoint succeeds");
+    let checkpoint = lix
+        .execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)")
+        .params(&[
+            Value::Text("Validate imports".into()),
+            Value::Jsonb(body.clone().into()),
+        ])
+        .await
+        .expect("described checkpoint succeeds");
     let commit_id = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
-    let rows = lix.execute(
-        "SELECT l.conversation_id, c.title, m.body
+    let rows = lix
+        .query(
+            "SELECT l.conversation_id, c.title, m.body
          FROM lix_log() AS l
          JOIN lix_conversation AS c ON c.id = l.conversation_id
          JOIN lix_comment AS m ON m.conversation_id = c.id
          WHERE l.commit_id = $1 AND l.is_checkpoint",
-        &[Value::Text(commit_id)],
-    ).await.expect("checkpoint conversation is readable through log");
+        )
+        .params(&[Value::Text(commit_id)])
+        .all()
+        .await
+        .expect("checkpoint conversation is readable through log");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows.rows()[0].get::<String>("title").unwrap(), "Validate imports");
-    assert_eq!(rows.rows()[0].get::<Value>("body").unwrap(), Value::Jsonb(body.into()));
+    assert_eq!(
+        rows.rows()[0].get::<String>("title").unwrap(),
+        "Validate imports"
+    );
+    assert_eq!(
+        rows.rows()[0].get::<Value>("body").unwrap(),
+        Value::Jsonb(body.into())
+    );
     lix.close().await.expect("repository closes");
 }
 
@@ -37,37 +51,38 @@ async fn checkpoint_creates_canonical_zettel_conversation() {
 async fn checkpoints_example_sql_contract() {
     let lix = crate::open_lix().await.expect("example repository opens");
     let root_commit_id = lix
-        .execute("SELECT lix_root_commit_id() AS commit_id", &[])
+        .query("SELECT lix_root_commit_id() AS commit_id")
+        .all()
         .await
         .expect("repository root should resolve")
         .rows()[0]
         .get::<String>("commit_id")
         .expect("root commit ID should decode");
 
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[
             Value::Text("checkpoint-demo".to_string()),
             Value::Text("draft".to_string()),
-        ],
-    )
-    .await
-    .expect("example tracked write succeeds");
+        ])
+        .await
+        .expect("example tracked write succeeds");
 
     let head_commit_id = lix
-        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .expect("active head should resolve")
         .rows()[0]
         .get::<String>("commit_id")
         .expect("active head commit ID should decode");
     let working_diffs = lix
-        .execute(
+        .query(
             "SELECT key, diff_type
              FROM lix_diff('lix_key_value', $1, $2)
              ORDER BY key",
-            &[Value::Text(root_commit_id), Value::Text(head_commit_id)],
         )
+        .params(&[Value::Text(root_commit_id), Value::Text(head_commit_id)])
+        .all()
         .await
         .expect("example working diff query succeeds");
     assert_eq!(working_diffs.len(), 1);
@@ -89,12 +104,12 @@ async fn checkpoints_example_sql_contract() {
         .await
         .expect("example checkpoint succeeds");
     let checkpoints = lix
-        .execute(
+        .query(
             "SELECT commit_id, position
              FROM lix_log() WHERE is_checkpoint
              ORDER BY position",
-            &[],
         )
+        .all()
         .await
         .expect("example checkpoint history query succeeds");
     assert_eq!(
@@ -111,13 +126,12 @@ async fn checkpoints_example_sql_contract() {
     );
 
     let remaining = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_diff('lix_key_value', $1, $2)",
-            &[
-                Value::Text(checkpoint.commit_id.clone()),
-                Value::Text(checkpoint.commit_id),
-            ],
-        )
+        .query("SELECT COUNT(*) AS count FROM lix_diff('lix_key_value', $1, $2)")
+        .params(&[
+            Value::Text(checkpoint.commit_id.clone()),
+            Value::Text(checkpoint.commit_id),
+        ])
+        .all()
         .await
         .expect("example final working diff query succeeds");
     assert_eq!(
@@ -447,7 +461,10 @@ simulation_test!(
             .await
             .expect("baseline rows should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -565,7 +582,10 @@ simulation_test!(scoped_checkpoint_closes_file_path_swaps, |sim| async move {
         .await
         .expect("baseline files should insert");
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            &[],
+        )
         .await
         .expect("baseline checkpoint should succeed");
 
@@ -626,7 +646,10 @@ simulation_test!(
             .await
             .expect("same names in different directories should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -688,7 +711,10 @@ simulation_test!(
             .await
             .expect("nested file should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -863,7 +889,10 @@ simulation_test!(
             .await
             .expect("child should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -922,7 +951,10 @@ simulation_test!(
             .expect("working row should insert");
         let head_before_empty = select_rows(&session, "SELECT lix_active_branch_commit_id()").await;
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[])", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY[])",
+                &[],
+            )
             .await
             .expect_err("empty scoped checkpoint is rejected");
         assert_eq!(
@@ -936,7 +968,10 @@ simulation_test!(
             .await
             .expect("transaction opens");
         rolled_back
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("checkpoint may stage in transaction");
         rolled_back.rollback().await.expect("rollback succeeds");
@@ -958,7 +993,10 @@ simulation_test!(
             .await
             .expect("tracked write should stage");
         let error = write_then_checkpoint
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect_err("checkpoint planning cannot ignore an earlier staged write");
         assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -972,11 +1010,17 @@ simulation_test!(
             .await
             .expect("transaction opens");
         committed
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect("first checkpoint stages");
         let duplicate = committed
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+                &[],
+            )
             .await
             .expect_err("one transaction cannot publish two checkpoints");
         assert_eq!(duplicate.code, "LIX_INVALID_TRANSACTION_STATE");

@@ -26,33 +26,26 @@ async fn main() -> Result<(), LixError> {
         serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_ref_parent","columns":[{"name":"id","type":"int8","nullable":false}],"primary_key":["id"]}),
         serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_ref_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"target","type":"row_ref","nullable":false}],"primary_key":["id"],"row_refs":[{"column":"target","on_delete":"cascade"}]}),
     ] {
-        db.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-            &[Value::Text(schema.to_string())],
-        )
-        .await?;
+        db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(schema.to_string())])
+            .await?;
     }
     let files = [
         "01920000-0000-7000-8000-0000000000a1",
         "01920000-0000-7000-8000-0000000000a2",
     ];
-    db.execute(
-        "INSERT INTO lix_file(id,path) VALUES ($1,'/a'),($2,'/b')",
-        &[Value::Text(files[0].into()), Value::Text(files[1].into())],
-    )
-    .await?;
-    db.execute(
-        "INSERT INTO bench_ref_parent(id,lixcol_file_id) VALUES (1,$1),(1,$2)",
-        &[Value::Text(files[0].into()), Value::Text(files[1].into())],
-    )
-    .await?;
+    db.execute("INSERT INTO lix_file(id,path) VALUES ($1,'/a'),($2,'/b')")
+        .params(&[Value::Text(files[0].into()), Value::Text(files[1].into())])
+        .await?;
+    db.execute("INSERT INTO bench_ref_parent(id,lixcol_file_id) VALUES (1,$1),(1,$2)")
+        .params(&[Value::Text(files[0].into()), Value::Text(files[1].into())])
+        .await?;
     let mut targets = Vec::new();
     for file in files {
         let result = db
-            .execute(
-                "SELECT lix_row_ref('bench_ref_parent',$1,1) AS reference",
-                &[Value::Text(file.into())],
-            )
+            .query("SELECT lix_row_ref('bench_ref_parent',$1,1) AS reference")
+            .params(&[Value::Text(file.into())])
+            .all()
             .await?;
         let reference = result.rows()[0].get::<lix::RowRef>("reference")?;
         targets.push(Value::Text(reference.as_str().to_owned()));
@@ -63,10 +56,10 @@ async fn main() -> Result<(), LixError> {
                 .map(|id| format!("({id},$1,'{}')", files[1]))
                 .collect::<Vec<_>>()
                 .join(",");
-            db.execute(
-                &format!("INSERT INTO bench_ref_child(id,target,lixcol_file_id) VALUES {values}"),
-                std::slice::from_ref(target),
-            )
+            db.execute(&format!(
+                "INSERT INTO bench_ref_child(id,target,lixcol_file_id) VALUES {values}"
+            ))
+            .params(std::slice::from_ref(target))
             .await?;
         }
     }
@@ -80,17 +73,16 @@ async fn main() -> Result<(), LixError> {
         writeln!(control, "enable").unwrap();
     }
     let started = Instant::now();
-    db.execute(
-        "DELETE FROM bench_ref_parent WHERE id=1 AND lixcol_file_id=$1",
-        &[Value::Text(files[0].into())],
-    )
-    .await?;
+    db.execute("DELETE FROM bench_ref_parent WHERE id=1 AND lixcol_file_id=$1")
+        .params(&[Value::Text(files[0].into())])
+        .await?;
     let elapsed = started.elapsed();
     if let Some(control) = &mut perf_control {
         writeln!(control, "disable").unwrap();
     }
     let remaining = db
-        .execute("SELECT count(*) AS n FROM bench_ref_child", &[])
+        .query("SELECT count(*) AS n FROM bench_ref_child")
+        .all()
         .await?
         .rows()[0]
         .get::<i64>("n")?;

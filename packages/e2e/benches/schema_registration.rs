@@ -50,10 +50,7 @@ fn schema_registration(c: &mut Criterion) {
                 black_box(
                     runtime
                         .block_on(async {
-                            lix.execute(
-                                "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
-                                &[schema_v1()],
-                            )
+                            lix.execute("INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)").params(&[schema_v1()])
                             .await
                         })
                         .unwrap(),

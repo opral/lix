@@ -438,7 +438,7 @@ async fn probe_partial_checkpoint(
     }
     let started = std::time::Instant::now();
     let checkpoint = selected
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await;
     let checkpoint = match checkpoint {
         Ok(result) => {
@@ -514,10 +514,9 @@ async fn probe_partial_checkpoint(
         .await
         .unwrap();
     let row = selected
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(target.to_owned())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(target.to_owned())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -553,10 +552,9 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
             .collect::<Vec<_>>()
             .join(",");
         source
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .unwrap();
         let branch_id = if root_backed {
@@ -634,10 +632,9 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
         let parameters = [Value::Text(target.clone())];
         trace.lock().unwrap().phase = "point-read";
         preparing
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = $1",
-                &parameters,
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&parameters)
+            .all()
             .await
             .unwrap();
         trace.lock().unwrap().phase = "write-spine";
@@ -676,13 +673,11 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
         drop(spine_read);
         trace.lock().unwrap().phase = "update";
         preparing
-            .execute(
-                "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                &[
-                    Value::Text(target.clone()),
-                    Value::Text("after-0".to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_key_value SET value = $2 WHERE key = $1")
+            .params(&[
+                Value::Text(target.clone()),
+                Value::Text("after-0".to_owned()),
+            ])
             .await
             .unwrap();
         trace.lock().unwrap().phase = "close";
@@ -824,22 +819,19 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
         for step in 0..3 {
             let updated_value = format!("after-{step}");
             local
-                .execute(
-                    "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                    &[
-                        Value::Text(target.clone()),
-                        Value::Text(updated_value.clone()),
-                    ],
-                )
+                .execute("UPDATE lix_key_value SET value = $2 WHERE key = $1")
+                .params(&[
+                    Value::Text(target.clone()),
+                    Value::Text(updated_value.clone()),
+                ])
                 .await
                 .unwrap_or_else(|error| {
                     panic!("prepared partial native SQL update {step} failed: {error}")
                 });
             let result = local
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = $1",
-                    &parameters,
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = $1")
+                .params(&parameters)
+                .all()
                 .await
                 .unwrap();
             assert_eq!(result.rows().len(), 1);
@@ -943,10 +935,10 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
             .await
             .unwrap();
         let authority_rows = authority_selected
-            .execute(
+            .query(
                 "SELECT key, value FROM lix_key_value WHERE key LIKE 'partial-sql-%' ORDER BY key",
-                &[],
             )
+            .all()
             .await
             .unwrap();
         assert_eq!(authority_rows.rows().len(), row_count);
@@ -1034,10 +1026,10 @@ async fn run_prepared_sql_dependency_case(root_backed: bool) {
             .await
             .unwrap();
         let rows = verifier
-            .execute(
+            .query(
                 "SELECT key, value FROM lix_key_value WHERE key LIKE 'partial-sql-%' ORDER BY key",
-                &[],
             )
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.rows().len(), row_count);

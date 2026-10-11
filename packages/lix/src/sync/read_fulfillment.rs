@@ -1279,11 +1279,10 @@ impl Observations {
             if cache_bytes <= MAX_POINT_READ_CACHE_BYTES
                 && cache_key_bytes <= MAX_POINT_READ_CACHE_KEY_BYTES
             {
-                self.point_read_cache
-                    .insert(
-                        (space, StorageKey(Bytes::copy_from_slice(&key.0))),
-                        Bytes::copy_from_slice(bytes),
-                    );
+                self.point_read_cache.insert(
+                    (space, StorageKey(Bytes::copy_from_slice(&key.0))),
+                    Bytes::copy_from_slice(bytes),
+                );
                 self.point_read_cache_bytes = cache_bytes;
                 self.point_read_cache_key_bytes = cache_key_bytes;
             }
@@ -1337,7 +1336,12 @@ impl<R: StorageAdapterRead> StorageAdapterRead for DependencyRead<R> {
                 for (key_index, key) in request.keys.iter().enumerate() {
                     let cache_key = (request.space, key.clone());
                     let cached_len = is_input_space(request.space)
-                        .then(|| observations.point_read_cache.get(&cache_key).map(Bytes::len))
+                        .then(|| {
+                            observations
+                                .point_read_cache
+                                .get(&cache_key)
+                                .map(Bytes::len)
+                        })
                         .flatten();
                     let cached = if let Some(cached_len) = cached_len {
                         let projected = match request.opts.projection {
@@ -1981,11 +1985,8 @@ async fn discover_bounded_with_read(
             required_locator_ids.push(crate::changelog::ChangeId::new(*commit.as_uuid()));
         }
     }
-    let required_locators = crate::tracked_state::load_canonical_change_locators(
-        &read,
-        &required_locator_ids,
-    )
-    .await?;
+    let required_locators =
+        crate::tracked_state::load_canonical_change_locators(&read, &required_locator_ids).await?;
     let mut required_locators = required_locators.into_iter();
     let mut required_index = 0usize;
     while required_index < request.required.len() {
@@ -2020,14 +2021,11 @@ async fn discover_bounded_with_read(
             address,
             ReadInputAddress::Metadata(NativeMetadataRef::ChangeLocator(_))
         ) {
-            required_locators
-                .next()
-                .flatten()
-                .map(|locator| {
-                    StorageProjectedValue::FullValue(Bytes::from(
-                        crate::tracked_state::encode_change_locator(locator),
-                    ))
-                })
+            required_locators.next().flatten().map(|locator| {
+                StorageProjectedValue::FullValue(Bytes::from(
+                    crate::tracked_state::encode_change_locator(locator),
+                ))
+            })
         } else {
             PointReadPlan::new(space, std::slice::from_ref(&key))
                 .materialize(&read, Default::default())
@@ -4358,9 +4356,8 @@ mod tests {
         }
     }
 
-    type PointCacheTestRead = DependencyRead<
-        LatencyProfileRead<Arc<StorageAdapterReadScope<MemoryRead>>>,
-    >;
+    type PointCacheTestRead =
+        DependencyRead<LatencyProfileRead<Arc<StorageAdapterReadScope<MemoryRead>>>>;
 
     async fn point_cache_fixture(
         entries: &[(StorageKey, Bytes)],
@@ -4683,14 +4680,12 @@ mod tests {
                 .unwrap();
             for index in 0..FILES {
                 authority
-                    .execute(
-                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-                        &[
-                            crate::Value::Text(uuid::Uuid::now_v7().to_string()),
-                            crate::Value::Text(format!("/profile/file-{index:02}.md")),
-                            crate::Value::Blob(Bytes::from_static(b"before").into()),
-                        ],
-                    )
+                    .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)")
+                    .params(&[
+                        crate::Value::Text(uuid::Uuid::now_v7().to_string()),
+                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                        crate::Value::Blob(Bytes::from_static(b"before").into()),
+                    ])
                     .await
                     .unwrap();
             }
@@ -4698,13 +4693,11 @@ mod tests {
             for edit in 0..edit_count {
                 let index = edit % FILES;
                 authority
-                    .execute(
-                        "UPDATE lix_file SET content = $1 WHERE path = $2",
-                        &[
-                            crate::Value::Blob(Bytes::from(format!("after-{edit}-{index}")).into()),
-                            crate::Value::Text(format!("/profile/file-{index:02}.md")),
-                        ],
-                    )
+                    .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+                    .params(&[
+                        crate::Value::Blob(Bytes::from(format!("after-{edit}-{index}")).into()),
+                        crate::Value::Text(format!("/profile/file-{index:02}.md")),
+                    ])
                     .await
                     .unwrap();
             }
@@ -6864,15 +6857,12 @@ mod tests {
         authority
             .execute(
                 "INSERT INTO lix_file(path, content) VALUES('/cold.txt', CAST('text' AS BYTEA))",
-                &[],
             )
             .await
             .unwrap();
         let rows = authority
-            .execute(
-                "SELECT id, lixcol_change_id AS change_id FROM lix_file WHERE path='/cold.txt'",
-                &[],
-            )
+            .query("SELECT id, lixcol_change_id AS change_id FROM lix_file WHERE path='/cold.txt'")
+            .all()
             .await
             .unwrap();
         let file_id = rows.rows()[0].get::<String>("id").unwrap();
@@ -6949,10 +6939,10 @@ mod tests {
                     request: crate::hot_state::HotStateScanRequest {
                         filter: crate::hot_state::HotStateFilter {
                             schema_keys: vec!["lix_account".to_owned()],
-                            row_pks: vec![crate::row_pk::RowPk::uuid_from_canonical(
-                                crate::SYSTEM_ACCOUNT_ID,
-                            )
-                            .unwrap()],
+                            row_pks: vec![
+                                crate::row_pk::RowPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
+                                    .unwrap(),
+                            ],
                             branch_ids: vec![leased.descriptor.global_branch.branch_id.clone()],
                             file_ids: vec![crate::NullableKeyFilter::Null],
                             untracked: Some(false),
@@ -7075,17 +7065,12 @@ mod tests {
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('direct-locator', 'value')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('direct-locator', 'value')")
             .await
             .unwrap();
         let rows = authority
-            .execute(
-                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'direct-locator'",
-                &[],
-            )
+            .query("SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'direct-locator'")
+            .all()
             .await
             .unwrap();
         let change = rows.rows()[0].get::<String>("id").unwrap();
@@ -7159,10 +7144,8 @@ mod tests {
             let key = format!("bounded-payload-{index}");
             row_pks.push(crate::row_pk::RowPk::single(&key));
             authority
-                .execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                    &[crate::Value::Text(key), crate::Value::Text(content.clone())],
-                )
+                .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+                .params(&[crate::Value::Text(key), crate::Value::Text(content.clone())])
                 .await
                 .unwrap();
         }
@@ -7244,15 +7227,11 @@ mod tests {
         authority
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('closure-payload-row', 'value')",
-                &[],
             )
             .await
             .unwrap();
         let rows = authority
-            .execute(
-                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'closure-payload-row'",
-                &[],
-            )
+            .query("SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'closure-payload-row'").all()
             .await
             .unwrap();
         let change_id = rows.rows()[0]
@@ -7670,10 +7649,7 @@ mod tests {
             .await
             .unwrap();
         let rows = global
-            .execute(
-                "SELECT lixcol_change_id AS id FROM lix_account WHERE id = $1 AND lixcol_untracked = false LIMIT 10",
-                &[crate::Value::Text(account_id.clone())],
-            )
+            .query("SELECT lixcol_change_id AS id FROM lix_account WHERE id = $1 AND lixcol_untracked = false LIMIT 10").params(&[crate::Value::Text(account_id.clone())]).all()
             .await
             .unwrap();
         let change_id = rows.rows()[0]

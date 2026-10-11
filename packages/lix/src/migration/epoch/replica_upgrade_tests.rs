@@ -25,12 +25,9 @@ impl Authority {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('upgrade-test', 'preserved')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('upgrade-test', 'preserved')")
+            .await
+            .unwrap();
         if include_files {
             let schema = serde_json::json!({
                 "$schema": "https://lix.dev/schema-v1.json",
@@ -41,15 +38,12 @@ impl Authority {
                 ],
                 "primary_key": ["id"]
             });
-            lix.execute(
-                "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-                &[crate::Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
+            lix.execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+                .params(&[crate::Value::Text(schema.to_string())])
+                .await
+                .unwrap();
             lix.execute(
                 "INSERT INTO legacy_custom_note(id,value) VALUES('legacy','custom-preserved')",
-                &[],
             )
             .await
             .unwrap();
@@ -251,16 +245,13 @@ async fn old_replica_with_recovery_data(
     assert!(!transport.active_account_id().is_empty());
     if local_only {
         lix.set_sync_role(crate::sync::SyncRole::Replica).unwrap();
-        lix.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('local-only-upgrade-test', 'local-only', true)", &[]).await.unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('local-only-upgrade-test', 'local-only', true)").await.unwrap();
     }
     if tracked {
         lix.set_sync_role(crate::sync::SyncRole::Replica).unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('offline-recovery', 'saved')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('offline-recovery', 'saved')")
+            .await
+            .unwrap();
     }
     lix.close().await.unwrap();
     transport.close_session().await.unwrap();
@@ -339,10 +330,8 @@ async fn clean_sparse_replica_bootstraps_before_publishing_new_epoch() {
             "acknowledged cache needs no recovery banner"
         );
         let rows = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'upgrade-test'")
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.rows().len(), 1);
@@ -492,14 +481,12 @@ async fn local_only_data_is_exportable_after_rebuild_and_source_is_kept() {
                         == Some("local-only-upgrade-test")))
         );
         assert!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key = 'local-only-upgrade-test'",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()
-            .is_empty()
+            lix.query("SELECT value FROM lix_key_value WHERE key = 'local-only-upgrade-test'")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
         );
         lix.close().await.unwrap();
         let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
@@ -587,10 +574,8 @@ async fn interrupted_checkpoint_rewrite_reopens_from_server_without_historical_c
             .await
             .unwrap();
         let rows = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'upgrade-test'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -798,12 +783,9 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
     // Fixture-only authoring admission creates unrelated caller state. The
     // recovery API independently authenticates its isolated writer context.
     lix.set_sync_role(crate::sync::SyncRole::Replica).unwrap();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('caller-only', 'unrelated')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('caller-only', 'unrelated')")
+        .await
+        .unwrap();
     let sources = lix.replica_recovery_sources().await.unwrap();
     assert_eq!(sources.len(), 1);
     let adapter = lix.storage_adapter();
@@ -874,10 +856,8 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
         .unwrap();
     assert_eq!(
         recovered
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'offline-recovery'",
-                &[]
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'offline-recovery'")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -886,10 +866,8 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
     );
     assert!(
         recovered
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'caller-only'",
-                &[]
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'caller-only'")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -969,12 +947,9 @@ async fn live_child_admission_can_overlap_same_engine_commits() {
     let (writes, opens) = tokio::join!(
         async {
             for i in 0..12 {
-                lix.execute(
-                    &format!(
-                        "INSERT INTO lix_key_value (key, value) VALUES ('admission-{i}', '{i}')"
-                    ),
-                    &[],
-                )
+                lix.execute(&format!(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('admission-{i}', '{i}')"
+                ))
                 .await?;
             }
             Ok::<_, LixError>(())
@@ -990,10 +965,8 @@ async fn live_child_admission_can_overlap_same_engine_commits() {
     writes.unwrap();
     opens.unwrap();
     let result = lix
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key LIKE 'admission-%'",
-            &[],
-        )
+        .query("SELECT key FROM lix_key_value WHERE key LIKE 'admission-%'")
+        .all()
         .await
         .unwrap();
     assert_eq!(result.rows().len(), 12);
@@ -1063,10 +1036,8 @@ async fn legacy_full_sync_bootstrap_survives_read_expiry_during_candidate_instal
     assert_eq!(admitted.report.migration.unwrap().from_format, 77);
     let lix = crate::open_lix().with_storage(storage).await.unwrap();
     let rows = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'upgrade-test'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1175,15 +1146,12 @@ async fn legacy_dirty_archive_survives_partial_conversion_and_remains_exportable
     partial
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('after-rejected-recovery', 'usable')",
-            &[],
         )
         .await
         .unwrap();
     let rows = partial
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'after-rejected-recovery'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'after-rejected-recovery'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1213,10 +1181,8 @@ async fn normal_open_preserves_dirty_legacy_replica_for_recovery_without_uploadi
         .await
         .expect("authenticated legacy open preserves dirty source as recovery data");
     let rows = partial
-        .execute(
-            "SELECT key, value FROM lix_key_value WHERE key = 'upgrade-test'",
-            &[],
-        )
+        .query("SELECT key, value FROM lix_key_value WHERE key = 'upgrade-test'")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.rows().len(), 1);
@@ -1254,10 +1220,7 @@ async fn normal_open_preserves_dirty_legacy_replica_for_recovery_without_uploadi
         .await
         .unwrap();
     let remote_rows = remote
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key IN ('offline-recovery', 'local-only-upgrade-test')",
-            &[],
-        )
+        .query("SELECT key FROM lix_key_value WHERE key IN ('offline-recovery', 'local-only-upgrade-test')").all()
         .await
         .unwrap();
     assert!(

@@ -205,7 +205,7 @@ fn status_mib(field: &str) -> String {
 }
 
 /// Pulls every page of `sql`, touching each row the way a consumer would.
-async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes: usize) {
+async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str) {
     let start_rss = reset_peak_rss();
     let start_heap = reset_peak_heap();
     let started = Instant::now();
@@ -213,14 +213,11 @@ async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes:
     let mut rows = 0usize;
     let mut pages = 0usize;
     let outcome = async {
-        let mut stream = session
-            .query_stream(sql, &[])
-            .with_page_bytes(page_bytes)
-            .await?;
+        let mut stream = session.query(sql).stream().await?;
         while let Some(page) = stream.next_page().await? {
             first_page_ms.get_or_insert_with(|| started.elapsed().as_millis());
             pages += 1;
-            rows += black_box(page.rows()).len();
+            rows += black_box(page).len();
         }
         Ok::<_, lix::LixError>(())
     }
@@ -228,7 +225,7 @@ async fn stream_phase(session: &Lix<Memory>, label: &str, sql: &str, page_bytes:
     let elapsed = started.elapsed();
     match outcome {
         Ok(()) => println!(
-            "inlang_project_scale phase={label} rows={rows} pages={pages} page_bytes={page_bytes} \
+            "inlang_project_scale phase={label} rows={rows} pages={pages} \
              ms={} first_page_ms={} us_per_row={:.1} start_rss_mib={start_rss} peak_rss_mib={} \
              peak_heap_mib={}",
             elapsed.as_millis(),
@@ -255,7 +252,8 @@ async fn insert_all(
         let sql = multi_row_insert(table, columns, chunk.len());
         let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
         transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .unwrap_or_else(|error| panic!("insert into {table} failed: {error:?}"));
     }
@@ -299,10 +297,7 @@ async fn run() {
             (files == 0).then_some(("message_id", "inlang_message")),
         ),
     ] {
-        session
-            .execute(&sql, &[])
-            .await
-            .expect("register inlang schema");
+        session.execute(&sql).await.expect("register inlang schema");
     }
 
     let file_ids = (0..files)
@@ -310,13 +305,11 @@ async fn run() {
         .collect::<Vec<_>>();
     for (index, file_id) in file_ids.iter().enumerate() {
         session
-            .execute(
-                "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
-                &[
-                    Value::Text(file_id.clone()),
-                    Value::Text(format!("/inlang/{index}.json")),
-                ],
-            )
+            .execute("INSERT INTO lix_file (id, path) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(file_id.clone()),
+                Value::Text(format!("/inlang/{index}.json")),
+            ])
             .await
             .expect("create inlang file");
     }
@@ -426,10 +419,8 @@ async fn run() {
     if phases.contains("flat") {
         let result = timed("flat_variants", rows, async {
             session
-                .execute(
-                    "SELECT id, message_id, matches, pattern FROM inlang_variant",
-                    &[],
-                )
+                .query("SELECT id, message_id, matches, pattern FROM inlang_variant")
+                .all()
                 .await
         })
         .await;
@@ -444,10 +435,8 @@ async fn run() {
         }
         let result = timed("flat_messages", rows, async {
             session
-                .execute(
-                    "SELECT id, bundle_id, locale, selectors FROM inlang_message",
-                    &[],
-                )
+                .query("SELECT id, bundle_id, locale, selectors FROM inlang_message")
+                .all()
                 .await
         })
         .await;
@@ -465,10 +454,7 @@ async fn run() {
         let started = Instant::now();
         loop {
             let result = session
-                .execute(
-                    "SELECT id, message_id, matches, pattern FROM inlang_variant WHERE id > $1 ORDER BY id LIMIT 10000",
-                    &[Value::Text(last.clone())],
-                )
+                .query("SELECT id, message_id, matches, pattern FROM inlang_variant WHERE id > $1 ORDER BY id LIMIT 10000").params(&[Value::Text(last.clone())]).all()
                 .await
                 .expect("keyset page");
             pages += 1;
@@ -507,7 +493,7 @@ async fn run() {
                 vec![]
             };
             let started = Instant::now();
-            let result = session.execute(sql, &params).await;
+            let result = session.query(sql).params(&params).all().await;
             let elapsed = started.elapsed();
             match result {
                 Ok(result) => {
@@ -535,29 +521,23 @@ async fn run() {
         }
     }
     if phases.contains("stream") {
-        let page_bytes = env_usize(
-            "LIX_INLANG_STREAM_PAGE_BYTES",
-            lix::DEFAULT_QUERY_STREAM_PAGE_BYTES,
-        );
         stream_phase(
             &session,
             "stream_variants",
             "SELECT id, message_id, matches, pattern FROM inlang_variant",
-            page_bytes,
         )
         .await;
         stream_phase(
             &session,
             "stream_messages",
             "SELECT id, bundle_id, locale, selectors FROM inlang_message",
-            page_bytes,
         )
         .await;
-        stream_phase(&session, "stream_join_nested", JOIN_NESTED_SQL, page_bytes).await;
+        stream_phase(&session, "stream_join_nested", JOIN_NESTED_SQL).await;
     }
     if phases.contains("join") {
         let result = timed("join_nested", rows, async {
-            session.execute(JOIN_NESTED_SQL, &[]).await
+            session.query(JOIN_NESTED_SQL).all().await
         })
         .await;
         match result {

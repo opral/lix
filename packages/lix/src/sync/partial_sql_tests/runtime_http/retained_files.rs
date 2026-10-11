@@ -99,10 +99,7 @@ async fn retained_file_case(checkpoint: bool) {
             .await
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('concurrent-authority','R')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('concurrent-authority','R')")
             .await
             .unwrap();
     }

@@ -536,12 +536,19 @@ mod tests {
 
         let session = std::sync::Arc::new(session);
         let (pages, profile) = scope(async {
+            let sql = "SELECT id, ordinal, payload FROM sql_profile_cancel_a \
+                       UNION ALL SELECT id, ordinal, payload FROM sql_profile_cancel_b";
+            let statement = session.parse_read_only_statement(sql, &[])?;
             let mut stream = session
-                .query_stream(
-                    "SELECT id, ordinal, payload FROM sql_profile_cancel_a \
-                     UNION ALL SELECT id, ordinal, payload FROM sql_profile_cancel_b",
-                    &[],
-                    1,
+                .open_live_query_stream(
+                    sql.to_owned(),
+                    statement,
+                    Vec::new(),
+                    crate::session::PageLimits {
+                        first_rows: usize::MAX,
+                        rows: usize::MAX,
+                        bytes: 1,
+                    },
                 )
                 .await?;
             let first = stream.next_page().await?.expect("first page");

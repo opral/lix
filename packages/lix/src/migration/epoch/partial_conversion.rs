@@ -238,12 +238,9 @@ mod tests {
                 .with_storage(storage.clone())
                 .await
                 .unwrap();
-            full.execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('convert', 'kept')",
-                &[],
-            )
-            .await
-            .unwrap();
+            full.execute("INSERT INTO lix_key_value (key, value) VALUES ('convert', 'kept')")
+                .await
+                .unwrap();
             let descriptor = full.partial_replica_descriptor(None).await.unwrap();
             let adapter = full.storage_adapter();
             let read = adapter.begin_read(Default::default()).await.unwrap();
@@ -329,7 +326,8 @@ mod tests {
                 assert_eq!(load_pointer(&storage).await.unwrap().unwrap().1, before);
                 let full = crate::open_lix().with_storage(storage).await.unwrap();
                 assert_eq!(
-                    full.execute("SELECT value FROM lix_key_value WHERE key = 'convert'", &[])
+                    full.query("SELECT value FROM lix_key_value WHERE key = 'convert'")
+                        .all()
                         .await
                         .unwrap()
                         .rows()

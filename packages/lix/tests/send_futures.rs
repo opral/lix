@@ -1,4 +1,4 @@
-use lix::{ExecuteBatchStatement, Lix, SwitchBranchOptions, open_lix};
+use lix::{Lix, SwitchBranchOptions, Value, open_lix};
 
 fn assert_send<T: Send>(_: T) {}
 fn assert_send_sync<T: Send + Sync>() {}
@@ -9,7 +9,7 @@ fn composed_open_execute_close_spawns_on_a_non_tokio_multithreaded_executor() {
     executor
         .spawn(async move {
             let lix = open_lix().await.expect("open Lix");
-            lix.execute("SELECT 1", &[]).await.expect("execute query");
+            lix.query("SELECT 1").all().await.expect("execute query");
             lix.close().await.expect("close Lix");
         })
         .detach();
@@ -22,18 +22,17 @@ async fn public_execution_and_observation_futures_are_send() {
 
     assert_send(lix.active_branch_id());
     assert_send(lix.open_another_session());
-    assert_send(lix.execute("SELECT 1", &[]));
+    assert_send(lix.query("SELECT 1").all());
     #[cfg(feature = "offline-migration")]
     assert_send(lix::convert_replica_to_partial(
         lix::Memory::new(),
         lix::ServerOptions::new("https://example.invalid/lix/test"),
         None,
     ));
-    assert_send(lix.execute_batch(&[ExecuteBatchStatement {
-        label: None,
-        sql: "SELECT 1".to_owned(),
-        params: Vec::new(),
-    }]));
+    assert_send(lix.execute_many(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        [[Value::from("a"), Value::from("b")]],
+    ));
     assert_send(lix.begin_transaction());
     assert_send(lix.query("SELECT 1").all());
     assert_send(lix.query("SELECT 1").stream());
@@ -48,8 +47,8 @@ async fn public_execution_and_observation_futures_are_send() {
     let mut events = lix.observe("SELECT 1", &[]).expect("observe query");
     assert_send(events.next());
 
-    let mut transaction = lix.begin_transaction().await.expect("begin transaction");
-    assert_send(transaction.execute("SELECT 1", &[]));
+    let transaction = lix.begin_transaction().await.expect("begin transaction");
+    assert_send(transaction.query("SELECT 1").all());
     assert_send(transaction.query("SELECT 1").one());
     assert_send(transaction.commit());
 }
@@ -60,7 +59,7 @@ async fn cloned_lix_queries_and_independent_observers_spawn_on_tokio() {
     let query_lix = lix.clone();
     let query = tokio::spawn(async move {
         for _ in 0..32 {
-            query_lix.execute("SELECT 1", &[]).await?;
+            query_lix.query("SELECT 1").all().await?;
         }
         Ok::<_, lix::LixError>(())
     });
@@ -109,7 +108,8 @@ async fn cancelling_and_closing_spawned_observers_is_deterministic() {
             .expect_err("cancelled observer task should not complete")
             .is_cancelled()
     );
-    lix.execute("SELECT 1", &[])
+    lix.query("SELECT 1")
+        .all()
         .await
         .expect("session remains usable after observer cancellation");
 

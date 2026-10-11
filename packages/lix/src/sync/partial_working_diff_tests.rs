@@ -9,7 +9,7 @@ async fn root_backed_dirty_base_remains_visible_with_empty_overlay_coverage() {
     };
     use crate::storage_adapter::StorageWriteOptions;
     let lix = crate::open_lix().await.unwrap();
-    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('base-dirty', 'original'), ('local-edit', 'before')", &[]).await.unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('base-dirty', 'original'), ('local-edit', 'before')").await.unwrap();
     let branch = lix
         .partial_replica_descriptor(None)
         .await
@@ -51,29 +51,24 @@ async fn root_backed_dirty_base_remains_visible_with_empty_overlay_coverage() {
         .unwrap();
     let query = "SELECT diff_type FROM lix_diff('lix_key_value') WHERE key = 'base-dirty'";
     assert_eq!(
-        lix.execute(query, &[]).await.unwrap().len(),
+        lix.query(query).all().await.unwrap().len(),
         1,
         "empty overlay index cannot hide dirty immutable baseline"
     );
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'after' WHERE key = 'local-edit'",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'local-edit'")
+        .await
+        .unwrap();
     assert_eq!(
-        lix.execute(query, &[]).await.unwrap().len(),
+        lix.query(query).all().await.unwrap().len(),
         1,
         "unrelated local edit must retain baseline dirty identity"
     );
     assert_eq!(
-        lix.execute(
-            "SELECT diff_type FROM lix_diff('lix_key_value') WHERE key = 'local-edit'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .len(),
+        lix.query("SELECT diff_type FROM lix_diff('lix_key_value') WHERE key = 'local-edit'")
+            .all()
+            .await
+            .unwrap()
+            .len(),
         1
     );
     let read = adapter.begin_read(Default::default()).await.unwrap();

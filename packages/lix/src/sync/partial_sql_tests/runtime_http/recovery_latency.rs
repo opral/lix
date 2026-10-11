@@ -188,10 +188,7 @@ async fn expired_serving_basis_retries_confirmed_wave_before_adoption() {
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_file(path,content) VALUES ('/lease-wave.txt',CAST('B' AS BYTEA))",
-                &[],
-            )
+            .execute("INSERT INTO lix_file(path,content) VALUES ('/lease-wave.txt',CAST('B' AS BYTEA))")
             .await
             .unwrap();
         let server = open_lix()
@@ -364,10 +361,7 @@ async fn expired_serving_basis_retries_confirmed_wave_before_adoption() {
             .await
             .expect("the first wave receipt should settle before the next local write");
             let authority_l1 = authority
-                .execute(
-                    "SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/lease-wave.txt'",
-                    &[],
-                )
+                .query("SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/lease-wave.txt'").all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -408,10 +402,7 @@ async fn expired_serving_basis_retries_confirmed_wave_before_adoption() {
                 .await
                 .expect("the pending second wave should use the fresh descriptor lease");
             let authority_l2 = authority
-                .execute(
-                    "SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/lease-wave.txt'",
-                    &[],
-                )
+                .query("SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/lease-wave.txt'").all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -500,12 +491,9 @@ async fn slow_recovery_inner(
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_file(path,content) VALUES \
+            .execute("INSERT INTO lix_file(path,content) VALUES \
                     ('/recovery-local.txt',CAST('B' AS BYTEA)), \
-                    ('/recovery-remote.txt',CAST('B' AS BYTEA))",
-                &[],
-            )
+                    ('/recovery-remote.txt',CAST('B' AS BYTEA))")
             .await
             .unwrap();
         let server = open_lix()
@@ -615,10 +603,7 @@ async fn slow_recovery_inner(
         }
         if !global_conflict && !inject_conflict_case {
             authority
-                .execute(
-                    "UPDATE lix_file SET content=CAST('R' AS BYTEA) WHERE path='/recovery-remote.txt'",
-                    &[],
-                )
+                .execute("UPDATE lix_file SET content=CAST('R' AS BYTEA) WHERE path='/recovery-remote.txt'")
                 .await
                 .unwrap();
         }
@@ -663,10 +648,7 @@ async fn slow_recovery_inner(
                 );
                 if global_conflict {
                     let uploaded_selected_file = authority
-                        .execute(
-                            "SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-local.txt'",
-                            &[],
-                        )
+                        .query("SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-local.txt'").all()
                         .await
                         .unwrap();
                     assert_eq!(
@@ -685,10 +667,7 @@ async fn slow_recovery_inner(
 
             loop {
                 let result = authority
-                    .execute(
-                        "SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-local.txt'",
-                        &[],
-                    )
+                    .query("SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-local.txt'").all()
                     .await
                     .unwrap();
                 let current = engine.sync_mode().partial_admission().unwrap();
@@ -699,10 +678,7 @@ async fn slow_recovery_inner(
                 let cursor_advanced = current.descriptor().cursor > old.descriptor().cursor;
                 let global_branch_is_authoritative = if let Some(branch_id) = &local_branch_id {
                     authority
-                        .execute(
-                            "SELECT id FROM lix_branch WHERE id=$1",
-                            &[Value::Text(branch_id.clone())],
-                        )
+                        .query("SELECT id FROM lix_branch WHERE id=$1").params(&[Value::Text(branch_id.clone())]).all()
                         .await
                         .unwrap()
                         .rows()
@@ -758,10 +734,7 @@ async fn slow_recovery_inner(
                         "L"
                     );
                     let remote = authority
-                        .execute(
-                            "SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-remote.txt'",
-                            &[],
-                        )
+                        .query("SELECT CAST(content AS TEXT) AS value FROM lix_file WHERE path='/recovery-remote.txt'").all()
                         .await
                         .unwrap();
                     assert_eq!(
@@ -784,10 +757,7 @@ async fn slow_recovery_inner(
             );
             if let Some(branch_id) = local_branch_id {
                 let branch = authority
-                    .execute(
-                        "SELECT id FROM lix_branch WHERE id=$1",
-                        &[Value::Text(branch_id)],
-                    )
+                    .query("SELECT id FROM lix_branch WHERE id=$1").params(&[Value::Text(branch_id)]).all()
                     .await
                     .unwrap();
                 assert_eq!(branch.rows().len(), 1, "complete GLOBAL recovery");

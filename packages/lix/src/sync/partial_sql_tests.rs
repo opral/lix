@@ -366,16 +366,10 @@ pub(crate) async fn execute_hydrating_over_http<
                             format!("object hydration did not resolve {address:?}: {error}"),
                         ));
                     }
-                    hydrate_native_object(
-                        storage,
-                        state,
-                        address,
-                        32 * 1024 * 1024,
-                        |request| {
-                            let transport = transport.clone();
-                            async move { transport.native_object_range(&request).await }
-                        },
-                    )
+                    hydrate_native_object(storage, state, address, 32 * 1024 * 1024, |request| {
+                        let transport = transport.clone();
+                        async move { transport.native_object_range(&request).await }
+                    })
                     .await?;
                     continue;
                 }
@@ -393,14 +387,9 @@ pub(crate) async fn execute_hydrating_over_http<
                     let response = transport.native_metadata(&request).await?;
                     let read = storage.begin_read(Default::default()).await?;
                     let mut writes = storage.new_write_set();
-                    let preconditions = stage_native_metadata(
-                        &read,
-                        &mut writes,
-                        state,
-                        &request,
-                        &response,
-                    )
-                    .await?;
+                    let preconditions =
+                        stage_native_metadata(&read, &mut writes, state, &request, &response)
+                            .await?;
                     drop(read);
                     storage
                         .commit_partial_replica_write_set(
@@ -425,7 +414,8 @@ pub(crate) async fn execute_hydrating_over_http<
     ))
 }
 
-fn value(result: ExecuteResult) -> String {
+fn value(result: impl Into<ExecuteResult>) -> String {
+    let result: ExecuteResult = result.into();
     assert_eq!(
         result.rows().len(),
         1,
@@ -448,10 +438,9 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .unwrap();
         let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
@@ -572,7 +561,7 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
         }
         // Same binary, fixture and SQL. Root I/O attribution is test-only and
         // includes adapter-returned local bytes, not wire bytes or OS CPU time.
-        authority.execute(sql, &params).await.unwrap();
+        authority.query(sql).params(&params).all().await.unwrap();
         let mut full_update_us = Vec::new();
         let mut full_read_us = Vec::new();
         let mut full_update_root = crate::hot_state::root_exact_profile::Profile::default();
@@ -582,10 +571,8 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             crate::hot_state::root_exact_profile::begin();
             let start = Instant::now();
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                    &[params[0].clone(), Value::Text(expected.clone())],
-                )
+                .execute("UPDATE lix_key_value SET value = $2 WHERE key = $1")
+                .params(&[params[0].clone(), Value::Text(expected.clone())])
                 .await
                 .unwrap();
             full_update_us.push(start.elapsed().as_micros());
@@ -593,7 +580,7 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             crate::hot_state::root_exact_profile::begin();
             let start = Instant::now();
             assert_eq!(
-                value(authority.execute(sql, &params).await.unwrap()),
+                value(authority.query(sql).params(&params).all().await.unwrap()),
                 expected
             );
             full_read_us.push(start.elapsed().as_micros());
@@ -638,13 +625,11 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             let (_, full_phases) = phase_profile::capture(async {
                 for index in 0..30 {
                     authority
-                        .execute(
-                            "UPDATE lix_key_value SET value = $2 WHERE key = $1",
-                            &[
-                                params[0].clone(),
-                                Value::Text(format!("authority-{}", index % 3)),
-                            ],
-                        )
+                        .execute("UPDATE lix_key_value SET value = $2 WHERE key = $1")
+                        .params(&[
+                            params[0].clone(),
+                            Value::Text(format!("authority-{}", index % 3)),
+                        ])
                         .await
                         .unwrap();
                 }
@@ -987,28 +972,25 @@ async fn partial_comment_author_join_survives_a_missing_change_record() {
         .await
         .unwrap();
     writer
-        .execute(
-            "INSERT INTO lix_conversation(id) VALUES ($1)",
-            &[Value::Text(CONVERSATION.to_owned())],
-        )
+        .execute("INSERT INTO lix_conversation(id) VALUES ($1)")
+        .params(&[Value::Text(CONVERSATION.to_owned())])
         .await
         .unwrap();
     writer
         .execute(
             "INSERT INTO lix_comment(id, conversation_id, body) VALUES ($1, $2, CAST($3 AS JSONB))",
-            &[
-                Value::Text(COMMENT.to_owned()),
-                Value::Text(CONVERSATION.to_owned()),
-                Value::Text(r#"{"_type":"zettel_doc","blocks":[]}"#.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Text(COMMENT.to_owned()),
+            Value::Text(CONVERSATION.to_owned()),
+            Value::Text(r#"{"_type":"zettel_doc","blocks":[]}"#.to_owned()),
+        ])
         .await
         .unwrap();
     let source_change = authority
-        .execute(
-            "SELECT lixcol_change_id FROM lix_comment WHERE id = $1",
-            &[Value::Text(COMMENT.to_owned())],
-        )
+        .query("SELECT lixcol_change_id FROM lix_comment WHERE id = $1")
+        .params(&[Value::Text(COMMENT.to_owned())])
+        .all()
         .await
         .unwrap();
     let Value::Text(change_id) = source_change.rows()[0]

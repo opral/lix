@@ -5,11 +5,8 @@ use std::io::Write as _;
 #[tokio::test]
 async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_rows() {
     let (storage, setup) = open_authority().await;
-    setup.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/test_plugin_column_merger.lixplugin',$1)",
-        &[Value::Blob(column_merger_archive().into())],
-    ).await.unwrap();
-    setup.execute("INSERT INTO merge_test_row(id,body,label) VALUES('0198b7a1-0000-7000-8000-000000000001','Alice said hello.\n\nBob said goodbye.','base')", &[]).await.unwrap();
+    setup.execute("INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/test_plugin_column_merger.lixplugin',$1)").params(&[Value::Blob(column_merger_archive().into())]).await.unwrap();
+    setup.execute("INSERT INTO merge_test_row(id,body,label) VALUES('0198b7a1-0000-7000-8000-000000000001','Alice said hello.\n\nBob said goodbye.','base')").await.unwrap();
     setup.close().await.unwrap();
     let probe = Arc::new(HttpProbe::default());
     let (url, server, authority) = serve_with_authority_session(storage, probe.clone()).await;
@@ -17,12 +14,12 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
     let replica = open_replica(directory.path(), &url).await;
     let read =
         "SELECT body,label FROM merge_test_row WHERE id='0198b7a1-0000-7000-8000-000000000001'";
-    replica.execute(read, &[]).await.unwrap();
+    replica.query(read).all().await.unwrap();
     probe.set_offline(true);
-    replica.execute("UPDATE merge_test_row SET body='Alice said hello.\n\nBob said GOODBYE.',label='incoming' WHERE id='0198b7a1-0000-7000-8000-000000000001'", &[]).await.unwrap();
+    replica.execute("UPDATE merge_test_row SET body='Alice said hello.\n\nBob said GOODBYE.',label='incoming' WHERE id='0198b7a1-0000-7000-8000-000000000001'").await.unwrap();
     replica.close().await.unwrap();
     let replica = open_replica_offline(directory.path()).await;
-    let pending = replica.execute(read, &[]).await.unwrap();
+    let pending = replica.query(read).all().await.unwrap();
     assert_eq!(
         pending.rows()[0].get::<String>("label").unwrap(),
         "incoming"
@@ -44,7 +41,7 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
                     Value::Text("incoming".into()),
                 ]]
             {
-                let local = replica.execute(read, &[]).await.unwrap();
+                let local = replica.query(read).all().await.unwrap();
                 if local.rows()[0].get::<String>("body").unwrap() == expected
                     && local.rows()[0].get::<String>("label").unwrap() == "incoming"
                 {
@@ -64,17 +61,11 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
 async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     let (storage, setup) = open_authority().await;
     setup
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/test_plugin_column_merger.lixplugin',$1)",
-            &[Value::Blob(column_merger_archive().into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/test_plugin_column_merger.lixplugin',$1)").params(&[Value::Blob(column_merger_archive().into())])
         .await
         .unwrap();
     setup
-        .execute(
-            "INSERT INTO lix_directory(path) VALUES('/library'),('/library/entries')",
-            &[],
-        )
+        .execute("INSERT INTO lix_directory(path) VALUES('/library'),('/library/entries')")
         .await
         .unwrap();
 
@@ -84,22 +75,18 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     setup
         .execute(
             "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_csv.lixplugin',$1)",
-            &[Value::Blob(csv_archive().into())],
         )
+        .params(&[Value::Blob(csv_archive().into())])
         .await
         .unwrap();
     setup
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/library/owned.csv',$1)",
-            &[Value::Blob(b"name,value\nproof,one\n".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/library/owned.csv',$1)")
+        .params(&[Value::Blob(b"name,value\nproof,one\n".to_vec().into())])
         .await
         .unwrap();
     let owners = setup
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key='lix_plugin_owner_v2'",
-            &[],
-        )
+        .query("SELECT key FROM lix_key_value WHERE key='lix_plugin_owner_v2'")
+        .all()
         .await
         .unwrap();
     assert!(
@@ -108,19 +95,15 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     );
 
     let registry = setup
-        .execute(
-            "SELECT key FROM lix_key_value WHERE key='lix_plugin_registry_v2'",
-            &[],
-        )
+        .query("SELECT key FROM lix_key_value WHERE key='lix_plugin_registry_v2'")
+        .all()
         .await
         .expect("plugin installation should persist its registry row");
     assert_eq!(registry.rows().len(), 1);
 
     let file_rows = setup
-        .execute(
-            "SELECT id FROM lix_file WHERE path='/library/owned.csv'",
-            &[],
-        )
+        .query("SELECT id FROM lix_file WHERE path='/library/owned.csv'")
+        .all()
         .await
         .unwrap();
     let owned_file_id = file_rows.rows()[0].get::<String>("id").unwrap();
@@ -130,7 +113,8 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     let read = "SELECT id, path, name, lixcol_updated_at FROM lix_directory \
         WHERE parent_id IS NULL ORDER BY name";
     let expected = setup
-        .execute(read, &[])
+        .query(read)
+        .all()
         .await
         .expect("authority root directory listing");
     let expected_rows = expected
@@ -165,7 +149,8 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     // must fulfill the selected directory rows and their plugin-registry side
     // dependency over native HTTP instead of falling back to authority SQL.
     let result = replica
-        .execute(read, &[])
+        .query(read)
+        .all()
         .await
         .expect("cold root directory listing should hydrate successfully");
     let actual_rows = result
@@ -212,7 +197,9 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
     let file_read = "SELECT id,path,name FROM lix_file WHERE id=$1";
     let file_params = [Value::Text(owned_file_id.clone())];
     let selected_file = replica
-        .execute(file_read, &file_params)
+        .query(file_read)
+        .params(&file_params)
+        .all()
         .await
         .expect("first file metadata read must admit its own executable owner");
     assert_eq!(
@@ -231,7 +218,9 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
 
     let offline_replica = open_replica_offline(directory.path()).await;
     let offline_file = offline_replica
-        .execute(file_read, &file_params)
+        .query(file_read)
+        .params(&file_params)
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -239,7 +228,8 @@ async fn partial_sync_cold_root_directory_listing_hydrates_plugin_registry() {
         "/library/owned.csv"
     );
     let offline = offline_replica
-        .execute(read, &[])
+        .query(read)
+        .all()
         .await
         .expect("hydrated directory rows should remain available after offline reopen");
     let offline_rows = offline
@@ -290,19 +280,17 @@ async fn partial_sync_materializes_csv_bytes_from_merged_semantic_rows() {
     setup
         .execute(
             "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_csv.lixplugin',$1)",
-            &[Value::Blob(csv_archive().into())],
         )
+        .params(&[Value::Blob(csv_archive().into())])
         .await
         .unwrap();
     setup
-        .execute("INSERT INTO lix_directory(path) VALUES('/nested')", &[])
+        .execute("INSERT INTO lix_directory(path) VALUES('/nested')")
         .await
         .unwrap();
     setup
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/nested/shared.csv',$1)",
-            &[Value::Blob(b"quick,dog\n".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/nested/shared.csv',$1)")
+        .params(&[Value::Blob(b"quick,dog\n".to_vec().into())])
         .await
         .unwrap();
     setup.close().await.unwrap();
@@ -312,33 +300,30 @@ async fn partial_sync_materializes_csv_bytes_from_merged_semantic_rows() {
     let replica = open_replica(directory.path(), &url).await;
     let initial_read = "SELECT content FROM lix_file WHERE path='/nested/shared.csv'";
     let read = "SELECT content FROM lix_file WHERE path='/nested/renamed.csv'";
-    let first = replica.execute(initial_read, &[]).await.unwrap();
+    let first = replica.query(initial_read).all().await.unwrap();
     assert_eq!(
         first.rows()[0].get::<Vec<u8>>("content").unwrap(),
         b"quick,dog\n"
     );
     // Retain the semantic scope as well as the derived content projection.
     replica
-        .execute("SELECT cells FROM csv_row", &[])
+        .query("SELECT cells FROM csv_row")
+        .all()
         .await
         .unwrap();
     replica
-        .execute("SELECT id,path FROM lix_directory", &[])
+        .query("SELECT id,path FROM lix_directory")
+        .all()
         .await
         .unwrap();
     probe.set_offline(true);
     replica
-        .execute(
-            "UPDATE lix_file SET content=$1 WHERE path='/nested/shared.csv'",
-            &[Value::Blob(b"quick,sleepy dog\n".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content=$1 WHERE path='/nested/shared.csv'")
+        .params(&[Value::Blob(b"quick,sleepy dog\n".to_vec().into())])
         .await
         .unwrap();
     replica
-        .execute(
-            "UPDATE lix_file SET path='/nested/renamed.csv' WHERE path='/nested/shared.csv'",
-            &[],
-        )
+        .execute("UPDATE lix_file SET path='/nested/renamed.csv' WHERE path='/nested/shared.csv'")
         .await
         .unwrap();
     authority
@@ -353,7 +338,7 @@ async fn partial_sync_materializes_csv_bytes_from_merged_semantic_rows() {
         loop {
             let rows = authority.execute(read, &[]).await;
             if rows == vec![vec![Value::Blob(expected.to_vec().into())]] {
-                let local = replica.execute(read, &[]).await.unwrap();
+                let local = replica.query(read).all().await.unwrap();
                 if local.rows()[0].get::<Vec<u8>>("content").unwrap() == expected {
                     break;
                 }
@@ -366,7 +351,8 @@ async fn partial_sync_materializes_csv_bytes_from_merged_semantic_rows() {
     assert!(authority.execute(initial_read, &[]).await.is_empty());
     assert!(
         replica
-            .execute(initial_read, &[])
+            .query(initial_read)
+            .all()
             .await
             .unwrap()
             .rows()
@@ -374,7 +360,8 @@ async fn partial_sync_materializes_csv_bytes_from_merged_semantic_rows() {
     );
     let native = authority.execute("SELECT cells FROM csv_row", &[]).await;
     let local = replica
-        .execute("SELECT cells FROM csv_row", &[])
+        .query("SELECT cells FROM csv_row")
+        .all()
         .await
         .unwrap();
     assert!(format!("{native:?}").contains("very quick"));
@@ -426,15 +413,13 @@ async fn parsed_file_lifecycle(incoming_delete: bool) {
     setup
         .execute(
             "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_csv.lixplugin',$1)",
-            &[Value::Blob(csv_archive().into())],
         )
+        .params(&[Value::Blob(csv_archive().into())])
         .await
         .unwrap();
     setup
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/lifecycle.csv',$1)",
-            &[Value::Blob(b"first,one\nsecond,two\n".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/lifecycle.csv',$1)")
+        .params(&[Value::Blob(b"first,one\nsecond,two\n".to_vec().into())])
         .await
         .unwrap();
     setup.close().await.unwrap();
@@ -443,26 +428,24 @@ async fn parsed_file_lifecycle(incoming_delete: bool) {
     let directory = TempDir::new().unwrap();
     let replica = open_replica(directory.path(), &url).await;
     let initial = replica
-        .execute(
-            "SELECT id,content FROM lix_file WHERE path='/lifecycle.csv'",
-            &[],
-        )
+        .query("SELECT id,content FROM lix_file WHERE path='/lifecycle.csv'")
+        .all()
         .await
         .unwrap();
     let id = initial.rows()[0].get::<String>("id").unwrap();
     let rows_sql = "SELECT id,cells FROM csv_row WHERE lixcol_file_id=$1 ORDER BY id";
     let before = replica
-        .execute(rows_sql, &[Value::Text(id.clone())])
+        .query(rows_sql)
+        .params(&[Value::Text(id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(before.rows().len(), 2);
     probe.set_offline(true);
     if incoming_delete {
         replica
-            .execute(
-                "DELETE FROM lix_file WHERE id=$1",
-                &[Value::Text(id.clone())],
-            )
+            .execute("DELETE FROM lix_file WHERE id=$1")
+            .params(&[Value::Text(id.clone())])
             .await
             .unwrap();
         authority
@@ -480,13 +463,11 @@ async fn parsed_file_lifecycle(incoming_delete: bool) {
             .await;
     } else {
         replica
-            .execute(
-                "UPDATE lix_file SET content=$1 WHERE id=$2",
-                &[
-                    Value::Blob(b"first,INCOMING\nsecond,two\n".to_vec().into()),
-                    Value::Text(id.clone()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content=$1 WHERE id=$2")
+            .params(&[
+                Value::Blob(b"first,INCOMING\nsecond,two\n".to_vec().into()),
+                Value::Text(id.clone()),
+            ])
             .await
             .unwrap();
         authority
@@ -513,7 +494,9 @@ async fn parsed_file_lifecycle(incoming_delete: bool) {
                 == expected
             {
                 let local = replica
-                    .execute(content_sql, &[Value::Text(id.clone())])
+                    .query(content_sql)
+                    .params(&[Value::Text(id.clone())])
+                    .all()
                     .await
                     .unwrap();
                 let settled = if incoming_delete {
@@ -536,7 +519,9 @@ async fn parsed_file_lifecycle(incoming_delete: bool) {
         .execute(rows_sql, &[Value::Text(id.clone())])
         .await;
     let local_rows = replica
-        .execute(rows_sql, &[Value::Text(id.clone())])
+        .query(rows_sql)
+        .params(&[Value::Text(id.clone())])
+        .all()
         .await
         .unwrap();
     if incoming_delete {

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::common::{ReadLimits, with_read_limits};
 use crate::query::{
-    ExecuteManyRequest, ExecuteRequest, QueryRequest, SnapshotTarget, SqlFuture, SqlTarget,
-    boxed, unsupported_remote_operation,
+    ExecuteManyRequest, ExecuteRequest, QueryRequest, SnapshotTarget, SqlFuture, SqlTarget, boxed,
+    unsupported_remote_operation,
 };
 use crate::session::{AssumeSendFuture, ExecuteOptions, ReadSnapshot};
 use crate::{
@@ -36,17 +36,14 @@ fn snapshot_read_only() -> LixError {
 /// Applies a byte cap to a result the engine did not collect under it, such
 /// as an authority read over HTTP.
 fn enforce_limits(result: &ExecuteResult, limits: ReadLimits) -> Result<(), LixError> {
-    crate::session::charge_execute_result(
-        &mut crate::common::ReadResultBudget::new(limits),
-        result,
-    )
+    crate::session::charge_execute_result(&mut crate::common::ReadResultBudget::new(limits), result)
 }
 
 impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    fn sql_target(&self) -> Arc<dyn SqlTarget> {
+    pub(crate) fn sql_target(&self) -> Arc<dyn SqlTarget> {
         Arc::new(self.clone())
     }
 
@@ -87,9 +84,9 @@ where
                 // buffered reads, the obstruction is the higher-ranked storage
                 // read borrow.
                 unsafe {
-                    AssumeSendFuture::new(
-                        async move { session.open_read_snapshot(sync_demand_tx).await },
-                    )
+                    AssumeSendFuture::new(async move {
+                        session.open_read_snapshot(sync_demand_tx).await
+                    })
                 }
             })
             .await?;
@@ -241,6 +238,42 @@ where
     }
 }
 
+#[cfg(test)]
+impl<StorageImpl> Lix<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    /// Runs a heterogeneous atomic statement batch through the engine's
+    /// batch path (the server protocol's `execute_batch`). Not public API:
+    /// public callers use `execute_many` or a transaction.
+    pub(crate) async fn execute_batch_for_test(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
+        let route = self.session.execute_batch_disposition(statements)?;
+        let local = self
+            .retry_replica_read(route, || {
+                self.retry_sync_demands(|| {
+                    self.session
+                        .execute_batch_with_options(statements, ExecuteOptions::default())
+                })
+            })
+            .await;
+        match local {
+            Err(error)
+                if route == ExecutionDisposition::CancellableRead
+                    && self.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
+                    && self.server.is_some()
+                    && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
+            {
+                self.execute_authority_read_batch(statements, &ExecuteOptions::default())
+                    .await
+            }
+            result => result.map(crate::ExecuteBatchResult::from_results),
+        }
+    }
+}
+
 impl<StorageImpl> SqlTarget for Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -249,9 +282,12 @@ where
         // SAFETY: the future owns the handle Arc and the request.
         unsafe {
             boxed(async move {
-                with_read_limits(request.limits, self.read_latest(&request.sql, &request.params))
-                    .await
-                    .map(QueryResult::from_execute_result)
+                with_read_limits(
+                    request.limits,
+                    self.read_latest(&request.sql, &request.params),
+                )
+                .await
+                .map(QueryResult::from_execute_result)
             })
         }
     }
@@ -264,7 +300,9 @@ where
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
         let limits = ReadLimits::bytes(request.max_bytes);
         // SAFETY: the future owns the handle Arc and the request.
-        unsafe { boxed(async move { with_read_limits(limits, self.execute_latest(request)).await }) }
+        unsafe {
+            boxed(async move { with_read_limits(limits, self.execute_latest(request)).await })
+        }
     }
 
     fn execute_many(self: Arc<Self>, request: ExecuteManyRequest) -> SqlFuture<u64> {
@@ -517,6 +555,78 @@ impl SqlTarget for RemoteLix {
                 .iter()
                 .map(ExecuteResult::rows_affected)
                 .sum())
+        })
+    }
+}
+
+/// SQL inside a [`super::RemoteLixTransaction`].
+pub(super) struct RemoteTransactionTarget(
+    pub(super) Option<Arc<crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>>>,
+);
+
+impl RemoteTransactionTarget {
+    fn transaction(
+        &self,
+    ) -> Result<&crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>, LixError>
+    {
+        self.0.as_deref().ok_or_else(closed_transaction_error)
+    }
+}
+
+impl SqlTarget for RemoteTransactionTarget {
+    fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
+        Box::pin(async move {
+            let result = self
+                .transaction()?
+                .execute(&request.sql, &request.params, None)
+                .await?;
+            enforce_limits(&result, request.limits)?;
+            Ok(QueryResult::from_execute_result(result))
+        })
+    }
+
+    fn stream(self: Arc<Self>, _request: QueryRequest) -> SqlFuture<RowStream> {
+        Box::pin(std::future::ready(Err(unsupported_remote_operation(
+            "stream()",
+        ))))
+    }
+
+    fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
+        Box::pin(async move {
+            let result = self
+                .transaction()?
+                .execute(
+                    &request.sql,
+                    &request.params,
+                    Some(crate::authority_client::ProtocolExecuteOptions {
+                        origin_key: request.options.origin_key,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            enforce_limits(&result, ReadLimits::bytes(request.max_bytes))?;
+            Ok(result)
+        })
+    }
+
+    fn execute_many(self: Arc<Self>, request: ExecuteManyRequest) -> SqlFuture<u64> {
+        Box::pin(async move {
+            let transaction = self.transaction()?;
+            let mut rows_affected = 0;
+            for params in request.param_sets {
+                rows_affected += transaction
+                    .execute(
+                        &request.sql,
+                        &params,
+                        Some(crate::authority_client::ProtocolExecuteOptions {
+                            origin_key: request.options.origin_key.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                    .await?
+                    .rows_affected();
+            }
+            Ok(rows_affected)
         })
     }
 }

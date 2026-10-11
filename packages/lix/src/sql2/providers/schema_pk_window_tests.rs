@@ -6,6 +6,7 @@
 //! span many packed mutation parts, and then layer HOT updates, deletes,
 //! file-scoped duplicates, untracked rows and global-branch rows on top.
 
+use crate::test_support::ResultRows;
 use std::collections::BTreeSet;
 
 use crate::{Lix, Memory, Value};
@@ -46,34 +47,24 @@ pub(super) fn id(index: u64) -> String {
 }
 
 pub(super) async fn open_fixture() -> Lix<Memory> {
-    let lix = crate::open_lix()
-        .with_storage(Memory::new())
-        .await
-        .unwrap();
+    let lix = crate::open_lix().with_storage(Memory::new()).await.unwrap();
     for global in ["FALSE", "TRUE"] {
-    lix.execute(
-        &format!(
+        lix.execute(&format!(
             "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
              \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
              {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB), {global})"
-        ),
-        &[],
-    )
+        ))
     .await
     .unwrap();
     }
-    lix.execute(
-        &format!(
-            "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/pkw-a'), ('{FILE_B}','/pkw-b')"
-        ),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/pkw-a'), ('{FILE_B}','/pkw-b')"
+    ))
     .await
     .unwrap();
-    lix.execute(
-        &format!("INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{FILE_B}','/pkw-global-b',TRUE)"),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{FILE_B}','/pkw-global-b',TRUE)"
+    ))
     .await
     .unwrap();
     lix
@@ -87,7 +78,7 @@ fn file_sql(file_id: Option<&str>) -> String {
 /// explicit transaction, so the commit lands as one packed base with many
 /// mutation parts.
 pub(super) async fn bulk_insert(lix: &Lix<Memory>, rows: &[(String, String, Option<&str>)]) {
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for chunk in rows.chunks(400) {
         let values = chunk
             .iter()
@@ -95,18 +86,17 @@ pub(super) async fn bulk_insert(lix: &Lix<Memory>, rows: &[(String, String, Opti
             .collect::<Vec<_>>()
             .join(", ");
         transaction
-            .execute(
-                &format!("INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES {values}"
+            ))
             .await
             .unwrap();
     }
     transaction.commit().await.unwrap();
 }
 
-pub(super) fn decode_rows(result: &crate::ExecuteResult) -> Vec<Row> {
-    decode_page(result.rows())
+pub(super) fn decode_rows(result: &impl ResultRows) -> Vec<Row> {
+    decode_page(result.result_rows())
 }
 
 pub(super) fn decode_page(rows: &[crate::Row]) -> Vec<Row> {
@@ -138,7 +128,8 @@ pub(super) fn decode_page(rows: &[crate::Row]) -> Vec<Row> {
 
 pub(super) async fn all_rows(lix: &Lix<Memory>) -> Vec<Row> {
     let result = lix
-        .execute(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
+        .query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+        .all()
         .await
         .unwrap();
     let mut rows = decode_rows(&result);
@@ -183,7 +174,13 @@ pub(super) async fn layered_fixture(seed: u64, shape: FixtureShape) -> Lix<Memor
         bulk_insert(
             &lix,
             &(0..300)
-                .map(|index| (id(index * stride + 1), format!("{file}-{index}"), Some(file)))
+                .map(|index| {
+                    (
+                        id(index * stride + 1),
+                        format!("{file}-{index}"),
+                        Some(file),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .await;
@@ -242,18 +239,15 @@ pub(super) async fn layered_fixture(seed: u64, shape: FixtureShape) -> Lix<Memor
             }
         }
         for statement in statements {
-            lix.execute(&statement, &[]).await.unwrap();
+            lix.execute(&statement).await.unwrap();
         }
     }
     for index in 0..30 {
         let row = rng.below(4800);
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO {SCHEMA} (id, value, lixcol_untracked) VALUES ('{}-u{index}', 'untracked-{index}', TRUE)",
                 id(row)
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
@@ -262,14 +256,11 @@ pub(super) async fn layered_fixture(seed: u64, shape: FixtureShape) -> Lix<Memor
     for index in 0..40_u64 {
         let row = index * 113 % 4800;
         let file = if index % 4 == 0 { Some(FILE_B) } else { None };
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO {SCHEMA} (id, value, lixcol_file_id, lixcol_global) VALUES ('{}', 'global-{index}', {}, TRUE)",
                 id(row),
                 file_sql(file)
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
@@ -305,20 +296,27 @@ async fn assert_windows_match_unrestricted_scan(shape: FixtureShape) {
         let mut params = Vec::new();
         if let Some((bound, inclusive)) = lower {
             params.push(Value::Text(bound.to_owned()));
-            predicates.push(format!("id {} ${}", if inclusive { ">=" } else { ">" }, params.len()));
+            predicates.push(format!(
+                "id {} ${}",
+                if inclusive { ">=" } else { ">" },
+                params.len()
+            ));
         }
         if let Some((bound, inclusive)) = upper {
             params.push(Value::Text(bound.to_owned()));
-            predicates.push(format!("id {} ${}", if inclusive { "<=" } else { "<" }, params.len()));
+            predicates.push(format!(
+                "id {} ${}",
+                if inclusive { "<=" } else { "<" },
+                params.len()
+            ));
         }
         let result = lix
-            .execute(
-                &format!(
-                    "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE {}",
-                    predicates.join(" AND ")
-                ),
-                &params,
-            )
+            .query(&format!(
+                "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE {}",
+                predicates.join(" AND ")
+            ))
+            .params(&params)
+            .all()
             .await
             .unwrap();
         let mut actual = decode_rows(&result);
@@ -375,7 +373,7 @@ fn id_sequence(rows: &[Row]) -> Vec<&str> {
 /// page against the reference: the id sequence must be exactly the next
 /// `page` ids, and every row must be a distinct current row.
 pub(super) async fn assert_keyset_pages_match(
-    execute: &mut (impl AsyncFnMut(&str, Vec<Value>) -> crate::ExecuteResult + ?Sized),
+    execute: &mut (impl AsyncFnMut(&str, Vec<Value>) -> crate::QueryResult + ?Sized),
     reference: &[Row],
     page: usize,
 ) {
@@ -386,24 +384,20 @@ pub(super) async fn assert_keyset_pages_match(
     let mut pages = 0;
     loop {
         let result = match last.as_ref() {
-            Some(last) => {
-                execute(
-                    &format!(
-                        "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id > $1 ORDER BY id LIMIT {page}"
-                    ),
-                    vec![Value::Text(last.clone())],
-                )
-                .await
-            }
-            None => {
-                execute(
-                    &format!(
-                        "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= $1 ORDER BY id LIMIT {page}"
-                    ),
-                    vec![Value::Text(String::new())],
-                )
-                .await
-            }
+            Some(last) => execute(
+                &format!(
+                    "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id > $1 ORDER BY id LIMIT {page}"
+                ),
+                vec![Value::Text(last.clone())],
+            )
+            .await,
+            None => execute(
+                &format!(
+                    "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= $1 ORDER BY id LIMIT {page}"
+                ),
+                vec![Value::Text(String::new())],
+            )
+            .await,
         };
         let rows = decode_rows(&result);
         let expected = sorted
@@ -433,7 +427,10 @@ pub(super) async fn assert_keyset_pages_match(
             break;
         }
         last = rows.last().map(|row| row.0.clone());
-        assert!(pages <= reference.len() + 1, "keyset pagination did not advance");
+        assert!(
+            pages <= reference.len() + 1,
+            "keyset pagination did not advance"
+        );
     }
 }
 
@@ -441,7 +438,7 @@ async fn assert_ordered_routes_match(lix: &Lix<Memory>) {
     let reference = all_rows(lix).await;
     for page in [1, 7, 64, 500] {
         let mut execute = async |sql: &str, params: Vec<Value>| {
-            lix.execute(sql, &params).await.unwrap()
+            lix.query(sql).params(&params).all().await.unwrap()
         };
         assert_keyset_pages_match(&mut execute, &reference, page).await;
     }
@@ -449,10 +446,11 @@ async fn assert_ordered_routes_match(lix: &Lix<Memory>) {
     // qualifying, current and distinct ones, and as many as exist.
     for (bound, limit) in [("k00500", 25_usize), ("k04790", 50), ("k01200", 4000)] {
         let result = lix
-            .execute(
-                &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id > $1 LIMIT {limit}"),
-                &[Value::Text(bound.to_owned())],
-            )
+            .query(&format!(
+                "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id > $1 LIMIT {limit}"
+            ))
+            .params(&[Value::Text(bound.to_owned())])
+            .all()
             .await
             .unwrap();
         let rows = decode_rows(&result);
@@ -462,16 +460,21 @@ async fn assert_ordered_routes_match(lix: &Lix<Memory>) {
             .collect::<BTreeSet<_>>();
         assert_eq!(rows.len(), limit.min(qualifying.len()), "bound {bound}");
         assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), rows.len());
-        assert!(rows.iter().all(|row| qualifying.contains(row)), "bound {bound}");
+        assert!(
+            rows.iter().all(|row| qualifying.contains(row)),
+            "bound {bound}"
+        );
     }
     // A closed interval in primary-key order, with no fetch.
     let result = lix
-        .execute(
-            &format!(
-                "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= $1 AND id < $2 ORDER BY id"
-            ),
-            &[Value::Text("k00777".to_owned()), Value::Text("k03333".to_owned())],
-        )
+        .query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= $1 AND id < $2 ORDER BY id"
+        ))
+        .params(&[
+            Value::Text("k00777".to_owned()),
+            Value::Text("k03333".to_owned()),
+        ])
+        .all()
         .await
         .unwrap();
     let rows = decode_rows(&result);
@@ -489,10 +492,13 @@ async fn assert_ordered_routes_match(lix: &Lix<Memory>) {
 
 #[tokio::test]
 async fn keyset_pages_match_the_reference_over_packed_bases() {
-    let lix = layered_fixture(11, FixtureShape {
-        checkpoint: false,
-        branch: false,
-    })
+    let lix = layered_fixture(
+        11,
+        FixtureShape {
+            checkpoint: false,
+            branch: false,
+        },
+    )
     .await;
     assert_ordered_routes_match(&lix).await;
     lix.close().await.unwrap();
@@ -500,10 +506,13 @@ async fn keyset_pages_match_the_reference_over_packed_bases() {
 
 #[tokio::test]
 async fn keyset_pages_match_the_reference_on_a_branch_root() {
-    let lix = layered_fixture(13, FixtureShape {
-        checkpoint: false,
-        branch: true,
-    })
+    let lix = layered_fixture(
+        13,
+        FixtureShape {
+            checkpoint: false,
+            branch: true,
+        },
+    )
     .await;
     assert_ordered_routes_match(&lix).await;
     lix.close().await.unwrap();
@@ -515,10 +524,13 @@ async fn keyset_pages_match_the_reference_on_a_branch_root() {
 #[tokio::test]
 async fn keyset_pagination_matches_the_unrestricted_scan_across_random_mutations() {
     for seed in [3_u64, 29] {
-        let lix = layered_fixture(seed, FixtureShape {
-            checkpoint: false,
-            branch: seed % 2 == 1,
-        })
+        let lix = layered_fixture(
+            seed,
+            FixtureShape {
+                checkpoint: false,
+                branch: seed % 2 == 1,
+            },
+        )
         .await;
         let mut rng = Lcg::new(seed.wrapping_mul(7919));
         for round in 0..5 {
@@ -553,12 +565,12 @@ async fn keyset_pagination_matches_the_unrestricted_scan_across_random_mutations
                         id(index + 3)
                     ),
                 };
-                lix.execute(&statement, &[]).await.unwrap();
+                lix.execute(&statement).await.unwrap();
             }
             let reference = all_rows(&lix).await;
             for page in [5, 97] {
                 let mut execute = async |sql: &str, params: Vec<Value>| {
-                    lix.execute(sql, &params).await.unwrap()
+                    lix.query(sql).params(&params).all().await.unwrap()
                 };
                 assert_keyset_pages_match(&mut execute, &reference, page).await;
             }
@@ -571,12 +583,15 @@ async fn keyset_pagination_matches_the_unrestricted_scan_across_random_mutations
 /// see them through the staged reader or not run at all.
 #[tokio::test]
 async fn keyset_pages_read_transaction_staged_rows() {
-    let lix = layered_fixture(17, FixtureShape {
-        checkpoint: false,
-        branch: false,
-    })
+    let lix = layered_fixture(
+        17,
+        FixtureShape {
+            checkpoint: false,
+            branch: false,
+        },
+    )
     .await;
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for statement in [
         format!("DELETE FROM {SCHEMA} WHERE id >= 'k00100' AND id < 'k00140'"),
         format!(
@@ -591,12 +606,13 @@ async fn keyset_pages_read_transaction_staged_rows() {
         ),
     ] {
         transaction
-            .execute(&statement, &[])
+            .execute(&statement)
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
     }
     let result = transaction
-        .execute(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
+        .query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+        .all()
         .await
         .unwrap();
     let mut reference = decode_rows(&result);
@@ -604,7 +620,7 @@ async fn keyset_pages_read_transaction_staged_rows() {
     assert!(reference.iter().any(|row| row.0 == "k02000-staged"));
     for page in [9, 300] {
         let mut execute = async |sql: &str, params: Vec<Value>| {
-            transaction.execute(sql, &params).await.unwrap()
+            transaction.query(sql).params(&params).all().await.unwrap()
         };
         assert_keyset_pages_match(&mut execute, &reference, page).await;
     }
@@ -613,7 +629,12 @@ async fn keyset_pages_read_transaction_staged_rows() {
 }
 
 async fn physical_plan(lix: &Lix<Memory>, sql: &str, params: &[Value]) -> String {
-    let result = lix.execute(&format!("EXPLAIN {sql}"), params).await.unwrap();
+    let result = lix
+        .query(&format!("EXPLAIN {sql}"))
+        .params(params)
+        .all()
+        .await
+        .unwrap();
     result
         .rows()
         .iter()
@@ -639,7 +660,10 @@ async fn primary_key_ranges_plan_as_ordered_fetching_scans() {
     let physical = plan.split("physical_plan").nth(1).expect("physical plan");
     assert!(!physical.contains("SortExec"), "{plan}");
     assert!(!physical.contains("FilterExec"), "{plan}");
-    assert!(physical.contains(&format!("SpecScanExec({SCHEMA})")), "{plan}");
+    assert!(
+        physical.contains(&format!("SpecScanExec({SCHEMA})")),
+        "{plan}"
+    );
     assert!(physical.contains("fetch=10"), "{plan}");
     assert!(physical.contains("output_ordering=[id@0 ASC"), "{plan}");
 
@@ -674,15 +698,12 @@ async fn primary_key_ranges_plan_as_ordered_fetching_scans() {
 #[tokio::test]
 async fn full_scans_shadow_multi_scope_root_rows_with_hot_overlays() {
     let lix = open_fixture().await;
-    lix.execute(
-        &format!(
-            "INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES \
+    lix.execute(&format!(
+        "INSERT INTO {SCHEMA} (id, value, lixcol_file_id) VALUES \
              ('k1', 'null-1', NULL), ('k3', 'null-3', NULL), \
              ('k1', 'a-1', '{FILE_A}'), ('k2', 'a-2', '{FILE_A}'), \
              ('k2', 'b-2', '{FILE_B}'), ('k4', 'b-4', '{FILE_B}')"
-        ),
-        &[],
-    )
+    ))
     .await
     .unwrap();
     let branch = lix
@@ -699,15 +720,25 @@ async fn full_scans_shadow_multi_scope_root_rows_with_hot_overlays() {
     .await
     .unwrap();
     for statement in [
-        format!("UPDATE {SCHEMA} SET value = 'a-2-updated' WHERE id = 'k2' AND lixcol_file_id = '{FILE_A}'"),
+        format!(
+            "UPDATE {SCHEMA} SET value = 'a-2-updated' WHERE id = 'k2' AND lixcol_file_id = '{FILE_A}'"
+        ),
         format!("DELETE FROM {SCHEMA} WHERE id = 'k1' AND lixcol_file_id = '{FILE_A}'"),
-        format!("UPDATE {SCHEMA} SET value = 'null-3-updated' WHERE id = 'k3' AND lixcol_file_id IS NULL"),
+        format!(
+            "UPDATE {SCHEMA} SET value = 'null-3-updated' WHERE id = 'k3' AND lixcol_file_id IS NULL"
+        ),
     ] {
-        lix.execute(&statement, &[]).await.unwrap();
+        lix.execute(&statement).await.unwrap();
     }
     let rows = all_rows(&lix).await;
     let row = |id: &str, value: &str, file: Option<&str>| -> Row {
-        (id.to_owned(), value.to_owned(), file.map(str::to_owned), false, false)
+        (
+            id.to_owned(),
+            value.to_owned(),
+            file.map(str::to_owned),
+            false,
+            false,
+        )
     };
     let mut expected = vec![
         row("k1", "null-1", None),
@@ -726,10 +757,13 @@ async fn full_scans_shadow_multi_scope_root_rows_with_hot_overlays() {
 /// fetch, and the rows are exactly the first ids of the unrestricted scan.
 #[tokio::test]
 async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
-    let lix = layered_fixture(19, FixtureShape {
-        checkpoint: false,
-        branch: false,
-    })
+    let lix = layered_fixture(
+        19,
+        FixtureShape {
+            checkpoint: false,
+            branch: false,
+        },
+    )
     .await;
     let plan = physical_plan(
         &lix,
@@ -756,10 +790,10 @@ async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
     reference.sort();
     for limit in [1_usize, 10, 333, 100_000] {
         let result = lix
-            .execute(
-                &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id LIMIT {limit}"),
-                &[],
-            )
+            .query(&format!(
+                "SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id LIMIT {limit}"
+            ))
+            .all()
             .await
             .unwrap();
         let rows = decode_rows(&result);
@@ -775,10 +809,10 @@ async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
         );
     }
     let result = lix
-        .execute(
-            &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id"
+        ))
+        .all()
         .await
         .unwrap();
     let mut rows = decode_rows(&result);
@@ -786,10 +820,10 @@ async fn primary_key_order_without_a_range_is_served_by_the_ordered_route() {
     rows.sort();
     assert_eq!(rows, reference);
     let result = lix
-        .execute(
-            &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id DESC LIMIT 25"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM {SCHEMA} ORDER BY id DESC LIMIT 25"
+        ))
+        .all()
         .await
         .unwrap();
     let rows = decode_rows(&result);
@@ -820,10 +854,10 @@ async fn unordered_limits_read_the_first_primary_key_windows() {
         let current = reference.iter().collect::<BTreeSet<_>>();
         for limit in [1_usize, 10, 777, 100_000] {
             let result = lix
-                .execute(
-                    &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} LIMIT {limit}"),
-                    &[],
-                )
+                .query(&format!(
+                    "SELECT {SELECT_COLUMNS} FROM {SCHEMA} LIMIT {limit}"
+                ))
+                .all()
                 .await
                 .unwrap();
             let rows = decode_rows(&result);
@@ -839,15 +873,26 @@ async fn unordered_limits_read_the_first_primary_key_windows() {
             .map(|row| row.0.as_str())
             .collect::<BTreeSet<_>>();
         let result = lix
-            .execute(&format!("SELECT id FROM {SCHEMA} LIMIT 50"), &[])
+            .query(&format!("SELECT id FROM {SCHEMA} LIMIT 50"))
+            .all()
             .await
             .unwrap();
         assert_eq!(result.rows().len(), 50);
-        assert!(result.rows().iter().all(|row| match row.get::<Value>("id").unwrap() {
-            Value::Text(id) => ids.contains(id.as_str()),
-            value => panic!("unexpected id {value:?}"),
-        }));
-        let plan = physical_plan(&lix, &format!("SELECT id, value FROM {SCHEMA} LIMIT 7"), &[]).await;
+        assert!(
+            result
+                .rows()
+                .iter()
+                .all(|row| match row.get::<Value>("id").unwrap() {
+                    Value::Text(id) => ids.contains(id.as_str()),
+                    value => panic!("unexpected id {value:?}"),
+                })
+        );
+        let plan = physical_plan(
+            &lix,
+            &format!("SELECT id, value FROM {SCHEMA} LIMIT 7"),
+            &[],
+        )
+        .await;
         let physical = plan.split("physical_plan").nth(1).expect("physical plan");
         assert!(physical.contains("fetch=7"), "{plan}");
         lix.close().await.unwrap();

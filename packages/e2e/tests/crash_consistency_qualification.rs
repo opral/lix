@@ -819,10 +819,7 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S
         ],
         "primary_key": ["id"],
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-        &[Value::Text(schema.to_string())],
-    )
+    lix.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
     .await
     .expect("register crash-consistency schema");
 }
@@ -851,32 +848,30 @@ async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
     insert: bool,
 ) -> Result<(), lix::LixError> {
     let rows = workload.rows;
-    let mut transaction = lix.begin_transaction().await?;
+    let transaction = lix.begin_transaction().await?;
     for index in 0..rows {
         let payload = format!("gen-{generation}-row-{index}");
         if insert {
             transaction
-                .execute(
-                    &format!(
-                        "INSERT INTO {SCHEMA_KEY} (id, generation, payload) VALUES ($1, $2, $3)"
-                    ),
-                    &[
-                        Value::Text(format!("row-{index}")),
-                        Value::Integer(generation),
-                        Value::Text(payload),
-                    ],
-                )
+                .execute(&format!(
+                    "INSERT INTO {SCHEMA_KEY} (id, generation, payload) VALUES ($1, $2, $3)"
+                ))
+                .params(&[
+                    Value::Text(format!("row-{index}")),
+                    Value::Integer(generation),
+                    Value::Text(payload),
+                ])
                 .await?;
         } else {
             transaction
-                .execute(
-                    &format!("UPDATE {SCHEMA_KEY} SET generation = $1, payload = $2 WHERE id = $3"),
-                    &[
-                        Value::Integer(generation),
-                        Value::Text(payload),
-                        Value::Text(format!("row-{index}")),
-                    ],
-                )
+                .execute(&format!(
+                    "UPDATE {SCHEMA_KEY} SET generation = $1, payload = $2 WHERE id = $3"
+                ))
+                .params(&[
+                    Value::Integer(generation),
+                    Value::Text(payload),
+                    Value::Text(format!("row-{index}")),
+                ])
                 .await?;
         }
     }
@@ -884,17 +879,13 @@ async fn upsert_generation<S: Storage + Clone + Send + Sync + 'static>(
         let content = Value::Blob(blob_for(generation, workload.blob_bytes).into());
         if insert {
             transaction
-                .execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                    &[Value::Text(BLOB_PATH.to_owned()), content],
-                )
+                .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&[Value::Text(BLOB_PATH.to_owned()), content])
                 .await?;
         } else {
             transaction
-                .execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
-                    &[content, Value::Text(BLOB_PATH.to_owned())],
-                )
+                .execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+                .params(&[content, Value::Text(BLOB_PATH.to_owned())])
                 .await?;
         }
     }
@@ -914,10 +905,10 @@ async fn read_generations<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
 ) -> Result<Vec<i64>, ReadFailure> {
     let result = lix
-        .execute(
-            &format!("SELECT id, generation FROM {SCHEMA_KEY} ORDER BY id"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT id, generation FROM {SCHEMA_KEY} ORDER BY id"
+        ))
+        .all()
         .await
         .map_err(|error| {
             let text = error.to_string();
@@ -941,10 +932,9 @@ async fn read_blob<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
 ) -> Result<Option<Vec<u8>>, String> {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(BLOB_PATH.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(BLOB_PATH.to_owned())])
+        .all()
         .await
         .map_err(|error| error.to_string())?;
     let rows = result.rows();
@@ -963,7 +953,9 @@ async fn scalar_text<S: Storage + Clone + Send + Sync + 'static>(
     params: &[Value],
 ) -> Result<String, String> {
     let result = lix
-        .execute(sql, params)
+        .query(sql)
+        .params(params)
+        .all()
         .await
         .map_err(|error| error.to_string())?;
     let rows = result.rows();
@@ -981,7 +973,9 @@ async fn scalar_i64<S: Storage + Clone + Send + Sync + 'static>(
     params: &[Value],
 ) -> Result<i64, String> {
     let result = lix
-        .execute(sql, params)
+        .query(sql)
+        .params(params)
+        .all()
         .await
         .map_err(|error| error.to_string())?;
     let rows = result.rows();
@@ -1393,10 +1387,9 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
             .await
             .expect("reopen durable round-trip Lix");
         let result = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text(UPLOAD_PATH.to_owned())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(UPLOAD_PATH.to_owned())])
+            .all()
             .await
             .expect("read durable round-trip file");
         let rows = result.rows();

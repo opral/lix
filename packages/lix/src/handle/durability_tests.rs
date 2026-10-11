@@ -43,12 +43,9 @@ async fn repository_policy_covers_automatic_explicit_and_additional_sessions() {
             .await
             .unwrap();
         storage.take_writes();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('durability-test', '1')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('durability-test', '1')")
+            .await
+            .unwrap();
         let automatic = storage.take_writes();
         assert!(!automatic.is_empty());
         assert!(
@@ -57,12 +54,10 @@ async fn repository_policy_covers_automatic_explicit_and_additional_sessions() {
                 .all(|value| *value == (policy == Durability::Durable))
         );
 
-        lix.execute_batch(&[ExecuteBatchStatement {
-            sql: "UPDATE lix_key_value SET value = 'batch' WHERE key = 'durability-test'"
-                .to_owned(),
-            params: Vec::new(),
-            label: None,
-        }])
+        lix.execute_many(
+            "UPDATE lix_key_value SET value = 'batch' WHERE key = 'durability-test'",
+            [Vec::<Value>::new()],
+        )
         .await
         .unwrap();
         let batch = storage.take_writes();
@@ -73,12 +68,9 @@ async fn repository_policy_covers_automatic_explicit_and_additional_sessions() {
                 .all(|value| *value == (policy == Durability::Durable))
         );
 
-        let mut transaction = lix.begin_transaction().await.unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
         transaction
-            .execute(
-                "UPDATE lix_key_value SET value = '2' WHERE key = 'durability-test'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value = '2' WHERE key = 'durability-test'")
             .await
             .unwrap();
         // Staging an explicit SQL transaction must not acknowledge a storage commit.
@@ -95,10 +87,7 @@ async fn repository_policy_covers_automatic_explicit_and_additional_sessions() {
         let session = lix.open_another_session().await.unwrap();
         storage.take_writes();
         session
-            .execute(
-                "UPDATE lix_key_value SET value = '3' WHERE key = 'durability-test'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value = '3' WHERE key = 'durability-test'")
             .await
             .unwrap();
         let additional = storage.take_writes();
@@ -118,12 +107,9 @@ async fn durable_is_default_and_buffered_does_not_weaken_forced_writes() {
     let storage = RecordingStorage::default();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     assert!(!storage.take_writes().is_empty());
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('durability-default', '1')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('durability-default', '1')")
+        .await
+        .unwrap();
     let default_writes = storage.take_writes();
     assert!(!default_writes.is_empty());
     assert!(default_writes.iter().all(|value| *value));

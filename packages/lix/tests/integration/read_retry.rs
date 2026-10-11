@@ -199,20 +199,17 @@ async fn repository_open_restarts_after_its_snapshot_expires() {
         .with_storage(storage.clone())
         .await
         .expect("repository open should restart as one coherent unit");
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[
             Value::Text("open-read-retry".into()),
             Value::Text("ready".into()),
-        ],
-    )
-    .await
-    .expect("opened repository accepts writes");
+        ])
+        .await
+        .expect("opened repository accepts writes");
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text("open-read-retry".into())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text("open-read-retry".into())])
+        .all()
         .await
         .expect("opened repository accepts reads");
 
@@ -242,12 +239,9 @@ async fn fresh_repository_open_restarts_each_early_coherent_read() {
             1,
             "read {calls_before_expiry} must expire"
         );
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('admission-retry', 'ready')",
-            &[],
-        )
-        .await
-        .expect("restarted admission leaves a writable repository");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('admission-retry', 'ready')")
+            .await
+            .expect("restarted admission leaves a writable repository");
         lix.close().await.expect("close initialized repository");
     }
 }
@@ -308,19 +302,16 @@ async fn auto_commit_query_restarts_after_its_snapshot_expires() {
         .with_storage(storage.clone())
         .await
         .expect("open Lix");
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[Value::Text("read-retry".into()), Value::Integer(42)],
-    )
-    .await
-    .expect("seed value");
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[Value::Text("read-retry".into()), Value::Integer(42)])
+        .await
+        .expect("seed value");
 
     storage.expire_next_read_call();
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text("read-retry".into())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text("read-retry".into())])
+        .all()
         .await
         .expect("expired read should restart transparently");
 
@@ -338,15 +329,13 @@ async fn filesystem_provider_scan_preserves_expired_read_for_session_retry() {
         .with_storage(storage.clone())
         .await
         .expect("open Lix");
-    lix.execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
+    lix.execute("INSERT INTO lix_directory (path) VALUES ('/docs')")
         .await
         .expect("seed directory");
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', $1)",
-        &[Value::Blob(b"hello".to_vec().into())],
-    )
-    .await
-    .expect("seed file");
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', $1)")
+        .params(&[Value::Blob(b"hello".to_vec().into())])
+        .await
+        .expect("seed file");
 
     for sql in [
         "SELECT id FROM lix_directory",
@@ -354,7 +343,8 @@ async fn filesystem_provider_scan_preserves_expired_read_for_session_retry() {
     ] {
         let expired_before = storage.expired_calls();
         storage.expire_next_scan_call();
-        lix.execute(sql, &[])
+        lix.query(sql)
+            .all()
             .await
             .expect("filesystem provider must preserve the typed retry signal");
         assert_eq!(storage.expired_calls(), expired_before + 1);
@@ -368,12 +358,10 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
         .with_storage(storage.clone())
         .await
         .expect("open Lix");
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/review.md', $1)",
-        &[Value::Blob(b"pending review".to_vec().into())],
-    )
-    .await
-    .expect("seed working file");
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/review.md', $1)")
+        .params(&[Value::Blob(b"pending review".to_vec().into())])
+        .await
+        .expect("seed working file");
     let statements = [
         ExecuteBatchStatement {
             label: None,
@@ -390,7 +378,7 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
         .remaining_expired_hot_epoch_calls
         .store(1, Ordering::Release);
     let result = lix
-        .execute_batch(&statements)
+        .execute_batch_for_test(&statements)
         .await
         .expect("review must retry the whole coherent batch after HOT epoch expiration")
         .results;
@@ -413,18 +401,18 @@ async fn expired_read_progress_does_not_hold_or_wait_for_writer_gate() {
         .with_storage(storage.clone())
         .await
         .expect("open Lix");
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[Value::Text("read-quiescence".into()), Value::Integer(42)],
-    )
-    .await
-    .expect("seed value");
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[Value::Text("read-quiescence".into()), Value::Integer(42)])
+        .await
+        .expect("seed value");
 
     let writer = lix.lock_collaboration_writes().await;
     storage.expire_next_read_call();
     let params = [Value::Text("read-quiescence".into())];
     let result = tokio::time::timeout(Duration::from_secs(1), async {
-        lix.execute("SELECT value FROM lix_key_value WHERE key = $1", &params)
+        lix.query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&params)
+            .all()
             .await
     })
     .await
@@ -445,15 +433,13 @@ async fn expired_read_backs_off_until_cross_context_writer_settles() {
         .with_storage(storage.clone())
         .await
         .expect("open Lix");
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[
             Value::Text("read-external-quiescence".into()),
             Value::Integer(42),
-        ],
-    )
-    .await
-    .expect("seed value");
+        ])
+        .await
+        .expect("seed value");
 
     // A writer in another browser context does not share this engine's write
     // gate. Keep expiring fresh snapshots until that external churn settles.
@@ -469,10 +455,9 @@ async fn expired_read_backs_off_until_cross_context_writer_settles() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(4),
-        lix.execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text("read-external-quiescence".into())],
-        ),
+        lix.query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text("read-external-quiescence".into())])
+            .all(),
     )
     .await
     .expect("bounded retry should wait for external writes to settle")
@@ -499,7 +484,7 @@ async fn perpetually_expired_read_remains_bounded() {
     storage.expire_read_calls(usize::MAX);
     let error = tokio::time::timeout(
         Duration::from_secs(4),
-        lix.execute("SELECT key FROM lix_key_value", &[]),
+        lix.query("SELECT key FROM lix_key_value").all(),
     )
     .await
     .expect("retry policy must remain bounded")
@@ -521,21 +506,18 @@ async fn auto_commit_mutation_restarts_after_its_planning_snapshot_expires() {
         .expect("open Lix");
 
     storage.expire_next_read_call();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[
             Value::Text("write-retry".into()),
             Value::Text("committed".into()),
-        ],
-    )
-    .await
-    .expect("the complete auto-commit mutation should restart");
+        ])
+        .await
+        .expect("the complete auto-commit mutation should restart");
 
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text("write-retry".into())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text("write-retry".into())])
+        .all()
         .await
         .expect("read committed value");
     assert_eq!(
@@ -555,15 +537,13 @@ async fn path_update_restarts_wherever_its_snapshot_expires() {
             .with_storage(storage.clone())
             .await
             .expect("open Lix");
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
                 Value::Text("/notes.md".into()),
                 Value::Blob(b"# Notes".to_vec().into()),
-            ],
-        )
-        .await
-        .expect("create the file");
+            ])
+            .await
+            .expect("create the file");
         lix
     }
     const RENAME: &str = "UPDATE lix_file SET path = $1 WHERE path = $2";
@@ -575,7 +555,8 @@ async fn path_update_restarts_wherever_its_snapshot_expires() {
     let measured = ExpiringReadStorage::new();
     let lix = open_with_file(&measured).await;
     let reads_before = measured.read_calls();
-    lix.execute(RENAME, &rename_params)
+    lix.execute(RENAME)
+        .params(&rename_params)
         .await
         .expect("rename without expiry");
     let reads_per_rename = measured.read_calls() - reads_before;
@@ -588,7 +569,8 @@ async fn path_update_restarts_wherever_its_snapshot_expires() {
         let storage = ExpiringReadStorage::new();
         let lix = open_with_file(&storage).await;
         storage.expire_read_call_after(ordinal);
-        lix.execute(RENAME, &rename_params)
+        lix.execute(RENAME)
+            .params(&rename_params)
             .await
             .unwrap_or_else(|error| {
                 panic!("the rename must restart when read {ordinal} expires: {error:?}")
@@ -598,10 +580,9 @@ async fn path_update_restarts_wherever_its_snapshot_expires() {
         }
         exercised += 1;
         let result = lix
-            .execute(
-                "SELECT path FROM lix_file WHERE path = $1",
-                &[Value::Text("/renamed.md".into())],
-            )
+            .query("SELECT path FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/renamed.md".into())])
+            .all()
             .await
             .expect("read the renamed file");
         assert_eq!(result.rows().len(), 1, "the rename committed once");
@@ -633,16 +614,15 @@ async fn mutation_batch_restarts_atomically_after_snapshot_expiry() {
             params: vec![Value::Text("batch-right".into()), Value::Integer(2)],
         },
     ];
-    lix.execute_batch(&statements)
+    lix.execute_batch_for_test(&statements)
         .await
         .expect("the complete mutation batch should restart");
 
     for (key, expected) in [("batch-left", 1), ("batch-right", 2)] {
         let result = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = $1",
-                &[Value::Text(key.into())],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text(key.into())])
+            .all()
             .await
             .expect("read committed batch value");
         assert_eq!(
@@ -675,7 +655,7 @@ async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
         },
     ];
     let results = lix
-        .execute_batch(&statements)
+        .execute_batch_for_test(&statements)
         .await
         .expect("the complete read batch should restart")
         .results;
@@ -694,7 +674,10 @@ async fn snapshot_open_restarts_after_expiry_and_serves_every_read() {
         .expect("open Lix");
 
     storage.expire_next_read_call();
-    let snapshot = lix.snapshot().await.expect("the snapshot open should restart");
+    let snapshot = lix
+        .snapshot()
+        .await
+        .expect("the snapshot open should restart");
     let first = snapshot.query("SELECT 1 AS value").one().await.unwrap();
     let second = snapshot.query("SELECT 2 AS value").one().await.unwrap();
 

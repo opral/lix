@@ -5114,12 +5114,9 @@ mod host_provisioning_tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        seed.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES ('upgrade-proof','retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        seed.execute("INSERT INTO lix_key_value(key,value) VALUES ('upgrade-proof','retained')")
+            .await
+            .unwrap();
         seed.close().await.unwrap();
         drop(seed);
         let server = lix_sdk::open_lix()
@@ -5196,10 +5193,8 @@ mod host_provisioning_tests {
         .unwrap();
         let current = lix_sdk::open_lix().with_storage(destination).await.unwrap();
         let value = current
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='upgrade-proof'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='upgrade-proof'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -5209,10 +5204,8 @@ mod host_provisioning_tests {
         current.close().await.unwrap();
         let reopened = lix_sdk::open_lix().with_storage(storage).await.unwrap();
         let proof = reopened
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='upgrade-proof'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='upgrade-proof'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -5229,12 +5222,9 @@ mod host_provisioning_tests {
             .open_storage(ID, SlateDBIoCounters::default())
             .unwrap();
         let lix = lix_sdk::open_lix().with_storage(storage).await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('legacy-proof','retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('legacy-proof','retained')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         drop(lix);
         assert!(
@@ -5273,10 +5263,8 @@ mod host_provisioning_tests {
             .unwrap();
         let lix = lix_sdk::open_lix().with_storage(storage).await.unwrap();
         let rows = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='legacy-proof'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='legacy-proof'")
+            .all()
             .await
             .unwrap();
         assert_eq!(

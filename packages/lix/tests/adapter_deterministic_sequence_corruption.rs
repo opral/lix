@@ -26,7 +26,6 @@ where
     lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
              VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
-        &[],
     )
     .await
     .expect("deterministic mode should enable without publishing a sequence row");
@@ -41,7 +40,7 @@ where
         .await
         .expect("repository should reopen");
     let result = lix
-        .execute("SELECT uuidv7() AS value", &[])
+        .execute("SELECT uuidv7() AS value")
         .await
         .expect("valid deterministic authority should produce the next UUID");
     let value = result.rows()[0]
@@ -140,7 +139,7 @@ where
         .await
         .expect("member-corrupt repository should open structurally");
     let error = lix
-        .execute("SELECT uuidv7()", &[])
+        .execute("SELECT uuidv7()")
         .await
         .expect_err("missing selected sequence member must fail closed");
     // Format 79 detects this corruption through its generation-bound presence

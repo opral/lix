@@ -1000,14 +1000,15 @@ async fn markdown_nodes_by_kind<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
+    lix.query(
         "SELECT id, payload_json FROM markdown_node \
          WHERE kind = $1 AND lixcol_file_id = $2 ORDER BY order_key, id",
-        &[
-            Value::Text(kind.to_owned()),
-            Value::Text(file_id.to_owned()),
-        ],
     )
+    .params(&[
+        Value::Text(kind.to_owned()),
+        Value::Text(file_id.to_owned()),
+    ])
+    .all()
     .await
     .expect("query Markdown rows by kind")
     .rows()
@@ -1034,12 +1035,12 @@ async fn update_markdown_node<StorageImpl>(
             .execute(
                 "UPDATE markdown_node SET payload_json = $1 \
                  WHERE id = $2 AND lixcol_file_id = $3",
-                &[
-                    Value::Text(payload_json.clone()),
-                    Value::Text(id.to_owned()),
-                    Value::Text(file_id.to_owned()),
-                ],
             )
+            .params(&[
+                Value::Text(payload_json.clone()),
+                Value::Text(id.to_owned()),
+                Value::Text(file_id.to_owned()),
+            ])
             .await
         {
             Ok(result) => {
@@ -1092,8 +1093,8 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[Value::Text(path.to_owned()), Value::Blob(data.into())],
     )
+    .params(&[Value::Text(path.to_owned()), Value::Blob(data.into())])
     .await
     .expect("write benchmark file");
 }
@@ -1102,13 +1103,12 @@ async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("read benchmark file")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("read benchmark file")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("benchmark file should be bytes")
 }
@@ -1117,13 +1117,12 @@ async fn file_id_at_path<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Str
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT id FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("query benchmark file ID")
-    .rows()[0]
+    lix.query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("query benchmark file ID")
+        .rows()[0]
         .get::<String>("id")
         .expect("benchmark file ID should be text")
 }

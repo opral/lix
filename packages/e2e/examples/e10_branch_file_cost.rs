@@ -81,7 +81,8 @@ async fn run_case(files: usize) {
     println!("branch_file_cost_seed,files={files},seed_ms={seed_ms:.3}");
 
     let plugin_rows = lix
-        .execute("SELECT COUNT(*) AS n FROM text_line", &[])
+        .query("SELECT COUNT(*) AS n FROM text_line")
+        .all()
         .await
         .map(|result| result.rows()[0].get::<i64>("n").unwrap_or(-1))
         .unwrap_or(-1);
@@ -151,7 +152,8 @@ async fn run_case(files: usize) {
     // the full plugin-materialized state, i.e. the planes are shared and not
     // silently missing.
     let branch_plugin_rows = lix
-        .execute("SELECT COUNT(*) AS n FROM text_line", &[])
+        .query("SELECT COUNT(*) AS n FROM text_line")
+        .all()
         .await
         .map(|result| result.rows()[0].get::<i64>("n").unwrap_or(-1))
         .unwrap_or(-1);
@@ -287,15 +289,13 @@ async fn install_text_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text("/.lix/plugins/plugin_text.lixplugin".to_owned()),
             Value::Blob(build_text_plugin_archive().into()),
-        ],
-    )
-    .await
-    .expect("install branch-file-cost text plugin");
+        ])
+        .await
+        .expect("install branch-file-cost text plugin");
 }
 
 async fn seed_files<StorageImpl>(lix: &Lix<StorageImpl>, files: usize)
@@ -317,7 +317,8 @@ where
             params.push(Value::Text(format!("/docs/file-{index:07}.txt")));
             params.push(Value::Blob(one_document(index).into()));
         }
-        lix.execute(&sql, &params)
+        lix.execute(&sql)
+            .params(&params)
             .await
             .expect("seed branch-file-cost files");
         written += batch;
@@ -328,15 +329,13 @@ async fn write_probe<StorageImpl>(lix: &Lix<StorageImpl>, path: &str)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(path.to_owned()),
             Value::Blob(one_document(path.len()).into()),
-        ],
-    )
-    .await
-    .unwrap_or_else(|error| panic!("write branch-file-cost probe {path}: {error:?}"));
+        ])
+        .await
+        .unwrap_or_else(|error| panic!("write branch-file-cost probe {path}: {error:?}"));
 }
 
 fn one_document(index: usize) -> Vec<u8> {

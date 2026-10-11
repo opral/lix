@@ -22,15 +22,13 @@ async fn install_markdown<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<
         archive.start_file(path, options).unwrap();
         archive.write_all(content).unwrap();
     }
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES($1,$2)",
-        &[
+    lix.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)")
+        .params(&[
             Value::Text("/.lix/plugins/plugin_markdown.lixplugin".into()),
             Value::Blob(archive.finish().unwrap().into_inner().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
 }
 
 /// Runs read statements in order against one snapshot.
@@ -56,53 +54,51 @@ async fn snapshot_reads<S: Storage + Clone + Send + Sync + 'static>(
 }
 
 async fn semantic_edit<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S>, text: &str) {
-    lix.execute(
-        "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph'",
-        &[Value::Text(
+    lix.execute("UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph'")
+        .params(&[Value::Text(
             serde_json::json!({"inline": [{"type": "text", "value": text}]}).to_string(),
-        )],
-    )
-    .await
-    .unwrap();
+        )])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn transaction_read_refreshes_plugin_observation_after_two_foreign_edits() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(
             b"# Title\n\nAlpha.\n\nBravo.\n".to_vec().into(),
-        )],
-    )
-    .await
-    .unwrap();
+        )])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
-    let read = |result: &lix::ExecuteResult| {
+    let read = |result: &lix::QueryResult| {
         String::from_utf8(result.rows()[0].get::<Vec<u8>>("content").unwrap()).unwrap()
     };
     let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
     let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
-    read(&lix.execute(query, &[]).await.unwrap());
+    read(&lix.query(query).all().await.unwrap());
     for suffix in ["1", "2"] {
-        let text = read(&other.execute(query, &[]).await.unwrap())
+        let text = read(&other.query(query).all().await.unwrap())
             .replace("Bravo.", &format!("Bravo {suffix}."))
             .replace("Bravo 1.", &format!("Bravo {suffix}."));
         other
-            .execute(update, &[Value::Blob(text.into_bytes().into())])
+            .execute(update)
+            .params(&[Value::Blob(text.into_bytes().into())])
             .await
             .unwrap();
     }
-    let mut transaction = lix.begin_transaction().await.unwrap();
-    let text = read(&transaction.execute(query, &[]).await.unwrap()).replace("Alpha.", "Alpha A.");
+    let transaction = lix.begin_transaction().await.unwrap();
+    let text = read(&transaction.query(query).all().await.unwrap()).replace("Alpha.", "Alpha A.");
     transaction
-        .execute(update, &[Value::Blob(text.into_bytes().into())])
+        .execute(update)
+        .params(&[Value::Blob(text.into_bytes().into())])
         .await
         .unwrap();
     transaction.commit().await.unwrap();
     assert_eq!(
-        read(&other.execute(query, &[]).await.unwrap()),
+        read(&other.query(query).all().await.unwrap()),
         "# Title\n\nAlpha A.\n\nBravo 2.\n"
     );
     other.close().await.unwrap();
@@ -113,30 +109,30 @@ async fn transaction_read_refreshes_plugin_observation_after_two_foreign_edits()
 async fn committed_transaction_read_refreshes_session_observation() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Original.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Original.\n".to_vec().into())])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
     let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
     let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
-    lix.execute(query, &[]).await.unwrap();
+    lix.query(query).all().await.unwrap();
     for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
-        other.execute(query, &[]).await.unwrap();
+        other.query(query).all().await.unwrap();
         other
-            .execute(update, &[Value::Blob(text.to_vec().into())])
+            .execute(update)
+            .params(&[Value::Blob(text.to_vec().into())])
             .await
             .unwrap();
     }
-    let mut transaction = lix.begin_transaction().await.unwrap();
-    let bytes = transaction.execute(query, &[]).await.unwrap().rows()[0]
+    let transaction = lix.begin_transaction().await.unwrap();
+    let bytes = transaction.query(query).all().await.unwrap().rows()[0]
         .get::<Vec<u8>>("content")
         .unwrap();
     assert_eq!(bytes, b"Other 2.\n");
     transaction.commit().await.unwrap();
-    lix.execute(update, &[Value::Blob(b"After commit.\n".to_vec().into())])
+    lix.execute(update)
+        .params(&[Value::Blob(b"After commit.\n".to_vec().into())])
         .await
         .expect("the committed read must refresh the session's write base");
     other.close().await.unwrap();
@@ -147,28 +143,28 @@ async fn committed_transaction_read_refreshes_session_observation() {
 async fn rolled_back_transaction_read_does_not_refresh_session_observation() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Original.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Original.\n".to_vec().into())])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
     let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
     let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
-    lix.execute(query, &[]).await.unwrap();
+    lix.query(query).all().await.unwrap();
     for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
-        other.execute(query, &[]).await.unwrap();
+        other.query(query).all().await.unwrap();
         other
-            .execute(update, &[Value::Blob(text.to_vec().into())])
+            .execute(update)
+            .params(&[Value::Blob(text.to_vec().into())])
             .await
             .unwrap();
     }
-    let mut transaction = lix.begin_transaction().await.unwrap();
-    transaction.execute(query, &[]).await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction.query(query).all().await.unwrap();
     transaction.rollback().await.unwrap();
     let error = lix
-        .execute(update, &[Value::Blob(b"Unseen.\n".to_vec().into())])
+        .execute(update)
+        .params(&[Value::Blob(b"Unseen.\n".to_vec().into())])
         .await
         .unwrap_err();
     assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
@@ -180,42 +176,36 @@ async fn rolled_back_transaction_read_does_not_refresh_session_observation() {
 async fn transformed_transaction_read_does_not_acknowledge_plugin_bytes() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Original.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Original.\n".to_vec().into())])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
-    lix.execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+    lix.query("SELECT content FROM lix_file WHERE path='/doc.md'")
+        .all()
         .await
         .unwrap();
     for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
         other
-            .execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+            .query("SELECT content FROM lix_file WHERE path='/doc.md'")
+            .all()
             .await
             .unwrap();
         other
-            .execute(
-                "UPDATE lix_file SET content=$1 WHERE path='/doc.md'",
-                &[Value::Blob(text.to_vec().into())],
-            )
+            .execute("UPDATE lix_file SET content=$1 WHERE path='/doc.md'")
+            .params(&[Value::Blob(text.to_vec().into())])
             .await
             .unwrap();
     }
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute(
-            "SELECT length(content) FROM lix_file WHERE path='/doc.md'",
-            &[],
-        )
+        .query("SELECT length(content) FROM lix_file WHERE path='/doc.md'")
+        .all()
         .await
         .unwrap();
     let error = transaction
-        .execute(
-            "UPDATE lix_file SET content=$1 WHERE path='/doc.md'",
-            &[Value::Blob(b"Unseen.\n".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content=$1 WHERE path='/doc.md'")
+        .params(&[Value::Blob(b"Unseen.\n".to_vec().into())])
         .await
         .unwrap_err();
     assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
@@ -228,40 +218,37 @@ async fn transformed_transaction_read_does_not_acknowledge_plugin_bytes() {
 async fn repeated_semantic_writes_chain_after_detaching_in_one_transaction() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Initial.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Initial.\n".to_vec().into())])
+        .await
+        .unwrap();
     let file_id: String = lix
-        .execute("SELECT id FROM lix_file WHERE path='/doc.md'", &[])
+        .query("SELECT id FROM lix_file WHERE path='/doc.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get("id")
         .unwrap();
 
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for text in ["First edit.", "Second edit."] {
         transaction
-            .execute(
-                "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2",
-                &[
+            .execute("UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2").params(&[
                     Value::Text(
                         serde_json::json!({"inline": [{"type": "text", "value": text}]})
                             .to_string(),
                     ),
                     Value::Text(file_id.clone()),
-                ],
-            )
+                ])
             .await
             .expect("the second semantic statement should reattach and chain the detached actor");
     }
     transaction.commit().await.unwrap();
 
     let content = lix
-        .execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/doc.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -281,20 +268,17 @@ async fn explicit_transaction_admits_semantic_writes_under_store_pressure() {
     let mut files = Vec::new();
     for index in 0..11 {
         let path = format!("/resource-{index}.md");
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES($1,$2)",
-            &[
+        lix.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)")
+            .params(&[
                 Value::Text(path.clone()),
                 Value::Blob(format!("Initial {index}.\n").into_bytes().into()),
-            ],
-        )
-        .await
-        .unwrap();
+            ])
+            .await
+            .unwrap();
         let file_id: String = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path=$1",
-                &[Value::Text(path.clone())],
-            )
+            .query("SELECT id FROM lix_file WHERE path=$1")
+            .params(&[Value::Text(path.clone())])
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -303,19 +287,16 @@ async fn explicit_transaction_admits_semantic_writes_under_store_pressure() {
         files.push((path, file_id));
     }
 
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for (index, (_, file_id)) in files.iter().enumerate() {
         transaction
-            .execute(
-                "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2",
-                &[
+            .execute("UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2").params(&[
                     Value::Text(
                         serde_json::json!({"inline": [{"type": "text", "value": format!("Edited {index}.")}]})
                             .to_string(),
                     ),
                     Value::Text(file_id.clone()),
-                ],
-            )
+                ])
             .await
             .unwrap_or_else(|error| {
                 panic!("semantic edit {index} should fit through Store admission: {error}")
@@ -325,10 +306,9 @@ async fn explicit_transaction_admits_semantic_writes_under_store_pressure() {
 
     for (index, (path, _)) in files.iter().enumerate() {
         let content = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path=$1",
-                &[Value::Text(path.clone())],
-            )
+            .query("SELECT content FROM lix_file WHERE path=$1")
+            .params(&[Value::Text(path.clone())])
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -343,29 +323,27 @@ async fn explicit_transaction_admits_semantic_writes_under_store_pressure() {
 async fn concurrent_plugin_writes_replay_auto_commit_snapshot_conflicts() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Alpha 0.\n\nBravo 0.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Alpha 0.\n\nBravo 0.\n".to_vec().into())])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
     let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
     let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
     for index in 1..=30 {
         let a_text = String::from_utf8(
-            lix.execute(query, &[]).await.unwrap().rows()[0]
+            lix.query(query).all().await.unwrap().rows()[0]
                 .get::<Vec<u8>>("content")
                 .unwrap(),
         )
         .unwrap();
         let b_text = String::from_utf8(
-            other.execute(query, &[]).await.unwrap().rows()[0]
+            other.query(query).all().await.unwrap().rows()[0]
                 .get::<Vec<u8>>("content")
                 .unwrap(),
         )
         .unwrap();
-        let mut transaction = lix.begin_transaction().await.unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
         let a_text = a_text
             .lines()
             .map(|line| {
@@ -391,19 +369,22 @@ async fn concurrent_plugin_writes_replay_auto_commit_snapshot_conflicts() {
             .join("\n")
             + "\n";
         transaction
-            .execute(update, &[Value::Blob(a_text.into_bytes().into())])
+            .execute(update)
+            .params(&[Value::Blob(a_text.into_bytes().into())])
             .await
             .unwrap();
         let b_params = [Value::Blob(b_text.into_bytes().into())];
-        let (commit, auto_commit) =
-            tokio::join!(transaction.commit(), other.execute(update, &b_params));
+        let (commit, auto_commit) = tokio::join!(
+            transaction.commit(),
+            other.execute(update).params(&b_params)
+        );
         let committed_alpha = commit.is_ok();
         if let Err(error) = commit {
             assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
         }
         auto_commit.expect("the auto-commit plugin edit must replay a snapshot conflict");
         let current = String::from_utf8(
-            other.execute(query, &[]).await.unwrap().rows()[0]
+            other.query(query).all().await.unwrap().rows()[0]
                 .get::<Vec<u8>>("content")
                 .unwrap(),
         )
@@ -421,33 +402,30 @@ async fn concurrent_plugin_writes_replay_auto_commit_snapshot_conflicts() {
 async fn stale_transaction_snapshot_conflicts_and_keeps_current_actor_usable() {
     let lix = open_lix().with_storage(Memory::new()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
-        &[Value::Blob(b"Alpha.\n\nBravo.\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)")
+        .params(&[Value::Blob(b"Alpha.\n\nBravo.\n".to_vec().into())])
+        .await
+        .unwrap();
     let other = lix.open_another_session().await.unwrap();
     let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
     let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
-    let before = lix.execute(query, &[]).await.unwrap().rows()[0]
+    let before = lix.query(query).all().await.unwrap().rows()[0]
         .get::<Vec<u8>>("content")
         .unwrap();
-    let mut transaction = lix.begin_transaction().await.unwrap();
-    transaction.execute(query, &[]).await.unwrap();
-    other.execute(query, &[]).await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction.query(query).all().await.unwrap();
+    other.query(query).all().await.unwrap();
     other
-        .execute(
-            update,
-            &[Value::Blob(b"Alpha.\n\nBravo 1.\n".to_vec().into())],
-        )
+        .execute(update)
+        .params(&[Value::Blob(b"Alpha.\n\nBravo 1.\n".to_vec().into())])
         .await
         .unwrap();
     let attempted = String::from_utf8(before)
         .unwrap()
         .replace("Alpha.", "Alpha A.");
     let write = transaction
-        .execute(update, &[Value::Blob(attempted.into_bytes().into())])
+        .execute(update)
+        .params(&[Value::Blob(attempted.into_bytes().into())])
         .await;
     let error = match write {
         Ok(_) => transaction.commit().await.unwrap_err(),
@@ -457,13 +435,11 @@ async fn stale_transaction_snapshot_conflicts_and_keeps_current_actor_usable() {
         }
     };
     assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
-    lix.execute(
-        update,
-        &[Value::Blob(b"Alpha A.\n\nBravo.\n".to_vec().into())],
-    )
-    .await
-    .expect("the stale observation must still rebase through the current actor");
-    let content = other.execute(query, &[]).await.unwrap().rows()[0]
+    lix.execute(update)
+        .params(&[Value::Blob(b"Alpha A.\n\nBravo.\n".to_vec().into())])
+        .await
+        .expect("the stale observation must still rebase through the current actor");
+    let content = other.query(query).all().await.unwrap().rows()[0]
         .get::<Vec<u8>>("content")
         .unwrap();
     assert_eq!(content, b"Alpha A.\n\nBravo 1.\n");
@@ -479,10 +455,8 @@ async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
         install_markdown(&primary).await;
         let backing = primary.open_storage_session(storage).await.unwrap();
         backing
-            .execute(
-                "INSERT INTO lix_file(path,content) VALUES('/a.md',$1)",
-                &[Value::Blob(b"initial\n".to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file(path,content) VALUES('/a.md',$1)")
+            .params(&[Value::Blob(b"initial\n".to_vec().into())])
             .await
             .unwrap();
         for index in 0..3 {
@@ -497,32 +471,19 @@ async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
             if coherent {
                 snapshot_reads(&backing, &statements).await;
             } else {
-                backing
-                    .execute_batch(
-                        &statements
-                            .iter()
-                            .map(|(sql, params)| ExecuteBatchStatement {
-                                label: None,
-                                sql: (*sql).to_owned(),
-                                params: params.to_vec(),
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .await
-                    .unwrap();
+                sequential_reads(&backing, &statements).await;
             }
             let external = format!("external {index}\n");
             backing
-                .execute(
-                    "UPDATE lix_file SET content=$1 WHERE path='/a.md'",
-                    &[Value::Blob(external.clone().into_bytes().into())],
-                )
+                .execute("UPDATE lix_file SET content=$1 WHERE path='/a.md'")
+                .params(&[Value::Blob(external.clone().into_bytes().into())])
                 .await
                 .expect(
                     "a mixed snapshot delivers current bytes and must refresh their observation",
                 );
             let rows = primary
-                .execute("SELECT content FROM lix_file WHERE path='/a.md'", &[])
+                .query("SELECT content FROM lix_file WHERE path='/a.md'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -557,7 +518,8 @@ async fn filesystem_import_follows_primary_semantic_edits() {
             .await
             .expect("external edits must import after primary semantic edits");
         let rows = primary
-            .execute("SELECT content FROM lix_file WHERE path='/a.md'", &[])
+            .query("SELECT content FROM lix_file WHERE path='/a.md'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -578,10 +540,8 @@ async fn mixed_read_batches_do_not_acknowledge_aggregate_file_bytes() {
         install_markdown(&primary).await;
         let backing = primary.open_storage_session(storage).await.unwrap();
         backing
-            .execute(
-                "INSERT INTO lix_file(path,content) VALUES('/a.md',$1),('/b.md',$1)",
-                &[Value::Blob(b"initial\n".to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file(path,content) VALUES('/a.md',$1),('/b.md',$1)")
+            .params(&[Value::Blob(b"initial\n".to_vec().into())])
             .await
             .unwrap();
         semantic_edit(&primary, "primary edit").await;
@@ -598,30 +558,17 @@ async fn mixed_read_batches_do_not_acknowledge_aggregate_file_bytes() {
         if coherent {
             snapshot_reads(&backing, &statements).await;
         } else {
-            backing
-                .execute_batch(
-                    &statements
-                        .iter()
-                        .map(|(sql, params)| ExecuteBatchStatement {
-                            label: None,
-                            sql: (*sql).to_owned(),
-                            params: params.to_vec(),
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                .unwrap();
+            sequential_reads(&backing, &statements).await;
         }
         let error = backing
-            .execute(
-                "UPDATE lix_file SET content=$1 WHERE path='/b.md'",
-                &[Value::Blob(b"stale replacement\n".to_vec().into())],
-            )
+            .execute("UPDATE lix_file SET content=$1 WHERE path='/b.md'")
+            .params(&[Value::Blob(b"stale replacement\n".to_vec().into())])
             .await
             .expect_err("aggregate results must not authorize replacing unseen current file bytes");
         assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
         let rows = primary
-            .execute("SELECT content FROM lix_file WHERE path='/b.md'", &[])
+            .query("SELECT content FROM lix_file WHERE path='/b.md'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -646,10 +593,8 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                 install_markdown(&primary).await;
                 let backing = primary.open_storage_session(storage).await.unwrap();
                 backing
-                    .execute(
-                        "INSERT INTO lix_file(path,content) VALUES('/a.md',$1),('/b.md',$1)",
-                        &[Value::Blob(b"initial\n".to_vec().into())],
-                    )
+                    .execute("INSERT INTO lix_file(path,content) VALUES('/a.md',$1),('/b.md',$1)")
+                    .params(&[Value::Blob(b"initial\n".to_vec().into())])
                     .await
                     .unwrap();
                 semantic_edit(&primary, "primary edit").await;
@@ -663,23 +608,7 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                 let results = if coherent {
                     snapshot_reads(&backing, &statements).await
                 } else {
-                    backing
-                        .execute_batch(
-                            &statements
-                                .iter()
-                                .map(|(sql, params)| ExecuteBatchStatement {
-                                    label: None,
-                                    sql: (*sql).to_owned(),
-                                    params: params.to_vec(),
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                        .await
-                        .unwrap()
-                        .results
-                        .into_iter()
-                        .map(|result| result.rows().to_vec())
-                        .collect()
+                    sequential_reads(&backing, &statements).await
                 };
                 let result = &results[usize::from(!files_first)];
                 assert_eq!(result.len(), 1);
@@ -688,22 +617,19 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                     b"primary edit\n"
                 );
                 backing
-                    .execute(
-                        "UPDATE lix_file SET content=$1 WHERE path='/a.md'",
-                        &[Value::Blob(b"seen replacement\n".to_vec().into())],
-                    )
+                    .execute("UPDATE lix_file SET content=$1 WHERE path='/a.md'")
+                    .params(&[Value::Blob(b"seen replacement\n".to_vec().into())])
                     .await
                     .expect("the returned file must be acknowledged");
                 let error = backing
-                    .execute(
-                        "UPDATE lix_file SET content=$1 WHERE path='/b.md'",
-                        &[Value::Blob(b"unseen replacement\n".to_vec().into())],
-                    )
+                    .execute("UPDATE lix_file SET content=$1 WHERE path='/b.md'")
+                    .params(&[Value::Blob(b"unseen replacement\n".to_vec().into())])
                     .await
                     .expect_err("a filtered or limited-out file must retain its stale observation");
                 assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
                 let rows = primary
-                    .execute("SELECT content FROM lix_file WHERE path='/b.md'", &[])
+                    .query("SELECT content FROM lix_file WHERE path='/b.md'")
+                    .all()
                     .await
                     .unwrap();
                 assert_eq!(
@@ -749,33 +675,31 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
     }
     lix.execute(
         "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_json.lixplugin',$1)",
-        &[Value::Blob(archive.finish().unwrap().into_inner().into())],
     )
+    .params(&[Value::Blob(archive.finish().unwrap().into_inner().into())])
     .await
     .unwrap();
 
     // Both ownerless files enter the fresh-import worker batch in one statement.
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/switch.md',$1),('/keep.md',$2)",
-        &[
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/switch.md',$1),('/keep.md',$2)")
+        .params(&[
             Value::Blob(b"switch original\n".to_vec().into()),
             Value::Blob(b"keep original\n".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     let file_id: String = lix
-        .execute("SELECT id FROM lix_file WHERE path='/switch.md'", &[])
+        .query("SELECT id FROM lix_file WHERE path='/switch.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
         .get("id")
         .unwrap();
     let original_rows = lix
-        .execute(
-            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()
@@ -789,20 +713,17 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
         Value::Blob(json_bytes.clone().into()),
         Value::Text(file_id.clone()),
     ];
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute(
-            "UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2",
-            &params,
-        )
+        .execute("UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2")
+        .params(&params)
         .await
         .expect("a different selected plugin must open a fresh actor");
     assert!(
         transaction
-            .execute(
-                "SELECT id FROM markdown_node WHERE lixcol_file_id=$1",
-                &[Value::Text(file_id.clone())],
-            )
+            .query("SELECT id FROM markdown_node WHERE lixcol_file_id=$1")
+            .params(&[Value::Text(file_id.clone())])
+            .all()
             .await
             .unwrap()
             .rows()
@@ -810,10 +731,9 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
     );
     assert_eq!(
         transaction
-            .execute(
-                "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
-                &[Value::Text(file_id.clone())],
-            )
+            .query("SELECT key FROM json_object_member WHERE lixcol_file_id=$1")
+            .params(&[Value::Text(file_id.clone())])
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -824,10 +744,9 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
     transaction.rollback().await.unwrap();
 
     let after_rollback = lix
-        .execute(
-            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()
@@ -839,20 +758,18 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
         "rollback restores the original semantic identities"
     );
     assert!(
-        lix.execute(
-            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT key FROM json_object_member WHERE lixcol_file_id=$1")
+            .params(&[Value::Text(file_id.clone())])
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     let original = lix
-        .execute(
-            "SELECT path,content FROM lix_file WHERE id=$1",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT path,content FROM lix_file WHERE id=$1")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -864,27 +781,23 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
         b"switch original\n"
     );
 
-    lix.execute(
-        "UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2",
-        &params,
-    )
-    .await
-    .expect("retry after rollback must publish the new plugin's actor");
-    assert!(
-        lix.execute(
-            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1",
-            &[Value::Text(file_id.clone())],
-        )
+    lix.execute("UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2")
+        .params(&params)
         .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        .expect("retry after rollback must publish the new plugin's actor");
+    assert!(
+        lix.query("SELECT id FROM markdown_node WHERE lixcol_file_id=$1")
+            .params(&[Value::Text(file_id.clone())])
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     let members = lix
-        .execute(
-            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
-            &[Value::Text(file_id.clone())],
-        )
+        .query("SELECT key FROM json_object_member WHERE lixcol_file_id=$1")
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(members.rows().len(), 1);
@@ -893,10 +806,11 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
         "replacement"
     );
     let owner = lix
-        .execute(
+        .query(
             "SELECT value FROM lix_key_value WHERE lixcol_file_id=$1 AND key='lix_plugin_owner_v2'",
-            &[Value::Text(file_id.clone())],
         )
+        .params(&[Value::Text(file_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(owner.rows().len(), 1);
@@ -904,7 +818,7 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
         panic!("owner must be JSON");
     };
     assert_eq!(owner.to_value()["plugin_key"], "plugin_json");
-    let files = lix.execute("SELECT path,content FROM lix_file WHERE path IN ('/switch.json','/keep.md') ORDER BY path", &[]).await.unwrap();
+    let files = lix.query("SELECT path,content FROM lix_file WHERE path IN ('/switch.json','/keep.md') ORDER BY path").all().await.unwrap();
     assert_eq!(files.rows().len(), 2);
     assert_eq!(
         files.rows()[0].get::<Vec<u8>>("content").unwrap(),
@@ -916,20 +830,17 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
     );
 
     // A subsequent ordinary edit exercises the newly published actor's authority.
-    lix.execute(
-        "UPDATE lix_file SET content=$1 WHERE id=$2",
-        &[
+    lix.execute("UPDATE lix_file SET content=$1 WHERE id=$2")
+        .params(&[
             Value::Blob(br#"{"followup":"warm"}"#.to_vec().into()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     let members = lix
-        .execute(
-            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
-            &[Value::Text(file_id)],
-        )
+        .query("SELECT key FROM json_object_member WHERE lixcol_file_id=$1")
+        .params(&[Value::Text(file_id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(members.rows().len(), 1);
@@ -944,13 +855,11 @@ async fn markdown_sql_edits_and_documented_insert_survive_reopen() {
     let storage = Memory::new();
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     install_markdown(&lix).await;
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/sql-edit.md',$1)",
-        &[Value::Blob(b"`old`\n".to_vec().into())],
-    )
-    .await
-    .unwrap();
-    let rows = lix.execute("SELECT id, parent_id, lixcol_file_id, payload_json FROM markdown_node WHERE kind='paragraph'", &[]).await.unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/sql-edit.md',$1)")
+        .params(&[Value::Blob(b"`old`\n".to_vec().into())])
+        .await
+        .unwrap();
+    let rows = lix.query("SELECT id, parent_id, lixcol_file_id, payload_json FROM markdown_node WHERE kind='paragraph'").all().await.unwrap();
     let row = &rows.rows()[0];
     let id: String = row.get("id").unwrap();
     let root: String = row.get("parent_id").unwrap();
@@ -960,30 +869,24 @@ async fn markdown_sql_edits_and_documented_insert_survive_reopen() {
     };
     let mut payload = payload.to_value();
     payload["inline"][0]["value"] = serde_json::json!("new");
-    lix.execute(
-        "UPDATE markdown_node SET payload_json=$1 WHERE id=$2 AND lixcol_file_id=$3",
-        &[
+    lix.execute("UPDATE markdown_node SET payload_json=$1 WHERE id=$2 AND lixcol_file_id=$3")
+        .params(&[
             Value::Text(payload.to_string()),
             Value::Text(id.clone()),
             Value::Text(file.clone()),
-        ],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "UPDATE markdown_node SET order_key='40' WHERE id=$1",
-        &[Value::Text(id.clone())],
-    )
-    .await
-    .unwrap();
-    lix.execute("INSERT INTO markdown_node (kind,parent_id,order_key,payload_json,format_json,lixcol_file_id) VALUES ('paragraph',$1,'60','{\"inline\":[{\"type\":\"text\",\"value\":\"New paragraph.\"}]}','{}',$2)", &[Value::Text(root), Value::Text(file.clone())]).await.unwrap();
+        ])
+        .await
+        .unwrap();
+    lix.execute("UPDATE markdown_node SET order_key='40' WHERE id=$1")
+        .params(&[Value::Text(id.clone())])
+        .await
+        .unwrap();
+    lix.execute("INSERT INTO markdown_node (kind,parent_id,order_key,payload_json,format_json,lixcol_file_id) VALUES ('paragraph',$1,'60','{\"inline\":[{\"type\":\"text\",\"value\":\"New paragraph.\"}]}','{}',$2)").params(&[Value::Text(root), Value::Text(file.clone())]).await.unwrap();
     lix.close().await.unwrap();
     let reopened = open_lix().with_storage(storage).await.unwrap();
     let bytes = reopened
-        .execute(
-            "SELECT content FROM lix_file WHERE path='/sql-edit.md'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path='/sql-edit.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -991,10 +894,9 @@ async fn markdown_sql_edits_and_documented_insert_survive_reopen() {
         .unwrap();
     assert_eq!(bytes, b"`new`\n\nNew paragraph.\n");
     let rows = reopened
-        .execute(
-            "SELECT payload_json FROM markdown_node WHERE id=$1 AND lixcol_file_id=$2",
-            &[Value::Text(id), Value::Text(file)],
-        )
+        .query("SELECT payload_json FROM markdown_node WHERE id=$1 AND lixcol_file_id=$2")
+        .params(&[Value::Text(id), Value::Text(file)])
+        .all()
         .await
         .unwrap();
     let Value::Jsonb(payload) = rows.rows()[0].get::<Value>("payload_json").unwrap() else {
@@ -1011,29 +913,23 @@ async fn markdown_rejected_semantic_edit_preserves_durable_rows_and_bytes() {
     let lix = open_lix().with_storage(storage.clone()).await.unwrap();
     install_markdown(&lix).await;
     let original = b"<div>keep</div>\n".to_vec();
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES('/guard.md',$1)",
-        &[Value::Blob(original.clone().into())],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/guard.md',$1)")
+        .params(&[Value::Blob(original.clone().into())])
+        .await
+        .unwrap();
     let before = lix
-        .execute(
-            "SELECT id,payload_json FROM markdown_node WHERE kind='html_block'",
-            &[],
-        )
+        .query("SELECT id,payload_json FROM markdown_node WHERE kind='html_block'")
+        .all()
         .await
         .unwrap();
     let id: String = before.rows()[0].get("id").unwrap();
     let payload: Value = before.rows()[0].get("payload_json").unwrap();
     let result = lix
-        .execute(
-            "UPDATE markdown_node SET payload_json=$1 WHERE id=$2",
-            &[
-                Value::Text(serde_json::json!({"value":"ordinary paragraph\n"}).to_string()),
-                Value::Text(id.clone()),
-            ],
-        )
+        .execute("UPDATE markdown_node SET payload_json=$1 WHERE id=$2")
+        .params(&[
+            Value::Text(serde_json::json!({"value":"ordinary paragraph\n"}).to_string()),
+            Value::Text(id.clone()),
+        ])
         .await;
     assert!(
         result.is_err(),
@@ -1042,7 +938,8 @@ async fn markdown_rejected_semantic_edit_preserves_durable_rows_and_bytes() {
     lix.close().await.unwrap();
     let reopened = open_lix().with_storage(storage).await.unwrap();
     let bytes = reopened
-        .execute("SELECT content FROM lix_file WHERE path='/guard.md'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/guard.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1050,10 +947,9 @@ async fn markdown_rejected_semantic_edit_preserves_durable_rows_and_bytes() {
         .unwrap();
     assert_eq!(bytes, original);
     let after = reopened
-        .execute(
-            "SELECT payload_json FROM markdown_node WHERE id=$1",
-            &[Value::Text(id)],
-        )
+        .query("SELECT payload_json FROM markdown_node WHERE id=$1")
+        .params(&[Value::Text(id)])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1061,4 +957,24 @@ async fn markdown_rejected_semantic_edit_preserves_durable_rows_and_bytes() {
         payload
     );
     reopened.close().await.unwrap();
+}
+
+/// Runs read statements one after another on the handle, each at the latest
+/// state.
+async fn sequential_reads<S: Storage + Clone + Send + Sync + 'static>(
+    lix: &Lix<S>,
+    statements: &[(&str, &[Value])],
+) -> Vec<Vec<lix::Row>> {
+    let mut results = Vec::new();
+    for (sql, params) in statements {
+        results.push(
+            lix.query(sql)
+                .params(*params)
+                .all()
+                .await
+                .unwrap()
+                .into_rows(),
+        );
+    }
+    results
 }

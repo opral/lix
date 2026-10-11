@@ -243,7 +243,8 @@ mod tests {
         use bytes::Bytes;
         let lix = crate::open_lix().await.unwrap();
         let source = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]

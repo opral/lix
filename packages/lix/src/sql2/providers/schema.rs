@@ -5174,10 +5174,11 @@ mod tests {
             .with_storage(crate::Memory::new())
             .await
             .unwrap();
-        lix.execute("INSERT INTO lix_file(id,path) VALUES ('01920000-0000-7000-8000-0000000000a1','/scope-a'), ('01920000-0000-7000-8000-0000000000a2','/scope-b')", &[]).await.unwrap();
-        lix.execute("INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES ('shared-pk','none',NULL), ('shared-pk','a','01920000-0000-7000-8000-0000000000a1'), ('shared-pk','b','01920000-0000-7000-8000-0000000000a2')", &[]).await.unwrap();
+        lix.execute("INSERT INTO lix_file(id,path) VALUES ('01920000-0000-7000-8000-0000000000a1','/scope-a'), ('01920000-0000-7000-8000-0000000000a2','/scope-b')").await.unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES ('shared-pk','none',NULL), ('shared-pk','a','01920000-0000-7000-8000-0000000000a1'), ('shared-pk','b','01920000-0000-7000-8000-0000000000a2')").await.unwrap();
         let result = lix
-            .execute("SELECT value FROM lix_key_value WHERE key='shared-pk'", &[])
+            .query("SELECT value FROM lix_key_value WHERE key='shared-pk'")
+            .all()
             .await
             .unwrap();
         let values = result
@@ -5195,32 +5196,28 @@ mod tests {
             std::collections::BTreeSet::from(["none".to_owned(), "a".to_owned(), "b".to_owned()])
         );
         assert!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 0",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()
-            .is_empty()
+            lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 0")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
         );
         assert_eq!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 1",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()
-            .len(),
+            lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 1")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
             1
         );
-        assert_eq!(lix.execute("SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id='01920000-0000-7000-8000-0000000000a1'", &[]).await.unwrap().rows().len(), 1);
+        assert_eq!(lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id='01920000-0000-7000-8000-0000000000a1'").all().await.unwrap().rows().len(), 1);
         assert_eq!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id IS NULL",
-                &[]
+            lix.query(
+                "SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id IS NULL"
             )
+            .all()
             .await
             .unwrap()
             .rows()
@@ -5238,60 +5235,47 @@ mod tests {
             .unwrap();
         let file_a = "01920000-0000-7000-8000-0000000000a1";
         let file_b = "01920000-0000-7000-8000-0000000000a2";
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_file(id,path) VALUES ('{file_a}','/range-a'), ('{file_b}','/range-b')"
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_file(id,path) VALUES ('{file_a}','/range-a'), ('{file_b}','/range-b')"
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES \
+        lix.execute(&format!(
+            "INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES \
                  ('range-2','local-null-r2',NULL), \
                  ('range-2','local-a-r2','{file_a}'), \
                  ('range-3','local-a-r3','{file_a}'), \
                  ('range-2','local-b-r2','{file_b}'), \
                  ('range-3','local-b-r3','{file_b}')"
-            ),
-            &[],
-        )
+        ))
         .await
         .unwrap();
         // A global file-backed row needs its owner in the global branch.
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{file_b}','/global-range-b',TRUE)"
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{file_b}','/global-range-b',TRUE)"
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_key_value(key,value,lixcol_file_id,lixcol_global) VALUES \
+        lix.execute(&format!(
+            "INSERT INTO lix_key_value(key,value,lixcol_file_id,lixcol_global) VALUES \
                  ('range-2','global-null-r2',NULL,TRUE), \
                  ('range-3','global-null-r3',NULL,TRUE), \
                  ('range-3','global-b-r3','{file_b}',TRUE)",
-            ),
-            &[],
-        )
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!("DELETE FROM lix_key_value WHERE key='range-3' AND lixcol_file_id='{file_b}'"),
-            &[],
-        )
+        lix.execute(&format!(
+            "DELETE FROM lix_key_value WHERE key='range-3' AND lixcol_file_id='{file_b}'"
+        ))
         .await
         .unwrap();
 
         let result = lix
-            .execute(
+            .query(
                 "SELECT key, value, lixcol_file_id, lixcol_global \
                  FROM lix_key_value WHERE key >= 'range-2' AND key < 'range-4'",
-                &[],
             )
+            .all()
             .await
             .unwrap();
         let rows = result

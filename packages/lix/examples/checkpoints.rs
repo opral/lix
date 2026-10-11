@@ -4,34 +4,31 @@ use lix::{LixError, Value, open_lix};
 async fn main() -> Result<(), LixError> {
     let lix = open_lix().await?;
     let initial_checkpoint = lix
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
-            &[
-                Value::Text("Start checkpoint example".into()),
-                Value::Jsonb(serde_json::json!({"_type":"zettel_doc","blocks":[]}).into()),
-            ],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)")
+        .params(&[
+            Value::Text("Start checkpoint example".into()),
+            Value::Jsonb(serde_json::json!({"_type":"zettel_doc","blocks":[]}).into()),
+        ])
         .await?
         .rows()[0]
         .get::<String>("commit_id")?;
 
     // Writes to a tracked SQL surface create ordinary working diffs.
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+        .params(&[
             Value::Text("checkpoint-demo".to_string()),
             Value::Text("draft".to_string()),
-        ],
-    )
-    .await?;
+        ])
+        .await?;
 
     let working_diffs = lix
-        .execute(
+        .query(
             "SELECT row_ref, key, diff_type, from_value, to_value
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())
              ORDER BY key",
-            &[Value::Text(initial_checkpoint)],
         )
+        .params(&[Value::Text(initial_checkpoint)])
+        .all()
         .await?;
 
     for row in working_diffs.rows() {
@@ -42,7 +39,7 @@ async fn main() -> Result<(), LixError> {
         println!("{diff_type} lix_key_value {key} ({row_ref})");
     }
     let checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)", &[
+        .execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)").params(&[
             Value::Text("Save draft key".into()),
             Value::Jsonb(serde_json::json!({
                 "_type":"zettel_doc",
@@ -58,14 +55,14 @@ async fn main() -> Result<(), LixError> {
 
     // Checkpoint membership filters the first-parent commit log.
     let checkpoints = lix
-        .execute(
+        .query(
             "SELECT l.commit_id, l.position, c.title
              FROM lix_log() AS l
              JOIN lix_conversation AS c ON c.id = l.conversation_id
              WHERE l.is_checkpoint
              ORDER BY position",
-            &[],
         )
+        .all()
         .await?;
 
     for row in checkpoints.rows() {
@@ -75,11 +72,12 @@ async fn main() -> Result<(), LixError> {
         println!("depth {depth}: {commit_id} {title}");
     }
     let remaining = lix
-        .execute(
+        .query(
             "SELECT COUNT(*) AS count
              FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id())",
-            &[Value::Text(checkpoint)],
         )
+        .params(&[Value::Text(checkpoint)])
+        .all()
         .await?;
     let remaining_count = remaining.rows()[0].get::<i64>("count")?;
     println!("working diffs after checkpoint: {remaining_count}");

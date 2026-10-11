@@ -605,10 +605,7 @@ mod tests {
             .await
             .unwrap();
         initial
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('legacy-content','preserved')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('legacy-content','preserved')")
             .await
             .unwrap();
         let repository_id = initial.lix_id().to_owned();
@@ -649,10 +646,7 @@ mod tests {
             "opening old storage must tolerate an absent observable token"
         );
         reopened
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('observable-token-upgrade','visible')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('observable-token-upgrade','visible')")
             .await
             .unwrap();
         assert!(
@@ -671,7 +665,6 @@ mod tests {
             .unwrap();
         lix.execute(
             "INSERT INTO lix_key_value (key,value) VALUES ('architectural-cut','preserved')",
-            &[],
         )
         .await
         .unwrap();
@@ -710,10 +703,8 @@ mod tests {
         assert_eq!(content_digest(&storage).await.unwrap(), before);
         assert_eq!(
             reopened
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key='architectural-cut'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key='architectural-cut'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -744,39 +735,31 @@ mod tests {
             .unwrap();
         lix.execute(
             "INSERT INTO lix_key_value (key,value) VALUES ('checkpoint-migration', 'preserved')",
-            &[],
         )
         .await
         .unwrap();
         let checkpoint = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("commit_id")
             .unwrap();
         let undo = lix
-            .execute(
-                "SELECT commit_id FROM lix_undo($1)",
-                &[crate::Value::Text(checkpoint.clone())],
-            )
+            .execute("SELECT commit_id FROM lix_undo($1)")
+            .params(&[crate::Value::Text(checkpoint.clone())])
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("commit_id")
             .unwrap();
         assert!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .rows()
-            .is_empty()
+            lix.query("SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
         );
         lix.close().await.unwrap();
 
@@ -799,17 +782,17 @@ mod tests {
         assert_eq!(content_digest(&storage).await.unwrap(), before);
 
         let missing = reopened
-            .execute("SELECT is_checkpoint FROM lix_commit", &[])
+            .query("SELECT is_checkpoint FROM lix_commit")
+            .all()
             .await
             .expect_err("checkpoint membership is no longer a lix_commit column");
         assert_eq!(missing.code, LixError::CODE_COLUMN_NOT_FOUND);
         for id in [&checkpoint, &undo] {
             assert_eq!(
                 reopened
-                    .execute(
-                        "SELECT id FROM lix_commit WHERE id = $1",
-                        &[crate::Value::Text(id.clone())],
-                    )
+                    .query("SELECT id FROM lix_commit WHERE id = $1")
+                    .params(&[crate::Value::Text(id.clone())])
+                    .all()
                     .await
                     .unwrap()
                     .rows()
@@ -820,13 +803,12 @@ mod tests {
         }
         assert!(
             reopened
-                .execute(
-                    "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2",
-                    &[
-                        crate::Value::Text(checkpoint.clone()),
-                        crate::Value::Text(checkpoint.clone()),
-                    ],
-                )
+                .query("SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2")
+                .params(&[
+                    crate::Value::Text(checkpoint.clone()),
+                    crate::Value::Text(checkpoint.clone()),
+                ])
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -836,13 +818,12 @@ mod tests {
         );
         assert!(
             !reopened
-                .execute(
-                    "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2",
-                    &[
-                        crate::Value::Text(undo.clone()),
-                        crate::Value::Text(checkpoint.clone()),
-                    ],
-                )
+                .query("SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2")
+                .params(&[
+                    crate::Value::Text(undo.clone()),
+                    crate::Value::Text(checkpoint.clone()),
+                ])
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -851,18 +832,14 @@ mod tests {
             "undo state must continue to retire the checkpoint at its anchor"
         );
         reopened
-            .execute(
-                "SELECT commit_id FROM lix_redo($1)",
-                &[crate::Value::Text(undo)],
-            )
+            .execute("SELECT commit_id FROM lix_redo($1)")
+            .params(&[crate::Value::Text(undo)])
             .await
             .unwrap();
         assert_eq!(
             reopened
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'",
-                    &[],
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -1272,12 +1249,9 @@ mod tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('v79-preserved','source')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('v79-preserved','source')")
+            .await
+            .unwrap();
         let embedded_id = lix.lix_id().to_owned();
         lix.close().await.unwrap();
         let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
@@ -1298,12 +1272,9 @@ mod tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "UPDATE lix_key_value SET value='unplanned' WHERE key='v79-preserved'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value='unplanned' WHERE key='v79-preserved'")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         assert_ne!(
             content_digest(&storage).await.unwrap(),
@@ -1324,12 +1295,9 @@ mod tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('preserved','yes')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('preserved','yes')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
             .await

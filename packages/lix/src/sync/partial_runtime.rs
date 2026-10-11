@@ -541,17 +541,23 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             let mut resident = true;
             for page in addresses.chunks(super::transfer::MANIFEST_PAGE_ITEMS) {
                 resident &= super::partial_blob::manifests_are_resident(storage, state, page)
-                    .await?.into_iter().all(|present| present);
+                    .await?
+                    .into_iter()
+                    .all(|present| present);
             }
             Ok(resident)
         }
         SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
             let mut resident = true;
             for page in ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
-                let hashes = page.iter().map(|id| crate::binary_cas::ChunkHash::from_hex(id))
+                let hashes = page
+                    .iter()
+                    .map(|id| crate::binary_cas::ChunkHash::from_hex(id))
                     .collect::<Result<Vec<_>, _>>()?;
                 resident &= super::partial_blob::chunks_are_resident(storage, state, &hashes)
-                    .await?.into_iter().all(|present| present);
+                    .await?
+                    .into_iter()
+                    .all(|present| present);
             }
             Ok(resident)
         }
@@ -578,7 +584,11 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
 
 // Speculative history inputs share the exact batch path. If that attempt fails,
 // revalidate/fetch only the original required prefix before deciding query fate.
-pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient + Clone + 'static>(
+pub(super) fn hydrate_demand<
+    'a,
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+>(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
     transport: &'a HttpSyncTransport<C>,
@@ -749,12 +759,7 @@ fn hydrate_demand_with_context<
                         .as_mut()
                         .map(CandidateTransferContext::reborrow);
                     hydrate_exact_demand_with_receipt(
-                        storage,
-                        state,
-                        transport,
-                        required,
-                        true,
-                        transfer,
+                        storage, state, transport, required, true, transfer,
                     )
                     .await
                 }
@@ -798,7 +803,8 @@ async fn hydrate_current_payload_after_native_fallback<
         CandidateFetchResult::Retained(
             super::read_fulfillment::staging::CandidateTransferResult::Ready,
         ) => {
-            let candidate = candidate.ok_or_else(|| LixError::unknown("candidate transfer was lost"))?;
+            let candidate =
+                candidate.ok_or_else(|| LixError::unknown("candidate transfer was lost"))?;
             candidate
                 .transfer
                 .promote(
@@ -920,9 +926,13 @@ fn hydrate_exact_demand_with_receipt<
             let mut required = Vec::new();
             let mut frontier = frontier.into_iter().peekable();
             while required.len() < 32 {
-                let Some(address) = frontier.next() else { break; };
-                if selected_payload_locator.as_ref()
-                    .is_some_and(|locator| address == ReadInputAddress::Metadata(locator.clone())) {
+                let Some(address) = frontier.next() else {
+                    break;
+                };
+                if selected_payload_locator
+                    .as_ref()
+                    .is_some_and(|locator| address == ReadInputAddress::Metadata(locator.clone()))
+                {
                     required.push(address);
                     continue;
                 }
@@ -935,38 +945,65 @@ fn hydrate_exact_demand_with_receipt<
                         let mut inputs = vec![address];
                         let cap = remaining.min(super::transfer::MANIFEST_PAGE_ITEMS);
                         while inputs.len() < cap {
-                            let Some(ReadInputAddress::BlobManifest(hash)) = frontier.peek() else { break; };
+                            let Some(ReadInputAddress::BlobManifest(hash)) = frontier.peek() else {
+                                break;
+                            };
                             hashes.push(crate::binary_cas::BlobId::from_bytes(*hash));
                             inputs.push(frontier.next().expect("peeked manifest input is present"));
                         }
-                        let resident = super::partial_blob::manifests_are_resident(storage, state, &hashes).await?;
-                        required.extend(inputs.into_iter().zip(resident)
-                            .filter_map(|(input, resident)| (!resident).then_some(input)));
+                        let resident =
+                            super::partial_blob::manifests_are_resident(storage, state, &hashes)
+                                .await?;
+                        required.extend(
+                            inputs
+                                .into_iter()
+                                .zip(resident)
+                                .filter_map(|(input, resident)| (!resident).then_some(input)),
+                        );
                     }
                     ReadInputAddress::BlobChunk(hash) => {
                         let mut hashes = vec![crate::binary_cas::ChunkHash::from_bytes(*hash)];
                         let mut inputs = vec![address];
                         let cap = remaining.min(super::transfer::CHUNK_CONCURRENCY);
                         while inputs.len() < cap {
-                            let Some(ReadInputAddress::BlobChunk(hash)) = frontier.peek() else { break; };
+                            let Some(ReadInputAddress::BlobChunk(hash)) = frontier.peek() else {
+                                break;
+                            };
                             hashes.push(crate::binary_cas::ChunkHash::from_bytes(*hash));
                             inputs.push(frontier.next().expect("peeked chunk input is present"));
                         }
-                        let resident = super::partial_blob::chunks_are_resident(storage, state, &hashes).await?;
-                        required.extend(inputs.into_iter().zip(resident)
-                            .filter_map(|(input, resident)| (!resident).then_some(input)));
+                        let resident =
+                            super::partial_blob::chunks_are_resident(storage, state, &hashes)
+                                .await?;
+                        required.extend(
+                            inputs
+                                .into_iter()
+                                .zip(resident)
+                                .filter_map(|(input, resident)| (!resident).then_some(input)),
+                        );
                     }
                     ReadInputAddress::Object(object) => {
-                        if !native_object_is_resident(storage, state, *object).await? { required.push(address); }
+                        if !native_object_is_resident(storage, state, *object).await? {
+                            required.push(address);
+                        }
                     }
                     ReadInputAddress::Metadata(metadata) => {
                         let read = storage.begin_read(Default::default()).await?;
-                        let resident = super::native_metadata::native_metadata_residency(&read, state, std::slice::from_ref(metadata)).await?[0];
-                        if !resident { required.push(address); }
+                        let resident = super::native_metadata::native_metadata_residency(
+                            &read,
+                            state,
+                            std::slice::from_ref(metadata),
+                        )
+                        .await?[0];
+                        if !resident {
+                            required.push(address);
+                        }
                     }
                     ReadInputAddress::ChangeRecord { .. } => {
-                        return Err(LixError::new("LIX_READ_FULFILLMENT_INVALID",
-                            "mutable change payloads cannot be required frontier inputs"));
+                        return Err(LixError::new(
+                            "LIX_READ_FULFILLMENT_INVALID",
+                            "mutable change payloads cannot be required frontier inputs",
+                        ));
                     }
                 }
             }
@@ -1000,9 +1037,7 @@ fn hydrate_exact_demand_with_receipt<
                         transport,
                         &fulfillment,
                         locator,
-                        candidate_transfer
-                            .as_mut()
-                            .map(|candidate| &mut *candidate),
+                        candidate_transfer.as_mut().map(|candidate| &mut *candidate),
                     )
                     .await?
                 {
@@ -1014,9 +1049,7 @@ fn hydrate_exact_demand_with_receipt<
                     state,
                     transport,
                     &fulfillment,
-                    candidate_transfer
-                        .as_mut()
-                        .map(|candidate| &mut *candidate),
+                    candidate_transfer.as_mut().map(|candidate| &mut *candidate),
                     false,
                 )
                 .await
@@ -1085,9 +1118,7 @@ fn hydrate_exact_demand_with_receipt<
                             transport,
                             &fulfillment,
                             locator,
-                            candidate_transfer
-                                .as_mut()
-                                .map(|candidate| &mut *candidate),
+                            candidate_transfer.as_mut().map(|candidate| &mut *candidate),
                         )
                         .await?
                     {
@@ -1116,38 +1147,72 @@ fn hydrate_exact_demand_with_receipt<
         match request {
             SyncDemandRequest::BlobManifests(addresses, _) => {
                 for page in addresses.chunks(super::transfer::MANIFEST_PAGE_ITEMS) {
-                    let resident = super::partial_blob::manifests_are_resident(storage, state, page).await?;
-                    let missing = page.iter().copied().zip(resident)
+                    let resident =
+                        super::partial_blob::manifests_are_resident(storage, state, page).await?;
+                    let missing = page
+                        .iter()
+                        .copied()
+                        .zip(resident)
                         .filter_map(|(address, resident)| (!resident).then_some(address))
                         .collect::<Vec<_>>();
-                    if missing.is_empty() { continue; }
-                    let ids = missing.iter().map(|address| address.to_hex()).collect::<Vec<_>>();
+                    if missing.is_empty() {
+                        continue;
+                    }
+                    let ids = missing
+                        .iter()
+                        .map(|address| address.to_hex())
+                        .collect::<Vec<_>>();
                     let manifests = transport.get_blobs(&ids).await?;
                     if manifests.len() != missing.len()
-                        || manifests.iter().zip(&missing)
-                            .any(|(manifest, address)| manifest.blob_id != address.to_hex()) {
-                        return Err(LixError::new(LixError::CODE_INVALID_PARAM,
-                            "blob manifest response does not match the bounded request batch"));
+                        || manifests
+                            .iter()
+                            .zip(&missing)
+                            .any(|(manifest, address)| manifest.blob_id != address.to_hex())
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "blob manifest response does not match the bounded request batch",
+                        ));
                     }
-                    super::partial_blob::install_manifest_pages(storage, state, &missing, &manifests).await?;
+                    super::partial_blob::install_manifest_pages(
+                        storage, state, &missing, &manifests,
+                    )
+                    .await?;
                 }
                 Ok(HydratedInputs::default())
             }
             SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
                 for page in ids.chunks(super::transfer::CHUNK_CONCURRENCY) {
-                    let hashes = page.iter().map(|id| crate::binary_cas::ChunkHash::from_hex(id))
+                    let hashes = page
+                        .iter()
+                        .map(|id| crate::binary_cas::ChunkHash::from_hex(id))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let resident = super::partial_blob::chunks_are_resident(storage, state, &hashes).await?;
-                    let missing = page.iter().zip(hashes).zip(resident)
-                        .filter_map(|((id, hash), resident)| (!resident).then_some((id.clone(), hash)))
+                    let resident =
+                        super::partial_blob::chunks_are_resident(storage, state, &hashes).await?;
+                    let missing = page
+                        .iter()
+                        .zip(hashes)
+                        .zip(resident)
+                        .filter_map(|((id, hash), resident)| {
+                            (!resident).then_some((id.clone(), hash))
+                        })
                         .collect::<Vec<_>>();
-                    if missing.is_empty() { continue; }
+                    if missing.is_empty() {
+                        continue;
+                    }
                     let missing_ids = missing.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
                     let chunks = super::transfer::fetch_chunk_page(transport, &missing_ids).await?;
-                    let chunks = missing.into_iter().zip(chunks)
-                        .map(|((_, hash), bytes)| bytes.map(|bytes| (hash, bytes))
-                            .ok_or_else(|| LixError::new(LixError::CODE_STORAGE_ERROR,
-                                "authority lacks demanded blob chunk")))
+                    let chunks = missing
+                        .into_iter()
+                        .zip(chunks)
+                        .map(|((_, hash), bytes)| {
+                            bytes.map(|bytes| (hash, bytes)).ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_STORAGE_ERROR,
+                                    "authority lacks demanded blob chunk",
+                                )
+                            })
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     super::partial_blob::install_chunk_page(storage, state, chunks).await?;
                 }
@@ -1863,8 +1928,7 @@ where
     // A resolved immutable target and its transfer owner outlive a foreground
     // demand. Candidate-local read scopes are always rerun from current state.
     let mut retained_candidate: Option<RetainedCandidate> = None;
-    let mut candidate_transfer =
-        super::read_fulfillment::staging::CandidateReadTransfer::default();
+    let mut candidate_transfer = super::read_fulfillment::staging::CandidateReadTransfer::default();
     let mut descriptor_refresh_generation = 0u64;
     let mut watch_cursor = state.descriptor().cursor;
     let mut blocked_global_cursor: Option<u64> = None;
@@ -2325,98 +2389,143 @@ where
                     retained_candidate = None;
                     candidate_transfer.retire()?;
                     match result {
-                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::LocalProgress)) => {
-                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
-                        watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
-                        // The merge receipt/cleanup completed, but its confirmed
-                        // coordinates can be newer than the installed admission.
-                        // Acquire one more descriptor before planning the next
-                        // ordinary wave so its CAS basis is current.
-                        request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);upload_due=true;retry_upload=false;
-                        retry_delay=Duration::from_millis(100);
-                        watch_after=web_time::Instant::now();
-                    },
-                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::NoChange)) => {
-                        let was_recovering_authority = authority_recovery_pending;
-                        health.observed(cursor);
-                        if !blocked_global_cursor.is_some_and(|blocked| cursor <= blocked) {
+                        Ok((
+                            cursor,
+                            super::partial_reconcile::PreparedDescriptor::LocalProgress,
+                        )) => {
+                            health.observed(cursor);
                             health.succeeded(SyncPhase::Descriptor);
-                        }
-                        force_descriptor_refresh=false;
-                        authority_recovery_pending = false;
-                        if was_recovering_authority {
-                            upload_due |= retry_upload;
-                        }
-                        if blocked_global_cursor.is_some_and(|blocked|cursor>blocked){blocked_global_cursor=None;}
-                        watch_cursor = watch_cursor.max(cursor);
-                        // The next request long-polls after this processed cursor.
-                        watch_after = web_time::Instant::now();
-                    },
-                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::RetryUpload(lease))) => {
-                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
-                        retry_upload_lease = Some(lease);
-                        watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
-                        force_descriptor_refresh=false;
-                        authority_recovery_pending=false;
-                        if !retry_upload {
-                            // A fresh typed proof may follow durable merge
-                            // progress rather than an earlier failed send.
-                            // Make this exact tuple immediately eligible while
-                            // still queuing local changes until it settles.
-                            retry_deadline = web_time::Instant::now();
+                            watch_cursor = watch_cursor.max(cursor);
+                            blocked_global_cursor = None;
+                            // The merge receipt/cleanup completed, but its confirmed
+                            // coordinates can be newer than the installed admission.
+                            // Acquire one more descriptor before planning the next
+                            // ordinary wave so its CAS basis is current.
+                            request_fresh_descriptor(
+                                &mut force_descriptor_refresh,
+                                &mut descriptor_refresh_generation,
+                            );
+                            upload_due = true;
+                            retry_upload = false;
                             retry_delay = Duration::from_millis(100);
+                            watch_after = web_time::Instant::now();
                         }
-                        retry_upload = true;
-                        // Schedule the exact frozen tuple. If the previous
-                        // send established a retry deadline, keep it; actual
-                        // reconciliation progress clears retry_upload and can
-                        // make subsequent work immediately eligible.
-                        upload_due=true;
-                        watch_after=web_time::Instant::now();
-                    },
-                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
-                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
-                        if authority_recovery_pending {
-                            request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
-                        } else {
-                            force_descriptor_refresh = false;
-                        }
-                        blocked_global_cursor=None;
-                        upload_due |= baseline_expired.is_some();
-                        publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
-                    },
-                    Err(error) => {
-                        health.failed(SyncPhase::Descriptor, &error);
-                        if is_terminal_partial_transport_error(&error) {
-                            terminal_error = Some(error);
-                            break 'worker;
-                        }
-                        if super::partial_global_merge_runtime::waits_for_state_change(&error) {
-                            let cursor=error.details.as_ref().and_then(|v|v.get("authorityCursor")).and_then(serde_json::Value::as_u64).unwrap_or(watch_cursor);
-                            blocked_global_cursor=Some(cursor);watch_cursor=watch_cursor.max(cursor);
-                            force_descriptor_refresh=false;retry_upload=false;upload_due=false;
-                            tracing::warn!(code=%error.code,message=%error.message,"partial GLOBAL reconciliation awaits local or authority change; pending edits retained");
-                            watch_after=web_time::Instant::now();
-                            continue 'worker;
-                        }
-                        if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" {
-                            if authority_recovery_pending {
-                                // The authenticated descriptor did not prove the
-                                // frozen tuple was included, so keep it intact and
-                                // gated. Retry descriptor/reconciliation after the
-                                // existing backoff; never resend stale coordinates
-                                // just because local notifications accumulated.
-                                request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
-                                upload_due = false;
-                            } else if !retry_upload {
-                                upload_due = true;
+                        Ok((cursor, super::partial_reconcile::PreparedDescriptor::NoChange)) => {
+                            let was_recovering_authority = authority_recovery_pending;
+                            health.observed(cursor);
+                            if !blocked_global_cursor.is_some_and(|blocked| cursor <= blocked) {
+                                health.succeeded(SyncPhase::Descriptor);
                             }
+                            force_descriptor_refresh = false;
+                            authority_recovery_pending = false;
+                            if was_recovering_authority {
+                                upload_due |= retry_upload;
+                            }
+                            if blocked_global_cursor.is_some_and(|blocked| cursor > blocked) {
+                                blocked_global_cursor = None;
+                            }
+                            watch_cursor = watch_cursor.max(cursor);
+                            // The next request long-polls after this processed cursor.
+                            watch_after = web_time::Instant::now();
                         }
-                        tracing::warn!(code=%error.code, message=%error.message, "partial reconciliation retained existing working set");
+                        Ok((
+                            cursor,
+                            super::partial_reconcile::PreparedDescriptor::RetryUpload(lease),
+                        )) => {
+                            health.observed(cursor);
+                            health.succeeded(SyncPhase::Descriptor);
+                            retry_upload_lease = Some(lease);
+                            watch_cursor = watch_cursor.max(cursor);
+                            blocked_global_cursor = None;
+                            force_descriptor_refresh = false;
+                            authority_recovery_pending = false;
+                            if !retry_upload {
+                                // A fresh typed proof may follow durable merge
+                                // progress rather than an earlier failed send.
+                                // Make this exact tuple immediately eligible while
+                                // still queuing local changes until it settles.
+                                retry_deadline = web_time::Instant::now();
+                                retry_delay = Duration::from_millis(100);
+                            }
+                            retry_upload = true;
+                            // Schedule the exact frozen tuple. If the previous
+                            // send established a retry deadline, keep it; actual
+                            // reconciliation progress clears retry_upload and can
+                            // make subsequent work immediately eligible.
+                            upload_due = true;
+                            watch_after = web_time::Instant::now();
+                        }
+                        Ok((
+                            cursor,
+                            super::partial_reconcile::PreparedDescriptor::Ready(prepared),
+                        )) => {
+                            health.observed(cursor);
+                            health.succeeded(SyncPhase::Descriptor);
+                            if authority_recovery_pending {
+                                request_fresh_descriptor(
+                                    &mut force_descriptor_refresh,
+                                    &mut descriptor_refresh_generation,
+                                );
+                            } else {
+                                force_descriptor_refresh = false;
+                            }
+                            blocked_global_cursor = None;
+                            upload_due |= baseline_expired.is_some();
+                            publication = Some(Box::pin(
+                                super::partial_publication::publish_prepared_partial(
+                                    engine.clone(),
+                                    prepared,
+                                ),
+                            ));
+                        }
+                        Err(error) => {
+                            health.failed(SyncPhase::Descriptor, &error);
+                            if is_terminal_partial_transport_error(&error) {
+                                terminal_error = Some(error);
+                                break 'worker;
+                            }
+                            if super::partial_global_merge_runtime::waits_for_state_change(&error) {
+                                let cursor = error
+                                    .details
+                                    .as_ref()
+                                    .and_then(|v| v.get("authorityCursor"))
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(watch_cursor);
+                                blocked_global_cursor = Some(cursor);
+                                watch_cursor = watch_cursor.max(cursor);
+                                force_descriptor_refresh = false;
+                                retry_upload = false;
+                                upload_due = false;
+                                tracing::warn!(code=%error.code,message=%error.message,"partial GLOBAL reconciliation awaits local or authority change; pending edits retained");
+                                watch_after = web_time::Instant::now();
+                                continue 'worker;
+                            }
+                            if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" {
+                                if authority_recovery_pending {
+                                    // The authenticated descriptor did not prove the
+                                    // frozen tuple was included, so keep it intact and
+                                    // gated. Retry descriptor/reconciliation after the
+                                    // existing backoff; never resend stale coordinates
+                                    // just because local notifications accumulated.
+                                    request_fresh_descriptor(
+                                        &mut force_descriptor_refresh,
+                                        &mut descriptor_refresh_generation,
+                                    );
+                                    upload_due = false;
+                                } else if !retry_upload {
+                                    upload_due = true;
+                                }
+                            }
+                            tracing::warn!(code=%error.code, message=%error.message, "partial reconciliation retained existing working set");
 
-                        watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
+                            watch_after = web_time::Instant::now()
+                                + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" {
+                                    Duration::from_secs(30)
+                                } else {
+                                    Duration::from_secs(1)
+                                };
+                        }
                     }
-                }
                 }
             }
             continue;
@@ -2597,7 +2706,10 @@ where
                 if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                     baseline_expired = Some(error.clone());
                     authority_recovery_pending = true;
-                    request_fresh_descriptor(&mut force_descriptor_refresh, &mut descriptor_refresh_generation);
+                    request_fresh_descriptor(
+                        &mut force_descriptor_refresh,
+                        &mut descriptor_refresh_generation,
+                    );
                     watch_after = web_time::Instant::now();
                 }
             }
@@ -3877,10 +3989,8 @@ mod tests {
         let authority = open_lix().await.unwrap();
         for index in 0..40 {
             authority
-                .execute(
-                    "SELECT commit_id FROM lix_create_checkpoint($1,NULL)",
-                    &[crate::Value::Text(format!("walk checkpoint {index}"))],
-                )
+                .execute("SELECT commit_id FROM lix_create_checkpoint($1,NULL)")
+                .params(&[crate::Value::Text(format!("walk checkpoint {index}"))])
                 .await
                 .unwrap();
         }

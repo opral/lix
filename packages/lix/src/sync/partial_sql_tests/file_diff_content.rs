@@ -8,37 +8,31 @@ async fn descriptor_only_file_diff_and_history_hydrate_selected_bytes() {
     let before_bytes = vec![b'a'; 300 * 1024];
     let after_bytes = vec![b'b'; 300 * 1024];
     authority
-        .execute(
-            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/selected', $2)",
-            &[
-                Value::Text(id.into()),
-                Value::Blob(before_bytes.clone().into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/selected', $2)")
+        .params(&[
+            Value::Text(id.into()),
+            Value::Blob(before_bytes.clone().into()),
+        ])
         .await
         .unwrap();
     let before = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/unrelated.asset', $1)",
-            &[Value::Blob(vec![0xab; 40 * 1024 * 1024].into())],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/unrelated.asset', $1)")
+        .params(&[Value::Blob(vec![0xab; 40 * 1024 * 1024].into())])
         .await
         .unwrap();
     authority
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE id = $2",
-            &[
-                Value::Blob(after_bytes.clone().into()),
-                Value::Text(id.into()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE id = $2")
+        .params(&[
+            Value::Blob(after_bytes.clone().into()),
+            Value::Text(id.into()),
+        ])
         .await
         .unwrap();
     let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
@@ -138,15 +132,12 @@ async fn descriptor_only_preview_hydrates_only_content_within_the_case_limit() {
     let large_bytes = vec![b'l'; 300 * 1024];
     let small_bytes = b"small preview".to_vec();
     authority
-        .execute(
-            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)",
-            &[
+        .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)").params(&[
                 Value::Text(large_id.into()),
                 Value::Blob(large_bytes.clone().into()),
                 Value::Text(small_id.into()),
                 Value::Blob(small_bytes.clone().into()),
-            ],
-        )
+            ])
         .await
         .unwrap();
     let large_blob_id = crate::binary_cas::BlobId::from_content(&large_bytes).to_hex();
@@ -253,10 +244,7 @@ async fn descriptor_only_preview_hydrates_only_content_within_the_case_limit() {
         .iter()
         .find(|row| row.get::<String>("id").unwrap() == small_id)
         .expect("small file row");
-    assert_eq!(
-        small_row.get::<Vec<u8>>("content").unwrap(),
-        small_bytes
-    );
+    assert_eq!(small_row.get::<Vec<u8>>("content").unwrap(), small_bytes);
     assert_eq!(
         small_row.get::<i64>("size_bytes").unwrap(),
         i64::try_from(small_bytes.len()).unwrap()

@@ -63,10 +63,8 @@ async fn run(lose_ack: bool) {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/checkpoint.bin',$1)",
-            &[Value::Blob(vec![17u8; 96 * 1024].into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/checkpoint.bin',$1)")
+        .params(&[Value::Blob(vec![17u8; 96 * 1024].into())])
         .await
         .unwrap();
     let server = open_lix()
@@ -221,10 +219,8 @@ async fn run(lose_ack: bool) {
         }
     }
     let actual = authority
-        .execute(
-            "SELECT content FROM lix_file WHERE path='/checkpoint.bin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path='/checkpoint.bin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(actual.rows()[0].get::<Vec<u8>>("content").unwrap(), content);

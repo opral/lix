@@ -124,26 +124,22 @@ where
         .expect("switch shared-blob session branch");
     for path in ["/shared-a.bin", "/shared-b.bin"] {
         session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(path.to_owned()),
-                    Value::Blob(OLD.to_vec().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(path.to_owned()),
+                Value::Blob(OLD.to_vec().into()),
+            ])
             .await
             .expect("insert shared blob owner");
     }
 
-    let mut rollback = session
+    let rollback = session
         .begin_transaction()
         .await
         .expect("begin shared replacement rollback");
     rollback
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
-            &[Value::Blob(ROLLED_BACK.to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'")
+        .params(&[Value::Blob(ROLLED_BACK.to_vec().into())])
         .await
         .expect("stage shared replacement rollback");
     rollback
@@ -171,10 +167,8 @@ where
     );
 
     session
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'",
-            &[Value::Blob(NEW.to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/shared-a.bin'")
+        .params(&[Value::Blob(NEW.to_vec().into())])
         .await
         .expect("commit one shared owner replacement");
     assert_eq!(
@@ -182,7 +176,7 @@ where
         Some(NEW.to_vec())
     );
     session
-        .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'", &[])
+        .execute("DELETE FROM lix_file WHERE path = '/shared-a.bin'")
         .await
         .expect("delete replaced shared owner");
     collect_repository_gc_for_bench(&adapter)
@@ -249,7 +243,7 @@ where
         Some(NEW),
     );
     reopened_session
-        .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'", &[])
+        .execute("DELETE FROM lix_file WHERE path = '/shared-b.bin'")
         .await
         .expect("delete final shared owner");
     assert_eq!(read_file_at(&reopened_session, "/shared-a.bin").await, None);
@@ -260,12 +254,10 @@ where
         .open_another_session()
         .await
         .expect("open shared-blob main session");
-    main.execute(
-        "DELETE FROM lix_branch WHERE id = $1",
-        &[Value::Text(branch_id)],
-    )
-    .await
-    .expect("release shared-blob branch history");
+    main.execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id)])
+        .await
+        .expect("release shared-blob branch history");
     drop(main);
 
     let sweep = collect_repository_gc_for_bench(&reopened_adapter)
@@ -296,10 +288,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("read shared blob owner")
         .rows()
@@ -327,8 +318,8 @@ where
         .execute(
             "INSERT INTO lix_file (path, content, lixcol_untracked) \
              VALUES ('/current-untracked.bin', $1, true)",
-            &[Value::Blob(b"durable-current-untracked".to_vec().into())],
         )
+        .params(&[Value::Blob(b"durable-current-untracked".to_vec().into())])
         .await
         .expect("current untracked file should publish");
     let adapter = lix.storage_adapter();
@@ -364,10 +355,8 @@ where
         .await
         .expect("cold untracked session should open");
     let content = session
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/current-untracked.bin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/current-untracked.bin'")
+        .all()
         .await
         .expect("cold current untracked file should read");
     assert_eq!(
@@ -412,18 +401,14 @@ where
         .await
         .expect("switch session branch");
     branch_session
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)",
-            &[Value::Blob(V1.to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/history.bin', $1)")
+        .params(&[Value::Blob(V1.to_vec().into())])
         .await
         .expect("history v1 should publish");
     let root_a = branch_commit(&branch_session, &branch_id).await;
     branch_session
-        .execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/history.bin'",
-            &[Value::Blob(V2.to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content = $1 WHERE path = '/history.bin'")
+        .params(&[Value::Blob(V2.to_vec().into())])
         .await
         .expect("history v2 should publish");
     let root_b = branch_commit(&branch_session, &branch_id).await;
@@ -473,23 +458,22 @@ where
         .await
         .expect("switch session branch");
     let diff = session
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff('lix_file', $1, $2)",
-            &[
-                Value::Text(fixture.root_a.clone()),
-                Value::Text(fixture.root_b.clone()),
-            ],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_file', $1, $2)")
+        .params(&[
+            Value::Text(fixture.root_a.clone()),
+            Value::Text(fixture.root_b.clone()),
+        ])
+        .all()
         .await
         .expect("retained historical blob diff should remain readable");
     assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
     session
-        .execute("SELECT commit_id FROM lix_undo()", &[])
+        .execute("SELECT commit_id FROM lix_undo()")
         .await
         .expect("retained historical blob should support undo");
     assert_eq!(read_current_file(&session).await, V1);
     session
-        .execute("SELECT commit_id FROM lix_redo()", &[])
+        .execute("SELECT commit_id FROM lix_redo()")
         .await
         .expect("retained historical blob should support redo");
     assert_eq!(read_current_file(&session).await, V2);
@@ -499,12 +483,10 @@ where
         .open_another_session()
         .await
         .expect("history main session should reopen");
-    main.execute(
-        "DELETE FROM lix_branch WHERE id = $1",
-        &[Value::Text(fixture.branch_id.clone())],
-    )
-    .await
-    .expect("history disposable branch should delete");
+    main.execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(fixture.branch_id.clone())])
+        .await
+        .expect("history disposable branch should delete");
     drop(main);
 
     let adapter = lix.storage_adapter();
@@ -547,10 +529,8 @@ where
         .await
         .expect("final history session should open");
     let branches = session
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_branch WHERE name = 'cas-history-disposable'",
-            &[],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_branch WHERE name = 'cas-history-disposable'")
+        .all()
         .await
         .expect("retired branch absence should read");
     assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
@@ -561,10 +541,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "SELECT commit_id FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id.to_owned())],
-        )
+        .query("SELECT commit_id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id.to_owned())])
+        .all()
         .await
         .expect("branch commit should load")
         .rows()[0]
@@ -577,10 +556,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/history.bin'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/history.bin'")
+        .all()
         .await
         .expect("current history file should read")
         .rows()[0]

@@ -11,8 +11,8 @@
 use std::collections::BTreeSet;
 
 use super::pk_window_tests::{
-    FILE_A, FILE_B, FixtureShape, Lcg, Row, SCHEMA, SELECT_COLUMNS, bulk_insert, decode_page, decode_rows, id,
-    layered_fixture, open_fixture,
+    FILE_A, FILE_B, FixtureShape, Lcg, Row, SCHEMA, SELECT_COLUMNS, bulk_insert, decode_page,
+    decode_rows, id, layered_fixture, open_fixture,
 };
 use super::{primary_key_windows_read, set_primary_key_window_rows};
 use crate::{Lix, Memory};
@@ -24,7 +24,8 @@ const ONE_WINDOW: usize = usize::MAX;
 async fn rows_of(lix: &Lix<Memory>, sql: &str, window_rows: usize) -> Vec<String> {
     let _window = set_primary_key_window_rows(window_rows);
     let result = lix
-        .execute(sql, &[])
+        .query(sql)
+        .all()
         .await
         .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     result
@@ -79,7 +80,8 @@ async fn reference_rows(lix: &Lix<Memory>) -> Vec<Row> {
     let _window = set_primary_key_window_rows(ONE_WINDOW);
     let windows_before = primary_key_windows_read();
     let result = lix
-        .execute(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
+        .query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -104,7 +106,7 @@ async fn assert_full_scan_streams_window_by_window(shape: FixtureShape) {
     let windows_before = primary_key_windows_read();
     let buffered = {
         let _window = set_primary_key_window_rows(41);
-        decode_rows(&lix.execute(&sql, &[]).await.unwrap())
+        decode_rows(&lix.query(&sql).all().await.unwrap())
     };
     let buffered_windows = primary_key_windows_read() - windows_before;
     // Windows end on stored span boundaries (packed parts, tree children),
@@ -226,7 +228,7 @@ async fn stream_windows_read_the_pinned_snapshot_across_writes_between_pulls() {
                 "INSERT INTO {SCHEMA} (id, value, lixcol_global) VALUES ('k04500-after', 'after', TRUE)"
             ),
         ] {
-            lix.execute(&statement, &[])
+            lix.execute(&statement)
                 .await
                 .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
         }
@@ -264,13 +266,10 @@ async fn window_and_page_boundaries_split_one_identity_across_file_scopes() {
     }
     bulk_insert(&lix, &rows).await;
     for index in [6_u64, 7, 60, 119] {
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO {SCHEMA} (id, value, lixcol_file_id, lixcol_global) VALUES ('{}', 'global', '{FILE_B}', TRUE)",
                 id(index)
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
@@ -288,7 +287,7 @@ async fn window_and_page_boundaries_split_one_identity_across_file_scopes() {
             id(33)
         ),
     ] {
-        lix.execute(&statement, &[]).await.unwrap();
+        lix.execute(&statement).await.unwrap();
     }
     let reference = reference_rows(&lix).await;
     let sql = format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}");
@@ -366,7 +365,7 @@ async fn windowed_reads_match_one_full_read_across_random_mutations() {
                         id(index + 5)
                     ),
                 };
-                lix.execute(&statement, &[]).await.unwrap();
+                lix.execute(&statement).await.unwrap();
             }
             let window_rows = [1, 7, 64, 1000][usize::try_from(rng.below(4)).unwrap()];
             for sql in &statements {
@@ -408,17 +407,14 @@ async fn non_string_primary_keys_are_read_in_windows() {
             r#"["g","n"]"#,
         ),
     ] {
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO lix_registered_schema (value) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
                  \"key\":\"{key}\",\"columns\":[{columns}],\"primary_key\":{primary_key}}}' AS JSONB))"
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     for chunk in (0..900_i64).collect::<Vec<_>>().chunks(300) {
         let ints = chunk
             .iter()
@@ -426,10 +422,7 @@ async fn non_string_primary_keys_are_read_in_windows() {
             .collect::<Vec<_>>()
             .join(", ");
         transaction
-            .execute(
-                &format!("INSERT INTO pkw_int (n, value) VALUES {ints}"),
-                &[],
-            )
+            .execute(&format!("INSERT INTO pkw_int (n, value) VALUES {ints}"))
             .await
             .unwrap();
         let pairs = chunk
@@ -438,10 +431,9 @@ async fn non_string_primary_keys_are_read_in_windows() {
             .collect::<Vec<_>>()
             .join(", ");
         transaction
-            .execute(
-                &format!("INSERT INTO pkw_pair (g, n, value) VALUES {pairs}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO pkw_pair (g, n, value) VALUES {pairs}"
+            ))
             .await
             .unwrap();
     }
@@ -453,7 +445,7 @@ async fn non_string_primary_keys_are_read_in_windows() {
         "DELETE FROM pkw_pair WHERE g = 'g3'",
         "UPDATE pkw_pair SET value = 'hot' WHERE n = 0",
     ] {
-        lix.execute(statement, &[]).await.unwrap();
+        lix.execute(statement).await.unwrap();
     }
     for sql in [
         "SELECT n, value FROM pkw_int",
@@ -487,13 +479,10 @@ async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
     let _window = set_primary_key_window_rows(3);
     let in_range = |row: &Row| row.0.as_str() >= "k00100" && row.0.as_str() < "k01500";
     let updated = lix
-        .execute(
-            &format!(
-                "UPDATE {SCHEMA} SET value = 'windowed' WHERE id >= 'k00100' AND id < 'k01500' \
+        .execute(&format!(
+            "UPDATE {SCHEMA} SET value = 'windowed' WHERE id >= 'k00100' AND id < 'k01500' \
                  AND lixcol_file_id = '{FILE_A}'"
-            ),
-            &[],
-        )
+        ))
         .await
         .unwrap();
     let expected_updates = before
@@ -503,12 +492,9 @@ async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
     assert!(expected_updates > 20);
     assert_eq!(updated.rows_affected(), expected_updates as u64);
     let deleted = lix
-        .execute(
-            &format!(
-                "DELETE FROM {SCHEMA} WHERE id >= 'k02000' AND id < 'k03000' AND lixcol_file_id IS NULL"
-            ),
-            &[],
-        )
+        .execute(&format!(
+            "DELETE FROM {SCHEMA} WHERE id >= 'k02000' AND id < 'k03000' AND lixcol_file_id IS NULL"
+        ))
         .await
         .unwrap();
     let in_delete =
@@ -540,14 +526,11 @@ async fn dml_over_many_windows_changes_exactly_the_matched_rows() {
 /// the global branch never holds a collection control for it.
 async fn open_local_schema_fixture() -> Lix<Memory> {
     let lix = crate::open_lix().with_storage(Memory::new()).await.unwrap();
-    lix.execute(
-        &format!(
+    lix.execute(&format!(
             "INSERT INTO lix_registered_schema (value) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
              \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
              {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB))"
-        ),
-        &[],
-    )
+        ))
     .await
     .unwrap();
     lix
@@ -630,7 +613,8 @@ async fn count_star_is_exact_without_a_global_collection_control() {
     let count_sql = format!("SELECT count(*) FROM {SCHEMA}");
     let assert_count = async |context: &str, expect_exact: bool| {
         let expected = lix
-            .execute(&format!("SELECT id, lixcol_file_id FROM {SCHEMA}"), &[])
+            .query(&format!("SELECT id, lixcol_file_id FROM {SCHEMA}"))
+            .all()
             .await
             .unwrap()
             .rows()
@@ -643,7 +627,8 @@ async fn count_star_is_exact_without_a_global_collection_control() {
             "{context}"
         );
         let plan = lix
-            .execute(&format!("EXPLAIN {count_sql}"), &[])
+            .query(&format!("EXPLAIN {count_sql}"))
+            .all()
             .await
             .unwrap()
             .rows()
@@ -667,34 +652,29 @@ async fn count_star_is_exact_without_a_global_collection_control() {
         format!("INSERT INTO {SCHEMA} (id, value, lixcol_untracked) VALUES ('k08888', 'u', TRUE)"),
     ] {
         if statement.contains(FILE_A) {
-            lix.execute(
-                &format!("INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/count-a')"),
-                &[],
-            )
+            lix.execute(&format!(
+                "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/count-a')"
+            ))
             .await
             .unwrap();
         }
-        lix.execute(&statement, &[])
+        lix.execute(&statement)
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
         assert_count(&statement, false).await;
     }
     // A global row gives the global branch a collection control; the count
     // must still see it exactly once.
-    lix.execute(
-        &format!(
+    lix.execute(&format!(
             "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
              \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
              {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB), TRUE)"
-        ),
-        &[],
-    )
+        ))
     .await
     .unwrap();
-    lix.execute(
-        &format!("INSERT INTO {SCHEMA} (id, value, lixcol_global) VALUES ('k07777', 'g', TRUE)"),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO {SCHEMA} (id, value, lixcol_global) VALUES ('k07777', 'g', TRUE)"
+    ))
     .await
     .unwrap();
     assert_count("global row", false).await;

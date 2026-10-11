@@ -23,10 +23,9 @@ fn open_and_start_sync_work_under_plain_block_on() {
             .expect("start sync under plain block_on");
 
         let result = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/hello.txt".to_owned())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/hello.txt".to_owned())])
+            .all()
             .await
             .expect("read synchronized file");
         assert_eq!(result.rows().len(), 1);
@@ -58,10 +57,8 @@ fn open_and_start_sync_work_under_plain_block_on() {
             let lix = open_lix().with_storage(storage.clone()).await.unwrap();
             storage.start_sync(&lix).await.unwrap();
             let result = lix
-                .execute(
-                    "SELECT content FROM lix_file WHERE path = '/.lix/README.md'",
-                    &[],
-                )
+                .query("SELECT content FROM lix_file WHERE path = '/.lix/README.md'")
+                .all()
                 .await
                 .unwrap();
             if let Some(content) = content {
@@ -136,10 +133,8 @@ fn separately_opened_storage_reads_completion_when_sync_starts() {
         assert!(!readme.exists());
         assert!(
             first_lix
-                .execute(
-                    "SELECT id FROM lix_file WHERE path = '/.lix/README.md'",
-                    &[]
-                )
+                .query("SELECT id FROM lix_file WHERE path = '/.lix/README.md'")
+                .all()
                 .await
                 .unwrap()
                 .rows()

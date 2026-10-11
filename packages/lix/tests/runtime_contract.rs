@@ -70,15 +70,12 @@ fn public_sdk_opens_writes_and_reads_without_a_tokio_runtime() {
         let lix = open_lix().await.expect("open Lix under plain block_on");
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('executor', CAST('true' AS JSONB))",
-            &[],
         )
         .await
         .expect("write under plain block_on");
         let result = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'executor'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'executor'")
+            .all()
             .await
             .expect("read under plain block_on");
         assert_eq!(result.rows().len(), 1);

@@ -8,6 +8,7 @@
 //! takes the source snapshot of the wrong scope is visible as a changed note,
 //! not only as an error.
 
+use crate::test_support::ResultRows;
 use crate::{Lix, Memory, Value};
 
 const SCHEMA: &str = "fsd_item";
@@ -50,24 +51,18 @@ fn id(index: u64) -> String {
 async fn open_fixture(branch: bool) -> Lix<Memory> {
     let lix = crate::open_lix().with_storage(Memory::new()).await.unwrap();
     for global in ["FALSE", "TRUE"] {
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
                  \"key\":\"{SCHEMA}\",\"columns\":[{{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}},\
                  {{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}},\
                  {{\"name\":\"note\",\"type\":\"text\",\"nullable\":false}}],\"primary_key\":[\"id\"]}}' AS JSONB), {global})"
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
-    lix.execute(
-        &format!(
-            "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/fsd-a'), ('{FILE_B}','/fsd-b')"
-        ),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_file(id,path) VALUES ('{FILE_A}','/fsd-a'), ('{FILE_B}','/fsd-b')"
+    ))
     .await
     .unwrap();
     for file_id in SCOPES {
@@ -82,10 +77,9 @@ async fn open_fixture(branch: bool) -> Lix<Memory> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        lix.execute(
-            &format!("INSERT INTO {SCHEMA} (id, value, note, lixcol_file_id) VALUES {values}"),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO {SCHEMA} (id, value, note, lixcol_file_id) VALUES {values}"
+        ))
         .await
         .unwrap();
     }
@@ -106,23 +100,20 @@ async fn open_fixture(branch: bool) -> Lix<Memory> {
     }
     // A HOT layer above the bases in every scope.
     for file_id in SCOPES {
-        lix.execute(
-            &format!(
-                "UPDATE {SCHEMA} SET value = 'hot' WHERE id = '{}' AND {}",
-                id(1003),
-                file_filter(file_id)
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "UPDATE {SCHEMA} SET value = 'hot' WHERE id = '{}' AND {}",
+            id(1003),
+            file_filter(file_id)
+        ))
         .await
         .unwrap();
     }
     lix
 }
 
-fn decode_rows(result: &crate::ExecuteResult) -> Vec<Row> {
+fn decode_rows(result: &impl ResultRows) -> Vec<Row> {
     let mut rows = result
-        .rows()
+        .result_rows()
         .iter()
         .map(|row| {
             let text = |column: &str| match row.get::<Value>(column).unwrap() {
@@ -185,7 +176,8 @@ fn expected_rows(touched: impl Fn(u64, Option<&str>) -> bool, updated: Option<&s
 
 async fn all_rows(lix: &Lix<Memory>) -> Vec<Row> {
     decode_rows(
-        &lix.execute(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
+        &lix.query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+            .all()
             .await
             .unwrap(),
     )
@@ -233,15 +225,16 @@ async fn assert_updates_keep_file_scopes(branch: bool, in_transaction: bool) {
         let expected = expected_rows(&touched, Some("updated"));
         let expected_count = expected.iter().filter(|row| row.1 == "updated").count();
         if in_transaction {
-            let mut transaction = lix.begin_transaction().await.unwrap();
+            let transaction = lix.begin_transaction().await.unwrap();
             let result = transaction
-                .execute(&statement, &[])
+                .execute(&statement)
                 .await
                 .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
             assert_eq!(result.rows_affected(), expected_count as u64, "{statement}");
             let staged = decode_rows(
                 &transaction
-                    .execute(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"), &[])
+                    .query(&format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA}"))
+                    .all()
                     .await
                     .unwrap(),
             );
@@ -249,7 +242,7 @@ async fn assert_updates_keep_file_scopes(branch: bool, in_transaction: bool) {
             transaction.commit().await.unwrap();
         } else {
             let result = lix
-                .execute(&statement, &[])
+                .execute(&statement)
                 .await
                 .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
             assert_eq!(result.rows_affected(), expected_count as u64, "{statement}");
@@ -265,7 +258,7 @@ async fn assert_deletes_keep_file_scopes(branch: bool) {
         let statement = format!("DELETE FROM {SCHEMA} WHERE {predicate}");
         let expected = expected_rows(&touched, None);
         let result = lix
-            .execute(&statement, &[])
+            .execute(&statement)
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
         assert_eq!(
@@ -314,7 +307,7 @@ async fn update_returning_reports_each_updated_file_scope() {
             "UPDATE {SCHEMA} SET value = 'updated' WHERE {predicate} RETURNING {SELECT_COLUMNS}"
         );
         let result = lix
-            .execute(&statement, &[])
+            .execute(&statement)
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
         let expected = expected_rows(&touched, Some("updated"))
@@ -339,32 +332,28 @@ async fn updates_keep_untracked_and_global_rows_in_their_file_scopes() {
         (1031, None, false, true),
         (1031, Some(FILE_A), false, false),
     ] {
-        lix.execute(
-            &format!(
+        lix.execute(&format!(
                 "INSERT INTO {SCHEMA} (id, value, note, lixcol_file_id, lixcol_untracked, lixcol_global) \
                  VALUES ('{}', 'v', 'note-{}-{index}', {}, {untracked}, {global})",
                 id(index),
                 scope_name(file_id),
                 file_sql(file_id)
-            ),
-            &[],
-        )
+            ))
         .await
         .unwrap();
     }
     let result = lix
-        .execute(
-            &format!("UPDATE {SCHEMA} SET value = 'updated' WHERE id >= 'k01030'"),
-            &[],
-        )
+        .execute(&format!(
+            "UPDATE {SCHEMA} SET value = 'updated' WHERE id >= 'k01030'"
+        ))
         .await
         .unwrap();
     assert_eq!(result.rows_affected(), 5);
     let rows = decode_rows(
-        &lix.execute(
-            &format!("SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= 'k01030'"),
-            &[],
-        )
+        &lix.query(&format!(
+            "SELECT {SELECT_COLUMNS} FROM {SCHEMA} WHERE id >= 'k01030'"
+        ))
+        .all()
         .await
         .unwrap(),
     );
@@ -388,7 +377,7 @@ async fn updates_keep_untracked_and_global_rows_in_their_file_scopes() {
     expected.sort();
     assert_eq!(rows, expected);
     let result = lix
-        .execute(&format!("DELETE FROM {SCHEMA} WHERE id >= 'k01030'"), &[])
+        .execute(&format!("DELETE FROM {SCHEMA} WHERE id >= 'k01030'"))
         .await
         .unwrap();
     assert_eq!(result.rows_affected(), 5);

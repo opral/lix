@@ -73,10 +73,7 @@ mod tests {
     async fn complete_lix_roundtrip_is_byte_identical() {
         let source = open_lix().await.expect("open source Lix");
         source
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('snapshot-test', 'complete')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('snapshot-test', 'complete')")
             .await
             .expect("seed snapshot state");
         source
@@ -110,10 +107,8 @@ mod tests {
             .await
             .expect("restore snapshot");
         let result = restored
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'snapshot-test'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'snapshot-test'")
+            .all()
             .await
             .expect("query restored state");
         assert_eq!(result.rows().len(), 1);
@@ -138,7 +133,6 @@ mod tests {
         source
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('protocol-snapshot', 'complete')",
-                &[],
             )
             .await
             .expect("seed snapshot state");
@@ -162,19 +156,14 @@ mod tests {
             .await
             .expect("restore protocol snapshot");
         let result = restored
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'protocol-snapshot'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'protocol-snapshot'")
+            .all()
             .await
             .expect("query restored state");
         assert_eq!(result.rows().len(), 1);
 
         restored
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('restored-write', 'allowed')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('restored-write', 'allowed')")
             .await
             .expect("authority admission marker must not escape into an exported snapshot");
 
@@ -251,10 +240,7 @@ mod tests {
     async fn failed_restore_cleans_candidate_and_destination_is_reusable() {
         let source = open_lix().await.expect("open source Lix");
         source
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('cleanup-test', 'complete')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('cleanup-test', 'complete')")
             .await
             .expect("seed cleanup test");
         let mut valid = Vec::new();
@@ -287,10 +273,8 @@ mod tests {
             .await
             .expect("failed restore should leave destination reusable");
         let result = restored
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'cleanup-test'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'cleanup-test'")
+            .all()
             .await
             .expect("reused destination contains restored state");
         assert_eq!(result.rows().len(), 1);

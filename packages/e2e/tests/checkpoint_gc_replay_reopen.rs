@@ -95,12 +95,12 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
         churn_once(&lix, 2, true).await;
         let superseded_head = newest_commit_id(&lix).await;
 
-        lix.execute("SELECT commit_id FROM lix_undo()", &[])
+        lix.execute("SELECT commit_id FROM lix_undo()")
             .await
             .expect("undo second churn commit");
         assert_generation(&lix, 1, false).await;
         let replay_owner = lix
-            .execute("SELECT commit_id FROM lix_redo()", &[])
+            .execute("SELECT commit_id FROM lix_redo()")
             .await
             .expect("redo second churn commit")
             .rows()[0]
@@ -110,14 +110,14 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
         assert_generation(&lix, 2, true).await;
 
         let compacted_owner = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("create compacting checkpoint")
             .rows()[0]
             .get::<String>("commit_id")
             .expect("checkpoint commit id decodes");
         for _ in 1..CHECKPOINT_GC_INTERVAL {
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                 .await
                 .expect("advance production checkpoint-GC cadence");
         }
@@ -162,31 +162,25 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::
         "primary_key": ["id"],
         "unique": [["indexed_value"]],
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-        &[Value::Text(schema.to_string())],
-    )
+    lix.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
     .await
     .expect("register checkpoint-GC schema");
 }
 
 async fn seed_rows<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("begin checkpoint-GC seed");
     for index in 0..ROW_COUNT {
         transaction
-            .execute(
-                &format!(
+            .execute(&format!(
                     "INSERT INTO {SCHEMA_KEY} (id, indexed_value, note, generation) VALUES ($1, $2, $3, 0)"
-                ),
-                &[
+                )).params(&[
                     Value::Text(format!("row-{index}")),
                     Value::Text(format!("indexed-{index}-0")),
                     Value::Text(format!("seed-{index}")),
-                ],
-            )
+                ])
             .await
             .expect("seed checkpoint-GC row");
     }
@@ -201,48 +195,40 @@ async fn churn_once<S: Storage + Clone + Send + Sync + 'static>(
     generation: usize,
     insert_replacement: bool,
 ) {
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("begin checkpoint-GC churn");
     transaction
-        .execute(
-            &format!(
-                "UPDATE {SCHEMA_KEY} SET indexed_value = $1, generation = $2 WHERE id = 'row-0'"
-            ),
-            &[
-                Value::Text(format!("indexed-0-{generation}")),
-                Value::Integer(generation as i64),
-            ],
-        )
+        .execute(&format!(
+            "UPDATE {SCHEMA_KEY} SET indexed_value = $1, generation = $2 WHERE id = 'row-0'"
+        ))
+        .params(&[
+            Value::Text(format!("indexed-0-{generation}")),
+            Value::Integer(generation as i64),
+        ])
         .await
         .expect("update indexed checkpoint-GC row");
     transaction
-        .execute(
-            &format!("UPDATE {SCHEMA_KEY} SET note = $1, generation = $2 WHERE id = 'row-1'"),
-            &[
-                Value::Text(if generation == 1 { "one" } else { "two" }.to_owned()),
-                Value::Integer(generation as i64),
-            ],
-        )
+        .execute(&format!(
+            "UPDATE {SCHEMA_KEY} SET note = $1, generation = $2 WHERE id = 'row-1'"
+        ))
+        .params(&[
+            Value::Text(if generation == 1 { "one" } else { "two" }.to_owned()),
+            Value::Integer(generation as i64),
+        ])
         .await
         .expect("update nonindexed checkpoint-GC row");
     if insert_replacement {
         transaction
-            .execute(
-                &format!(
+            .execute(&format!(
                     "INSERT INTO {SCHEMA_KEY} (id, indexed_value, note, generation) VALUES ('row-99', 'indexed-99-2', 'replacement', 2)"
-                ),
-                &[],
-            )
+                ))
             .await
             .expect("insert checkpoint-GC replacement row");
     } else {
         transaction
-            .execute(
-                &format!("DELETE FROM {SCHEMA_KEY} WHERE id = 'row-99'"),
-                &[],
-            )
+            .execute(&format!("DELETE FROM {SCHEMA_KEY} WHERE id = 'row-99'"))
             .await
             .expect("delete checkpoint-GC replacement row");
     }
@@ -254,7 +240,8 @@ async fn churn_once<S: Storage + Clone + Send + Sync + 'static>(
 
 async fn newest_commit_id<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) -> String {
     let result = lix
-        .execute("SELECT id FROM lix_commit ORDER BY id DESC LIMIT 1", &[])
+        .query("SELECT id FROM lix_commit ORDER BY id DESC LIMIT 1")
+        .all()
         .await
         .expect("load newest checkpoint-GC commit");
     result.rows()[0]
@@ -267,10 +254,10 @@ async fn assert_commit_present<S: Storage + Clone + Send + Sync + 'static>(
     commit_id: &str,
 ) {
     let result = lix
-        .execute(
-            &format!("SELECT id FROM lix_commit WHERE id = '{commit_id}'"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT id FROM lix_commit WHERE id = '{commit_id}'"
+        ))
+        .all()
         .await
         .expect("query retained checkpoint-GC commit");
     assert!(
@@ -285,10 +272,10 @@ async fn assert_generation<S: Storage + Clone + Send + Sync + 'static>(
     replacement_present: bool,
 ) {
     let state = lix
-        .execute(
-            &format!("SELECT indexed_value, note, generation FROM {SCHEMA_KEY} WHERE id = 'row-1'"),
-            &[],
-        )
+        .query(&format!(
+            "SELECT indexed_value, note, generation FROM {SCHEMA_KEY} WHERE id = 'row-1'"
+        ))
+        .all()
         .await
         .expect("read checkpoint-GC live state");
     assert_eq!(
@@ -300,10 +287,8 @@ async fn assert_generation<S: Storage + Clone + Send + Sync + 'static>(
         if generation == 1 { "one" } else { "two" }
     );
     let replacement = lix
-        .execute(
-            &format!("SELECT id FROM {SCHEMA_KEY} WHERE id = 'row-99'"),
-            &[],
-        )
+        .query(&format!("SELECT id FROM {SCHEMA_KEY} WHERE id = 'row-99'"))
+        .all()
         .await
         .expect("read checkpoint-GC replacement row");
     assert_eq!(!replacement.is_empty(), replacement_present);
@@ -311,10 +296,7 @@ async fn assert_generation<S: Storage + Clone + Send + Sync + 'static>(
 
 async fn assert_history_readable<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {
     let history = lix
-        .execute(
-            &format!("SELECT to_note AS note FROM lix_history('{SCHEMA_KEY}') WHERE diff_type <> 'removed' AND id = 'row-1'"),
-            &[],
-        )
+        .query(&format!("SELECT to_note AS note FROM lix_history('{SCHEMA_KEY}') WHERE diff_type <> 'removed' AND id = 'row-1'")).all()
         .await
         .expect("read compacted checkpoint-GC history");
     assert!(!history.is_empty());

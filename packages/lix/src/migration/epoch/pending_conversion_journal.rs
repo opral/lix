@@ -269,7 +269,6 @@ mod tests {
         source
             .execute(
                 "INSERT INTO lix_key_value(key,value) VALUES('migration-preserved','original')",
-                &[],
             )
             .await
             .unwrap();
@@ -423,10 +422,8 @@ mod tests {
             selected.head.commit_id
         );
         let rows = reopened
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='migration-preserved'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='migration-preserved'")
+            .all()
             .await
             .unwrap();
         assert!(format!("{rows:?}").contains("original"));

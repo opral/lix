@@ -50,10 +50,10 @@ pub fn hint_from_error(err: &CliError) -> Vec<String> {
 
 /// Query lix_key_value for 'lix_cli_hints'. Returns true unless value is explicitly "false".
 pub fn are_hints_enabled(lix: &crate::db::LocalLix) -> bool {
-    let result = crate::db::block_on(lix.execute(
-        "SELECT value FROM lix_key_value WHERE key = 'lix_cli_hints'",
-        &[],
-    ));
+    let result = crate::db::block_on(
+        lix.query("SELECT value FROM lix_key_value WHERE key = 'lix_cli_hints'")
+            .all(),
+    );
     match result {
         Ok(result) => {
             if let Some(row) = result.rows().first() {

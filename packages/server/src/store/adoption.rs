@@ -394,12 +394,9 @@ mod tests {
             .with_storage(stage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES ('adoption-proof','retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES ('adoption-proof','retained')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         drop(lix);
         let proof = lix_sdk::migration::migrate_repository(stage.clone())
@@ -436,10 +433,8 @@ mod tests {
             .unwrap();
         let lix = lix_sdk::open_lix().with_storage(stage).await.unwrap();
         let rows = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'adoption-proof'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'adoption-proof'")
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.rows().len(), 1);

@@ -26,23 +26,20 @@ async fn main() -> Result<(), LixError> {
         serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_parent","columns":[{"name":"id","type":"int8","nullable":false}],"primary_key":["id"]}),
         serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"parent_id","type":"int8","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"bench_parent","columns":["id"]},"on_delete":"cascade"}]}),
     ] {
-        db.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-            &[Value::Text(schema.to_string())],
-        )
-        .await?;
+        db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(schema.to_string())])
+            .await?;
     }
-    db.execute("INSERT INTO bench_parent(id) VALUES (1),(2)", &[])
+    db.execute("INSERT INTO bench_parent(id) VALUES (1),(2)")
         .await?;
     for start in (0..total).step_by(1000) {
         let values = (start..(start + 1000).min(total))
             .map(|id| format!("({id},{})", if id < fanout { 1 } else { 2 }))
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(
-            &format!("INSERT INTO bench_child(id,parent_id) VALUES {values}"),
-            &[],
-        )
+        db.execute(&format!(
+            "INSERT INTO bench_child(id,parent_id) VALUES {values}"
+        ))
         .await?;
     }
     let mut perf_control = std::env::var_os("LIX_CASCADE_PERF_CONTROL").map(|path| {
@@ -55,14 +52,14 @@ async fn main() -> Result<(), LixError> {
         writeln!(control, "enable").unwrap();
     }
     let started = Instant::now();
-    db.execute("DELETE FROM bench_parent WHERE id=1", &[])
-        .await?;
+    db.execute("DELETE FROM bench_parent WHERE id=1").await?;
     let elapsed = started.elapsed();
     if let Some(control) = &mut perf_control {
         writeln!(control, "disable").unwrap();
     }
     let remaining = db
-        .execute("SELECT count(*) AS n FROM bench_child", &[])
+        .query("SELECT count(*) AS n FROM bench_child")
+        .all()
         .await?
         .rows()[0]
         .get::<i64>("n")?;

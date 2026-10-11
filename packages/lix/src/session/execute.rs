@@ -582,7 +582,10 @@ impl ExecuteResult {
                 Some(rows) => rows,
                 None => backing.materialize_rows(),
             },
-            Err(shared) => shared.rows.get_or_init(|| shared.materialize_rows()).clone(),
+            Err(shared) => shared
+                .rows
+                .get_or_init(|| shared.materialize_rows())
+                .clone(),
         }
     }
 
@@ -707,6 +710,12 @@ impl QueryResult {
     /// Returns the position of a column name.
     pub fn column_index(&self, column_name: &str) -> Option<usize> {
         self.inner.column_index(column_name)
+    }
+}
+
+impl From<QueryResult> for ExecuteResult {
+    fn from(result: QueryResult) -> Self {
+        result.inner
     }
 }
 
@@ -1472,7 +1481,9 @@ where
     /// Admits each pull of a live stream: a session operation guard is held
     /// only while the producer runs, so idle streams never block writes or
     /// close.
-    pub(crate) fn query_stream_admission(self: &Arc<Self>) -> super::query_stream::QueryStreamPullAdmission {
+    pub(crate) fn query_stream_admission(
+        self: &Arc<Self>,
+    ) -> super::query_stream::QueryStreamPullAdmission {
         let admission_session = Arc::clone(self);
         Arc::new(move || {
             let session = Arc::clone(&admission_session);
@@ -3215,10 +3226,12 @@ where
                                 )
                                 .await
                                 .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| with_batch_statement_index(
-                                                normalize_sql_surface_error(error, sql),
-                                                statement_index,
-                                            ))
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, sql),
+                                        statement_index,
+                                    )
+                                })
                             };
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
@@ -3278,11 +3291,7 @@ where
                             )
                         })?;
                         captured_interests.extend(capture.map(|(_, capture)| capture));
-                        Ok((
-                            results,
-                            file_view_mutations,
-                            captured_interests,
-                        ))
+                        Ok((results, file_view_mutations, captured_interests))
                     }
                 },
             )
@@ -4558,11 +4567,7 @@ pub(crate) fn seed_foreground_filesystem_interest(
         return Ok(());
     };
     if let Some(read) = sql2::exact_file_content_id_read(statement, params) {
-        register_seeded_exact_id_file_content_interest(
-            capture,
-            active_branch_id,
-            &read,
-        )?;
+        register_seeded_exact_id_file_content_interest(capture, active_branch_id, &read)?;
         return Ok(());
     }
     let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
@@ -4638,7 +4643,10 @@ fn register_seeded_exact_id_file_content_interest(
         cache_small_blob_data: false,
     })?;
     let request = sql2::lix_file_content_scan_request(&branch_ids, read.include_metadata);
-    capture.register(sql2::exact_id_file_content_interest(&request, &read.file_id))?;
+    capture.register(sql2::exact_id_file_content_interest(
+        &request,
+        &read.file_id,
+    ))?;
     Ok(())
 }
 
@@ -8070,10 +8078,8 @@ mod tests {
                 ExactLixFileReadColumn::Content,
             ))
         );
-        let content_only = sql2::parse_statement(
-            "SELECT content FROM lix_file WHERE id = $1 LIMIT $2",
-        )
-        .unwrap();
+        let content_only =
+            sql2::parse_statement("SELECT content FROM lix_file WHERE id = $1 LIMIT $2").unwrap();
         assert_eq!(
             sql2::exact_file_content_id_read(
                 &content_only,
@@ -8244,11 +8250,10 @@ mod tests {
              FROM lix_file WHERE id = $1",
         )
         .unwrap();
-        assert!(sql2::exact_file_content_id_read(
-            &with_computed_and_direct,
-            &[Value::Text(file_id)]
-        )
-        .is_some());
+        assert!(
+            sql2::exact_file_content_id_read(&with_computed_and_direct, &[Value::Text(file_id)])
+                .is_some()
+        );
     }
 
     #[test]

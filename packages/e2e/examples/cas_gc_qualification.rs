@@ -413,20 +413,19 @@ where
         .execute(
             "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[
-                Value::Text(FILE_PATH.to_owned()),
-                Value::Blob(payload.into()),
-            ],
         )
+        .params(&[
+            Value::Text(FILE_PATH.to_owned()),
+            Value::Blob(payload.into()),
+        ])
         .await
         .expect("write retained qualification payload through SQL");
     let upload = upload_started.finish(slate_io, None);
     let expected_content_hash = expected_hasher.finalize().to_hex().to_string();
     let uploaded = session
-        .execute(
-            "SELECT content, content_identity FROM lix_file WHERE path = $1",
-            &[Value::Text(FILE_PATH.to_owned())],
-        )
+        .query("SELECT content, content_identity FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(FILE_PATH.to_owned())])
+        .all()
         .await
         .expect("read uploaded qualification payload")
         .rows()
@@ -446,10 +445,8 @@ where
         .expect("uploaded content identity should decode");
     let root_a = branch_commit(&session).await;
     session
-        .execute(
-            "DELETE FROM lix_file WHERE path = $1",
-            &[Value::Text(FILE_PATH.to_owned())],
-        )
+        .execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(FILE_PATH.to_owned())])
         .await
         .expect("delete payload from advancing branch");
     let root_b = branch_commit(&session).await;
@@ -467,15 +464,15 @@ where
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                  ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                &[
-                    Value::Text("/qualification/retention.json".to_owned()),
-                    Value::Blob(format!("{{\"revision\":{revision}}}").into_bytes().into()),
-                ],
             )
+            .params(&[
+                Value::Text("/qualification/retention.json".to_owned()),
+                Value::Blob(format!("{{\"revision\":{revision}}}").into_bytes().into()),
+            ])
             .await
             .expect("publish retention commit");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("publish retention checkpoint");
     }
@@ -545,26 +542,24 @@ where
         .await
         .expect("switch session branch");
     let diff = session
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff('lix_file', $1, $2)",
-            &[
-                Value::Text(fixture.root_a.clone()),
-                Value::Text(fixture.root_b.clone()),
-            ],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_file', $1, $2)")
+        .params(&[
+            Value::Text(fixture.root_a.clone()),
+            Value::Text(fixture.root_b.clone()),
+        ])
+        .all()
         .await
         .expect("cold retained diff should remain readable");
     assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
     let absent = session
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_file WHERE path = $1",
-            &[Value::Text(FILE_PATH.to_owned())],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(FILE_PATH.to_owned())])
+        .all()
         .await
         .expect("retained root B file absence should read");
     assert_eq!(absent.rows()[0].get::<i64>("entries").unwrap(), 0);
     session
-        .execute("SELECT commit_id FROM lix_undo()", &[])
+        .execute("SELECT commit_id FROM lix_undo()")
         .await
         .expect("retained owner undo should succeed");
     let bytes = read_current_file(&session).await;
@@ -575,14 +570,13 @@ where
     );
     drop(bytes);
     session
-        .execute("SELECT commit_id FROM lix_redo()", &[])
+        .execute("SELECT commit_id FROM lix_redo()")
         .await
         .expect("retained owner redo should succeed");
     let absent = session
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_file WHERE path = $1",
-            &[Value::Text(FILE_PATH.to_owned())],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(FILE_PATH.to_owned())])
+        .all()
         .await
         .expect("redone retained file absence should read");
     assert_eq!(absent.rows()[0].get::<i64>("entries").unwrap(), 0);
@@ -595,10 +589,8 @@ where
         .await
         .expect("open workspace for final owner release");
     workspace
-        .execute(
-            "DELETE FROM lix_branch WHERE id = $1",
-            &[Value::Text(fixture.branch_id.clone())],
-        )
+        .execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(fixture.branch_id.clone())])
         .await
         .expect("delete final retained owner branch");
     drop(workspace);
@@ -641,10 +633,9 @@ where
         .await
         .expect("final session should open");
     let branches = workspace
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1",
-            &[Value::Text(fixture.branch_id.clone())],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(fixture.branch_id.clone())])
+        .all()
         .await
         .expect("released branch absence should read");
     assert_eq!(branches.rows()[0].get::<i64>("entries").unwrap(), 0);
@@ -703,10 +694,9 @@ where
         .await
         .expect("active branch id should load");
     session
-        .execute(
-            "SELECT commit_id FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id)],
-        )
+        .query("SELECT commit_id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id)])
+        .all()
         .await
         .expect("branch commit should load")
         .rows()[0]
@@ -719,10 +709,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(FILE_PATH.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(FILE_PATH.to_owned())])
+        .all()
         .await
         .expect("current retained file should read")
         .rows()[0]

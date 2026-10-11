@@ -70,10 +70,13 @@ async fn sequential_batches_survive_observation_cache_eviction() {
         .expect("document-scale workspace should open");
     install_plugin(&lix, "plugin_text", &build_git_text_v2_plugin_archive()).await;
 
-    lix.execute_batch(&[file_insert_statement(
-        "txt",
-        (0..DOCUMENTS).map(|index| format!("before {index}\n").into_bytes()),
-    )])
+    execute_atomically(
+        &lix,
+        &[file_insert_statement(
+            "txt",
+            (0..DOCUMENTS).map(|index| format!("before {index}\n").into_bytes()),
+        )],
+    )
     .await
     .expect("the first batch should exceed the Store working set");
 
@@ -87,7 +90,7 @@ async fn sequential_batches_survive_observation_cache_eviction() {
             ],
         })
         .collect::<Vec<_>>();
-    lix.execute_batch(&updates)
+    execute_atomically(&lix, &updates)
         .await
         .expect("retained observations must survive cache eviction between batches");
 
@@ -120,11 +123,9 @@ async fn assert_format_scales(
     let input_bytes = documents.iter().map(Vec::len).sum::<usize>();
     let statement = file_insert_statement(extension, documents);
     let started = Instant::now();
-    let results = lix
-        .execute_batch(&[statement])
+    let results = execute_atomically(&lix, &[statement])
         .await
-        .expect("an atomic import must not be bounded by the live actor working set")
-        .results;
+        .expect("an atomic import must not be bounded by the live actor working set");
     let elapsed = started.elapsed();
     eprintln!(
         "plugin_document_scale format={extension} documents={expected_count} input_bytes={input_bytes} elapsed_ms={:.3} per_document_us={:.3}",
@@ -134,10 +135,8 @@ async fn assert_format_scales(
     assert_eq!(results[0].rows_affected(), expected_count as u64);
 
     let files = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_file WHERE path LIKE '/scale-document-%'",
-            &[],
-        )
+        .query("SELECT COUNT(*) AS count FROM lix_file WHERE path LIKE '/scale-document-%'")
+        .all()
         .await
         .expect("imported documents should query");
     assert_eq!(
@@ -145,10 +144,8 @@ async fn assert_format_scales(
         expected_count as i64
     );
     let semantic_rows = lix
-        .execute(
-            &format!("SELECT COUNT(*) AS count FROM {semantic_table}"),
-            &[],
-        )
+        .query(&format!("SELECT COUNT(*) AS count FROM {semantic_table}"))
+        .all()
         .await
         .expect("semantic rows should query");
     assert!(
@@ -203,13 +200,12 @@ async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("imported file should read")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("imported file should read")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("imported file data should be bytes")
 }
@@ -218,15 +214,13 @@ async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive:
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("reference plugin should install");
+        ])
+        .await
+        .expect("reference plugin should install");
 }
 
 fn build_markdown_plugin_archive() -> Vec<u8> {
@@ -323,4 +317,43 @@ fn build_plugin_archive(wasm_path: &Path, manifest: &str, schemas: &[(&str, &str
         .finish()
         .expect("plugin archive should finish")
         .into_inner()
+}
+
+/// Runs statements atomically in one transaction and returns each result:
+/// reads through `query`, writes through `execute`.
+async fn execute_atomically<S>(
+    lix: &lix::Lix<S>,
+    statements: &[lix::ExecuteBatchStatement],
+) -> Result<Vec<lix::ExecuteResult>, lix::LixError>
+where
+    S: lix::storage::Storage + Clone + Send + Sync + 'static,
+{
+    let transaction = lix.begin_transaction().await?;
+    let mut results = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let read_only = lix::parse_sql_script(&statement.sql, statement.params.len())
+            .is_ok_and(|plan| plan.statements.iter().all(|statement| statement.read_only));
+        let result = if read_only {
+            transaction
+                .query(&statement.sql)
+                .params(&statement.params)
+                .all()
+                .await
+                .map(lix::ExecuteResult::from)
+        } else {
+            transaction
+                .execute(&statement.sql)
+                .params(&statement.params)
+                .await
+        };
+        match result {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+    transaction.commit().await?;
+    Ok(results)
 }

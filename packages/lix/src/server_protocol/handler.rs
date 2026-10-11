@@ -7448,10 +7448,10 @@ mod tests {
     async fn serve_preserves_preexisting_untracked_rows() {
         let storage = Memory::new();
         let source = open_lix().with_storage(storage.clone()).await.unwrap();
-        source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)", &[]).await.unwrap();
+        source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('local-state','preserved',true)").await.unwrap();
         let query =
             "SELECT key, value, lixcol_untracked FROM lix_key_value WHERE key = 'local-state'";
-        let before = source.execute(query, &[]).await.unwrap();
+        let before = source.query(query).all().await.unwrap();
         assert_eq!(before.rows().len(), 1);
         source.close().await.unwrap();
         let server = open_lix()
@@ -7466,7 +7466,7 @@ mod tests {
             .from_snapshot(futures_util::io::Cursor::new(after))
             .await
             .unwrap();
-        let after = restored.execute(query, &[]).await.unwrap();
+        let after = restored.query(query).all().await.unwrap();
         assert_eq!(
             before.rows(),
             after.rows(),
@@ -7491,16 +7491,14 @@ mod tests {
             .expect("a second read-capable engine should open");
 
         let error = plain
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('bypass', 'forbidden')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('bypass', 'forbidden')")
             .await
             .expect_err("plain writers must not bypass authority publication");
         assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
         assert!(
             plain
-                .execute("SELECT * FROM lix_key_value WHERE key = 'bypass'", &[])
+                .query("SELECT * FROM lix_key_value WHERE key = 'bypass'")
+                .all()
                 .await
                 .expect("rejected row absence should query")
                 .rows()
@@ -8381,12 +8379,12 @@ mod tests {
         authority
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ('/history.md', CAST('one' AS BYTEA))",
-                &[],
             )
             .await
             .expect("seed historical file");
         let file_id = authority
-            .execute("SELECT id FROM lix_file WHERE path = '/history.md'", &[])
+            .query("SELECT id FROM lix_file WHERE path = '/history.md'")
+            .all()
             .await
             .expect("load historical file id")
             .rows()[0]
@@ -8397,10 +8395,8 @@ mod tests {
             .await
             .expect("checkpoint first version");
         authority
-            .execute(
-                "UPDATE lix_file SET content = CAST('two' AS BYTEA) WHERE id = $1",
-                &[Value::Text(file_id)],
-            )
+            .execute("UPDATE lix_file SET content = CAST('two' AS BYTEA) WHERE id = $1")
+            .params(&[Value::Text(file_id)])
             .await
             .expect("write second historical version");
 
@@ -8601,7 +8597,7 @@ mod tests {
             },
         ];
         let results = replica
-            .execute_batch(&statements)
+            .execute_batch_for_test(&statements)
             .await
             .expect("history hydration retries the atomic batch before its local commit")
             .results;
@@ -8621,10 +8617,8 @@ mod tests {
             .await
             .expect("open an offline reader over the committed replica state");
         let count = offline_reader
-            .execute(
-                "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'",
-                &[],
-            )
+            .query("SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'history-hydrated'")
+            .all()
             .await
             .expect("read committed batch state");
         assert_eq!(
@@ -10801,10 +10795,8 @@ mod tests {
         let cursor = snapshot["cursor"].as_u64().expect("snapshot cursor");
 
         client
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))",
-                &[Value::Text("/empty-inline.md".to_owned())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))")
+            .params(&[Value::Text("/empty-inline.md".to_owned())])
             .await
             .expect("empty authority file should commit");
         let pull = request(
@@ -10827,10 +10819,8 @@ mod tests {
         let empty_cursor = empty_pull["cursor"].as_u64().expect("empty file cursor");
 
         client
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('inline' AS BYTEA))",
-                &[Value::Text("/nonempty-inline.md".to_owned())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST('inline' AS BYTEA))")
+            .params(&[Value::Text("/nonempty-inline.md".to_owned())])
             .await
             .expect("non-empty authority file should commit");
         let pull = request(
@@ -10994,24 +10984,17 @@ mod tests {
             .await
             .expect("source session should switch branches");
         source
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('sync-source', 'selected')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('sync-source', 'selected')")
             .await
             .expect("source branch should diverge");
         source
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('sync-source-older', 'selected')",
-                &[],
             )
             .await
             .expect("source branch should span more than one commit");
         client
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('sync-target', 'authored')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('sync-target', 'authored')")
             .await
             .expect("target branch should diverge");
         let merge = client
@@ -15863,7 +15846,7 @@ mod tests {
             assert!(!record.activity.transaction_is_active());
             assert!(record.transactions.lock().await.active.is_none());
             assert_eq!(
-                record.lix.execute("SELECT 1", &[]).await.unwrap_err().code,
+                record.lix.query("SELECT 1").all().await.unwrap_err().code,
                 LixError::CODE_CLOSED
             );
             drop(record);
@@ -15875,10 +15858,8 @@ mod tests {
             let replacement = app.server.inner.registry.lock().await[&replacement_id].clone();
             let rows = replacement
                 .lix
-                .execute(
-                    "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'",
-                    &[],
-                )
+                .query("SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'")
+                .all()
                 .await
                 .expect("replacement reads committed state");
             assert_eq!(rows.rows()[0].get::<i64>("count").unwrap(), 0);
@@ -15959,10 +15940,8 @@ mod tests {
             Arc::clone(&registry.get(&observer_id).expect("observer session").lix)
         };
         let visible = observer
-            .execute(
-                "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'",
-                &[],
-            )
+            .query("SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'abandoned'")
+            .all()
             .await
             .expect("observer should read committed state");
         assert_eq!(visible.rows()[0].get::<i64>("count").unwrap(), 0);
@@ -16455,7 +16434,8 @@ mod tests {
         app.server.close().await.expect("close server again");
         assert_eq!(
             child
-                .execute("SELECT 1", &[])
+                .query("SELECT 1")
+                .all()
                 .await
                 .expect_err("child closed")
                 .code,
@@ -16565,7 +16545,6 @@ mod tests {
         let seed = open_lix().with_storage(memory.clone()).await.unwrap();
         seed.execute(
             "INSERT INTO lix_key_value(key,value) VALUES('http-merge-a','B'),('http-merge-b','B')",
-            &[],
         )
         .await
         .unwrap();
@@ -16590,17 +16569,11 @@ mod tests {
             .unwrap();
         let authority = &lease.record.lix;
         local
-            .execute(
-                "UPDATE lix_key_value SET value='L' WHERE key='http-merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='L' WHERE key='http-merge-a'")
             .await
             .unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='R' WHERE key='http-merge-b'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='R' WHERE key='http-merge-b'")
             .await
             .unwrap();
         let remote = authority.partial_replica_descriptor(None).await.unwrap();

@@ -20219,22 +20219,19 @@ mod effective_file_cascade_tests {
             "columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],
             "primary_key":["id"]
         });
-        lix.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[crate::Value::Text(schema.to_string())],
-        )
-        .await
-        .unwrap();
-        lix.execute("INSERT INTO lix_file(id,path,content) VALUES($1,'/deleted.bin',CAST('a' AS BYTEA)),($2,'/retained.bin',CAST('b' AS BYTEA))", &[crate::Value::Text(FILE.into()),crate::Value::Text(OTHER.into())]).await.unwrap();
+        lix.execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+            .params(&[crate::Value::Text(schema.to_string())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_file(id,path,content) VALUES($1,'/deleted.bin',CAST('a' AS BYTEA)),($2,'/retained.bin',CAST('b' AS BYTEA))").params(&[crate::Value::Text(FILE.into()),crate::Value::Text(OTHER.into())]).await.unwrap();
         let values = (0..600)
             .map(|index| format!("('row-{index}','value','{FILE}')"))
             .chain(std::iter::once(format!("('retained','other','{OTHER}')")))
             .collect::<Vec<_>>()
             .join(",");
-        lix.execute(
-            &format!("INSERT INTO cascade_probe(id,value,lixcol_file_id) VALUES {values}"),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO cascade_probe(id,value,lixcol_file_id) VALUES {values}"
+        ))
         .await
         .unwrap();
         lix.create_checkpoint().await.unwrap();
@@ -20311,24 +20308,21 @@ mod effective_file_cascade_tests {
         drop(physical);
         drop(read);
         let lix = crate::open_lix().with_storage(backing).await.unwrap();
-        lix.execute(
-            "DELETE FROM lix_file WHERE id=$1",
-            &[crate::Value::Text(FILE.into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_file WHERE id=$1")
+            .params(&[crate::Value::Text(FILE.into())])
+            .await
+            .unwrap();
         let deleted = lix
-            .execute(
-                "SELECT id FROM cascade_probe WHERE lixcol_file_id=$1",
-                &[crate::Value::Text(FILE.into())],
-            )
+            .query("SELECT id FROM cascade_probe WHERE lixcol_file_id=$1")
+            .params(&[crate::Value::Text(FILE.into())])
+            .all()
             .await
             .unwrap();
         assert!(
             deleted.rows().is_empty(),
             "descriptor deletion must cascade into root-backed semantic state"
         );
-        let retained = lix.execute("SELECT id FROM cascade_probe WHERE lixcol_file_id=$1 AND id='retained' AND value='other'", &[crate::Value::Text(OTHER.into())]).await.unwrap();
+        let retained = lix.query("SELECT id FROM cascade_probe WHERE lixcol_file_id=$1 AND id='retained' AND value='other'").params(&[crate::Value::Text(OTHER.into())]).all().await.unwrap();
         assert_eq!(retained.rows().len(), 1);
     }
 }

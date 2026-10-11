@@ -29,10 +29,10 @@ async fn partial_browser_file_profile_authority() {
                 .collect::<Vec<_>>()
                 .join(",");
             authority
-                .execute(
-                    &format!("INSERT INTO lix_file(path,content) VALUES {values}"),
-                    &[Value::Blob(vec![97, 98].into())],
-                )
+                .execute(&format!(
+                    "INSERT INTO lix_file(path,content) VALUES {values}"
+                ))
+                .params(&[Value::Blob(vec![97, 98].into())])
                 .await
                 .unwrap();
         }

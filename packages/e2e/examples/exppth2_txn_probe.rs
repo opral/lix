@@ -126,29 +126,28 @@ async fn run_profile(files: usize, updates: usize, payload: usize, loops: usize)
         .expect("open Lix");
 
     let seed: Vec<u8> = vec![b'a'; payload];
-    let mut transaction = lix.begin_transaction().await.expect("begin seed");
+    let transaction = lix.begin_transaction().await.expect("begin seed");
     for index in 0..files {
         transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/exppth2-{index:06}.bin")),
-                    Value::Blob(seed.clone().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/exppth2-{index:06}.bin")),
+                Value::Blob(seed.clone().into()),
+            ])
             .await
             .expect("seed insert");
     }
     transaction.commit().await.expect("commit seed");
 
     let rows = lix
-        .execute("SELECT id FROM lix_file ORDER BY path", &[])
+        .query("SELECT id FROM lix_file ORDER BY path")
+        .all()
         .await
         .expect("read ids back");
     let ids = rows
         .rows()
         .iter()
-        .map(|row| match rows.get(row, "id").expect("file id") {
+        .map(|row| match row.value("id").expect("file id") {
             Value::Text(text) => text.clone(),
             other => panic!("unexpected id value {other:?}"),
         })
@@ -172,12 +171,10 @@ async fn run_profile(files: usize, updates: usize, payload: usize, loops: usize)
         let updated: Vec<u8> = vec![payload_byte; payload];
         let started = Instant::now();
         for id in ids.iter().take(updates) {
-            lix.execute(
-                "UPDATE lix_file SET content = $1 WHERE id = $2",
-                &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
-            )
-            .await
-            .expect("update by id");
+            lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2")
+                .params(&[Value::Blob(updated.clone().into()), Value::Text(id.clone())])
+                .await
+                .expect("update by id");
         }
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         let (calls, point_batch, file_prefix, fallback, decoded, matched) =
@@ -209,29 +206,28 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
     // Identical fixture for every arm. Seeded in one transaction so fixture
     // build time does not dominate at large file counts.
     let seed: Vec<u8> = vec![b'a'; payload];
-    let mut transaction = lix.begin_transaction().await.expect("begin seed");
+    let transaction = lix.begin_transaction().await.expect("begin seed");
     for index in 0..files {
         transaction
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/exppth2-{index:06}.bin")),
-                    Value::Blob(seed.clone().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/exppth2-{index:06}.bin")),
+                Value::Blob(seed.clone().into()),
+            ])
             .await
             .expect("seed insert");
     }
     transaction.commit().await.expect("commit seed");
 
     let rows = lix
-        .execute("SELECT id FROM lix_file ORDER BY path", &[])
+        .query("SELECT id FROM lix_file ORDER BY path")
+        .all()
         .await
         .expect("read ids back");
     let ids = rows
         .rows()
         .iter()
-        .map(|row| match rows.get(row, "id").expect("file id") {
+        .map(|row| match row.value("id").expect("file id") {
             Value::Text(text) => text.clone(),
             other => panic!("unexpected id value {other:?}"),
         })
@@ -243,22 +239,18 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
     match arm {
         "by_id_per_stmt" => {
             for id in ids.iter().take(updates) {
-                lix.execute(
-                    "UPDATE lix_file SET content = $1 WHERE id = $2",
-                    &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
-                )
-                .await
-                .expect("update by id");
+                lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2")
+                    .params(&[Value::Blob(updated.clone().into()), Value::Text(id.clone())])
+                    .await
+                    .expect("update by id");
             }
         }
         "by_id_one_txn" => {
-            let mut transaction = lix.begin_transaction().await.expect("begin updates");
+            let transaction = lix.begin_transaction().await.expect("begin updates");
             for id in ids.iter().take(updates) {
                 transaction
-                    .execute(
-                        "UPDATE lix_file SET content = $1 WHERE id = $2",
-                        &[Value::Blob(updated.clone().into()), Value::Text(id.clone())],
-                    )
+                    .execute("UPDATE lix_file SET content = $1 WHERE id = $2")
+                    .params(&[Value::Blob(updated.clone().into()), Value::Text(id.clone())])
                     .await
                     .expect("update by id in transaction");
             }
@@ -266,15 +258,13 @@ async fn run_arm(arm: &str, files: usize, updates: usize, payload: usize) -> f64
         }
         "by_path_per_stmt" => {
             for index in 0..updates {
-                lix.execute(
-                    "UPDATE lix_file SET content = $1 WHERE path = $2",
-                    &[
+                lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+                    .params(&[
                         Value::Blob(updated.clone().into()),
                         Value::Text(format!("/exppth2-{index:06}.bin")),
-                    ],
-                )
-                .await
-                .expect("update by path");
+                    ])
+                    .await
+                    .expect("update by path");
             }
         }
         other => panic!("unknown arm {other}"),

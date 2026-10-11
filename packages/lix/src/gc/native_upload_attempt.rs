@@ -697,10 +697,7 @@ mod tests {
             .await
             .unwrap();
         session
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('attempt-owned','kept')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('attempt-owned','kept')")
             .await
             .unwrap();
         let descriptor = lix
@@ -736,12 +733,10 @@ mod tests {
             .unwrap();
         session.close().await.unwrap();
         drop(session);
-        lix.execute(
-            "DELETE FROM lix_branch WHERE id=$1",
-            &[crate::Value::Text(branch.id)],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_branch WHERE id=$1")
+            .params(&[crate::Value::Text(branch.id)])
+            .await
+            .unwrap();
         for expired in [false, true] {
             if expired {
                 state.expires_at_ms = 1;

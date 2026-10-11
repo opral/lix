@@ -127,7 +127,9 @@ mod upload_plan_profile {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .unwrap();
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let mut replica = open_lix().with_storage(storage.clone()).await.unwrap();
         replica
             .set_sync_role(crate::sync::SyncRole::Replica)
@@ -388,12 +390,12 @@ mod upload_plan_profile {
                 } else {
                     "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"
                 };
-                let checkpoint = replica.execute(sql, &[]).await.unwrap().rows()[0]
+                let checkpoint = replica.execute(sql).await.unwrap().rows()[0]
                     .get::<String>("commit_id")
                     .unwrap();
                 let profile = drain(&authority, &replica, &storage, 2, retained_plan).await;
                 let remote_checkpoint = authority
-                    .execute("SELECT working_base_commit_id AS id FROM lix_branch WHERE id = lix_active_branch_id()", &[])
+                    .query("SELECT working_base_commit_id AS id FROM lix_branch WHERE id = lix_active_branch_id()").all()
                     .await
                     .unwrap()
                     .rows()[0]
