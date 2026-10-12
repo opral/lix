@@ -18,6 +18,9 @@ where
 {
     std::thread::Builder::new()
         .name(name.to_owned())
+        // Engine poll chains and RocksDB bulk reads can exceed Rust's default
+        // stack. Keep this budget independent of the embedding application's.
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || futures_lite::future::block_on(factory()))
         .map(|_| ())
         .map_err(|error| {

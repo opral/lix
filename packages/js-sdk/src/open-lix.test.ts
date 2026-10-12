@@ -1634,7 +1634,7 @@ test("fs storage on-demand sync does not create directories for missing imports"
 	await lix.close();
 });
 
-test("fs storage on-demand sync propagates deletion on a default-sized Rust stack", async () => {
+test("fs storage sync owns its engine stack despite small inherited thread stacks", async () => {
 	const dir = tempFsDir();
 	const filePath = join(dir, "note.md");
 	mkdirSync(dir, { recursive: true });
@@ -1652,6 +1652,18 @@ test("fs storage on-demand sync propagates deletion on a default-sized Rust stac
 		const storage = new FilesystemStorage({ path: ${JSON.stringify(dir)}, syncAllFiles: false });
 		const lix = await openLix({ storage });
 		try {
+			await lix.execute(
+				"INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+				[JSON.stringify({
+					$schema: "https://lix.dev/schema-v1.json",
+					key: "stack_probe",
+					columns: [{ name: "id", type: "text", nullable: false }],
+					primary_key: ["id"],
+				})],
+			);
+			await lix.execute("INSERT INTO stack_probe (id) VALUES ('committed')");
+			const committed = await lix.execute("SELECT id FROM stack_probe");
+			if (committed.rows[0]?.id !== "committed") throw new Error("write was not committed");
 			await storage.importPaths(["note.md"]);
 			const read = async () => (await lix.execute("SELECT id FROM lix_file WHERE path = $1", ["/note.md"])).rows;
 			if ((await read()).length !== 1) throw new Error("file was not imported");
@@ -1667,7 +1679,7 @@ test("fs storage on-demand sync propagates deletion on a default-sized Rust stac
 	try {
 		await expect(
 			promisify(execFile)(process.execPath, ["--input-type=module", "--eval", script], {
-				env: { ...process.env, RUST_MIN_STACK: "2097152" },
+				env: { ...process.env, RUST_MIN_STACK: "1048576" },
 				timeout: 8_000,
 			}),
 		).resolves.toBeDefined();

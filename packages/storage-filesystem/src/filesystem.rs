@@ -33,6 +33,9 @@ use crate::RocksDBFilesystem;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
+// This thread executes the engine's write/validation graph and RocksDB reads.
+// Match the native engine actors rather than inheriting Rust's small default.
+const FILESYSTEM_ENGINE_STACK_SIZE: usize = 32 * 1024 * 1024;
 const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
@@ -707,6 +710,7 @@ impl FilesystemSupervisor {
         let worker_state = Arc::clone(&state);
         let worker = thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
+            .stack_size(FILESYSTEM_ENGINE_STACK_SIZE)
             .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem, debouncer))
             .map_err(|error| {
                 LixError::new(
