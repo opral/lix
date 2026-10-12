@@ -311,7 +311,7 @@ where
     }
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
-        let limits = ReadLimits::bytes(request.max_bytes);
+        let limits = ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
         // SAFETY: the future owns the handle Arc and the request.
         unsafe {
             boxed(async move { with_read_limits(limits, self.execute_latest(request)).await })
@@ -478,7 +478,7 @@ where
     }
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
-        let limits = ReadLimits::bytes(request.max_bytes);
+        let limits = ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
         // SAFETY: the future owns the transaction Arc and the request.
         unsafe { boxed(async move { with_read_limits(limits, self.write(request)).await }) }
     }

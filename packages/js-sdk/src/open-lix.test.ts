@@ -763,11 +763,23 @@ test("duplicate column names throw and dangerous names stay data", async () => {
 		rowsAffected: 0,
 		notices: [],
 	};
-	const wrapped = wrapExecuteResult(raw);
+	// A read wrote nothing: the call rejects.
+	expect(() => wrapExecuteResult(raw)).toThrow(
+		expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
+	);
+	// A published write never rejects; only reading `rows` throws, while
+	// spreading and serializing the result still work.
+	const wrapped = wrapExecuteResult({
+		...raw,
+		rowsAffected: 1,
+		commit: { before: "a", after: "b" },
+	} as never);
 	expect(wrapped.columns).toHaveLength(2);
 	expect(() => wrapped.rows).toThrow(
 		expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
 	);
+	expect({ ...wrapped }).not.toHaveProperty("rows");
+	expect(JSON.parse(JSON.stringify(wrapped)).rowsAffected).toBe(1);
 
 	const dangerous = await lix.execute(
 		'SELECT 3 AS "__proto__", 4 AS "constructor"',

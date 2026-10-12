@@ -902,3 +902,49 @@ async fn a_read_cancelled_mid_flush_poisons_its_transaction() {
         assert_eq!(row.get::<String>("value").unwrap(), "1");
     }
 }
+
+/// `SELECT id, id` is ambiguous at planning. A write whose RETURNING repeats
+/// a name runs and is read by position, unless the caller keys rows by name
+/// (`unique_column_names`, as the JS SDK does): then it is rejected before
+/// anything is written.
+#[tokio::test]
+async fn duplicate_output_columns_are_rejected_before_running_when_keyed_by_name() {
+    let lix = seeded(1).await;
+    let error = lix
+        .query("SELECT id, id FROM api_item")
+        .all()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_AMBIGUOUS_COLUMN);
+    let error = lix
+        .execute("INSERT INTO api_item (id, label) VALUES (9, 'nine') RETURNING id, id")
+        .unique_column_names()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_AMBIGUOUS_COLUMN);
+    let transaction = lix.begin_transaction().await.unwrap();
+    let error = transaction
+        .execute("UPDATE api_item SET label = 'x' RETURNING OLD.label, NEW.label")
+        .unique_column_names()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_AMBIGUOUS_COLUMN);
+    transaction.commit().await.unwrap();
+    assert_eq!(count(&lix).await, 1, "the insert did not run");
+    assert_eq!(
+        lix.query("SELECT label FROM api_item")
+            .one()
+            .await
+            .unwrap()
+            .get::<String>("label")
+            .unwrap(),
+        "label-0",
+        "the update did not run"
+    );
+    // Without the option the write runs and its rows read by position.
+    let result = lix
+        .execute("UPDATE api_item SET label = 'y' RETURNING OLD.label, NEW.label")
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
+}

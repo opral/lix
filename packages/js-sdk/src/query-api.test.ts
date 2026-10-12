@@ -347,29 +347,25 @@ test("concurrent snapshot and stream releases are never refused for backpressure
 	}
 });
 
-test("execute never rejects after its write ran, even with duplicate columns", async () => {
+test("duplicate output columns reject before anything is written", async () => {
 	const lix = await seeded();
+	const ambiguous = { code: "LIX_ERROR_AMBIGUOUS_COLUMN" };
 	try {
-		const result = await lix.execute(
-			"INSERT INTO api_item (id, label) VALUES (90, 'dup') RETURNING id, id",
-		);
-		expect(result.rowsAffected).toBe(1);
-		expect(result.commit).not.toBeNull();
-		expect(() => result.rows).toThrow(
-			expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
-		);
-		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 90")).toEqual({ id: 90 });
-
-		await lix.transaction(async (tx) => {
-			const staged = await tx.execute(
-				"INSERT INTO api_item (id, label) VALUES (91, 'dup') RETURNING id, id",
-			);
-			expect(staged.rowsAffected).toBe(1);
-			expect(() => staged.rows).toThrow(
-				expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
-			);
-		});
-		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 91")).toEqual({ id: 91 });
+		await expect(
+			lix.execute("INSERT INTO api_item (id, label) VALUES (90, 'dup') RETURNING id, id"),
+		).rejects.toMatchObject(ambiguous);
+		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 90")).toBeUndefined();
+		await expect(
+			lix.transaction((tx) =>
+				tx.execute("INSERT INTO api_item (id, label) VALUES (91, 'dup') RETURNING id, id"),
+			),
+		).rejects.toMatchObject(ambiguous);
+		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 91")).toBeUndefined();
+		// A read through execute() wrote nothing, so it rejects too.
+		await expect(
+			lix.execute("SELECT a.id, b.id FROM api_item a JOIN api_item b ON a.id = b.id"),
+		).rejects.toMatchObject(ambiguous);
+		await expect(lix.query("SELECT id, id FROM api_item")).rejects.toMatchObject(ambiguous);
 	} finally {
 		await lix.close();
 	}

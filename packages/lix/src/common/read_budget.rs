@@ -22,6 +22,9 @@ pub(crate) struct ReadLimits {
     pub(crate) max_bytes: usize,
     /// Rows the caller accepts (single-row reads); `None` is unlimited.
     pub(crate) max_rows: Option<usize>,
+    /// The caller keys rows by column name: a write whose `RETURNING` repeats
+    /// a name is rejected while binding, before it runs.
+    pub(crate) unique_columns: bool,
 }
 
 impl Default for ReadLimits {
@@ -29,6 +32,7 @@ impl Default for ReadLimits {
         Self {
             max_bytes: DEFAULT_MAX_RESULT_BYTES,
             max_rows: None,
+            unique_columns: false,
         }
     }
 }
@@ -38,7 +42,13 @@ impl ReadLimits {
         Self {
             max_bytes,
             max_rows: None,
+            unique_columns: false,
         }
+    }
+
+    pub(crate) fn with_unique_columns(mut self, unique_columns: bool) -> Self {
+        self.unique_columns = unique_columns;
+        self
     }
 
     /// At most one row, of any size.
@@ -46,6 +56,7 @@ impl ReadLimits {
         Self {
             max_bytes: usize::MAX,
             max_rows: Some(1),
+            unique_columns: false,
         }
     }
 }

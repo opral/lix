@@ -159,7 +159,9 @@ fn configured_execute(mut execution: lix::Execute, options: ExecuteOptions) -> l
     if let Some(max_bytes) = options.max_bytes {
         execution = execution.max_bytes(max_bytes);
     }
-    execution
+    // JS rows are keyed by column name: refuse a repeated RETURNING name
+    // before the write runs rather than after it committed.
+    execution.unique_column_names()
 }
 
 fn configured_execute_many(

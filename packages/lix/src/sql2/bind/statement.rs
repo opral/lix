@@ -386,6 +386,23 @@ fn bind_returning(
             "{action} RETURNING requires at least one result expression"
         )));
     }
+    // A caller that keys rows by name (the JS SDK) gets a repeated name
+    // rejected here, while binding, before anything is written. Otherwise
+    // such rows are returned and read by position.
+    let mut names = BTreeSet::new();
+    let unique_columns = crate::common::current_read_limits().unique_columns;
+    for item in items.iter().filter(|_| unique_columns) {
+        if !names.insert(item.output_name.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_AMBIGUOUS_COLUMN,
+                format!(
+                    "{action} RETURNING has more than one column named '{}'",
+                    item.output_name
+                ),
+            )
+            .with_hint("Alias the columns so every name is unique, e.g. RETURNING old.id AS old_id, new.id AS new_id."));
+        }
+    }
 
     Ok(Some(BoundReturning {
         items,

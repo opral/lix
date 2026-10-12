@@ -33,6 +33,7 @@ pub(crate) struct ExecuteRequest {
     pub(crate) params: Vec<Value>,
     pub(crate) options: ExecuteOptions,
     pub(crate) max_bytes: usize,
+    pub(crate) unique_columns: bool,
 }
 
 /// One statement with many parameter sets.
@@ -218,6 +219,7 @@ impl Execute {
                 params: Vec::new(),
                 options: ExecuteOptions::default(),
                 max_bytes: DEFAULT_MAX_RESULT_BYTES,
+                unique_columns: false,
             },
         }
     }
@@ -250,6 +252,15 @@ impl Execute {
     /// Identifies the caller-defined origin of this write.
     pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
         self.request.options.origin_key = Some(origin_key.into());
+        self
+    }
+
+    /// Rejects a write whose `RETURNING` repeats a column name
+    /// (`RETURNING OLD.value, NEW.value`) with LIX_ERROR_AMBIGUOUS_COLUMN
+    /// before it runs, for callers that key rows by name. By default such
+    /// rows are returned and read by position.
+    pub fn unique_column_names(mut self) -> Self {
+        self.request.unique_columns = true;
         self
     }
 

@@ -39,7 +39,7 @@ simulation_test!(sql_missing_column_has_lix_error_code, |sim| async move {
 });
 
 simulation_test!(
-    sql_duplicate_projection_name_is_parse_error,
+    sql_duplicate_projection_name_is_ambiguous_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -55,7 +55,7 @@ simulation_test!(
             .await
             .expect_err("duplicate projection names should fail during planning");
 
-        assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+        assert_eq!(error.code, LixError::CODE_AMBIGUOUS_COLUMN);
     }
 );
 

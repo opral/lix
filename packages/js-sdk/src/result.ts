@@ -65,8 +65,14 @@ export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {
 	try {
 		wrapped.rows = rowsOf(result);
 	} catch (error) {
+		// The engine rejects a write whose RETURNING repeats a column name
+		// before it runs, so a result that cannot be keyed is a read: nothing
+		// was written and the call can reject.
+		if (!result.commit && result.rowsAffected === 0) throw error;
+		// Defensive: never reject after a write. Only reading `rows` throws;
+		// spreading or serializing the result does not.
 		Object.defineProperty(wrapped, "rows", {
-			enumerable: true,
+			enumerable: false,
 			get() {
 				throw error;
 			},
