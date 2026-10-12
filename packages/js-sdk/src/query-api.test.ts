@@ -374,3 +374,15 @@ test("execute never rejects after its write ran, even with duplicate columns", a
 		await lix.close();
 	}
 });
+
+test("a fan-out of 100 concurrent reads all answer", async () => {
+	const lix = await openLix();
+	try {
+		const results = await Promise.all(
+			Array.from({ length: 100 }, (_, n) => lix.queryOne<{ n: number }>("SELECT $1 AS n", [n])),
+		);
+		expect(results.map((row) => row?.n)).toEqual(Array.from({ length: 100 }, (_, n) => n));
+	} finally {
+		await lix.close();
+	}
+});

@@ -9,7 +9,12 @@ export const WORKER_OPERATION_MAX_PULL_ACTIVE = 32;
 export const WORKER_OPERATION_MAX_OBSERVERS = 32;
 export const WORKER_OPERATION_MAX_OBSERVER_ACTIVE = WORKER_OPERATION_MAX_OBSERVERS;
 export const WORKER_OPERATION_MAX_QUEUED = 128;
-export const WORKER_OPERATION_MAX_QUEUED_PER_SESSION = 32;
+/**
+ * Operations one Lix may have waiting in its worker. Reads of the latest
+ * state run in order on the session's lane, so a fan-out of `query()` calls
+ * queues here; the client admits at most WORKER_CLIENT_MAX_ORDINARY_PENDING.
+ */
+export const WORKER_OPERATION_MAX_QUEUED_PER_SESSION = 112;
 export const WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS = 32;
 export const WORKER_OPERATION_MAX_OBSERVER_REGISTRATION_WAITERS_PER_SESSION = 32;
 export const WORKER_OPERATION_QUEUE_WAIT_MS = 30_000;
@@ -23,6 +28,9 @@ export const WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING = WORKER_OPERATION_MAX_OBS
 export function workerQueueFullError(): Error & { code: string } {
 	return Object.assign(new Error("Worker operation queue is full"), {
 		code: "LIX_WORKER_QUEUE_FULL",
+		hint:
+			"Too many operations are waiting on this Lix (about 110). Await earlier calls before " +
+			"issuing more, or bound the fan-out; independent reads can use snapshots or streams.",
 	});
 }
 
