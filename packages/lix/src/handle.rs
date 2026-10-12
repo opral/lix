@@ -725,7 +725,6 @@ impl RemoteLix {
         // Own the session before awaiting begin so failure or cancellation
         // schedules closure of any transaction the server may have started.
         let mut opened = RemoteLixTransaction {
-            rollback_only: Arc::default(),
             transaction: None,
             client: Some(client),
         };
@@ -776,18 +775,14 @@ impl RemoteLix {
 /// Call [`Self::rollback`] to await rollback and session closure explicitly.
 #[derive(Debug)]
 pub struct RemoteLixTransaction {
-    /// Set when a failed `execute_many` left part of its parameter sets
-    /// staged: commit then rolls back and fails.
-    rollback_only: Arc<AtomicBool>,
     transaction: Option<Arc<ProtocolTransaction<crate::sync::AuthorityHttp>>>,
     client: Option<ProtocolClient<crate::sync::AuthorityHttp>>,
 }
 impl RemoteLixTransaction {
     fn sql_target(&self) -> Arc<dyn crate::query::SqlTarget> {
-        Arc::new(sql_targets::RemoteTransactionTarget {
-            transaction: self.transaction.clone(),
-            rollback_only: Arc::clone(&self.rollback_only),
-        })
+        Arc::new(sql_targets::RemoteTransactionTarget(
+            self.transaction.clone(),
+        ))
     }
 
     /// Starts a read inside this remote transaction.
@@ -811,14 +806,6 @@ impl RemoteLixTransaction {
     }
 
     pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
-        if self.rollback_only.load(Ordering::Acquire) {
-            let _ = self.rollback().await;
-            return Err(LixError::new(
-                LixError::CODE_INVALID_TRANSACTION_STATE,
-                "an execute_many() in this transaction failed after staging part of its \
-                 parameter sets; the transaction was rolled back",
-            ));
-        }
         let result = self
             .transaction
             .as_ref()

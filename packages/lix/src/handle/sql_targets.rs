@@ -45,37 +45,16 @@ fn retries_in_transaction() -> LixError {
     .with_hint("Transactions never replay; retry the whole transaction instead.")
 }
 
-/// Remote handles check locally, with the engine's own parser, that `query()`
-/// does not write before any SQL reaches the server.
-fn remote_class(sql: &str) -> Result<crate::sql2::StatementClass, LixError> {
-    crate::sql2::classify_statement(sql)
-}
-
-fn remote_read_only(sql: &str) -> Result<(), LixError> {
-    if !remote_class(sql)?.read_only {
-        return Err(crate::session::reject_non_read_error());
-    }
-    Ok(())
-}
-
 fn remote_write(request: &ExecuteRequest) -> Result<(), LixError> {
     if request.max_bytes != crate::common::DEFAULT_MAX_RESULT_BYTES {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "max_bytes is not supported for remote writes",
+            "max_bytes is not supported for remote execute()",
         )
         .with_hint(
             "The server caps RETURNING rows at its default before it commits; a client-side \
              check would only fail after the write was published.",
         ));
-    }
-    Ok(())
-}
-
-fn remote_write_many(request: &ExecuteManyRequest) -> Result<(), LixError> {
-    let class = remote_class(&request.sql)?;
-    if class.read_only || class.returning {
-        return Err(crate::session::execute_many_returns_rows());
     }
     Ok(())
 }
@@ -503,13 +482,9 @@ where
 impl SqlTarget for RemoteLix {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
-            remote_read_only(&request.sql)?;
-            let result = self
-                .client
-                .execute(&request.sql, &request.params, None)
-                .await?;
-            enforce_limits(&result, request.limits)?;
-            Ok(QueryResult::from_execute_result(result))
+            self.client
+                .query(&request.sql, &request.params, Some(request.limits.max_bytes))
+                .await
         })
     }
 
@@ -526,11 +501,7 @@ impl SqlTarget for RemoteLix {
                 .execute(
                     &request.sql,
                     &request.params,
-                    Some(crate::authority_client::ProtocolExecuteOptions {
-                        origin_key: request.options.origin_key,
-                        max_auto_commit_retries: request.options.max_auto_commit_retries,
-                        ..Default::default()
-                    }),
+                    Some(protocol_options(request.options)),
                 )
                 .await
         })
@@ -538,69 +509,45 @@ impl SqlTarget for RemoteLix {
 
     fn execute_many(self: Arc<Self>, request: ExecuteManyRequest) -> SqlFuture<u64> {
         Box::pin(async move {
-            remote_write_many(&request)?;
-            if request.param_sets.is_empty() {
-                return Ok(0);
-            }
-            let statements = request
-                .param_sets
-                .into_iter()
-                .map(|params| ExecuteBatchStatement {
-                    sql: request.sql.clone(),
-                    params,
-                    label: None,
-                })
-                .collect::<Vec<_>>();
-            let result = self
-                .client
-                .execute_batch(
-                    &statements,
-                    Some(crate::authority_client::ProtocolExecuteOptions {
-                        origin_key: request.options.origin_key,
-                        max_auto_commit_retries: request.options.max_auto_commit_retries,
-                        ..Default::default()
-                    }),
+            self.client
+                .execute_many(
+                    &request.sql,
+                    request.param_sets,
+                    Some(protocol_options(request.options)),
                 )
-                .await?;
-            Ok(result
-                .results
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .sum())
+                .await
         })
     }
 }
 
-/// SQL inside a [`super::RemoteLixTransaction`].
-pub(super) struct RemoteTransactionTarget {
-    pub(super) transaction:
-        Option<Arc<crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>>>,
-    /// Set when an `execute_many` failed after staging some parameter sets:
-    /// the server cannot undo them, so the transaction may only roll back.
-    pub(super) rollback_only: Arc<std::sync::atomic::AtomicBool>,
+fn protocol_options(options: ExecuteOptions) -> crate::authority_client::ProtocolExecuteOptions {
+    crate::authority_client::ProtocolExecuteOptions {
+        origin_key: options.origin_key,
+        max_auto_commit_retries: options.max_auto_commit_retries,
+        ..Default::default()
+    }
 }
+
+/// SQL inside a [`super::RemoteLixTransaction`].
+pub(super) struct RemoteTransactionTarget(
+    pub(super) Option<Arc<crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>>>,
+);
 
 impl RemoteTransactionTarget {
     fn transaction(
         &self,
     ) -> Result<&crate::authority_client::ProtocolTransaction<crate::sync::AuthorityHttp>, LixError>
     {
-        self.transaction
-            .as_deref()
-            .ok_or_else(closed_transaction_error)
+        self.0.as_deref().ok_or_else(closed_transaction_error)
     }
 }
 
 impl SqlTarget for RemoteTransactionTarget {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
-            remote_read_only(&request.sql)?;
-            let result = self
-                .transaction()?
-                .execute(&request.sql, &request.params, None)
-                .await?;
-            enforce_limits(&result, request.limits)?;
-            Ok(QueryResult::from_execute_result(result))
+            self.transaction()?
+                .query(&request.sql, &request.params, Some(request.limits.max_bytes))
+                .await
         })
     }
 
@@ -620,10 +567,7 @@ impl SqlTarget for RemoteTransactionTarget {
                 .execute(
                     &request.sql,
                     &request.params,
-                    Some(crate::authority_client::ProtocolExecuteOptions {
-                        origin_key: request.options.origin_key,
-                        ..Default::default()
-                    }),
+                    Some(protocol_options(request.options)),
                 )
                 .await
         })
@@ -634,32 +578,13 @@ impl SqlTarget for RemoteTransactionTarget {
             if request.options.max_auto_commit_retries.is_some() {
                 return Err(retries_in_transaction());
             }
-            remote_write_many(&request)?;
-            let transaction = self.transaction()?;
-            let mut rows_affected = 0;
-            for (index, params) in request.param_sets.into_iter().enumerate() {
-                match transaction
-                    .execute(
-                        &request.sql,
-                        &params,
-                        Some(crate::authority_client::ProtocolExecuteOptions {
-                            origin_key: request.options.origin_key.clone(),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                {
-                    Ok(result) => rows_affected += result.rows_affected(),
-                    Err(error) => {
-                        if index > 0 {
-                            self.rollback_only
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            Ok(rows_affected)
+            self.transaction()?
+                .execute_many(
+                    &request.sql,
+                    request.param_sets,
+                    Some(protocol_options(request.options)),
+                )
+                .await
         })
     }
 }

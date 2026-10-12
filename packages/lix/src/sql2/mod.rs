@@ -44,7 +44,7 @@ mod value_contract;
 mod write_normalization;
 
 pub(crate) use error::datafusion_error_to_lix_error;
-pub(crate) use script::{StatementClass, classify_statement};
+pub(crate) use script::classify_statement;
 
 /// Whether `query()` accepts the statement: a bound read. Reads that call
 /// `uuidv7()` or `current_timestamp` are reads too.

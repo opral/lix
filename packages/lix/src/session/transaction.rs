@@ -207,14 +207,6 @@ where
         super::execute::reject_non_read(&statement)
     }
 
-    /// Classifies one statement as a pure read or a durable operation.
-    pub(crate) fn execution_disposition(
-        &self,
-        sql: &str,
-    ) -> Result<super::ExecutionDisposition, LixError> {
-        self.session.execution_disposition(sql)
-    }
-
     /// Pages a result this transaction already read. Transaction streams see
     /// the transaction's state when they open, including its staged writes.
     pub(crate) async fn open_materialized_stream(
