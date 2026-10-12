@@ -181,6 +181,8 @@ struct ManagerState {
     shutting_down: bool,
     clock: u64,
     cleanup_sequence: u64,
+    deletion_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    deleted: std::collections::HashSet<String>,
     #[cfg(test)]
     state_drop_probe: Option<CacheRootLeaseDropProbe>,
 }
@@ -516,6 +518,7 @@ impl LixRuntimeManager {
         )
         .map_err(|error| anyhow::anyhow!("Invalid LIX_SERVER_PUBLIC_URL: {}", error.message))?;
         manager.spawn_idle_reaper(config.idle_timeout);
+        manager.spawn_deletion_recovery();
         Ok(manager)
     }
 
@@ -589,6 +592,9 @@ impl LixRuntimeManager {
             return Err(LixRuntimeError::InvalidId);
         }
 
+        if self.state.lock().await.deleted.contains(lix_id) {
+            return Err(LixRuntimeError::NotFound);
+        }
         let lifecycle = self.lifecycle_lock(lix_id).await;
         let mut lifecycle_guard = Some(lifecycle.read_owned().await);
         // Keep the catalog record fetched under the lifecycle read lease. A
@@ -601,10 +607,13 @@ impl LixRuntimeManager {
         if !record.as_ref().is_some_and(|record| record.state == "live") {
             return Err(LixRuntimeError::NotFound);
         }
+        let opening_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let runtime_cell = 'select_runtime: loop {
             let action = {
                 let mut state = self.state.lock().await;
-                if state.shutting_down {
+                if state.deleted.contains(lix_id) {
+                    return Err(LixRuntimeError::NotFound);
+                } else if state.shutting_down {
                     return Err(LixRuntimeError::ShuttingDown);
                 } else if let Some(cleanup) = state.cleaning.get(lix_id) {
                     if let Some(snapshot) = &cleanup.failed_open {
@@ -776,6 +785,12 @@ impl LixRuntimeManager {
                             return Err(LixRuntimeError::UpgradeFailed(diagnostic));
                         }
                         RuntimeOpenState::Opening => {
+                            if tokio::time::Instant::now() >= opening_deadline
+                                || snapshot.phase == "storage_migrating"
+                                || snapshot.phase == "storage_publishing"
+                            {
+                                return Err(LixRuntimeError::Opening(snapshot));
+                            }
                             if snapshot.phase == "failed" {
                                 return Err(LixRuntimeError::Opening(snapshot));
                             }
@@ -803,9 +818,15 @@ impl LixRuntimeManager {
         let runtime = runtime_cell
             .get()
             .expect("runtime opener reported success before storing its runtime");
-        if self.state.lock().await.shutting_down {
+        let state = self.state.lock().await;
+        if state.deleted.contains(lix_id) {
+            return Err(LixRuntimeError::NotFound);
+        }
+        if state.shutting_down {
             return Err(LixRuntimeError::ShuttingDown);
         }
+        // Pinning a service and the local tombstone fence share one admission
+        // lock, so a get selected before deletion cannot escape after its ACK.
         match runtime.acquire().await {
             Some(service) => Ok(service),
             None => Err(LixRuntimeError::Recovering),
@@ -1151,7 +1172,8 @@ impl LixRuntimeManager {
 
     /// Admit only a currently registered session. Keep the eviction lock until
     /// validation and pinning finish; invalid requests never clone the runtime,
-    /// reset its idle clock, query the catalog, or start an opener.
+    /// reset its idle clock, query the catalog, or start an opener. Valid
+    /// sessions also check the manager tombstone fence before pinning their service.
     pub(crate) async fn get_session_runtime(
         &self,
         lix_id: &str,
@@ -1161,7 +1183,7 @@ impl LixRuntimeManager {
         let lifecycle = self.lifecycle_lock(lix_id).await;
         let _lifecycle = lifecycle.read_owned().await;
         let mut state = self.state.lock().await;
-        if state.shutting_down {
+        if state.shutting_down || state.deleted.contains(lix_id) {
             return Err(admission.missing_runtime_response());
         }
         let runtime = {
@@ -1514,7 +1536,7 @@ impl LixRuntimeManager {
     /// Prevents new opens and closes protocol servers so their live streams
     /// cannot keep HTTP graceful shutdown from reaching the storage owners.
     pub async fn shutdown(&self) -> Result<()> {
-        let (runtimes, cleanups) = {
+        let (runtimes, cleanups, deletion_tasks) = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
             let cleanups = state
@@ -1533,7 +1555,11 @@ impl LixRuntimeManager {
                     )
                 })
                 .collect::<Vec<_>>();
-            (runtimes, cleanups)
+            (
+                runtimes,
+                cleanups,
+                std::mem::take(&mut state.deletion_tasks),
+            )
         };
 
         let mut closers = JoinSet::new();
@@ -1569,6 +1595,12 @@ impl LixRuntimeManager {
                 first_error.get_or_insert_with(|| {
                     anyhow::anyhow!("wait for runtime cleanup during shutdown: {error}")
                 });
+            }
+        }
+        for (_, task) in deletion_tasks {
+            if let Err(error) = task.await {
+                first_error
+                    .get_or_insert_with(|| anyhow::anyhow!("join repository deletion: {error}"));
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -2718,6 +2750,194 @@ mod tests {
         assert_eq!(gate.starts.load(Ordering::SeqCst), 1);
         assert_eq!(manager.cached_lix_count().await, 1);
         drop(service);
+    }
+
+    #[tokio::test]
+    async fn deletion_tombstones_before_joining_a_blocked_owned_open() {
+        let gate = TestOpenGate {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            fail_next: Arc::new(AtomicBool::new(false)),
+        };
+        let manager = memory_manager_with_open_gate(1, gate.clone()).await;
+        let started = gate.started.notified();
+        let opening_manager = Arc::clone(&manager);
+        let opening = tokio::spawn(async move { opening_manager.get(LIX_A).await });
+        started.await;
+        let before = manager.repository_record(LIX_A).await.unwrap().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.delete_repository(LIX_A.into()),
+        )
+        .await
+        .expect("delete must not wait for a blocked upgrade")
+        .unwrap();
+        assert_eq!(
+            manager
+                .repository_record(LIX_A)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "deleted"
+        );
+        assert!(
+            manager
+                .authority_admission(LIX_A, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .publish_open_admission(LIX_A, &before)
+                .await
+                .is_err(),
+            "even a current-format opener must not publish over a tombstone"
+        );
+        assert!(
+            manager
+                .legacy_storage_present(&before.storage_id)
+                .await
+                .unwrap(),
+            "physical data stays intact until its owner has joined"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.delete_repository(LIX_A.into()),
+        )
+        .await
+        .expect("repeat delete must not queue behind upgrade")
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), manager.get(LIX_A))
+                .await
+                .expect("new get must observe deleted catalog promptly"),
+            Err(LixRuntimeError::NotFound)
+        ));
+        opening.abort();
+        let _ = opening.await;
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while manager
+                .legacy_storage_present(&before.storage_id)
+                .await
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup should join the opener and retire its store");
+        assert_eq!(manager.cached_lix_count().await, 0);
+        assert!(matches!(
+            manager.get(LIX_A).await,
+            Err(LixRuntimeError::NotFound)
+        ));
+        manager.delete_repository(LIX_A.into()).await.unwrap();
+        assert_eq!(
+            manager
+                .repository_record(LIX_A)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_repository_rejects_existing_sessions_before_physical_cleanup() {
+        let manager = memory_manager(2).await;
+        let app = crate::routes::router(
+            manager.clone(),
+            None,
+            Duration::from_secs(5),
+            Default::default(),
+        );
+        let session = open_protocol_session(&app, LIX_A).await;
+        let lifecycle = manager.lifecycle_lock(LIX_A).await;
+        let lease = lifecycle.read_owned().await;
+        manager.delete_repository(LIX_A.into()).await.unwrap();
+        assert!(manager.legacy_storage_present(LIX_A).await.unwrap());
+        assert_eq!(
+            app.oneshot(stale_session_request("POST", "sync/update", Some(&session)))
+                .await
+                .unwrap()
+                .status(),
+            410
+        );
+        drop(lease);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deletion_recovery_retries_durable_tombstone_after_restart() {
+        let original = memory_manager(2).await;
+        let mut record = original.repository_record(LIX_A).await.unwrap().unwrap();
+        record.state = "deleted".into();
+        record.admission = None;
+        record.retired = vec![LIX_B.into()];
+        let (objects, prefix) = original.catalog_store();
+        let path = ObjectPath::from(format!("{prefix}.lix-repositories/{LIX_A}.json"));
+        objects
+            .put(&path, serde_json::to_vec(&record).unwrap().into())
+            .await
+            .unwrap();
+        objects
+            .put(
+                &ObjectPath::from(format!(
+                    "{prefix}.lix-repositories/00000000-0000-4000-8000-000000000000.json"
+                )),
+                b"invalid catalog".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let mut restarted = LixRuntimeManager::new_in_memory(2);
+        Arc::get_mut(&mut restarted).unwrap().backend = StorageBackend::Memory {
+            object_store: objects,
+        };
+        drop(original);
+        assert!(matches!(
+            restarted.get(LIX_A).await,
+            Err(LixRuntimeError::NotFound)
+        ));
+        restarted.recover_repository_deletions().await.unwrap();
+        restarted.shutdown().await.unwrap();
+        let complete = restarted.repository_record(LIX_A).await.unwrap().unwrap();
+        assert!(complete.deletion_complete);
+        assert_eq!(complete.state, "deleted");
+        assert!(!restarted.legacy_storage_present(LIX_A).await.unwrap());
+        assert!(!restarted.legacy_storage_present(LIX_B).await.unwrap());
+        restarted.recover_repository_deletions().await.unwrap();
+        restarted.delete_repository(LIX_A.into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_reports_physical_migration_without_waiting_for_engine_open() {
+        let manager = memory_manager(1).await;
+        let operation = OpenOperation::new(LIX_A.into(), Duration::from_secs(300));
+        operation.phase(OperationPhase::StorageMigrating, "legacy_migration");
+        let (_owner, opened) = watch::channel(RuntimeOpenState::Opening);
+        manager.state.lock().await.entries.insert(
+            LIX_A.into(),
+            RuntimeEntry {
+                operation,
+                open_context: opentelemetry::trace::SpanContext::empty_context(),
+                runtime: Arc::new(OnceCell::new()),
+                opened,
+                last_used: 1,
+                idle_since: None,
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_millis(25), manager.get(LIX_A))
+            .await
+            .expect("physical upgrade must yield typed progress immediately");
+        let Err(LixRuntimeError::Opening(snapshot)) = result else {
+            panic!("expected correlated opening progress");
+        };
+        assert_eq!(snapshot.phase, "storage_migrating");
     }
 
     #[tokio::test]
@@ -4301,9 +4521,16 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let release_body = Arc::new(Notify::new());
         let body_gate = Arc::clone(&release_body);
-        let app = axum::Router::new().fallback(move || {
+        let app = axum::Router::new().fallback(move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
             let gate = Arc::clone(&body_gate);
             async move {
+                // Startup tombstone recovery lists the catalog independently
+                // of the object bodies whose runtime ownership this test probes.
+                if query.as_deref().is_some_and(|query| query.contains("list-type=2")) {
+                    return http::Response::builder().header("content-type", "application/xml")
+                        .body(Body::from("<ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                        .unwrap();
+                }
                 let stream = futures_util::stream::once(async move {
                     gate.notified().await;
                     Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{}"))
@@ -4448,6 +4675,9 @@ mod tests {
 // SlateDB prefix, so cache eviction and storage open can never create a resource.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepositoryRecord {
+    /// A deleted catalog row is a durable cleanup job until this is true.
+    #[serde(default)]
+    deletion_complete: bool,
     /// Written after creation or an owned open validates the authority.
     /// Missing metadata requires storage inspection before admission.
     #[serde(default)]
@@ -4597,6 +4827,7 @@ impl LixRuntimeManager {
     ) -> Result<()> {
         let (store, prefix) = self.catalog_store();
         let bytes = serde_json::to_vec(&RepositoryRecord {
+            deletion_complete: false,
             admission: Some(AuthorityAdmission::current()),
             state: state.to_owned(),
             fingerprint,
@@ -4712,6 +4943,7 @@ impl LixRuntimeManager {
             .put_opts(
                 &ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json")),
                 serde_json::to_vec(&RepositoryRecord {
+                    deletion_complete: false,
                     admission: Some(AuthorityAdmission::current()),
                     state: "live".to_owned(),
                     fingerprint: None,
@@ -4839,6 +5071,7 @@ impl LixRuntimeManager {
         }
         let storage_id = uuid::Uuid::new_v4().to_string();
         let reservation = RepositoryRecord {
+            deletion_complete: false,
             admission: None,
             state: "creating".to_owned(),
             fingerprint: None,
@@ -4930,6 +5163,7 @@ impl LixRuntimeManager {
         match initialized {
             Ok(fingerprint) => {
                 let published = RepositoryRecord {
+                    deletion_complete: false,
                     admission: Some(AuthorityAdmission::current()),
                     state: "live".to_owned(),
                     fingerprint: Some(fingerprint),
@@ -4994,12 +5228,25 @@ impl LixRuntimeManager {
         id: String,
     ) -> Result<(), lix_sdk::server_protocol::LifecycleError> {
         let lifecycle = self.lifecycle_lock(&id).await;
-        let _lifecycle = lifecycle.write().await;
-        let (storage_id, retired) = if let Some(record) = self
-            .repository_record(&id)
-            .await
-            .map_err(lifecycle_failure)?
-        {
+        // Deletion's linearization point is the durable catalog tombstone, not
+        // acquisition of an exclusive lease behind a potentially long upgrade.
+        // The shared lease still excludes creation/replacement writers.
+        let lease = Arc::clone(&lifecycle).read_owned().await;
+        let (catalog, prefix) = self.catalog_store();
+        let path = ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json"));
+        let tombstone = loop {
+            let response = match catalog.get(&path).await {
+                Ok(response) => response,
+                Err(object_store::Error::NotFound { .. }) => return Ok(()),
+                Err(error) => return Err(lifecycle_failure(error)),
+            };
+            let version = object_store::UpdateVersion {
+                e_tag: response.meta.e_tag.clone(),
+                version: response.meta.version.clone(),
+            };
+            let mut record: RepositoryRecord =
+                serde_json::from_slice(&response.bytes().await.map_err(lifecycle_failure)?)
+                    .map_err(lifecycle_failure)?;
             if record.state == "creating" {
                 return Err(lix_sdk::server_protocol::LifecycleError::new(
                     http::StatusCode::CONFLICT,
@@ -5007,35 +5254,152 @@ impl LixRuntimeManager {
                     "Repository creation is in progress.",
                 ));
             }
-            (record.storage_id, record.retired)
-        } else {
+            if record.state == "deleted" {
+                break record;
+            }
+            record.state = "deleted".to_owned();
+            record.deletion_complete = false;
+            record.admission = None;
+            record.fingerprint = None;
+            match catalog
+                .put_opts(
+                    &path,
+                    serde_json::to_vec(&record)
+                        .map_err(lifecycle_failure)?
+                        .into(),
+                    object_store::PutOptions {
+                        mode: object_store::PutMode::Update(version),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => break record,
+                // An opener may publish admission concurrently. Read its latest
+                // mapping before retrying; never overwrite a replacement store.
+                Err(object_store::Error::Precondition { .. }) => continue,
+                Err(error) => return Err(lifecycle_failure(error)),
+            }
+        };
+        drop(lease);
+        if tombstone.deletion_complete {
+            self.state.lock().await.deleted.insert(id);
             return Ok(());
-        };
-        // Persist the tombstone before closing sessions. Even after a crash,
-        // no handshake or old create receipt can bring this repository back.
-        let (catalog, prefix) = self.catalog_store();
-        let tombstone = RepositoryRecord {
-            admission: None,
-            state: "deleted".to_owned(),
-            fingerprint: None,
-            storage_id: storage_id.clone(),
-            retired: retired.clone(),
-        };
-        catalog
-            .put(
-                &ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json")),
-                serde_json::to_vec(&tombstone)
-                    .map_err(lifecycle_failure)?
-                    .into(),
-            )
-            .await
-            .map_err(lifecycle_failure)?;
+        }
+        self.schedule_deletion_cleanup(id, tombstone).await;
+        Ok(())
+    }
+
+    async fn schedule_deletion_cleanup(self: &Arc<Self>, id: String, tombstone: RepositoryRecord) {
+        let mut state = self.state.lock().await;
+        // Existing sessions use this local fence. Cold opens and other hosts
+        // use the durable catalog; this manager owns all sessions it admits.
+        state.deleted.insert(id.clone());
+        if state.shutting_down
+            || state
+                .deletion_tasks
+                .get(&id)
+                .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let manager = Arc::clone(self);
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            let lifecycle = manager.lifecycle_lock(&task_id).await;
+            // Never queue an exclusive writer behind a migration: Tokio's fair
+            // RwLock would also block fresh reads of the durable tombstone.
+            let _lease = loop {
+                if let Ok(lease) = Arc::clone(&lifecycle).try_write_owned() {
+                    break lease;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            if let Err(error) = manager
+                .finish_repository_deletion(&task_id, &tombstone)
+                .await
+            {
+                tracing::error!(lix_id = %task_id, error = %error.message, "deleted repository cleanup failed; tombstone retained for retry");
+            }
+        });
+        // Registration and the shutdown gate share one state lock. Recovery
+        // and repeated DELETE never detach or start duplicate cleanup owners.
+        state.deletion_tasks.insert(id, task);
+    }
+
+    /// Recover accepted deletions on startup and retry cleanup after transient
+    /// object-store failures. No UI retry or live repository directory is needed.
+    fn spawn_deletion_recovery(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                if manager.state.lock().await.shutting_down {
+                    break;
+                }
+                if let Err(error) = manager.recover_repository_deletions().await {
+                    tracing::error!(%error, "repository deletion recovery failed");
+                }
+                drop(manager);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    async fn recover_repository_deletions(self: &Arc<Self>) -> Result<()> {
+        let (objects, prefix) = self.catalog_store();
+        let mut records = objects.list(Some(&ObjectPath::from(format!(
+            "{prefix}.lix-repositories/"
+        ))));
+        while let Some(object) = records.try_next().await? {
+            if self.state.lock().await.shutting_down {
+                break;
+            }
+            let Some(id) = object
+                .location
+                .as_ref()
+                .strip_prefix(&format!("{prefix}.lix-repositories/"))
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|id| valid_lix_id(id))
+            else {
+                continue;
+            };
+            let record = async {
+                let bytes = objects.get(&object.location).await?.bytes().await?;
+                Ok::<RepositoryRecord, anyhow::Error>(serde_json::from_slice(&bytes)?)
+            }
+            .await;
+            let record = match record {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(lix_id = %id, %error, "skip unavailable or malformed catalog during deletion recovery");
+                    continue;
+                }
+            };
+            if record.state != "deleted" || record.deletion_complete {
+                continue;
+            }
+            if self.state.lock().await.shutting_down {
+                break;
+            }
+            self.schedule_deletion_cleanup(id.to_owned(), record).await;
+        }
+        Ok(())
+    }
+
+    async fn finish_repository_deletion(
+        &self,
+        id: &str,
+        tombstone: &RepositoryRecord,
+    ) -> Result<(), lix_sdk::server_protocol::LifecycleError> {
         let (entry, cleanup) = {
             let mut state = self.state.lock().await;
-            state.failed_upgrades.remove(&id);
+            state.failed_upgrades.remove(id);
             (
-                state.entries.remove(&id),
-                state.cleaning.get(&id).map(|value| value.done.clone()),
+                state.entries.remove(id),
+                state.cleaning.get(id).map(|value| value.done.clone()),
             )
         };
         if let Some(entry) = entry {
@@ -5062,10 +5426,42 @@ impl LixRuntimeManager {
                 }
             }
         }
-        self.sweep_retired(&retired)
+        self.sweep_retired(&tombstone.retired)
             .await
             .map_err(lifecycle_failure)?;
-        self.sweep_retired(&[storage_id])
+        self.sweep_retired(std::slice::from_ref(&tombstone.storage_id))
+            .await
+            .map_err(lifecycle_failure)?;
+        let (objects, prefix) = self.catalog_store();
+        let path = ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json"));
+        let response = objects.get(&path).await.map_err(lifecycle_failure)?;
+        let version = object_store::UpdateVersion {
+            e_tag: response.meta.e_tag.clone(),
+            version: response.meta.version.clone(),
+        };
+        let mut record: RepositoryRecord =
+            serde_json::from_slice(&response.bytes().await.map_err(lifecycle_failure)?)
+                .map_err(lifecycle_failure)?;
+        if record.state != "deleted"
+            || record.storage_id != tombstone.storage_id
+            || record.retired != tombstone.retired
+        {
+            return Err(lifecycle_failure(
+                "repository changed during deletion cleanup",
+            ));
+        }
+        record.deletion_complete = true;
+        objects
+            .put_opts(
+                &path,
+                serde_json::to_vec(&record)
+                    .map_err(lifecycle_failure)?
+                    .into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Update(version),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(lifecycle_failure)?;
         Ok(())
@@ -5137,6 +5533,7 @@ mod lifecycle_recovery_tests {
             .await
             .unwrap();
         let record = RepositoryRecord {
+            deletion_complete: false,
             state: "live".into(),
             fingerprint: Some(empty_create_fingerprint()),
             storage_id: uuid::Uuid::new_v4().to_string(),
@@ -5333,6 +5730,7 @@ mod host_provisioning_tests {
             .put(
                 &ObjectPath::from(format!(".lix-repositories/{ID}.json")),
                 serde_json::to_vec(&RepositoryRecord {
+                    deletion_complete: false,
                     state: "live".to_owned(),
                     fingerprint: None,
                     storage_id: source_storage_id.clone(),

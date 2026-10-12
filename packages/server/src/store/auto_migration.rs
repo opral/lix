@@ -19,9 +19,6 @@ impl LixRuntimeManager {
         id: &str,
         expected: &RepositoryRecord,
     ) -> Result<()> {
-        if expected.admission.as_ref() == Some(&AuthorityAdmission::current()) {
-            return Ok(());
-        }
         let (objects, prefix) = self.catalog_store();
         let path = ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json"));
         let response = objects.get(&path).await?;
@@ -173,6 +170,7 @@ mod tests {
             .put(
                 &ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json")),
                 serde_json::to_vec(&RepositoryRecord {
+                    deletion_complete: false,
                     state: "live".into(),
                     storage_id: physical.into(),
                     fingerprint: Some("keep".into()),

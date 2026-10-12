@@ -349,6 +349,7 @@ async fn write_profile_catalog(manager: &LixRuntimeManager, physical: &str) {
         .put(
             &ObjectPath::from(format!("{prefix}.lix-repositories/{PROFILE_ID}.json")),
             serde_json::to_vec(&RepositoryRecord {
+                deletion_complete: false,
                 state: "live".to_owned(),
                 fingerprint: Some("migration-profile".to_owned()),
                 storage_id: physical.to_owned(),
