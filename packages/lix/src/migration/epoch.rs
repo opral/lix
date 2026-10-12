@@ -1934,7 +1934,17 @@ where
         return Ok(false);
     }
     clear_bank(target).await?;
-    let _ = copy_repository_with_progress(source, target, true, progress, from_format).await?;
+    // Only v79-v81 replace the declared-column index layout. Later partial
+    // replicas already own current-format resident indexes, including those
+    // used by pending local edits; preserve them with the rest of the source.
+    let _ = copy_repository_with_progress(
+        source,
+        target,
+        (79..82).contains(&from_format),
+        progress,
+        from_format,
+    )
+    .await?;
     // A pointerless legacy claim fences the source's live marker before copy.
     // Restore the captured role marker in the isolated candidate so the
     // partial migration steps and validator see the actual source layout.
@@ -4881,6 +4891,8 @@ where
                 (84, false) => crate::init::REPOSITORY_PROTOCOL_V84,
                 (85, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V85,
                 (85, false) => crate::init::REPOSITORY_PROTOCOL_V85,
+                (86, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V86,
+                (86, false) => crate::init::REPOSITORY_PROTOCOL_V86,
                 _ => panic!("unsupported fixture format"),
             }),
         ),

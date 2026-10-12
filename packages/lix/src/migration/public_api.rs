@@ -271,7 +271,7 @@ where
             "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
-    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84 | 85))
+    } else if matches!(before.format, Some(80 | 81 | 82 | 83 | 84 | 85 | 86))
         || (before.role == RepositoryRole::PartialReplica && before.current)
     {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
@@ -884,6 +884,7 @@ mod tests {
             83,
             84,
             85,
+            86,
             crate::init::CURRENT_FORMAT_VERSION,
         ]
         .into_iter()
