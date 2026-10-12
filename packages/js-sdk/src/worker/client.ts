@@ -35,6 +35,7 @@ import {
 	deserializeWorkerError,
 	serializeWorkerError,
 	isCancellableRead,
+	isReleaseOperation,
 	isSessionCloseRequest,
 	type WorkerConnection,
 	type WorkerNotification,
@@ -74,15 +75,7 @@ function workerOperationCategory(
 	operation: WorkerOperation,
 ): PendingRequest["category"] {
 	if (operation.kind === "observe.close") return "observer-close";
-	// Releasing a resource is never refused for backpressure: each open stream
-	// or snapshot closes at most once, so these stay bounded by what is open,
-	// and refusing one would leak the resource on the worker.
-	if (
-		operation.kind === "stream.close" ||
-		operation.kind === "readSnapshot.close" ||
-		operation.kind === "exportSnapshot.cancel"
-	)
-		return "release";
+	if (isReleaseOperation(operation)) return "release";
 	if (
 		operation.kind === "close" ||
 		operation.kind === "transaction.commit" ||

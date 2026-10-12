@@ -254,6 +254,19 @@ export type WorkerNotification =
 export type WorkerInput = WorkerRequest | WorkerNotification;
 
 /** Reads whose engine work a `request.cancel` notification stops. */
+/**
+ * Releases a resource: never refused for backpressure. Each open stream or
+ * snapshot closes at most once, so these stay bounded by what is open, and
+ * refusing one would leak the resource on the worker.
+ */
+export function isReleaseOperation(operation: WorkerOperation): boolean {
+	return (
+		operation.kind === "stream.close" ||
+		operation.kind === "readSnapshot.close" ||
+		operation.kind === "exportSnapshot.cancel"
+	);
+}
+
 export function isCancellableRead(operation: WorkerOperation): boolean {
 	return (
 		operation.kind === "query" ||

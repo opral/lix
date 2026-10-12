@@ -1,6 +1,7 @@
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isReleaseOperation,
 	type WorkerInput,
 	type WorkerRequest,
 	type WorkerOperation,
@@ -282,7 +283,9 @@ export class RepositorySession {
 			}
 			return;
 		}
+		// Releases are exempt, as in the client and the host.
 		if (
+			!isReleaseOperation(message.operation) &&
 			this.queue.length + this.requests.size >= WORKER_CLIENT_MAX_PENDING
 		) {
 			this.output({

@@ -480,3 +480,28 @@ test("read snapshots map to the owner's id and do not survive owner loss", async
 	const close = f.request({ kind: "readSnapshot.close", readSnapshotId });
 	expect(f.result(close)).toMatchObject({ ok: true });
 });
+
+test("releases are admitted when the pending budget is full", async () => {
+	const f = fixture();
+	await f.open();
+	const open = f.request({ kind: "stream", sql: "SELECT 1", params: [] });
+	await tick();
+	const streamId = (f.result(open).value as { streamId: number }).streamId;
+	f.pause();
+	for (let i = 0; i < 160; i++) f.request({ kind: "query", sql: "SELECT 1", params: [] });
+	const refused = f.request({ kind: "query", sql: "SELECT 1", params: [] });
+	expect(f.output).toContainEqual(
+		expect.objectContaining({
+			id: refused,
+			ok: false,
+			error: expect.objectContaining({ code: "LIX_WORKER_QUEUE_FULL" }),
+		}),
+	);
+	const release = f.request({ kind: "stream.close", streamId });
+	expect(
+		f.output.some((message) => "ok" in message && message.id === release && !message.ok),
+	).toBe(false);
+	expect(f.sent).toContainEqual(
+		expect.objectContaining({ operation: expect.objectContaining({ kind: "stream.close" }) }),
+	);
+});
