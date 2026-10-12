@@ -48,14 +48,31 @@ export function rowsOf(result: {
 	);
 }
 
+/**
+ * Wraps the result of a statement that already ran. It never throws: a write
+ * may have committed (or staged, in a transaction) by now. When the result
+ * has duplicate column names, reading `rows` throws `LIX_AMBIGUOUS_COLUMN`
+ * while `columns`, `rowsAffected` and `commit` stay readable.
+ */
 export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {
-	return {
+	const wrapped = {
 		columns: result.columns,
-		rows: rowsOf(result),
+		rows: [] as Row[],
 		rowsAffected: result.rowsAffected,
 		notices: result.notices,
 		commit: result.commit ?? null,
 	};
+	try {
+		wrapped.rows = rowsOf(result);
+	} catch (error) {
+		Object.defineProperty(wrapped, "rows", {
+			enumerable: true,
+			get() {
+				throw error;
+			},
+		});
+	}
+	return wrapped;
 }
 
 export function normalizeOptionals<T>(value: T): T {

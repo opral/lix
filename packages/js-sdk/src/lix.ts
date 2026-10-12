@@ -942,9 +942,12 @@ export class LixTransaction implements Reader {
 		const native = nativeParams("execute", "lixTransaction", params);
 		const bindingOptions = executeOptions("execute", "lixTransaction", options);
 		throwIfAborted(options.signal);
-		const { commit: _commit, ...statement } = wrapExecuteResult(
+		const statement: Partial<ExecuteResult> = wrapExecuteResult(
 			await this.#run(() => this.binding.execute(sql, native, bindingOptions)),
 		);
+		// The durable receipt arrives from commit(). Deleting keeps a throwing
+		// `rows` getter (duplicate columns) unevaluated.
+		delete statement.commit;
 		return statement as StatementResult<TRow>;
 	}
 

@@ -291,3 +291,31 @@ test("concurrent snapshot and stream releases are never refused for backpressure
 		await lix.close();
 	}
 });
+
+test("execute never rejects after its write ran, even with duplicate columns", async () => {
+	const lix = await seeded();
+	try {
+		const result = await lix.execute(
+			"INSERT INTO api_item (id, label) VALUES (90, 'dup') RETURNING id, id",
+		);
+		expect(result.rowsAffected).toBe(1);
+		expect(result.commit).not.toBeNull();
+		expect(() => result.rows).toThrow(
+			expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
+		);
+		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 90")).toEqual({ id: 90 });
+
+		await lix.transaction(async (tx) => {
+			const staged = await tx.execute(
+				"INSERT INTO api_item (id, label) VALUES (91, 'dup') RETURNING id, id",
+			);
+			expect(staged.rowsAffected).toBe(1);
+			expect(() => staged.rows).toThrow(
+				expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
+			);
+		});
+		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 91")).toEqual({ id: 91 });
+	} finally {
+		await lix.close();
+	}
+});

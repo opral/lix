@@ -763,7 +763,9 @@ test("duplicate column names throw and dangerous names stay data", async () => {
 		rowsAffected: 0,
 		notices: [],
 	};
-	expect(() => wrapExecuteResult(raw)).toThrow(
+	const wrapped = wrapExecuteResult(raw);
+	expect(wrapped.columns).toHaveLength(2);
+	expect(() => wrapped.rows).toThrow(
 		expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
 	);
 

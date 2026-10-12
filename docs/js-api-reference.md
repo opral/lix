@@ -564,7 +564,7 @@ Transactions expose:
 const row = result.rows[0]!;
 ```
 
-Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. A result with duplicate column names rejects with `LIX_AMBIGUOUS_COLUMN`, since an object holds one value per name; alias the columns.
+Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. A read with duplicate column names rejects with `LIX_AMBIGUOUS_COLUMN`, since an object holds one value per name; alias the columns. `execute()` never fails after its statement ran: for such a result it resolves, and reading `rows` throws `LIX_AMBIGUOUS_COLUMN` while `columns`, `rowsAffected` and `commit` stay readable.
 
 ## Value
 
