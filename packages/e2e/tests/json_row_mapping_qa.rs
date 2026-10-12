@@ -90,8 +90,7 @@ async fn json_row_mapping_sql_creates_and_renames_nested_container_without_rekey
     // A caller-chosen ID permits ordinary SQL creation; no plugin-specific hash is needed.
     lix.execute("INSERT INTO json_object_member(key,kind,container_id,lixcol_file_id) VALUES('settings','object','settings-container',$1)").params(&[Value::Text(file_id.clone())]).await.unwrap();
     lix.execute("INSERT INTO json_object_member(parent_id,key,kind,scalar_json,lixcol_file_id) VALUES('settings-container','enabled','boolean','true'::jsonb,$1)").params(&[Value::Text(file_id.clone())]).await.unwrap();
-    // Commit each valid tree separately: deleting and recreating a descendant
-    // primary key cannot share one commit.
+    // Each step leaves a valid tree; see the one-transaction variant below.
     for sql in [
         "DELETE FROM json_object_member WHERE parent_id='settings-container' AND key='enabled' AND occurrence=0 AND lixcol_file_id=$1",
         "DELETE FROM json_object_member WHERE parent_id='root' AND key='settings' AND occurrence=0 AND lixcol_file_id=$1",
@@ -196,4 +195,72 @@ async fn json_row_mapping_sql_duplicate_decoded_keys_roundtrip_and_edit_one_occu
         br#"{ "same": 1, "same": 99 }"#
     );
     reopened.close().await.unwrap();
+}
+
+/// Pins the README's rename recipe: deleting a container's descendants and
+/// recreating them under the same primary keys commits atomically in one
+/// transaction.
+#[tokio::test]
+async fn json_row_mapping_rename_with_descendants_commits_in_one_transaction() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_json(&lix).await;
+    lix.execute("INSERT INTO lix_file(path,content) VALUES('/nested.json',$1)")
+        .params(&[Value::Blob(
+            br#"{"settings":{"enabled":true}}"#.to_vec().into(),
+        )])
+        .await
+        .unwrap();
+    let file_id = lix
+        .query("SELECT id FROM lix_file WHERE path='/nested.json'")
+        .one()
+        .await
+        .unwrap()
+        .get::<String>("id")
+        .unwrap();
+    let container = lix
+        .query("SELECT container_id FROM json_object_member WHERE parent_id='root' AND key='settings' AND lixcol_file_id=$1")
+        .params(&[Value::Text(file_id.clone())])
+        .one()
+        .await
+        .unwrap()
+        .get::<String>("container_id")
+        .unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
+    let mut outcome = Ok(());
+    for sql in [
+        "DELETE FROM json_object_member WHERE parent_id=$2 AND key='enabled' AND occurrence=0 AND lixcol_file_id=$1",
+        "DELETE FROM json_object_member WHERE parent_id='root' AND key='settings' AND occurrence=0 AND lixcol_file_id=$1",
+        "INSERT INTO json_object_member(key,kind,container_id,lixcol_file_id) VALUES('preferences','object',$2,$1)",
+        "INSERT INTO json_object_member(parent_id,key,occurrence,order_key,kind,scalar_json,lixcol_file_id) VALUES($2,'enabled',0,'80','boolean','true'::jsonb,$1)",
+    ] {
+        let params = [Value::Text(file_id.clone()), Value::Text(container.clone())];
+        let params: &[Value] = if sql.contains("$2") {
+            &params
+        } else {
+            &params[..1]
+        };
+        if let Err(error) = transaction.execute(sql).params(params).await {
+            outcome = Err(error);
+            break;
+        }
+    }
+    let outcome = match outcome {
+        Ok(()) => transaction.commit().await.map(|_| ()),
+        Err(error) => {
+            transaction.rollback().await.unwrap();
+            Err(error)
+        }
+    };
+    outcome.expect("the rename commits in one transaction");
+    let content = lix
+        .query("SELECT content FROM lix_file WHERE id=$1")
+        .params(&[Value::Text(file_id)])
+        .one()
+        .await
+        .unwrap();
+    assert_eq!(
+        content.get::<Vec<u8>>("content").unwrap(),
+        br#"{"preferences":{"enabled":true}}"#
+    );
+    lix.close().await.unwrap();
 }

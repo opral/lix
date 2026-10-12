@@ -103,9 +103,8 @@ or empty container with a transaction containing a `DELETE` of its
 old primary key and an `INSERT` of its new row. Each SQL statement must leave a
 valid tree, including statements inside a transaction. For a nonempty
 container, save its descendant rows, delete them leaf-first, replace the parent,
-then reinsert descendants parent-first using separate committed `execute` calls.
-The current engine rejects deleting and reinserting the same primary key within
-one transaction, so this workaround is not atomic. Retain the parent's `container_id` and
+then reinsert descendants parent-first, all in one transaction so the rename is
+atomic. Retain the parent's `container_id` and
 restore each descendant's original primary key (including array UUIDs), value,
 formatting, and `order_key`. This preserves descendant identities without
 rekeying them, while keeping every intermediate tree valid.
