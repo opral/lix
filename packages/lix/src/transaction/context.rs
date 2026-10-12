@@ -951,6 +951,12 @@ pub(crate) struct SqlStatementCheckpoint {
     pending_undo_baseline: Option<commit::UndoBaselinePublication>,
     successful_undo_redo: bool,
     native_migration_validation: bool,
+    /// Deterministic-mode sequence values the rolled-back statements drew
+    /// are handed out again, as if they never ran.
+    functions: Option<crate::functions::FunctionProviderCheckpoint>,
+    /// Rows the rolled-back statements read no longer count for conflict
+    /// detection.
+    reads: SqlReadSetCheckpoint,
 }
 
 #[derive(Clone)]
@@ -3273,6 +3279,8 @@ where
             pending_undo_baseline: self.pending_undo_baseline.clone(),
             successful_undo_redo: self.successful_undo_redo,
             native_migration_validation: self.native_migration_validation,
+            functions: self.functions.statement_checkpoint(),
+            reads: self.sql_read_set.checkpoint(),
         })
     }
 
@@ -3291,8 +3299,14 @@ where
             pending_undo_baseline,
             successful_undo_redo,
             native_migration_validation,
+            functions,
+            reads,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
+        if let Some(functions) = functions {
+            self.functions.restore_statement_checkpoint(functions);
+        }
+        self.sql_read_set.restore(reads);
         self.filesystem_path_index_epoch
             .store(filesystem_path_index_epoch, Ordering::SeqCst);
         // The cache is derived from the discarded post-image. Evict it rather

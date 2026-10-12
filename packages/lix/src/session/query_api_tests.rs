@@ -812,3 +812,42 @@ async fn a_long_read_yields_without_an_executor_budget() {
         "one poll ran for {longest:?}"
     );
 }
+
+/// A failed `execute_many` in a transaction is rolled back as a unit,
+/// including the deterministic sequence values its successful sets drew: the
+/// next value is the one a transaction without it would get.
+#[tokio::test]
+async fn a_failed_execute_many_rewinds_the_deterministic_sequence() {
+    async fn next_uuid_after(failed_execute_many: bool) -> String {
+        let lix = open_lix().await.unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+             VALUES ('lix_deterministic_mode', CAST('{\"enabled\":true}' AS JSONB), true, true)",
+        )
+        .await
+        .unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
+        if failed_execute_many {
+            // Each set draws a file id from the sequence; the second
+            // repeats the path and fails.
+            let error = transaction
+                .execute_many("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+                    [Value::from("/a.txt"), Value::Blob(b"a".to_vec().into())],
+                    [Value::from("/a.txt"), Value::Blob(b"b".to_vec().into())],
+                ])
+                .await
+                .unwrap_err();
+            assert_ne!(error.code, LixError::CODE_INTERNAL_ERROR);
+        }
+        let id = transaction
+            .query("SELECT uuidv7() AS id")
+            .one()
+            .await
+            .unwrap()
+            .get::<String>("id")
+            .unwrap();
+        transaction.rollback().await.unwrap();
+        id
+    }
+    assert_eq!(next_uuid_after(true).await, next_uuid_after(false).await);
+}
