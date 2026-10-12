@@ -176,7 +176,9 @@ Anything else (plain objects, arrays, `Date`, `undefined`, `NaN`, `Infinity`, `b
 
 Rows are plain objects keyed by column name. A result with two columns of the same name rejects with `LIX_ERROR_AMBIGUOUS_COLUMN`; alias them (`SELECT a.id AS a_id, b.id AS b_id`).
 
-Reads have no deadline. Aborting `signal` rejects the call with the signal's reason and cancels the read in the engine: its work stops within a few milliseconds, so the next call on the same Lix runs at once. Closing a snapshot or the Lix cancels the reads running through it the same way.
+Reads have no deadline. Aborting `signal` rejects the call with the signal's reason and cancels the read in the engine: streaming reads (scans and the filters and projections over them) stop within a few milliseconds, so the next call on the same Lix runs at once. Closing a snapshot or the Lix cancels the reads running through it the same way.
+
+Two phases do not yield: an in-memory sort (`ORDER BY` without a small `LIMIT`) and window evaluation over its output run as one long synchronous step once their input is read, so an abort during them takes effect only when that step ends. Measured in review as the delay before the next query after an abort: `ORDER BY` 15 ms natively (40M rows) and about 1.2 s on the wasm worker (6M rows); a window over a sort 11.7 s natively (20M rows) and 4.7 s on the wasm worker (3M rows). A wasm worker is single-threaded, so the whole worker, including other requests and a close, waits for that time. Reads that return rows already in key order (primary-key scans and streams) have no such phase. Bound sorted and windowed reads with `LIMIT` or a narrower `WHERE`, or keep them to modest row counts on the worker.
 
 ### queryOne()
 
