@@ -35,7 +35,7 @@ async fn background_reconciliation_refreshes_warm_file_listing_after_conflicting
         storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
         transport.bind_native_baseline_lease(old.baseline_lease()).unwrap();
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::sync_demand_channel(4);
         let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage, old.clone(), Some(transport),

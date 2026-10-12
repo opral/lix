@@ -240,7 +240,7 @@ struct Replica {
     lix: Lix<Memory>,
     storage: Memory,
     transport: AuthorityTransport,
-    _demand_tx: tokio::sync::mpsc::Sender<super::runtime::SyncDemand>,
+    _demand_tx: super::runtime::SyncDemandSender,
     demand_rx: tokio::sync::mpsc::Receiver<super::runtime::SyncDemand>,
     pending_demands: Vec<super::runtime::SyncDemand>,
     upload_plan: Option<super::repository::CachedSyncUploadPlan>,
@@ -289,7 +289,7 @@ impl Replica {
     }
 
     fn from_open_lix(lix: Lix<Memory>, storage: Memory, transport: AuthorityTransport) -> Self {
-        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(8);
+        let (demand_tx, demand_rx) = crate::sync::runtime::sync_demand_channel(8);
         Self {
             lix,
             storage,

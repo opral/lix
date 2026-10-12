@@ -125,8 +125,7 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
                 .code,
             "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
         );
-        let (demand_tx, demand_rx) =
-            tokio::sync::mpsc::channel::<crate::sync::runtime::SyncDemand>(1);
+        let (demand_tx, demand_rx) = crate::sync::sync_demand_channel(1);
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(

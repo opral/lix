@@ -846,7 +846,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
     sync_role: crate::sync::SyncRole,
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     sync_replica_remote_id: Option<Arc<str>>,
     partial_replica_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     await_durable_commit: bool,
@@ -2739,7 +2739,7 @@ where
     /// mutations only; durable publication remains exclusively in commit_prepared.
     pub(crate) fn set_sync_demand_sender(
         &mut self,
-        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sender: Option<crate::sync::SyncDemandSender>,
     ) {
         self.sync_demand_tx = sender;
         if self.sync_demand_tx.is_some() && self.sync_role == crate::sync::SyncRole::PartialReplica

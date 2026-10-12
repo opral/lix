@@ -34,7 +34,7 @@ const SYNC_DEMAND_FETCH_CONCURRENCY: usize = 6;
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
     pub(super) shutdown_tx: tokio::sync::watch::Sender<SyncShutdown>,
-    pub(crate) demand_tx: tokio::sync::mpsc::Sender<SyncDemand>,
+    pub(crate) demand_tx: SyncDemandSender,
     pub(super) completion_rx: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>>,
     pub(super) task: SyncTask,
 }
@@ -63,6 +63,73 @@ pub(super) enum SyncShutdown {
 pub(crate) struct SyncDemand {
     pub(super) request: SyncDemandRequest,
     pub(super) response: tokio::sync::oneshot::Sender<Result<HydratedInputs, LixError>>,
+    /// Credited with the successful transport bytes the worker receives
+    /// while serving this demand; its waiter's stall window watches it.
+    pub(super) progress: DemandProgress,
+}
+
+/// Successful sync-transport bytes received while serving demands from one
+/// demand channel (one Lix handle's sync worker). Waiters on that channel
+/// treat any increase as "not stalled", including while their own demand
+/// still queues behind another one that is transferring.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DemandProgress(Arc<std::sync::atomic::AtomicU64>);
+
+impl DemandProgress {
+    fn bytes(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The sending side of a sync demand channel, carrying the channel's
+/// [`DemandProgress`].
+#[derive(Clone, Debug)]
+pub(crate) struct SyncDemandSender {
+    sender: tokio::sync::mpsc::Sender<SyncDemand>,
+    progress: DemandProgress,
+}
+
+impl From<tokio::sync::mpsc::Sender<SyncDemand>> for SyncDemandSender {
+    fn from(sender: tokio::sync::mpsc::Sender<SyncDemand>) -> Self {
+        Self {
+            sender,
+            progress: DemandProgress::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for SyncDemandSender {
+    type Target = tokio::sync::mpsc::Sender<SyncDemand>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
+/// A sync demand channel: the worker's receiver and a sender carrying the
+/// channel's progress.
+pub(crate) fn sync_demand_channel(
+    capacity: usize,
+) -> (SyncDemandSender, tokio::sync::mpsc::Receiver<SyncDemand>) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    (sender.into(), receiver)
+}
+
+tokio::task_local! {
+    /// The progress of the demands the current task is serving.
+    static SERVING: Vec<DemandProgress>;
+}
+
+/// Runs `serve` (a worker serving `demands`), crediting the successful
+/// transport bytes it receives to those demands' waiters.
+pub(super) fn serving_demands<F>(
+    progress: Vec<DemandProgress>,
+    serve: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    SERVING.scope(progress, serve)
 }
 
 #[cfg(test)]
@@ -458,73 +525,86 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
     }
 }
 
-/// How long a foreground operation waits on a sync demand while the sync
-/// transport makes no progress at all. There is no wall-clock limit: a slow
-/// transfer (a large blob on a slow link) keeps receiving bytes and is never
-/// cut off. A worker or transport that hangs, though, must not hold session
-/// guards forever.
+/// How long a sync demand's waiter waits while its demand channel receives
+/// no successful transport bytes. There is no wall-clock limit on the whole
+/// demand: a transfer that keeps completing requests (each request is
+/// bounded by the transport's own per-request timeout) is never cut off.
+/// Failed responses (5xx, 429), timeouts and other handles' traffic are not
+/// progress, so a worker that hangs or an authority that keeps failing fails
+/// the waiter with a retryable LIX_ERROR_SYNC_TRANSPORT_STALLED instead of
+/// holding session guards forever. The window also covers queueing the
+/// demand and waiting for the worker to pick it up.
 const SYNC_DEMAND_STALL_WINDOW: Duration = Duration::from_secs(60);
 
-static TRANSPORT_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Records that the sync transport received data (a response or a chunk of
-/// one). Waiters on a sync demand treat any progress as "not stalled".
-pub(crate) fn note_transport_progress() {
-    TRANSPORT_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn transport_progress() -> u64 {
-    TRANSPORT_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+/// Records `bytes` of a successful sync response (or a chunk of one) for the
+/// demands the current task serves. Outside a demand's service (background
+/// pulls, long polls, uploads) it records nothing.
+pub(crate) fn note_transport_progress(bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX).max(1);
+    let _ = SERVING.try_with(|serving| {
+        for progress in serving {
+            progress
+                .0
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }
 
 /// How often one operation may restart because the replica published a new
 /// serving basis while it waited.
 const MAX_ADMISSION_RESTARTS: u32 = 16;
 
+/// Sends a demand and waits for its answer. It fails only when the demand
+/// channel makes no progress for [`SYNC_DEMAND_STALL_WINDOW`]; dropping the
+/// returned future cancels the wait.
 async fn send_sync_demand(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    demand_tx: &SyncDemandSender,
     request: SyncDemandRequest,
 ) -> Result<HydratedInputs, LixError> {
-    let (response, done) = tokio::sync::oneshot::channel();
-    demand_tx
-        .send(SyncDemand { request, response })
-        .await
-        .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
-    done.await.map_err(|_| stopped_error())?
+    send_demand_with_window(demand_tx, request, SYNC_DEMAND_STALL_WINDOW).await
 }
 
-/// Sends a hydration demand on behalf of a foreground SQL operation. It fails
-/// only when the sync transport makes no progress for
-/// [`SYNC_DEMAND_STALL_WINDOW`]; dropping the returned future cancels the wait.
+/// Sends a hydration demand on behalf of a foreground SQL operation.
 async fn send_hydration_demand(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    demand_tx: &SyncDemandSender,
     request: SyncDemandRequest,
 ) -> Result<HydratedInputs, LixError> {
-    send_hydration_demand_with_window(demand_tx, request, SYNC_DEMAND_STALL_WINDOW).await
+    send_demand_with_window(demand_tx, request, SYNC_DEMAND_STALL_WINDOW).await
 }
 
-async fn send_hydration_demand_with_window(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+async fn send_demand_with_window(
+    demand_tx: &SyncDemandSender,
     request: SyncDemandRequest,
     stall_window: Duration,
 ) -> Result<HydratedInputs, LixError> {
     use futures_util::FutureExt as _;
+    let progress = demand_tx.progress.clone();
     let (response, done) = tokio::sync::oneshot::channel();
-    demand_tx
-        .send(SyncDemand { request, response })
-        .await
-        .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
-    let done = done.fuse();
-    futures_util::pin_mut!(done);
-    let mut seen = transport_progress();
+    let demand = SyncDemand {
+        request,
+        response,
+        progress: progress.clone(),
+    };
+    // Queueing (the channel is bounded) and waiting are both inside the
+    // window.
+    let wait = async {
+        demand_tx
+            .send(demand)
+            .await
+            .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
+        done.await.map_err(|_| stopped_error())?
+    }
+    .fuse();
+    futures_util::pin_mut!(wait);
+    let mut seen = progress.bytes();
     loop {
         let window = super::platform::executor_neutral_sleep(stall_window).fuse();
         futures_util::pin_mut!(window);
         futures_util::select_biased! {
-            result = done => return result.map_err(|_| stopped_error())?,
+            result = wait => return result,
             () = window => {}
         }
-        let now = transport_progress();
+        let now = progress.bytes();
         if now == seen {
             return Err(LixError::new(
                 SYNC_TRANSPORT_STALLED_CODE,
@@ -540,7 +620,7 @@ async fn send_hydration_demand_with_window(
 }
 
 pub(crate) async fn reconcile_partial_before_branch_switch(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    demand_tx: &SyncDemandSender,
 ) -> Result<(), LixError> {
     send_sync_demand(demand_tx, SyncDemandRequest::ReconcilePartial)
         .await
@@ -550,7 +630,7 @@ pub(crate) async fn reconcile_partial_before_branch_switch(
 /// Prepare the currently admitted partial replica's bounded write frontier.
 /// This request is deliberately explicit so read-only opens stay lazy.
 pub(crate) async fn prepare_offline_editing(
-    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    demand_tx: &SyncDemandSender,
 ) -> Result<(), LixError> {
     send_sync_demand(demand_tx, SyncDemandRequest::PrepareOfflineEditing)
         .await
@@ -596,7 +676,7 @@ impl SyncDemandRetry {
 
     pub(crate) async fn hydrate_pinned_for_retry(
         &mut self,
-        demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
+        demand_tx: Option<&SyncDemandSender>,
         error: LixError,
     ) -> Result<HydratedInputs, LixError> {
         let Some(demand_tx) = demand_tx else {
@@ -608,7 +688,7 @@ impl SyncDemandRetry {
 
     pub(crate) async fn hydrate_for_retry(
         &mut self,
-        demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
+        demand_tx: Option<&SyncDemandSender>,
         error: LixError,
     ) -> Result<(), LixError> {
         let Some(demand_tx) = demand_tx else {
@@ -1145,6 +1225,7 @@ where
             Ok(request) => Some(SyncDemand {
                 request,
                 response: demand.response,
+                progress: demand.progress,
             }),
             Err(error) => {
                 let _ = demand.response.send(Err(error));
@@ -1176,16 +1257,21 @@ where
     }
     let history_ids = history_ids.into_iter().cloned().collect::<BTreeSet<_>>();
     let chunk_ids = chunk_ids.into_iter().cloned().collect::<BTreeSet<_>>();
-    let history_result = if history_ids.is_empty() {
-        Ok(())
-    } else {
-        hydrate_history_ids(lix, transport, history_ids).await
-    };
-    let chunk_result = if chunk_ids.is_empty() {
-        Ok(())
-    } else {
-        hydrate_chunk_ids(lix, transport, chunk_ids).await
-    };
+    let progress = demands.iter().map(|demand| demand.progress.clone()).collect();
+    let (history_result, chunk_result) = serving_demands(progress, async {
+        let history_result = if history_ids.is_empty() {
+            Ok(())
+        } else {
+            hydrate_history_ids(lix, transport, history_ids).await
+        };
+        let chunk_result = if chunk_ids.is_empty() {
+            Ok(())
+        } else {
+            hydrate_chunk_ids(lix, transport, chunk_ids).await
+        };
+        (history_result, chunk_result)
+    })
+    .await;
     #[cfg(not(test))]
     let barrier_result = Ok(());
     #[cfg(test)]
@@ -2166,62 +2252,111 @@ mod tests {
     async fn a_hydration_demand_waits_while_the_transport_progresses_and_fails_when_it_stalls() {
         use std::time::Duration;
         let window = Duration::from_millis(50);
-        // A worker that holds the demand and never answers.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        // A worker that holds the demand, receives successful bytes for it
+        // for eight 20 ms ticks, then goes silent without answering.
+        let (tx, mut rx) = sync_demand_channel(4);
         let holder = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(demand) = rx.recv().await {
-                held.push(demand);
-            }
+            let demand = rx.recv().await.unwrap();
+            serving_demands(vec![demand.progress.clone()], async {
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    note_transport_progress(100);
+                }
+            })
+            .await;
+            let _held = (demand, rx);
+            std::future::pending::<()>().await;
         });
-        // Progress for eight 20 ms ticks, then silence.
-        let ticker = tokio::spawn(async {
-            for _ in 0..8 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                note_transport_progress();
+        // Traffic outside a demand's service (another handle, a long poll)
+        // is not progress for this demand.
+        let unrelated = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                note_transport_progress(100);
             }
         });
         let started = std::time::Instant::now();
-        let error = send_hydration_demand_with_window(
-            &tx,
-            SyncDemandRequest::PublicationBarrier,
-            window,
-        )
-        .await
-        .unwrap_err();
+        let error = send_demand_with_window(&tx, SyncDemandRequest::PublicationBarrier, window)
+            .await
+            .unwrap_err();
         assert_eq!(error.code, SYNC_TRANSPORT_STALLED_CODE);
         assert!(
             started.elapsed() >= Duration::from_millis(150),
             "progress kept the demand waiting past one window: {:?}",
             started.elapsed()
         );
-        ticker.await.unwrap();
+        holder.abort();
 
         // A demand answered while the transport progresses succeeds, however
         // many windows it spans.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        let (tx, mut rx) = sync_demand_channel(4);
         let answerer = tokio::spawn(async move {
             let demand = rx.recv().await.unwrap();
-            for _ in 0..10 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                note_transport_progress();
-            }
+            serving_demands(vec![demand.progress.clone()], async {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    note_transport_progress(100);
+                }
+            })
+            .await;
             let _ = demand.response.send(Ok(HydratedInputs::default()));
         });
-        send_hydration_demand_with_window(
-            &tx,
-            SyncDemandRequest::PublicationBarrier,
-            window,
-        )
+        send_demand_with_window(&tx, SyncDemandRequest::PublicationBarrier, window)
+            .await
+            .unwrap();
+        answerer.await.unwrap();
+        unrelated.abort();
+    }
+
+    /// Queueing is inside the window: a demand that cannot even be queued
+    /// (the worker never receives) stalls instead of waiting forever, and a
+    /// demand queued behind one the worker is serving shares its progress.
+    #[tokio::test]
+    async fn queueing_a_demand_is_inside_the_stall_window() {
+        use std::time::Duration;
+        let window = Duration::from_millis(50);
+        let (tx, rx) = sync_demand_channel(1);
+        let (response, _done) = tokio::sync::oneshot::channel();
+        tx.send(SyncDemand {
+            request: SyncDemandRequest::PublicationBarrier,
+            response,
+            progress: Default::default(),
+        })
         .await
         .unwrap();
-        answerer.await.unwrap();
-        holder.abort();
+        let error = send_demand_with_window(&tx, SyncDemandRequest::PublicationBarrier, window)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, SYNC_TRANSPORT_STALLED_CODE);
+        drop(rx);
+
+        let (tx, mut rx) = sync_demand_channel(4);
+        let worker = tokio::spawn(async move {
+            // Serve the first demand for 200 ms with progress, then the next.
+            for _ in 0..2 {
+                let demand = rx.recv().await.unwrap();
+                serving_demands(vec![demand.progress.clone()], async {
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        note_transport_progress(100);
+                    }
+                })
+                .await;
+                let _ = demand.response.send(Ok(HydratedInputs::default()));
+            }
+        });
+        let (first, second) = tokio::join!(
+            send_demand_with_window(&tx, SyncDemandRequest::PublicationBarrier, window),
+            send_demand_with_window(&tx, SyncDemandRequest::PublicationBarrier, window),
+        );
+        first.unwrap();
+        second.unwrap();
+        worker.await.unwrap();
     }
 
     #[tokio::test]
     async fn admission_restarts_are_capped() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        let (tx, mut rx) = sync_demand_channel(4);
         tokio::spawn(async move {
             while let Some(demand) = rx.recv().await {
                 let _ = demand.response.send(Err(LixError::new(
@@ -3768,7 +3903,7 @@ mod tests {
         };
         let mut retry = SyncDemandRetry::default();
         for _ in 0..3 {
-            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            let (demand_tx, mut demand_rx) = sync_demand_channel(1);
             // Repeating the exact address after restart must reach the worker:
             // the new serving basis may still need this shared immutable input.
             let hydrate = retry.hydrate_for_retry(Some(&demand_tx), missing());
@@ -3798,7 +3933,7 @@ mod tests {
                 crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
                     .annotate_missing(LixError::unknown("missing input"));
             missing.details.as_mut().unwrap()[marker] = serde_json::json!(true);
-            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            let (demand_tx, mut demand_rx) = sync_demand_channel(1);
             let error = SyncDemandRetry::default()
                 .hydrate_for_retry(Some(&demand_tx), missing.clone())
                 .await
@@ -3841,7 +3976,7 @@ mod tests {
         let commit_id = uuid::Uuid::now_v7().to_string();
         let error = LixError::new("LIX_SYNC_HISTORY_REQUIRED", "history is deferred")
             .with_details(serde_json::json!({ "commitIds": [commit_id.clone()] }));
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, mut demand_rx) = sync_demand_channel(1);
         let request = sync_demand_request_for_error(&error)
             .expect("history demand is valid")
             .expect("history demand is classified");
@@ -3866,7 +4001,7 @@ mod tests {
         let commit_id = uuid::Uuid::now_v7().to_string();
         let error =
             LixError::commit_not_found(commit_id.clone(), "walk_commit_graph", "graph_node");
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, mut demand_rx) = sync_demand_channel(1);
         let request = sync_demand_request_for_error(&error)
             .expect("sparse graph demand is valid")
             .expect("sparse graph demand is classified");
@@ -3902,7 +4037,7 @@ mod tests {
         let chunk_id = "a".repeat(64);
         let error = LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
             .with_details(serde_json::json!({ "chunkIds": [chunk_id.clone()] }));
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, mut demand_rx) = sync_demand_channel(1);
         let request = sync_demand_request_for_error(&error)
             .expect("chunk demand is valid")
             .expect("chunk demand is classified");
@@ -3926,7 +4061,7 @@ mod tests {
     async fn shutdown_result_unblocks_a_pending_demand() {
         let error = LixError::new("LIX_SYNC_CHUNKS_REQUIRED", "chunks are deferred")
             .with_details(serde_json::json!({ "chunkIds": ["a".repeat(64)] }));
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, mut demand_rx) = sync_demand_channel(1);
         let request = sync_demand_request_for_error(&error)
             .expect("chunk demand is valid")
             .expect("chunk demand is classified");
@@ -3948,6 +4083,7 @@ mod tests {
         let pending = vec![SyncDemand {
             request: request(),
             response: retrying_response,
+            progress: Default::default(),
         }];
         let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
         let (queued_response, queued_done) = tokio::sync::oneshot::channel();
@@ -3955,6 +4091,7 @@ mod tests {
             .send(SyncDemand {
                 request: request(),
                 response: queued_response,
+                progress: Default::default(),
             })
             .await
             .expect("queued demand is admitted");
@@ -3970,12 +4107,13 @@ mod tests {
     #[tokio::test]
     async fn worker_exit_unblocks_a_demand_waiting_for_channel_capacity() {
         let request = || SyncDemandRequest::Chunks(vec!["a".repeat(64)]);
-        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, demand_rx) = sync_demand_channel(1);
         let (queued_response, queued_done) = tokio::sync::oneshot::channel();
         demand_tx
             .send(SyncDemand {
                 request: request(),
                 response: queued_response,
+                progress: Default::default(),
             })
             .await
             .expect("first demand fills the channel");
@@ -4083,10 +4221,12 @@ mod tests {
                 SyncDemand {
                     request: SyncDemandRequest::Chunks(chunk_ids.clone()),
                     response: first_response,
+                    progress: Default::default(),
                 },
                 SyncDemand {
                     request: SyncDemandRequest::Chunks(chunk_ids),
                     response: second_response,
+                    progress: Default::default(),
                 },
             ],
         )
@@ -4260,10 +4400,12 @@ mod tests {
                 SyncDemand {
                     request: SyncDemandRequest::History(vec![parent.clone()]),
                     response: first_response,
+                    progress: Default::default(),
                 },
                 SyncDemand {
                     request: SyncDemandRequest::History(vec![parent.clone()]),
                     response: second_response,
+                    progress: Default::default(),
                 },
             ],
         )
@@ -4294,6 +4436,7 @@ mod tests {
             vec![SyncDemand {
                 request: SyncDemandRequest::History(vec![parent.clone()]),
                 response: repeat_response,
+                progress: Default::default(),
             }],
         )
         .await;
@@ -4445,6 +4588,7 @@ mod tests {
                 vec![SyncDemand {
                     request: SyncDemandRequest::History(vec![worker_parent]),
                     response,
+                    progress: Default::default(),
                 }],
             )
             .await
@@ -4506,6 +4650,7 @@ mod tests {
             .send(SyncDemand {
                 request: SyncDemandRequest::History(vec![parent]),
                 response,
+                progress: Default::default(),
             })
             .await
             .expect("new demand queues before the upload iteration");
@@ -4581,6 +4726,7 @@ mod tests {
         let mut demands = vec![SyncDemand {
             request: SyncDemandRequest::History(vec![parent]),
             response,
+            progress: Default::default(),
         }];
         let (_demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
         let mut delta_pull_limit = super::super::MAX_SYNC_REQUEST_ITEMS;
@@ -4730,6 +4876,7 @@ mod tests {
         let demands = vec![SyncDemand {
             request: SyncDemandRequest::PublicationBarrier,
             response,
+            progress: Default::default(),
         }];
         let expired = || {
             Err(LixError::new(
@@ -4808,7 +4955,7 @@ mod tests {
         };
         let mut retry = SyncDemandRetry::default();
         loop {
-            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            let (demand_tx, mut demand_rx) = sync_demand_channel(1);
             let hydrate = retry.hydrate_for_retry(Some(&demand_tx), error);
             let serve = async {
                 let demand = demand_rx.recv().await.expect("history demand arrives");
@@ -4887,6 +5034,7 @@ mod tests {
             vec![SyncDemand {
                 request: SyncDemandRequest::History(vec![parent.clone()]),
                 response,
+                progress: Default::default(),
             }],
         )
         .await;

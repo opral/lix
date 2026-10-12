@@ -30,7 +30,7 @@ pub(crate) async fn switch_existing_branch<S>(
     engine: Arc<Engine<S>>,
     server: ServerOptions,
     completion: PartialBranchSwitchCompletion,
-    demand_tx: Option<tokio::sync::mpsc::Sender<super::runtime::SyncDemand>>,
+    demand_tx: Option<super::runtime::SyncDemandSender>,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -231,7 +231,7 @@ pub(super) async fn prepare_existing_branch_with_retry<S, C>(
     engine: Arc<Engine<S>>,
     transport: &HttpSyncTransport<C>,
     target: &str,
-    demand_tx: Option<&tokio::sync::mpsc::Sender<super::runtime::SyncDemand>>,
+    demand_tx: Option<&super::runtime::SyncDemandSender>,
 ) -> Result<super::partial_publication::PreparedPartialPublication, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,

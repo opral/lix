@@ -304,7 +304,7 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
@@ -749,7 +749,7 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
             );
             storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
             let worker_storage = storage;
             let worker_state = state;
             let worker_transport = transport.clone();
@@ -981,7 +981,7 @@ async fn run_production_cold_global_probe(
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
     let worker_transport = transport.clone();
@@ -1179,7 +1179,7 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
         crate::sync::partial_replica_write_capability(),
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
@@ -1432,7 +1432,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
             );
             storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
             let worker_storage = storage.clone();
             let worker_state = state.clone();
             let worker_transport = transport.clone();

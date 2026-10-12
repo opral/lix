@@ -575,7 +575,7 @@ async fn file_read_fulfillment_uses_public_retry_and_preserves_local_edits() {
         crate::sync::partial_replica_write_capability(),
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let replica = Lix::from_partial_engine_for_test(Arc::new(engine), session, sender);
     let worker = tokio::spawn(async move {
         while let Some(demand) = receiver.recv().await {

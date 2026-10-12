@@ -1200,7 +1200,7 @@ mod tests {
             error.details.as_ref().unwrap()["missingNativeObject"],
             original.details.as_ref().unwrap()["missingNativeObject"]
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, mut receiver) = crate::sync::sync_demand_channel(1);
         let mut retry = crate::sync::SyncDemandRetry::default();
         let rejected = tokio::time::timeout(
             Duration::from_secs(1),

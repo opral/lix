@@ -110,7 +110,7 @@ pub(crate) struct ReadSnapshot<StorageImpl: Storage + 'static> {
     in_flight: Arc<InFlightReads>,
     /// Partial replicas fetch missing immutable inputs through this channel
     /// and layer them over the pinned view; the pinned state never moves.
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
 }
 
 /// Every open snapshot of one session, so closing the session closes them.
@@ -175,7 +175,7 @@ where
     /// Pins the current repository state of this session's active branch.
     pub(crate) async fn open_read_snapshot(
         &self,
-        sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     ) -> Result<Arc<ReadSnapshot<StorageImpl>>, LixError> {
         self.ensure_open()?;
         self.refresh_active_branch_base_if_stale().await?;

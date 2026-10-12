@@ -11373,7 +11373,7 @@ mod tests {
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(8);
+        let (demand_tx, mut demand_rx) = crate::sync::runtime::sync_demand_channel(8);
         lix.set_sync_demand_sender_for_test(demand_tx);
         tokio::spawn(async move {
             while let Some(demand) = demand_rx.recv().await {

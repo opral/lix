@@ -8512,7 +8512,7 @@ mod tests {
             .await
             .expect("install sparse replica snapshot");
 
-        let (demand_tx, mut demand_rx) = mpsc::channel(1);
+        let (demand_tx, mut demand_rx) = crate::sync::sync_demand_channel(1);
         replica.set_sync_demand_sender_for_test(demand_tx);
         let replica = Arc::new(replica);
         let hydrate_replica = Arc::clone(&replica);

@@ -1113,7 +1113,7 @@ where
     transaction_lifecycle: Arc<PublicTransactionLifecycle>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_lease: Option<Arc<SyncSessionLease>>,
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     server: Option<ServerOptions>,
     authority_read_session: Arc<AuthorityReadSession>,
     open_report: Arc<OpenReport>,
@@ -2024,7 +2024,7 @@ where
     #[cfg(test)]
     pub(crate) fn set_sync_demand_sender_for_test(
         &mut self,
-        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+        sender: crate::sync::SyncDemandSender,
     ) {
         self.sync_demand_tx = Some(sender);
     }
@@ -3416,7 +3416,7 @@ mod tests {
     #[tokio::test]
     async fn retries_distinct_sync_demands_until_the_operation_succeeds() {
         let mut lix = open_lix().await.expect("open Lix");
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(4);
+        let (demand_tx, mut demand_rx) = crate::sync::sync_demand_channel(4);
         lix.sync_demand_tx = Some(demand_tx);
         let responder = tokio::spawn(async move {
             for _ in 0..3 {
@@ -4112,7 +4112,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
     pub(crate) fn from_partial_engine_for_test(
         engine: Arc<Engine<StorageSession<S>>>,
         session: SessionContext<StorageSession<S>>,
-        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+        sender: crate::sync::SyncDemandSender,
     ) -> Self {
         let lix = Self {
             engine,

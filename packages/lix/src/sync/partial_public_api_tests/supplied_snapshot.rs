@@ -127,7 +127,7 @@ async fn reconcile_supplied_missing_file_snapshots() {
     // foreground query or manual candidate publication to drive convergence.
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
         storage,

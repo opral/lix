@@ -324,6 +324,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                         LixError::unknown("queued resident demand"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -454,7 +455,7 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
         .unwrap();
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender.clone());
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -536,7 +537,7 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
     client.offline.store(true, Ordering::SeqCst);
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -648,7 +649,7 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
         .unwrap();
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -693,7 +694,7 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     let engine = Arc::new(engine);
     let raw_session = session.clone();
-    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let (sender, _receiver) = crate::sync::runtime::sync_demand_channel(1);
     let lix = Lix::from_partial_engine_for_test(engine, session, sender);
     let edit = raw_session
         .execute(
@@ -1041,7 +1042,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
             .unwrap();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
             old.clone(),
@@ -1065,6 +1066,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
                             LixError::unknown("resident foreground demand"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1257,7 +1259,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
             .unwrap();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
             old.clone(),
@@ -1288,6 +1290,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                             LixError::unknown("resident foreground demand"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1360,6 +1363,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                             LixError::unknown("resident demand during reconciliation transfer"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1467,6 +1471,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                                 LixError::unknown("resident demand during retired cleanup"),
                             ),
                             response,
+                            progress: Default::default(),
                         })
                         .await
                         .unwrap();
@@ -1796,7 +1801,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         };
         let (response, done) = tokio::sync::oneshot::channel();
         sender
-            .send(crate::sync::runtime::SyncDemand { request, response })
+            .send(crate::sync::runtime::SyncDemand { request, response, progress: Default::default() })
             .await
             .unwrap();
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -1853,7 +1858,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
                                 .unwrap_or_else(|| panic!("unexpected SQL error: {error:?}"));
                         let (response, done) = tokio::sync::oneshot::channel();
                         sender
-                            .send(crate::sync::runtime::SyncDemand { request, response })
+                            .send(crate::sync::runtime::SyncDemand { request, response, progress: Default::default() })
                             .await
                             .unwrap();
                         done.await.unwrap().unwrap();

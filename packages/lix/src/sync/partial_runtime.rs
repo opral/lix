@@ -126,7 +126,7 @@ where
     let janitor_storage = storage.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
+    let (demand_tx, demand_rx) = crate::sync::runtime::sync_demand_channel(64);
     let health = engine.as_ref().map(|engine| engine.sync_mode().health());
     let task = spawn_sync_task(async move {
         let _owner_guard = owner_guard;
@@ -2594,7 +2594,9 @@ where
             continue;
         }
         let result = {
-            let hydrate = async {
+            // Successful bytes received while serving count as this demand
+            // channel's progress for the waiters' stall windows.
+            let hydrate = super::runtime::serving_demands(vec![demand.progress.clone()], async {
                 loop {
                     if let Some(engine) = &engine {
                         engine.sync_mode().ensure_partial_admission_healthy()?;
@@ -2690,7 +2692,7 @@ where
                         engine.sync_mode().partial_admission().as_deref() != Some(state.as_ref()));
                     if !admission_changed { return result; }
                 }
-            }
+            })
             .fuse();
             let shutdown = shutdown_rx.changed().fuse();
             let cancelled = demand.response.closed().fuse();
@@ -2885,6 +2887,7 @@ mod tests {
                         LixError::unknown("missing"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -2930,6 +2933,7 @@ mod tests {
                     LixError::unknown("stale demand"),
                 ),
                 response,
+                progress: Default::default(),
             })
             .await
             .unwrap();
@@ -2980,6 +2984,7 @@ mod tests {
                         LixError::unknown("missing"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -3515,6 +3520,7 @@ mod tests {
                     LixError::unknown("missing metadata"),
                 ),
                 response: first_response,
+                progress: Default::default(),
             })
             .await
             .unwrap();
@@ -3523,6 +3529,7 @@ mod tests {
             .send(SyncDemand {
                 request: SyncDemandRequest::History(vec!["unsupported-history-demand".into()]),
                 response: second_response,
+                progress: Default::default(),
             })
             .await
             .unwrap();
@@ -4117,6 +4124,7 @@ mod tests {
                     LixError::unknown("missing"),
                 ),
                 response,
+                progress: Default::default(),
             })
             .await
             .unwrap();
@@ -4137,6 +4145,7 @@ mod tests {
                         LixError::unknown("duplicate demand"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -4195,6 +4204,7 @@ mod tests {
                         LixError::unknown("missing"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();

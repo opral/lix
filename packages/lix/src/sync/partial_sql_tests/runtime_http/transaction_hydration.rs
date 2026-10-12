@@ -67,7 +67,7 @@ async fn snapshot_hydrates_native_inputs_without_moving_its_state() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let (authority, engine, session, old) = publication::fixture().await;
         let storage = engine.storage();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
+        let (sender, mut receiver) = crate::sync::sync_demand_channel(4);
         let sql = "SELECT value FROM lix_key_value WHERE key='resident'";
         let served = std::sync::atomic::AtomicUsize::new(0);
         let calls = async {
@@ -130,7 +130,7 @@ async fn explicit_transaction_hydration(commit: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let (authority, engine, session, old) = publication::fixture().await;
         let storage = engine.storage();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
+        let (sender, mut receiver) = crate::sync::sync_demand_channel(4);
         let calls = async {
             let mut retry = crate::sync::SyncDemandRetry::default();
             let opened = loop {
@@ -249,7 +249,7 @@ async fn profile_warm_partial_explicit_transaction() {
         )
         .await
         .unwrap();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
+        let (sender, mut receiver) = crate::sync::sync_demand_channel(4);
         let mut transaction = session
             .begin_transaction()
             .await

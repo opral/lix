@@ -609,7 +609,7 @@ async fn slow_recovery_inner(
         }
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, demand_rx) = crate::sync::sync_demand_channel(1);
         let (changes, changes_rx) = tokio::sync::watch::channel(0);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),

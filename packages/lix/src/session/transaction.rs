@@ -41,7 +41,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) sync_mode: SyncModeState,
-    pub(super) sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    pub(super) sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     pub(super) has_started_statement: bool,
     pub(super) has_written_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
@@ -143,7 +143,7 @@ where
 {
     pub(crate) fn with_sync_demand_sender(
         mut self,
-        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sender: Option<crate::sync::SyncDemandSender>,
     ) -> Self {
         if let Some(transaction) = self.transaction.as_mut() {
             transaction.set_sync_demand_sender(sender.clone());

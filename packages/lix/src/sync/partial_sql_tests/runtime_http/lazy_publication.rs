@@ -69,7 +69,7 @@ async fn observer_receives_prepared_current_basis_after_publication() {
 
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, demand_rx) = tokio::sync::mpsc::channel(4);
+        let (sender, demand_rx) = crate::sync::sync_demand_channel(4);
         // Prime only the original basis before the server worker starts. The
         // authority and HTTP server use distinct engines over the same storage;
         // updating before long-poll avoids relying on cross-engine notification.
