@@ -1,3 +1,4 @@
+/// <reference lib="esnext.disposable" preserve="true" />
 export type RemoteLixFetch = (
 	input: RequestInfo | URL,
 	init?: RequestInit,
@@ -270,8 +271,10 @@ export type CallOptions = {
 /** Options of `query()`. */
 export type QueryOptions = CallOptions & {
 	/**
-	 * Byte cap of the buffered result, measured in the engine (default 64 MiB).
-	 * `Infinity` opts out. Exceeding it rejects with `LIX_ERROR_RESULT_TOO_LARGE`.
+	 * Byte cap of the buffered result (default 64 MiB): the memory the engine
+	 * holds for its rows. `Infinity` opts out. Exceeding it rejects with
+	 * `LIX_ERROR_RESULT_TOO_LARGE`. On a remote Lix the cap is checked when the
+	 * response arrives; the server's own response limit applies first.
 	 */
 	maxBytes?: number;
 };
@@ -308,7 +311,11 @@ export type WriteOptions = {
 
 /** Options of `execute()`. */
 export type ExecuteOptions = WriteOptions & {
-	/** Byte cap of the returned rows (default 64 MiB); `Infinity` opts out. */
+	/**
+	 * Byte cap of the returned rows (default 64 MiB); `Infinity` opts out.
+	 * Not supported on a remote Lix (rejects `LIX_INVALID_PARAM`): the server
+	 * applies its default cap before it commits.
+	 */
 	maxBytes?: number;
 };
 
@@ -380,7 +387,7 @@ export type TransactionResult<T> = CommitReceipt & {
 export interface RowStream<TRow extends object = Row>
 	extends AsyncIterable<TRow>,
 		AsyncDisposable {
-	readonly columns: string[];
+	readonly columns: readonly string[];
 	/** The same cursor as pages. The first page is small; later pages are <= 4096 rows / 1 MiB. */
 	pages(): AsyncIterableIterator<TRow[]>;
 	/** Idempotent. Resolves once the engine has stopped and the read state is released. */
@@ -395,7 +402,10 @@ export interface Reader {
 		params?: readonly SqlParam[],
 		options?: QueryOptions,
 	): Promise<TRow[]>;
-	/** At most one row: `undefined` if there is none; rejects `LIX_ERROR_NOT_UNIQUE` if there are more. */
+	/**
+	 * At most one row: `undefined` if there is none; rejects `LIX_ERROR_NOT_UNIQUE`
+	 * if there are more. Reads at most two rows, so it takes no `maxBytes`.
+	 */
 	queryOne<TRow extends object = Row>(
 		sql: string,
 		params?: readonly SqlParam[],

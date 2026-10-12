@@ -6,8 +6,15 @@ export class Value {
 	readonly #raw: LixValue;
 
 	private constructor(raw: LixValue, clone = true) {
-		validateExplicitValue(raw);
-		this.#raw = clone ? cloneValue(raw) : raw;
+		try {
+			validateExplicitValue(raw);
+			this.#raw = clone ? cloneValue(raw) : raw;
+		} catch (error) {
+			// Validating and copying JSON recurse; a stack overflow is a bad
+			// parameter, not an engine fault.
+			if (!(error instanceof RangeError)) throw error;
+			throw invalidParam(0, "JSON SQL parameters are nested too deeply", "jsonb");
+		}
 		this.kind = this.#raw.kind;
 	}
 
@@ -137,11 +144,17 @@ export function normalizeParam(param: SqlParam, index = 0): LixValue {
 			? { kind: "integer", value }
 			: { kind: "real", value };
 	}
-	if (value instanceof Uint8Array) {
+	if (isUint8Array(value)) {
 		return {
 			kind: "blob",
 			value: new Uint8Array(value),
 		};
+	}
+	if (typeof value === "bigint") {
+		const error = invalidParam(index, "bigint is not a valid SQL parameter", "bigint");
+		error.hint =
+			"Pass Number(value) when it is a safe integer, or bind it as text and CAST it in SQL.";
+		throw error;
 	}
 	if (typeof value === "object" && value) {
 		if (value instanceof Date) {
@@ -157,6 +170,19 @@ export function normalizeParam(param: SqlParam, index = 0): LixValue {
 				"typed array SQL parameters must be Uint8Array",
 				value.constructor.name,
 			);
+		}
+		if (isArrayBuffer(value)) {
+			const error = invalidParam(
+				index,
+				"ArrayBuffer is not a valid SQL parameter; bind bytes as a Uint8Array",
+				"ArrayBuffer",
+			);
+			error.hint = "Pass new Uint8Array(buffer).";
+			throw error;
+		}
+		if (!Array.isArray(value) && !isPlainObject(value)) {
+			const name = value.constructor?.name ?? "object";
+			throw invalidParam(index, `${name} is not a valid SQL parameter`, name);
 		}
 		const actual = Array.isArray(value) ? "array" : "object";
 		const error = invalidParam(
@@ -316,7 +342,7 @@ function validateExplicitValue(value: LixValue) {
 			}
 			break;
 		case "blob":
-			if (value.value instanceof Uint8Array) return;
+			if (isUint8Array(value.value)) return;
 			break;
 		default:
 			break;
@@ -425,6 +451,22 @@ function cloneJsonValue(value: JsonValue): JsonValue {
 		);
 	}
 	return value;
+}
+
+/** Also true for a Uint8Array from another realm (a vm context, an iframe). */
+function isUint8Array(value: unknown): value is Uint8Array {
+	return (
+		value instanceof Uint8Array ||
+		(ArrayBuffer.isView(value) &&
+			Object.prototype.toString.call(value) === "[object Uint8Array]")
+	);
+}
+
+function isArrayBuffer(value: object): boolean {
+	return (
+		value instanceof ArrayBuffer ||
+		Object.prototype.toString.call(value) === "[object ArrayBuffer]"
+	);
 }
 
 function isPlainObject(value: object) {

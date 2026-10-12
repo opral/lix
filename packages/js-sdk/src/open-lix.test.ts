@@ -2453,7 +2453,14 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 				testCase.name,
 			).rejects.toMatchObject({
 				code: "LIX_INVALID_PARAM",
-				message: expect.stringMatching(/wrap JSON values with json\(value\)/),
+				// Only JSON-shaped values get the json() hint; a Map or a class
+				// instance is named instead.
+				message: expect.stringMatching(
+					Array.isArray(value) ||
+						[Object.prototype, null].includes(Object.getPrototypeOf(value))
+						? /wrap JSON values with json\(value\)/
+						: /is not a valid SQL parameter/,
+				),
 			});
 		}
 		try {

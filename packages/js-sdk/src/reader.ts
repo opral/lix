@@ -1,3 +1,4 @@
+/// <reference lib="esnext.disposable" preserve="true" />
 import { invalidArgument } from "./errors.js";
 import type {
 	BindingExecuteOptions,
@@ -22,13 +23,14 @@ import type {
 	StreamOptions,
 } from "./types.js";
 
-// `await using` needs Symbol.asyncDispose. Engines without it get the
-// registered symbol TypeScript's downlevel helpers also fall back to.
-if (typeof (Symbol as { asyncDispose?: symbol }).asyncDispose !== "symbol") {
-	Object.defineProperty(Symbol, "asyncDispose", {
-		value: Symbol.for("Symbol.asyncDispose"),
-	});
-}
+/**
+ * The key of `[Symbol.asyncDispose]()`, for `await using`. Engines without
+ * the symbol use the registered one; a `Symbol.asyncDispose` polyfill must
+ * load before this module. Globals are never patched.
+ */
+const asyncDispose: typeof Symbol.asyncDispose =
+	(Symbol as { asyncDispose?: typeof Symbol.asyncDispose }).asyncDispose ??
+	(Symbol.for("Symbol.asyncDispose") as typeof Symbol.asyncDispose);
 
 type LixError = Error & { code: string; hint?: string; details?: unknown };
 
@@ -91,7 +93,15 @@ export function nativeParams(
 	if (params === undefined) return [];
 	if (!Array.isArray(params))
 		throw invalidArgument(operation, "params", "array", typeof params, receiver);
-	return params.map((param, index) => toNativeValue(normalizeParam(param, index)));
+	try {
+		// `Array.from` visits holes, so a sparse array rejects instead of
+		// binding nothing for the missing positions.
+		return Array.from(params, (param, index) => toNativeValue(normalizeParam(param, index)));
+	} catch (error) {
+		const details = (error as { details?: { operation?: string } }).details;
+		if (details && typeof details === "object") details.operation = operation;
+		throw error;
+	}
 }
 
 function assertOptions(
@@ -371,7 +381,7 @@ const streamFinalizer = new FinalizationRegistry<QueryStreamBinding>(
  * engine stream. An error is latched: later pulls reject with it.
  */
 export class LixRowStream<TRow extends object> implements RowStream<TRow> {
-	readonly columns: string[];
+	readonly columns: readonly string[];
 	#tail: Promise<unknown> = Promise.resolve();
 	/** The page the row iterator is consuming, and its next row's index. */
 	#rows: TRow[] = [];
@@ -391,7 +401,7 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 		private readonly binding: QueryStreamBinding,
 		private readonly signal?: AbortSignal,
 	) {
-		this.columns = Object.freeze([...binding.columns]) as string[];
+		this.columns = Object.freeze([...binding.columns]);
 		streamFinalizer.register(this, binding, this);
 		const stream = new WeakRef(this);
 		this.#abort = () => {
@@ -456,7 +466,7 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 		return this.#closeWith(undefined);
 	}
 
-	[Symbol.asyncDispose](): Promise<void> {
+	[asyncDispose](): Promise<void> {
 		return this.close();
 	}
 
@@ -632,7 +642,7 @@ export class LixSnapshot implements Snapshot {
 		})());
 	}
 
-	[Symbol.asyncDispose](): Promise<void> {
+	[asyncDispose](): Promise<void> {
 		return this.close();
 	}
 }

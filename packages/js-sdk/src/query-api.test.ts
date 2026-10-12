@@ -47,6 +47,24 @@ test("query returns rows, never writes, and caps buffered bytes", async () => {
 	}
 });
 
+test("snapshots and transactions apply maxBytes", async () => {
+	const lix = await seeded(50);
+	const sql = "SELECT id, label FROM api_item";
+	const tooLarge = { code: "LIX_ERROR_RESULT_TOO_LARGE" };
+	try {
+		await lix.read(async (snapshot) => {
+			await expect(snapshot.query(sql, [], { maxBytes: 128 })).rejects.toMatchObject(tooLarge);
+			expect(await snapshot.query(sql, [], { maxBytes: Infinity })).toHaveLength(50);
+		});
+		await lix.transaction(async (tx) => {
+			await expect(tx.query(sql, [], { maxBytes: 128 })).rejects.toMatchObject(tooLarge);
+			expect(await tx.query(sql, [], { maxBytes: Infinity })).toHaveLength(50);
+		});
+	} finally {
+		await lix.close();
+	}
+});
+
 test("queryOne reports absent and ambiguous results", async () => {
 	const lix = await seeded();
 	try {
@@ -106,6 +124,43 @@ test("executeMany is atomic and rejects statements that return rows", async () =
 		expect(
 			await lix.executeMany("INSERT INTO api_item (id, label) VALUES ($1, $2)", []),
 		).toEqual({ rowsAffected: 0 });
+	} finally {
+		await lix.close();
+	}
+});
+
+test("parameter errors name the call and give a fitting hint", async () => {
+	const lix = await openLix();
+	try {
+		// A hole is a missing parameter, not a skipped one.
+		// eslint-disable-next-line no-sparse-arrays
+		await expect(lix.query("SELECT $1 AS a, $2 AS b", [1, , 3] as never)).rejects.toMatchObject({
+			code: "LIX_INVALID_PARAM",
+			details: { operation: "query", argument: "params[1]" },
+		});
+		await expect(lix.executeMany("SELECT $1", [[10n as never]])).rejects.toMatchObject({
+			code: "LIX_INVALID_PARAM",
+			details: { operation: "executeMany", paramSetIndex: 0 },
+			hint: expect.stringContaining("Number(value)"),
+		});
+		await expect(lix.query("SELECT $1", [new ArrayBuffer(2) as never])).rejects.toMatchObject({
+			message: expect.stringContaining("ArrayBuffer"),
+			hint: expect.stringContaining("Uint8Array"),
+		});
+		const map = lix.query("SELECT $1", [new Map() as never]);
+		await expect(map).rejects.toMatchObject({ message: "Map is not a valid SQL parameter" });
+		await expect(map).rejects.not.toHaveProperty("hint");
+		let deep: unknown = 1;
+		for (let depth = 0; depth < 200_000; depth++) deep = [deep];
+		expect(() => json(deep as never)).toThrow(
+			expect.objectContaining({ code: "LIX_INVALID_PARAM" }),
+		);
+		const { runInNewContext } = await import("node:vm");
+		const foreign = runInNewContext("new Uint8Array([7, 8])") as Uint8Array;
+		expect(foreign instanceof Uint8Array).toBe(false);
+		expect(await lix.queryOne("SELECT $1 AS b", [foreign])).toEqual({
+			b: new Uint8Array([7, 8]),
+		});
 	} finally {
 		await lix.close();
 	}
