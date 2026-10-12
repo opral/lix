@@ -49,7 +49,7 @@ type SyncServerRuntimeOptions = LixServerOptions & {
 
 type PendingRequest = {
 	operation: WorkerOperation;
-	category: "ordinary" | "observer-close" | "control";
+	category: "ordinary" | "observer-close" | "control" | "release";
 	timer?: ReturnType<typeof setTimeout>;
 	abortSignal?: AbortSignal;
 	abortListener?: () => void;
@@ -73,11 +73,17 @@ function workerOperationCategory(
 	operation: WorkerOperation,
 ): PendingRequest["category"] {
 	if (operation.kind === "observe.close") return "observer-close";
+	// Releasing a resource is never refused for backpressure: each open stream
+	// or snapshot closes at most once, so these stay bounded by what is open,
+	// and refusing one would leak the resource on the worker.
 	if (
-		operation.kind === "close" ||
-		operation.kind === "exportSnapshot.cancel" ||
 		operation.kind === "stream.close" ||
 		operation.kind === "readSnapshot.close" ||
+		operation.kind === "exportSnapshot.cancel"
+	)
+		return "release";
+	if (
+		operation.kind === "close" ||
 		operation.kind === "transaction.commit" ||
 		operation.kind === "transaction.rollback" ||
 		operation.kind === "openSnapshot.finish"
@@ -832,17 +838,20 @@ export class LixWorkerClient {
 		let controlPending = 0;
 		let observerClosePending = 0;
 		let ordinaryPending = 0;
+		let releasePending = 0;
 		for (const pending of this.pending.values()) {
 			if (pending.category === "control") controlPending++;
 			else if (pending.category === "observer-close") observerClosePending++;
+			else if (pending.category === "release") releasePending++;
 			else ordinaryPending++;
 		}
 		if (
-			this.pending.size >= WORKER_CLIENT_MAX_PENDING ||
+			category !== "release" &&
+			(this.pending.size - releasePending >= WORKER_CLIENT_MAX_PENDING ||
 			(category === "control" && controlPending >= WORKER_CLIENT_MAX_CONTROL_PENDING) ||
 			(category === "observer-close" &&
 				observerClosePending >= WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING) ||
-			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING)
+			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING))
 		) {
 			return Promise.reject(workerQueueFullError());
 		}

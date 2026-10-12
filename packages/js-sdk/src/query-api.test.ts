@@ -266,3 +266,28 @@ test("reads reject multi-statement SQL", async () => {
 		await lix.close();
 	}
 });
+
+test("concurrent snapshot and stream releases are never refused for backpressure", async () => {
+	const lix = await openLix();
+	try {
+		const reads = await Promise.allSettled(
+			Array.from({ length: 40 }, () =>
+				lix.read((snapshot) => snapshot.queryOne("SELECT 1 AS n")),
+			),
+		);
+		expect(reads.filter((read) => read.status === "rejected")).toEqual([]);
+		const streams = await Promise.allSettled(
+			Array.from({ length: 40 }, async () => {
+				for await (const row of await lix.stream(
+					"SELECT value FROM generate_series(1, 200)",
+				)) {
+					expect(row).toHaveProperty("value");
+					break;
+				}
+			}),
+		);
+		expect(streams.filter((stream) => stream.status === "rejected")).toEqual([]);
+	} finally {
+		await lix.close();
+	}
+});
