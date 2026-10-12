@@ -1,5 +1,5 @@
 import { expect, test, vi } from "vitest";
-import type { LixBinding, ObserveEventsBinding } from "../binding-types.js";
+import type { LixBinding, ObserveEventsBinding, TelemetryParentContext } from "../binding-types.js";
 import type {
 	WorkerHostEndpoint,
 	WorkerInput,
@@ -2076,3 +2076,70 @@ test("pulls of open streams never wait behind long reads in the independent pool
 		expect(responses).toContainEqual(expect.objectContaining({ id: 4, ok: true })),
 	);
 });
+
+
+test.each(["success", "open failure", "first page failure"])(
+	"stream opening propagates and clears the telemetry parent on %s",
+	async (outcome) => {
+		const parent = {
+			traceparent: "00-11111111111111111111111111111111-1111111111111111-01",
+		};
+		let activeParent: TelemetryParentContext | undefined;
+		const parents: Array<TelemetryParentContext | undefined> = [];
+		const responses: WorkerResponse[] = [];
+		let receive!: (message: WorkerInput) => void;
+		const binding = {
+			setTelemetryParent(value?: TelemetryParentContext) {
+				activeParent = value;
+				parents.push(value);
+			},
+			async stream() {
+				await Promise.resolve();
+				expect(activeParent).toEqual(parent);
+				if (outcome === "open failure") throw new Error("open failed");
+				return {
+					columns: [],
+					async next() {
+						await Promise.resolve();
+						expect(activeParent).toEqual(parent);
+						if (outcome === "first page failure") throw new Error("page failed");
+						return null;
+					},
+					async cancel() {},
+				};
+			},
+		} as unknown as LixBinding;
+		startWorkerHost(
+			{
+				postMessage: (message) => responses.push(message),
+				onMessage: (listener) => (receive = listener),
+			},
+			async () => binding,
+		);
+		receive({
+			id: 1,
+			sessionId: 0,
+			operation: {
+				kind: "open",
+				storage: { kind: "memory" },
+				telemetryEnabled: true,
+				progressEnabled: false,
+			},
+		});
+		await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+		receive({
+			id: 2,
+			sessionId: 0,
+			telemetryParent: parent,
+			operation: { kind: "stream", sql: "SELECT 1", params: [] },
+		});
+		await vi.waitFor(() =>
+			expect(responses).toContainEqual(expect.objectContaining({
+				id: 2,
+				ok: outcome === "success",
+			})),
+		);
+		expect(parents).toEqual([parent, undefined]);
+		expect(activeParent).toBeUndefined();
+	},
+);

@@ -471,16 +471,23 @@ export function startWorkerHost(
 				message,
 				`stream.open:${message.id}`,
 				undefined,
-				async () =>
-					registerQueryStream(
-						sessionId,
-						await requiredLix(sessionId).stream(
-							operation.sql,
-							operation.params,
-							operation.options,
-							readSignal(message.id),
-						),
-					),
+				async () => {
+					const binding = requiredLix(sessionId);
+					binding.setTelemetryParent(message.telemetryParent);
+					try {
+						return await registerQueryStream(
+							sessionId,
+							await binding.stream(
+								operation.sql,
+								operation.params,
+								operation.options,
+								readSignal(message.id),
+							),
+						);
+					} finally {
+						binding.setTelemetryParent();
+					}
+				},
 			);
 			return;
 		}
