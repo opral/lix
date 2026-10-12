@@ -2839,7 +2839,13 @@ mod tests {
     #[test]
     fn deletion_keeps_single_worker_lifecycle_transport_responsive() {
         let (completed, completion) = std::sync::mpsc::channel();
+        let stage = Arc::new(std::sync::Mutex::new(String::from("runtime setup")));
+        let worker_stage = Arc::clone(&stage);
         let worker = std::thread::spawn(move || {
+            let mark = |stage: String| {
+                eprintln!("single-worker lifecycle: {stage}");
+                *worker_stage.lock().unwrap() = stage;
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
@@ -2853,6 +2859,7 @@ mod tests {
                         runtime: Handle::current(),
                     }),
                 };
+                mark("provision fixtures".into());
                 let setup = Arc::clone(&manager);
                 let io_runtime = Handle::current();
                 tokio::task::spawn_blocking(move || {
@@ -2867,7 +2874,9 @@ mod tests {
                     Default::default(),
                 );
                 for id in [LIX_A, LIX_B, LIX_C] {
+                    mark(format!("open {id}"));
                     open_protocol_session(&app, id).await;
+                    mark(format!("delete {id}"));
                     let response = app
                         .clone()
                         .oneshot(
@@ -2884,6 +2893,7 @@ mod tests {
                         .await
                         .unwrap();
                     assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+                    mark(format!("health after {id}"));
                     assert_eq!(
                         app.clone()
                             .oneshot(
@@ -2899,11 +2909,14 @@ mod tests {
                     );
                 }
                 use lix_sdk::server_protocol::LixLifecycleStore as _;
+                mark("create unrelated repository".into());
                 LifecycleHost(Arc::clone(&manager))
                     .create("owner".into(), "after-deletion".into(), None)
                     .await
                     .expect("unrelated create must progress while deletion tears down storage");
+                mark("shutdown and join deletion cleanup".into());
                 manager.shutdown().await.unwrap();
+                mark("verify durable completion".into());
                 for id in [LIX_A, LIX_B, LIX_C] {
                     assert!(
                         manager
@@ -2919,9 +2932,9 @@ mod tests {
         });
         // This deadline runs outside Tokio: a blocked I/O worker cannot also
         // prevent the regression test's timeout from detecting starvation.
-        completion.recv_timeout(Duration::from_secs(10)).expect(
-            "single I/O worker must serve lifecycle requests and complete deletion cleanup",
-        );
+        completion.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| {
+            panic!("single I/O worker must serve lifecycle requests and complete deletion cleanup: {error}; stage: {}", stage.lock().unwrap());
+        });
         worker.join().unwrap();
     }
 
