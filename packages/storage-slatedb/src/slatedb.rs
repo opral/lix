@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::ops::{Bound, Range};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -67,6 +68,12 @@ const LENGTH_TAG: u8 = b'L';
 const LAYOUT_COMPLETE_KEY: &[u8] = b"\0lix-physical-layout-complete";
 const LAYOUT_PROGRESS_KEY: &[u8] = b"\0lix-physical-layout-progress";
 const LAYOUT_SOURCE_SEQ_KEY: &[u8] = b"\0lix-physical-layout-source-sequence";
+// Checkpoints amortize remote WAL writes while bounding memory and replay work.
+// One existing value larger than the byte limit is copied alone: legacy values
+// must remain migratable even when they exceed today's normal write budget.
+const MIGRATION_CHECKPOINT_MAX_ROWS: usize = 4096;
+const MIGRATION_CHECKPOINT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MIGRATION_SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const LEGACY_SEGMENT_PREFIX: &[u8] = b"\0lix-legacy-immutable-segment:";
 const IMMUTABLE_VALUE_PATH: &str = "lix-immutable-value-segment-v1";
 const IMMUTABLE_VALUE_CACHE_PATH: &str = "lix-immutable-value-segment-v1";
@@ -947,6 +954,196 @@ impl StartupImmutableGc {
 #[derive(Clone, Debug, Default)]
 pub struct SlateDBObjectStoreOptions {
     pub cache: Option<SlateDBCacheOptions>,
+}
+
+/// Phase of the versioned SlateDB open and physical-layout upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlateDBOpenPhase {
+    CurrentStorageInitialization,
+    SourceLayoutCheck,
+    LegacyStorageInitialization,
+    LegacyMigration,
+    MigrationPublication,
+    Ready,
+}
+
+impl SlateDBOpenPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentStorageInitialization => "current_storage_initialization",
+            Self::SourceLayoutCheck => "source_layout_check",
+            Self::LegacyStorageInitialization => "legacy_storage_initialization",
+            Self::LegacyMigration => "legacy_migration",
+            Self::MigrationPublication => "migration_publication",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+/// Dependency currently awaited while opening or migrating a repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlateDBOpenDependency {
+    None,
+    CurrentSlateDbOpen,
+    CurrentLayoutMarkerRead,
+    LegacyObjectStoreList,
+    LegacySlateDbOpen,
+    LegacySlateDbClose,
+    LegacySnapshotRead,
+    MigrationSourceSequenceRead,
+    MigrationSourceSequenceWrite,
+    MigrationCursorRead,
+    LegacyRowScan,
+    /// Includes SlateDB's awaited durable WAL/object-store persistence.
+    MigrationCheckpointWrite,
+    MigrationPublicationWrite,
+}
+
+impl SlateDBOpenDependency {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CurrentSlateDbOpen => "current_slatedb_open",
+            Self::CurrentLayoutMarkerRead => "current_layout_marker_read",
+            Self::LegacyObjectStoreList => "legacy_object_store_list",
+            Self::LegacySlateDbOpen => "legacy_slatedb_open",
+            Self::LegacySlateDbClose => "legacy_slatedb_close",
+            Self::LegacySnapshotRead => "legacy_snapshot_read",
+            Self::MigrationSourceSequenceRead => "migration_source_sequence_read",
+            Self::MigrationSourceSequenceWrite => "migration_source_sequence_write",
+            Self::MigrationCursorRead => "migration_cursor_read",
+            Self::LegacyRowScan => "legacy_row_scan",
+            Self::MigrationCheckpointWrite => "migration_checkpoint_write",
+            Self::MigrationPublicationWrite => "migration_publication_write",
+        }
+    }
+}
+
+/// Meaning of an opening progress notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlateDBOpenProgressEvent {
+    /// A dependency call is about to be awaited. This identifies the active
+    /// dependency but does not itself represent completed work.
+    DependencyStarted,
+    /// The dependency future returned successfully.
+    DependencyFinished,
+    /// The dependency future returned an error. The open result carries the
+    /// original error.
+    DependencyFailed,
+    /// A bounded migration batch has been durably checkpointed.
+    CheckpointDurable,
+    /// The storage backend finished initialization and any required upgrade.
+    Ready,
+}
+
+impl SlateDBOpenProgressEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DependencyStarted => "dependency_started",
+            Self::DependencyFinished => "dependency_finished",
+            Self::DependencyFailed => "dependency_failed",
+            Self::CheckpointDurable => "checkpoint_durable",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+/// Observable progress for one storage-open attempt.
+///
+/// `rows`, `bytes`, and `checkpoints` count only migration work durably
+/// checkpointed during this attempt. They reset when an interrupted migration
+/// is reopened; `resumed` reports whether the attempt found an existing cursor.
+/// The callback is observational and must return promptly. Observer panics are
+/// ignored so they cannot change storage-open semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlateDBOpenProgress {
+    pub phase: SlateDBOpenPhase,
+    pub dependency: SlateDBOpenDependency,
+    pub event: SlateDBOpenProgressEvent,
+    pub rows: u64,
+    pub bytes: u64,
+    pub checkpoints: u64,
+    pub resumed: bool,
+}
+
+type SlateDBOpenProgressCallback = Arc<dyn Fn(SlateDBOpenProgress) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct SlateDBOpenProgressReporter {
+    callback: SlateDBOpenProgressCallback,
+    enabled: Arc<AtomicBool>,
+}
+
+impl SlateDBOpenProgressReporter {
+    fn new(callback: SlateDBOpenProgressCallback) -> Self {
+        Self {
+            callback,
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn report(
+        &self,
+        phase: SlateDBOpenPhase,
+        dependency: SlateDBOpenDependency,
+        event: SlateDBOpenProgressEvent,
+        counts: MigrationProgressCounts,
+    ) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let progress = SlateDBOpenProgress {
+            phase,
+            dependency,
+            event,
+            rows: counts.rows,
+            bytes: counts.bytes,
+            checkpoints: counts.checkpoints,
+            resumed: counts.resumed,
+        };
+        if catch_unwind(AssertUnwindSafe(|| (self.callback)(progress))).is_err() {
+            self.enabled.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MigrationProgressCounts {
+    rows: u64,
+    bytes: u64,
+    checkpoints: u64,
+    resumed: bool,
+}
+
+async fn observe_open_dependency<T, E, F: Future<Output = Result<T, E>>>(
+    reporter: Option<&SlateDBOpenProgressReporter>,
+    phase: SlateDBOpenPhase,
+    dependency: SlateDBOpenDependency,
+    counts: MigrationProgressCounts,
+    future: F,
+) -> Result<T, E> {
+    if let Some(reporter) = reporter {
+        reporter.report(
+            phase,
+            dependency,
+            SlateDBOpenProgressEvent::DependencyStarted,
+            counts,
+        );
+    }
+    let output = future.await;
+    if let Some(reporter) = reporter {
+        reporter.report(
+            phase,
+            dependency,
+            if output.is_ok() {
+                SlateDBOpenProgressEvent::DependencyFinished
+            } else {
+                SlateDBOpenProgressEvent::DependencyFailed
+            },
+            counts,
+        );
+    }
+    output
 }
 
 #[derive(Clone, Debug)]
@@ -2446,6 +2643,7 @@ impl SlateDB {
             true,
             metrics,
             diagnostics,
+            None,
         )
         .map(|mut storage| {
             storage.path = path;
@@ -2465,6 +2663,28 @@ impl SlateDB {
             false,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Opens SlateDB and reports storage initialization and legacy physical
+    /// layout migration progress. Notifications run on the SlateDB manager
+    /// thread and must return promptly. They are observational: the callback
+    /// cannot cancel an in-flight database operation or migration checkpoint.
+    pub fn open_object_store_with_options_and_progress(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        options: SlateDBObjectStoreOptions,
+        on_progress: impl Fn(SlateDBOpenProgress) + Send + Sync + 'static,
+    ) -> Result<Self, StorageError> {
+        Self::open_object_store_with_read_dispatch(
+            db_path,
+            object_store,
+            options,
+            false,
+            None,
+            None,
+            Some(SlateDBOpenProgressReporter::new(Arc::new(on_progress))),
         )
     }
 
@@ -2487,6 +2707,34 @@ impl SlateDB {
             false,
             Some(metrics),
             Some(counters),
+            None,
+        )
+    }
+
+    /// Opens SlateDB with both I/O counters and observable initialization and
+    /// migration progress. Progress callbacks run on the SlateDB manager
+    /// thread and must return promptly; they never cancel or abandon an
+    /// in-flight database operation or migration checkpoint.
+    pub fn open_object_store_with_options_and_io_counters_and_progress(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        options: SlateDBObjectStoreOptions,
+        counters: SlateDBIoCounters,
+        on_progress: impl Fn(SlateDBOpenProgress) + Send + Sync + 'static,
+    ) -> Result<Self, StorageError> {
+        let metrics = Arc::clone(&counters.metrics);
+        let object_store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore {
+            inner: object_store,
+            counters: counters.clone(),
+        });
+        Self::open_object_store_with_read_dispatch(
+            db_path,
+            object_store,
+            options,
+            false,
+            Some(metrics),
+            Some(counters),
+            Some(SlateDBOpenProgressReporter::new(Arc::new(on_progress))),
         )
     }
 
@@ -2503,6 +2751,7 @@ impl SlateDB {
         read_on_caller_current_thread: bool,
         metrics: Option<Arc<DefaultMetricsRecorder>>,
         counters: Option<SlateDBIoCounters>,
+        progress: Option<SlateDBOpenProgressReporter>,
     ) -> Result<Self, StorageError> {
         validate_object_store_options(&options)?;
         let db_path = db_path.into();
@@ -2519,6 +2768,7 @@ impl SlateDB {
                 options,
                 read_on_caller_current_thread,
                 metrics,
+                progress,
             )?,
             immutable_value_store,
             path: PathBuf::from(db_path),
@@ -4763,6 +5013,7 @@ impl SlateDBWorker {
         options: SlateDBObjectStoreOptions,
         local_filesystem: bool,
         metrics: Option<Arc<DefaultMetricsRecorder>>,
+        progress: Option<SlateDBOpenProgressReporter>,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
         let reclamation = InFlightTracker::default();
@@ -4781,6 +5032,7 @@ impl SlateDBWorker {
                     opened_tx,
                     manager_in_flight,
                     local_filesystem,
+                    progress,
                 );
             })
             .map_err(|error| StorageError::Io(format!("spawn slatedb worker: {error}")))?;
@@ -4996,6 +5248,7 @@ fn run_slatedb_manager(
     opened: mpsc::Sender<Result<(Handle, Arc<Db>), StorageError>>,
     in_flight: InFlightTracker,
     collect_local_garbage_on_close: bool,
+    progress: Option<SlateDBOpenProgressReporter>,
 ) {
     let runtime = match Builder::new_multi_thread()
         .worker_threads(RUNTIME_WORKER_THREADS)
@@ -5017,6 +5270,7 @@ fn run_slatedb_manager(
         Arc::clone(&object_store),
         options,
         metrics,
+        progress,
     ) {
         Ok(db) => db,
         Err(error) => {
@@ -5105,6 +5359,7 @@ fn open_slatedb(
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
     metrics: Option<Arc<DefaultMetricsRecorder>>,
+    progress: Option<SlateDBOpenProgressReporter>,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
         let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
@@ -5131,10 +5386,30 @@ fn open_slatedb(
                 DEFAULT_METADATA_CACHE_BYTES,
             ));
         }
-        let db = builder.build().await.map_err(slatedb_error)?;
-        if let Err(error) = migrate_physical_layout(&db, &db_path, object_store).await {
-            let _ = db.close().await;
-            return Err(error);
+        let db = observe_open_dependency(
+            progress.as_ref(),
+            SlateDBOpenPhase::CurrentStorageInitialization,
+            SlateDBOpenDependency::CurrentSlateDbOpen,
+            MigrationProgressCounts::default(),
+            builder.build(),
+        )
+        .await
+        .map_err(slatedb_error)?;
+        let counts =
+            match migrate_physical_layout(&db, &db_path, object_store, progress.as_ref()).await {
+                Ok(counts) => counts,
+                Err(error) => {
+                    let _ = db.close().await;
+                    return Err(error);
+                }
+            };
+        if let Some(progress) = &progress {
+            progress.report(
+                SlateDBOpenPhase::Ready,
+                SlateDBOpenDependency::None,
+                SlateDBOpenProgressEvent::Ready,
+                counts,
+            );
         }
         Ok(db)
     })
@@ -5163,10 +5438,21 @@ async fn migrate_physical_layout(
     db: &Db,
     db_path: &str,
     store: Arc<dyn ObjectStore>,
-) -> Result<(), StorageError> {
-    if let Some(version) = db.get(LAYOUT_COMPLETE_KEY).await.map_err(slatedb_error)? {
+    reporter: Option<&SlateDBOpenProgressReporter>,
+) -> Result<MigrationProgressCounts, StorageError> {
+    let empty_counts = MigrationProgressCounts::default();
+    let version = observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::SourceLayoutCheck,
+        SlateDBOpenDependency::CurrentLayoutMarkerRead,
+        empty_counts,
+        db.get(LAYOUT_COMPLETE_KEY),
+    )
+    .await
+    .map_err(slatedb_error)?;
+    if let Some(version) = version {
         return if version.as_ref() == b"3" {
-            Ok(())
+            Ok(empty_counts)
         } else {
             Err(StorageError::Corruption(
                 "unsupported SlateDB physical layout marker".into(),
@@ -5175,30 +5461,57 @@ async fn migrate_physical_layout(
     }
     let legacy_path = join_db_path(db_path, LEGACY_SEGMENTED_FORMAT_PATH);
     let legacy_prefix = ObjectPath::from(legacy_path.clone());
-    let has_legacy = store
-        .list(Some(&legacy_prefix))
-        .next()
-        .await
-        .transpose()
-        .map_err(object_store_error)?
-        .is_some();
+    let has_legacy = observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::SourceLayoutCheck,
+        SlateDBOpenDependency::LegacyObjectStoreList,
+        empty_counts,
+        async {
+            store
+                .list(Some(&legacy_prefix))
+                .next()
+                .await
+                .transpose()
+                .map_err(object_store_error)
+                .map(|entry| entry.is_some())
+        },
+    )
+    .await?;
     if has_legacy {
-        let legacy = Db::builder(legacy_path, store)
-            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
-            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
-            .with_settings(slatedb_settings())
-            .build()
+        let legacy = observe_open_dependency(
+            reporter,
+            SlateDBOpenPhase::LegacyStorageInitialization,
+            SlateDBOpenDependency::LegacySlateDbOpen,
+            empty_counts,
+            Db::builder(legacy_path, store)
+                .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+                .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+                .with_settings(slatedb_settings())
+                .build(),
+        )
+        .await
+        .map_err(slatedb_error)?;
+        let copied = async {
+            let counts = copy_legacy_physical_rows(db, &legacy, reporter).await?;
+            let final_snapshot = observe_open_dependency(
+                reporter,
+                SlateDBOpenPhase::LegacyMigration,
+                SlateDBOpenDependency::LegacySnapshotRead,
+                counts,
+                legacy.snapshot(),
+            )
             .await
             .map_err(slatedb_error)?;
-        let copied = async {
-            copy_legacy_physical_rows(db, &legacy).await?;
-            let final_sequence = legacy
-                .snapshot()
-                .await
-                .map_err(slatedb_error)?
-                .seq()
-                .to_be_bytes();
-            let expected = db.get(LAYOUT_SOURCE_SEQ_KEY).await.map_err(slatedb_error)?;
+            let final_sequence = final_snapshot.seq().to_be_bytes();
+            let expected = observe_open_dependency(
+                reporter,
+                SlateDBOpenPhase::LegacyMigration,
+                SlateDBOpenDependency::MigrationSourceSequenceRead,
+                counts,
+                db.get(LAYOUT_SOURCE_SEQ_KEY),
+            )
+            .await
+            .map_err(slatedb_error)?;
             if expected.as_ref().map(Bytes::as_ref) != Some(final_sequence.as_slice()) {
                 return Err(StorageError::Corruption(
                     "legacy SlateDB generation advanced before migration publication".into(),
@@ -5207,27 +5520,48 @@ async fn migrate_physical_layout(
             // The migration's old-path writer remains open (and fences prior
             // writers) through completion. Concurrent old binaries are not a
             // supported rolling-upgrade mode.
-            finish_physical_layout(db).await
+            finish_physical_layout(db, reporter, counts).await?;
+            Ok(counts)
         }
         .await;
-        let closed = legacy.close().await.map_err(slatedb_error);
-        copied?;
+        let close_counts = copied.as_ref().copied().unwrap_or_default();
+        let closed = observe_open_dependency(
+            reporter,
+            SlateDBOpenPhase::LegacyStorageInitialization,
+            SlateDBOpenDependency::LegacySlateDbClose,
+            close_counts,
+            legacy.close(),
+        )
+        .await
+        .map_err(slatedb_error);
+        let counts = copied?;
         closed?;
-        return Ok(());
+        return Ok(counts);
     }
-    finish_physical_layout(db).await
+    finish_physical_layout(db, reporter, empty_counts).await?;
+    Ok(empty_counts)
 }
-async fn finish_physical_layout(db: &Db) -> Result<(), StorageError> {
+async fn finish_physical_layout(
+    db: &Db,
+    reporter: Option<&SlateDBOpenProgressReporter>,
+    counts: MigrationProgressCounts,
+) -> Result<(), StorageError> {
     let mut batch = WriteBatch::new();
     batch.put(LAYOUT_COMPLETE_KEY, b"3");
     batch.delete(LAYOUT_PROGRESS_KEY);
     batch.delete(LAYOUT_SOURCE_SEQ_KEY);
-    db.write_with_options(
-        batch,
-        &SlateDBWriteOptions {
-            await_durable: true,
-            ..Default::default()
-        },
+    observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::MigrationPublication,
+        SlateDBOpenDependency::MigrationPublicationWrite,
+        counts,
+        db.write_with_options(
+            batch,
+            &SlateDBWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            },
+        ),
     )
     .await
     .map_err(slatedb_error)?;
@@ -5246,10 +5580,32 @@ impl PrefixExtractor for LegacyStorageSpacePrefixExtractor {
         (len >= 4).then_some(4)
     }
 }
-async fn copy_legacy_physical_rows(db: &Db, legacy: &Db) -> Result<(), StorageError> {
-    let snapshot = legacy.snapshot().await.map_err(slatedb_error)?;
+async fn copy_legacy_physical_rows(
+    db: &Db,
+    legacy: &Db,
+    reporter: Option<&SlateDBOpenProgressReporter>,
+) -> Result<MigrationProgressCounts, StorageError> {
+    let empty_counts = MigrationProgressCounts::default();
+    let snapshot = observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::LegacyMigration,
+        SlateDBOpenDependency::LegacySnapshotRead,
+        empty_counts,
+        legacy.snapshot(),
+    )
+    .await
+    .map_err(slatedb_error)?;
     let sequence = snapshot.seq().to_be_bytes();
-    if let Some(expected) = db.get(LAYOUT_SOURCE_SEQ_KEY).await.map_err(slatedb_error)? {
+    let expected = observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::LegacyMigration,
+        SlateDBOpenDependency::MigrationSourceSequenceRead,
+        empty_counts,
+        db.get(LAYOUT_SOURCE_SEQ_KEY),
+    )
+    .await
+    .map_err(slatedb_error)?;
+    if let Some(expected) = expected {
         if expected.as_ref() != sequence {
             return Err(StorageError::Corruption(
                 "legacy SlateDB generation advanced during physical migration".into(),
@@ -5258,75 +5614,212 @@ async fn copy_legacy_physical_rows(db: &Db, legacy: &Db) -> Result<(), StorageEr
     } else {
         let mut initial = WriteBatch::new();
         initial.put(LAYOUT_SOURCE_SEQ_KEY, sequence);
-        db.write_with_options(
-            initial,
-            &SlateDBWriteOptions {
-                await_durable: true,
-                ..Default::default()
-            },
+        observe_open_dependency(
+            reporter,
+            SlateDBOpenPhase::LegacyMigration,
+            SlateDBOpenDependency::MigrationSourceSequenceWrite,
+            empty_counts,
+            db.write_with_options(
+                initial,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            ),
         )
         .await
         .map_err(slatedb_error)?;
     }
-    let progress = db.get(LAYOUT_PROGRESS_KEY).await.map_err(slatedb_error)?;
+    let progress = observe_open_dependency(
+        reporter,
+        SlateDBOpenPhase::LegacyMigration,
+        SlateDBOpenDependency::MigrationCursorRead,
+        empty_counts,
+        db.get(LAYOUT_PROGRESS_KEY),
+    )
+    .await
+    .map_err(slatedb_error)?;
+    let mut counts = MigrationProgressCounts {
+        resumed: progress.is_some(),
+        ..MigrationProgressCounts::default()
+    };
     let lower = progress.map_or(Bound::Unbounded, Bound::Excluded);
-    let mut rows = snapshot
-        .scan((lower, Bound::<Bytes>::Unbounded))
+    if let Some(reporter) = reporter {
+        reporter.report(
+            SlateDBOpenPhase::LegacyMigration,
+            SlateDBOpenDependency::LegacyRowScan,
+            SlateDBOpenProgressEvent::DependencyStarted,
+            counts,
+        );
+    }
+    // This is a full sequential copy, not an interactive page read. SlateDB's
+    // default reads just one SST block per object-store request. Read ahead in
+    // bounded chunks without polluting the cache with this one-time scan.
+    let scan_options =
+        SlateDBScanOptions::default().with_read_ahead_bytes(MIGRATION_SCAN_READ_AHEAD_BYTES);
+    let mut rows = match snapshot
+        .scan_with_options((lower, Bound::<Bytes>::Unbounded), &scan_options)
         .await
-        .map_err(slatedb_error)?;
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            if let Some(reporter) = reporter {
+                reporter.report(
+                    SlateDBOpenPhase::LegacyMigration,
+                    SlateDBOpenDependency::LegacyRowScan,
+                    SlateDBOpenProgressEvent::DependencyFailed,
+                    counts,
+                );
+            }
+            return Err(slatedb_error(error));
+        }
+    };
     let mut batch = WriteBatch::new();
     let mut count = 0usize;
     let mut bytes = 0usize;
-    while let Some(row) = rows.next().await.map_err(slatedb_error)? {
+    let mut batch_bytes = 0usize;
+    loop {
+        let row = match rows.next().await {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(error) => {
+                if let Some(reporter) = reporter {
+                    reporter.report(
+                        SlateDBOpenPhase::LegacyMigration,
+                        SlateDBOpenDependency::LegacyRowScan,
+                        SlateDBOpenProgressEvent::DependencyFailed,
+                        counts,
+                    );
+                }
+                return Err(slatedb_error(error));
+            }
+        };
         if row.key.len() < 4 || row.key.len() >= MAX_SLATEDB_KEY_LEN {
+            if let Some(reporter) = reporter {
+                reporter.report(
+                    SlateDBOpenPhase::LegacyMigration,
+                    SlateDBOpenDependency::LegacyRowScan,
+                    SlateDBOpenProgressEvent::DependencyFailed,
+                    counts,
+                );
+            }
             return Err(StorageError::InvalidKey);
+        }
+        let locator = decode_immutable_locator(&row.value).ok();
+        let row_bytes = (row.key.len() + 1)
+            .saturating_mul(2)
+            .saturating_add(row.value.len())
+            .saturating_add(9)
+            .saturating_add(if locator.is_some() {
+                LEGACY_SEGMENT_PREFIX.len() + 32
+            } else {
+                0
+            })
+            // Include the cursor overhead conservatively once per source row.
+            .saturating_add(LAYOUT_PROGRESS_KEY.len() + row.key.len());
+        if count != 0
+            && (count >= MIGRATION_CHECKPOINT_MAX_ROWS
+                || batch_bytes.saturating_add(row_bytes) > MIGRATION_CHECKPOINT_MAX_BYTES)
+        {
+            observe_open_dependency(
+                reporter,
+                SlateDBOpenPhase::LegacyMigration,
+                SlateDBOpenDependency::MigrationCheckpointWrite,
+                counts,
+                db.write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .map_err(slatedb_error)?;
+            counts.rows = counts.rows.saturating_add(count as u64);
+            counts.bytes = counts.bytes.saturating_add(bytes as u64);
+            counts.checkpoints = counts.checkpoints.saturating_add(1);
+            if let Some(reporter) = reporter {
+                reporter.report(
+                    SlateDBOpenPhase::LegacyMigration,
+                    SlateDBOpenDependency::MigrationCheckpointWrite,
+                    SlateDBOpenProgressEvent::CheckpointDurable,
+                    counts,
+                );
+                // The checkpoint call temporarily becomes the active
+                // dependency. Restore the scan label before asking SlateDB
+                // for the next row so a stall report identifies the awaited
+                // work accurately.
+                reporter.report(
+                    SlateDBOpenPhase::LegacyMigration,
+                    SlateDBOpenDependency::LegacyRowScan,
+                    SlateDBOpenProgressEvent::DependencyStarted,
+                    counts,
+                );
+            }
+            batch = WriteBatch::new();
+            count = 0;
+            bytes = 0;
+            batch_bytes = 0;
         }
         let mut key = Vec::with_capacity(row.key.len() + 1);
         key.push(VALUE_TAG);
         key.extend_from_slice(&row.key);
         let key = Key(Bytes::from(key));
-        batch.put(&key.0, &row.value);
-        if let Ok(locator) = decode_immutable_locator(&row.value) {
+        batch.put_bytes(key.0.clone(), row.value.clone());
+        if let Some(locator) = locator {
             let mut protected = LEGACY_SEGMENT_PREFIX.to_vec();
             protected.extend_from_slice(&locator.segment_id.0);
             // Preserve legacy object reachability even if its copied v3 key is
             // deleted. The original physical repository is retained in v2.
-            batch.put(protected, Bytes::new());
+            batch.put_bytes(Bytes::from(protected), Bytes::new());
         }
-        batch.put(
+        batch.put_bytes(
             tagged_key(&key, LENGTH_TAG)?.0,
             encode_value_length(row.value.len()),
         );
-        batch.put(LAYOUT_PROGRESS_KEY, &row.key);
+        batch.put_bytes(Bytes::from_static(LAYOUT_PROGRESS_KEY), row.key.clone());
         count += 1;
         bytes = bytes.saturating_add(row.value.len());
-        if count >= 32 || bytes >= 2 * 1024 * 1024 {
+        batch_bytes = batch_bytes.saturating_add(row_bytes);
+    }
+    if let Some(reporter) = reporter {
+        reporter.report(
+            SlateDBOpenPhase::LegacyMigration,
+            SlateDBOpenDependency::LegacyRowScan,
+            SlateDBOpenProgressEvent::DependencyFinished,
+            counts,
+        );
+    }
+    if count != 0 {
+        observe_open_dependency(
+            reporter,
+            SlateDBOpenPhase::LegacyMigration,
+            SlateDBOpenDependency::MigrationCheckpointWrite,
+            counts,
             db.write_with_options(
                 batch,
                 &SlateDBWriteOptions {
                     await_durable: true,
                     ..Default::default()
                 },
-            )
-            .await
-            .map_err(slatedb_error)?;
-            batch = WriteBatch::new();
-            count = 0;
-            bytes = 0;
-        }
-    }
-    if count != 0 {
-        db.write_with_options(
-            batch,
-            &SlateDBWriteOptions {
-                await_durable: true,
-                ..Default::default()
-            },
+            ),
         )
         .await
         .map_err(slatedb_error)?;
+        counts.rows = counts.rows.saturating_add(count as u64);
+        counts.bytes = counts.bytes.saturating_add(bytes as u64);
+        counts.checkpoints = counts.checkpoints.saturating_add(1);
+        if let Some(reporter) = reporter {
+            reporter.report(
+                SlateDBOpenPhase::LegacyMigration,
+                SlateDBOpenDependency::MigrationCheckpointWrite,
+                SlateDBOpenProgressEvent::CheckpointDurable,
+                counts,
+            );
+        }
     }
-    Ok(())
+    Ok(counts)
 }
 
 fn disk_cache_budgets(total_bytes: usize) -> (usize, usize) {
@@ -5906,10 +6399,29 @@ mod tests {
             .await
             .unwrap();
         legacy.close().await.unwrap();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&progress);
         assert!(matches!(
-            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default()),
+            SlateDB::open_object_store_with_options_and_progress(
+                root,
+                objects.clone(),
+                Default::default(),
+                move |event| observed.lock().unwrap().push(event),
+            ),
             Err(StorageError::InvalidKey)
         ));
+        {
+            let progress = progress.lock().unwrap();
+            assert!(progress.iter().any(|event| {
+                event.dependency == SlateDBOpenDependency::LegacyRowScan
+                    && event.event == SlateDBOpenProgressEvent::DependencyFailed
+            }));
+            assert!(
+                !progress
+                    .iter()
+                    .any(|event| event.event == SlateDBOpenProgressEvent::Ready)
+            );
+        }
         let destination = Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
             .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
             .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
@@ -5937,6 +6449,369 @@ mod tests {
             Some(Bytes::from_static(b"unchanged"))
         );
         legacy.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_layout_progress_counts_only_durable_batches_and_ready_follows_close() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = "physical-upgrade-progress";
+        let legacy = Db::builder(
+            join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+            objects.clone(),
+        )
+        .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+        .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+        .with_settings(slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+        let mut batch = WriteBatch::new();
+        for index in 0u32..(2 * MIGRATION_CHECKPOINT_MAX_ROWS as u32 + 1) {
+            let mut key = SpaceId(93).0.to_be_bytes().to_vec();
+            key.extend_from_slice(&index.to_be_bytes());
+            batch.put(key, b"ten-bytes!");
+        }
+        legacy
+            .write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&observed);
+        let storage = SlateDB::open_object_store_with_options_and_progress(
+            root,
+            objects.clone(),
+            Default::default(),
+            move |event| callback_events.lock().unwrap().push(event),
+        )
+        .unwrap();
+        let events = observed.lock().unwrap().clone();
+        let checkpoints = events
+            .iter()
+            .filter(|event| event.event == SlateDBOpenProgressEvent::CheckpointDurable)
+            .map(|event| (event.rows, event.bytes, event.checkpoints))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checkpoints,
+            vec![(4096, 40960, 1), (8192, 81920, 2), (8193, 81930, 3)]
+        );
+        let close_finished = events
+            .iter()
+            .rposition(|event| {
+                event.dependency == SlateDBOpenDependency::LegacySlateDbClose
+                    && event.event == SlateDBOpenProgressEvent::DependencyFinished
+            })
+            .unwrap();
+        let ready = events
+            .iter()
+            .position(|event| event.event == SlateDBOpenProgressEvent::Ready)
+            .unwrap();
+        assert!(close_finished < ready);
+        assert_eq!(events[ready].rows, 8193);
+        assert_eq!(events[ready].bytes, 81930);
+        assert_eq!(events[ready].checkpoints, 3);
+        assert!(!events[ready].resumed);
+        drop(events);
+        drop(observed);
+
+        storage.flush().await.unwrap();
+        drop(storage);
+        let legacy = Db::builder(join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH), objects)
+            .with_segment_extractor(Arc::new(LegacyStorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))])
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        let mut rows = legacy
+            .snapshot()
+            .await
+            .unwrap()
+            .scan((Bound::<Bytes>::Unbounded, Bound::Unbounded))
+            .await
+            .unwrap();
+        let mut retained = 0;
+        while rows.next().await.unwrap().is_some() {
+            retained += 1;
+        }
+        assert_eq!(retained, 8193);
+        legacy.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_migration_byte_budget_bounds_large_keys_and_values() {
+        for (root, key_len, value_len) in [
+            ("migration-medium-values", 8, 700 * 1024),
+            ("migration-large-keys", 60 * 1024, 1),
+        ] {
+            let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let legacy = Db::builder(
+                join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+                objects.clone(),
+            )
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+            let mut batch = WriteBatch::new();
+            let value = Bytes::from(vec![7; value_len]);
+            for index in 0u32..40 {
+                let mut key = SpaceId(93).0.to_be_bytes().to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                key.resize(key_len, 0);
+                batch.put(key, &value);
+            }
+            legacy
+                .write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let destination = Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects)
+                .with_settings(slatedb_settings())
+                .build()
+                .await
+                .unwrap();
+            let checkpoints = Arc::new(Mutex::new(Vec::new()));
+            let observed = checkpoints.clone();
+            let reporter = SlateDBOpenProgressReporter::new(Arc::new(move |event| {
+                if event.event == SlateDBOpenProgressEvent::CheckpointDurable {
+                    observed.lock().unwrap().push(event.rows);
+                }
+            }));
+            let counts = copy_legacy_physical_rows(&destination, &legacy, Some(&reporter))
+                .await
+                .unwrap();
+            assert_eq!(counts.rows, 40);
+            let per_row_bytes =
+                2 * (key_len + 1) + value_len + 9 + LAYOUT_PROGRESS_KEY.len() + key_len;
+            let rows_per_checkpoint = MIGRATION_CHECKPOINT_MAX_BYTES / per_row_bytes;
+            let expected = (rows_per_checkpoint..40)
+                .step_by(rows_per_checkpoint)
+                .map(|rows| rows as u64)
+                .chain(std::iter::once(40))
+                .collect::<Vec<_>>();
+            assert_eq!(*checkpoints.lock().unwrap(), expected);
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            destination.close().await.unwrap();
+            legacy.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_physical_migration_resumes_an_atomic_durable_prefix() {
+        for fail_checkpoint in [false, true] {
+            let objects = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+            let root = "migration-interrupted-durable-prefix";
+            let legacy = Db::builder(
+                join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+                objects.clone(),
+            )
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+            let source_rows = 2 * MIGRATION_CHECKPOINT_MAX_ROWS + 1;
+            let old_key = |index: usize| {
+                let mut key = SpaceId(93).0.to_be_bytes().to_vec();
+                key.extend_from_slice(&(index as u32).to_be_bytes());
+                key
+            };
+            let segment_id = Key(Bytes::from(vec![7; 32]));
+            let locator = encode_immutable_locator(&ImmutableValueLocator {
+                segment_id: segment_id.clone(),
+                segment_len: 9,
+                range: 0..9,
+            })
+            .unwrap();
+            let source_value = |index: usize| {
+                if index == 17 {
+                    locator.clone()
+                } else {
+                    Bytes::from_static(b"preserved")
+                }
+            };
+            let mut batch = WriteBatch::new();
+            for index in 0..source_rows {
+                batch.put_bytes(Bytes::from(old_key(index)), source_value(index));
+            }
+            legacy
+                .write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let destination =
+                Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+                    .with_settings(slatedb_settings())
+                    .build()
+                    .await
+                    .unwrap();
+            let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+            let fault_store = objects.clone();
+            let reporter = SlateDBOpenProgressReporter::new(Arc::new(move |event| {
+                if event.event == SlateDBOpenProgressEvent::CheckpointDurable {
+                    if fail_checkpoint {
+                        fault_store.fail_writes();
+                    } else {
+                        abort.abort();
+                    }
+                }
+            }));
+            let interrupted = futures_util::future::Abortable::new(
+                copy_legacy_physical_rows(&destination, &legacy, Some(&reporter)),
+                registration,
+            )
+            .await;
+            if fail_checkpoint {
+                assert!(matches!(interrupted, Ok(Err(StorageError::Io(message)))
+                if message.contains("injected write failure")));
+            } else {
+                assert!(
+                    interrupted.is_err(),
+                    "stop copying after the first durable checkpoint"
+                );
+            }
+            // Closing drains any write already submitted when cancellation occurred.
+            // Reopening observes only the durable prefix, as after process restart.
+            if fail_checkpoint {
+                let _ = destination.close().await;
+                objects.fail_writes.store(false, Ordering::Release);
+            } else {
+                destination.close().await.unwrap();
+            }
+            let destination =
+                Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+                    .with_settings(slatedb_settings())
+                    .build()
+                    .await
+                    .unwrap();
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let cursor = destination.get(LAYOUT_PROGRESS_KEY).await.unwrap().unwrap();
+            assert_eq!(
+                destination
+                    .get(LAYOUT_SOURCE_SEQ_KEY)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                legacy.snapshot().await.unwrap().seq().to_be_bytes()
+            );
+            let committed_rows = (0..source_rows)
+                .take_while(|index| old_key(*index).as_slice() <= cursor.as_ref())
+                .count();
+            assert!(committed_rows >= MIGRATION_CHECKPOINT_MAX_ROWS);
+            assert!(committed_rows < source_rows);
+            if fail_checkpoint {
+                assert_eq!(committed_rows, MIGRATION_CHECKPOINT_MAX_ROWS);
+            }
+            for index in 0..source_rows {
+                let mut physical = vec![VALUE_TAG];
+                physical.extend_from_slice(&old_key(index));
+                let value_key = Key(Bytes::from(physical));
+                let value = destination.get(&value_key.0).await.unwrap();
+                let length = destination
+                    .get(tagged_key(&value_key, LENGTH_TAG).unwrap().0)
+                    .await
+                    .unwrap();
+                if index < committed_rows {
+                    assert_eq!(value, Some(source_value(index)));
+                    assert_eq!(
+                        decode_value_length(&length.unwrap()).unwrap(),
+                        source_value(index).len()
+                    );
+                } else {
+                    assert!(value.is_none());
+                    assert!(length.is_none());
+                }
+            }
+            let mut protection_key = LEGACY_SEGMENT_PREFIX.to_vec();
+            protection_key.extend_from_slice(&segment_id.0);
+            assert_eq!(
+                destination.get(protection_key).await.unwrap(),
+                Some(Bytes::new())
+            );
+            let resumed = copy_legacy_physical_rows(&destination, &legacy, None)
+                .await
+                .unwrap();
+            assert!(resumed.resumed);
+            assert_eq!(resumed.rows as usize + committed_rows, source_rows);
+            assert_eq!(
+                destination.get(LAYOUT_PROGRESS_KEY).await.unwrap().unwrap(),
+                old_key(source_rows - 1)
+            );
+            for index in committed_rows..source_rows {
+                let mut physical = vec![VALUE_TAG];
+                physical.extend_from_slice(&old_key(index));
+                let value_key = Key(Bytes::from(physical));
+                assert_eq!(
+                    destination.get(&value_key.0).await.unwrap(),
+                    Some(source_value(index))
+                );
+                let length = destination
+                    .get(tagged_key(&value_key, LENGTH_TAG).unwrap().0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    decode_value_length(&length).unwrap(),
+                    source_value(index).len()
+                );
+            }
+            // A changed source must never be silently resumed or published.
+            let mut changed = WriteBatch::new();
+            changed.put(old_key(source_rows), b"new-generation");
+            legacy
+                .write_with_options(
+                    changed,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(copy_legacy_physical_rows(&destination, &legacy, None).await,
+            Err(StorageError::Corruption(message)) if message.contains("generation advanced"))
+            );
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            destination.close().await.unwrap();
+            legacy.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -6002,9 +6877,42 @@ mod tests {
             .await
             .unwrap();
         partial.close().await.unwrap();
-        let storage =
-            SlateDB::open_object_store_with_options(root, objects.clone(), Default::default())
-                .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&observed);
+        let storage = SlateDB::open_object_store_with_options_and_progress(
+            root,
+            objects.clone(),
+            Default::default(),
+            move |event| callback_events.lock().unwrap().push(event),
+        )
+        .unwrap();
+        let events = observed.lock().unwrap().clone();
+        let durable = events
+            .iter()
+            .find(|event| event.event == SlateDBOpenProgressEvent::CheckpointDurable)
+            .unwrap();
+        assert_eq!(durable.rows, 1);
+        assert_eq!(durable.bytes, 65 * 1024 * 1024);
+        assert_eq!(durable.checkpoints, 1);
+        assert!(durable.resumed);
+        let close_finished = events
+            .iter()
+            .rposition(|event| {
+                event.dependency == SlateDBOpenDependency::LegacySlateDbClose
+                    && event.event == SlateDBOpenProgressEvent::DependencyFinished
+            })
+            .unwrap();
+        let ready = events
+            .iter()
+            .position(|event| event.event == SlateDBOpenProgressEvent::Ready)
+            .unwrap();
+        assert!(close_finished < ready);
+        assert_eq!(events[ready].rows, 1);
+        assert_eq!(events[ready].bytes, 65 * 1024 * 1024);
+        assert_eq!(events[ready].checkpoints, 1);
+        assert!(events[ready].resumed);
+        drop(events);
+        drop(observed);
         let read = storage.begin_read(Default::default()).await.unwrap();
         let key = Key(Bytes::from_static(b"large"));
         let requests = [GetManyRequest {

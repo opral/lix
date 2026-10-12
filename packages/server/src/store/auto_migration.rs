@@ -19,9 +19,6 @@ impl LixRuntimeManager {
         id: &str,
         expected: &RepositoryRecord,
     ) -> Result<()> {
-        if expected.admission.as_ref() == Some(&AuthorityAdmission::current()) {
-            return Ok(());
-        }
         let (objects, prefix) = self.catalog_store();
         let path = ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json"));
         let response = objects.get(&path).await?;
@@ -170,6 +167,7 @@ mod tests {
             .put(
                 &ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json")),
                 serde_json::to_vec(&RepositoryRecord {
+                    deletion_complete: false,
                     state: "live".into(),
                     storage_id: physical.into(),
                     fingerprint: Some("keep".into()),
@@ -202,7 +200,7 @@ mod tests {
                             },
                         )
                         | AuthorityAdmissionError::Runtime(
-                            LixRuntimeError::Migrating { .. } | LixRuntimeError::Recovering,
+                            LixRuntimeError::Recovering | LixRuntimeError::Opening(_),
                         ),
                     ) => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -275,7 +273,16 @@ mod tests {
         catalog(&manager, &physical, None).await;
         let (opened, _) = watch::channel(RuntimeOpenState::Opening);
         let record = manager.repository_record(ID).await.unwrap().unwrap();
-        let error = manager.open_lix(ID, &record, &opened).await.err().unwrap();
+        let error = manager
+            .open_lix(
+                ID,
+                &record,
+                &opened,
+                OpenOperation::new(ID.to_owned(), manager.open_stall_timeout),
+            )
+            .await
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("not an existing authority"));
         assert_ne!(
             lix_sdk::migration::inspect_repository(storage)
@@ -370,7 +377,7 @@ mod tests {
             .await
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"]["code"], "LIX_REPOSITORY_MIGRATING");
+        assert_eq!(error["error"]["code"], "LIX_REPOSITORY_OPENING");
         let lifecycle = manager.lifecycle_lock(ID).await;
         assert!(
             lifecycle.try_write().is_err(),

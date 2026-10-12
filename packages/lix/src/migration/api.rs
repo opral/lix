@@ -64,10 +64,66 @@ fn migration_step<F: Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>
     Box::pin(create())
 }
 
+pub(super) struct MigrationStepProgress<'a> {
+    sink: Option<&'a std::sync::Arc<dyn crate::OpenProgressSink>>,
+    from_version: u32,
+    completed: std::sync::atomic::AtomicU64,
+}
+impl<'a> MigrationStepProgress<'a> {
+    pub(super) fn new(
+        sink: Option<&'a std::sync::Arc<dyn crate::OpenProgressSink>>,
+        from_version: u32,
+    ) -> Self {
+        let progress = Self {
+            sink,
+            from_version,
+            completed: std::sync::atomic::AtomicU64::new(0),
+        };
+        progress.report();
+        progress
+    }
+    fn report(&self) {
+        crate::open_types::emit_open_progress(
+            self.sink,
+            crate::OpenProgress {
+                scope: crate::OpenScope::Local,
+                phase: crate::OpenPhase::Migrating,
+                from_format: Some(self.from_version),
+                to_format: CURRENT_FORMAT_VERSION,
+                completed: Some(self.completed.load(std::sync::atomic::Ordering::Relaxed)),
+                total: None,
+            },
+        );
+    }
+}
+pub(super) async fn migration_step_with_progress<F: Future<Output = Result<T, LixError>>, T>(
+    progress: &MigrationStepProgress<'_>,
+    create: impl FnOnce() -> F,
+) -> Result<T, LixError> {
+    let value = migration_step(create).await?;
+    progress
+        .completed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    progress.report();
+    Ok(value)
+}
+
 pub(crate) async fn migrate_lix_with_adapter<S>(
     storage: S,
     adapter: crate::storage_adapter::StorageAdapter<S>,
     options: MigrationOptions,
+) -> Result<MigrationReport, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    migrate_lix_with_adapter_and_progress(storage, adapter, options, None).await
+}
+
+pub(crate) async fn migrate_lix_with_adapter_and_progress<S>(
+    storage: S,
+    adapter: crate::storage_adapter::StorageAdapter<S>,
+    options: MigrationOptions,
+    progress: Option<&std::sync::Arc<dyn crate::OpenProgressSink>>,
 ) -> Result<MigrationReport, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -121,20 +177,29 @@ where
         }
     };
     read.finish().map_err(storage_error)?;
+    let progress = MigrationStepProgress::new(progress, from_version);
     if from_version <= 78 {
-        migration_step(|| super::deterministic_witness::backfill(&adapter, options, false)).await?;
+        migration_step_with_progress(&progress, || {
+            super::deterministic_witness::backfill(&adapter, options, false)
+        })
+        .await?;
     }
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
     let commit_records_rewritten = if from_version <= 74 {
-        migration_step(|| rewrite_commit_records_to_v6(&adapter, &storage, options, from_version))
-            .await?
+        migration_step_with_progress(&progress, || {
+            rewrite_commit_records_to_v6(&adapter, &storage, options, from_version)
+        })
+        .await?
     } else {
         0
     };
     if from_version <= 72 {
-        migration_step(|| migrate_v72_account_profile_uri(&adapter, &storage, options)).await?;
+        migration_step_with_progress(&progress, || {
+            migrate_v72_account_profile_uri(&adapter, &storage, options)
+        })
+        .await?;
     }
     // The v72 amendment authors ordinary commits. Qualify the deterministic
     // remainder from that amended source, after its logical preservation check.
@@ -144,11 +209,16 @@ where
         None
     };
     if from_version <= 73 {
-        migration_step(|| migrate_v73_row_pk_indexes(&adapter, &storage, options)).await?;
+        migration_step_with_progress(&progress, || {
+            migrate_v73_row_pk_indexes(&adapter, &storage, options)
+        })
+        .await?;
     }
     let commit_members_rewritten = if from_version <= 74 {
-        migration_step(|| migrate_v74_complete_snapshot_commits(&adapter, &storage, options))
-            .await?
+        migration_step_with_progress(&progress, || {
+            migrate_v74_complete_snapshot_commits(&adapter, &storage, options)
+        })
+        .await?
     } else {
         0
     };
@@ -192,7 +262,10 @@ where
         .await?;
     }
     let checkpoint_records_rewritten = if from_version <= 77 {
-        migration_step(|| super::checkpoint_metadata::migrate(&adapter, options)).await?
+        migration_step_with_progress(&progress, || {
+            super::checkpoint_metadata::migrate(&adapter, options)
+        })
+        .await?
     } else {
         0
     };
@@ -209,7 +282,7 @@ where
         _ => None,
     };
     let legacy_commit_records_rewritten = if let Some(marker) = legacy_commit_records_rewritten {
-        migration_step(|| {
+        migration_step_with_progress(&progress, || {
             super::checkpoint_metadata::normalize_v7_records(&adapter, options, marker)
         })
         .await?
@@ -217,7 +290,7 @@ where
         0
     };
     if from_version <= 78 {
-        migration_step(|| {
+        migration_step_with_progress(&progress, || {
             backfill_missing_row_pk_indexes(
                 &adapter,
                 &storage,
@@ -231,32 +304,50 @@ where
             )
         })
         .await?;
-        migration_step(|| super::deterministic_witness::backfill(&adapter, options, true)).await?;
+        migration_step_with_progress(&progress, || {
+            super::deterministic_witness::backfill(&adapter, options, true)
+        })
+        .await?;
     }
     if from_version <= 79 {
-        migration_step(|| super::incorporation::migrate(&adapter, options, false)).await?;
+        migration_step_with_progress(&progress, || {
+            super::incorporation::migrate(&adapter, options, false)
+        })
+        .await?;
     }
     if from_version <= 80 {
-        migration_step(|| super::runtime_epoch::migrate(&adapter, false)).await?;
-    }
-    if from_version <= 81 {
-        migration_step(|| super::hot_indexes::migrate(&adapter, options, false)).await?;
-    }
-    if from_version <= 82 {
-        migration_step(|| super::author_storage::migrate(&adapter, options, false)).await?;
-    }
-    if from_version <= 83 {
-        migration_step(|| super::first_parent_checkpoints::migrate(&adapter, options, false))
+        migration_step_with_progress(&progress, || super::runtime_epoch::migrate(&adapter, false))
             .await?;
     }
+    if from_version <= 81 {
+        migration_step_with_progress(&progress, || {
+            super::hot_indexes::migrate(&adapter, options, false)
+        })
+        .await?;
+    }
+    if from_version <= 82 {
+        migration_step_with_progress(&progress, || {
+            super::author_storage::migrate(&adapter, options, false)
+        })
+        .await?;
+    }
+    if from_version <= 83 {
+        migration_step_with_progress(&progress, || {
+            super::first_parent_checkpoints::migrate(&adapter, options, false)
+        })
+        .await?;
+    }
     if from_version <= 84 {
-        migration_step(|| super::semantic_fingerprint_format::migrate(&adapter, false)).await?;
+        migration_step_with_progress(&progress, || {
+            super::semantic_fingerprint_format::migrate(&adapter, false)
+        })
+        .await?;
     }
     if from_version <= 85 {
-        migration_step(|| migrate_v86_marker(&adapter)).await?;
+        migration_step_with_progress(&progress, || migrate_v86_marker(&adapter)).await?;
     }
     if from_version <= 86 {
-        migration_step(|| migrate_v87_marker(&adapter)).await?;
+        migration_step_with_progress(&progress, || migrate_v87_marker(&adapter)).await?;
     }
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_stream::stream;
@@ -45,14 +45,18 @@ fn connection_locator_rejects_raw_protocol_and_noncanonical_ids() {
             "accepted invalid locator: {invalid}"
         );
     }
-    assert!(super::normalize_protocol_base_url(
-        "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-    )
-    .is_ok());
-    assert!(super::normalize_protocol_base_url(
-        "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
-    )
-    .is_ok());
+    assert!(
+        super::normalize_protocol_base_url(
+            "http://127.0.0.1:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok()
+    );
+    assert!(
+        super::normalize_protocol_base_url(
+            "http://[::1]:3000/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc"
+        )
+        .is_ok()
+    );
 }
 
 #[derive(Clone, Default)]
@@ -157,7 +161,14 @@ impl ProtocolHttp for ScriptHttp {
             Some(ScriptOutcome::Error(error)) => Err(error),
             Some(ScriptOutcome::PendingStream) => {
                 let cancellations = self.stream_cancellations.clone();
-                Ok(ProtocolHttpStream { status: 200, headers: vec![], body: Box::pin(futures_util::stream::pending()), cancel: Arc::new(move || { cancellations.fetch_add(1, Ordering::SeqCst); }) })
+                Ok(ProtocolHttpStream {
+                    status: 200,
+                    headers: vec![],
+                    body: Box::pin(futures_util::stream::pending()),
+                    cancel: Arc::new(move || {
+                        cancellations.fetch_add(1, Ordering::SeqCst);
+                    }),
+                })
             }
             Some(ScriptOutcome::Stream {
                 status,
@@ -212,7 +223,9 @@ impl ProtocolHttp for ScriptHttp {
 
     async fn sleep(&self, duration: Duration) {
         self.sleeps.lock().unwrap().push(duration);
-        if self.block_sleeps.load(Ordering::SeqCst) { futures_util::future::pending::<()>().await; }
+        if self.block_sleeps.load(Ordering::SeqCst) {
+            futures_util::future::pending::<()>().await;
+        }
     }
 
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -437,9 +450,13 @@ async fn execute_recovers_once_on_session_gone_and_pins_the_last_branch() {
     http.push_json(200, execute_ok());
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     assert_eq!(client.active_branch_id().await.expect("branch"), "branch-a");
     client
         .execute("SELECT 1", &[], None)
@@ -494,7 +511,8 @@ async fn execute_recovers_once_on_server_closed() {
         .iter()
         .filter(|request| request.method == "POST")
     {
-        let body: serde_json::Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["options"]["maxAutoCommitRetries"], 0);
     }
     client.close().await.expect("close");
@@ -516,9 +534,13 @@ async fn execute_second_session_gone_fails_without_another_handshake() {
     http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     let error = client
         .execute("SELECT 1", &[], None)
         .await
@@ -536,9 +558,15 @@ async fn execute_second_session_gone_fails_without_another_handshake() {
 #[tokio::test]
 async fn session_recovery_rejects_an_authenticated_account_change() {
     let http = ScriptHttp::default();
-    http.push_json(200, handshake_with_account("session-1", "main", "account-a"));
+    http.push_json(
+        200,
+        handshake_with_account("session-1", "main", "account-a"),
+    );
     http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
-    http.push_json(200, handshake_with_account("session-2", "main", "account-b"));
+    http.push_json(
+        200,
+        handshake_with_account("session-2", "main", "account-b"),
+    );
 
     let client = open_protocol_client(
         http.clone(),
@@ -605,9 +633,13 @@ async fn observe_recovers_once_on_session_gone() {
     http.push_stream(200, "event: message\ndata: \n\n");
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     let events = client
         .observe("SELECT 1", Vec::new())
         .await
@@ -630,9 +662,13 @@ async fn observe_second_session_gone_fails_without_a_reconnect_loop() {
     http.push_json(410, protocol_error(SESSION_GONE_CODE, 410));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     let events = client
         .observe("SELECT 1", Vec::new())
         .await
@@ -664,9 +700,13 @@ async fn observe_error_event_recovers_once_then_fails() {
     http.push_stream(200, &sse_error(SESSION_GONE_CODE));
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     let events = client
         .observe("SELECT 1", Vec::new())
         .await
@@ -840,6 +880,117 @@ async fn opening_reports_authority_migration_from_typed_admission_errors() {
 }
 
 #[tokio::test]
+async fn protocol_open_waits_for_opening_deadlines_without_reporting_migrations() {
+    for code in ["LIX_REPOSITORY_OPENING", "LIX_OPEN_DEADLINE_EXCEEDED"] {
+        let http = ScriptHttp::default();
+        http.push_json(
+            503,
+            serde_json::json!({"error": {
+                "code": code,
+                "message": "repository is still opening",
+                "details": {"fromVersion": 79, "toVersion": 81}
+            }}),
+        );
+        http.push_json(200, handshake("ready", "main"));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink =
+            crate::CallbackOpenProgressSink::new(move |event| captured.lock().unwrap().push(event));
+        let client = super::open_protocol_client_with_progress(
+            http.clone(),
+            ADMISSION_URL,
+            None,
+            Some(Arc::new(sink)),
+        )
+        .await
+        .expect("opening response should be retried until handshake succeeds");
+
+        assert_eq!(http.requests().len(), 2, "{code}");
+        assert_eq!(*http.sleeps.lock().unwrap(), vec![Duration::from_secs(1)]);
+        assert!(client.open_report().migrations.is_empty(), "{code}");
+        assert!(client.open_report().migration.is_none(), "{code}");
+        let events = events.lock().unwrap();
+        let opening: Vec<_> = events
+            .iter()
+            .filter(|event| event.phase == crate::OpenPhase::Opening)
+            .collect();
+        assert_eq!(opening.len(), 1, "{code}");
+        assert_eq!(opening[0].scope, crate::OpenScope::Authority, "{code}");
+        assert_eq!(opening[0].from_format, Some(79), "{code}");
+        assert_eq!(opening[0].to_format, 81, "{code}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.phase != crate::OpenPhase::Migrating),
+            "opening is not a migration: {code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn protocol_open_uses_server_migration_and_validation_phases() {
+    let http = ScriptHttp::default();
+    for phase in ["engine_migrating", "validating"] {
+        http.push_json(
+            503,
+            serde_json::json!({"error": {
+                "code": "LIX_REPOSITORY_OPENING",
+                "message": "repository is still opening",
+                "details": {
+                    "openPhase": phase,
+                    "fromVersion": 79,
+                    "toVersion": 87
+                }
+            }}),
+        );
+    }
+    http.push_json(200, handshake("ready", "main"));
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let sink =
+        crate::CallbackOpenProgressSink::new(move |event| captured.lock().unwrap().push(event));
+    let client = super::open_protocol_client_with_progress(
+        http.clone(),
+        ADMISSION_URL,
+        None,
+        Some(Arc::new(sink)),
+    )
+    .await
+    .expect("opening responses should be retried until handshake succeeds");
+
+    let events = events.lock().unwrap();
+    let observed_phases: Vec<_> = events.iter().map(|event| event.phase).collect();
+    assert_eq!(
+        observed_phases,
+        vec![
+            crate::OpenPhase::Inspecting,
+            crate::OpenPhase::Migrating,
+            crate::OpenPhase::Validating,
+            crate::OpenPhase::Complete,
+        ]
+    );
+    assert_eq!(
+        client.open_report().migrations,
+        vec![crate::OpenMigration {
+            scope: crate::OpenScope::Authority,
+            from_format: 79,
+            to_format: 87,
+        }]
+    );
+    assert_eq!(
+        client.open_report().migration,
+        Some(crate::OpenMigrationReport {
+            from_format: 79,
+            to_format: 87,
+        })
+    );
+    assert_eq!(http.requests().len(), 3);
+    assert_eq!(http.sleeps.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn opening_awaits_typed_migration_without_a_total_deadline() {
     let http = ScriptHttp::default();
     for index in 0..40 {
@@ -952,6 +1103,150 @@ async fn bounded_admission_waits_for_migration_and_reports_authority_upgrade() {
 }
 
 #[tokio::test]
+async fn bounded_admission_waits_for_opening_deadlines_without_reporting_migrations() {
+    for code in ["LIX_REPOSITORY_OPENING", "LIX_OPEN_DEADLINE_EXCEEDED"] {
+        let http = ScriptHttp::default();
+        http.push_json(
+            503,
+            serde_json::json!({"error": {
+                "code": code,
+                "message": "repository is still opening",
+                "details": {"fromVersion": 79, "toVersion": 81}
+            }}),
+        );
+        http.push_json(200, admission_identity());
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let sink =
+            crate::CallbackOpenProgressSink::new(move |event| captured.lock().unwrap().push(event));
+        let (_, report) =
+            super::admit_protocol_client(http.clone(), ADMISSION_URL, Some(Arc::new(sink)))
+                .await
+                .expect("opening response should be retried until admission succeeds");
+
+        assert_eq!(http.requests().len(), 2, "{code}");
+        assert_eq!(*http.sleeps.lock().unwrap(), vec![Duration::from_secs(1)]);
+        assert!(report.migrations.is_empty(), "{code}");
+        assert!(report.migration.is_none(), "{code}");
+        let events = events.lock().unwrap();
+        let opening: Vec<_> = events
+            .iter()
+            .filter(|event| event.phase == crate::OpenPhase::Opening)
+            .collect();
+        assert_eq!(opening.len(), 1, "{code}");
+        assert_eq!(opening[0].scope, crate::OpenScope::Authority, "{code}");
+        assert_eq!(opening[0].from_format, Some(79), "{code}");
+        assert_eq!(opening[0].to_format, 81, "{code}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.phase != crate::OpenPhase::Migrating),
+            "opening is not a migration: {code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_admission_uses_server_migration_and_validation_phases() {
+    let http = ScriptHttp::default();
+    for phase in ["engine_migrating", "validating"] {
+        http.push_json(
+            503,
+            serde_json::json!({"error": {
+                "code": "LIX_REPOSITORY_OPENING",
+                "message": "repository is still opening",
+                "details": {
+                    "openPhase": phase,
+                    "fromVersion": 79,
+                    "toVersion": 87
+                }
+            }}),
+        );
+    }
+    http.push_json(200, admission_identity());
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let sink =
+        crate::CallbackOpenProgressSink::new(move |event| captured.lock().unwrap().push(event));
+    let (_, report) =
+        super::admit_protocol_client(http.clone(), ADMISSION_URL, Some(Arc::new(sink)))
+            .await
+            .expect("opening responses should be retried until admission succeeds");
+
+    let events = events.lock().unwrap();
+    let observed_phases: Vec<_> = events.iter().map(|event| event.phase).collect();
+    assert_eq!(
+        observed_phases,
+        vec![
+            crate::OpenPhase::Inspecting,
+            crate::OpenPhase::Migrating,
+            crate::OpenPhase::Validating,
+            crate::OpenPhase::Complete,
+        ]
+    );
+    assert_eq!(
+        report.migrations,
+        vec![crate::OpenMigration {
+            scope: crate::OpenScope::Authority,
+            from_format: 79,
+            to_format: 87,
+        }]
+    );
+    // Read-only admission reports authority work in the scoped list; it does
+    // not itself perform a local migration.
+    assert!(report.migration.is_none());
+    assert_eq!(http.requests().len(), 3);
+    assert_eq!(http.sleeps.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn stalled_protocol_open_and_admission_return_typed_details_without_retry() {
+    let body = serde_json::json!({"error": {
+        "code": "LIX_OPEN_STALLED",
+        "message": "repository open is stalled",
+        "details": {
+            "operationId": "open-operation-123",
+            "phase": "migrating",
+            "elapsedMs": 300_000
+        }
+    }});
+
+    let http = ScriptHttp::default();
+    http.push_json(503, body.clone());
+    let error = open_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .expect_err("stalled opener should be returned to the caller");
+    assert_eq!(error.code, "LIX_OPEN_STALLED");
+    assert_eq!(
+        error.details.as_ref().unwrap()["operationId"],
+        "open-operation-123"
+    );
+    assert_eq!(error.details.as_ref().unwrap()["phase"], "migrating");
+    assert_eq!(error.details.as_ref().unwrap()["elapsedMs"], 300_000);
+    assert_eq!(error.details.as_ref().unwrap()["httpStatus"], 503);
+    assert_eq!(http.requests().len(), 1);
+    assert!(http.sleeps.lock().unwrap().is_empty());
+
+    let http = ScriptHttp::default();
+    http.push_json(503, body);
+    let error = super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .expect_err("stalled opener should be returned to the admission caller");
+    assert_eq!(error.code, "LIX_OPEN_STALLED");
+    assert_eq!(
+        error.details.as_ref().unwrap()["operationId"],
+        "open-operation-123"
+    );
+    assert_eq!(error.details.as_ref().unwrap()["phase"], "migrating");
+    assert_eq!(error.details.as_ref().unwrap()["elapsedMs"], 300_000);
+    assert_eq!(error.details.as_ref().unwrap()["httpStatus"], 503);
+    assert_eq!(http.requests().len(), 1);
+    assert!(http.sleeps.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn bounded_admission_rejects_auth_and_oversized_responses_without_retry() {
     let url = "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
     let http = ScriptHttp::default();
@@ -989,23 +1284,36 @@ async fn admission_epoch_errors_report_actual_and_expected_versions() {
     let mut identity = admission_identity();
     identity["storageEpoch"] = serde_json::json!(81);
     http.push_json(200, identity);
-    let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+    let error = super::admit_protocol_client(http, ADMISSION_URL, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "LIX_ADMISSION_EPOCH");
     let details = error.details.unwrap();
     assert_eq!(details["storageEpoch"], 81);
-    assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+    assert_eq!(
+        details["expectedStorageEpoch"],
+        crate::CURRENT_STORAGE_FORMAT_VERSION
+    );
     for status in [409, 426] {
         let http = ScriptHttp::default();
-        http.push_json(status, serde_json::json!({ "error": {
-            "code": "LIX_PROTOCOL_VERSION_MISMATCH",
-            "details": { "storageEpoch": 83, "protocolEpoch": 21, "private": "excluded" }
-        }}));
-        let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+        http.push_json(
+            status,
+            serde_json::json!({ "error": {
+                "code": "LIX_PROTOCOL_VERSION_MISMATCH",
+                "details": { "storageEpoch": 83, "protocolEpoch": 21, "private": "excluded" }
+            }}),
+        );
+        let error = super::admit_protocol_client(http, ADMISSION_URL, None)
+            .await
+            .unwrap_err();
         let details = error.details.unwrap();
         assert_eq!(details["httpStatus"], status);
         assert_eq!(details["storageEpoch"], 83);
         assert_eq!(details["protocolEpoch"], 21);
-        assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+        assert_eq!(
+            details["expectedStorageEpoch"],
+            crate::CURRENT_STORAGE_FORMAT_VERSION
+        );
         assert!(details.get("private").is_none());
     }
 }
@@ -1060,8 +1368,7 @@ async fn admission_sends_server_and_sync_protocol_versions() {
             && value == &crate::SERVER_PROTOCOL_VERSION.to_string()
     }));
     assert!(headers.iter().any(|(name, value)| {
-        name == "lix-sync-protocol-version"
-            && value == &crate::SYNC_PROTOCOL_VERSION.to_string()
+        name == "lix-sync-protocol-version" && value == &crate::SYNC_PROTOCOL_VERSION.to_string()
     }));
 }
 

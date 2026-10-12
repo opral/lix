@@ -312,6 +312,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     async fn state() -> PartialReplicaState {
         let authority = crate::open_lix().await.unwrap();
@@ -407,8 +408,56 @@ mod tests {
             assert!(source.is_partial());
             assert_eq!(source.format(), from_format);
 
-            let migrated = admit_partial_repository(&storage, None).await.unwrap();
+            let events = Arc::new(Mutex::new(Vec::<OpenProgress>::new()));
+            let captured = Arc::clone(&events);
+            let sink: Arc<dyn OpenProgressSink> =
+                Arc::new(crate::CallbackOpenProgressSink::new(move |event| {
+                    captured.lock().unwrap().push(event)
+                }));
+            let migrated = admit_partial_repository(&storage, (from_format == 79).then_some(&sink))
+                .await
+                .unwrap();
             assert_eq!(migrated.report.migration.unwrap().from_format, from_format);
+            if from_format == 79 {
+                let events = events.lock().unwrap();
+                let validation = events
+                    .iter()
+                    .position(|event| event.phase == OpenPhase::Validating)
+                    .expect("successful sparse migration validates after repair steps");
+                let zeroes: Vec<_> = events[..validation]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| {
+                        event.phase == OpenPhase::Migrating && event.completed == Some(0)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                let postcopy = *zeroes
+                    .last()
+                    .expect("sparse repair progress starts after the candidate copy");
+                assert!(
+                    events[..postcopy].iter().any(|event| {
+                        event.phase == OpenPhase::Migrating
+                            && event.completed.is_some_and(|completed| completed > 0)
+                    }),
+                    "candidate copy reports work before repair progress restarts"
+                );
+                let completed: Vec<_> = events[postcopy..validation]
+                    .iter()
+                    .filter(|event| event.phase == OpenPhase::Migrating)
+                    .map(|event| event.completed)
+                    .collect();
+                assert_eq!(
+                    completed,
+                    (0_u64..=9).map(Some).collect::<Vec<_>>(),
+                    "repair completion advances only after each awaited sparse migration step succeeds"
+                );
+                assert!(events[postcopy..validation].iter().all(|event| {
+                    event.scope == crate::OpenScope::Local
+                        && event.from_format == Some(79)
+                        && event.to_format == crate::init::CURRENT_FORMAT_VERSION
+                }));
+            }
             let reopened = admit_partial_epoch(&storage).await.unwrap();
             assert_eq!(reopened.state, state);
             let read = reopened

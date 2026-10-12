@@ -37,17 +37,19 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
     let captured = Arc::clone(&migrations);
     let observer: Arc<dyn crate::OpenProgressSink> = Arc::new(
         crate::CallbackOpenProgressSink::new(move |event: crate::OpenProgress| {
-            if let Some(from_format) = event.from_format {
-                let mut observed = captured.lock().unwrap_or_else(|error| error.into_inner());
-                if let Some(first) = observed.first_mut() {
-                    first.from_format = first.from_format.min(from_format);
-                    first.to_format = first.to_format.max(event.to_format);
-                } else {
-                    observed.push(crate::OpenMigration {
-                        scope: crate::OpenScope::Authority,
-                        from_format,
-                        to_format: event.to_format,
-                    });
+            if event.phase == crate::OpenPhase::Migrating {
+                if let Some(from_format) = event.from_format {
+                    let mut observed = captured.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(first) = observed.first_mut() {
+                        first.from_format = first.from_format.min(from_format);
+                        first.to_format = first.to_format.max(event.to_format);
+                    } else {
+                        observed.push(crate::OpenMigration {
+                            scope: crate::OpenScope::Authority,
+                            from_format,
+                            to_format: event.to_format,
+                        });
+                    }
                 }
             }
             crate::open_types::emit_open_progress(progress.as_ref(), event);
@@ -96,6 +98,9 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
                 http.sleep(delay).await;
                 continue;
             }
+            if error.code == "LIX_OPEN_STALLED" {
+                return Err(error);
+            }
             if matches!(response.status, 502 | 503 | 504) {
                 admission_backoff(&http, &mut retries, None).await?;
                 continue;
@@ -112,7 +117,9 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
                         "expectedProtocolEpoch": crate::SYNC_PROTOCOL_VERSION,
                     });
                     for field in ["storageEpoch", "protocolEpoch"] {
-                        if let Some(value) = error.details.as_ref()
+                        if let Some(value) = error
+                            .details
+                            .as_ref()
                             .and_then(|details| details.get(field))
                             .and_then(serde_json::Value::as_u64)
                         {
@@ -122,8 +129,9 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
                     LixError::new(
                         "LIX_ADMISSION_EPOCH",
                         "Repository is incompatible with this client version",
-                    ).with_details(details)
-                },
+                    )
+                    .with_details(details)
+                }
                 status => LixError::new(
                     "LIX_ADMISSION_HTTP",
                     format!("Authority admission returned HTTP {status}"),
@@ -147,7 +155,8 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
             return Err(LixError::new(
                 "LIX_ADMISSION_EPOCH",
                 "Repository is incompatible with this client version",
-            ).with_details(serde_json::json!({
+            )
+            .with_details(serde_json::json!({
                 "storageEpoch": identity.storage_epoch,
                 "protocolEpoch": identity.protocol_epoch,
                 "expectedStorageEpoch": crate::CURRENT_STORAGE_FORMAT_VERSION,

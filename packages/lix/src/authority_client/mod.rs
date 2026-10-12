@@ -1318,14 +1318,18 @@ fn error_clears_cached_branch(error: &LixError) -> bool {
 
 use wire::RequestWireValue;
 
-/// Only an explicit HTTP migration response permits waiting for admission.
-/// Keep each request/backoff bounded, but do not impose a total migration
-/// deadline: dropping the caller's opening future cancels this wait.
+/// Explicit opening and migration responses permit waiting for admission.
+/// Bound each request/backoff independently of the manager-owned opener;
+/// dropping the caller cancels only its wait. A stalled opener is terminal
+/// for this caller and is never retried automatically.
 pub(crate) fn opening_migration_retry_delay(error: &LixError) -> Option<std::time::Duration> {
     (error_http_status(error) == Some(503)
         && matches!(
             error.code.as_str(),
-            "LIX_REPOSITORY_MIGRATING" | "LIX_ERROR_MIGRATING"
+            "LIX_REPOSITORY_MIGRATING"
+                | "LIX_ERROR_MIGRATING"
+                | "LIX_REPOSITORY_OPENING"
+                | "LIX_OPEN_DEADLINE_EXCEEDED"
         ))
     .then_some(std::time::Duration::from_secs(1))
 }
@@ -1342,11 +1346,29 @@ pub(crate) fn report_authority_migration(
             .and_then(serde_json::Value::as_u64)
             .and_then(|version| u32::try_from(version).ok())
     };
+    let phase = match error.code.as_str() {
+        "LIX_REPOSITORY_MIGRATING" | "LIX_ERROR_MIGRATING" => crate::OpenPhase::Migrating,
+        "LIX_REPOSITORY_OPENING" | "LIX_OPEN_DEADLINE_EXCEEDED" => {
+            match error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("openPhase"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("storage_migrating" | "storage_publishing" | "engine_migrating") => {
+                    crate::OpenPhase::Migrating
+                }
+                Some("validating") => crate::OpenPhase::Validating,
+                _ => crate::OpenPhase::Opening,
+            }
+        }
+        _ => crate::OpenPhase::Opening,
+    };
     crate::open_types::emit_open_progress(
         progress,
         crate::OpenProgress {
             scope: crate::OpenScope::Authority,
-            phase: crate::OpenPhase::Migrating,
+            phase,
             from_format: format("fromVersion", "fromFormat"),
             to_format: format("toVersion", "toFormat")
                 .unwrap_or(crate::CURRENT_STORAGE_FORMAT_VERSION),

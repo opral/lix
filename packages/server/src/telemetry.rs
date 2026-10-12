@@ -78,6 +78,20 @@ pub(crate) fn set_request_actor(account: Option<&str>) {
 /// Copy only structural diagnostics; SQL, parameters and thrown messages stay private.
 pub(crate) fn record_failure_details(span: &tracing::Span, details: &serde_json::Value) {
     for (key, attribute) in [
+        ("openOperationId", "lix.open.operation_id"),
+        ("openPhase", "lix.open.phase"),
+        ("openFailurePhase", "lix.open.failed_phase"),
+        ("openDependency", "lix.open.dependency"),
+        ("openElapsedMs", "lix.open.elapsed_ms"),
+        ("openIdleMs", "lix.open.idle_ms"),
+        ("openRows", "lix.open.rows"),
+        ("openBytes", "lix.open.bytes"),
+        ("openCompletedGroups", "lix.open.completed_groups"),
+        ("openerRetained", "lix.open.opener_retained"),
+        (
+            "requestDeadlineExceeded",
+            "lix.open.request_deadline_exceeded",
+        ),
         ("sourceCode", "lix.error.source_code"),
         ("migrationPhase", "lix.migration.phase"),
         ("fromVersion", "lix.migration.from_version"),
