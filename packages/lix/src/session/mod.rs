@@ -55,8 +55,8 @@ pub use execute::{
     TryFromValue,
 };
 pub(crate) use execute::{
-    ExecutionDisposition, FileRead, QueryStreamRoute, charge_execute_result, not_a_write,
-    reject_non_read_error,
+    ExecutionDisposition, FileRead, QueryStreamRoute, charge_execute_result,
+    execute_many_returns_rows, reject_non_read_error,
 };
 pub(crate) use idempotency::ExecuteIdempotency;
 pub(crate) use idempotency::{

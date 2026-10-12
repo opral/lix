@@ -64,9 +64,9 @@ pub(crate) fn unsupported_remote_operation(operation: &str) -> LixError {
 /// [`crate::Lix`], a [`Snapshot`] or a transaction.
 ///
 /// A `Query` does nothing until one of [`Self::all`], [`Self::one`],
-/// [`Self::optional`] or [`Self::stream`] is awaited. It only runs reads:
-/// statements that write (including reads that call durable runtime functions
-/// such as `lix_uuid_v7()`) fail with `LIX_ERROR_READ_ONLY`; use `execute`.
+/// [`Self::optional`] or [`Self::stream`] is awaited. It never writes:
+/// statements that write fail with `LIX_ERROR_READ_ONLY`; use `execute`.
+/// Reads that call `uuidv7()` or `current_timestamp` are reads.
 #[must_use = "a Query does nothing until all(), one(), optional() or stream() is awaited"]
 pub struct Query {
     target: Arc<dyn SqlTarget>,
@@ -186,13 +186,13 @@ impl Query {
     }
 }
 
-/// A write statement waiting to run: `execute(sql)` on a [`crate::Lix`] or a
+/// A statement waiting to run: `execute(sql)` on a [`crate::Lix`] or a
 /// transaction. Await it to run it.
 ///
-/// `execute` only runs statements that write (DML, DDL, and reads that call
-/// durable runtime functions); a pure read fails with `LIX_NOT_A_WRITE`.
-/// `RETURNING` rows are buffered under the same 64 MiB cap as reads; a write
-/// whose `RETURNING` rows exceed it fails without committing.
+/// `execute` runs any single statement, writes and reads alike. Its rows (a
+/// read's result or `RETURNING` rows) are buffered under the same 64 MiB cap
+/// as `query`; a write whose `RETURNING` rows exceed it fails without
+/// committing.
 #[must_use = "an Execute does nothing until it is awaited"]
 pub struct Execute {
     target: Arc<dyn SqlTarget>,
@@ -240,7 +240,7 @@ impl Execute {
         self
     }
 
-    /// Caps the encoded bytes of buffered `RETURNING` rows. Defaults to
+    /// Caps the encoded bytes of the buffered result rows. Defaults to
     /// 64 MiB; `usize::MAX` opts out.
     pub fn max_bytes(mut self, max_bytes: usize) -> Self {
         self.request.max_bytes = max_bytes;

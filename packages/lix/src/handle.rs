@@ -748,7 +748,7 @@ impl RemoteLix {
         )
     }
 
-    /// Starts a write executed on the server; see [`Lix::execute`].
+    /// Starts a statement executed on the server; see [`Lix::execute`].
     pub fn execute(&self, sql: &str) -> crate::Execute {
         crate::Execute::new(Arc::new(self.clone()), sql)
     }
@@ -866,7 +866,7 @@ impl RemoteLixTransaction {
         crate::Query::new(self.sql_target(), sql)
     }
 
-    /// Stages a write inside this remote transaction.
+    /// Runs a statement inside this remote transaction.
     pub fn execute(&self, sql: &str) -> crate::Execute {
         crate::Execute::new(self.sql_target(), sql)
     }
@@ -1862,9 +1862,10 @@ where
         &self.open_report
     }
 
-    /// Starts a write: DML, DDL, or a read that calls a durable runtime
-    /// function. Await the returned [`crate::Execute`] to run it. Pure reads
-    /// fail with `LIX_NOT_A_WRITE`; use [`Self::query`].
+    /// Starts any single statement: DML, DDL or a read. Await the returned
+    /// [`crate::Execute`] to run it. It returns rows (a read's result or
+    /// `RETURNING` rows) plus the affected row count. For reads,
+    /// [`Self::query`] is the idiomatic form and can never write.
     ///
     /// Lix supports a PostgreSQL-dialect subset executed by DataFusion.
     /// Positional placeholders use `$1`, `$2`, and so on. `sql` must be a
@@ -2527,8 +2528,8 @@ impl<StorageImpl> LixTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    /// Stages a write in this transaction; it becomes visible to others at
-    /// [`Self::commit`]. Pure reads fail with `LIX_NOT_A_WRITE`.
+    /// Runs any statement in this transaction. Writes become visible to
+    /// others at [`Self::commit`].
     pub fn execute(&self, sql: &str) -> crate::Execute {
         crate::Execute::new(self.sql_target(), sql)
     }

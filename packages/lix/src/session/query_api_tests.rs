@@ -489,7 +489,7 @@ async fn transaction_execute_many_is_all_or_nothing() {
             .await
             .unwrap_err()
             .code,
-        LixError::CODE_NOT_A_WRITE
+        LixError::CODE_INVALID_PARAM
     );
     assert_eq!(
         transaction
@@ -517,8 +517,57 @@ async fn transaction_execute_many_is_all_or_nothing() {
             .await
             .unwrap_err()
             .code,
-        LixError::CODE_NOT_A_WRITE
+        LixError::CODE_INVALID_PARAM
     );
+}
+
+#[tokio::test]
+async fn execute_runs_reads_under_the_byte_cap() {
+    let lix = seeded(100).await;
+    let result = lix
+        .execute("SELECT id, label FROM api_item WHERE id < $1 ORDER BY id")
+        .bind(3_i64)
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 0);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.get::<i64>("id").unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        lix.execute("SELECT id, label FROM api_item")
+            .max_bytes(128)
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_RESULT_TOO_LARGE
+    );
+
+    let transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute("INSERT INTO api_item (id, label) VALUES (1000, 'staged')")
+        .await
+        .unwrap();
+    let staged = transaction
+        .execute("SELECT label FROM api_item WHERE id = 1000")
+        .await
+        .unwrap();
+    assert_eq!(staged.rows()[0].get::<String>("label").unwrap(), "staged");
+    assert_eq!(
+        transaction
+            .execute("SELECT id, label FROM api_item")
+            .max_bytes(128)
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_RESULT_TOO_LARGE
+    );
+    transaction.commit().await.unwrap();
+    assert_eq!(count(&lix).await, 101);
 }
 
 #[tokio::test]
@@ -553,7 +602,11 @@ async fn returning_rows_over_the_cap_fail_without_committing() {
         .unwrap_err();
     assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
     transaction.commit().await.unwrap();
-    assert_eq!(count(&lix).await, 51, "the earlier transaction write commits");
+    assert_eq!(
+        count(&lix).await,
+        51,
+        "the earlier transaction write commits"
+    );
     assert_eq!(
         lix.query("SELECT count(*) AS n FROM api_item WHERE label = 'capped'")
             .one()
@@ -621,12 +674,7 @@ async fn buffered_streams_use_the_query_byte_cap() {
             .unwrap();
     }
     let sql = "SELECT path, content FROM lix_file ORDER BY path";
-    let error = lix
-        .query(sql)
-        .max_bytes(4096)
-        .stream()
-        .await
-        .unwrap_err();
+    let error = lix.query(sql).max_bytes(4096).stream().await.unwrap_err();
     assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
     assert!(error.message.contains("buffered"), "{}", error.message);
     for stream in [

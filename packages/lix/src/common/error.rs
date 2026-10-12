@@ -149,9 +149,6 @@ impl LixError {
     /// statement that writes was passed to a read API (`query`, `stream`).
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
-    /// A pure read was passed to `execute`; reads go through `query`.
-    pub const CODE_NOT_A_WRITE: &'static str = "LIX_NOT_A_WRITE";
-
     /// A buffered result exceeded its byte cap. Nothing was returned.
     pub const CODE_RESULT_TOO_LARGE: &'static str = "LIX_RESULT_TOO_LARGE";
 

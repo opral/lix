@@ -2410,24 +2410,10 @@ async fn partial_replica_open_profile() {
             } else {
                 Vec::new()
             };
-            let read_only = lix::parse_sql_script(sql, parameters.len())
-                .unwrap()
-                .statements[0]
-                .read_only;
             let before = probe.attempted_requests.load(Ordering::Relaxed);
             let bytes_before = probe.response_body_bytes.load(Ordering::Relaxed);
             let started = Instant::now();
-            let result: lix::ExecuteResult = if read_only {
-                replica
-                    .query(sql)
-                    .params(&parameters)
-                    .all()
-                    .await
-                    .unwrap()
-                    .into()
-            } else {
-                replica.execute(sql).params(&parameters).await.unwrap()
-            };
+            let result = replica.execute(sql).params(&parameters).await.unwrap();
             if operation == "read_own_write" {
                 let value = result.rows()[0].get::<Value>("value").unwrap();
                 let value = match value {
@@ -2505,21 +2491,12 @@ async fn local_first_foreground_profile_scorecard() {
                     "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
                 ),
             ] {
-                let read_only = lix::parse_sql_script(sql, 0).unwrap().statements[0].read_only;
                 let scope = AllocationScope::start();
                 let start = Instant::now();
-                if read_only {
-                    replica
-                        .query(sql)
-                        .all()
-                        .await
-                        .expect("profile foreground operation");
-                } else {
-                    replica
-                        .execute(sql)
-                        .await
-                        .expect("profile foreground operation");
-                }
+                replica
+                    .execute(sql)
+                    .await
+                    .expect("profile foreground operation");
                 let elapsed = start.elapsed();
                 let allocation = scope.finish();
                 records.push(json!({"live_rows": width, "rtt_ms": rtt_ms,
@@ -3782,7 +3759,7 @@ async fn content_only_path_read_prepares_offline_update(scalar_expression: bool)
     stop_server(server).await;
 }
 
-/// Runs writes atomically in one transaction and returns each result.
+/// Runs statements atomically in one transaction and returns each result.
 async fn execute_atomically<S>(
     lix: &Lix<S>,
     statements: &[(String, Vec<Value>)],
@@ -3806,7 +3783,7 @@ where
 }
 
 #[tokio::test]
-async fn remote_handles_enforce_the_read_write_split() {
+async fn remote_queries_never_write_and_execute_runs_anything() {
     let (authority_storage, authority) = open_authority().await;
     authority.close().await.expect("close authority setup");
     let probe = Arc::new(HttpProbe::default());
@@ -3822,11 +3799,6 @@ async fn remote_handles_enforce_the_read_write_split() {
         .await
         .unwrap_err();
     assert_eq!(error.code, LixError::CODE_READ_ONLY);
-    let error = remote
-        .execute("SELECT key FROM lix_key_value")
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, LixError::CODE_NOT_A_WRITE);
     let error = remote
         .execute("INSERT INTO lix_key_value (key, value) VALUES ('remote-cap', 'x')")
         .max_bytes(1)
@@ -3859,13 +3831,27 @@ async fn remote_handles_enforce_the_read_write_split() {
         .await
         .unwrap();
     assert_eq!(inserted, 2);
+    // execute() runs reads too, on the server.
+    let read = remote
+        .execute("SELECT key FROM lix_key_value WHERE key LIKE 'remote-%' ORDER BY key")
+        .await
+        .unwrap();
+    assert_eq!(read.rows_affected(), 0);
+    assert_eq!(
+        read.rows()
+            .iter()
+            .map(|row| row.get::<String>("key").unwrap())
+            .collect::<Vec<_>>(),
+        ["remote-a", "remote-b"]
+    );
     assert_eq!(
         remote
             .execute_many("SELECT $1", Vec::<[Value; 1]>::new())
             .await
             .unwrap_err()
             .code,
-        LixError::CODE_NOT_A_WRITE
+        LixError::CODE_INVALID_PARAM,
+        "execute_many cannot return rows"
     );
 
     // A remote transaction: reads see staged writes; a failed execute_many

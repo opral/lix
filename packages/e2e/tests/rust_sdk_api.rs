@@ -370,8 +370,8 @@ async fn execute_many_is_atomic_and_counts_rows() {
     let error = lix
         .execute_many("SELECT $1", [[1_i64]])
         .await
-        .expect_err("execute_many only runs writes");
-    assert_eq!(error.code, LixError::CODE_NOT_A_WRITE);
+        .expect_err("execute_many cannot return rows");
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     lix.close().await.unwrap();
 }
 

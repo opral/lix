@@ -1423,9 +1423,6 @@ where
         result.map(|result| (result, profile))
     }
 
-    /// Parses a statement for a read-only API (`query`, `stream`, snapshot
-    /// reads). Writes and durable runtime functions are rejected with
-    /// `LIX_ERROR_READ_ONLY`: they go through `execute`.
     /// Parses and checks the statement of an `execute_many` call.
     pub(crate) fn check_execute_many_statement(&self, sql: &str) -> Result<(), LixError> {
         self.ensure_open()?;
@@ -4468,30 +4465,29 @@ pub(crate) fn check_returning_cap(result: &ExecuteResult) -> Result<(), LixError
     charge_execute_result(&mut crate::common::ReadResultBudget::default(), result)
 }
 
-/// Checks the statement of an `execute_many` call: it must write and must not
-/// return rows (execute_many reports only the affected row count).
+/// Checks the statement of an `execute_many` call: it reports only the
+/// affected row count, so it must not produce rows (no read, no RETURNING).
 pub(crate) fn check_execute_many_statement(
     statement: &DataFusionStatement,
 ) -> Result<(), LixError> {
-    if execution_disposition(statement)? != ExecutionDisposition::Durable {
-        return Err(not_a_write());
-    }
-    if sql2::statement_has_returning(statement) {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "execute_many() reports only the affected row count and cannot return rows",
-        )
-        .with_hint("Drop RETURNING, or run execute() per parameter set inside a transaction."));
+    if execution_disposition(statement)? != ExecutionDisposition::Durable
+        || sql2::statement_has_returning(statement)
+    {
+        return Err(execute_many_returns_rows());
     }
     Ok(())
 }
 
-pub(crate) fn not_a_write() -> LixError {
+pub(crate) fn execute_many_returns_rows() -> LixError {
     LixError::new(
-        LixError::CODE_NOT_A_WRITE,
-        "execute() only runs statements that write; this statement only reads",
+        LixError::CODE_INVALID_PARAM,
+        "execute_many() reports only the affected row count and cannot run a statement that \
+         returns rows",
     )
-    .with_hint("Use query(sql).all(), one(), optional() or stream() for reads.")
+    .with_hint(
+        "Drop RETURNING, read with query(), or run execute() per parameter set inside a \
+         transaction.",
+    )
 }
 
 /// Rejects statements a read-only API must not run.

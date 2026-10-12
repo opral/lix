@@ -20,8 +20,6 @@ use super::{
     closed_transaction_error,
 };
 
-use crate::session::not_a_write;
-
 /// A stream that has to buffer its statement reports the cap in stream terms.
 pub(crate) fn buffered_stream_error(error: LixError) -> LixError {
     if error.code != LixError::CODE_RESULT_TOO_LARGE {
@@ -47,8 +45,8 @@ fn retries_in_transaction() -> LixError {
     .with_hint("Transactions never replay; retry the whole transaction instead.")
 }
 
-/// Remote handles check the read/write split locally, with the engine's own
-/// parser, before any SQL reaches the server.
+/// Remote handles check locally, with the engine's own parser, that `query()`
+/// does not write before any SQL reaches the server.
 fn remote_class(sql: &str) -> Result<crate::sql2::StatementClass, LixError> {
     crate::sql2::classify_statement(sql)
 }
@@ -61,9 +59,6 @@ fn remote_read_only(sql: &str) -> Result<(), LixError> {
 }
 
 fn remote_write(request: &ExecuteRequest) -> Result<(), LixError> {
-    if remote_class(&request.sql)?.read_only {
-        return Err(not_a_write());
-    }
     if request.max_bytes != crate::common::DEFAULT_MAX_RESULT_BYTES {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -79,14 +74,8 @@ fn remote_write(request: &ExecuteRequest) -> Result<(), LixError> {
 
 fn remote_write_many(request: &ExecuteManyRequest) -> Result<(), LixError> {
     let class = remote_class(&request.sql)?;
-    if class.read_only {
-        return Err(not_a_write());
-    }
-    if class.returning {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "execute_many() reports only the affected row count and cannot return rows",
-        ));
+    if class.read_only || class.returning {
+        return Err(crate::session::execute_many_returns_rows());
     }
     Ok(())
 }
@@ -248,10 +237,6 @@ where
             options,
             ..
         } = request;
-        let route = self.session.execution_disposition(&sql)?;
-        if route != ExecutionDisposition::Durable {
-            return Err(not_a_write());
-        }
         if !matches!(
             self.engine.sync_mode().role(),
             crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
@@ -493,9 +478,6 @@ where
         }
         let mut inner = self.inner.lock().await;
         let transaction = inner.as_mut().ok_or_else(closed_transaction_error)?;
-        if transaction.execution_disposition(&request.sql)? != ExecutionDisposition::Durable {
-            return Err(not_a_write());
-        }
         transaction
             .execute_with_returning_cap(request.sql, request.params, request.options)
             .await

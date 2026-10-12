@@ -13,9 +13,6 @@ pub struct SqlScriptStatement {
     pub sql: String,
     /// The request-wide parameter range to bind to this statement.
     pub params: Range<usize>,
-    /// Whether the statement is a read: run it with `query`. Otherwise it
-    /// writes: run it with `execute`.
-    pub read_only: bool,
 }
 
 /// Parsed statement and parameter boundaries produced by [`parse_sql_script`].
@@ -98,8 +95,9 @@ pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScr
     build_atomic_plan(executable, provided_param_count)
 }
 
-/// How a single statement may be run: what remote handles check before
-/// sending SQL to the server, with the parser and routing the engine uses.
+/// What remote handles check before sending SQL to the server, with the
+/// parser and routing the engine uses: `query()` must not write, and
+/// `execute_many()` must not return rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatementClass {
     pub(crate) read_only: bool,
@@ -181,13 +179,12 @@ fn build_atomic_plan(
         .map(|statement| {
             let sql = statement.statement.to_string();
             let placeholders = placeholder_usage(&statement.tokens);
-            let read_only = super::read_only_statement(&statement.statement);
-            (sql, placeholders, read_only)
+            (sql, placeholders)
         })
         .collect::<Vec<_>>();
     let expected_param_count = statements
         .iter()
-        .map(|(_, placeholders, _)| placeholders.explicit_max)
+        .map(|(_, placeholders)| placeholders.explicit_max)
         .max()
         .unwrap_or(0);
     if provided_param_count != expected_param_count {
@@ -206,13 +203,9 @@ fn build_atomic_plan(
 
     let statements = statements
         .into_iter()
-        .map(|(sql, placeholders, read_only)| {
+        .map(|(sql, placeholders)| {
             let params = 0..placeholders.explicit_max;
-            SqlScriptStatement {
-                sql,
-                params,
-                read_only,
-            }
+            SqlScriptStatement { sql, params }
         })
         .collect();
     Ok(SqlScriptPlan { statements })
@@ -327,25 +320,32 @@ mod tests {
             vec![SqlScriptStatement {
                 sql: "SELECT $1".to_string(),
                 params: 0..1,
-                read_only: true,
             }]
         );
     }
 
     #[test]
     fn classifies_reads_and_writes() {
-        let statements = atomic(
-            "SELECT 1; INSERT INTO lix_key_value (key, value) VALUES ('k', 'v'); \
-             SELECT uuidv7(); SELECT commit_id FROM lix_create_checkpoint()",
-            0,
-        );
+        let classes = [
+            "SELECT 1",
+            "INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')",
+            "SELECT uuidv7()",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            "DELETE FROM lix_key_value RETURNING key",
+        ]
+        .map(|sql| classify_statement(sql).unwrap())
+        .map(|class| (class.read_only, class.returning));
         assert_eq!(
-            statements
-                .iter()
-                .map(|statement| statement.read_only)
-                .collect::<Vec<_>>(),
-            [true, false, true, false]
+            classes,
+            [
+                (true, false),
+                (false, false),
+                (true, false),
+                (false, false),
+                (false, true)
+            ]
         );
+        assert!(classify_statement("SELECT 1; SELECT 2").is_err());
     }
 
     #[test]
