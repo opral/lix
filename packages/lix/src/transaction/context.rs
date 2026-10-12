@@ -951,7 +951,7 @@ pub(crate) static FLUSH_PAUSE: std::sync::Mutex<
 async fn flush_pause_for_test() {
     let pause = FLUSH_PAUSE.lock().unwrap().clone();
     if let Some((release, reached)) = pause {
-        reached.store(true, std::sync::atomic::Ordering::SeqCst);
+        reached.store(true, Ordering::SeqCst);
         release.notified().await;
     }
 }
