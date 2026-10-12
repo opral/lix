@@ -696,3 +696,53 @@ async fn buffered_streams_use_the_query_byte_cap() {
         assert!(rows >= 3);
     }
 }
+
+#[tokio::test]
+async fn execute_many_rejects_every_row_returning_statement_and_validates_binding() {
+    let lix = seeded(1).await;
+    for sql in [
+        "SELECT uuidv7()",
+        "SELECT current_timestamp",
+        "SELECT commit_id FROM lix_undo()",
+        "SELECT $1",
+        "INSERT INTO api_item (id, label) VALUES (900, 'x') RETURNING id",
+    ] {
+        let error = lix
+            .execute_many(sql, Vec::<[Value; 0]>::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+    }
+    // Without parameter sets nothing runs, but the statement still binds.
+    assert!(
+        lix.execute_many("INSERT INTO nope (a) VALUES ($1)", Vec::<[Value; 1]>::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        lix.execute_many(
+            "INSERT INTO api_item (id, label) VALUES ($1, $2)",
+            Vec::<[Value; 2]>::new()
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let transaction = lix.begin_transaction().await.unwrap();
+    assert!(
+        transaction
+            .execute_many("INSERT INTO nope (a) VALUES ($1)", Vec::<[Value; 1]>::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        transaction
+            .execute_many("SELECT uuidv7()", Vec::<[Value; 0]>::new())
+            .await
+            .unwrap_err()
+            .code,
+        LixError::CODE_INVALID_PARAM
+    );
+    transaction.rollback().await.unwrap();
+    assert_eq!(count(&lix).await, 1);
+}

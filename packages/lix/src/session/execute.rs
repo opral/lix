@@ -4470,9 +4470,12 @@ pub(crate) fn check_returning_cap(result: &ExecuteResult) -> Result<(), LixError
 pub(crate) fn check_execute_many_statement(
     statement: &DataFusionStatement,
 ) -> Result<(), LixError> {
-    if execution_disposition(statement)? != ExecutionDisposition::Durable
-        || sql2::statement_has_returning(statement)
-    {
+    // Classify first: a statement that cannot be routed fails here.
+    execution_disposition(statement)?;
+    // Any statement that produces rows is rejected, whatever its route: a
+    // query that calls a durable function (`SELECT uuidv7()`) or a table
+    // function such as `lix_undo()` runs as a write but still returns rows.
+    if sql2::statement_returns_rows(statement) {
         return Err(execute_many_returns_rows());
     }
     Ok(())
@@ -4888,6 +4891,22 @@ where
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
+    /// Binds and plans a write statement without running it, so a statement
+    /// that names a missing table or column fails even when no parameter set
+    /// would run it.
+    pub(crate) fn validate_write_statement(
+        &mut self,
+        sql: &str,
+        statement: &DataFusionStatement,
+    ) -> Result<(), LixError> {
+        if sql2::bind_statement_route(statement)? != sql2::BoundStatementRoute::Write {
+            return Ok(());
+        }
+        self.transaction_mut()?
+            .prepare_sql_write_logical_plan(sql, statement)
+            .map(|_| ())
+    }
+
     /// Runs one write statement once per parameter set. All sets stage or
     /// none do: a failure rolls back the sets already staged by this call.
     pub(crate) async fn execute_many_atomically(
@@ -4899,6 +4918,8 @@ where
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         check_execute_many_statement(&statement)?;
         if param_sets.is_empty() {
+            // Nothing runs, but the statement must still bind.
+            self.validate_write_statement(sql, &statement)?;
             return Ok(0);
         }
         Box::pin(self.flush_prepared_mutations_with_sync()).await?;

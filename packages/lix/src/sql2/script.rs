@@ -101,7 +101,8 @@ pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatementClass {
     pub(crate) read_only: bool,
-    pub(crate) returning: bool,
+    /// The statement produces rows: a query, an `EXPLAIN`, or `RETURNING`.
+    pub(crate) returns_rows: bool,
 }
 
 pub(crate) fn classify_statement(sql: &str) -> Result<StatementClass, LixError> {
@@ -114,7 +115,7 @@ pub(crate) fn classify_statement(sql: &str) -> Result<StatementClass, LixError> 
     };
     Ok(StatementClass {
         read_only: super::read_only_statement(&statement.statement),
-        returning: super::statement_has_returning(&statement.statement),
+        returns_rows: super::statement_returns_rows(&statement.statement),
     })
 }
 
@@ -334,14 +335,14 @@ mod tests {
             "DELETE FROM lix_key_value RETURNING key",
         ]
         .map(|sql| classify_statement(sql).unwrap())
-        .map(|class| (class.read_only, class.returning));
+        .map(|class| (class.read_only, class.returns_rows));
         assert_eq!(
             classes,
             [
-                (true, false),
+                (true, true),
                 (false, false),
-                (true, false),
-                (false, false),
+                (true, true),
+                (false, true),
                 (false, true)
             ]
         );

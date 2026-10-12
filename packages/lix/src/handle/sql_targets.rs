@@ -245,6 +245,13 @@ where
         } = request;
         self.session.check_execute_many_statement(&sql)?;
         if param_sets.is_empty() {
+            // Nothing runs, but the statement must still bind: plan it in a
+            // throwaway transaction.
+            let statement = crate::sql2::parse_statement(&sql)?;
+            let mut transaction = self.session.begin_transaction().await?;
+            let validated = transaction.validate_write_statement(&sql, &statement);
+            transaction.rollback().await?;
+            validated?;
             return Ok(0);
         }
         let statements = param_sets

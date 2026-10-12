@@ -59,7 +59,7 @@ pub(crate) fn read_only_statement(statement: &datafusion::sql::parser::Statement
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
-    statement_has_durable_runtime_function, statement_has_returning,
+    statement_has_durable_runtime_function, statement_has_returning, statement_returns_rows,
 };
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,

@@ -17,7 +17,7 @@ fn check_query(sql: &str) -> Result<(), LixError> {
 
 fn check_execute_many(sql: &str) -> Result<(), LixError> {
     let class = crate::sql2::classify_statement(sql)?;
-    if class.read_only || class.returning {
+    if class.returns_rows {
         return Err(crate::session::execute_many_returns_rows());
     }
     Ok(())
