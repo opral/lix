@@ -534,6 +534,7 @@ async fn authority_stream(
                         break;
                     }
                     let value = Reflect::get(&chunk, &"value".into()).unwrap_or(JsValue::UNDEFINED);
+                    crate::sync::runtime::note_transport_progress();
                     yield Ok(Bytes::from(Uint8Array::new(&value).to_vec()));
                 }
                 Err(error) => {

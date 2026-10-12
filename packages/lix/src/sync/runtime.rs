@@ -22,6 +22,9 @@ const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
 pub(super) const PARTIAL_ADMISSION_CHANGED_CODE: &str = "LIX_PARTIAL_ADMISSION_CHANGED";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
+/// The sync transport received nothing for a whole stall window. Retryable:
+/// the authority or the network may come back.
+pub(crate) const SYNC_TRANSPORT_STALLED_CODE: &str = "LIX_SYNC_TRANSPORT_STALLED";
 const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 16;
 /// Independent sparse heads are safe to fetch concurrently. Keeping the cap
 /// below the HTTP/1 connection fan-out used by browser transports avoids both
@@ -455,10 +458,24 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
     }
 }
 
-/// The longest a foreground operation waits for one sync demand. User reads
-/// have no deadline, but an engine-internal wait for the network must not hold
-/// session guards forever when the worker or transport hangs.
-const SYNC_DEMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a foreground operation waits on a sync demand while the sync
+/// transport makes no progress at all. There is no wall-clock limit: a slow
+/// transfer (a large blob on a slow link) keeps receiving bytes and is never
+/// cut off. A worker or transport that hangs, though, must not hold session
+/// guards forever.
+const SYNC_DEMAND_STALL_WINDOW: Duration = Duration::from_secs(60);
+
+static TRANSPORT_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records that the sync transport received data (a response or a chunk of
+/// one). Waiters on a sync demand treat any progress as "not stalled".
+pub(crate) fn note_transport_progress() {
+    TRANSPORT_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn transport_progress() -> u64 {
+    TRANSPORT_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How often one operation may restart because the replica published a new
 /// serving basis while it waited.
@@ -476,11 +493,20 @@ async fn send_sync_demand(
     done.await.map_err(|_| stopped_error())?
 }
 
-/// Sends a hydration demand on behalf of a foreground SQL operation, which
-/// waits at most [`SYNC_DEMAND_TIMEOUT`].
+/// Sends a hydration demand on behalf of a foreground SQL operation. It fails
+/// only when the sync transport makes no progress for
+/// [`SYNC_DEMAND_STALL_WINDOW`]; dropping the returned future cancels the wait.
 async fn send_hydration_demand(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
     request: SyncDemandRequest,
+) -> Result<HydratedInputs, LixError> {
+    send_hydration_demand_with_window(demand_tx, request, SYNC_DEMAND_STALL_WINDOW).await
+}
+
+async fn send_hydration_demand_with_window(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+    request: SyncDemandRequest,
+    stall_window: Duration,
 ) -> Result<HydratedInputs, LixError> {
     use futures_util::FutureExt as _;
     let (response, done) = tokio::sync::oneshot::channel();
@@ -488,18 +514,28 @@ async fn send_hydration_demand(
         .send(SyncDemand { request, response })
         .await
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
-    let timeout = super::platform::executor_neutral_sleep(SYNC_DEMAND_TIMEOUT).fuse();
     let done = done.fuse();
-    futures_util::pin_mut!(timeout, done);
-    futures_util::select_biased! {
-        result = done => result.map_err(|_| stopped_error())?,
-        () = timeout => Err(LixError::new(
-            SYNC_DEMAND_STALLED_CODE,
-            format!(
-                "sync demand did not complete within {} s",
-                SYNC_DEMAND_TIMEOUT.as_secs()
-            ),
-        )),
+    futures_util::pin_mut!(done);
+    let mut seen = transport_progress();
+    loop {
+        let window = super::platform::executor_neutral_sleep(stall_window).fuse();
+        futures_util::pin_mut!(window);
+        futures_util::select_biased! {
+            result = done => return result.map_err(|_| stopped_error())?,
+            () = window => {}
+        }
+        let now = transport_progress();
+        if now == seen {
+            return Err(LixError::new(
+                SYNC_TRANSPORT_STALLED_CODE,
+                format!(
+                    "sync demand made no transport progress for {} s",
+                    stall_window.as_secs_f64()
+                ),
+            )
+            .with_details(serde_json::json!({ "retryable": true })));
+        }
+        seen = now;
     }
 }
 
@@ -2125,6 +2161,90 @@ pub(super) fn stopped_error() -> LixError {
 #[cfg(test)]
 mod tests {
     mod reconnect_validation_tests;
+
+    #[tokio::test]
+    async fn a_hydration_demand_waits_while_the_transport_progresses_and_fails_when_it_stalls() {
+        use std::time::Duration;
+        let window = Duration::from_millis(50);
+        // A worker that holds the demand and never answers.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(demand) = rx.recv().await {
+                held.push(demand);
+            }
+        });
+        // Progress for eight 20 ms ticks, then silence.
+        let ticker = tokio::spawn(async {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                note_transport_progress();
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = send_hydration_demand_with_window(
+            &tx,
+            SyncDemandRequest::PublicationBarrier,
+            window,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, SYNC_TRANSPORT_STALLED_CODE);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "progress kept the demand waiting past one window: {:?}",
+            started.elapsed()
+        );
+        ticker.await.unwrap();
+
+        // A demand answered while the transport progresses succeeds, however
+        // many windows it spans.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        let answerer = tokio::spawn(async move {
+            let demand = rx.recv().await.unwrap();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                note_transport_progress();
+            }
+            let _ = demand.response.send(Ok(HydratedInputs::default()));
+        });
+        send_hydration_demand_with_window(
+            &tx,
+            SyncDemandRequest::PublicationBarrier,
+            window,
+        )
+        .await
+        .unwrap();
+        answerer.await.unwrap();
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_restarts_are_capped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncDemand>(4);
+        tokio::spawn(async move {
+            while let Some(demand) = rx.recv().await {
+                let _ = demand.response.send(Err(LixError::new(
+                    PARTIAL_ADMISSION_CHANGED_CODE,
+                    "the serving basis changed",
+                )));
+            }
+        });
+        let missing = crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([7; 32])
+            .annotate_missing(LixError::new("LIX_STORAGE_READ_MISSING", "missing"));
+        let mut retry = SyncDemandRetry::default();
+        for _ in 0..MAX_ADMISSION_RESTARTS {
+            retry
+                .hydrate_for_retry(Some(&tx), missing.clone())
+                .await
+                .expect("each basis change restarts the operation");
+        }
+        let error = retry
+            .hydrate_for_retry(Some(&tx), missing)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, SYNC_DEMAND_STALLED_CODE);
+    }
 
     #[test]
     fn committed_or_uncertain_operations_never_become_native_or_legacy_demands() {

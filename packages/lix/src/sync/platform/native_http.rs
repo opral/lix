@@ -69,6 +69,7 @@ impl AuthorityHttp {
                     "creation response exceeds 64 KiB",
                 ));
             }
+            crate::sync::runtime::note_transport_progress();
             bytes.extend_from_slice(&chunk);
         }
         Ok(ProtocolHttpResponse {
@@ -210,6 +211,7 @@ impl ProtocolHttp for AuthorityHttp {
         let body: ProtocolByteStream = Box::pin(async_stream::try_stream! {
             let mut response = response;
             while let Some(chunk) = response.chunk().await.map_err(|error| transport_error("read authority stream", error))? {
+                crate::sync::runtime::note_transport_progress();
                 yield Bytes::from(chunk);
             }
         });
@@ -271,6 +273,7 @@ impl RawHttpClient for reqwest::Client {
                         request.response_limit,
                     ));
                 }
+                crate::sync::runtime::note_transport_progress();
                 body.extend_from_slice(&chunk);
             }
             Ok(RawHttpResponse {

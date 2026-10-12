@@ -537,6 +537,7 @@ where
         let response = self.client.send(request.clone());
         track_send(ReadSendEvent::Dispatched(id.clone()))?;
         let response = response.await?;
+        super::runtime::note_transport_progress();
         if !session_gone(&response) {
             if (200..300).contains(&response.status) {
                 let mut session = self.session.lock().await;

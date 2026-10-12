@@ -4481,6 +4481,21 @@ pub(crate) fn check_execute_many_statement(
     Ok(())
 }
 
+/// A transaction whose pinned inputs could not be hydrated (the same input was
+/// demanded twice, or the replica's basis kept changing) cannot keep its staged
+/// snapshot: report a retryable transaction conflict. Transport stalls and
+/// other errors pass through unchanged.
+fn stalled_hydration_as_conflict(error: LixError) -> LixError {
+    if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
+        LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "transaction could not preserve its staged snapshot while loading inputs",
+        )
+    } else {
+        error
+    }
+}
+
 pub(crate) fn execute_many_returns_rows() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PARAM,
@@ -4988,11 +5003,7 @@ where
                     let hydrated = retry
                         .hydrate_pinned_for_retry(Some(sender), error.clone())
                         .await
-                        .map_err(|error| {
-                        if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
-                            LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "transaction could not preserve its staged snapshot while loading inputs")
-                        } else { error }
-                    })?;
+                        .map_err(stalled_hydration_as_conflict)?;
                     if !self
                         .transaction_mut()?
                         .refresh_hydrated_native_inputs(&error, &hydrated)
@@ -5051,7 +5062,8 @@ where
             }
             let hydrated = retry
                 .hydrate_pinned_for_retry(Some(&sender), error.clone())
-                .await?;
+                .await
+                .map_err(stalled_hydration_as_conflict)?;
             self.transaction_mut()?
                 .refresh_hydrated_native_inputs(&error, &hydrated)
                 .await?;
