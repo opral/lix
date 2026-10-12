@@ -39,7 +39,8 @@ impl Authority {
                     { "name": "id", "type": "text", "nullable": false },
                     { "name": "value", "type": "text", "nullable": false }
                 ],
-                "primary_key": ["id"]
+                "primary_key": ["id"],
+                "unique": [["value"]]
             });
             lix.execute(
                 "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
@@ -1428,3 +1429,6 @@ async fn active_legacy_migration_claim_retains_exact_source_marker_for_recovery(
         state
     );
 }
+
+#[path = "browser_preservation_regression_tests.rs"]
+mod browser_preservation_regression_tests;
