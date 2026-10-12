@@ -3469,12 +3469,71 @@ impl ActorGate {
     }
 }
 
-/// A pinned read state. Its reads run on the snapshot's own thread, so they
-/// never occupy the session actor; streams it opens pull on their own threads.
+/// A pinned read state. Its reads never occupy the session actor: a small
+/// dispatcher thread hands each read to a shared worker pool, so independent
+/// reads of one snapshot run concurrently (up to
+/// [`SNAPSHOT_READ_CONCURRENCY`]); streams it opens pull on their own threads.
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "ReadSnapshot")]
 pub struct NativeReadSnapshot {
     commands: GatedSender<ReadSnapshotCommand>,
+}
+
+/// How many reads of one snapshot execute at once. Further reads queue on the
+/// snapshot, in order, and still honour their cancel token while queued.
+const SNAPSHOT_READ_CONCURRENCY: usize = 8;
+
+/// The workers every native snapshot read runs on. One pool serves all
+/// snapshots, so opening a snapshot does not spawn threads for its reads.
+static SNAPSHOT_READ_RUNTIME: std::sync::LazyLock<std::result::Result<Runtime, String>> =
+    std::sync::LazyLock::new(|| {
+        let workers = thread::available_parallelism().map_or(4, |count| count.get().clamp(2, 16));
+        Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name("lix-snapshot-read")
+            .thread_stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to create snapshot read runtime: {error}"))
+    });
+
+/// Counts the reads a snapshot has handed to the pool, so close can wait for
+/// them.
+#[derive(Default)]
+struct SnapshotReads {
+    running: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl SnapshotReads {
+    /// Registers a read. Called on the dispatcher, in command order, before
+    /// the read is spawned, so a close that follows always waits for it.
+    fn begin(self: &Arc<Self>) -> SnapshotReadGuard {
+        self.running.fetch_add(1, Ordering::AcqRel);
+        SnapshotReadGuard(Arc::clone(self))
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.running.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+struct SnapshotReadGuard(Arc<SnapshotReads>);
+
+impl Drop for SnapshotReadGuard {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
 }
 
 enum ReadSnapshotCommand {
@@ -3595,14 +3654,19 @@ impl Drop for NativeReadSnapshot {
     }
 }
 
+/// Dispatches a snapshot's commands. It never runs a read itself: each read is
+/// spawned on the shared pool, so reads overlap and a slow one cannot delay the
+/// next. A close stops intake first, then waits for every read already handed
+/// out, so no command goes unsettled.
 fn run_read_snapshot_actor(
     snapshot: lix::Snapshot,
     receiver: mpsc::Receiver<ReadSnapshotCommand>,
     gate: ActorGate,
 ) {
-    let rt = match Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(error) => {
+    let runtime = match &*SNAPSHOT_READ_RUNTIME {
+        Ok(runtime) => runtime,
+        Err(message) => {
+            let error = io::Error::other(message.clone());
             gate.close(&receiver, |command| match command {
                 ReadSnapshotCommand::Query { deferred, .. } => {
                     deferred.reject(to_napi_error(&error));
@@ -3616,10 +3680,9 @@ fn run_read_snapshot_actor(
             return;
         }
     };
-    let limited = |query: lix::Query, max_bytes: Option<usize>| match max_bytes {
-        Some(max_bytes) => query.max_bytes(max_bytes),
-        None => query,
-    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(SNAPSHOT_READ_CONCURRENCY));
+    let reads = Arc::new(SnapshotReads::default());
+    let mut close_deferred = None;
     while let Ok(command) = receiver.recv() {
         match command {
             ReadSnapshotCommand::Query {
@@ -3629,14 +3692,20 @@ fn run_read_snapshot_actor(
                 cancel,
                 deferred,
             } => {
-                let query = snapshot.query(&sql).params(params);
-                let result = rt
-                    .block_on(cancellable(
-                        cancel,
-                        crate::session::run_query(query, options),
-                    ))
+                let snapshot = snapshot.clone();
+                let permits = Arc::clone(&permits);
+                let guard = reads.begin();
+                runtime.spawn(async move {
+                    let _guard = guard;
+                    let result = cancellable(cancel, async {
+                        let _permit = acquire_read_permit(&permits).await;
+                        let query = snapshot.query(&sql).params(params);
+                        crate::session::run_query(query, options).await
+                    })
+                    .await
                     .and_then(ExecuteResult::try_from);
-                settle_deferred(deferred, result);
+                    settle_deferred(deferred, result);
+                });
             }
             ReadSnapshotCommand::Stream {
                 sql,
@@ -3645,26 +3714,53 @@ fn run_read_snapshot_actor(
                 cancel,
                 deferred,
             } => {
-                let query = limited(snapshot.query(&sql).params(params), max_bytes);
-                let result = rt
-                    .block_on(cancellable(cancel, query.stream()))
+                let snapshot = snapshot.clone();
+                let permits = Arc::clone(&permits);
+                let guard = reads.begin();
+                runtime.spawn(async move {
+                    let _guard = guard;
+                    let result = cancellable(cancel, async {
+                        let _permit = acquire_read_permit(&permits).await;
+                        let query = snapshot.query(&sql).params(params);
+                        match max_bytes {
+                            Some(max_bytes) => query.max_bytes(max_bytes),
+                            None => query,
+                        }
+                        .stream()
+                        .await
+                    })
+                    .await
                     .and_then(start_query_stream);
-                settle_deferred(deferred, result);
+                    settle_deferred(deferred, result);
+                });
             }
             ReadSnapshotCommand::Close(deferred) => {
-                let result = rt.block_on(snapshot.close());
-                if let Some(deferred) = deferred {
-                    settle_deferred(deferred, result);
-                }
-                // Reads queued meanwhile, and every later one, reject as
-                // closed.
-                gate.close(&receiver, settle_closed_snapshot_command);
-                return;
+                close_deferred = deferred;
+                break;
             }
         }
     }
+    // Reads handed out before the close finish first, then the view is
+    // released.
+    let result = runtime.block_on(async {
+        reads.wait_idle().await;
+        snapshot.close().await
+    });
+    if let Some(deferred) = close_deferred {
+        settle_deferred(deferred, result);
+    }
+    // Reads queued meanwhile, and every later one, reject as closed.
     gate.close(&receiver, settle_closed_snapshot_command);
-    let _ = rt.block_on(snapshot.close());
+}
+
+/// Waits for one of the snapshot's read slots.
+async fn acquire_read_permit(
+    permits: &Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::OwnedSemaphorePermit {
+    Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .expect("the snapshot read semaphore is never closed")
 }
 
 impl Drop for NativeQueryStream {

@@ -201,3 +201,117 @@ test("a native snapshot answers every read sent right after close()", async () =
 		await binding.close();
 	}
 });
+
+// A bounded read that takes a noticeable, steady time (hundreds of ms).
+const SLOW_READ = "SELECT count(*) AS n FROM generate_series(1, 30000000)";
+
+async function timed<T>(run: () => Promise<T>): Promise<{ ms: number; value: T }> {
+	const start = performance.now();
+	const value = await run();
+	return { ms: performance.now() - start, value };
+}
+
+test("native snapshot reads run concurrently, not one at a time", async () => {
+	const binding = await openLixBinding({ kind: "memory" });
+	try {
+		const snapshot = await binding.snapshot();
+		// Warm up, then time one read alone.
+		await snapshot.query("SELECT 1", []);
+		const solo = await timed(() => snapshot.query(SLOW_READ, []));
+		expect(solo.value.rows).toEqual([[{ kind: "integer", value: 30000000 }]]);
+		expect(solo.ms).toBeGreaterThan(100);
+
+		// Two reads together take about one read's time, not two.
+		const pair = await timed(() =>
+			Promise.all([snapshot.query(SLOW_READ, []), snapshot.query(SLOW_READ, [])]),
+		);
+		for (const result of pair.value) {
+			expect(result.rows).toEqual([[{ kind: "integer", value: 30000000 }]]);
+		}
+		expect(pair.ms).toBeLessThan(solo.ms * 1.5);
+
+		// A slow read does not hold up a quick one on the same snapshot.
+		const slow = snapshot.query(SLOW_READ, []);
+		await started();
+		const quick = await timed(() => snapshot.query("SELECT 1 AS n", []));
+		expect(quick.ms).toBeLessThan(solo.ms / 2);
+		await slow;
+
+		// A burst beyond the concurrency bound all settles.
+		const burst = await Promise.all(
+			Array.from({ length: 24 }, (_, n) => snapshot.query(`SELECT ${n} AS n`, [])),
+		);
+		expect(burst.map((result) => result.rows[0][0])).toEqual(
+			Array.from({ length: 24 }, (_, n) => ({ kind: "integer", value: n })),
+		);
+		await snapshot.close();
+	} finally {
+		await binding.close();
+	}
+});
+
+test("cancelling one native snapshot read leaves its siblings running", async () => {
+	const binding = await openLixBinding({ kind: "memory" });
+	try {
+		const snapshot = await binding.snapshot();
+		const controller = new AbortController();
+		const cancelled = snapshot.query(LONG_READ, [], undefined, controller.signal);
+		cancelled.catch(() => undefined);
+		const sibling = snapshot.query(SLOW_READ, []);
+		await started();
+		controller.abort(new Error("stop one"));
+		await expect(within(3_000, cancelled)).rejects.toThrow("stop one");
+		expect((await within(10_000, sibling)).rows).toEqual([
+			[{ kind: "integer", value: 30000000 }],
+		]);
+
+		// Cancelling a read that is still queued behind running ones works too.
+		const controller2 = new AbortController();
+		const running = Array.from({ length: 8 }, () => {
+			const read = snapshot.query(LONG_READ, [], undefined, controller2.signal);
+			read.catch(() => undefined);
+			return read;
+		});
+		const queued = new AbortController();
+		const waiting = snapshot.query("SELECT 1", [], undefined, queued.signal);
+		waiting.catch(() => undefined);
+		await started();
+		queued.abort(new Error("stop queued"));
+		await expect(within(3_000, waiting)).rejects.toThrow("stop queued");
+		controller2.abort(new Error("stop running"));
+		for (const read of running) {
+			await expect(within(3_000, read)).rejects.toThrow("stop running");
+		}
+		expect((await snapshot.query("SELECT 7 AS n", [])).rows).toEqual([
+			[{ kind: "integer", value: 7 }],
+		]);
+		await snapshot.close();
+	} finally {
+		await binding.close();
+	}
+});
+
+test("closing a native snapshot waits for its in-flight reads and rejects later ones", async () => {
+	const binding = await openLixBinding({ kind: "memory" });
+	try {
+		const snapshot = await binding.snapshot();
+		const reads = [snapshot.query(SLOW_READ, []), snapshot.query(SLOW_READ, [])];
+		const stream = snapshot.stream("SELECT * FROM generate_series(1, 100000)", []);
+		await started();
+		const closing = snapshot.close();
+		const again = snapshot.close();
+		const late = snapshot.query("SELECT 1", []);
+		late.catch(() => undefined);
+		await within(10_000, closing);
+		await within(3_000, again);
+		for (const read of reads) {
+			expect((await read).rows).toEqual([[{ kind: "integer", value: 30000000 }]]);
+		}
+		await within(3_000, stream.then((opened) => opened.cancel()));
+		await expect(within(3_000, late)).rejects.toMatchObject({
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
+		});
+	} finally {
+		await binding.close();
+	}
+});
