@@ -1,5 +1,7 @@
 mod partial;
 mod partial_merge;
+mod sql_targets;
+pub(crate) use sql_targets::buffered_stream_error;
 
 use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
@@ -29,8 +31,8 @@ use crate::open_types::{
     OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, emit_open_progress,
 };
 
+use crate::session::ExecuteOptions;
 use crate::session::SessionContext;
-use crate::session::{CoherentReadBatch, ExecuteOptions};
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteRow;
 
@@ -113,7 +115,11 @@ impl OpenProgressSink for RetainingOpenProgressSink {
                 crate::OpenScope::Authority => &self.authority_migrated_from,
             };
             let _ = slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some(if old == 0 { from_format } else { old.min(from_format) })
+                Some(if old == 0 {
+                    from_format
+                } else {
+                    old.min(from_format)
+                })
             });
         } else if matches!(progress.phase, OpenPhase::Opening | OpenPhase::Complete) {
             let version = match progress.scope {
@@ -229,40 +235,17 @@ impl AuthorityReadSession {
         if client.active_branch_id().await? != branch_id {
             client.switch_branch(branch_id).await?;
         }
-        client.execute(sql, params, Some(ProtocolExecuteOptions {
-            origin_key: options.origin_key.clone(),
-            max_auto_commit_retries: options.max_auto_commit_retries,
-            ..Default::default()
-        })).await
-    }
-
-    async fn execute_batch(
-        &self,
-        server: &ServerOptions,
-        expected_account_id: &str,
-        branch_id: &str,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let mut state = self.state.lock().await;
-        if matches!(*state, AuthorityReadSessionState::Closed) {
-            return Err(LixError::new(LixError::CODE_CLOSED, "cannot execute an authority read from a closed Lix handle"));
-        }
-        if matches!(*state, AuthorityReadSessionState::Uninitialized) {
-            let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
-            *state = AuthorityReadSessionState::Open(Box::new(client));
-        }
-        let AuthorityReadSessionState::Open(client) = &*state else {
-            unreachable!("closed authority read session was handled above");
-        };
-        if client.active_branch_id().await? != branch_id {
-            client.switch_branch(branch_id).await?;
-        }
-        client.execute_batch(statements, Some(ProtocolExecuteOptions {
-            origin_key: options.origin_key.clone(),
-            max_auto_commit_retries: options.max_auto_commit_retries,
-            ..Default::default()
-        })).await
+        client
+            .execute(
+                sql,
+                params,
+                Some(ProtocolExecuteOptions {
+                    origin_key: options.origin_key.clone(),
+                    max_auto_commit_retries: options.max_auto_commit_retries,
+                    ..Default::default()
+                }),
+            )
+            .await
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -270,8 +253,9 @@ impl AuthorityReadSession {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, AuthorityReadSessionState::Closed) {
                 AuthorityReadSessionState::Open(client) => Some(client),
-                AuthorityReadSessionState::Uninitialized
-                | AuthorityReadSessionState::Closed => None,
+                AuthorityReadSessionState::Uninitialized | AuthorityReadSessionState::Closed => {
+                    None
+                }
             }
         };
         match client {
@@ -305,37 +289,17 @@ impl AuthorityReadSession {
         // remains Send across wasm bindings.
         let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
 
-        let result = client.execute(sql, params, Some(ProtocolExecuteOptions {
-            origin_key: options.origin_key.clone(),
-            max_auto_commit_retries: options.max_auto_commit_retries,
-            ..Default::default()
-        })).await;
-        let close_result = client.close().await;
-        match (result, close_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    async fn execute_batch(
-        &self,
-        server: &ServerOptions,
-        expected_account_id: &str,
-        branch_id: &str,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let state = self.state.lock().await;
-        if matches!(*state, AuthorityReadSessionState::Closed) {
-            return Err(LixError::new(LixError::CODE_CLOSED, "cannot execute an authority read from a closed Lix handle"));
-        }
-        let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
-        let result = client.execute_batch(statements, Some(ProtocolExecuteOptions {
-            origin_key: options.origin_key.clone(),
-            max_auto_commit_retries: options.max_auto_commit_retries,
-            ..Default::default()
-        })).await;
+        let result = client
+            .execute(
+                sql,
+                params,
+                Some(ProtocolExecuteOptions {
+                    origin_key: options.origin_key.clone(),
+                    max_auto_commit_retries: options.max_auto_commit_retries,
+                    ..Default::default()
+                }),
+            )
+            .await;
         let close_result = client.close().await;
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -500,7 +464,8 @@ where
         let retained_progress = Arc::new(RetainingOpenProgressSink::new(self.open_progress));
         let (engine, migrated_from) = retry_expired_read(|| {
             let storage = storage.clone();
-            let open_progress: Arc<dyn OpenProgressSink> = Arc::new(AuthorityOpenProgressSink(retained_progress.clone()));
+            let open_progress: Arc<dyn OpenProgressSink> =
+                Arc::new(AuthorityOpenProgressSink(retained_progress.clone()));
             let wasm_runtime = self.wasm_runtime.clone();
             let telemetry = self.telemetry.clone();
             async move {
@@ -665,9 +630,7 @@ impl IntoFuture for RemoteOpenLixBuilder {
     type IntoFuture = crate::sync::SyncTransportFuture<'static, RemoteLix>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            if self.open.wasm_runtime.is_some()
-                || self.open.telemetry.is_some()
-            {
+            if self.open.wasm_runtime.is_some() || self.open.telemetry.is_some() {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     "remote execution cannot configure a local runtime or telemetry sink",
@@ -675,11 +638,19 @@ impl IntoFuture for RemoteOpenLixBuilder {
             }
             let http = crate::sync::authority_http(&self.server.headers)?;
             let client = crate::authority_client::open_protocol_client_with_progress(
-                http, self.server.url, None, self.open.open_progress,
-            ).await?;
+                http,
+                self.server.url,
+                None,
+                self.open.open_progress,
+            )
+            .await?;
             let account_id = client.active_account_id().await?;
             let open_report = Arc::new(client.open_report().clone());
-            Ok(RemoteLix { client, account_id, open_report })
+            Ok(RemoteLix {
+                client,
+                account_id,
+                open_report,
+            })
         })
     }
 }
@@ -706,13 +677,19 @@ impl RemoteLix {
         )
     }
 
-    pub fn execute<'a>(&'a self, sql: &'a str, params: &'a [Value]) -> RemoteExecuteBuilder<'a> {
-        RemoteExecuteBuilder {
-            lix: self,
-            sql,
-            params,
-            options: ProtocolExecuteOptions::default(),
-        }
+    /// Starts a statement executed on the server; see [`Lix::execute`].
+    pub fn execute(&self, sql: &str) -> crate::Execute {
+        crate::Execute::new(Arc::new(self.clone()), sql)
+    }
+
+    /// Runs one write statement once per parameter set on the server.
+    pub fn execute_many<I, P>(&self, sql: &str, param_sets: I) -> crate::ExecuteMany
+    where
+        I: IntoIterator<Item = P>,
+        P: IntoIterator,
+        P::Item: Into<Value>,
+    {
+        crate::ExecuteMany::new(Arc::new(self.clone()), sql, param_sets)
     }
     pub async fn create_branch(
         &self,
@@ -751,14 +728,14 @@ impl RemoteLix {
             transaction: None,
             client: Some(client),
         };
-        opened.transaction = Some(
+        opened.transaction = Some(Arc::new(
             opened
                 .client
                 .as_ref()
                 .ok_or_else(closed_transaction_error)?
                 .begin_transaction()
                 .await?,
-        );
+        ));
         Ok(opened)
     }
 
@@ -777,16 +754,6 @@ impl RemoteLix {
             lix: self,
             account_id: None,
             branch_id: None,
-        }
-    }
-    pub fn execute_batch<'a>(
-        &'a self,
-        statements: &'a [ExecuteBatchStatement],
-    ) -> RemoteExecuteBatchBuilder<'a> {
-        RemoteExecuteBatchBuilder {
-            lix: self,
-            statements,
-            options: ProtocolExecuteOptions::default(),
         }
     }
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
@@ -808,22 +775,36 @@ impl RemoteLix {
 /// Call [`Self::rollback`] to await rollback and session closure explicitly.
 #[derive(Debug)]
 pub struct RemoteLixTransaction {
-    transaction: Option<ProtocolTransaction<crate::sync::AuthorityHttp>>,
+    transaction: Option<Arc<ProtocolTransaction<crate::sync::AuthorityHttp>>>,
     client: Option<ProtocolClient<crate::sync::AuthorityHttp>>,
 }
 impl RemoteLixTransaction {
-    pub fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> RemoteTransactionExecuteBuilder<'a> {
-        RemoteTransactionExecuteBuilder {
-            transaction: self,
-            sql,
-            params,
-            options: ProtocolExecuteOptions::default(),
-        }
+    fn sql_target(&self) -> Arc<dyn crate::query::SqlTarget> {
+        Arc::new(sql_targets::RemoteTransactionTarget(
+            self.transaction.clone(),
+        ))
     }
+
+    /// Starts a read inside this remote transaction.
+    pub fn query(&self, sql: &str) -> crate::Query {
+        crate::Query::new(self.sql_target(), sql)
+    }
+
+    /// Runs a statement inside this remote transaction.
+    pub fn execute(&self, sql: &str) -> crate::Execute {
+        crate::Execute::new(self.sql_target(), sql)
+    }
+
+    /// Stages one write statement once per parameter set.
+    pub fn execute_many<I, P>(&self, sql: &str, param_sets: I) -> crate::ExecuteMany
+    where
+        I: IntoIterator<Item = P>,
+        P: IntoIterator,
+        P::Item: Into<Value>,
+    {
+        crate::ExecuteMany::new(self.sql_target(), sql, param_sets)
+    }
+
     pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
         let result = self
             .transaction
@@ -905,36 +886,11 @@ impl<'a> IntoFuture for RemoteOpenAnotherSessionBuilder<'a> {
                 .await?;
             let account_id = client.active_account_id().await?;
             let open_report = Arc::new(client.open_report().clone());
-            Ok(RemoteLix { client, account_id, open_report })
-        })
-    }
-}
-
-/// Configures SQL executed inside a remote transaction.
-#[derive(Debug)]
-pub struct RemoteTransactionExecuteBuilder<'a> {
-    transaction: &'a RemoteLixTransaction,
-    sql: &'a str,
-    params: &'a [Value],
-    options: ProtocolExecuteOptions,
-}
-impl RemoteTransactionExecuteBuilder<'_> {
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-}
-impl<'a> IntoFuture for RemoteTransactionExecuteBuilder<'a> {
-    type Output = Result<ExecuteResult, LixError>;
-    type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            self.transaction
-                .transaction
-                .as_ref()
-                .ok_or_else(closed_transaction_error)?
-                .execute(self.sql, self.params, Some(self.options))
-                .await
+            Ok(RemoteLix {
+                client,
+                account_id,
+                open_report,
+            })
         })
     }
 }
@@ -967,73 +923,6 @@ impl RemoteObserveEvents {
         if let Some(events) = self.events.take() {
             events.close();
         }
-    }
-}
-
-/// Configures an atomic SQL batch on the server.
-#[derive(Debug)]
-pub struct RemoteExecuteBatchBuilder<'a> {
-    lix: &'a RemoteLix,
-    statements: &'a [ExecuteBatchStatement],
-    options: ProtocolExecuteOptions,
-}
-impl RemoteExecuteBatchBuilder<'_> {
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-
-    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
-    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
-    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
-        self.options.max_auto_commit_retries = Some(retries);
-        self
-    }
-}
-impl<'a> IntoFuture for RemoteExecuteBatchBuilder<'a> {
-    type Output = Result<crate::ExecuteBatchResult, LixError>;
-    type IntoFuture = crate::sync::SyncTransportFuture<'a, crate::ExecuteBatchResult>;
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            self.lix
-                .client
-                .execute_batch(self.statements, Some(self.options))
-                .await
-        })
-    }
-}
-
-/// Configures execution on a remote repository.
-#[derive(Debug)]
-pub struct RemoteExecuteBuilder<'a> {
-    lix: &'a RemoteLix,
-    sql: &'a str,
-    params: &'a [Value],
-    options: ProtocolExecuteOptions,
-}
-impl RemoteExecuteBuilder<'_> {
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-
-    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
-    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
-    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
-        self.options.max_auto_commit_retries = Some(retries);
-        self
-    }
-}
-impl<'a> IntoFuture for RemoteExecuteBuilder<'a> {
-    type Output = Result<ExecuteResult, LixError>;
-    type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            self.lix
-                .client
-                .execute(self.sql, self.params, Some(self.options))
-                .await
-        })
     }
 }
 
@@ -1205,178 +1094,6 @@ where
     }
 }
 
-/// Configures one SQL statement execution.
-#[expect(missing_debug_implementations)]
-pub struct ExecuteBuilder<'a, StorageImpl = Memory>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    lix: &'a Lix<StorageImpl>,
-    sql: String,
-    params: Vec<Value>,
-    options: ExecuteOptions,
-}
-
-impl<StorageImpl> ExecuteBuilder<'_, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    /// Identifies the caller-defined origin of this execution.
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-
-    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
-    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
-    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
-        self.options.max_auto_commit_retries = Some(retries);
-        self
-    }
-}
-
-impl<'a, StorageImpl> IntoFuture for ExecuteBuilder<'a, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    type Output = Result<ExecuteResult, LixError>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        // SAFETY: the builder owns the SQL, parameters, and options. The only
-        // borrowed value retained across suspension is a shared reference to
-        // the Sync session; storage handles are Send by the Storage contract.
-        if !matches!(
-            self.lix.engine.sync_mode().role(),
-            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
-        ) {
-            return Box::pin(unsafe {
-                crate::session::AssumeSendFuture::new(async move {
-                    self.lix
-                        .session
-                        .execute_with_options(&self.sql, &self.params, self.options)
-                        .await
-                })
-            });
-        }
-        Box::pin(unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                let route = self.lix.session.execution_disposition(&self.sql)?;
-                let authority_fallback = route == ExecutionDisposition::CancellableRead
-                    && self.lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
-                    && self.lix.server.is_some();
-                let local = self
-                    .lix
-                    .retry_replica_read(route, || {
-                        self.lix.retry_sync_demands(|| {
-                            self.lix.session.execute_with_options(
-                                &self.sql,
-                                &self.params,
-                                self.options.clone(),
-                            )
-                        })
-                    })
-                    .await;
-                match local {
-                    Err(error)
-                        if authority_fallback
-                            && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
-                    {
-                        self.lix
-                            .execute_authority_read(&self.sql, &self.params, &self.options)
-                            .await
-                    }
-                    result => result,
-                }
-            })
-        })
-    }
-}
-
-/// Configures one atomic SQL batch execution.
-#[expect(missing_debug_implementations)]
-pub struct ExecuteBatchBuilder<'a, StorageImpl = Memory>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    lix: &'a Lix<StorageImpl>,
-    statements: Vec<ExecuteBatchStatement>,
-    options: ExecuteOptions,
-}
-
-impl<StorageImpl> ExecuteBatchBuilder<'_, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    /// Identifies the caller-defined origin of this batch.
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-
-    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
-    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
-    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
-        self.options.max_auto_commit_retries = Some(retries);
-        self
-    }
-}
-
-impl<'a, StorageImpl> IntoFuture for ExecuteBatchBuilder<'a, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    type Output = Result<crate::ExecuteBatchResult, LixError>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        // SAFETY: as above, the builder owns every request value and borrows
-        // only the Sync session across suspension.
-        if !matches!(
-            self.lix.engine.sync_mode().role(),
-            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
-        ) {
-            return Box::pin(unsafe {
-                crate::session::AssumeSendFuture::new(async move {
-                    self.lix
-                        .session
-                        .execute_batch_with_options(&self.statements, self.options)
-                        .await
-                        .map(crate::ExecuteBatchResult::from_results)
-                })
-            });
-        }
-        Box::pin(unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                let route = self
-                    .lix
-                    .session
-                    .execute_batch_disposition(&self.statements)?;
-                let local = self.lix
-                    .retry_replica_read(route, || {
-                        self.lix.retry_sync_demands(|| {
-                            self.lix
-                                .session
-                                .execute_batch_with_options(&self.statements, self.options.clone())
-                        })
-                    })
-                    .await;
-                match local {
-                    Err(error)
-                        if route == ExecutionDisposition::CancellableRead
-                            && self.lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
-                            && self.lix.server.is_some()
-                            && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
-                    {
-                        self.lix.execute_authority_read_batch(&self.statements, &self.options).await
-                    }
-                    result => result.map(crate::ExecuteBatchResult::from_results),
-                }
-            })
-        })
-    }
-}
-
 /// Clonable handle for a Lix repository.
 ///
 /// Clones share the active branch, file-view state, and close lifecycle.
@@ -1396,7 +1113,7 @@ where
     transaction_lifecycle: Arc<PublicTransactionLifecycle>,
     primary_switch_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     sync_lease: Option<Arc<SyncSessionLease>>,
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     server: Option<ServerOptions>,
     authority_read_session: Arc<AuthorityReadSession>,
     open_report: Arc<OpenReport>,
@@ -1536,8 +1253,15 @@ where
                 total: None,
             },
         );
-        let lix =
-            partial::open_partial_lix(storage, wasm_runtime, telemetry, server, durability, Some(open_progress.clone())).await?;
+        let lix = partial::open_partial_lix(
+            storage,
+            wasm_runtime,
+            telemetry,
+            server,
+            durability,
+            Some(open_progress.clone()),
+        )
+        .await?;
         retained_progress.retain_initialized(lix.open_report.initialized);
         emit_open_progress(
             Some(&open_progress),
@@ -2054,30 +1778,40 @@ where
         &self.open_report
     }
 
-    /// Executes one PostgreSQL-dialect SQL statement against this Lix session.
+    /// Starts any single statement: DML, DDL or a read. Await the returned
+    /// [`crate::Execute`] to run it. It returns rows (a read's result or
+    /// `RETURNING` rows) plus the affected row count. For reads,
+    /// [`Self::query`] is the idiomatic form and can never write.
     ///
     /// Lix supports a PostgreSQL-dialect subset executed by DataFusion.
-    /// Positional placeholders use `$1`, `$2`, and so on. Parsing PostgreSQL
-    /// syntax does not imply support for every PostgreSQL statement or runtime
-    /// feature. Use `information_schema` for catalog inspection. Lix owns
-    /// transaction boundaries for each statement.
-    /// While a transaction is active, call `execute()` on the transaction
-    /// handle instead.
+    /// Positional placeholders use `$1`, `$2`, and so on. `sql` must be a
+    /// single statement; Lix owns the transaction boundary of each call. For
+    /// several statements atomically, use [`Self::begin_transaction`]; for
+    /// one statement with many parameter sets, use [`Self::execute_many`].
     ///
-    /// `sql` must be a single statement. To run several statements atomically,
-    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
-    /// statements into one script string.
-    pub fn execute<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> ExecuteBuilder<'a, StorageImpl> {
-        ExecuteBuilder {
-            lix: self,
-            sql: sql.to_string(),
-            params: params.to_vec(),
-            options: ExecuteOptions::default(),
-        }
+    /// ```no_run
+    /// # async fn example() -> Result<(), lix::LixError> {
+    /// let lix = lix::open_lix().await?;
+    /// lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+    ///     .bind("theme")
+    ///     .bind("dark")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn execute(&self, sql: &str) -> crate::Execute {
+        crate::Execute::new(self.sql_target(), sql)
+    }
+
+    /// Runs one write statement once per parameter set, atomically and in
+    /// one call. Resolves to the total rows affected.
+    pub fn execute_many<I, P>(&self, sql: &str, param_sets: I) -> crate::ExecuteMany
+    where
+        I: IntoIterator<Item = P>,
+        P: IntoIterator,
+        P::Item: Into<Value>,
+    {
+        crate::ExecuteMany::new(self.sql_target(), sql, param_sets)
     }
 
     /// Classifies one SQL execution for a caller that owns its transport
@@ -2236,79 +1970,6 @@ where
         })
     }
 
-    /// Executes statements sequentially against one atomic snapshot.
-    /// Pure reads share one read snapshot; batches containing writes retain
-    /// transactional read-after-write and rollback semantics.
-    ///
-    /// Each entry is one statement plus its own parameters. Callers assemble
-    /// the array; Lix does not parse a multi-statement script on their behalf.
-    pub fn execute_batch<'a>(
-        &'a self,
-        statements: &'a [ExecuteBatchStatement],
-    ) -> ExecuteBatchBuilder<'a, StorageImpl> {
-        ExecuteBatchBuilder {
-            lix: self,
-            statements: statements.to_vec(),
-            options: ExecuteOptions::default(),
-        }
-    }
-
-    /// Executes read statements against one coherent storage snapshot and
-    /// returns the snapshot metadata required by official storage adapters.
-    #[doc(hidden)]
-    pub fn execute_coherent_read_batch(
-        &self,
-        statements: &[(&str, &[Value])],
-    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
-        let statements = Arc::new(
-            statements
-                .iter()
-                .map(|(sql, params)| ((*sql).to_owned(), (*params).to_vec()))
-                .collect::<Vec<_>>(),
-        );
-        let routed = statements
-            .iter()
-            .map(|(sql, params)| ExecuteBatchStatement {
-                sql: sql.clone(),
-                params: params.clone(),
-                label: None,
-            })
-            .collect::<Vec<_>>();
-        let route = self.session.execute_batch_disposition(&routed);
-        let session = Arc::clone(&self.session);
-        let demand_tx = self.sync_demand_tx.clone();
-        // SAFETY: the future owns its local session and statement values, as
-        // do the ordinary execute builders. Each retry opens a complete new
-        // coherent snapshot after hydration releases the old read scope.
-        unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                if route? == ExecutionDisposition::Durable {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch only accepts read statements without durable runtime functions",
-                    ));
-                }
-                crate::common::with_read_deadline(async {
-                    let mut retry = crate::sync::SyncDemandRetry::default();
-                    loop {
-                        let result = retry_expired_read(|| {
-                            Arc::clone(&session)
-                                .execute_coherent_read_batch_owned(Arc::clone(&statements))
-                        })
-                        .await;
-                        match result {
-                            Ok(result) => return Ok(result),
-                            Err(error) => {
-                                retry.hydrate_for_retry(demand_tx.as_ref(), error).await?
-                            }
-                        }
-                    }
-                })
-                .await
-            })
-        }
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     pub(crate) fn execute_batch_disposition(
@@ -2363,9 +2024,24 @@ where
     #[cfg(test)]
     pub(crate) fn set_sync_demand_sender_for_test(
         &mut self,
-        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+        sender: crate::sync::SyncDemandSender,
     ) {
         self.sync_demand_tx = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_stream_route_for_test(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::session::QueryStreamRoute, LixError> {
+        let statement = self.session.parse_read_only_statement(sql, params)?;
+        Ok(self.session.query_stream_route(&statement, params))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
+        self.session.running_query_stream_count_for_test()
     }
 
     #[cfg(test)]
@@ -2427,8 +2103,10 @@ where
             })
             .await?;
         Ok(LixTransaction {
-            _lifecycle: lifecycle,
-            inner: Some(inner),
+            shared: Arc::new(TransactionShared {
+                inner: tokio::sync::Mutex::new(Some(inner)),
+                _lifecycle: lifecycle,
+            }),
         })
     }
 
@@ -2457,29 +2135,16 @@ where
         let expected_account_id = self.active_account_id().to_owned();
         let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
         self.authority_read_session
-            .execute(server, &expected_account_id, &branch_id, sql, params, options)
+            .execute(
+                server,
+                &expected_account_id,
+                &branch_id,
+                sql,
+                params,
+                options,
+            )
             .await
             .map(ExecuteResult::with_authority_notice)
-    }
-
-    async fn execute_authority_read_batch(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
-                "authoritative read requires a configured server",
-            )
-        })?;
-        let expected_account_id = self.active_account_id().to_owned();
-        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
-        let mut result = self.authority_read_session
-            .execute_batch(server, &expected_account_id, &branch_id, statements, options)
-            .await?;
-        result.results = result.results.into_iter().map(ExecuteResult::with_authority_notice).collect();
-        Ok(result)
     }
 
     /// Repository identity stored as `lix_key_value.lix_id`.
@@ -2630,19 +2295,14 @@ where
         if route == ExecutionDisposition::Durable {
             return operation().await;
         }
-        // Includes typed input preparation/hydration between complete local
-        // attempts. The deadline never wraps a durable operation.
-        crate::common::with_read_deadline(async {
-            if matches!(
-                self.engine.sync_mode().role(),
-                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
-            ) {
-                retry_expired_read(operation).await
-            } else {
-                operation().await
-            }
-        })
-        .await
+        if matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
+            retry_expired_read(operation).await
+        } else {
+            operation().await
+        }
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -2723,84 +2383,55 @@ where
     }
 }
 
+/// An explicit transaction: reads see its own writes, and nothing is visible
+/// to others until [`Self::commit`].
+///
+/// `query` and `execute` take `&self` and return owned builders; calls on one
+/// transaction run one at a time, in the order their futures are first
+/// polled (awaiting them in sequence runs them in that order). Dropping the
+/// transaction without committing rolls it back.
 #[expect(missing_debug_implementations)]
 pub struct LixTransaction<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    inner: Option<lix::SessionTransaction<StorageSession<StorageImpl>>>,
+    shared: Arc<TransactionShared<StorageImpl>>,
+}
+
+/// State shared by a transaction handle and the builders it hands out.
+pub(crate) struct TransactionShared<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    inner: tokio::sync::Mutex<Option<lix::SessionTransaction<StorageSession<StorageImpl>>>>,
+    /// Released with the last reference, so the handle's close waits for
+    /// in-flight builders too.
     _lifecycle: PublicTransactionLease,
-}
-
-/// Configures one SQL statement inside an explicit transaction.
-#[expect(missing_debug_implementations)]
-pub struct TransactionExecuteBuilder<'a, StorageImpl = Memory>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    transaction: &'a mut LixTransaction<StorageImpl>,
-    sql: &'a str,
-    params: &'a [Value],
-    options: ExecuteOptions,
-}
-
-impl<StorageImpl> TransactionExecuteBuilder<'_, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    /// Identifies the caller-defined origin of this execution.
-    pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
-        self.options.origin_key = Some(origin_key.into());
-        self
-    }
-}
-
-impl<'a, StorageImpl> IntoFuture for TransactionExecuteBuilder<'a, StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    type Output = Result<ExecuteResult, LixError>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(unsafe {
-            crate::session::AssumeSendFuture::new(async move {
-                {
-                    self.transaction
-                        .inner
-                        .as_mut()
-                        .ok_or_else(closed_transaction_error)?
-                        .execute_with_options(
-                            self.sql.to_owned(),
-                            self.params.to_vec(),
-                            self.options,
-                        )
-                        .await
-                }
-            })
-        })
-    }
 }
 
 impl<StorageImpl> LixTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    /// Executes one SQL statement inside this transaction.
-    ///
-    /// Writes are staged until `commit()`. Reads use the transaction overlay,
-    /// so they can observe writes staged by earlier calls on this handle.
-    pub fn execute<'a>(
-        &'a mut self,
-        sql: &'a str,
-        params: &'a [Value],
-    ) -> TransactionExecuteBuilder<'a, StorageImpl> {
-        TransactionExecuteBuilder {
-            transaction: self,
-            sql,
-            params,
-            options: ExecuteOptions::default(),
-        }
+    /// Runs any statement in this transaction. Writes become visible to
+    /// others at [`Self::commit`].
+    pub fn execute(&self, sql: &str) -> crate::Execute {
+        crate::Execute::new(self.sql_target(), sql)
+    }
+
+    /// Stages one write statement once per parameter set.
+    pub fn execute_many<I, P>(&self, sql: &str, param_sets: I) -> crate::ExecuteMany
+    where
+        I: IntoIterator<Item = P>,
+        P: IntoIterator,
+        P::Item: Into<Value>,
+    {
+        crate::ExecuteMany::new(self.sql_target(), sql, param_sets)
+    }
+
+    /// Starts a read that sees this transaction's own staged writes.
+    pub fn query(&self, sql: &str) -> crate::Query {
+        crate::Query::new(self.sql_target(), sql)
     }
 
     /// Executes one SQL statement inside this transaction with explicit options.
@@ -2815,13 +2446,12 @@ where
     ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                {
-                    self.inner
-                        .as_mut()
-                        .ok_or_else(closed_transaction_error)?
-                        .execute_with_options(sql, params, options)
-                        .await
-                }
+                let mut inner = self.shared.inner.lock().await;
+                inner
+                    .as_mut()
+                    .ok_or_else(closed_transaction_error)?
+                    .execute_with_options(sql, params, options)
+                    .await
             })
         }
     }
@@ -2831,7 +2461,10 @@ where
         &mut self,
         row: TransactionWriteRow,
     ) -> Result<(), LixError> {
-        self.inner
+        self.shared
+            .inner
+            .lock()
+            .await
             .as_mut()
             .ok_or_else(closed_transaction_error)?
             .stage_test_row(row)
@@ -2845,27 +2478,46 @@ where
         expected_head_commit_id: &str,
         target_commit_id: &str,
     ) -> Result<(), LixError> {
-        self.inner
+        self.shared
+            .inner
+            .lock()
+            .await
             .as_mut()
             .ok_or_else(closed_transaction_error)?
             .restore_branch_ref_for_test(branch_id, expected_head_commit_id, target_commit_id)
             .await
     }
 
-    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
-        self.inner
-            .take()
-            .ok_or_else(closed_transaction_error)?
-            .commit()
+    async fn take_inner(
+        &self,
+    ) -> Result<lix::SessionTransaction<StorageSession<StorageImpl>>, LixError> {
+        self.shared
+            .inner
+            .lock()
             .await
+            .take()
+            .ok_or_else(closed_transaction_error)
     }
 
-    pub async fn rollback(mut self) -> Result<(), LixError> {
-        self.inner
-            .take()
-            .ok_or_else(closed_transaction_error)?
-            .rollback()
-            .await
+    pub async fn commit(self) -> Result<crate::CommitReceipt, LixError> {
+        self.take_inner().await?.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), LixError> {
+        self.take_inner().await?.rollback().await
+    }
+}
+
+impl<StorageImpl> Drop for LixTransaction<StorageImpl>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        // Roll back now unless a call is still running; that call holds the
+        // shared state and rolls back when it releases it.
+        if let Ok(mut inner) = self.shared.inner.try_lock() {
+            drop(inner.take());
+        }
     }
 }
 
@@ -3034,7 +2686,8 @@ mod tests {
         })
         .await;
         drop(closing);
-        lix.execute("SELECT 1", &[])
+        lix.query("SELECT 1")
+            .all()
             .await
             .expect("opening reservation does not block parent SQL");
 
@@ -3088,7 +2741,6 @@ mod tests {
         source
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('remote-snapshot', 'true'::jsonb)",
-                &[],
             )
             .await
             .unwrap();
@@ -3309,7 +2961,8 @@ mod tests {
                 } else {
                     result.unwrap();
                 }
-                lix.execute("SELECT 1", &[])
+                lix.query("SELECT 1")
+                    .all()
                     .await
                     .expect("parent remains usable after transaction finishes");
                 lix.close().await.unwrap();
@@ -3391,7 +3044,8 @@ mod tests {
         drop(lix.begin_transaction().await.unwrap());
         closing_rx.await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            lix.execute("SELECT 1", &[])
+            lix.query("SELECT 1")
+                .all()
                 .await
                 .expect("parent SQL during cleanup");
             lix.begin_transaction()
@@ -3476,7 +3130,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            lix.execute("SELECT 1", &[])
+            lix.query("SELECT 1")
+                .all()
                 .await
                 .expect("failed child begin leaves parent usable");
             lix.close().await.unwrap();
@@ -3576,12 +3231,12 @@ mod tests {
         let nested = child.open_another_session().await.unwrap();
         root_spans.lock().unwrap().clear();
         child_spans.lock().unwrap().clear();
-        child.execute("SELECT 41", &[]).await.unwrap();
-        nested.execute("SELECT 42", &[]).await.unwrap();
+        child.query("SELECT 41").all().await.unwrap();
+        nested.query("SELECT 42").all().await.unwrap();
         assert!(!child_spans.lock().unwrap().is_empty());
         assert!(root_spans.lock().unwrap().is_empty());
         child_spans.lock().unwrap().clear();
-        root.execute("SELECT 43", &[]).await.unwrap();
+        root.query("SELECT 43").all().await.unwrap();
         assert!(!root_spans.lock().unwrap().is_empty());
         assert!(child_spans.lock().unwrap().is_empty());
         nested.close().await.unwrap();
@@ -3603,7 +3258,8 @@ mod tests {
         let branch_id = lix.active_branch_id().await.expect("branch");
         let reused = lix.clone();
         reused
-            .execute("SELECT 1", &[])
+            .query("SELECT 1")
+            .all()
             .await
             .expect("reuse should execute");
         let _another = lix
@@ -3633,7 +3289,7 @@ mod tests {
     #[tokio::test]
     async fn open_lix_without_a_sink_emits_no_spans() {
         let lix = open_lix().await.expect("open Lix");
-        lix.execute("SELECT 1", &[]).await.expect("execute");
+        lix.query("SELECT 1").all().await.expect("execute");
         assert!(lix.telemetry().is_none());
     }
 
@@ -3660,7 +3316,8 @@ mod tests {
             .await
             .expect("a second current handle joins the active generation");
         second
-            .execute("SELECT 1", &[])
+            .query("SELECT 1")
+            .all()
             .await
             .expect("joined handle remains usable");
     }
@@ -3715,7 +3372,7 @@ mod tests {
             .with_telemetry(Arc::clone(&sink).into_sink())
             .await
             .expect("open Lix");
-        lix.execute("SELECT 1", &[]).await.expect("execute");
+        lix.query("SELECT 1").all().await.expect("execute");
         let started = sink.started.lock().expect("started");
         assert!(started.iter().all(|name| *name != "lix.repository.opened"));
         assert!(started.contains(&"lix.sql.query"));
@@ -3759,7 +3416,7 @@ mod tests {
     #[tokio::test]
     async fn retries_distinct_sync_demands_until_the_operation_succeeds() {
         let mut lix = open_lix().await.expect("open Lix");
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(4);
+        let (demand_tx, mut demand_rx) = crate::sync::sync_demand_channel(4);
         lix.sync_demand_tx = Some(demand_tx);
         let responder = tokio::spawn(async move {
             for _ in 0..3 {
@@ -3801,14 +3458,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_history_and_mixed_coherent_reads_use_local_state() {
+    async fn replica_history_and_current_state_share_a_local_snapshot() {
         let lix = open_lix().await.expect("open Lix");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('local-history', 'value')",
-            &[],
-        )
-        .await
-        .expect("seed working state");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('local-history', 'value')")
+            .await
+            .expect("seed working state");
         let checkpoint = lix.create_checkpoint().await.expect("seed checkpoint");
         lix.set_sync_role(crate::sync::SyncRole::Replica)
             .expect("mark replica");
@@ -3816,55 +3470,68 @@ mod tests {
         let params = [Value::Text(checkpoint.commit_id)];
         let sql = "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint AND commit_id = $1";
         let local = lix
-            .execute(sql, &params)
+            .query(sql)
+            .params(&params)
+            .all()
             .await
             .expect("cached history is local");
         assert_eq!(local.rows().len(), 1);
-        let batch = lix
-            .execute_coherent_read_batch(&[
-                (
-                    "SELECT value FROM lix_key_value WHERE key = 'local-history'",
-                    &[],
-                ),
-                (sql, &params),
-            ])
+        let snapshot = lix.snapshot().await.expect("open replica snapshot");
+        let current = snapshot
+            .query("SELECT value FROM lix_key_value WHERE key = 'local-history'")
+            .all()
             .await
-            .expect("current state and history share a local snapshot");
-        assert_eq!(batch.results[0].rows().len(), 1);
-        assert_eq!(batch.results[1].rows().len(), 1);
-        assert!(batch.storage_mutation_revision.is_some());
+            .expect("current state reads from the local snapshot");
+        let history = snapshot
+            .query(sql)
+            .params(&params)
+            .all()
+            .await
+            .expect("history reads from the same local snapshot");
+        assert_eq!(current.len(), 1);
+        assert_eq!(history.len(), 1);
+        assert!(snapshot.storage_mutation_revision().is_some());
+        snapshot.close().await.expect("close snapshot");
         lix.close().await.expect("close replica");
     }
 
     #[tokio::test]
-    async fn replica_coherent_reads_reject_mutations_before_execution() {
+    async fn replica_snapshot_reads_reject_mutations_before_execution() {
         let lix = open_lix().await.expect("open Lix");
         lix.set_sync_role(crate::sync::SyncRole::Replica)
             .expect("mark replica");
         for sql in [
             "INSERT INTO lix_key_value (key, value) VALUES ('read-only', 'unexpected')",
-            "SELECT uuidv7()",
-            "SELECT current_timestamp",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
         ] {
-            let error = lix
-                .execute_coherent_read_batch(&[("SELECT * FROM lix_checkpoint", &[]), (sql, &[])])
+            let snapshot = lix.snapshot().await.expect("open replica snapshot");
+            snapshot
+                .query("SELECT 1 AS value")
+                .all()
                 .await
-                .expect_err("coherent reads cannot mutate either engine");
-            assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
+                .expect("snapshot reads work on a replica");
+            let error = snapshot
+                .query(sql)
+                .all()
+                .await
+                .expect_err("snapshot reads cannot mutate either engine");
+            assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
         }
         lix.close().await.expect("close replica");
     }
 
     #[tokio::test]
-    async fn replica_coherent_hot_read_without_authority_does_not_panic() {
+    async fn replica_snapshot_hot_read_without_authority_does_not_panic() {
         let lix = open_lix().await.expect("open Lix");
         lix.set_sync_role(crate::sync::SyncRole::Replica)
             .expect("mark replica");
-        let batch = lix
-            .execute_coherent_read_batch(&[("SELECT 1 AS value", &[])])
+        let snapshot = lix.snapshot().await.expect("open replica snapshot");
+        let row = snapshot
+            .query("SELECT 1 AS value")
+            .one()
             .await
             .expect("a local read does not require a connected authority client");
-        assert_eq!(batch.results[0].rows()[0].get::<i64>("value").unwrap(), 1);
+        assert_eq!(row.get::<i64>("value").unwrap(), 1);
         lix.close().await.expect("close replica");
     }
 
@@ -3930,16 +3597,19 @@ mod tests {
 
         first.close().await.expect("close first child session");
         let error = first
-            .execute("SELECT 1", &[])
+            .query("SELECT 1")
+            .all()
             .await
             .expect_err("closed child session must reject work");
         assert_eq!(error.code, LixError::CODE_CLOSED);
 
         second
-            .execute("SELECT 2", &[])
+            .query("SELECT 2")
+            .all()
             .await
             .expect("second child remains open");
-        root.execute("SELECT 3", &[])
+        root.query("SELECT 3")
+            .all()
             .await
             .expect("root remains open");
     }
@@ -4014,7 +3684,8 @@ mod tests {
             .expect("open session inheriting the author");
         assert_eq!(inherited.active_account_id(), AUTHOR_ID);
         let active = author
-            .execute("SELECT lix_active_account_id() AS account_id", &[])
+            .query("SELECT lix_active_account_id() AS account_id")
+            .all()
             .await
             .expect("read SQL active account");
         assert_eq!(
@@ -4023,17 +3694,12 @@ mod tests {
         );
 
         author
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('account-test', CAST('true' AS JSONB))",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('account-test', CAST('true' AS JSONB))")
             .await
             .expect("write attributed change");
         let attribution = author
-            .execute(
-                "SELECT account_id FROM lix_change WHERE schema_key = 'lix_key_value'",
-                &[],
-            )
+            .query("SELECT account_id FROM lix_change WHERE schema_key = 'lix_key_value'")
+            .all()
             .await
             .expect("query attribution");
         assert_eq!(
@@ -4052,17 +3718,14 @@ mod tests {
             .await
             .expect("open system session");
         system
-            .execute(
-                "UPDATE lix_account SET name = 'Ada Lovelace' WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .execute("UPDATE lix_account SET name = 'Ada Lovelace' WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
             .await
             .expect("rename account");
         let account = system
-            .execute(
-                "SELECT name FROM lix_account WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .query("SELECT name FROM lix_account WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
+            .all()
             .await
             .expect("read renamed account");
         assert_eq!(
@@ -4077,50 +3740,36 @@ mod tests {
             .expect("open unused account session");
 
         system
-            .execute(
-                "DELETE FROM lix_account WHERE id = $1",
-                &[Value::Text(UNUSED_ID.to_string())],
-            )
+            .execute("DELETE FROM lix_account WHERE id = $1")
+            .params(&[Value::Text(UNUSED_ID.to_string())])
             .await
             .expect("delete unused account");
         let error = unused
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('deleted-account', CAST('true' AS JSONB))",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('deleted-account', CAST('true' AS JSONB))")
             .await
             .expect_err("deleted account must not keep writing through an open session");
         assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
         let error = system
-            .execute(
-                "DELETE FROM lix_account WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .execute("DELETE FROM lix_account WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
             .await
             .expect_err("authored changes must restrict account deletion");
         assert_eq!(error.code, "LIX_FOREIGN_KEY_VIOLATION");
 
         system
-            .execute(
-                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .execute("UPDATE lix_account SET status = 'disabled' WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
             .await
             .expect("disable author");
         let error = author
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('disabled-account', CAST('true' AS JSONB))",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('disabled-account', CAST('true' AS JSONB))")
             .await
             .expect_err("disabled account must not keep writing through an open session");
         assert_eq!(error.code, "LIX_ACCOUNT_DISABLED");
 
         let error = system
-            .execute(
-                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
-                &[Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string())],
-            )
+            .execute("UPDATE lix_account SET status = 'disabled' WHERE id = $1")
+            .params(&[Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string())])
             .await
             .expect_err("built-in accounts must remain active");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -4135,10 +3784,8 @@ mod tests {
         // Before this fix those rows were staged onto main as local copies
         // (`lixcol_global = false`) that shadowed the global rows.
         let accounts = root
-            .execute(
-                "SELECT id, name, lixcol_global FROM lix_account ORDER BY name",
-                &[],
-            )
+            .query("SELECT id, name, lixcol_global FROM lix_account ORDER BY name")
+            .all()
             .await
             .expect("query accounts should succeed");
         assert_eq!(
@@ -4160,16 +3807,17 @@ mod tests {
             .await
             .expect("global session should open");
         let home_rows = global
-            .execute(
+            .query(
                 "SELECT id, name, lixcol_global \
                  FROM lix_account \
                  WHERE id IN ($1, $2) \
                  ORDER BY name",
-                &[
-                    Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
-                    Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
-                ],
             )
+            .params(&[
+                Value::Text(lix::SYSTEM_ACCOUNT_ID.to_string()),
+                Value::Text(lix::ANONYMOUS_ACCOUNT_ID.to_string()),
+            ])
+            .all()
             .await
             .expect("query home account rows should succeed");
         assert_eq!(
@@ -4187,10 +3835,9 @@ mod tests {
             .await
             .expect("provision author");
         let author_rows = global
-            .execute(
-                "SELECT id, lixcol_global FROM lix_account WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .query("SELECT id, lixcol_global FROM lix_account WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
+            .all()
             .await
             .expect("query ensure_account row should succeed");
         assert_eq!(author_rows.rows().len(), 1);
@@ -4211,10 +3858,8 @@ mod tests {
         .expect("switch to draft branch");
 
         let draft_accounts = root
-            .execute(
-                "SELECT id, name, lixcol_global FROM lix_account ORDER BY name",
-                &[],
-            )
+            .query("SELECT id, name, lixcol_global FROM lix_account ORDER BY name")
+            .all()
             .await
             .expect("query accounts on draft branch should succeed");
         assert_eq!(
@@ -4467,7 +4112,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
     pub(crate) fn from_partial_engine_for_test(
         engine: Arc<Engine<StorageSession<S>>>,
         session: SessionContext<StorageSession<S>>,
-        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+        sender: crate::sync::SyncDemandSender,
     ) -> Self {
         let lix = Self {
             engine,

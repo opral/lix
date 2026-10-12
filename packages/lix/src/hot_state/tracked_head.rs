@@ -15,6 +15,8 @@ pub(crate) use crate::row_state::{
 #[cfg(test)]
 pub(crate) use hot::hot_decode_row_pk_probe;
 #[cfg(test)]
+pub(crate) use hot::take_packed_identity_rows_visited_for_test;
+#[cfg(test)]
 pub(crate) use hot::stage_hot_collection_live_count_for_test;
 #[cfg(test)]
 pub(crate) use hot::stage_hot_collection_control_for_test;

@@ -8,25 +8,21 @@ use lix::{CreateBranchOptions, MergeBranchOptions, SwitchBranchOptions, Value, o
 async fn test_only_row_merger_composes_text_without_a_file() {
     let lix = open_lix().await.expect("workspace should open");
     let archive = build_plugin_archive();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text("/.lix/plugins/test_plugin_column_merger.lixplugin".to_owned()),
             Value::Blob(archive.into()),
-        ],
-    )
-    .await
-    .expect("row-only plugin should install");
-    lix.execute(
-        "INSERT INTO merge_test_row (id, body, label) VALUES ($1, $2, $3)",
-        &[
+        ])
+        .await
+        .expect("row-only plugin should install");
+    lix.execute("INSERT INTO merge_test_row (id, body, label) VALUES ($1, $2, $3)")
+        .params(&[
             Value::Text("0198b7a1-0000-7000-8000-000000000001".to_owned()),
             Value::Text("Alice said hello.\n\nBob said goodbye.".to_owned()),
             Value::Text("base-label".to_owned()),
-        ],
-    )
-    .await
-    .expect("merge test row should insert");
+        ])
+        .await
+        .expect("merge test row should insert");
 
     let source_branch = lix
         .create_branch(CreateBranchOptions {
@@ -42,28 +38,24 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     })
     .await
     .expect("peer should select source branch");
-    let mut a = lix.begin_transaction().await.expect("transaction A");
-    let mut b = peer.begin_transaction().await.expect("transaction B");
-    a.execute(
-        "UPDATE merge_test_row SET body = $1, label = $2 WHERE id = $3",
-        &[
+    let a = lix.begin_transaction().await.expect("transaction A");
+    let b = peer.begin_transaction().await.expect("transaction B");
+    a.execute("UPDATE merge_test_row SET body = $1, label = $2 WHERE id = $3")
+        .params(&[
             Value::Text("Alice said HELLO.\n\nBob said goodbye.".to_owned()),
             Value::Text("label-a".to_owned()),
             Value::Text("0198b7a1-0000-7000-8000-000000000001".to_owned()),
-        ],
-    )
-    .await
-    .expect("A edit should stage");
-    b.execute(
-        "UPDATE merge_test_row SET body = $1, label = $2 WHERE id = $3",
-        &[
+        ])
+        .await
+        .expect("A edit should stage");
+    b.execute("UPDATE merge_test_row SET body = $1, label = $2 WHERE id = $3")
+        .params(&[
             Value::Text("Alice said hello.\n\nBob said GOODBYE.".to_owned()),
             Value::Text("label-b".to_owned()),
             Value::Text("0198b7a1-0000-7000-8000-000000000001".to_owned()),
-        ],
-    )
-    .await
-    .expect("B edit should stage");
+        ])
+        .await
+        .expect("B edit should stage");
     a.commit().await.expect("A should commit");
     b.commit().await.expect("B should commit on its branch");
     // Explicit branch application accepts source after target. Registered
@@ -76,12 +68,11 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .expect("explicit merge should invoke the row-only merger");
 
     let result = lix
-        .execute(
-            "SELECT body, label FROM merge_test_row WHERE id = $1",
-            &[Value::Text(
-                "0198b7a1-0000-7000-8000-000000000001".to_owned(),
-            )],
-        )
+        .query("SELECT body, label FROM merge_test_row WHERE id = $1")
+        .params(&[Value::Text(
+            "0198b7a1-0000-7000-8000-000000000001".to_owned(),
+        )])
+        .all()
         .await
         .expect("merged test row should read");
     assert_eq!(

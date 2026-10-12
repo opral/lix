@@ -139,7 +139,7 @@ mod tests {
             &LixError::new("OFFLINE", "unavailable"),
         );
         for _ in 0..3 {
-            lix.execute("SELECT 1", &[]).await.unwrap();
+            lix.query("SELECT 1").all().await.unwrap();
         }
         assert_eq!(lix.sync_health().state, SyncHealthState::Stalled);
         assert_eq!(lix.sync_health().applied_cursor, Some(492));

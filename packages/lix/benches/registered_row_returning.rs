@@ -344,7 +344,7 @@ async fn measure_case(plans: &SqlPlans, case: Case) -> Duration {
     };
     let sql = plans.sql(case);
     let started = Instant::now();
-    let result = session.execute(sql, &[]).await.unwrap_or_else(|error| {
+    let result = session.execute(sql).await.unwrap_or_else(|error| {
         panic!(
             "registered-row {} benchmark SQL failed: {error:?}\\nSQL: {sql}",
             case.operation.name()
@@ -411,12 +411,12 @@ async fn run_explicit_pre_staged_profile(plans: &SqlPlans, rounds: usize, warmup
 
 async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> Duration {
     let session = new_fixture().await;
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("open explicit registered-row RETURNING benchmark transaction");
     let seeded = transaction
-        .execute(&plans.insert, &[])
+        .execute(&plans.insert)
         .await
         .expect("seed explicit registered-row RETURNING benchmark rows");
     assert_eq!(
@@ -433,12 +433,9 @@ async fn measure_explicit_pre_staged_case(plans: &SqlPlans, returning: bool) -> 
             .expect("write explicit benchmark RETURNING projection");
     }
     let started = Instant::now();
-    let result = transaction
-        .execute(&sql, &[])
-        .await
-        .unwrap_or_else(|error| {
-            panic!("explicit registered-row RETURNING benchmark SQL failed: {error:?}\nSQL: {sql}")
-        });
+    let result = transaction.execute(&sql).await.unwrap_or_else(|error| {
+        panic!("explicit registered-row RETURNING benchmark SQL failed: {error:?}\nSQL: {sql}")
+    });
     let elapsed = started.elapsed();
 
     assert_eq!(result.rows_affected(), 1);
@@ -462,7 +459,7 @@ async fn new_fixture() -> Lix<Memory> {
         .await
         .expect("open registered-row RETURNING benchmark lix");
     let registration = session
-        .execute(REGISTER_SCHEMA_SQL, &[])
+        .execute(REGISTER_SCHEMA_SQL)
         .await
         .expect("register benchmark row schema");
     assert_eq!(registration.rows_affected(), 1);
@@ -472,7 +469,7 @@ async fn new_fixture() -> Lix<Memory> {
 async fn seeded_fixture(plans: &SqlPlans) -> Lix<Memory> {
     let session = new_fixture().await;
     let seed = session
-        .execute(&plans.insert, &[])
+        .execute(&plans.insert)
         .await
         .expect("seed registered-row UPDATE benchmark rows");
     assert_eq!(

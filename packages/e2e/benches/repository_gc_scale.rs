@@ -244,10 +244,7 @@ where
         ],
         "primary_key": ["path"],
     });
-    main.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-        &[Value::Text(schema.to_string())],
-    )
+    main.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
     .await
     .expect("register repository-GC schema");
     let branch = main
@@ -269,7 +266,7 @@ where
         .await
         .expect("switch session branch");
     for commit_index in 0..commit_count {
-        let mut transaction = branch_session
+        let transaction = branch_session
             .begin_transaction()
             .await
             .expect("begin repository-GC fixture transaction");
@@ -279,13 +276,10 @@ where
                 .and_then(|base| base.checked_add(row_index))
                 .expect("repository-GC fixture row index overflow");
             transaction
-                .execute(
-                    "INSERT INTO repository_gc_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                    &[
+                .execute("INSERT INTO repository_gc_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))").params(&[
                         Value::Text(format!("/row/{row:08}")),
                         Value::Text(format!(r#"{{"commit":{commit_index},"row":{row}}}"#)),
-                    ],
-                )
+                    ])
                 .await
                 .expect("stage repository-GC fixture row");
         }
@@ -294,12 +288,10 @@ where
             .await
             .expect("publish repository-GC fixture commit");
     }
-    main.execute(
-        "DELETE FROM lix_branch WHERE id = $1",
-        &[Value::Text(branch.id)],
-    )
-    .await
-    .expect("delete repository-GC disposable branch");
+    main.execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch.id)])
+        .await
+        .expect("delete repository-GC disposable branch");
     SeedResult {
         elapsed: started.elapsed(),
         puts: commit_count.saturating_mul(changes_per_commit),

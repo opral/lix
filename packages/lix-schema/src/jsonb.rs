@@ -1466,6 +1466,17 @@ pub fn validate_canonical_json_text(bytes: &[u8]) -> Result<&str, JsonbError> {
     validate_canonical_json_text_with_number_rendering(bytes).map(|(text, _)| text)
 }
 
+/// Validates canonical JSON text exactly like
+/// [`validate_canonical_json_text`], but also rejects the accepted legacy
+/// number spellings that [`Jsonb::append_canonical_json`] re-renders. Text
+/// accepted here is rendered back byte-for-byte by a text-backed [`Jsonb`].
+pub fn validate_verbatim_canonical_json_text(bytes: &[u8]) -> Result<&str, JsonbError> {
+    match validate_canonical_json_text_with_number_rendering(bytes)? {
+        (text, false) => Ok(text),
+        (_, true) => Err(JsonbError("JSONB text numbers are not rendered verbatim")),
+    }
+}
+
 fn validate_canonical_json_text_with_number_rendering(
     bytes: &[u8],
 ) -> Result<(&str, bool), JsonbError> {

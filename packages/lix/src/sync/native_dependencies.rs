@@ -228,8 +228,8 @@ pub(super) async fn select(
 mod tests {
     use super::super::native_metadata::{NativeMetadataRequest, validate_native_metadata_response};
     use super::*;
-    use crate::storage::StorageWrite;
     use crate::open_lix;
+    use crate::storage::StorageWrite;
 
     async fn fixture() -> (
         crate::Lix<crate::Memory>,
@@ -237,17 +237,12 @@ mod tests {
         NativeMetadataResponse,
     ) {
         let lix = open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('bundle','value')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES('bundle','value')")
+            .await
+            .unwrap();
         let rows = lix
-            .execute(
-                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key='bundle'",
-                &[],
-            )
+            .query("SELECT lixcol_change_id AS id FROM lix_key_value WHERE key='bundle'")
+            .all()
             .await
             .unwrap();
         let request = NativeMetadataRequest {
@@ -460,10 +455,10 @@ mod tests {
                     key(&item.address).unwrap(),
                     MAX_NATIVE_METADATA_PAYLOAD_BYTES,
                 )
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .as_ref(),
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
                 item.bytes
             );
         }

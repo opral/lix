@@ -115,6 +115,10 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
         "peer of `session` in the reclamation cycle, by design",
     ),
     ("handle", "entry point; reaches everywhere by design"),
+    (
+        "query",
+        "public SQL surface shared by `handle`'s Lix, snapshots and transactions",
+    ),
     ("hot_index_aging_probe", "cfg(test) measurement probe"),
     ("hot_row_tombstone_probe", "cfg(test) measurement probe"),
     ("init", "entry point; reaches everywhere by design"),

@@ -150,7 +150,7 @@ where
     let _ = take_plan_load_attribution();
     let checkpoint_start = Instant::now();
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint should publish");
     let checkpoint_wall = checkpoint_start.elapsed();
@@ -176,7 +176,7 @@ where
     ] {
         let _ = take_plan_load_attribution();
         let start = Instant::now();
-        let outcome = session.execute(sql, &[]).await;
+        let outcome = session.query(sql).all().await;
         let elapsed = start.elapsed();
         match outcome {
             Ok(result) => println!(
@@ -190,9 +190,7 @@ where
     }
 
     let undo_start = Instant::now();
-    let undo = session
-        .execute("SELECT commit_id FROM lix_undo()", &[])
-        .await;
+    let undo = session.execute("SELECT commit_id FROM lix_undo()").await;
     let undo_wall = undo_start.elapsed();
     match undo {
         Ok(_) => println!("op undo wall_ms {:.1}", undo_wall.as_secs_f64() * 1000.0),
@@ -342,16 +340,14 @@ async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin commit");
+    let transaction = session.begin_transaction().await.expect("begin commit");
     for index in 0..rows {
         transaction
-            .execute(
-                "INSERT INTO replay_scope (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text(format!("/row/{batch:08}/{index:08}")),
-                    Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
-                ],
-            )
+            .execute("INSERT INTO replay_scope (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text(format!("/row/{batch:08}/{index:08}")),
+                Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
+            ])
             .await
             .expect("insert row");
     }
@@ -372,10 +368,7 @@ where
         "primary_key": ["path"],
     });
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register schema");
 }

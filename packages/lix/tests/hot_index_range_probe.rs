@@ -94,12 +94,10 @@ async fn ordinal_range_ids(
     upper: i64,
 ) -> Vec<String> {
     let result = session
-        .execute(
-            &format!(
-                "SELECT id FROM {table} WHERE ordinal BETWEEN {lower} AND {upper} ORDER BY id"
-            ),
-            &[],
-        )
+        .query(&format!(
+            "SELECT id FROM {table} WHERE ordinal BETWEEN {lower} AND {upper} ORDER BY id"
+        ))
+        .all()
         .await
         .expect("range query should succeed");
     result
@@ -127,10 +125,8 @@ async fn seeded_session(schema_key: &str, declare_unique: bool, rows: usize) -> 
         r#"{{"$schema":"https://lix.dev/schema-v1.json","key":"{schema_key}","columns":[{{"name":"id","type":"text","nullable":false}},{{"name":"ordinal","type":"int8","nullable":false}}],"primary_key":["id"]{unique}}}"#
     );
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-            &[Value::Text(schema)],
-        )
+        .execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema)])
         .await
         .expect("register schema");
 
@@ -139,10 +135,10 @@ async fn seeded_session(schema_key: &str, declare_unique: bool, rows: usize) -> 
     for index in 0..rows {
         let ordinal = index as i64 - 3;
         session
-            .execute(
-                &format!("INSERT INTO {schema_key} (id, ordinal) VALUES ($1, {ordinal})"),
-                &[Value::Text(format!("n{index}"))],
-            )
+            .execute(&format!(
+                "INSERT INTO {schema_key} (id, ordinal) VALUES ($1, {ordinal})"
+            ))
+            .params(&[Value::Text(format!("n{index}"))])
             .await
             .expect("insert row");
     }

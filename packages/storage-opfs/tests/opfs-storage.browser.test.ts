@@ -1,4 +1,5 @@
 import {
+	json,
 	openLix,
 	type LixStorageProvider,
 	type LixStorageProviderRegistration,
@@ -102,7 +103,7 @@ test("persists a complete local Lix", async () => {
 	const first = await openLix({ storage });
 	await first.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["durable-opfs", { value: 42 }],
+		["durable-opfs", json({ value: 42 })],
 	);
 	await first.close();
 
@@ -127,7 +128,7 @@ test("shares a name across Lix workers", async () => {
 	try {
 		await first.execute(
 			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-			["shared-value", { value: 1 }],
+			["shared-value", json({ value: 1 })],
 		);
 		expect(
 			(
@@ -138,7 +139,7 @@ test("shares a name across Lix workers", async () => {
 		).toEqual({ value: 1 });
 		await second.execute(
 			"UPDATE lix_key_value SET value = $1 WHERE key = $2",
-			[{ value: 2 }, "shared-value"],
+			[json({ value: 2 }), "shared-value"],
 		);
 		expect(
 			(
@@ -390,7 +391,7 @@ test("wakes lix.observe after another Lix worker commits", async () => {
 			.then((result) => (result.done ? undefined : result.value));
 		await first.execute(
 			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-			["observed-value", { value: 1 }],
+			["observed-value", json({ value: 1 })],
 		);
 
 		const update = await withTimeout(changed, 2_000);

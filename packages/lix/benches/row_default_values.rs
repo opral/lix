@@ -36,10 +36,7 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
             "primary_key": ["id"]
         });
         let registered = session
-            .execute(
-                "INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)",
-                &[Value::Jsonb(schema.into())],
-            )
+            .execute("INSERT INTO lix_registered_schema (schema_key, value) VALUES ($1 ->> 'key', $1)").params(&[Value::Jsonb(schema.into())])
             .await
             .expect("register benchmark schema");
         assert_eq!(registered.rows_affected(), 1);
@@ -50,7 +47,7 @@ fn fixture(runtime: &tokio::runtime::Runtime) -> Lix<Memory> {
 fn execute(runtime: &tokio::runtime::Runtime, session: &Lix<Memory>, sql: &str) {
     black_box(
         runtime
-            .block_on(session.execute(sql, &[]).into_future())
+            .block_on(session.execute(sql).into_future())
             .expect("execute benchmark SQL"),
     );
 }

@@ -67,24 +67,21 @@ async fn new_branch_with_missing_source_cannot_publish_partial_recovery() {
         .await;
     assert!(result.is_err(), "an absent parent must fail validation");
     assert!(
-        lix.execute(
-            "SELECT id FROM lix_branch WHERE id = $1",
-            &[crate::Value::Text(branch)]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT id FROM lix_branch WHERE id = $1")
+            .params(&[crate::Value::Text(branch)])
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     assert!(
-        lix.execute(
-            "SELECT value FROM lix_key_value WHERE key = 'invalid-recovery-receipt'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT value FROM lix_key_value WHERE key = 'invalid-recovery-receipt'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     lix.close().await.unwrap();
 }
@@ -129,20 +126,17 @@ async fn existing_branch_ref_and_normal_commit_remain_rejected_atomically() {
     let error = result.unwrap_err();
     assert!(error.message.contains("explicit branch ref"), "{error}");
     assert!(
-        lix.execute(
-            "SELECT value FROM lix_key_value WHERE key = 'invalid-existing-ref-write'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT value FROM lix_key_value WHERE key = 'invalid-existing-ref-write'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     let rows = lix
-        .execute(
-            "SELECT name FROM lix_branch WHERE id = $1",
-            &[crate::Value::Text(branch)],
-        )
+        .query("SELECT name FROM lix_branch WHERE id = $1")
+        .params(&[crate::Value::Text(branch)])
+        .all()
         .await
         .unwrap();
     assert_ne!(
@@ -210,20 +204,16 @@ async fn recovery_content_does_not_inherit_the_callers_branch() {
     let mut roots = Vec::new();
     for (index, caller) in [&lix, &other].into_iter().enumerate() {
         caller
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    crate::Value::Text(format!("/caller-{index}.txt")),
-                    crate::Value::Blob(b"unrelated caller content".to_vec().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                crate::Value::Text(format!("/caller-{index}.txt")),
+                crate::Value::Blob(b"unrelated caller content".to_vec().into()),
+            ])
             .await
             .unwrap();
         caller
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('unrelated', $1)",
-                &[crate::Value::Text(format!("caller {index}"))],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('unrelated', $1)")
+            .params(&[crate::Value::Text(format!("caller {index}"))])
             .await
             .unwrap();
         let branch = uuid::Uuid::now_v7().to_string();
@@ -244,7 +234,8 @@ async fn recovery_content_does_not_inherit_the_callers_branch() {
             .unwrap();
         assert!(
             recovered
-                .execute("SELECT path FROM lix_file", &[])
+                .query("SELECT path FROM lix_file")
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -252,10 +243,8 @@ async fn recovery_content_does_not_inherit_the_callers_branch() {
         );
         assert!(
             recovered
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'unrelated'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'unrelated'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -263,10 +252,8 @@ async fn recovery_content_does_not_inherit_the_callers_branch() {
         );
         assert_eq!(
             recovered
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'captured'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'captured'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -276,7 +263,8 @@ async fn recovery_content_does_not_inherit_the_callers_branch() {
         );
         roots.push(
             recovered
-                .execute("SELECT lix_root_commit_id() AS root", &[])
+                .query("SELECT lix_root_commit_id() AS root")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]

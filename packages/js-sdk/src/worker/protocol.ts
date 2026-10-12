@@ -1,13 +1,13 @@
 import type { HttpResponsePolicy } from "../http-transport.js";
 import type {
-	BindingBatchStatement,
+	BindingExecuteOptions,
+	BindingExecuteResult,
 	BindingParam,
+	BindingReadOptions,
 	LixStorageConfig,
 } from "../binding-types.js";
 import type {
 	CreateBranchOptions,
-	ExecuteOptions,
-	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetryParentContext,
@@ -136,12 +136,20 @@ export type WorkerOperation =
 			kind: "execute";
 			sql: string;
 			params: BindingParam[];
-			options?: ExecuteOptions;
+			options?: BindingExecuteOptions;
 	  }
 	| {
-			kind: "executeBatch";
-			statements: BindingBatchStatement[];
-			options?: LixBatchOptions;
+			kind: "executeMany";
+			sql: string;
+			paramSets: BindingParam[][];
+			options?: BindingExecuteOptions;
+	  }
+	| {
+			/** A buffered read of the latest state, or of a read snapshot. */
+			kind: "query";
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
 	  }
 	| { kind: "beginTransaction" }
 	| {
@@ -149,7 +157,28 @@ export type WorkerOperation =
 			transactionId: number;
 			sql: string;
 			params: BindingParam[];
-			options?: ExecuteOptions;
+			options?: BindingExecuteOptions;
+	  }
+	| {
+			kind: "transaction.executeMany";
+			transactionId: number;
+			sql: string;
+			paramSets: BindingParam[][];
+			options?: BindingExecuteOptions;
+	  }
+	| {
+			kind: "transaction.query";
+			transactionId: number;
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
+	  }
+	| {
+			kind: "transaction.stream";
+			transactionId: number;
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
 	  }
 	| { kind: "transaction.commit"; transactionId: number }
 	| { kind: "transaction.rollback"; transactionId: number }
@@ -175,6 +204,15 @@ export type WorkerOperation =
 	| { kind: "exportSnapshot" }
 	| { kind: "exportSnapshot.next"; exportId: number }
 	| { kind: "exportSnapshot.cancel"; exportId: number }
+	| {
+			/** Opens a stream of the latest state, or of a read snapshot. */
+			kind: "stream";
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
+	  }
+	| { kind: "stream.next"; streamId: number }
+	| { kind: "stream.close"; streamId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "observe.close"; observeId: number }
@@ -182,6 +220,8 @@ export type WorkerOperation =
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
+	/** Cancels a read in flight: the engine drops it within a time slice. */
+	| { kind: "request.cancel"; requestId: number }
 	| { kind: "observe.cancel"; requestId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
@@ -208,6 +248,39 @@ export type WorkerNotification =
 	  };
 
 export type WorkerInput = WorkerRequest | WorkerNotification;
+
+/** Reads whose engine work a `request.cancel` notification stops. */
+/**
+ * Releases a resource: never refused for backpressure. Each open stream or
+ * snapshot closes at most once, so these stay bounded by what is open, and
+ * refusing one would leak the resource on the worker.
+ */
+export function isReleaseOperation(operation: WorkerOperation): boolean {
+	return (
+		operation.kind === "stream.close" ||
+		operation.kind === "exportSnapshot.cancel"
+	);
+}
+
+export function isCancellableRead(operation: WorkerOperation): boolean {
+	return (
+		operation.kind === "query" ||
+		operation.kind === "stream" ||
+		operation.kind === "transaction.query" ||
+		operation.kind === "transaction.stream"
+	);
+}
+
+/**
+ * Opening a stream answers with its columns and first page in one round
+ * trip. `page` is null when the result ended within the first page; the
+ * stream is then already closed on the worker.
+ */
+export type WorkerStreamOpened = {
+	streamId: number;
+	columns: string[];
+	page: BindingExecuteResult | null;
+};
 
 export type WorkerConnection = {
 	postMessage(message: WorkerInput): void;

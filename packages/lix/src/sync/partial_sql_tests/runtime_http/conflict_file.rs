@@ -101,10 +101,7 @@ async fn conflicting_file_case_at_path(
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/shared.txt',CAST('B' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/shared.txt',CAST('B' AS BYTEA))")
         .await
         .unwrap();
     let server = open_lix()
@@ -238,16 +235,15 @@ async fn conflicting_file_case_at_path(
     crate::sync::admit_sync_authority_storage(&authority.storage_adapter(), None)
         .await
         .unwrap();
-    authority.execute(remote_sql, &[]).await.unwrap();
+    authority.execute(remote_sql).await.unwrap();
     if checkpoint {
-        authority.execute("INSERT INTO lix_key_value(key,value,lixcol_untracked) VALUES('private-authority','retained',true)", &[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value(key,value,lixcol_untracked) VALUES('private-authority','retained',true)").await.unwrap();
     }
     let retired_file = if expected == "<deleted>" || final_path != "/shared.txt" {
         authority
-            .execute(
-                "SELECT id FROM lix_file WHERE path=$1",
-                &[Value::Text(final_path.into())],
-            )
+            .query("SELECT id FROM lix_file WHERE path=$1")
+            .params(&[Value::Text(final_path.into())])
+            .all()
             .await
             .unwrap()
             .rows()
@@ -258,7 +254,7 @@ async fn conflicting_file_case_at_path(
     };
     let captured_remote = transport.partial_replica_descriptor(None).await.unwrap();
     if checkpoint {
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))").await.unwrap();
     }
     let mut prepared = prepare_descriptor_with_merge(
         engine.clone(),
@@ -271,10 +267,7 @@ async fn conflicting_file_case_at_path(
     if lost_merge {
         assert_eq!(prepared.err().unwrap().code, "TEST_LOST_MERGE_ACK");
         authority
-            .execute(
-                "UPDATE lix_file SET content=CAST('later' AS BYTEA) WHERE path='/shared.txt'",
-                &[],
-            )
+            .execute("UPDATE lix_file SET content=CAST('later' AS BYTEA) WHERE path='/shared.txt'")
             .await
             .unwrap();
         prepared = prepare_descriptor_with_merge(
@@ -324,15 +317,14 @@ async fn conflicting_file_case_at_path(
         );
         drop(read);
         let private = authority
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='private-authority'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='private-authority'")
+            .all()
             .await
             .unwrap();
         assert!(format!("{private:?}").contains("retained"));
         let diff = authority
-            .execute("SELECT row_ref FROM lix_diff('lix_file')", &[])
+            .query("SELECT row_ref FROM lix_diff('lix_file')")
+            .all()
             .await
             .unwrap();
         let read = authority_storage
@@ -364,12 +356,10 @@ async fn conflicting_file_case_at_path(
             .collect::<Vec<_>>();
         drop(native);
         drop(read);
-        let checkpoint_file = authority.execute("SELECT CAST(content AS TEXT) AS content FROM lix_as_of('lix_file', $1) WHERE path='/shared.txt'", &[Value::Text(checkpoint.clone())]).await;
+        let checkpoint_file = authority.query("SELECT CAST(content AS TEXT) AS content FROM lix_as_of('lix_file', $1) WHERE path='/shared.txt'").params(&[Value::Text(checkpoint.clone())]).all().await;
         let current_file = authority
-            .execute(
-                "SELECT CAST(content AS TEXT) AS content FROM lix_file WHERE path='/shared.txt'",
-                &[],
-            )
+            .query("SELECT CAST(content AS TEXT) AS content FROM lix_file WHERE path='/shared.txt'")
+            .all()
             .await;
         assert!(
             diff.rows().is_empty(),
@@ -440,8 +430,8 @@ async fn conflicting_file_case_at_path(
     // Once demanded, the merged file remains readable without a transport.
     let local = session.execute(sql, &params).await.unwrap();
     assert_eq!(local, hydrated);
-    let remote = authority.execute(sql, &params).await.unwrap();
-    assert_eq!(local, remote);
+    let remote = authority.query(sql).params(&params).all().await.unwrap();
+    assert_eq!(local.rows(), remote.rows());
     if expected != "<deleted>" {
         assert_eq!(local.rows().len(), 1);
     }

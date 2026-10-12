@@ -1,4 +1,4 @@
-import type { WorkerOperation } from "./protocol.js";
+import { isCancellableRead, type WorkerOperation } from "./protocol.js";
 
 // Every new public operation must declare its lost-acknowledgement policy.
 // SQL text is not a safe classifier (CTEs and functions can write). Detached
@@ -14,9 +14,13 @@ const commitPolicy = {
 	"openSnapshot.finish": false,
 	openAnotherSession: false,
 	execute: true,
-	executeBatch: true,
+	executeMany: true,
+	query: false,
 	beginTransaction: false,
 	"transaction.execute": false,
+	"transaction.executeMany": false,
+	"transaction.query": false,
+	"transaction.stream": false,
 	"transaction.commit": true,
 	"transaction.rollback": false,
 	replicaRecoverySources: false,
@@ -36,6 +40,9 @@ const commitPolicy = {
 	exportSnapshot: false,
 	"exportSnapshot.next": false,
 	"exportSnapshot.cancel": false,
+	stream: false,
+	"stream.next": false,
+	"stream.close": false,
 	observe: false,
 	"observe.next": false,
 	"observe.close": false,
@@ -49,6 +56,16 @@ export function operationDeadline(
 	operation: WorkerOperation,
 ): number | undefined {
 	if (operation.kind === "observe.next") return undefined;
+	// Reads have no fatal deadline: a slow aggregate or a slow page is not a
+	// hung worker. They are cancellable instead (`request.cancel`,
+	// `stream.close`), and the engine yields so the
+	// worker keeps receiving those messages while a read runs.
+	if (
+		isCancellableRead(operation) ||
+		operation.kind === "stream.next" ||
+		operation.kind === "stream.close"
+	)
+		return undefined;
 	if (operation.kind === "close") return 5_000;
 	if (operation.kind === "open") return 30_000;
 	return 60_000;

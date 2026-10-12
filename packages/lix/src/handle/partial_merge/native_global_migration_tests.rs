@@ -11,10 +11,7 @@ async fn run_global_migration(restart: bool) {
     let memory = Memory::new();
     let authority = open_lix().with_storage(memory.clone()).await.unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('base','initial')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('base','initial')")
         .await
         .unwrap();
     let base = authority.partial_replica_descriptor(None).await.unwrap();
@@ -39,10 +36,7 @@ async fn run_global_migration(restart: bool) {
         .await
         .unwrap();
     child
-        .execute(
-            "UPDATE lix_key_value SET value='local-pending' WHERE key='base'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='local-pending' WHERE key='base'")
         .await
         .unwrap();
     let source = child
@@ -246,7 +240,8 @@ async fn run_global_migration(restart: bool) {
         .await
         .unwrap();
     let rows = view
-        .execute("SELECT value FROM lix_key_value WHERE key='base'", &[])
+        .query("SELECT value FROM lix_key_value WHERE key='base'")
+        .all()
         .await
         .unwrap();
     let Value::Jsonb(value) = rows.rows()[0].get::<Value>("value").unwrap() else {
@@ -254,14 +249,12 @@ async fn run_global_migration(restart: bool) {
     };
     assert_eq!(value.as_json_string().as_deref(), Some("local-pending"));
     assert_eq!(
-        view.execute(
-            "SELECT diff_type FROM lix_diff('lix_key_value') WHERE key='base'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .len(),
+        view.query("SELECT diff_type FROM lix_diff('lix_key_value') WHERE key='base'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .len(),
         1,
         "migration must preserve the original dirty checkpoint interval"
     );

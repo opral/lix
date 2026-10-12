@@ -380,8 +380,7 @@ pub(super) fn validate_checkpoint_conversation_envelope(
         invalid("checkpoint graph metadata omitted its nullable conversation envelope")
     })?;
     if envelope.commit_id != commit_id
-        || crate::storage_codec::id_string::uuid_bytes_from_canonical(&envelope.commit_id)
-            .is_none()
+        || crate::storage_codec::id_string::uuid_bytes_from_canonical(&envelope.commit_id).is_none()
     {
         return Err(invalid(
             "checkpoint conversation envelope commit identity mismatch",
@@ -476,11 +475,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             }
         }
         if !locator_ids.is_empty() {
-            let locators = crate::tracked_state::load_canonical_change_locators(
-                &read,
-                &locator_ids,
-            )
-            .await?;
+            let locators =
+                crate::tracked_state::load_canonical_change_locators(&read, &locator_ids).await?;
             if locators.len() != locator_indices.len() {
                 return Err(invalid("native metadata locator cardinality mismatch"));
             }
@@ -525,10 +521,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 .await?
         };
         if conversation_ids.len() != checkpoint_pointer_indices.len() {
-            return Err(invalid("checkpoint conversation metadata cardinality mismatch"));
+            return Err(invalid(
+                "checkpoint conversation metadata cardinality mismatch",
+            ));
         }
         let mut checkpoint_conversations = BTreeMap::new();
-        for (index, conversation_id) in checkpoint_pointer_indices.into_iter().zip(conversation_ids) {
+        for (index, conversation_id) in checkpoint_pointer_indices.into_iter().zip(conversation_ids)
+        {
             checkpoint_conversations.insert(index, conversation_id);
         }
         let mut objects = Vec::with_capacity(values.len());
@@ -553,12 +552,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 return Err(invalid("native metadata payload exceeds bound"));
             }
             validate_bytes(address, &bytes)?;
-            let checkpoint_conversation = checkpoint_conversations.get(&index).map(|id| {
-                CheckpointConversationEnvelope {
-                    commit_id: address.id().to_owned(),
-                    conversation_id: RequiredNullable(id.clone()),
-                }
-            });
+            let checkpoint_conversation =
+                checkpoint_conversations
+                    .get(&index)
+                    .map(|id| CheckpointConversationEnvelope {
+                        commit_id: address.id().to_owned(),
+                        conversation_id: RequiredNullable(id.clone()),
+                    });
             objects.push(NativeMetadata {
                 address: address.clone(),
                 bytes: bytes.to_vec(),
@@ -923,7 +923,10 @@ async fn stage_checkpoint_conversation_proofs(
         };
         let id = canonical_id(&envelope.commit_id)?;
         let value = envelope.conversation_id.0.clone();
-        if facts.insert(id, value.clone()).is_some_and(|prior| prior != value) {
+        if facts
+            .insert(id, value.clone())
+            .is_some_and(|prior| prior != value)
+        {
             return Err(invalid("conflicting checkpoint conversation envelopes"));
         }
     }
@@ -1004,11 +1007,12 @@ async fn stage_checkpoint_conversation_proofs(
         let pointer_bytes = match pointer {
             Some(StorageProjectedValue::FullValue(bytes)) => {
                 if bytes.len() != 16 {
-                    return Err(invalid("checkpoint conversation pointer has invalid length"));
+                    return Err(invalid(
+                        "checkpoint conversation pointer has invalid length",
+                    ));
                 }
-                uuid::Uuid::from_slice(&bytes).map_err(|_| {
-                    invalid("checkpoint conversation pointer is not a UUID")
-                })?;
+                uuid::Uuid::from_slice(&bytes)
+                    .map_err(|_| invalid("checkpoint conversation pointer is not a UUID"))?;
                 Some(bytes)
             }
             Some(StorageProjectedValue::KeyOnly) => {
@@ -1018,23 +1022,32 @@ async fn stage_checkpoint_conversation_proofs(
         };
         let coverage_bytes_existing = match coverage {
             Some(StorageProjectedValue::FullValue(bytes)) => {
-                crate::checkpoint_conversation::validate_partial_null_coverage(&bytes, state.epoch_id())?;
+                crate::checkpoint_conversation::validate_partial_null_coverage(
+                    &bytes,
+                    state.epoch_id(),
+                )?;
                 Some(bytes)
             }
             Some(StorageProjectedValue::KeyOnly) => {
-                return Err(invalid("checkpoint conversation coverage omitted its value"));
+                return Err(invalid(
+                    "checkpoint conversation coverage omitted its value",
+                ));
             }
             None => None,
         };
 
-        let existing_coverage_current = coverage_bytes_existing.as_ref().is_some_and(|bytes| bytes == &coverage_bytes);
+        let existing_coverage_current = coverage_bytes_existing
+            .as_ref()
+            .is_some_and(|bytes| bytes == &coverage_bytes);
         if let Some(staged) = staged_pointer.as_ref() {
             let staged_matches = expected.as_ref().is_some_and(|expected_id| {
                 uuid::Uuid::parse_str(expected_id)
                     .is_ok_and(|expected| staged.as_ref() == expected.as_bytes())
             });
             if !staged_matches {
-                return Err(invalid("staged checkpoint conversation pointer conflicts with authority"));
+                return Err(invalid(
+                    "staged checkpoint conversation pointer conflicts with authority",
+                ));
             }
         }
         if let Some(staged) = staged_coverage.as_ref() {
@@ -1043,19 +1056,27 @@ async fn stage_checkpoint_conversation_proofs(
                 state.epoch_id(),
             )?;
             if expected.is_some() && staged_is_current {
-                return Err(invalid("staged checkpoint NULL proof conflicts with authority pointer"));
+                return Err(invalid(
+                    "staged checkpoint NULL proof conflicts with authority pointer",
+                ));
             }
             if expected.is_none() && staged_is_current && pointer_bytes.is_some() {
-                return Err(invalid("staged checkpoint NULL proof conflicts with resident pointer"));
+                return Err(invalid(
+                    "staged checkpoint NULL proof conflicts with resident pointer",
+                ));
             }
         }
         if let Some(expected_id) = expected {
             let expected_uuid = uuid::Uuid::parse_str(expected_id)
                 .map_err(|_| invalid("invalid checkpoint conversation UUID"))?;
-            if pointer_bytes.as_ref().is_some_and(|actual| actual.as_ref() != expected_uuid.as_bytes())
+            if pointer_bytes
+                .as_ref()
+                .is_some_and(|actual| actual.as_ref() != expected_uuid.as_bytes())
                 || existing_coverage_current
             {
-                return Err(invalid("checkpoint conversation pointer conflicts with authority"));
+                return Err(invalid(
+                    "checkpoint conversation pointer conflicts with authority",
+                ));
             }
             match pointer_bytes {
                 Some(bytes) => guards.push(StoragePrecondition::KeyValueEquals {
@@ -1065,10 +1086,16 @@ async fn stage_checkpoint_conversation_proofs(
                 }),
                 None => {
                     guards.push(StoragePrecondition::KeyAbsent {
-                    space: pointer_space,
-                    key: pointer_key.clone(),
+                        space: pointer_space,
+                        key: pointer_key.clone(),
                     });
-                    writes.put(pointer_space, pointer_key, StorageValue { bytes: Bytes::copy_from_slice(expected_uuid.as_bytes()) });
+                    writes.put(
+                        pointer_space,
+                        pointer_key,
+                        StorageValue {
+                            bytes: Bytes::copy_from_slice(expected_uuid.as_bytes()),
+                        },
+                    );
                 }
             }
             match coverage_bytes_existing {
@@ -1088,7 +1115,9 @@ async fn stage_checkpoint_conversation_proofs(
             }
         } else {
             if pointer_bytes.is_some() {
-                return Err(invalid("authority NULL conflicts with resident checkpoint pointer"));
+                return Err(invalid(
+                    "authority NULL conflicts with resident checkpoint pointer",
+                ));
             }
             guards.push(StoragePrecondition::KeyAbsent {
                 space: pointer_space,
@@ -1153,27 +1182,18 @@ mod tests {
             serde_json::from_value(explicit_null.clone()).expect("explicit null is present");
         assert_eq!(envelope.conversation_id.0, None);
         let mut omitted = explicit_null;
-        omitted
-            .as_object_mut()
-            .unwrap()
-            .remove("conversationId");
+        omitted.as_object_mut().unwrap().remove("conversationId");
         assert!(serde_json::from_value::<CheckpointConversationEnvelope>(omitted).is_err());
     }
 
     #[tokio::test]
     async fn exact_checkpoint_conversation_reference_rejects_noncheckpoint_graph() {
         let lix = open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key, value) VALUES ('ordinary-commit', 'seed')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key, value) VALUES ('ordinary-commit', 'seed')")
+            .await
+            .unwrap();
         let rows = lix
-            .execute(
-                "SELECT commit_id FROM lix_log() WHERE NOT is_checkpoint ORDER BY created_at DESC LIMIT 1",
-                &[],
-            )
+            .query("SELECT commit_id FROM lix_log() WHERE NOT is_checkpoint ORDER BY created_at DESC LIMIT 1").all()
             .await
             .unwrap();
         let id = rows.rows()[0].get::<String>("commit_id").unwrap();
@@ -1182,12 +1202,14 @@ mod tests {
             objects: vec![NativeMetadataRef::CommitGraphRecord(id.clone())],
         };
         let response = lix.read_sync_native_metadata(&request).await.unwrap();
-        assert!(validate_checkpoint_conversation_envelope(
-            &NativeMetadataRef::CheckpointConversation(id),
-            &response.objects[0].bytes,
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_checkpoint_conversation_envelope(
+                &NativeMetadataRef::CheckpointConversation(id),
+                &response.objects[0].bytes,
+                None,
+            )
+            .is_err()
+        );
     }
 
     async fn commit_raw_fixture(
@@ -1204,17 +1226,12 @@ mod tests {
     async fn direct_change_locator_is_resolved_without_a_physical_locator_row() {
         let authority = open_lix().await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('locator-native', 'value')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('locator-native', 'value')")
             .await
             .unwrap();
         let rows = authority
-            .execute(
-                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'locator-native'",
-                &[],
-            )
+            .query("SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'locator-native'")
+            .all()
             .await
             .unwrap();
         let change = rows.rows()[0].get::<String>("id").unwrap();
@@ -1486,9 +1503,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored.values,
-            [Some(StorageProjectedValue::FullValue(Bytes::copy_from_slice(
-                &graph.bytes
-            )))]
+            [Some(StorageProjectedValue::FullValue(
+                Bytes::copy_from_slice(&graph.bytes)
+            ))]
         );
         let mut changed = response.clone();
         let graph = changed

@@ -45,8 +45,32 @@ fn classify_ast_statement(statement: &SqlStatement) -> SqlStatementKind {
         SqlStatement::Insert(_) | SqlStatement::Update(_) | SqlStatement::Delete(_) => {
             SqlStatementKind::Write
         }
+        // A data-modifying CTE (`WITH d AS (DELETE ... RETURNING *) SELECT`)
+        // is a write in a query's clothing; Lix runs neither path for it.
+        SqlStatement::Query(query) if query_modifies_data(query) => SqlStatementKind::Other,
         SqlStatement::Query(_) | SqlStatement::Explain { .. } => SqlStatementKind::Read,
         _ => SqlStatementKind::Other,
+    }
+}
+
+/// Whether a query body or any of its CTEs is an `INSERT`, `UPDATE`,
+/// `DELETE` or `MERGE`.
+fn query_modifies_data(query: &Query) -> bool {
+    query
+        .with
+        .as_ref()
+        .is_some_and(|with| with.cte_tables.iter().any(|cte| query_modifies_data(&cte.query)))
+        || set_expr_modifies_data(&query.body)
+}
+
+fn set_expr_modifies_data(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => true,
+        SetExpr::Query(query) => query_modifies_data(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_modifies_data(left) || set_expr_modifies_data(right)
+        }
+        _ => false,
     }
 }
 

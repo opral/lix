@@ -790,9 +790,8 @@ impl AuthoritativeBranchCoordinate {
                 Some(checkpoint_commit_id),
                 Some(author_id),
                 Some(ref_change_id),
-            )
-                if crate::storage_codec::id_string::uuid_bytes_from_canonical(&author_id)
-                    .is_some() =>
+            ) if crate::storage_codec::id_string::uuid_bytes_from_canonical(&author_id)
+                .is_some() =>
             {
                 if crate::storage_codec::id_string::uuid_bytes_from_canonical(&ref_change_id)
                     .is_none()
@@ -2106,7 +2105,8 @@ fn selected_payload_matches_authored(
     selected: &ParsedMember,
     authored: &ParsedMember,
 ) -> Result<bool, LixError> {
-    let same_payload = sync_change_records_equal(&selected.change_record(), &authored.change_record())?;
+    let same_payload =
+        sync_change_records_equal(&selected.change_record(), &authored.change_record())?;
     Ok(authored.authored
         && selected.change_id == authored.change_id
         && selected.schema_key == authored.schema_key
@@ -2164,7 +2164,10 @@ impl ParsedSyncHeader {
             if !header.is_checkpoint
                 || !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == *id)
             {
-                return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync checkpoint conversation id requires a checkpoint and UUID"));
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync checkpoint conversation id requires a checkpoint and UUID",
+                ));
             }
         }
         let incorporation = if let Some(source) = &header.complete_incorporation_source_commit_id {
@@ -3285,8 +3288,7 @@ fn encode_sync_snapshot_row(
 }
 
 fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixError> {
-    if crate::storage_codec::id_string::uuid_bytes_from_canonical(&row.change_account_id)
-        .is_none()
+    if crate::storage_codec::id_string::uuid_bytes_from_canonical(&row.change_account_id).is_none()
     {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -4885,11 +4887,14 @@ where
                         if update.expected_head_commit_id.as_deref() != authoritative
                             || update.expected_checkpoint_commit_id.as_deref()
                                 != authoritative_checkpoint
-                            || update.expected_ref_change_id.as_deref().is_some_and(|expected| {
-                                Some(expected)
-                                    != authoritative_coordinate
-                                        .and_then(AuthoritativeBranchCoordinate::ref_change_id)
-                            })
+                            || update
+                                .expected_ref_change_id
+                                .as_deref()
+                                .is_some_and(|expected| {
+                                    Some(expected)
+                                        != authoritative_coordinate
+                                            .and_then(AuthoritativeBranchCoordinate::ref_change_id)
+                                })
                         {
                             return Err(LixError::new(
                                 LixError::CODE_INVALID_PARAM,
@@ -4998,14 +5003,10 @@ where
                         .expect("folded delta branch was loaded once");
                     let previous = previous_authoritative.get(branch_id);
                     let local_metadata_advanced_without_head = previous.is_some_and(|previous| {
-                        local.0.as_deref()
-                            == previous.head_commit_id()
-                            && local.1.as_deref()
-                                == previous.checkpoint_commit_id()
-                            && (local.2.as_deref()
-                                != previous.author_id()
-                                || local.3.as_deref()
-                                    != previous.ref_change_id())
+                        local.0.as_deref() == previous.head_commit_id()
+                            && local.1.as_deref() == previous.checkpoint_commit_id()
+                            && (local.2.as_deref() != previous.author_id()
+                                || local.3.as_deref() != previous.ref_change_id())
                     });
                     // Own acknowledged prefixes must never roll back a newer
                     // local transaction. A competing server branch wins. Walk
@@ -5874,9 +5875,9 @@ where
         let mut preconditions = Vec::new();
         let partial_admission = crate::sync::load_partial_replica_state(&read).await?;
         for header in header_by_id.values().filter(|header| header.is_checkpoint) {
-            let admission = partial_admission.as_ref().map(|(state, receipt)| {
-                (state.epoch_id(), receipt)
-            });
+            let admission = partial_admission
+                .as_ref()
+                .map(|(state, receipt)| (state.epoch_id(), receipt));
             crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
                 &read,
                 &mut writes,
@@ -5993,10 +5994,7 @@ where
             let change = sync_ref_change_record(
                 &branch.branch_id,
                 head,
-                ChangeId::parse_lix(
-                    &branch.ref_change_id,
-                    "sync snapshot branch ref change",
-                )?,
+                ChangeId::parse_lix(&branch.ref_change_id, "sync snapshot branch ref change")?,
                 &branch.author_id,
                 record.created_at,
             )?;
@@ -6443,19 +6441,20 @@ where
                     }
                     trusted_records.insert(header.commit_id, existing.clone());
                     if header.is_checkpoint {
-                        let admission = partial_admission.as_ref().map(|(state, receipt)| {
-                            (state.epoch_id(), receipt)
-                        });
-                        conversation_changed |= crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
-                            &read,
-                            &mut writes,
-                            &mut conversation_preconditions,
-                            header.commit_id,
-                            true,
-                            header.checkpoint_conversation_id.as_deref(),
-                            admission,
-                        )
-                        .await?;
+                        let admission = partial_admission
+                            .as_ref()
+                            .map(|(state, receipt)| (state.epoch_id(), receipt));
+                        conversation_changed |=
+                            crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                                &read,
+                                &mut writes,
+                                &mut conversation_preconditions,
+                                header.commit_id,
+                                true,
+                                header.checkpoint_conversation_id.as_deref(),
+                                admission,
+                            )
+                            .await?;
                     }
                     let existing_scope = match load_published_commit_state_topology(
                         &read,
@@ -6526,19 +6525,20 @@ where
                     trusted_records.insert(header.commit_id, record.clone());
                     new_records.push(record);
                     if header.is_checkpoint {
-                        let admission = partial_admission.as_ref().map(|(state, receipt)| {
-                            (state.epoch_id(), receipt)
-                        });
-                        conversation_changed |= crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
-                            &read,
-                            &mut writes,
-                            &mut conversation_preconditions,
-                            header.commit_id,
-                            false,
-                            header.checkpoint_conversation_id.as_deref(),
-                            admission,
-                        )
-                        .await?;
+                        let admission = partial_admission
+                            .as_ref()
+                            .map(|(state, receipt)| (state.epoch_id(), receipt));
+                        conversation_changed |=
+                            crate::checkpoint_conversation::stage_checkpoint_conversation_fact(
+                                &read,
+                                &mut writes,
+                                &mut conversation_preconditions,
+                                header.commit_id,
+                                false,
+                                header.checkpoint_conversation_id.as_deref(),
+                                admission,
+                            )
+                            .await?;
                     }
                     stage_commit_history_deferred_with_scope(
                         &mut writes,
@@ -6902,9 +6902,11 @@ where
                     "sync ref head and checkpoint coordinates must be paired",
                 ));
             }
-            if update.author_id.as_deref().is_some_and(|author_id| {
-                BranchHeadControl::author_id_bytes(author_id).is_err()
-            }) || head.is_some() != update.author_id.is_some()
+            if update
+                .author_id
+                .as_deref()
+                .is_some_and(|author_id| BranchHeadControl::author_id_bytes(author_id).is_err())
+                || head.is_some() != update.author_id.is_some()
             {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -7057,13 +7059,15 @@ where
             }
             if current != *expected
                 || current_checkpoint != *expected_checkpoint
-                || expected_ref_change_id.is_some_and(|expected| {
-                    current_ref_change_id != Some(expected)
-                })
+                || expected_ref_change_id
+                    .is_some_and(|expected| current_ref_change_id != Some(expected))
             {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
-                    format!("sync ref '{}' changed from its expected row version", update.branch_id),
+                    format!(
+                        "sync ref '{}' changed from its expected row version",
+                        update.branch_id
+                    ),
                 ));
             }
             changed_refs.push((update.clone(), *head, *checkpoint));
@@ -7801,9 +7805,7 @@ where
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
-                    Some(existing)
-                        if !sync_change_records_equal(&existing, &change)? =>
-                    {
+                    Some(existing) if !sync_change_records_equal(&existing, &change)? => {
                         return Err(immutable_object_mismatch("change", change.change_id));
                     }
                     Some(_) => {}
@@ -10020,16 +10022,15 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Authority)
             .unwrap();
         let head = authority
-            .execute("SELECT id FROM lix_commit ORDER BY id", &[])
+            .query("SELECT id FROM lix_commit ORDER BY id")
+            .all()
             .await
             .unwrap();
-        authority.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('authority-local-only','preserved',true)", &[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('authority-local-only','preserved',true)").await.unwrap();
         assert_eq!(
             authority
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'authority-local-only'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'authority-local-only'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -10037,7 +10038,8 @@ mod tests {
             1
         );
         let after = authority
-            .execute("SELECT id FROM lix_commit ORDER BY id", &[])
+            .query("SELECT id FROM lix_commit ORDER BY id")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -10063,13 +10065,11 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
 
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/remote.md".to_owned()),
-                    Value::Text(String::new()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/remote.md".to_owned()),
+                Value::Text(String::new()),
+            ])
             .await
             .expect("remote file create should commit");
         let created = authority
@@ -10090,10 +10090,9 @@ mod tests {
             .expect("replica should apply file create");
 
         let file_id = authority
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1",
-                &[Value::Text("/remote.md".to_owned())],
-            )
+            .query("SELECT id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/remote.md".to_owned())])
+            .all()
             .await
             .expect("remote file id should load")
             .rows()[0]
@@ -10126,13 +10125,11 @@ mod tests {
         );
 
         authority
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2",
-                &[
-                    Value::Text("# right-marker\n".to_owned()),
-                    Value::Text(file_id),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE id = $2")
+            .params(&[
+                Value::Text("# right-marker\n".to_owned()),
+                Value::Text(file_id),
+            ])
             .await
             .expect("remote editor write should commit");
         let edited = authority
@@ -10391,10 +10388,8 @@ mod tests {
 
         let plain = open_lix().with_storage(storage.clone()).await.unwrap();
         let error = plain
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/forbidden.txt', $1)",
-                &[Value::Blob(b"forbidden".to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ('/forbidden.txt', $1)")
+            .params(&[Value::Blob(b"forbidden".to_vec().into())])
             .await
             .expect_err("a plain engine must remain fenced by the durable replica receipt");
         assert_eq!(error.code, "LIX_REPLICA_CACHE_READ_ONLY");
@@ -10404,10 +10399,8 @@ mod tests {
         assert_eq!(backing.active_branch_id().await.unwrap(), draft.id);
         let changed = replica.sync_mode_state().change_watcher();
         backing
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ('/watched.txt', $1)",
-                &[Value::Blob(b"filesystem edit".to_vec().into())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ('/watched.txt', $1)")
+            .params(&[Value::Blob(b"filesystem edit".to_vec().into())])
             .await
             .expect("the inherited adapter must admit a real replica write");
         assert!(
@@ -10452,19 +10445,14 @@ mod tests {
             .await
             .expect("a second plain engine should open the same replica storage");
         let second_error = second_engine
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('second-engine', 'forbidden')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('second-engine', 'forbidden')")
             .await
             .expect_err("the durable receipt must fence a process-local disabled role");
         assert_eq!(second_error.code, "LIX_REPLICA_CACHE_READ_ONLY");
         assert!(
             second_engine
-                .execute(
-                    "SELECT * FROM lix_key_value WHERE key = 'second-engine'",
-                    &[]
-                )
+                .query("SELECT * FROM lix_key_value WHERE key = 'second-engine'")
+                .all()
                 .await
                 .expect("fenced row absence should query")
                 .rows()
@@ -10472,10 +10460,7 @@ mod tests {
         );
 
         replica
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('local-only', 'durable')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('local-only', 'durable')")
             .await
             .expect("admitted replica writes locally");
         replica
@@ -10613,13 +10598,11 @@ mod tests {
         );
 
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/atomic-fast-forward.md".to_owned()),
-                    Value::Text("created".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/atomic-fast-forward.md".to_owned()),
+                Value::Text("created".to_owned()),
+            ])
             .await
             .expect("authority file create should commit");
         let created = authority
@@ -10663,13 +10646,11 @@ mod tests {
             .expect("created branch should remain headed");
 
         authority
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
-                &[
-                    Value::Text("edited".to_owned()),
-                    Value::Text("/atomic-fast-forward.md".to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2")
+            .params(&[
+                Value::Text("edited".to_owned()),
+                Value::Text("/atomic-fast-forward.md".to_owned()),
+            ])
             .await
             .expect("authority file edit should commit");
         let edited = authority
@@ -10768,10 +10749,8 @@ mod tests {
         );
 
         authority
-            .execute(
-                "DELETE FROM lix_file WHERE path = $1",
-                &[Value::Text("/atomic-fast-forward.md".to_owned())],
-            )
+            .execute("DELETE FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/atomic-fast-forward.md".to_owned())])
             .await
             .expect("authority file delete should commit");
         let deleted = authority
@@ -10801,13 +10780,11 @@ mod tests {
         };
 
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/atomic-fast-forward.md".to_owned()),
-                    Value::Text("recreated".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/atomic-fast-forward.md".to_owned()),
+                Value::Text("recreated".to_owned()),
+            ])
             .await
             .expect("authority file recreate should commit");
         let recreated = authority
@@ -10837,10 +10814,8 @@ mod tests {
             panic!("file recreate should produce a delta");
         };
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))",
-                &[Value::Text("/empty-fast-forward.md".to_owned())],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST('' AS BYTEA))")
+            .params(&[Value::Text("/empty-fast-forward.md".to_owned())])
             .await
             .expect("empty authority file should commit");
         let empty = authority
@@ -10896,13 +10871,11 @@ mod tests {
         )
         .await;
         replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/inline-admission.md".to_owned()),
-                    Value::Text("authenticated inline payload".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/inline-admission.md".to_owned()),
+                Value::Text("authenticated inline payload".to_owned()),
+            ])
             .await
             .expect("replica file write should commit");
         let request = replica
@@ -10987,24 +10960,20 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].inline_blobs, request.inline_blobs);
         let history = authority
-            .execute(
-                "SELECT lixcol_to_commit_id FROM lix_history('lix_file') WHERE to_path = $1 ORDER BY lixcol_position LIMIT 1",
-                &[Value::Text("/inline-admission.md".to_owned())],
-            )
+            .query("SELECT lixcol_to_commit_id FROM lix_history('lix_file') WHERE to_path = $1 ORDER BY lixcol_position LIMIT 1").params(&[Value::Text("/inline-admission.md".to_owned())]).all()
             .await
             .expect("public file history query should remain readable after inline sync");
         let history = authority
-            .execute(
-                "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = $2",
-                &[
-                    Value::Text(
-                        history.rows()[0]
-                            .get::<String>("lixcol_to_commit_id")
-                            .unwrap(),
-                    ),
-                    Value::Text("/inline-admission.md".to_owned()),
-                ],
-            )
+            .query("SELECT content FROM lix_as_of('lix_file', $1) WHERE path = $2")
+            .params(&[
+                Value::Text(
+                    history.rows()[0]
+                        .get::<String>("lixcol_to_commit_id")
+                        .unwrap(),
+                ),
+                Value::Text("/inline-admission.md".to_owned()),
+            ])
+            .all()
             .await
             .expect("synced history endpoint snapshot");
         assert!(
@@ -11031,13 +11000,11 @@ mod tests {
         let replica =
             accounting_replica_from_snapshot(&authority, &snapshot, replica_storage.clone()).await;
         replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text("/large-local.bin".to_owned()),
-                    Value::Blob(vec![7_u8; 65 * 1024].into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text("/large-local.bin".to_owned()),
+                Value::Blob(vec![7_u8; 65 * 1024].into()),
+            ])
             .await
             .expect("large local file should commit");
         replica_storage.reset();
@@ -11065,13 +11032,11 @@ mod tests {
             .set_sync_role(super::super::SyncRole::Authority)
             .expect("accounted authority role should install");
         accounted_authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text("/large-authority.bin".to_owned()),
-                    Value::Blob(vec![9_u8; 65 * 1024].into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text("/large-authority.bin".to_owned()),
+                Value::Blob(vec![9_u8; 65 * 1024].into()),
+            ])
             .await
             .expect("large authority file should commit");
         authority_storage.reset();
@@ -11201,10 +11166,7 @@ mod tests {
             .await
             .expect("plain engine can read the receipt-bound storage");
         let error = plain
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('local-divergent', 'local')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('local-divergent', 'local')")
             .await
             .expect_err("a durable authority receipt must make local divergence impossible");
         assert_eq!(error.code, "LIX_REPLICA_CACHE_READ_ONLY");
@@ -11236,10 +11198,8 @@ mod tests {
         );
         assert!(
             replica
-                .execute(
-                    "SELECT * FROM lix_key_value WHERE key = 'local-divergent'",
-                    &[],
-                )
+                .query("SELECT * FROM lix_key_value WHERE key = 'local-divergent'")
+                .all()
                 .await
                 .expect("the rejected row absence should query")
                 .rows()
@@ -11413,7 +11373,7 @@ mod tests {
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(8);
+        let (demand_tx, mut demand_rx) = crate::sync::runtime::sync_demand_channel(8);
         lix.set_sync_demand_sender_for_test(demand_tx);
         tokio::spawn(async move {
             while let Some(demand) = demand_rx.recv().await {
@@ -11482,12 +11442,19 @@ mod tests {
             // The source record has another schema/PK and payload entirely;
             // only its account, timestamp, and origin apply to the derived row.
             let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, row, source.clone()).unwrap();
-            assert!(wire.semantic_fingerprint.is_some(), "live snapshots carry a canonical typed proof even when the root stores identity only");
+            assert!(
+                wire.semantic_fingerprint.is_some(),
+                "live snapshots carry a canonical typed proof even when the root stores identity only"
+            );
             assert_eq!(
                 wire.snapshot_payload.as_deref(),
-                Some(super::super::commit::encode_sync_row_payload_preserving_storage(
-                    row.decoded_snapshot().expect("materialized typed row")
-                ).unwrap().as_str()),
+                Some(
+                    super::super::commit::encode_sync_row_payload_preserving_storage(
+                        row.decoded_snapshot().expect("materialized typed row")
+                    )
+                    .unwrap()
+                    .as_str()
+                ),
             );
             let parsed = parse_snapshot_row(&wire).unwrap();
             assert_eq!(parsed.row_pk, *row.row_pk());
@@ -11534,16 +11501,27 @@ mod tests {
         )
         .unwrap();
         assert_ne!(sql_null, json_null);
-        assert_eq!(sql_null.to_json_value().unwrap(), json_null.to_json_value().unwrap());
+        assert_eq!(
+            sql_null.to_json_value().unwrap(),
+            json_null.to_json_value().unwrap()
+        );
         let source_bytes = sql_null.durable_payload().unwrap();
         let json_null_bytes = json_null.durable_payload().unwrap();
         assert_ne!(
             crate::tracked_state::tracked_payload_semantic_fingerprint(
-                "lix_key_value", &row_pk, Some(&source_bytes), None,
-            ).unwrap(),
+                "lix_key_value",
+                &row_pk,
+                Some(&source_bytes),
+                None,
+            )
+            .unwrap(),
             crate::tracked_state::tracked_payload_semantic_fingerprint(
-                "lix_key_value", &row_pk, Some(&json_null_bytes), None,
-            ).unwrap(),
+                "lix_key_value",
+                &row_pk,
+                Some(&json_null_bytes),
+                None,
+            )
+            .unwrap(),
             "typed proof must distinguish SQL NULL from JSON null",
         );
         let source = ChangeRecord {
@@ -11560,8 +11538,8 @@ mod tests {
         };
         let commit_id = CommitId::for_test_label("json-null-materialized");
         let json = json_null.to_json_shared().unwrap();
-        let expected = super::super::commit::encode_sync_row_payload_preserving_storage(&json_null)
-            .unwrap();
+        let expected =
+            super::super::commit::encode_sync_row_payload_preserving_storage(&json_null).unwrap();
         let materialized = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
             MaterializedTrackedStateRow {
                 row_pk,
@@ -11579,9 +11557,17 @@ mod tests {
             },
         ])
         .unwrap();
-        let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, materialized.iter().next().unwrap(), source).unwrap();
+        let wire = encode_sync_snapshot_row(
+            GLOBAL_BRANCH_ID,
+            materialized.iter().next().unwrap(),
+            source,
+        )
+        .unwrap();
         assert_eq!(wire.snapshot_payload.as_deref(), Some(expected.as_str()));
-        assert_ne!(wire.snapshot_payload.unwrap(), super::super::commit::encode_sync_row_payload_bytes(source_bytes.as_ref()));
+        assert_ne!(
+            wire.snapshot_payload.unwrap(),
+            super::super::commit::encode_sync_row_payload_bytes(source_bytes.as_ref())
+        );
     }
 
     #[test]
@@ -11817,14 +11803,12 @@ mod tests {
             "primary_key": ["id"]
         });
         authority
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-                &[Value::Text(schema.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+            .params(&[Value::Text(schema.to_string())])
             .await
             .unwrap();
         authority
-            .execute("INSERT INTO amended_sync_row (id) VALUES ('old')", &[])
+            .execute("INSERT INTO amended_sync_row (id) VALUES ('old')")
             .await
             .unwrap();
         let (_, old_head) = default_head(&authority.pull_sync_repository(None, 128).await.unwrap());
@@ -11832,20 +11816,17 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"name":"extra","type":"text","nullable":true}));
-        authority.execute("UPDATE lix_registered_schema SET value = CAST($1 AS JSONB) WHERE schema_key = 'amended_sync_row'", &[Value::Text(schema.to_string())]).await.unwrap();
+        authority.execute("UPDATE lix_registered_schema SET value = CAST($1 AS JSONB) WHERE schema_key = 'amended_sync_row'").params(&[Value::Text(schema.to_string())]).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO amended_sync_row (id, extra) VALUES ('new', 'value')",
-                &[],
-            )
+            .execute("INSERT INTO amended_sync_row (id, extra) VALUES ('new', 'value')")
             .await
             .unwrap();
         let snapshot = authority.pull_sync_repository(None, 128).await.unwrap();
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let query = "SELECT id FROM amended_sync_row ORDER BY id";
         assert_eq!(
-            replica.execute(query, &[]).await.unwrap().rows(),
-            authority.execute(query, &[]).await.unwrap().rows()
+            replica.query(query).all().await.unwrap().rows(),
+            authority.query(query).all().await.unwrap().rows()
         );
         hydrate_history_commit(&authority, &replica, &old_head).await;
         assert_eq!(
@@ -11868,26 +11849,20 @@ mod tests {
             "columns": [{"name":"id","type":"text","nullable":false}, {"name":"value","type":"text","nullable":false}],
             "primary_key": ["id"]
         });
-        authority.execute("INSERT INTO lix_registered_schema (schema_key, value, lixcol_global) VALUES ('sync_custom_row', CAST($1 AS JSONB), false)", &[Value::Text(schema.to_string())]).await.unwrap();
+        authority.execute("INSERT INTO lix_registered_schema (schema_key, value, lixcol_global) VALUES ('sync_custom_row', CAST($1 AS JSONB), false)").params(&[Value::Text(schema.to_string())]).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO sync_custom_row (id, value) VALUES ('row', 'initial')",
-                &[],
-            )
+            .execute("INSERT INTO sync_custom_row (id, value) VALUES ('row', 'initial')")
             .await
             .unwrap();
         let initial = authority.pull_sync_repository(None, 128).await.unwrap();
         let replica = replica_from_snapshot(&authority, &initial).await;
         let query = "SELECT value FROM sync_custom_row WHERE id = 'row'";
         assert_eq!(
-            replica.execute(query, &[]).await.unwrap().rows(),
-            authority.execute(query, &[]).await.unwrap().rows()
+            replica.query(query).all().await.unwrap().rows(),
+            authority.query(query).all().await.unwrap().rows()
         );
         authority
-            .execute(
-                "UPDATE sync_custom_row SET value = 'server-edit' WHERE id = 'row'",
-                &[],
-            )
+            .execute("UPDATE sync_custom_row SET value = 'server-edit' WHERE id = 'row'")
             .await
             .unwrap();
         let cursor = replica
@@ -11900,14 +11875,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            replica.execute(query, &[]).await.unwrap().rows(),
-            authority.execute(query, &[]).await.unwrap().rows()
+            replica.query(query).all().await.unwrap().rows(),
+            authority.query(query).all().await.unwrap().rows()
         );
         replica
-            .execute(
-                "UPDATE sync_custom_row SET value = 'local-edit' WHERE id = 'row'",
-                &[],
-            )
+            .execute("UPDATE sync_custom_row SET value = 'local-edit' WHERE id = 'row'")
             .await
             .unwrap();
         let push = replica
@@ -11917,8 +11889,8 @@ mod tests {
             .unwrap();
         authority.push_sync_repository(&push).await.unwrap();
         assert_eq!(
-            replica.execute(query, &[]).await.unwrap().rows(),
-            authority.execute(query, &[]).await.unwrap().rows()
+            replica.query(query).all().await.unwrap().rows(),
+            authority.query(query).all().await.unwrap().rows()
         );
         replica.close().await.unwrap();
         authority.close().await.unwrap();
@@ -12035,7 +12007,8 @@ mod tests {
                 .unwrap();
             let replica = replica_from_snapshot(&authority, &snapshot).await;
             let history = authority
-                .execute("SELECT commit_id FROM lix_log()", &[])
+                .query("SELECT commit_id FROM lix_log()")
+                .all()
                 .await
                 .unwrap();
             for row in history.rows() {
@@ -12053,10 +12026,8 @@ mod tests {
                 checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
             }
             let undone = replica
-                .execute(
-                    "SELECT commit_id FROM lix_undo($1)",
-                    &[Value::Text(checkpoint)],
-                )
+                .execute("SELECT commit_id FROM lix_undo($1)")
+                .params(&[Value::Text(checkpoint)])
                 .await
                 .unwrap();
             assert!(undone.rows()[0].get::<String>("commit_id").is_ok());
@@ -12076,10 +12047,7 @@ mod tests {
             );
             assert_eq!(
             authority
-                .execute(
-                    "SELECT working_base_commit_id FROM lix_branch WHERE id=lix_active_branch_id()",
-                    &[]
-                )
+                .query("SELECT working_base_commit_id FROM lix_branch WHERE id=lix_active_branch_id()").all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -12115,7 +12083,8 @@ mod tests {
         // not merely the current snapshot. Keep the publication-only demand
         // responder so an accidental online dependency still fails the test.
         let history = authority
-            .execute("SELECT commit_id FROM lix_log()", &[])
+            .query("SELECT commit_id FROM lix_log()")
+            .all()
             .await
             .unwrap();
         for row in history.rows() {
@@ -12128,10 +12097,8 @@ mod tests {
         }
 
         let undone = replica
-            .execute(
-                "SELECT commit_id FROM lix_undo($1)",
-                &[Value::Text(checkpoint.clone())],
-            )
+            .execute("SELECT commit_id FROM lix_undo($1)")
+            .params(&[Value::Text(checkpoint.clone())])
             .await
             .expect("offline undo")
             .rows()[0]
@@ -12139,10 +12106,7 @@ mod tests {
             .expect("undo receipt");
         assert_eq!(
             replica
-                .execute(
-                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-                    &[],
-                )
+                .query("SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
                 .await
                 .expect("replica baseline")
                 .rows()[0]
@@ -12151,10 +12115,8 @@ mod tests {
             baseline
         );
         let redone = replica
-            .execute(
-                "SELECT commit_id FROM lix_redo($1)",
-                &[Value::Text(undone.clone())],
-            )
+            .execute("SELECT commit_id FROM lix_redo($1)")
+            .params(&[Value::Text(undone.clone())])
             .await
             .expect("offline redo")
             .rows()[0]
@@ -12162,10 +12124,7 @@ mod tests {
             .expect("redo receipt");
         assert_eq!(
             replica
-                .execute(
-                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-                    &[],
-                )
+                .query("SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
                 .await
                 .expect("replica final baseline")
                 .rows()[0]
@@ -12212,10 +12171,7 @@ mod tests {
         assert_eq!(read_key_value(&authority, "sync-undo").await, "after");
         assert_eq!(
             authority
-                .execute(
-                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-                    &[],
-                )
+                .query("SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
                 .await
                 .expect("authority baseline")
                 .rows()[0]
@@ -12540,10 +12496,7 @@ mod tests {
         write_key_value(&replica, "pending", "second").await;
         for value in ["intermediate", "second"] {
             write_key_value(&replica, "pending", value).await;
-            replica.execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
-                &[],
-            ).await.expect("scoped checkpoint");
+            replica.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.expect("scoped checkpoint");
         }
         let (branch_id, _) = default_head(&snapshot);
         let read = replica
@@ -12711,10 +12664,8 @@ mod tests {
             assert_eq!(read_key_value(&right, "winner").await, "server");
             assert!(
                 right
-                    .execute(
-                        "SELECT value FROM lix_key_value WHERE key = 'local-only'",
-                        &[]
-                    )
+                    .query("SELECT value FROM lix_key_value WHERE key = 'local-only'")
+                    .all()
                     .await
                     .expect("discarded local row is absent")
                     .rows()
@@ -12735,10 +12686,8 @@ mod tests {
                 .expect("secondary after reset");
             assert!(
                 right
-                    .execute(
-                        "SELECT value FROM lix_key_value WHERE key = 'unrelated-pending'",
-                        &[]
-                    )
+                    .query("SELECT value FROM lix_key_value WHERE key = 'unrelated-pending'")
+                    .all()
                     .await
                     .expect("other branch pending work is reset")
                     .rows()
@@ -12770,9 +12719,7 @@ mod tests {
                 "columns": [{ "name": "id", "type": "text", "nullable": false }],
                 "primary_key": ["id"]
             });
-            replica.execute(
-                "INSERT INTO lix_registered_schema (schema_key, value, lixcol_global) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB), true)",
-                &[Value::Text(schema.to_string())]).await.expect("local global/schema mutation");
+            replica.execute("INSERT INTO lix_registered_schema (schema_key, value, lixcol_global) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB), true)").params(&[Value::Text(schema.to_string())]).await.expect("local global/schema mutation");
         }
         write_key_value(&right, "dependent", "discarded").await;
         right
@@ -12815,10 +12762,8 @@ mod tests {
                 .is_none()
         );
         let result = right
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'dependent'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'dependent'")
+            .all()
             .await
             .expect("current state readable");
         assert!(result.rows().is_empty());
@@ -12831,8 +12776,8 @@ mod tests {
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) \
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            &[Value::Text(key.to_owned()), Value::Text(value.to_owned())],
         )
+        .params(&[Value::Text(key.to_owned()), Value::Text(value.to_owned())])
         .await
         .expect("key-value write should commit");
     }
@@ -12842,10 +12787,9 @@ mod tests {
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         let value = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = $1",
-                &[Value::Text(key.to_owned())],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text(key.to_owned())])
+            .all()
             .await
             .expect("key-value read should succeed")
             .rows()
@@ -12866,7 +12810,8 @@ mod tests {
     where
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
-        lix.execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        lix.query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("active branch head should load")
             .rows()[0]
@@ -12926,13 +12871,12 @@ mod tests {
     }
 
     async fn read_file_content(lix: &Lix<Memory>, path: &str) -> Value {
-        lix.execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
-        .await
-        .expect("file content should remain readable")
-        .rows()[0]
+        lix.query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(path.to_owned())])
+            .all()
+            .await
+            .expect("file content should remain readable")
+            .rows()[0]
             .get::<Value>("content")
             .expect("file content should decode")
     }
@@ -13117,7 +13061,8 @@ mod tests {
 
         write_key_value(&authority, "restore-sync", "abandoned").await;
         let abandoned_head = authority
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("abandoned head should read")
             .rows()[0]
@@ -13164,22 +13109,19 @@ mod tests {
         let _limit = TestRepositoryTransactionEventTransferLimit::install(128);
 
         let error = authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                &[
-                    Value::Text("rejected-authority-event".to_owned()),
-                    Value::Text("must-not-commit".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)")
+            .params(&[
+                Value::Text("rejected-authority-event".to_owned()),
+                Value::Text("must-not-commit".to_owned()),
+            ])
             .await
             .expect_err("an unpullable authority event must fail before commit");
         assert_eq!(error.code, "LIX_ERROR_SYNC_ITEM_TOO_LARGE");
 
         let result = authority
-            .execute(
-                "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = $1",
-                &[Value::Text("rejected-authority-event".to_owned())],
-            )
+            .query("SELECT COUNT(*) AS count FROM lix_key_value WHERE key = $1")
+            .params(&[Value::Text("rejected-authority-event".to_owned())])
+            .all()
             .await
             .expect("rejected row count should remain readable");
         assert_eq!(
@@ -13301,13 +13243,11 @@ mod tests {
             physical_account.is_some(),
         );
         replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/after-bootstrap.txt".to_owned()),
-                    Value::Text("works".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/after-bootstrap.txt".to_owned()),
+                Value::Text("works".to_owned()),
+            ])
             .await
             .expect("the first file write after bootstrap should succeed");
         replica
@@ -13315,10 +13255,8 @@ mod tests {
             .await
             .expect("the first checkpoint after bootstrap should succeed");
         let files = replica
-            .execute(
-                "SELECT path FROM lix_file WHERE path = '/after-bootstrap.txt'",
-                &[],
-            )
+            .query("SELECT path FROM lix_file WHERE path = '/after-bootstrap.txt'")
+            .all()
             .await
             .expect("the new file should be readable");
         assert_eq!(files.rows().len(), 1);
@@ -13777,7 +13715,8 @@ mod tests {
 
         write_key_value(&replica, "checkpoint-source-local-1", "replica-1a").await;
         let first_source_parent_id = replica
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("first checkpoint source parent should load")
             .rows()[0]
@@ -13785,7 +13724,8 @@ mod tests {
             .expect("first checkpoint source parent should decode");
         write_key_value(&replica, "checkpoint-source-local-1", "replica-1b").await;
         let first_source_id = replica
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("checkpoint source head should load")
             .rows()[0]
@@ -13796,7 +13736,8 @@ mod tests {
             .await
             .expect("first replica checkpoint should succeed");
         let first_checkpoint_id = replica
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("first checkpoint head should load")
             .rows()[0]
@@ -13805,7 +13746,8 @@ mod tests {
 
         write_key_value(&replica, "checkpoint-source-local-2", "replica-2").await;
         let second_source_id = replica
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("second checkpoint source head should load")
             .rows()[0]
@@ -13816,7 +13758,8 @@ mod tests {
             .await
             .expect("second replica checkpoint should succeed");
         let second_checkpoint_id = replica
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("checkpoint head should load")
             .rows()[0]
@@ -14122,13 +14065,11 @@ mod tests {
     async fn snapshot_live_state_omits_tombstones_and_remains_writable() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/deleted-before-snapshot.txt".to_owned()),
-                    Value::Text("old".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/deleted-before-snapshot.txt".to_owned()),
+                Value::Text("old".to_owned()),
+            ])
             .await
             .expect("file create should succeed");
         authority
@@ -14136,10 +14077,8 @@ mod tests {
             .await
             .expect("create checkpoint should succeed");
         authority
-            .execute(
-                "DELETE FROM lix_file WHERE path = $1",
-                &[Value::Text("/deleted-before-snapshot.txt".to_owned())],
-            )
+            .execute("DELETE FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/deleted-before-snapshot.txt".to_owned())])
             .await
             .expect("file delete should succeed");
         authority
@@ -14153,10 +14092,9 @@ mod tests {
             .expect("snapshot should load");
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let absent = replica
-            .execute(
-                "SELECT path FROM lix_file WHERE path = $1",
-                &[Value::Text("/deleted-before-snapshot.txt".to_owned())],
-            )
+            .query("SELECT path FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/deleted-before-snapshot.txt".to_owned())])
+            .all()
             .await
             .expect("live-state read should succeed");
         assert!(
@@ -14165,13 +14103,11 @@ mod tests {
         );
 
         replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/deleted-before-snapshot.txt".to_owned()),
-                    Value::Text("new".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/deleted-before-snapshot.txt".to_owned()),
+                Value::Text("new".to_owned()),
+            ])
             .await
             .expect("recreating a deleted file after bootstrap should succeed");
         replica
@@ -14285,13 +14221,11 @@ mod tests {
             .await
             .expect("imported branch should be switchable");
         target
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/after-sync.txt".to_string()),
-                    Value::Text("works".to_string()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/after-sync.txt".to_string()),
+                Value::Text("works".to_string()),
+            ])
             .await
             .expect("first file write after sync must have a checkpoint cursor");
 
@@ -14492,13 +14426,11 @@ mod tests {
     async fn ref_conflict_does_not_import_commit() {
         let source = open_lix().await.expect("source should open");
         source
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/conflict.txt".to_string()),
-                    Value::Text("content".to_string()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/conflict.txt".to_string()),
+                Value::Text("content".to_string()),
+            ])
             .await
             .expect("source write should succeed");
         let source_snapshot = source
@@ -14619,10 +14551,8 @@ mod tests {
             .await
             .expect("main branch should become active again");
         authority
-            .execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.id)],
-            )
+            .execute("DELETE FROM lix_branch WHERE id = $1")
+            .params(&[Value::Text(branch.id)])
             .await
             .expect("disposable branch should be deleted");
 
@@ -15056,7 +14986,8 @@ mod tests {
             .expect("local repository should open");
         write_key_value(&local, "local-only", "must-survive").await;
         let local_head_before = local
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("local head should load")
             .rows()[0]
@@ -15086,7 +15017,8 @@ mod tests {
             .expect("a rejected bootstrap should return the fixture to standalone mode");
         assert_eq!(read_key_value(&local, "local-only").await, "must-survive");
         let local_head_after = local
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("local head should remain readable")
             .rows()[0]
@@ -15236,10 +15168,8 @@ mod tests {
         }
         for index in 0..6 {
             authority
-                .execute(
-                    "DELETE FROM lix_key_value WHERE key = $1",
-                    &[Value::Text(format!("page-{index:02}"))],
-                )
+                .execute("DELETE FROM lix_key_value WHERE key = $1")
+                .params(&[Value::Text(format!("page-{index:02}"))])
                 .await
                 .expect("tombstone-heavy page fixture should delete a row");
         }
@@ -16807,8 +16737,8 @@ mod tests {
                     Some(ChangeId::for_test_label("coordinate-ref-change").to_string()),
                     "test coordinate",
                 )
-                    .expect_err("a partial coordinate must be rejected")
-                    .code,
+                .expect_err("a partial coordinate must be rejected")
+                .code,
                 LixError::CODE_INVALID_PARAM,
             );
         }
@@ -16925,13 +16855,11 @@ mod tests {
     async fn divergent_file_insert_and_edit_preserve_checkpoint_cursor_and_both_rows() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/existing.md".to_owned()),
-                    Value::Text("base".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/existing.md".to_owned()),
+                Value::Text("base".to_owned()),
+            ])
             .await
             .expect("base file should commit");
         let snapshot = authority
@@ -16946,23 +16874,19 @@ mod tests {
         transfer_commit_blobs(&authority, &editing_replica, &snapshot_history.commits).await;
 
         inserting_replica
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/created.md".to_owned()),
-                    Value::Text("created".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/created.md".to_owned()),
+                Value::Text("created".to_owned()),
+            ])
             .await
             .expect("new file should commit locally");
         editing_replica
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
-                &[
-                    Value::Text("edited".to_owned()),
-                    Value::Text("/existing.md".to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2")
+            .params(&[
+                Value::Text("edited".to_owned()),
+                Value::Text("/existing.md".to_owned()),
+            ])
             .await
             .expect("existing file should edit locally");
 
@@ -17022,10 +16946,7 @@ mod tests {
         drop(read);
 
         let paths = inserting_replica
-            .execute(
-                "SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path",
-                &[],
-            )
+            .query("SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path").all()
             .await
             .expect("both reconciled files should remain queryable");
         assert_eq!(paths.rows().len(), 2);
@@ -17049,10 +16970,7 @@ mod tests {
             .await
             .expect("authority should accept the reconciled file edit");
         let authority_paths = authority
-            .execute(
-                "SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path",
-                &[],
-            )
+            .query("SELECT path FROM lix_file WHERE path IN ('/created.md', '/existing.md') ORDER BY path").all()
             .await
             .expect("authority should expose both files");
         assert_eq!(authority_paths.rows().len(), 2);
@@ -17107,13 +17025,11 @@ mod tests {
     async fn ordinary_remote_write_preserves_the_shared_checkpoint_baseline() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/shared.md".to_owned()),
-                    Value::Text("baseline".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/shared.md".to_owned()),
+                Value::Text("baseline".to_owned()),
+            ])
             .await
             .expect("baseline file should commit");
         let checkpoint = authority
@@ -17135,13 +17051,11 @@ mod tests {
         let peer = replica_from_snapshot(&authority, &snapshot).await;
 
         origin
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
-                &[
-                    Value::Text("ordinary write".to_owned()),
-                    Value::Text("/shared.md".to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2")
+            .params(&[
+                Value::Text("ordinary write".to_owned()),
+                Value::Text("/shared.md".to_owned()),
+            ])
             .await
             .expect("ordinary file write should commit locally");
         publish_pending_with_blobs(&origin, &authority).await;
@@ -17210,13 +17124,11 @@ mod tests {
         let peer = replica_from_snapshot(&authority, &snapshot).await;
 
         origin
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/checkpoint-sync.md".to_owned()),
-                    Value::Text("dirty".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/checkpoint-sync.md".to_owned()),
+                Value::Text("dirty".to_owned()),
+            ])
             .await
             .expect("replica file write should commit");
         publish_pending_with_blobs(&origin, &authority).await;
@@ -17479,11 +17391,12 @@ mod tests {
             "authority checkpoint should be clean",
         );
         let peer_diff = peer
-            .execute(
+            .query(
                 "SELECT id, diff_type \
                  FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
-                &[Value::Text(pushed_checkpoint.to_owned())],
             )
+            .params(&[Value::Text(pushed_checkpoint.to_owned())])
+            .all()
             .await
             .expect("peer working diff should load");
         assert_eq!(
@@ -17532,13 +17445,11 @@ mod tests {
     async fn sparse_snapshot_can_diff_from_checkpoint_without_authored_bodies() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/history.md".to_owned()),
-                    Value::Text("before".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/history.md".to_owned()),
+                Value::Text("before".to_owned()),
+            ])
             .await
             .expect("baseline file should commit");
         let checkpoint = authority
@@ -17547,13 +17458,11 @@ mod tests {
             .expect("checkpoint should commit")
             .commit_id;
         authority
-            .execute(
-                "UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2",
-                &[
-                    Value::Text("after".to_owned()),
-                    Value::Text("/history.md".to_owned()),
-                ],
-            )
+            .execute("UPDATE lix_file SET content = CAST($1 AS BYTEA) WHERE path = $2")
+            .params(&[
+                Value::Text("after".to_owned()),
+                Value::Text("/history.md".to_owned()),
+            ])
             .await
             .expect("post-checkpoint file update should commit");
         let snapshot = authority
@@ -17564,10 +17473,9 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
 
         let diff = replica
-            .execute(
-                "SELECT diff_type FROM lix_diff('lix_file', $1, $2)",
-                &[Value::Text(checkpoint), Value::Text(head)],
-            )
+            .query("SELECT diff_type FROM lix_diff('lix_file', $1, $2)")
+            .params(&[Value::Text(checkpoint), Value::Text(head)])
+            .all()
             .await
             .expect("checkpoint diff should use its authenticated sparse snapshot");
         assert_eq!(diff.rows().len(), 1);
@@ -17583,13 +17491,11 @@ mod tests {
     async fn sparse_snapshot_history_reads_files_added_at_checkpoint_state() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/baseline.md".to_owned()),
-                    Value::Text("baseline".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/baseline.md".to_owned()),
+                Value::Text("baseline".to_owned()),
+            ])
             .await
             .expect("baseline file should commit");
         authority
@@ -17599,11 +17505,11 @@ mod tests {
         let added_file = authority
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA)) RETURNING id",
-                &[
-                    Value::Text("/added.md".to_owned()),
-                    Value::Text("added".to_owned()),
-                ],
             )
+            .params(&[
+                Value::Text("/added.md".to_owned()),
+                Value::Text("added".to_owned()),
+            ])
             .await
             .expect("added file should commit");
         let added_file_id = added_file.rows()[0]
@@ -17629,13 +17535,10 @@ mod tests {
 
         let history = loop {
             match replica
-                .execute(
-                    "SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1",
-                    &[
+                .query("SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1").params(&[
                         Value::Text(checkpoint.clone()),
                         Value::Text(added_file_id.clone()),
-                    ],
-                )
+                    ]).all()
                 .await
             {
                 Ok(history) => break history,
@@ -17702,13 +17605,11 @@ mod tests {
     async fn warm_replica_history_reads_files_added_by_a_later_checkpoint() {
         let authority = open_lix().await.expect("authority should open");
         authority
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                &[
-                    Value::Text("/baseline.md".to_owned()),
-                    Value::Text("baseline".to_owned()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+            .params(&[
+                Value::Text("/baseline.md".to_owned()),
+                Value::Text("baseline".to_owned()),
+            ])
             .await
             .expect("baseline file should commit");
         let previous_checkpoint = authority
@@ -17731,11 +17632,11 @@ mod tests {
         let added_file = authority
             .execute(
                 "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA)) RETURNING id",
-                &[
-                    Value::Text("/added-later.md".to_owned()),
-                    Value::Text("added later".to_owned()),
-                ],
             )
+            .params(&[
+                Value::Text("/added-later.md".to_owned()),
+                Value::Text("added later".to_owned()),
+            ])
             .await
             .expect("later file should commit");
         let added_file_id = added_file.rows()[0]
@@ -17758,13 +17659,12 @@ mod tests {
 
         let diff = loop {
             match replica
-                .execute(
-                    "SELECT id AS file_id FROM lix_diff('lix_file', $1, $2)",
-                    &[
-                        Value::Text(previous_checkpoint.clone()),
-                        Value::Text(latest_checkpoint.clone()),
-                    ],
-                )
+                .query("SELECT id AS file_id FROM lix_diff('lix_file', $1, $2)")
+                .params(&[
+                    Value::Text(previous_checkpoint.clone()),
+                    Value::Text(latest_checkpoint.clone()),
+                ])
+                .all()
                 .await
             {
                 Ok(diff) => break diff,
@@ -17834,13 +17734,10 @@ mod tests {
         );
 
         let history = replica
-            .execute(
-                "SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1",
-                &[
+            .query("SELECT id, to_path AS path FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 ORDER BY lixcol_position ASC LIMIT 1").params(&[
                     Value::Text(latest_checkpoint),
                     Value::Text(added_file_id),
-                ],
-            )
+                ]).all()
             .await
             .expect("hydrated warm checkpoint history should be queryable");
         assert_eq!(history.rows().len(), 1);

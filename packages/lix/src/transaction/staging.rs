@@ -1461,19 +1461,28 @@ impl<'a> PreparedValidationRow<'a> {
     }
 
     pub(crate) fn domain(&self) -> Domain {
-        Domain::exact_file(
-            self.branch_id().to_string(),
-            self.untracked(),
-            self.file_id().map(str::to_owned),
-        )
+        match self {
+            Self::State(row) => Domain::exact_file(
+                row.branch_id,
+                row.untracked,
+                row.file_id.map(ToString::to_string),
+            ),
+        }
     }
 
     pub(crate) fn domain_row_identity(&self) -> DomainRowIdentity {
-        DomainRowIdentity::in_domain(
-            self.domain(),
-            self.schema_key().to_string(),
-            self.row_pk().clone(),
-        )
+        match self {
+            Self::State(row) => {
+                DomainRowIdentity::in_domain(self.domain(), row.schema_key, row.row_pk.clone())
+            }
+        }
+    }
+
+    /// The row's schema key borrowed for the prepared batch's lifetime.
+    pub(crate) fn schema_key_ref(self) -> &'a str {
+        match self {
+            Self::State(row) => row.schema_key.as_str(),
+        }
     }
 }
 

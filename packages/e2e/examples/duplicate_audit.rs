@@ -190,10 +190,8 @@ async fn build(corpus: &str, dir: &Path) {
             drop(branch_session);
             if corpus == "gc" {
                 session
-                    .execute(
-                        "DELETE FROM lix_branch WHERE id = $1",
-                        &[Value::Text(branch.id)],
-                    )
+                    .execute("DELETE FROM lix_branch WHERE id = $1")
+                    .params(&[Value::Text(branch.id)])
                     .await
                     .expect("delete GC-disposable branch");
                 let adapter = StorageAdapter::new(storage.clone());
@@ -233,8 +231,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register audit schema");
 }
@@ -269,16 +267,14 @@ where
     let mut index = 0;
     while index < rows {
         let end = (index + commit_rows).min(rows);
-        let mut transaction = session.begin_transaction().await.expect("begin seed");
+        let transaction = session.begin_transaction().await.expect("begin seed");
         while index < end {
             transaction
-                .execute(
-                    "INSERT INTO audit_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                    &[
-                        Value::Text(format!("/row/{index:08}")),
-                        Value::Text(shape.json(index, 0)),
-                    ],
-                )
+                .execute("INSERT INTO audit_row (path, value) VALUES ($1, CAST($2 AS JSONB))")
+                .params(&[
+                    Value::Text(format!("/row/{index:08}")),
+                    Value::Text(shape.json(index, 0)),
+                ])
                 .await
                 .expect("stage seed row");
             index += 1;
@@ -300,17 +296,15 @@ async fn edit_rows<S>(
 {
     let window = window.min(live_rows);
     for round in 1..=rounds {
-        let mut transaction = session.begin_transaction().await.expect("begin edit");
+        let transaction = session.begin_transaction().await.expect("begin edit");
         for offset in 0..window {
             let index = (round * 7 + offset) % live_rows;
             transaction
-                .execute(
-                    "UPDATE audit_row SET value = CAST($2 AS JSONB) WHERE path = $1",
-                    &[
-                        Value::Text(format!("/row/{index:08}")),
-                        Value::Text(shape.json(index, round)),
-                    ],
-                )
+                .execute("UPDATE audit_row SET value = CAST($2 AS JSONB) WHERE path = $1")
+                .params(&[
+                    Value::Text(format!("/row/{index:08}")),
+                    Value::Text(shape.json(index, round)),
+                ])
                 .await
                 .expect("stage edit row");
         }
@@ -340,13 +334,11 @@ where
     let len = env_usize("LIX_AUDIT_FILE_BYTES", 4 * 1024 * 1024);
     for file in 0..files {
         session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/media/{file:04}.bin")),
-                    Value::Blob(media_bytes(file, 0, len).into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/media/{file:04}.bin")),
+                Value::Blob(media_bytes(file, 0, len).into()),
+            ])
             .await
             .expect("insert media file");
     }
@@ -369,11 +361,11 @@ where
                 .execute(
                     "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                      ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[
-                        Value::Text(format!("/media/{file:04}.bin")),
-                        Value::Blob(bytes.into()),
-                    ],
                 )
+                .params(&[
+                    Value::Text(format!("/media/{file:04}.bin")),
+                    Value::Blob(bytes.into()),
+                ])
                 .await
                 .expect("edit media file");
         }

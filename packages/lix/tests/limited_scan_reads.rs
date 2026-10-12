@@ -11,21 +11,19 @@ async fn limit_bounds_storage_reads_and_skips_deleted_rows() -> Result<(), LixEr
             "columns":[{"name":"id","type":"int8","nullable":false}],
             "primary_key":["id"]
         });
-        db.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-            &[Value::Text(schema.to_string())],
-        )
-        .await?;
+        db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(schema.to_string())])
+            .await?;
         let rows = (0..n)
             .map(|id| format!("({id})"))
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(&format!("INSERT INTO limited_rows(id) VALUES {rows}"), &[])
+        db.execute(&format!("INSERT INTO limited_rows(id) VALUES {rows}"))
             .await?;
-        db.execute("DELETE FROM limited_rows WHERE id IN (0,1,2)", &[])
+        db.execute("DELETE FROM limited_rows WHERE id IN (0,1,2)")
             .await?;
         let (result, census) = measure_checkpoint_foreground(async {
-            db.execute("SELECT id FROM limited_rows LIMIT 1", &[]).await
+            db.query("SELECT id FROM limited_rows LIMIT 1").all().await
         })
         .await;
         let result = result?;
@@ -33,19 +31,14 @@ async fn limit_bounds_storage_reads_and_skips_deleted_rows() -> Result<(), LixEr
         assert!(result.rows()[0].get::<i64>("id")? >= 3);
         println!("LIMIT input_rows={n} storage={census:?}");
         counts.push(census);
-        assert!(db.execute(
-            "SELECT id FROM limited_rows WHERE lixcol_file_id IN ('01920000-0000-7000-8000-0000000000a1', '01920000-0000-7000-8000-0000000000a2') LIMIT 1", &[]
-        ).await?.rows().is_empty());
-        db.execute(
-            &format!("INSERT INTO limited_rows(id,lixcol_untracked) VALUES ({n},true)"),
-            &[],
-        )
+        assert!(db.query("SELECT id FROM limited_rows WHERE lixcol_file_id IN ('01920000-0000-7000-8000-0000000000a1', '01920000-0000-7000-8000-0000000000a2') LIMIT 1").all().await?.rows().is_empty());
+        db.execute(&format!(
+            "INSERT INTO limited_rows(id,lixcol_untracked) VALUES ({n},true)"
+        ))
         .await?;
         let retained = db
-            .execute(
-                "SELECT id FROM limited_rows WHERE lixcol_untracked = true LIMIT 1",
-                &[],
-            )
+            .query("SELECT id FROM limited_rows WHERE lixcol_untracked = true LIMIT 1")
+            .all()
             .await?;
         assert_eq!(retained.rows().len(), 1);
         assert_eq!(retained.rows()[0].get::<i64>("id")?, n);
@@ -74,26 +67,22 @@ async fn join_above_sixty_four_keys_keeps_indexed_probe() -> Result<(), LixError
                     {"name":"value","type":"text","nullable":false}],
                 "primary_key":["id"], "unique":[["value"]]
             });
-            db.execute(
-                "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-                &[Value::Text(schema.to_string())],
-            )
-            .await?;
+            db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+                .params(&[Value::Text(schema.to_string())])
+                .await?;
         }
         for (table, count) in [("wide_build", 70), ("wide_probe", n)] {
             let rows = (0..count)
                 .map(|id| format!("({id},'value{id}')"))
                 .collect::<Vec<_>>()
                 .join(",");
-            db.execute(&format!("INSERT INTO {table}(id,value) VALUES {rows}"), &[])
+            db.execute(&format!("INSERT INTO {table}(id,value) VALUES {rows}"))
                 .await?;
         }
         let (result, census) = measure_checkpoint_foreground(async {
-            db.execute(
-                "SELECT b.id FROM wide_build b JOIN wide_probe p ON b.value = p.value",
-                &[],
-            )
-            .await
+            db.query("SELECT b.id FROM wide_build b JOIN wide_probe p ON b.value = p.value")
+                .all()
+                .await
         })
         .await;
         assert_eq!(result?.rows().len(), 70);

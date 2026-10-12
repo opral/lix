@@ -26,7 +26,7 @@ impl LixOrderBetween {
 }
 
 impl ScalarUDFImpl for LixOrderBetween {
-        fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         "lix_order_between"
     }
     fn signature(&self) -> &Signature {
@@ -79,50 +79,37 @@ mod tests {
     #[tokio::test]
     async fn sql_order_between_works_in_public_bound_writes() {
         let lix = crate::open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES (lix_order_between(NULL, NULL), CAST('true' AS JSONB))",
-            &[],
-        ).await.unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES (lix_order_between(NULL, NULL), CAST('true' AS JSONB))").await.unwrap();
         let rows = lix
-            .execute("SELECT key FROM lix_key_value WHERE key = '80'", &[])
+            .query("SELECT key FROM lix_key_value WHERE key = '80'")
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.rows()[0].values(), &[crate::Value::Text("80".into())]);
-        let updated = lix.execute(
-            "UPDATE lix_key_value SET value = CAST('false' AS JSONB) WHERE key = lix_order_between($1, $2) RETURNING lix_order_between(key, NULL) AS next_key",
-            &[crate::Value::Null, crate::Value::Null],
-        ).await.unwrap();
+        let updated = lix.execute("UPDATE lix_key_value SET value = CAST('false' AS JSONB) WHERE key = lix_order_between($1, $2) RETURNING lix_order_between(key, NULL) AS next_key").params(&[crate::Value::Null, crate::Value::Null]).await.unwrap();
         assert_eq!(
             updated.rows()[0].values(),
             &[crate::Value::Text(
                 crate::plugin::runtime::order_between(Some("80"), None).unwrap()
             )]
         );
-        let invalid = lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES (lix_order_between($1, $2), CAST('true' AS JSONB))",
-            &[crate::Value::Text("c0".into()), crate::Value::Text("80".into())],
-        ).await.unwrap_err();
+        let invalid = lix.execute("INSERT INTO lix_key_value (key, value) VALUES (lix_order_between($1, $2), CAST('true' AS JSONB))").params(&[crate::Value::Text("c0".into()), crate::Value::Text("80".into())]).await.unwrap_err();
         assert_eq!(invalid.code, crate::LixError::CODE_INVALID_PARAM);
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/80', CAST('' AS BYTEA))",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/80', CAST('' AS BYTEA))")
+            .await
+            .unwrap();
         lix.execute(
             "UPDATE lix_file SET path = '/' || lix_order_between('80', NULL) WHERE path = '/80'",
-            &[],
         )
         .await
         .unwrap();
         let rows = lix
-            .execute(
-                "SELECT path FROM lix_file WHERE path = $1",
-                &[crate::Value::Text(format!(
-                    "/{}",
-                    crate::plugin::runtime::order_between(Some("80"), None).unwrap()
-                ))],
-            )
+            .query("SELECT path FROM lix_file WHERE path = $1")
+            .params(&[crate::Value::Text(format!(
+                "/{}",
+                crate::plugin::runtime::order_between(Some("80"), None).unwrap()
+            ))])
+            .all()
             .await
             .unwrap();
         assert_eq!(

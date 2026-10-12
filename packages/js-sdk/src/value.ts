@@ -6,8 +6,15 @@ export class Value {
 	readonly #raw: LixValue;
 
 	private constructor(raw: LixValue, clone = true) {
-		validateExplicitValue(raw);
-		this.#raw = clone ? cloneValue(raw) : raw;
+		try {
+			validateExplicitValue(raw);
+			this.#raw = clone ? cloneValue(raw) : raw;
+		} catch (error) {
+			// Validating and copying JSON recurse; a stack overflow is a bad
+			// parameter, not an engine fault.
+			if (!(error instanceof RangeError)) throw error;
+			throw invalidParam(0, "JSON SQL parameters are nested too deeply", "jsonb");
+		}
 		this.kind = this.#raw.kind;
 	}
 
@@ -73,6 +80,14 @@ export class Value {
 	}
 }
 
+/**
+ * Binds a JSON value as `jsonb`. Plain objects and arrays are not accepted as
+ * parameters on their own, so JSON is always explicit.
+ */
+export function json(value: JsonValue): Value {
+	return Value.jsonb(value);
+}
+
 export type NativeLixValue =
 	| Exclude<LixValue, { kind: "blob" }>
 	| { kind: "blob"; value?: null; blob: Uint8Array };
@@ -94,11 +109,9 @@ export function fromNativeValue(value: NativeLixValue): LixValue {
 	};
 }
 
-export function normalizeParam(
-	value: SqlParam,
-	index = 0,
-	seen = new WeakSet<object>(),
-): LixValue {
+export function normalizeParam(param: SqlParam, index = 0): LixValue {
+	// Runtime values come from untyped callers too; check them as `unknown`.
+	const value: unknown = param;
 	if (value instanceof Value) return fromNativeValue(value._toNative());
 	if (value === null) return { kind: "null", value: null };
 	if (typeof value === "boolean") return { kind: "boolean", value };
@@ -131,15 +144,25 @@ export function normalizeParam(
 			? { kind: "integer", value }
 			: { kind: "real", value };
 	}
-	if (value instanceof Uint8Array) {
+	if (isUint8Array(value)) {
 		return {
 			kind: "blob",
 			value: new Uint8Array(value),
 		};
 	}
+	if (typeof value === "bigint") {
+		const error = invalidParam(index, "bigint is not a valid SQL parameter", "bigint");
+		error.hint =
+			"Pass Number(value) when it is a safe integer, or bind it as text and CAST it in SQL.";
+		throw error;
+	}
 	if (typeof value === "object" && value) {
 		if (value instanceof Date) {
-			throw invalidParam(index, "Date is not a valid SQL parameter", "Date");
+			throw invalidParam(
+				index,
+				"Date is not a valid SQL parameter; pass an ISO string or a number",
+				"Date",
+			);
 		}
 		if (ArrayBuffer.isView(value)) {
 			throw invalidParam(
@@ -148,8 +171,27 @@ export function normalizeParam(
 				value.constructor.name,
 			);
 		}
-		assertJsonSerializable(value, seen, index);
-		return { kind: "jsonb", value };
+		if (isArrayBuffer(value)) {
+			const error = invalidParam(
+				index,
+				"ArrayBuffer is not a valid SQL parameter; bind bytes as a Uint8Array",
+				"ArrayBuffer",
+			);
+			error.hint = "Pass new Uint8Array(buffer).";
+			throw error;
+		}
+		if (!Array.isArray(value) && !isPlainObject(value)) {
+			const name = value.constructor?.name ?? "object";
+			throw invalidParam(index, `${name} is not a valid SQL parameter`, name);
+		}
+		const actual = Array.isArray(value) ? "array" : "object";
+		const error = invalidParam(
+			index,
+			`${actual === "array" ? "an array" : "a plain object"} is not a valid SQL parameter; wrap JSON values with json(value)`,
+			actual,
+		);
+		error.hint = "Import { json } from '@lix-js/sdk' and pass json(value) to bind JSON.";
+		throw error;
 	}
 	throw invalidParam(
 		index,
@@ -300,7 +342,7 @@ function validateExplicitValue(value: LixValue) {
 			}
 			break;
 		case "blob":
-			if (value.value instanceof Uint8Array) return;
+			if (isUint8Array(value.value)) return;
 			break;
 		default:
 			break;
@@ -409,6 +451,22 @@ function cloneJsonValue(value: JsonValue): JsonValue {
 		);
 	}
 	return value;
+}
+
+/** Also true for a Uint8Array from another realm (a vm context, an iframe). */
+function isUint8Array(value: unknown): value is Uint8Array {
+	return (
+		value instanceof Uint8Array ||
+		(ArrayBuffer.isView(value) &&
+			Object.prototype.toString.call(value) === "[object Uint8Array]")
+	);
+}
+
+function isArrayBuffer(value: object): boolean {
+	return (
+		value instanceof ArrayBuffer ||
+		Object.prototype.toString.call(value) === "[object ArrayBuffer]"
+	);
 }
 
 function isPlainObject(value: object) {

@@ -145,18 +145,16 @@ where
     let mut written = 0usize;
     while written < files {
         let batch = seed_batch.min(files - written);
-        let mut transaction = session.begin_transaction().await.expect("begin seed");
+        let transaction = session.begin_transaction().await.expect("begin seed");
         for index in 0..batch {
             let ordinal = written + index;
             let bucket = ordinal % SEED_DIRECTORIES;
             transaction
-                .execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-                    &[
-                        Value::Text(format!("/data/d{bucket:04}/f{ordinal:09}.txt")),
-                        Value::Text(format!("v{ordinal}")),
-                    ],
-                )
+                .execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+                .params(&[
+                    Value::Text(format!("/data/d{bucket:04}/f{ordinal:09}.txt")),
+                    Value::Text(format!("v{ordinal}")),
+                ])
                 .await
                 .expect("seed file insert");
         }
@@ -175,13 +173,11 @@ where
         .chain((0..samples).map(|index| format!("/empty/e{index:06}")))
         .collect::<Vec<_>>();
     for chunk in paths.chunks(seed_batch.max(1)) {
-        let mut transaction = session.begin_transaction().await.expect("begin victims");
+        let transaction = session.begin_transaction().await.expect("begin victims");
         for path in chunk {
             transaction
-                .execute(
-                    "INSERT INTO lix_directory (path) VALUES ($1)",
-                    &[Value::Text(path.clone())],
-                )
+                .execute("INSERT INTO lix_directory (path) VALUES ($1)")
+                .params(&[Value::Text(path.clone())])
                 .await
                 .expect("seed empty directory");
         }
@@ -194,10 +190,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let deleted = session
-        .execute(
-            "DELETE FROM lix_directory WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .execute("DELETE FROM lix_directory WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
         .await
         .expect("empty directory delete should succeed");
     assert_eq!(
@@ -212,10 +206,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = session
-        .execute(
-            "SELECT count(*) AS files FROM lix_file WHERE path LIKE '/data/%'",
-            &[],
-        )
+        .query("SELECT count(*) AS files FROM lix_file WHERE path LIKE '/data/%'")
+        .all()
         .await
         .expect("count seeded files");
     result.rows()[0]

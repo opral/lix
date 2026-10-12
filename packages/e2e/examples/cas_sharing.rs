@@ -396,13 +396,11 @@ where
         let started = Instant::now();
         let result = self
             .session
-            .execute(
-                UPSERT_SQL,
-                &[
-                    Value::Text(path.to_owned()),
-                    Value::Blob(bytes.to_vec().into()),
-                ],
-            )
+            .execute(UPSERT_SQL)
+            .params(&[
+                Value::Text(path.to_owned()),
+                Value::Blob(bytes.to_vec().into()),
+            ])
             .await
             .expect("write cas sharing blob");
         let elapsed = started.elapsed();
@@ -432,13 +430,11 @@ where
             .await
             .expect("switch session branch");
         let result = session
-            .execute(
-                UPSERT_SQL,
-                &[
-                    Value::Text(path.to_owned()),
-                    Value::Blob(bytes.to_vec().into()),
-                ],
-            )
+            .execute(UPSERT_SQL)
+            .params(&[
+                Value::Text(path.to_owned()),
+                Value::Blob(bytes.to_vec().into()),
+            ])
             .await
             .expect("write cas sharing branch blob");
         assert_eq!(result.rows_affected(), 1);

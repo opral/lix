@@ -191,7 +191,7 @@ async fn checkpoints_scenario(samples: &[usize], rows_per_commit: usize) {
             commit_batch(&fixture.session, created, rows_per_commit).await;
             fixture
                 .session
-                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                 .await
                 .expect("create checkpoint");
             created += 1;
@@ -224,30 +224,25 @@ async fn row_commits_scenario(samples: &[usize], rows_per_commit: usize) {
     });
     fixture
         .session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register row schema");
     let mut committed = 0usize;
     for &target in samples {
         while committed < target {
-            let mut transaction = fixture
+            let transaction = fixture
                 .session
                 .begin_transaction()
                 .await
                 .expect("begin commit");
             for index in 0..rows_per_commit {
                 transaction
-                    .execute(
-                        "INSERT INTO expv_row (id, name, amount) VALUES ($1, $2, $3)",
-                        &[
-                            Value::Text(format!("{committed:08}-{index:08}")),
-                            Value::Text(format!("name-{committed}-{index}")),
-                            Value::Integer((committed * 1000 + index) as i64),
-                        ],
-                    )
+                    .execute("INSERT INTO expv_row (id, name, amount) VALUES ($1, $2, $3)")
+                    .params(&[
+                        Value::Text(format!("{committed:08}-{index:08}")),
+                        Value::Text(format!("name-{committed}-{index}")),
+                        Value::Integer((committed * 1000 + index) as i64),
+                    ])
                     .await
                     .expect("insert row");
             }
@@ -284,7 +279,7 @@ async fn checkpoint_then_gc_scenario(commits: usize, rows_per_commit: usize, gc_
     );
     fixture
         .session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("create checkpoint");
     report(
@@ -325,14 +320,15 @@ async fn uploads_scenario(samples: &[usize], bytes_per_upload: usize, delete: bo
                 .execute(
                     "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                      ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[Value::Text(path.clone()), Value::Blob(payload.into())],
                 )
+                .params(&[Value::Text(path.clone()), Value::Blob(payload.into())])
                 .await
                 .expect("write uploaded file through SQL");
             if delete {
                 fixture
                     .session
-                    .execute("DELETE FROM lix_file WHERE path = $1", &[Value::Text(path)])
+                    .execute("DELETE FROM lix_file WHERE path = $1")
+                    .params(&[Value::Text(path)])
                     .await
                     .expect("delete uploaded file");
             }
@@ -435,16 +431,14 @@ async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin commit");
+    let transaction = session.begin_transaction().await.expect("begin commit");
     for index in 0..rows {
         transaction
-            .execute(
-                "INSERT INTO space_growth (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text(format!("/row/{batch:08}/{index:08}")),
-                    Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
-                ],
-            )
+            .execute("INSERT INTO space_growth (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text(format!("/row/{batch:08}/{index:08}")),
+                Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
+            ])
             .await
             .expect("insert row");
     }
@@ -465,10 +459,7 @@ where
         "primary_key": ["path"],
     });
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register schema");
 }

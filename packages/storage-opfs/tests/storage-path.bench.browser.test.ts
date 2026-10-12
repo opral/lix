@@ -6,7 +6,7 @@ type Samples = {
 };
 
 test("same-Wasm memory and JS SQLite OPFS execution paths", async () => {
-	const { openLix } = await import("@lix-js/sdk");
+	const { openLix, json } = await import("@lix-js/sdk");
 	const { OpfsStorage } = await import("@lix-js/storage-opfs");
 	const results = [];
 	for (const storage of [
@@ -19,11 +19,12 @@ test("same-Wasm memory and JS SQLite OPFS execution paths", async () => {
 		},
 	]) {
 		const lix = await openLix({ storage: storage.value });
-		await lix.executeBatch(
-			Array.from({ length: 512 }, (_, index) => ({
-				sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-				params: [`bench-${index}`, { index, revision: 0 }],
-			})),
+		await lix.executeMany(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+			Array.from({ length: 512 }, (_, index) => [
+				`bench-${index}`,
+				json({ index, revision: 0 }),
+			]),
 		);
 		await lix.execute(
 			"SELECT value FROM lix_key_value WHERE key = $1",
@@ -31,7 +32,7 @@ test("same-Wasm memory and JS SQLite OPFS execution paths", async () => {
 		);
 		await lix.execute(
 			"UPDATE lix_key_value SET value = $1 WHERE key = $2",
-			[{ index: 0, revision: -1 }, "bench-0"],
+			[json({ index: 0, revision: -1 }), "bench-0"],
 		);
 
 		const samples: Samples = { read: [], write: [] };
@@ -46,7 +47,7 @@ test("same-Wasm memory and JS SQLite OPFS execution paths", async () => {
 			started = performance.now();
 			await lix.execute(
 				"UPDATE lix_key_value SET value = $1 WHERE key = $2",
-				[{ index: sample % 512, revision: sample }, `bench-${sample % 512}`],
+				[json({ index: sample % 512, revision: sample }), `bench-${sample % 512}`],
 			);
 			samples.write.push(performance.now() - started);
 		}

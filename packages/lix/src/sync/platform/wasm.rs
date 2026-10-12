@@ -41,6 +41,11 @@ impl SyncTask {
     }
 }
 
+/// Browser timers do not depend on an executor reactor.
+pub(crate) fn executor_neutral_sleep(duration: Duration) -> impl Future<Output = ()> + Send {
+    sleep(duration)
+}
+
 pub(crate) fn sleep(duration: Duration) -> impl Future<Output = ()> + Send {
     let state = Arc::new(BrowserSleepState {
         done: AtomicBool::new(false),

@@ -22,10 +22,9 @@ fn released_blob() -> Vec<u8> {
 
 async fn assert_json_value(lix: &Lix<Memory>, key: &str, expected: serde_json::Value) {
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(key.to_string())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(key.to_string())])
+        .all()
         .await
         .unwrap_or_else(|error| panic!("key-value read for {key} failed: {error:?}"));
     assert_eq!(result.rows().len(), 1, "expected one row for {key}");
@@ -40,10 +39,9 @@ async fn assert_json_value(lix: &Lix<Memory>, key: &str, expected: serde_json::V
 
 async fn assert_key_absent(lix: &Lix<Memory>, key: &str) {
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(key.to_string())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(key.to_string())])
+        .all()
         .await
         .unwrap_or_else(|error| panic!("key-value absence read for {key} failed: {error:?}"));
     assert!(result.rows().is_empty(), "{key} should be absent");
@@ -51,10 +49,9 @@ async fn assert_key_absent(lix: &Lix<Memory>, key: &str) {
 
 async fn assert_file(lix: &Lix<Memory>, path: &str, expected: Vec<u8>) {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .unwrap_or_else(|error| panic!("file read for {path} failed: {error:?}"));
     assert_eq!(result.rows().len(), 1, "expected one file at {path}");
@@ -67,10 +64,9 @@ async fn assert_file(lix: &Lix<Memory>, path: &str, expected: Vec<u8>) {
 
 async fn assert_file_absent(lix: &Lix<Memory>, path: &str) {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .unwrap_or_else(|error| panic!("file absence read for {path} failed: {error:?}"));
     assert!(result.rows().is_empty(), "{path} should be absent");
@@ -138,10 +134,9 @@ async fn released_v75_repository_explicitly_migrates_with_semantics_intact() {
     assert_main_state(&lix).await;
 
     let draft = lix
-        .execute(
-            "SELECT name FROM lix_branch WHERE id = $1",
-            &[Value::Text(DRAFT_BRANCH_ID.to_string())],
-        )
+        .query("SELECT name FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(DRAFT_BRANCH_ID.to_string())])
+        .all()
         .await
         .expect("draft descriptor should remain queryable");
     assert_eq!(draft.rows().len(), 1);
@@ -165,7 +160,6 @@ async fn released_v75_repository_explicitly_migrates_with_semantics_intact() {
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES \
          ('fixture-post-upgrade', CAST('{\"writable\":true}' AS JSONB))",
-        &[],
     )
     .await
     .expect("migrated repository should remain writable");

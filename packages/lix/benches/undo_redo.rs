@@ -1,8 +1,8 @@
 use std::{cell::RefCell, future::IntoFuture, time::Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lix::{ExecuteBatchStatement, Memory, Value};
 use lix::{Lix, open_lix};
+use lix::{Memory, Value};
 
 fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Memory {
     runtime.block_on(async move {
@@ -12,18 +12,14 @@ fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Me
             .await
             .expect("benchmark lix opens");
         session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('bench-key', '0')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('bench-key', '0')")
             .await
             .expect("benchmark history starts");
         for value in 1..history_depth {
             session
-                .execute(
-                    &format!("UPDATE lix_key_value SET value = '{value}' WHERE key = 'bench-key'"),
-                    &[],
-                )
+                .execute(&format!(
+                    "UPDATE lix_key_value SET value = '{value}' WHERE key = 'bench-key'"
+                ))
                 .await
                 .expect("benchmark history commit succeeds");
         }
@@ -40,28 +36,19 @@ fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: u
             .await
             .expect("benchmark lix opens");
         session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before'), ('noise-key', '0')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before'), ('noise-key', '0')")
             .await
             .expect("benchmark rows start");
         for value in 1..history_depth {
             session
-                .execute(
-                    &format!(
+                .execute(&format!(
                         "UPDATE lix_key_value SET value = '{value}' WHERE key = 'noise-key'"
-                    ),
-                    &[],
-                )
+                    ))
                 .await
                 .expect("benchmark unrelated history commit succeeds");
         }
         session
-            .execute(
-                "UPDATE lix_key_value SET value = 'after' WHERE key = 'target-key'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'target-key'")
             .await
             .expect("benchmark target update succeeds");
         drop(session);
@@ -77,10 +64,7 @@ fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: u
             .await
             .expect("benchmark lix opens");
         session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before')")
             .await
             .expect("benchmark target starts");
         let values = (0..parent_width)
@@ -88,17 +72,13 @@ fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: u
             .collect::<Vec<_>>()
             .join(",");
         session
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .expect("wide parent commit succeeds");
         session
-            .execute(
-                "UPDATE lix_key_value SET value = 'after' WHERE key = 'target-key'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'target-key'")
             .await
             .expect("benchmark target update succeeds");
         drop(session);
@@ -122,24 +102,22 @@ fn seeded_wide_transition_storage(
             .collect::<Vec<_>>()
             .join(",");
         session
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .expect("transition rows start");
         let after = "a".repeat(256);
-        let updates = (0..transition_width)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: format!(
-                    "UPDATE lix_key_value SET value = '{after}' WHERE key = 'transition-{index}'"
-                ),
-                params: vec![],
-            })
-            .collect::<Vec<_>>();
         session
-            .execute_batch(&updates)
+            .execute_many(
+                "UPDATE lix_key_value SET value = $1 WHERE key = $2",
+                (0..transition_width).map(|index| {
+                    [
+                        Value::Text(after.clone()),
+                        Value::Text(format!("transition-{index}")),
+                    ]
+                }),
+            )
             .await
             .expect("wide transition commit succeeds");
         drop(session);
@@ -158,13 +136,11 @@ fn seeded_descriptor_unrelated_width_storage(
             .await
             .expect("benchmark lix opens");
         session
-            .execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text("/descriptor-target.txt".to_owned()),
-                    Value::Blob(b"target".as_slice().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text("/descriptor-target.txt".to_owned()),
+                Value::Blob(b"target".as_slice().into()),
+            ])
             .await
             .expect("target file creates");
         let values = (0..unrelated_width)
@@ -172,17 +148,13 @@ fn seeded_descriptor_unrelated_width_storage(
             .collect::<Vec<_>>()
             .join(",");
         session
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .expect("unrelated repository rows write");
         session
-            .execute(
-                "DELETE FROM lix_file WHERE path = '/descriptor-target.txt'",
-                &[],
-            )
+            .execute("DELETE FROM lix_file WHERE path = '/descriptor-target.txt'")
             .await
             .expect("target file deletes");
         drop(session);
@@ -205,17 +177,13 @@ fn seeded_checkpoint_inventory_storage(
             .collect::<Vec<_>>()
             .join(",");
         session
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .expect("checkpoint inventory rows commit");
         let checkpoint = session
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("checkpoint inventory checkpoint succeeds")
             .rows()[0]
@@ -308,10 +276,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute(
-                                            "UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'",
-                                            &[],
-                                        )
+                                        .execute("UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'")
                                         .into_future(),
                                 )
                                 .expect("benchmarked ordinary update succeeds");
@@ -336,7 +301,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .execute("SELECT commit_id FROM lix_undo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked undo succeeds");
@@ -352,7 +317,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
         runtime
             .block_on(
                 redo_session
-                    .execute("SELECT commit_id FROM lix_undo()", &[])
+                    .execute("SELECT commit_id FROM lix_undo()")
                     .into_future(),
             )
             .expect("redo benchmark starts undone");
@@ -374,7 +339,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_redo()", &[])
+                                        .execute("SELECT commit_id FROM lix_redo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked redo succeeds");
@@ -405,7 +370,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .execute("SELECT commit_id FROM lix_undo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked descriptor undo succeeds");
@@ -441,10 +406,8 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute(
-                                            "SELECT commit_id FROM lix_undo($1)",
-                                            &target_params,
-                                        )
+                                        .execute("SELECT commit_id FROM lix_undo($1)")
+                                        .params(&target_params)
                                         .into_future(),
                                 )
                                 .expect("full checkpoint undo succeeds");
@@ -471,10 +434,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute(
-                                            "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'checkpoint-0')])",
-                                            &target_params,
-                                        )
+                                        .execute("SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'checkpoint-0')])").params(&target_params)
                                         .into_future(),
                                 )
                                 .expect("scoped checkpoint undo succeeds");
@@ -507,7 +467,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .execute("SELECT commit_id FROM lix_undo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked wide-transition undo succeeds");
@@ -540,7 +500,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .execute("SELECT commit_id FROM lix_undo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked wide-parent undo succeeds");
@@ -571,7 +531,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                             runtime
                                 .block_on(
                                     session
-                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .execute("SELECT commit_id FROM lix_undo()")
                                         .into_future(),
                                 )
                                 .expect("benchmarked sparse-gap undo succeeds");

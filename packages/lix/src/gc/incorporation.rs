@@ -139,7 +139,8 @@ mod tests {
     async fn complete_proof_missing_graph_requires_an_omission_not_only_a_header_marker() {
         let lix = crate::open_lix().await.unwrap();
         let head = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -201,9 +202,10 @@ mod tests {
         let lix = crate::open_lix().await.unwrap();
         let mut ids = Vec::new();
         for value in ["parent", "source"] {
-            lix.execute("INSERT INTO lix_key_value(key,value) VALUES('proof-residency',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", &[crate::Value::Text(value.into())]).await.unwrap();
+            lix.execute("INSERT INTO lix_key_value(key,value) VALUES('proof-residency',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value").params(&[crate::Value::Text(value.into())]).await.unwrap();
             let head = lix
-                .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+                .query("SELECT lix_active_branch_commit_id() AS id")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -211,7 +213,7 @@ mod tests {
                 .unwrap();
             ids.push(CommitId::parse_lix(&head, "proof source chain").unwrap());
         }
-        let checkpoint = lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+        let checkpoint = lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
         let checkpoint = CommitId::parse_lix(&checkpoint, "complete checkpoint").unwrap();
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
@@ -294,20 +296,16 @@ mod tests {
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let original_chunks = blob_chunks(&read).await;
         drop(read);
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES('/retired-proof.bin',$1)",
-            &[crate::Value::Blob(vec![71; 96 * 1024].into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('retired-proof','old')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file(path,content) VALUES('/retired-proof.bin',$1)")
+            .params(&[crate::Value::Blob(vec![71; 96 * 1024].into())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES('retired-proof','old')")
+            .await
+            .unwrap();
         let old = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -332,19 +330,16 @@ mod tests {
         assert!(!changes.is_empty());
         drop(read);
         for (index, value) in ["new", "latest"].into_iter().enumerate() {
-            lix.execute(
-                &format!("UPDATE lix_key_value SET value='{value}' WHERE key='retired-proof'"),
-                &[],
-            )
+            lix.execute(&format!(
+                "UPDATE lix_key_value SET value='{value}' WHERE key='retired-proof'"
+            ))
             .await
             .unwrap();
-            lix.execute(
-                "UPDATE lix_file SET content=$1 WHERE path='/retired-proof.bin'",
-                &[crate::Value::Blob(vec![81 + index as u8; 96 * 1024].into())],
-            )
-            .await
-            .unwrap();
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') UNION ALL SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
+            lix.execute("UPDATE lix_file SET content=$1 WHERE path='/retired-proof.bin'")
+                .params(&[crate::Value::Blob(vec![81 + index as u8; 96 * 1024].into())])
+                .await
+                .unwrap();
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') UNION ALL SELECT row_ref FROM lix_diff('lix_file')))").await.unwrap();
         }
         for pass in 0..2 {
             let read = adapter.begin_read(Default::default()).await.unwrap();

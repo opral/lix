@@ -30,7 +30,6 @@ use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::parser::Statement as DataFusionStatement;
-#[cfg(feature = "storage-benches")]
 use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
@@ -204,15 +203,6 @@ impl PartialEq for ExecuteResult {
                 && self.rows() == other.rows()
                 && self.notices() == other.notices()))
     }
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoherentReadBatch {
-    pub active_branch_id: String,
-    pub active_branch_commit_id: String,
-    pub storage_mutation_revision: Option<Vec<u8>>,
-    pub results: Vec<ExecuteResult>,
 }
 
 /// One materialized file read and the logical range it represents.
@@ -514,7 +504,10 @@ impl ExecuteResult {
         }
     }
 
-    fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
+    pub(super) fn with_file_view_mutations(
+        mut self,
+        mutations: Vec<sql2::SessionFileViewMutation>,
+    ) -> Self {
         let backing = self.backing.get_or_insert_with(|| {
             Arc::new(ExecuteResultBacking {
                 columns: Vec::new().into(),
@@ -570,6 +563,24 @@ impl ExecuteResult {
         })
     }
 
+    /// Takes the rows out of this result. Rows share one value arena, so
+    /// this moves them without copying values when the result is not shared.
+    pub fn into_rows(self) -> Vec<Row> {
+        let Some(backing) = self.backing else {
+            return Vec::new();
+        };
+        match Arc::try_unwrap(backing) {
+            Ok(mut backing) => match backing.rows.take() {
+                Some(rows) => rows,
+                None => backing.materialize_rows(),
+            },
+            Err(shared) => shared
+                .rows
+                .get_or_init(|| shared.materialize_rows())
+                .clone(),
+        }
+    }
+
     /// Returns the number of rows in this result set.
     pub fn len(&self) -> usize {
         self.rows().len()
@@ -621,16 +632,135 @@ impl ExecuteResult {
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.
-    pub fn get<'a>(&self, row: &'a Row, column_name: &str) -> Option<&'a Value> {
-        let index = self.column_index(column_name)?;
-        row.get_index(index)
+    /// Fails when the name is absent or shared by several columns.
+    pub fn get<'a>(&self, row: &'a Row, column_name: &str) -> Result<&'a Value, LixError> {
+        row.value(column_name)
     }
 
-    /// Returns the index for a column name.
-    pub fn column_index(&self, column_name: &str) -> Option<usize> {
-        self.columns()
-            .iter()
-            .position(|column| column == column_name)
+    /// Returns the position of a column name. Fails when the name is absent
+    /// or shared by several columns.
+    pub fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
+        resolve_column(self.columns(), column_name)
+    }
+}
+
+/// Resolves a column name to its position. Every name lookup (rows, results)
+/// goes through this, so a name shared by several result columns fails the
+/// same way everywhere.
+pub(crate) fn resolve_column(columns: &[String], column_name: &str) -> Result<usize, LixError> {
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.as_str() == column_name)
+        .map(|(index, _)| index);
+    let index = matches.next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_COLUMN_NOT_FOUND,
+            format!(
+                "column '{}' does not exist; available columns: {}",
+                column_name,
+                if columns.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    columns.join(", ")
+                }
+            ),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_AMBIGUOUS_COLUMN,
+            format!(
+                "column '{column_name}' appears more than once in the result; \
+                 alias the columns or read it by position"
+            ),
+        ));
+    }
+    Ok(index)
+}
+
+/// The rows a read returned: see [`crate::Query::all`].
+///
+/// Column names live once at the result-set level and rows share one value
+/// arena, so a result is cheap to keep and to iterate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryResult {
+    inner: ExecuteResult,
+}
+
+impl QueryResult {
+    pub(crate) fn from_execute_result(inner: ExecuteResult) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the result-set column names in row value order.
+    pub fn columns(&self) -> &[String] {
+        self.inner.columns()
+    }
+
+    /// Returns the stable SQL type for each result-set column.
+    pub fn column_types(&self) -> &[ResultColumnType] {
+        self.inner.column_types()
+    }
+
+    /// Returns the rows.
+    pub fn rows(&self) -> &[Row] {
+        self.inner.rows()
+    }
+
+    /// Takes the rows out of this result.
+    pub fn into_rows(self) -> Vec<Row> {
+        self.inner.into_rows()
+    }
+
+    /// Iterates rows with borrowed access to the shared column metadata.
+    pub fn iter(&self) -> impl Iterator<Item = ResultRowRef<'_>> {
+        self.inner.iter()
+    }
+
+    /// Returns the number of rows.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns true when the read returned no rows.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns non-fatal diagnostics produced while planning or executing.
+    pub fn notices(&self) -> &[LixNotice] {
+        self.inner.notices()
+    }
+
+    /// Returns the position of a column name. Fails when the name is absent
+    /// or shared by several columns.
+    pub fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
+        self.inner.column_index(column_name)
+    }
+}
+
+impl From<QueryResult> for ExecuteResult {
+    fn from(result: QueryResult) -> Self {
+        result.inner
+    }
+}
+
+impl IntoIterator for QueryResult {
+    type Item = Row;
+    type IntoIter = std::vec::IntoIter<Row>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_rows().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a QueryResult {
+    type Item = &'a Row;
+    type IntoIter = std::slice::Iter<'a, Row>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows().iter()
     }
 }
 
@@ -747,20 +877,26 @@ impl Row {
         &self.backing.values[self.values.clone()]
     }
 
+    /// Returns the result-set column names, in value order.
+    pub fn columns(&self) -> &[String] {
+        &self.backing.columns
+    }
+
     /// Returns the value at `index`.
     pub fn get_index(&self, index: usize) -> Option<&Value> {
         self.values().get(index)
     }
 
-    /// Returns the raw value for `column_name`, or an error when the column is absent.
-    pub fn value(&self, column_name: &str) -> Result<&Value, LixError> {
-        let index = self.column_index(column_name)?;
+    /// Returns the raw value for a column position or name. Looking a name
+    /// up fails when it is absent or when several result columns share it.
+    pub fn value(&self, column: impl ColumnIndex) -> Result<&Value, LixError> {
+        let index = column.index_in(self)?;
         self.values().get(index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_COLUMN_NOT_FOUND,
                 format!(
-                    "column '{}' points past row width {}; available columns: {}",
-                    column_name,
+                    "column {} points past row width {}; available columns: {}",
+                    column.describe(),
                     self.values.len(),
                     self.available_columns()
                 ),
@@ -768,29 +904,16 @@ impl Row {
         })
     }
 
-    /// Converts the named column to a native Rust value.
-    pub fn get<T>(&self, column_name: &str) -> Result<T, LixError>
+    /// Converts the column at a position or with a name to a native Rust value.
+    pub fn get<T>(&self, column: impl ColumnIndex) -> Result<T, LixError>
     where
         T: TryFromValue,
     {
-        T::try_from_value(self.value(column_name)?)
+        T::try_from_value(self.value(column)?)
     }
 
     fn column_index(&self, column_name: &str) -> Result<usize, LixError> {
-        self.backing
-            .columns
-            .iter()
-            .position(|column| column == column_name)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_COLUMN_NOT_FOUND,
-                    format!(
-                        "column '{}' does not exist; available columns: {}",
-                        column_name,
-                        self.available_columns()
-                    ),
-                )
-            })
+        resolve_column(&self.backing.columns, column_name)
     }
 
     fn available_columns(&self) -> String {
@@ -815,6 +938,60 @@ impl std::fmt::Debug for Row {
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
         self.backing.columns == other.backing.columns && self.values() == other.values()
+    }
+}
+
+impl std::ops::Index<usize> for Row {
+    type Output = Value;
+
+    /// Returns the value at `index`; panics past the row width.
+    fn index(&self, index: usize) -> &Value {
+        &self.values()[index]
+    }
+}
+
+/// A column position (`usize`) or name (`&str`) for [`Row::get`].
+pub trait ColumnIndex: sealed::Sealed {
+    #[doc(hidden)]
+    fn index_in(&self, row: &Row) -> Result<usize, LixError>;
+    #[doc(hidden)]
+    fn describe(&self) -> String;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for usize {}
+    impl Sealed for &str {}
+    impl Sealed for &String {}
+}
+
+impl ColumnIndex for usize {
+    fn index_in(&self, _row: &Row) -> Result<usize, LixError> {
+        Ok(*self)
+    }
+
+    fn describe(&self) -> String {
+        format!("#{self}")
+    }
+}
+
+impl ColumnIndex for &str {
+    fn index_in(&self, row: &Row) -> Result<usize, LixError> {
+        row.column_index(self)
+    }
+
+    fn describe(&self) -> String {
+        format!("'{self}'")
+    }
+}
+
+impl ColumnIndex for &String {
+    fn index_in(&self, row: &Row) -> Result<usize, LixError> {
+        row.column_index(self)
+    }
+
+    fn describe(&self) -> String {
+        format!("'{self}'")
     }
 }
 
@@ -934,13 +1111,16 @@ impl ResultRowRef<'_> {
         self.values
     }
 
-    /// Returns the value for `column_name`.
-    pub fn get(&self, column_name: &str) -> Option<&Value> {
-        let index = self
-            .columns
-            .iter()
-            .position(|column| column == column_name)?;
-        self.values.get(index)
+    /// Returns the value for `column_name`. Fails when the name is absent or
+    /// shared by several columns.
+    pub fn get(&self, column_name: &str) -> Result<&Value, LixError> {
+        let index = resolve_column(self.columns, column_name)?;
+        self.values.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_COLUMN_NOT_FOUND,
+                format!("column '{column_name}' points past the row width"),
+            )
+        })
     }
 
     /// Returns the value at `index`.
@@ -1093,40 +1273,6 @@ impl TransactionBatchStatements {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadBatchKind {
-    Ordinary,
-    Coherent,
-}
-
-impl ReadBatchKind {
-    fn telemetry_name(self) -> &'static str {
-        match self {
-            Self::Ordinary => "batch",
-            Self::Coherent => "coherent_read_batch",
-        }
-    }
-
-    fn normalize_error(self, error: LixError, sql: &str, index: usize) -> LixError {
-        let error = normalize_sql_surface_error(error, sql);
-        match self {
-            Self::Ordinary => with_batch_statement_index(error, index),
-            Self::Coherent => error,
-        }
-    }
-}
-
-struct ReadBatchSnapshot {
-    active_branch_id: String,
-    active_branch_commit_id: String,
-    storage_mutation_revision: Option<Vec<u8>>,
-}
-
-struct ReadBatchResult {
-    results: Vec<ExecuteResult>,
-    snapshot: Option<ReadBatchSnapshot>,
-}
-
 enum IdempotencyReceiptResolution {
     Absent,
     Replay(ExecuteIdempotencyReceipt),
@@ -1232,7 +1378,7 @@ where
     /// transaction boundaries for each statement.
     ///
     /// `sql` must be a single statement. To run several statements atomically,
-    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// run them in one transaction (`Lix::transaction`). Do not concatenate
     /// statements into one script string.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
@@ -1277,149 +1423,271 @@ where
         result.map(|result| (result, profile))
     }
 
-    /// Benchmark-only comparison of the eager result path with internal
-    /// collected-batch and live-batch consumers. No stream escapes the scoped
-    /// storage read, and this does not change the public execution contract.
-    #[cfg(feature = "storage-benches")]
-    pub(crate) async fn execute_result_streaming_profiled(
+    /// Parses and checks the statement of an `execute_many` call.
+    pub(crate) fn check_execute_many_statement(&self, sql: &str) -> Result<(), LixError> {
+        self.ensure_open()?;
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        check_execute_many_statement(&statement)
+    }
+
+    pub(crate) fn parse_read_only_statement(
         &self,
         sql: &str,
         params: &[Value],
-        mode: &str,
-        row_limit: Option<usize>,
-    ) -> Result<crate::SqlReadProfile, LixError> {
-        let (result, profile) = crate::sql_profile::scope(async {
-            if mode == "full" {
-                let result = self.execute(sql, params).await?;
-                let rows = result.rows();
-                let consumed = row_limit.map_or(rows.len(), |limit| limit.min(rows.len()));
-                let checksum = rows.iter().take(consumed).try_fold(0u64, |checksum, row| {
-                    profile_result_checksum(checksum, row.values())
-                })?;
-                crate::sql_profile::record_result_rows(consumed, rows.len(), rows.len());
-                crate::sql_profile::record_result_checksum(checksum);
-                return Ok(());
-            }
+    ) -> Result<DataFusionStatement, LixError> {
+        self.ensure_open()?;
+        if let Some(operation) = &self.account_insertion {
+            operation.ensure_sql(sql, params)?;
+        }
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        reject_non_read(&statement)?;
+        Ok(statement)
+    }
 
-            if !matches!(mode, "stream" | "live" | "count_only") {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("unknown result streaming profile mode '{mode}'"),
-                ));
-            }
+    /// Classifies one read statement for streaming.
+    pub(crate) fn query_stream_route(
+        &self,
+        statement: &DataFusionStatement,
+        params: &[Value],
+    ) -> QueryStreamRoute {
+        let read_plan = sql2::plan_read_statement(statement, params);
+        // Runtime functions read and advance their state through the
+        // buffered read path, which owns that bookkeeping.
+        let materialized = matches!(read_plan.native, Some(sql2::NativeReadPlan::Filesystem(_)))
+            || sql2::statement_has_durable_runtime_function(statement)
+            || read_plan.late_content.is_some()
+            || read_plan.acknowledge_file_views
+            || self.hot_state.capture_foreground_read_interests().is_some();
+        if materialized {
+            QueryStreamRoute::Materialized
+        } else {
+            QueryStreamRoute::Live
+        }
+    }
 
-            self.ensure_open()?;
-            let statement = self.sql_planning_cache.parse_statement(sql)?;
-            if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Read
-                || sql2::statement_has_durable_runtime_function(&statement)
-                || exact_filesystem_read_route(&statement, params).is_some()
-                || late_materialized_lix_file_content_read(&statement, params).is_some()
-            {
-                return Err(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "result streaming profiler accepts only ordinary cancellable reads",
-                ));
-            }
+    /// Pages a result that must be fully executed before its rows exist.
+    pub(crate) async fn open_materialized_query_stream(
+        &self,
+        result: impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static,
+        limits: super::PageLimits,
+        extra_registry: Option<&Arc<super::query_stream::QueryStreamRegistry>>,
+        ensure_open: impl FnOnce() -> Result<(), LixError>,
+    ) -> Result<super::RowStream, LixError> {
+        let (sender, receiver) = super::query_stream::query_stream_channel();
+        let mut registries = vec![&self.query_streams];
+        registries.extend(extra_registry);
+        super::RowStream::open(
+            &registries,
+            || {
+                self.ensure_open()?;
+                ensure_open()
+            },
+            receiver,
+            super::query_stream::produce_materialized_pages(result, limits, sender),
+            None,
+        )
+        .await
+    }
 
-            let _operation_guard = self.begin_waitable_session_operation().await?;
-            let read_scope = self
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await?;
-            with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
-                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
-                    let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-                    let ctx = SessionSqlExecutionContext {
-                        active_branch_id: &active_branch_id,
-                        active_account_id: self.active_account_id(),
-                        read_store,
-                        hot_state: Arc::clone(&self.hot_state),
-                        binary_cas: Arc::clone(&self.binary_cas),
-                        branch_ctx: Arc::clone(&self.branch_ctx),
-                        catalog_context: Arc::clone(&self.catalog_context),
-                        sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                        functions: FunctionProviderHandle::system(),
-                        plugin_host: self.plugin_host.clone(),
-                        file_views: None,
-                    };
-                    let read_session =
-                        sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
-
-                    match mode {
-                        "stream" => {
-                            let result =
-                                sql2::execute_read_statement_in_session_with_collected_batches(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut cursor =
-                                sql2::BatchRowCursor::collected(&result.fields, &result.batches);
-                            consume_profile_cursor(&mut cursor, row_limit).await?;
-                        }
-                        "live" => {
-                            let mut result =
-                                sql2::execute_read_statement_in_session_with_batch_stream(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut cursor = sql2::BatchRowCursor::live(&mut result);
-                            consume_profile_cursor(&mut cursor, row_limit).await?;
-                            drop(cursor);
-                            drop(result);
-                        }
-                        "count_only" => {
-                            let mut result =
-                                sql2::execute_read_statement_in_session_with_batch_stream(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await?;
-                            let _notice_count = result.notices.len();
-                            let mut rows = 0usize;
-                            let mut batches = 0usize;
-                            while let Some(batch) = {
-                                let started = std::time::Instant::now();
-                                let batch = result
-                                    .stream
-                                    .try_next()
-                                    .await
-                                    .map_err(sql2::datafusion_error_to_lix_error);
-                                crate::sql_profile::record_phase(
-                                    crate::sql_profile::Phase::ArrowExecution,
-                                    started.elapsed(),
-                                );
-                                batch?
-                            } {
-                                rows = rows.saturating_add(batch.num_rows());
-                                batches = batches.saturating_add(1);
-                            }
-                            crate::sql_profile::record_result_count_only(rows, batches);
-                            crate::sql_profile::record_result_rows(rows, 0, 0);
-                            drop(result);
-                        }
-                        _ => unreachable!("profile mode validated before opening read"),
-                    }
-                    drop(read_session);
-                    drop(ctx);
-                    Ok(())
-                },
-            )
-            .await
+    /// Admits each pull of a live stream: a session operation guard is held
+    /// only while the producer runs, so idle streams never block writes or
+    /// close.
+    pub(crate) fn query_stream_admission(
+        self: &Arc<Self>,
+    ) -> super::query_stream::QueryStreamPullAdmission {
+        let admission_session = Arc::clone(self);
+        Arc::new(move || {
+            let session = Arc::clone(&admission_session);
+            Box::pin(async move {
+                let guard = session.begin_waitable_session_operation().await?;
+                let guard: super::query_stream::QueryStreamPullGuard = Box::new(guard);
+                Ok(guard)
+            })
         })
+    }
+
+    /// Streams one read of the latest state. Ordinary reads stream live from
+    /// one storage snapshot pinned for the stream's lifetime; reads whose rows
+    /// only exist after the whole statement ran are executed buffered (under
+    /// the default byte cap) and paged out.
+    pub(crate) async fn open_live_query_stream(
+        self: &Arc<Self>,
+        sql: String,
+        statement: DataFusionStatement,
+        params: Vec<Value>,
+        limits: super::PageLimits,
+    ) -> Result<super::RowStream, LixError> {
+        let (sender, receiver) = super::query_stream::query_stream_channel();
+        let session = Arc::clone(self);
+        // SAFETY: the producer owns its Arc session, request values and
+        // channel sender; the storage read it opens is borrowed from that
+        // owned session and dropped before the future completes. Remaining
+        // compiler failures are the higher-ranked SQL futures shared with
+        // `execute`.
+        let producer = unsafe {
+            super::AssumeSendFuture::new(async move {
+                session
+                    .produce_live_query_stream(&sql, statement, &params, limits, sender)
+                    .await;
+            })
+        };
+        super::RowStream::open(
+            &[&self.query_streams],
+            || self.ensure_open(),
+            receiver,
+            producer,
+            Some(self.query_stream_admission()),
+        )
+        .await
+    }
+
+    /// Streams one read from one fresh pinned snapshot. Failures before the
+    /// first page restart from a fresh snapshot under the buffered
+    /// expired-read policy; after a page was handed out they end the stream.
+    async fn produce_live_query_stream(
+        &self,
+        sql: &str,
+        statement: DataFusionStatement,
+        params: &[Value],
+        limits: super::PageLimits,
+        sender: super::query_stream::QueryStreamSender,
+    ) {
+        let mut progress = QueryStreamProgress::default();
+        let outcome = async {
+            self.refresh_active_branch_base_if_stale().await?;
+            let mut retries = ExpiredReadRetryState::default();
+            loop {
+                let attempt = async {
+                    let read = self
+                        .storage
+                        .begin_read(StorageReadOptions::default())
+                        .await?;
+                    let progress = &mut progress;
+                    let statement = statement.clone();
+                    let sender = &sender;
+                    with_static_session_sql_read::<StorageImpl, _, _, _>(
+                        read,
+                        move |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
+                            self.stream_read_statement_with_store(
+                                read_store, sql, statement, params, limits, sender, progress,
+                            )
+                        },
+                    )
+                    .await
+                }
+                .await;
+                let Err(error) = attempt else {
+                    return Ok(());
+                };
+                if progress.page_sent || sender.is_closed() {
+                    return Err(error);
+                }
+                let Some(delay) = retries.next_delay(&error) else {
+                    return Err(error);
+                };
+                tokio::task::yield_now().await;
+                if !delay.is_zero() {
+                    super::query_stream::retry_delay(delay).await;
+                }
+            }
+        }
         .await;
-        result?;
-        Ok(profile)
+        finish_query_stream(outcome, sql, &sender).await;
+    }
+
+    /// Streams one read statement from `read_store`, sending the header and
+    /// every page. The caller sends the end-of-stream confirmation.
+    pub(super) async fn stream_read_statement_with_store(
+        &self,
+        read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        sql: &str,
+        statement: DataFusionStatement,
+        params: &[Value],
+        limits: super::PageLimits,
+        sender: &super::query_stream::QueryStreamSender,
+        progress: &mut QueryStreamProgress,
+    ) -> Result<(), LixError> {
+        use super::query_stream::{
+            QueryStreamHeader, QueryStreamMessage, send_query_stream_message,
+        };
+
+        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        let ctx = SessionSqlExecutionContext {
+            active_branch_id: &active_branch_id,
+            active_account_id: self.active_account_id(),
+            read_store,
+            hot_state: Arc::clone(&self.hot_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            branch_ctx: Arc::clone(&self.branch_ctx),
+            catalog_context: Arc::clone(&self.catalog_context),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+            functions: FunctionProviderHandle::system(),
+            plugin_host: self.plugin_host.clone(),
+            file_views: None,
+        };
+        let read_session =
+            sql2::prepare_read_session(&ctx, std::slice::from_ref(&statement)).await?;
+        let mut result = sql2::execute_read_statement_in_session_with_batch_stream(
+            &read_session,
+            sql,
+            statement,
+            params,
+        )
+        .await?;
+        if !progress.header_sent {
+            let header = QueryStreamHeader {
+                columns: result
+                    .fields
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+                column_types: result
+                    .fields
+                    .iter()
+                    .map(sql2::result_column_type)
+                    .collect::<Result<_, _>>()?,
+                notices: std::mem::take(&mut result.notices),
+            };
+            send_query_stream_message(sender, QueryStreamMessage::Header(header)).await?;
+            progress.header_sent = true;
+        }
+        let mut pager = sql2::ResultPager::new(result.fields.clone(), limits);
+        loop {
+            #[cfg(feature = "storage-benches")]
+            let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+            let batch = result
+                .stream
+                .try_next()
+                .await
+                .map_err(sql2::datafusion_error_to_lix_error);
+            #[cfg(feature = "storage-benches")]
+            if let Some(started) = started {
+                crate::sql_profile::record_phase(
+                    crate::sql_profile::Phase::ArrowExecution,
+                    started.elapsed(),
+                );
+            }
+            let Some(batch) = batch? else {
+                break;
+            };
+            for page in pager.push(batch)? {
+                send_query_stream_message(
+                    sender,
+                    QueryStreamMessage::Page(query_stream_page(page)),
+                )
+                .await?;
+                progress.page_sent = true;
+            }
+        }
+        if let Some(page) = pager.finish()? {
+            send_query_stream_message(sender, QueryStreamMessage::Page(query_stream_page(page)))
+                .await?;
+            progress.page_sent = true;
+        }
+        drop(result);
+        drop(read_session);
+        drop(ctx);
+        Ok(())
     }
 
     pub(crate) async fn execute_with_options(
@@ -1926,6 +2194,7 @@ where
                                 )
                                 .await?;
                                 let result = ExecuteResult::from_sql_write_result(result);
+                                check_returning_cap(&result)?;
                                 if result.needs_direct_new_change_id_remap() {
                                     transaction.require_canonical_change_id_remap();
                                 }
@@ -2415,7 +2684,7 @@ where
     ///
     /// Each entry is one statement plus its own parameters. Callers assemble
     /// the array; Lix does not parse a multi-statement script on their behalf.
-    pub async fn execute_batch(
+    pub(crate) async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecuteBatchResult, LixError> {
@@ -2835,23 +3104,16 @@ where
             .map(|statement| (statement.sql.as_str(), statement.params.as_slice()))
             .collect::<Vec<_>>();
         Ok(self
-            .execute_read_batch(
-                &statements,
-                parsed,
-                ReadBatchKind::Ordinary,
-                outer_query_span_covers_operation,
-            )
-            .await?
-            .results)
+            .execute_read_batch(&statements, parsed, outer_query_span_covers_operation)
+            .await?)
     }
 
     async fn execute_read_batch(
         &self,
         statements: &[(&str, &[Value])],
         parsed: Vec<datafusion::sql::parser::Statement>,
-        kind: ReadBatchKind,
         outer_query_span_covers_operation: bool,
-    ) -> Result<ReadBatchResult, LixError> {
+    ) -> Result<Vec<ExecuteResult>, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
             is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed, params)
@@ -2885,39 +3147,9 @@ where
                             acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
-                        let (snapshot, active_branch_head) = if kind == ReadBatchKind::Coherent {
-                            let head = self
-                                .branch_ctx
-                                .ref_reader(read_store.clone())
-                                .load_head(&active_branch_id)
-                                .await?
-                                .ok_or_else(|| {
-                                    LixError::branch_not_found(
-                                        active_branch_id.clone(),
-                                        "execute coherent read batch",
-                                        "active branch",
-                                    )
-                                })?;
-                            let snapshot = ReadBatchSnapshot {
-                                active_branch_id: active_branch_id.clone(),
-                                active_branch_commit_id: head.commit_id.to_string(),
-                                storage_mutation_revision:
-                                    StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
-                                        &read_store,
-                                    )
-                                    .await?
-                                    .map(|revision| revision.to_vec()),
-                            };
-                            (Some(snapshot), Some(head))
-                        } else {
-                            (None, None)
-                        };
                         if parsed.is_empty() {
                             return Ok((
-                                ReadBatchResult {
-                                    results: Vec::new(),
-                                    snapshot,
-                                },
+                                Vec::new(),
                                 Vec::new(),
                                 Vec::<Arc<crate::hot_state::ReadInterestRegistry>>::new(),
                             ));
@@ -2935,12 +3167,7 @@ where
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
                         };
-                        let read_session = match active_branch_head {
-                            Some(head) => {
-                                sql2::prepare_read_session_at_head(&ctx, head, &parsed).await?
-                            }
-                            None => sql2::prepare_read_session(&ctx, &parsed).await?,
-                        };
+                        let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
                         let mut result_budget = crate::common::ReadResultBudget::default();
                         let mut results = Vec::with_capacity(statements.len());
                         let mut file_view_mutations = Vec::new();
@@ -2963,7 +3190,7 @@ where
                                     SqlStatementTelemetry::start(
                                         self.telemetry.as_ref(),
                                         sql,
-                                        kind.telemetry_name(),
+                                        "batch",
                                         Some(statement_index),
                                     )
                                 })
@@ -2993,7 +3220,10 @@ where
                                         )
                                         .await
                                         .map_err(|error| {
-                                            kind.normalize_error(error, sql, statement_index)
+                                            with_batch_statement_index(
+                                                normalize_sql_surface_error(error, sql),
+                                                statement_index,
+                                            )
                                         })?;
                                     file_view_mutations.extend(mutations);
                                     captured_interests.extend(captured);
@@ -3007,7 +3237,12 @@ where
                                 )
                                 .await
                                 .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| kind.normalize_error(error, sql, statement_index))
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, sql),
+                                        statement_index,
+                                    )
+                                })
                             };
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
@@ -3067,11 +3302,7 @@ where
                             )
                         })?;
                         captured_interests.extend(capture.map(|(_, capture)| capture));
-                        Ok((
-                            ReadBatchResult { results, snapshot },
-                            file_view_mutations,
-                            captured_interests,
-                        ))
+                        Ok((results, file_view_mutations, captured_interests))
                     }
                 },
             )
@@ -3082,84 +3313,6 @@ where
         self.file_views.apply_mutations(file_view_mutations);
         self.flush_partial_read_interests().await?;
         Ok(results)
-    }
-
-    #[doc(hidden)]
-    pub async fn execute_coherent_read_batch(
-        &self,
-        statements: &[(&str, &[Value])],
-    ) -> Result<CoherentReadBatch, LixError> {
-        let telemetry = start_batch(
-            self.telemetry.as_ref(),
-            &crate::telemetry::SQL_COHERENT_READ_BATCH,
-            statements.len(),
-            statements.iter().map(|(sql, _)| *sql),
-        );
-        let operation = self.execute_coherent_read_batch_inner(statements);
-        let result = match telemetry.as_ref() {
-            Some(telemetry) => telemetry.instrument(operation).await,
-            None => operation.await,
-        };
-        if let Some(telemetry) = telemetry {
-            finish_operation(telemetry, &result);
-        }
-        result
-    }
-
-    pub(crate) fn execute_coherent_read_batch_owned(
-        self: Arc<Self>,
-        statements: Arc<Vec<(String, Vec<Value>)>>,
-    ) -> impl Future<Output = Result<CoherentReadBatch, LixError>> + Send + 'static {
-        // SAFETY: the future owns its Arc session and every SQL/parameter
-        // payload. Storage read handles are Send by the Storage contract; the
-        // compiler obstruction is the higher-ranked shared reference carried
-        // by borrowing adapters such as RocksDB snapshots.
-        unsafe {
-            super::AssumeSendFuture::new(async move {
-                let statement_refs = statements
-                    .iter()
-                    .map(|(sql, params)| (sql.as_str(), params.as_slice()))
-                    .collect::<Vec<_>>();
-                self.execute_coherent_read_batch(&statement_refs).await
-            })
-        }
-    }
-
-    async fn execute_coherent_read_batch_inner(
-        &self,
-        statements: &[(&str, &[Value])],
-    ) -> Result<CoherentReadBatch, LixError> {
-        self.ensure_open()?;
-        let parsed = statements
-            .iter()
-            .map(|(sql, _)| {
-                let statement = self.sql_planning_cache.parse_statement(sql)?;
-                if sql2::statement_has_durable_runtime_function(&statement) {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch does not support durable runtime functions",
-                    ));
-                }
-                match sql2::bind_statement_route(&statement)? {
-                    sql2::BoundStatementRoute::Read => Ok(statement),
-                    sql2::BoundStatementRoute::Write => Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "execute_coherent_read_batch only accepts read statements",
-                    )),
-                }
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        self.refresh_active_branch_base_if_stale().await?;
-        let ReadBatchResult { results, snapshot } = self
-            .execute_read_batch(statements, parsed, ReadBatchKind::Coherent, false)
-            .await?;
-        let snapshot = snapshot.expect("coherent read batch captures snapshot metadata");
-        Ok(CoherentReadBatch {
-            active_branch_id: snapshot.active_branch_id,
-            active_branch_commit_id: snapshot.active_branch_commit_id,
-            storage_mutation_revision: snapshot.storage_mutation_revision,
-            results,
-        })
     }
 
     #[cfg(test)]
@@ -3249,7 +3402,7 @@ where
         Ok(Some(stats))
     }
 
-    async fn execute_read_statement_with_store(
+    pub(super) async fn execute_read_statement_with_store(
         &self,
         read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         sql: &str,
@@ -4264,85 +4417,115 @@ fn sql_substring_byte_range(start: i64, length: u64, size: u64) -> (u64, u64) {
     (effective_start, effective_end)
 }
 
-#[cfg(feature = "storage-benches")]
-async fn consume_profile_cursor(
-    cursor: &mut sql2::BatchRowCursor<'_>,
-    row_limit: Option<usize>,
-) -> Result<(), LixError> {
-    let limit = row_limit.unwrap_or(usize::MAX);
-    let mut consumed = 0usize;
-    let mut checksum = 0u64;
-    while consumed < limit {
-        let Some(values) = cursor.next_values().await? else {
-            break;
-        };
-        checksum = profile_result_checksum(checksum, &values)?;
-        consumed += 1;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryStreamRoute {
+    /// Streams from a live DataFusion plan over one pinned snapshot.
+    Live,
+    /// Executes buffered, then pages the materialized result.
+    Materialized,
+}
+
+#[derive(Default)]
+pub(super) struct QueryStreamProgress {
+    header_sent: bool,
+    page_sent: bool,
+}
+
+fn query_stream_page(page: sql2::SessionReadResult) -> Vec<Row> {
+    ExecuteResult::from_session_read_result(sql2::SessionReadSqlResult {
+        runtime_functions: None,
+        query: page,
+    })
+    .into_rows()
+}
+
+/// Confirms the end of a stream, or reports why it stopped.
+pub(super) async fn finish_query_stream(
+    outcome: Result<(), LixError>,
+    sql: &str,
+    sender: &super::query_stream::QueryStreamSender,
+) {
+    use super::query_stream::QueryStreamMessage;
+    if sender.is_closed() {
+        return;
     }
-    crate::sql_profile::record_result_rows(consumed, consumed, 0);
-    crate::sql_profile::record_result_checksum(checksum);
+    let message = match outcome {
+        Ok(()) => QueryStreamMessage::End,
+        Err(error) => QueryStreamMessage::Error(normalize_sql_surface_error(error, sql)),
+    };
+    let _ = sender.send(message).await;
+}
+
+/// Fails when a write's `RETURNING` rows exceed the byte cap of the calling
+/// scope. Callers check before the write commits, so nothing is published.
+pub(crate) fn check_returning_cap(result: &ExecuteResult) -> Result<(), LixError> {
+    if result.columns().is_empty() {
+        return Ok(());
+    }
+    charge_execute_result(&mut crate::common::ReadResultBudget::default(), result)
+}
+
+/// Checks the statement of an `execute_many` call: it reports only the
+/// affected row count, so it must not produce rows (no read, no RETURNING).
+pub(crate) fn check_execute_many_statement(
+    statement: &DataFusionStatement,
+) -> Result<(), LixError> {
+    // Classify first: a statement that cannot be routed fails here.
+    execution_disposition(statement)?;
+    // Any statement that produces rows is rejected, whatever its route: a
+    // query that calls a durable function (`SELECT uuidv7()`) or a table
+    // function such as `lix_undo()` runs as a write but still returns rows.
+    if sql2::statement_returns_rows(statement) {
+        return Err(execute_many_returns_rows());
+    }
     Ok(())
 }
 
-#[cfg(feature = "storage-benches")]
-fn profile_result_checksum(checksum: u64, values: &[Value]) -> Result<u64, LixError> {
-    if values.len() != 3 {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "streaming profile expected exactly three projected values",
-        ));
-    }
-    let mut checksum = if checksum == 0 {
-        0xcbf2_9ce4_8422_2325
+/// A transaction whose pinned inputs could not be hydrated (the same input was
+/// demanded twice, or the replica's basis kept changing) cannot keep its staged
+/// snapshot: report a retryable transaction conflict. Transport stalls and
+/// other errors pass through unchanged.
+fn stalled_hydration_as_conflict(error: LixError) -> LixError {
+    if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
+        LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "transaction could not preserve its staged snapshot while loading inputs",
+        )
     } else {
-        checksum
-    };
-    checksum = profile_checksum_bytes(checksum, &[0xff]);
-    for value in values {
-        checksum = match value {
-            Value::Null => profile_checksum_bytes(checksum, &[0]),
-            Value::Boolean(value) => profile_checksum_bytes(checksum, &[1, u8::from(*value)]),
-            Value::Integer(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[2]);
-                profile_checksum_bytes(checksum, &value.to_le_bytes())
-            }
-            Value::Real(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[3]);
-                profile_checksum_bytes(checksum, &value.to_bits().to_le_bytes())
-            }
-            Value::Text(value) => profile_checksum_sized_bytes(checksum, 4, value.as_bytes()),
-            Value::Jsonb(value) => {
-                profile_checksum_sized_bytes(checksum, 5, value.to_string().as_bytes())
-            }
-            Value::Blob(value) => {
-                profile_checksum_sized_bytes(checksum, 6, value.as_bytes().as_ref())
-            }
-            Value::Timestamptz(value) => {
-                let checksum = profile_checksum_bytes(checksum, &[7]);
-                profile_checksum_bytes(checksum, &value.to_le_bytes())
-            }
-            Value::RowRef(value) => {
-                profile_checksum_sized_bytes(checksum, 8, value.as_str().as_bytes())
-            }
-        };
+        error
     }
-    Ok(checksum)
 }
 
-#[cfg(feature = "storage-benches")]
-fn profile_checksum_sized_bytes(checksum: u64, tag: u8, bytes: &[u8]) -> u64 {
-    let checksum = profile_checksum_bytes(checksum, &[tag]);
-    let checksum = profile_checksum_bytes(checksum, &(bytes.len() as u64).to_le_bytes());
-    profile_checksum_bytes(checksum, bytes)
+pub(crate) fn execute_many_returns_rows() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        "execute_many (JS: executeMany) reports only the affected row count and cannot run a \
+         statement that returns rows",
+    )
+    .with_hint(
+        "Drop RETURNING, read with query(), or run execute() per parameter set inside a \
+         transaction.",
+    )
 }
 
-#[cfg(feature = "storage-benches")]
-fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        checksum ^= u64::from(*byte);
-        checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
+/// Rejects statements a read-only API must not run.
+///
+/// Reads that call `uuidv7()` or `current_timestamp` are reads: outside
+/// deterministic mode those functions persist nothing, and in deterministic
+/// mode they only advance the engine's private sequence bookkeeping.
+pub(crate) fn reject_non_read(statement: &DataFusionStatement) -> Result<(), LixError> {
+    if sql2::bind_statement_route(statement)? == sql2::BoundStatementRoute::Write {
+        return Err(reject_non_read_error());
     }
-    checksum
+    Ok(())
+}
+
+pub(crate) fn reject_non_read_error() -> LixError {
+    LixError::new(
+        LixError::CODE_READ_ONLY,
+        "query() and stream() only run reads; this statement changes the repository",
+    )
+    .with_hint("Use execute() for INSERT, UPDATE, DELETE, DDL and checkpoint functions.")
 }
 
 fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), LixError> {
@@ -4381,14 +4564,14 @@ fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), 
                 )?;
             }
             for batch in batches.iter() {
-                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+                budget.charge(sql2::batch_public_bytes(batch), batch.num_rows())?;
             }
         }
     }
     Ok(())
 }
 
-fn charge_execute_result(
+pub(crate) fn charge_execute_result(
     budget: &mut crate::common::ReadResultBudget,
     result: &ExecuteResult,
 ) -> Result<(), LixError> {
@@ -4410,7 +4593,7 @@ fn charge_execute_result(
             .unwrap_or_else(|error| error.into_inner());
         if let Some(columnar) = columnar.as_ref() {
             for batch in columnar.batches.iter() {
-                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+                budget.charge(sql2::batch_public_bytes(batch), batch.num_rows())?;
             }
         } else if let Some(rows) = backing.rows.get() {
             for row in rows {
@@ -4437,11 +4620,7 @@ pub(crate) fn seed_foreground_filesystem_interest(
         return Ok(());
     };
     if let Some(read) = sql2::exact_file_content_id_read(statement, params) {
-        register_seeded_exact_id_file_content_interest(
-            capture,
-            active_branch_id,
-            &read,
-        )?;
+        register_seeded_exact_id_file_content_interest(capture, active_branch_id, &read)?;
         return Ok(());
     }
     let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
@@ -4517,7 +4696,10 @@ fn register_seeded_exact_id_file_content_interest(
         cache_small_blob_data: false,
     })?;
     let request = sql2::lix_file_content_scan_request(&branch_ids, read.include_metadata);
-    capture.register(sql2::exact_id_file_content_interest(&request, &read.file_id))?;
+    capture.register(sql2::exact_id_file_content_interest(
+        &request,
+        &read.file_id,
+    ))?;
     Ok(())
 }
 
@@ -4653,11 +4835,7 @@ where
             }
         }
     });
-    if replayable {
-        crate::common::with_read_deadline(operation).await
-    } else {
-        operation.await
-    }
+    operation.await
 }
 
 /// Runs one session SQL read using a widened storage-read lifetime.
@@ -4696,7 +4874,7 @@ where
 ///
 /// The returned read scope must not outlive the storage value that produced
 /// `read`, and it must be dropped before the enclosing SQL execution returns.
-unsafe fn assume_static_storage_read<StorageImpl>(
+pub(super) unsafe fn assume_static_storage_read<StorageImpl>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
 ) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
 where
@@ -4728,6 +4906,87 @@ where
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
+    /// Binds and plans a write statement without running it, so a statement
+    /// that names a missing table or column fails even when no parameter set
+    /// would run it.
+    pub(crate) fn validate_write_statement(
+        &mut self,
+        sql: &str,
+        statement: &DataFusionStatement,
+    ) -> Result<(), LixError> {
+        if sql2::bind_statement_route(statement)? != sql2::BoundStatementRoute::Write {
+            return Ok(());
+        }
+        self.transaction_mut()?
+            .prepare_sql_write_logical_plan(sql, statement)
+            .map(|_| ())
+    }
+
+    /// Runs one write statement once per parameter set. All sets stage or
+    /// none do: a failure rolls back the sets already staged by this call.
+    pub(crate) async fn execute_many_atomically(
+        &mut self,
+        sql: &str,
+        param_sets: Vec<Vec<Value>>,
+        options: ExecuteOptions,
+    ) -> Result<u64, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        check_execute_many_statement(&statement)?;
+        if param_sets.is_empty() {
+            // Nothing runs, but the statement must still bind.
+            self.validate_write_statement(sql, &statement)?;
+            return Ok(0);
+        }
+        Box::pin(self.flush_prepared_mutations_with_sync()).await?;
+        let checkpoint = self.transaction_mut()?.begin_sql_statement_checkpoint()?;
+        let mut rows_affected = 0;
+        for params in param_sets {
+            match self
+                .execute_with_options(sql.to_owned(), params, options.clone())
+                .await
+            {
+                Ok(result) => rows_affected += result.rows_affected(),
+                Err(error) => {
+                    Box::pin(self.flush_prepared_mutations_with_sync()).await?;
+                    Box::pin(
+                        self.transaction_mut()?
+                            .rollback_sql_statement_checkpoint(checkpoint),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(rows_affected)
+    }
+
+    /// Executes one statement, failing (and discarding the statement's
+    /// staged writes) when its `RETURNING` rows exceed the byte cap of the
+    /// calling scope.
+    pub(crate) async fn execute_with_returning_cap(
+        &mut self,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(&sql)?;
+        if !sql2::statement_has_returning(&statement) {
+            return self.execute_with_options(sql, params, options).await;
+        }
+        Box::pin(self.flush_prepared_mutations_with_sync()).await?;
+        let checkpoint = self.transaction_mut()?.begin_sql_statement_checkpoint()?;
+        let result = self.execute_with_options(sql, params, options).await?;
+        if let Err(error) = check_returning_cap(&result) {
+            Box::pin(
+                self.transaction_mut()?
+                    .rollback_sql_statement_checkpoint(checkpoint),
+            )
+            .await?;
+            return Err(error);
+        }
+        Ok(result)
+    }
+
     pub(super) async fn flush_prepared_mutations_with_sync(&mut self) -> Result<(), LixError> {
         let sender = self
             .sync_demand_tx
@@ -4744,11 +5003,7 @@ where
                     let hydrated = retry
                         .hydrate_pinned_for_retry(Some(sender), error.clone())
                         .await
-                        .map_err(|error| {
-                        if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
-                            LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "transaction could not preserve its staged snapshot while loading inputs")
-                        } else { error }
-                    })?;
+                        .map_err(stalled_hydration_as_conflict)?;
                     if !self
                         .transaction_mut()?
                         .refresh_hydrated_native_inputs(&error, &hydrated)
@@ -4807,7 +5062,8 @@ where
             }
             let hydrated = retry
                 .hydrate_pinned_for_retry(Some(&sender), error.clone())
-                .await?;
+                .await
+                .map_err(stalled_hydration_as_conflict)?;
             self.transaction_mut()?
                 .refresh_hydrated_native_inputs(&error, &hydrated)
                 .await?;
@@ -5547,7 +5803,7 @@ where
     Ok((ExecuteResult::from_sql_write_result(result), Some(path)))
 }
 
-fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
+pub(super) fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     if (error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql))
         || (error.code == LixError::CODE_SCHEMA_DEFINITION
             && error.message.to_ascii_lowercase().contains("system schema"))
@@ -5729,12 +5985,19 @@ mod tests {
         Engine::initialize(storage.clone()).await.unwrap();
         let engine = Engine::new(storage).await.unwrap();
         let session = engine.open_session().await.unwrap();
-        let value = Value::Text("x".repeat(crate::common::MAX_READ_RESULT_BYTES + 1));
+        let value = Value::Text("x".repeat(crate::common::DEFAULT_MAX_RESULT_BYTES + 1));
         let error = session
-            .execute("SELECT $1 AS value", &[value])
+            .execute("SELECT $1 AS value", &[value.clone()])
             .await
             .unwrap_err();
-        assert_eq!(error.code, "LIX_READ_RESOURCE_EXHAUSTED");
+        assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+        let opted_out = crate::common::with_read_limits(
+            crate::common::ReadLimits::bytes(usize::MAX),
+            session.execute("SELECT $1 AS value", &[value]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opted_out.len(), 1);
         assert_eq!(
             session
                 .execute("SELECT 1 AS value", &[])
@@ -7919,10 +8182,8 @@ mod tests {
                 ExactLixFileReadColumn::Content,
             ))
         );
-        let content_only = sql2::parse_statement(
-            "SELECT content FROM lix_file WHERE id = $1 LIMIT $2",
-        )
-        .unwrap();
+        let content_only =
+            sql2::parse_statement("SELECT content FROM lix_file WHERE id = $1 LIMIT $2").unwrap();
         assert_eq!(
             sql2::exact_file_content_id_read(
                 &content_only,
@@ -8093,11 +8354,10 @@ mod tests {
              FROM lix_file WHERE id = $1",
         )
         .unwrap();
-        assert!(sql2::exact_file_content_id_read(
-            &with_computed_and_direct,
-            &[Value::Text(file_id)]
-        )
-        .is_some());
+        assert!(
+            sql2::exact_file_content_id_read(&with_computed_and_direct, &[Value::Text(file_id)])
+                .is_some()
+        );
     }
 
     #[test]
@@ -13536,27 +13796,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coherent_read_batch_rejects_write_statements() {
-        let session = open_session().await;
-        let statements: [(&str, &[Value]); 1] = [(
-            "INSERT INTO lix_key_value (key, value) VALUES ('batch-write', 'value')",
-            &[],
-        )];
-
-        let error = session
-            .execute_coherent_read_batch(&statements)
-            .await
-            .expect_err("write statement should be rejected");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            error
-                .message
-                .contains("execute_coherent_read_batch only accepts read statements")
-        );
-    }
-
-    #[tokio::test]
     async fn tracked_insert_fast_lane_rejects_duplicate_committed_identity_without_overwrite() {
         let session = open_session().await;
         session
@@ -13597,27 +13836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_coherent_batch_keeps_snapshot_metadata() {
-        let session = open_session().await;
-        let empty = session.execute_coherent_read_batch(&[]).await.unwrap();
-        let nonempty = session
-            .execute_coherent_read_batch(&[("SELECT 1", &[])])
-            .await
-            .unwrap();
-        assert!(empty.results.is_empty());
-        assert_eq!(empty.active_branch_id, nonempty.active_branch_id);
-        assert_eq!(
-            empty.active_branch_commit_id,
-            nonempty.active_branch_commit_id
-        );
-        assert_eq!(
-            empty.storage_mutation_revision,
-            nonempty.storage_mutation_revision
-        );
-    }
-
-    #[tokio::test]
-    async fn shared_read_batch_preserves_each_apis_error_details() {
+    async fn read_batch_errors_name_the_failing_statement() {
         let session = open_session().await;
         let sql = "SELECT nonexistent_column FROM lix_file";
         let ordinary = session
@@ -13627,105 +13846,28 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let coherent = session
-            .execute_coherent_read_batch(&[("SELECT 1", &[]), (sql, &[])])
-            .await
-            .unwrap_err();
-        assert_eq!(ordinary.code, coherent.code);
         assert_eq!(ordinary.details.as_ref().unwrap()["statementIndex"], 1);
-        assert!(
-            coherent
-                .details
-                .as_ref()
-                .and_then(|details| details.get("statementIndex"))
-                .is_none()
-        );
     }
 
     #[tokio::test]
-    async fn coherent_read_batch_returns_metadata_and_ordered_results() {
+    async fn read_batch_registers_union_of_referenced_providers() {
         let session = open_session().await;
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('batch-read', 'value')",
-                &[],
+        let results = session
+            .execute_batch_with_options(
+                &[
+                    batch_statement("SELECT 1 AS one"),
+                    batch_statement("SELECT COUNT(*) AS files FROM lix_file"),
+                    batch_statement("SELECT COUNT(*) AS changes FROM lix_change"),
+                ],
+                ExecuteOptions::default(),
             )
             .await
-            .expect("seed row");
-        let active_branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch id should load");
-        let storage_mutation_revision = session
-            .storage_mutation_revision()
-            .await
-            .expect("mutation revision should load");
-        let active_branch_commit_id = session
-            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
-            .await
-            .expect("active branch commit should load")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("commit id should be text");
-        let statements: [(&str, &[Value]); 3] = [
-            ("SELECT 'first' AS label", &[]),
-            (
-                "SELECT key, value FROM lix_key_value WHERE key = 'batch-read'",
-                &[],
-            ),
-            (
-                "SELECT lixcol_position \
-                 FROM lix_history('lix_key_value') \
-                 WHERE key = 'batch-read'",
-                &[],
-            ),
-        ];
+            .expect("read batch should register every referenced provider");
 
-        let batch = session
-            .execute_coherent_read_batch(&statements)
-            .await
-            .expect("coherent read batch should execute");
-
-        assert_eq!(batch.active_branch_id, active_branch_id);
-        assert_eq!(batch.active_branch_commit_id, active_branch_commit_id);
-        assert_eq!(batch.storage_mutation_revision, storage_mutation_revision);
-        assert_eq!(batch.results.len(), 3);
-        assert_eq!(
-            batch.results[0].rows()[0].get::<String>("label").unwrap(),
-            "first"
-        );
-        let row = &batch.results[1].rows()[0];
-        assert_eq!(row.get::<String>("key").unwrap(), "batch-read");
-        assert_eq!(
-            row.get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("value")
-        );
-        assert_eq!(
-            batch.results[2].rows()[0]
-                .get::<i64>("lixcol_position")
-                .unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn coherent_read_batch_registers_union_of_referenced_providers() {
-        let session = open_session().await;
-        let statements: [(&str, &[Value]); 3] = [
-            ("SELECT 1 AS one", &[]),
-            ("SELECT COUNT(*) AS files FROM lix_file", &[]),
-            ("SELECT COUNT(*) AS changes FROM lix_change", &[]),
-        ];
-
-        let batch = session
-            .execute_coherent_read_batch(&statements)
-            .await
-            .expect("coherent batch should register every referenced provider");
-
-        assert_eq!(batch.results.len(), 3);
-        assert_eq!(batch.results[0].rows()[0].get::<i64>("one").unwrap(), 1);
-        assert_eq!(batch.results[1].rows()[0].get::<i64>("files").unwrap(), 1);
-        assert!(batch.results[2].rows()[0].get::<i64>("changes").unwrap() > 0);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].rows()[0].get::<i64>("one").unwrap(), 1);
+        assert_eq!(results[1].rows()[0].get::<i64>("files").unwrap(), 1);
+        assert!(results[2].rows()[0].get::<i64>("changes").unwrap() > 0);
     }
 
     #[tokio::test]

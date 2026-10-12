@@ -175,10 +175,9 @@ async fn bounded_root_installer_discovers_core_opening_dependencies_without_scan
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .unwrap();
         let selected_branch = authority.active_branch_id().await.unwrap();

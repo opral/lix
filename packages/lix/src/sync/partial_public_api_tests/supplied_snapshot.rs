@@ -71,7 +71,8 @@ async fn reconcile_supplied_missing_file_snapshots() {
         .await
         .unwrap();
     let expected = authority
-        .execute("SELECT path,name FROM lix_file ORDER BY path", &[])
+        .query("SELECT path,name FROM lix_file ORDER BY path")
+        .all()
         .await
         .unwrap();
     authority.close().await.unwrap();
@@ -126,7 +127,7 @@ async fn reconcile_supplied_missing_file_snapshots() {
     // foreground query or manual candidate publication to drive convergence.
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
         storage,
@@ -147,7 +148,7 @@ async fn reconcile_supplied_missing_file_snapshots() {
             crate::sync::platform::sleep(std::time::Duration::from_millis(2)).await;
         }
         let sql = "SELECT path,name FROM lix_file ORDER BY path";
-        assert_eq!(lix.execute(sql, &[]).await.unwrap().rows(), expected.rows());
+        assert_eq!(lix.query(sql).all().await.unwrap().rows(), expected.rows());
         eprintln!(
             "supplied snapshot converged: cursor {} -> {}, {} file rows, {} retained interests",
             old.descriptor().cursor,
@@ -162,7 +163,7 @@ async fn reconcile_supplied_missing_file_snapshots() {
         );
         let before = requests.load(Ordering::SeqCst);
         for _ in 0..3 {
-            assert_eq!(lix.execute(sql, &[]).await.unwrap().rows(), expected.rows());
+            assert_eq!(lix.query(sql).all().await.unwrap().rows(), expected.rows());
         }
         assert_eq!(
             requests.load(Ordering::SeqCst),

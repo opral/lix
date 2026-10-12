@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Value, open_lix};
+use lix::{Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 
@@ -58,62 +58,42 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
             .expect("initialize durable Lix");
         register_schema(&lix).await;
 
-        let inserts = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: format!(
-                    "INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, CAST($2 AS JSONB))"
-                ),
-                params: vec![
-                    Value::Text(format!("/{index:04}")),
-                    Value::Text(format!(r#"{{"generation":0,"index":{index}}}"#)),
-                ],
-            })
-            .collect::<Vec<_>>();
         let inserted = lix
-            .execute_batch(&inserts)
+            .execute_many(
+                &format!("INSERT INTO {SCHEMA_KEY} (path, value) VALUES ($1, CAST($2 AS JSONB))"),
+                (0..ROW_COUNT).map(|index| {
+                    [
+                        Value::Text(format!("/{index:04}")),
+                        Value::Text(format!(r#"{{"generation":0,"index":{index}}}"#)),
+                    ]
+                }),
+            )
             .await
-            .expect("insert complete collection")
-            .results;
-        assert_eq!(
-            inserted
-                .iter()
-                .map(|result| result.rows_affected())
-                .sum::<u64>(),
-            ROW_COUNT as u64
-        );
+            .expect("insert complete collection");
+        assert_eq!(inserted, ROW_COUNT as u64);
 
-        let replacements = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                label: None,
-                sql: format!("UPDATE {SCHEMA_KEY} SET value = CAST($1 AS JSONB) WHERE path = $2"),
-                params: vec![
-                    Value::Text(format!(r#"{{"generation":1,"index":{index}}}"#)),
-                    Value::Text(format!("/{index:04}")),
-                ],
-            })
-            .collect::<Vec<_>>();
         let replaced = lix
-            .execute_batch(&replacements)
+            .execute_many(
+                &format!("UPDATE {SCHEMA_KEY} SET value = CAST($1 AS JSONB) WHERE path = $2"),
+                (0..ROW_COUNT).map(|index| {
+                    [
+                        Value::Text(format!(r#"{{"generation":1,"index":{index}}}"#)),
+                        Value::Text(format!("/{index:04}")),
+                    ]
+                }),
+            )
             .await
-            .expect("replace complete collection")
-            .results;
-        assert_eq!(
-            replaced
-                .iter()
-                .map(|result| result.rows_affected())
-                .sum::<u64>(),
-            ROW_COUNT as u64
-        );
+            .expect("replace complete collection");
+        assert_eq!(replaced, ROW_COUNT as u64);
 
         assert_eq!(
-            lix.execute(&format!("DELETE FROM {SCHEMA_KEY}"), &[])
+            lix.execute(&format!("DELETE FROM {SCHEMA_KEY}"))
                 .await
                 .expect("delete replacement collection")
                 .rows_affected(),
             ROW_COUNT as u64
         );
-        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("checkpoint deleted replacement collection");
         assert_collection_empty(&lix).await;
@@ -130,10 +110,8 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         .expect("reopen durable Lix");
     assert_collection_empty(&lix).await;
     let checkpoints = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_log() WHERE is_checkpoint",
-            &[],
-        )
+        .query("SELECT COUNT(*) AS count FROM lix_log() WHERE is_checkpoint")
+        .all()
         .await
         .expect("read checkpoints after reopen");
     assert!(checkpoints.rows()[0].get::<i64>("count").unwrap() >= 1);
@@ -152,17 +130,15 @@ async fn register_schema<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::
         ],
         "primary_key": ["path"]
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
+    lix.execute("INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))").params(&[Value::Text(schema.to_string())])
     .await
     .expect("register replacement schema");
 }
 
 async fn assert_collection_empty<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {
     let count = lix
-        .execute(&format!("SELECT COUNT(*) AS count FROM {SCHEMA_KEY}"), &[])
+        .query(&format!("SELECT COUNT(*) AS count FROM {SCHEMA_KEY}"))
+        .all()
         .await
         .expect("read replacement collection count");
     assert_eq!(count.rows()[0].get::<i64>("count").unwrap(), 0);

@@ -20,14 +20,15 @@ test("writes return the commit span they published", async () => {
 	const read = await lix.execute("SELECT 1 AS value");
 	expect(read.commit).toBeNull();
 
-	const batchBefore = await head();
-	const batch = await lix.executeBatch([
-		{ sql: "INSERT INTO lix_key_value (key, value) VALUES ('span-js-b', 'one')" },
-		{ sql: "UPDATE lix_key_value SET value = 'two' WHERE key = 'span-js-b' RETURNING key" },
-	]);
-	expect(batch.commit).toEqual({ before: batchBefore, after: await head() });
-	expect(batch.results).toHaveLength(2);
-	for (const statement of batch.results) expect(statement).not.toHaveProperty("commit");
+	const manyBefore = await head();
+	expect(
+		await lix.executeMany("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+			["span-js-b", "one"],
+			["span-js-c", "two"],
+		]),
+	).toEqual({ rowsAffected: 2 });
+	const afterMany = await head();
+	expect(afterMany).not.toBe(manyBefore);
 
 	// Inside an explicit transaction the commit is the write.
 	const transaction = await lix.beginTransaction();
@@ -37,7 +38,7 @@ test("writes return the commit span they published", async () => {
 	expect(staged.rowsAffected).toBe(1);
 	expect(staged).not.toHaveProperty("commit");
 	const receipt = await transaction.commit();
-	expect(receipt.commit).toEqual({ before: batch.commit?.after, after: await head() });
+	expect(receipt.commit).toEqual({ before: afterMany, after: await head() });
 	const readOnly = await lix.beginTransaction();
 	await readOnly.execute("SELECT 1");
 	expect(await readOnly.commit()).toEqual({ commit: null });

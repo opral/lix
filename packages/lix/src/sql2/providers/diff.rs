@@ -912,15 +912,15 @@ where
                         false,
                     )
                     .await;
-                    let (diff, from_global_rows, to_global_rows) =
-                        if mode == DiffMode::WorkingHot && !root_backed_working {
-                            let (diff, from, to, _) =
-                                effective_result.map_err(hot_only_diff_error)?;
-                            (diff, from, to)
-                        } else {
-                            let (diff, from, to, _) = effective_result?;
-                            (diff, from, to)
-                        };
+                    let (diff, from_global_rows, to_global_rows) = if mode == DiffMode::WorkingHot
+                        && !root_backed_working
+                    {
+                        let (diff, from, to, _) = effective_result.map_err(hot_only_diff_error)?;
+                        (diff, from, to)
+                    } else {
+                        let (diff, from, to, _) = effective_result?;
+                        (diff, from, to)
+                    };
                     if route.request.retain_payloads {
                         diff.validate_live_payloads()
                             .map_err(lix_error_to_datafusion_error)?;
@@ -3065,20 +3065,15 @@ mod tests {
             .await
             .unwrap();
         let id = "0193182b-2a72-7ed5-9015-76bf271af333";
-        lix.execute(
-            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/selected', $2)",
-            &[
+        lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/selected', $2)")
+            .params(&[
                 Value::Text(id.into()),
                 Value::Blob(b"before".to_vec().into()),
-            ],
-        )
-        .await
-        .unwrap();
+            ])
+            .await
+            .unwrap();
         let before = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
@@ -3087,23 +3082,20 @@ mod tests {
         // The compared range changes the small selected file and an unrelated
         // 40 MiB asset. The test records physical chunk requests, not elapsed time.
         let large = vec![0xab; 40 * 1024 * 1024];
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/unrelated.asset', $1)",
-            &[Value::Blob(large.into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "UPDATE lix_file SET path = '/renamed', content = $1 WHERE id = $2",
-            &[
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/unrelated.asset', $1)")
+            .params(&[Value::Blob(large.into())])
+            .await
+            .unwrap();
+        lix.execute("UPDATE lix_file SET path = '/renamed', content = $1 WHERE id = $2")
+            .params(&[
                 Value::Blob(b"after".to_vec().into()),
                 Value::Text(id.into()),
-            ],
-        )
-        .await
-        .unwrap();
+            ])
+            .await
+            .unwrap();
         let after = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -3280,47 +3272,39 @@ mod tests {
         let file_id = "0193182b-2a72-7ed5-9015-76bf271af333";
         lix.execute(
             "INSERT INTO lix_file (id, path, content) VALUES ($1, '/docs/nested/a.txt', $2)",
-            &[
-                Value::Text(file_id.into()),
-                Value::Blob(b"same bytes".to_vec().into()),
-            ],
         )
+        .params(&[
+            Value::Text(file_id.into()),
+            Value::Blob(b"same bytes".to_vec().into()),
+        ])
         .await
         .expect("create nested file");
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/other.txt', $1)",
-            &[Value::Blob(b"unaffected".to_vec().into())],
-        )
-        .await
-        .expect("create unrelated file");
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/other.txt', $1)")
+            .params(&[Value::Blob(b"unaffected".to_vec().into())])
+            .await
+            .expect("create unrelated file");
         let nested = lix
-            .execute(
-                "SELECT id FROM lix_directory WHERE path = '/docs/nested'",
-                &[],
-            )
+            .query("SELECT id FROM lix_directory WHERE path = '/docs/nested'")
+            .all()
             .await
             .unwrap();
         let directory_id = nested.rows()[0].get::<String>("id").unwrap();
         let checkpoint = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("baseline checkpoint");
         let baseline = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
-        lix.execute(
-            "UPDATE lix_directory SET path = '/renamed' WHERE path = '/docs'",
-            &[],
-        )
-        .await
-        .expect("move ancestor");
+        lix.execute("UPDATE lix_directory SET path = '/renamed' WHERE path = '/docs'")
+            .await
+            .expect("move ancestor");
         let moved_file_full = lix
-            .execute("SELECT id, diff_type FROM lix_diff('lix_file')", &[])
+            .query("SELECT id, diff_type FROM lix_diff('lix_file')")
+            .all()
             .await
             .expect("expanded descendant path diff");
         let moved_file_count = lix
-            .execute("SELECT count(*) AS n FROM lix_diff('lix_file')", &[])
+            .query("SELECT count(*) AS n FROM lix_diff('lix_file')")
+            .all()
             .await
             .expect("expanded descendant path count");
         assert_eq!(
@@ -3332,7 +3316,7 @@ mod tests {
             "SELECT count(*) AS n FROM lix_diff('lix_file')".to_owned(),
             format!("SELECT count(*) AS n FROM lix_diff('lix_file') WHERE id = '{file_id}'"),
         ] {
-            let result = lix.execute(&query, &[]).await.expect("path-only count");
+            let result = lix.query(&query).all().await.expect("path-only count");
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), 1);
         }
         for (filter, expected_rows) in [
@@ -3340,19 +3324,16 @@ mod tests {
             (format!(" WHERE id = '{directory_id}'"), 1),
         ] {
             let result = lix
-                .execute(
-                    &format!("SELECT count(*) AS n FROM lix_diff('lix_directory'){filter}"),
-                    &[],
-                )
+                .query(&format!(
+                    "SELECT count(*) AS n FROM lix_diff('lix_directory'){filter}"
+                ))
+                .all()
                 .await
                 .unwrap();
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
         }
         let target = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("seal ancestor move");
         let target = target.rows()[0].get::<String>("commit_id").unwrap();
@@ -3364,7 +3345,8 @@ mod tests {
                 "SELECT count(*) AS n FROM {source} WHERE lixcol_to_commit_id = '{target}'"
             );
             let count = lix
-                .execute(&count_query, &[])
+                .query(&count_query)
+                .all()
                 .await
                 .expect("projection-independent historical count");
             assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 1);
@@ -3373,7 +3355,8 @@ mod tests {
                 "SELECT id, diff_type, from_path, to_path FROM {source} WHERE id = '{file_id}' AND lixcol_to_commit_id = '{target}'"
             );
             let result = lix
-                .execute(&query, &[])
+                .query(&query)
+                .all()
                 .await
                 .expect("historical ancestor path difference");
             assert_eq!(result.rows().len(), 1);
@@ -3394,17 +3377,15 @@ mod tests {
             format!("lix_history('lix_directory', '{target}')"),
         ] {
             let count = lix
-                .execute(
-                    &format!(
-                        "SELECT count(*) AS n FROM {source} WHERE lixcol_to_commit_id = '{target}'"
-                    ),
-                    &[],
-                )
+                .query(&format!(
+                    "SELECT count(*) AS n FROM {source} WHERE lixcol_to_commit_id = '{target}'"
+                ))
+                .all()
                 .await
                 .unwrap();
             assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 2);
 
-            let result = lix.execute(&format!("SELECT diff_type, from_path, to_path FROM {source} WHERE id = '{directory_id}' AND lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
+            let result = lix.query(&format!("SELECT diff_type, from_path, to_path FROM {source} WHERE id = '{directory_id}' AND lixcol_to_commit_id = '{target}'")).all().await.unwrap();
             assert_eq!(result.rows().len(), 1);
             let rows = result.rows();
             assert_eq!(rows[0].get::<String>("diff_type").unwrap(), "modified");
@@ -3423,59 +3404,43 @@ mod tests {
             .await
             .unwrap();
         for path in ["/old/a.txt", "/replace.txt", "/unrelated.txt"] {
-            lix.execute(
-                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                &[
+            lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&[
                     Value::Text(path.into()),
                     Value::Blob(b"original".to_vec().into()),
-                ],
-            )
-            .await
-            .unwrap();
+                ])
+                .await
+                .unwrap();
         }
         let before = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("commit_id")
             .unwrap();
-        lix.execute(
-            "UPDATE lix_directory SET path = '/new' WHERE path = '/old'",
-            &[],
-        )
-        .await
-        .unwrap();
-        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'", &[])
+        lix.execute("UPDATE lix_directory SET path = '/new' WHERE path = '/old'")
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/replace.txt', $1)",
-            &[Value::Blob(b"replacement".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'")
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/replace.txt', $1)")
+            .params(&[Value::Blob(b"replacement".to_vec().into())])
+            .await
+            .unwrap();
         let after = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("commit_id")
             .unwrap();
         // Make current paths disagree with both historical endpoints.
-        lix.execute(
-            "UPDATE lix_directory SET path = '/later' WHERE path = '/new'",
-            &[],
-        )
-        .await
-        .unwrap();
-        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'", &[])
+        lix.execute("UPDATE lix_directory SET path = '/later' WHERE path = '/new'")
+            .await
+            .unwrap();
+        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'")
             .await
             .unwrap();
         let source = format!("lix_diff('lix_file', '{before}', '{after}')");
@@ -3492,22 +3457,19 @@ mod tests {
             ("from_path = '/old/a.txt' OR diff_type = 'added'", 2),
             ("to_path IN ('/new/a.txt', NULL)", 1),
         ] {
-            let result = lix.execute(&format!("SELECT id, from_path, to_path, from_content, to_content FROM {source} WHERE {predicate}"), &[]).await.unwrap();
+            let result = lix.query(&format!("SELECT id, from_path, to_path, from_content, to_content FROM {source} WHERE {predicate}")).all().await.unwrap();
             assert_eq!(result.rows().len(), expected, "{predicate}");
         }
-        let parameterized = lix.execute(
-            "SELECT id FROM lix_diff('lix_file', $1, $2) WHERE from_path IN ($3) OR to_path IN ($4)",
-            &[Value::Text(before.clone()), Value::Text(after.clone()),
-              Value::Text("/old/a.txt".into()), Value::Text("/replace.txt".into())],
-        ).await.unwrap();
+        let parameterized = lix.query("SELECT id FROM lix_diff('lix_file', $1, $2) WHERE from_path IN ($3) OR to_path IN ($4)").params(&[Value::Text(before.clone()), Value::Text(after.clone()),
+              Value::Text("/old/a.txt".into()), Value::Text("/replace.txt".into())]).all().await.unwrap();
         assert_eq!(parameterized.rows().len(), 2);
         // Two indexes, independent of the number of predicates or projections.
         assert_eq!(paths::INDEX_BUILDS.with(|n| n.get()), 2);
         let result = lix
-            .execute(
-                &format!("SELECT from_path, to_path FROM {source} WHERE from_path = '/old/a.txt'"),
-                &[],
-            )
+            .query(&format!(
+                "SELECT from_path, to_path FROM {source} WHERE from_path = '/old/a.txt'"
+            ))
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -3524,33 +3486,23 @@ mod tests {
             .with_storage(crate::storage::Memory::new())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/existing/a.txt', $1)",
-            &[Value::Blob(b"old".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/existing/a.txt', $1)")
+            .params(&[Value::Blob(b"old".to_vec().into())])
+            .await
+            .unwrap();
         let before = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("commit_id")
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/archive/b.txt', $1)",
-            &[Value::Blob(b"new".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/archive/b.txt', $1)")
+            .params(&[Value::Blob(b"new".to_vec().into())])
+            .await
+            .unwrap();
         let after = lix
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
@@ -3558,10 +3510,10 @@ mod tests {
             .unwrap();
         PATH_EXPANSIONS.with(|n| n.set(0));
         let result = lix
-            .execute(
-                &format!("SELECT count(*) AS n FROM lix_diff('lix_file', '{before}', '{after}')"),
-                &[],
-            )
+            .query(&format!(
+                "SELECT count(*) AS n FROM lix_diff('lix_file', '{before}', '{after}')"
+            ))
+            .all()
             .await
             .unwrap();
         assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), 1);

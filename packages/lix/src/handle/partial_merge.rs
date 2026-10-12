@@ -491,7 +491,7 @@ mod tests {
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
-        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base'),('merge-b','base')",&[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base'),('merge-b','base')").await.unwrap();
         let base = authority
             .partial_replica_descriptor(None)
             .await
@@ -504,17 +504,11 @@ mod tests {
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='local' WHERE key='merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='local' WHERE key='merge-a'")
             .await
             .unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='remote' WHERE key='merge-b'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='remote' WHERE key='merge-b'")
             .await
             .unwrap();
         let first = publish_wave(&authority, &local, &base).await;
@@ -575,10 +569,8 @@ mod tests {
             ]
         );
         let values = authority
-            .execute(
-                "SELECT key,value FROM lix_key_value WHERE key LIKE 'merge-%' ORDER BY key",
-                &[],
-            )
+            .query("SELECT key,value FROM lix_key_value WHERE key LIKE 'merge-%' ORDER BY key")
+            .all()
             .await
             .unwrap();
         assert_eq!(values.rows().len(), 2);
@@ -590,10 +582,7 @@ mod tests {
         // L2 is authored on the original browser L while M exists remotely.
         // The next attempt must traverse M's second parent to prove base L.
         local
-            .execute(
-                "UPDATE lix_key_value SET value='newer-local' WHERE key='merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='newer-local' WHERE key='merge-a'")
             .await
             .unwrap();
         let second = publish_wave(&authority, &local, &first.captured_local_head_commit_id).await;
@@ -613,10 +602,7 @@ mod tests {
             ]
         );
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='later' WHERE key='merge-b'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='later' WHERE key='merge-b'")
             .await
             .unwrap();
         let before_retry = authority
@@ -652,10 +638,7 @@ mod tests {
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('merge-a','base')")
             .await
             .unwrap();
         let base = authority
@@ -670,17 +653,11 @@ mod tests {
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='local' WHERE key='merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='local' WHERE key='merge-a'")
             .await
             .unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='remote' WHERE key='merge-a'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='remote' WHERE key='merge-a'")
             .await
             .unwrap();
         let request = publish_wave(&authority, &local, &base).await;
@@ -699,7 +676,8 @@ mod tests {
             receipt.merge_commit_id
         );
         let value = authority
-            .execute("SELECT value FROM lix_key_value WHERE key='merge-a'", &[])
+            .query("SELECT value FROM lix_key_value WHERE key='merge-a'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -736,10 +714,7 @@ mod tests {
                 .set_sync_role(crate::sync::SyncRole::Authority)
                 .unwrap();
             authority
-                .execute(
-                    "INSERT INTO lix_key_value(key,value) VALUES('included','base')",
-                    &[],
-                )
+                .execute("INSERT INTO lix_key_value(key,value) VALUES('included','base')")
                 .await
                 .unwrap();
             let base = authority
@@ -750,10 +725,7 @@ mod tests {
                 .head
                 .commit_id;
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value='included-L' WHERE key='included'",
-                    &[],
-                )
+                .execute("UPDATE lix_key_value SET value='included-L' WHERE key='included'")
                 .await
                 .unwrap();
             let local = open_lix()
@@ -762,10 +734,7 @@ mod tests {
                 .unwrap();
             if later_remote {
                 authority
-                    .execute(
-                        "UPDATE lix_key_value SET value='remote-R' WHERE key='included'",
-                        &[],
-                    )
+                    .execute("UPDATE lix_key_value SET value='remote-R' WHERE key='included'")
                     .await
                     .unwrap();
             }
@@ -788,7 +757,8 @@ mod tests {
                 "already included rows must not be authored again"
             );
             let rows = authority
-                .execute("SELECT value FROM lix_key_value WHERE key='included'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='included'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -800,10 +770,7 @@ mod tests {
                 })
             );
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value='after-ACK-loss' WHERE key='included'",
-                    &[],
-                )
+                .execute("UPDATE lix_key_value SET value='after-ACK-loss' WHERE key='included'")
                 .await
                 .unwrap();
             assert_eq!(
@@ -814,7 +781,8 @@ mod tests {
                 receipt
             );
             let rows = authority
-                .execute("SELECT value FROM lix_key_value WHERE key='included'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='included'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(
@@ -831,33 +799,24 @@ mod tests {
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('checkpoint-included','base')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('checkpoint-included','base')")
             .await
             .unwrap();
         let base = authority.partial_replica_descriptor(None).await.unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='L' WHERE key='checkpoint-included'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='L' WHERE key='checkpoint-included'")
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
             .unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='R-later' WHERE key='checkpoint-included'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='R-later' WHERE key='checkpoint-included'")
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         let later = authority.partial_replica_descriptor(None).await.unwrap();
         let request = publish_wave_with_base_checkpoint(
             &authority,
@@ -917,28 +876,19 @@ mod tests {
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
-        authority.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('retained-local','base'),('retained-remote','base')",
-            &[],
-        ).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value(key,value) VALUES('retained-local','base'),('retained-remote','base')").await.unwrap();
         let base = authority.partial_replica_descriptor(None).await.unwrap();
         let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='local' WHERE key='retained-local'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='local' WHERE key='retained-local'")
             .await
             .unwrap();
-        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='remote' WHERE key='retained-remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='remote' WHERE key='retained-remote'")
             .await
             .unwrap();
         let request = publish_wave_with_base_checkpoint(
@@ -976,20 +926,14 @@ mod tests {
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
-        authority.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('checkpoint-local','base'),('checkpoint-remote','base')",
-            &[],
-        ).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value(key,value) VALUES('checkpoint-local','base'),('checkpoint-remote','base')").await.unwrap();
         let base = authority.partial_replica_descriptor(None).await.unwrap();
         let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='local' WHERE key='checkpoint-local'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='local' WHERE key='checkpoint-local'")
             .await
             .unwrap();
         let ordinary_head = local
@@ -999,15 +943,12 @@ mod tests {
             .selected_branch
             .head
             .commit_id;
-        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='remote' WHERE key='checkpoint-remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='remote' WHERE key='checkpoint-remote'")
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         let local_descriptor = local.partial_replica_descriptor(None).await.unwrap();
         let remote = authority.partial_replica_descriptor(None).await.unwrap();
         let forged = invalid_checkpoint.map(|non_checkpoint| {
@@ -1028,13 +969,10 @@ mod tests {
         // Acceptance must use the current authority coordinate, not the one
         // captured while retaining the incoming checkpoint's original bodies.
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='remote-later' WHERE key='checkpoint-remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='remote-later' WHERE key='checkpoint-remote'")
             .await
             .unwrap();
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap();
         let before = authority.partial_replica_descriptor(None).await.unwrap();
         let outcome = authority
             .merge_partial_replica_for_account(&request, authority.active_account_id())
@@ -1057,7 +995,7 @@ mod tests {
                 after.selected_branch.checkpoint.commit_id,
                 local_descriptor.selected_branch.checkpoint.commit_id
             );
-            let values = authority.execute("SELECT key,value FROM lix_key_value WHERE key IN ('checkpoint-local','checkpoint-remote') ORDER BY key", &[]).await.unwrap();
+            let values = authority.query("SELECT key,value FROM lix_key_value WHERE key IN ('checkpoint-local','checkpoint-remote') ORDER BY key").all().await.unwrap();
             assert_eq!(
                 values.rows()[0].get::<serde_json::Value>("value").unwrap(),
                 serde_json::json!("local")

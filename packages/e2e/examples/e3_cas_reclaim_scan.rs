@@ -102,24 +102,22 @@ fn main() {
                 .execute(
                     "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
                      ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-                    &[
-                        Value::Text(format!("/e3/payload-{index:07}.bin")),
-                        Value::Blob(distinct_payload(index as u64, file_kib * 1024).into()),
-                    ],
                 )
+                .params(&[
+                    Value::Text(format!("/e3/payload-{index:07}.bin")),
+                    Value::Blob(distinct_payload(index as u64, file_kib * 1024).into()),
+                ])
                 .await
                 .expect("write reclaim scan payload");
         }
         if orphan {
             session
-                .execute(
-                    "DELETE FROM lix_file WHERE path LIKE $1",
-                    &[Value::Text("/e3/%".to_owned())],
-                )
+                .execute("DELETE FROM lix_file WHERE path LIKE $1")
+                .params(&[Value::Text("/e3/%".to_owned())])
                 .await
                 .expect("delete reclaim scan payloads");
             session
-                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                 .await
                 .expect("checkpoint reclaim scan deletion");
         }

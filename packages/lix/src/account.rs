@@ -159,10 +159,7 @@ mod tests {
             .await
             .expect("attributed session should open");
         session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('token-control', CAST('1' AS JSONB))",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('token-control', CAST('1' AS JSONB))")
             .await
             .expect("ordinary write should commit");
         assert_eq!(
@@ -173,7 +170,6 @@ mod tests {
         session
             .execute(
                 "UPDATE lix_key_value SET value = CAST('2' AS JSONB) WHERE key = 'token-control'",
-                &[],
             )
             .await
             .expect("second ordinary write should commit");
@@ -190,10 +186,8 @@ mod tests {
             .await
             .expect("system session should open");
         system
-            .execute(
-                "UPDATE lix_account SET status = 'disabled' WHERE id = $1",
-                &[Value::Text(AUTHOR_ID.to_string())],
-            )
+            .execute("UPDATE lix_account SET status = 'disabled' WHERE id = $1")
+            .params(&[Value::Text(AUTHOR_ID.to_string())])
             .await
             .expect("disable author");
         let after_disable = current_token(&adapter)
@@ -207,10 +201,7 @@ mod tests {
         // The warm session proved itself active moments ago; the rotated token
         // is what makes it re-read and fail.
         let error = session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('after-disable', CAST('1' AS JSONB))",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('after-disable', CAST('1' AS JSONB))")
             .await
             .expect_err("a disabled account must not commit off a warm proof");
         assert_eq!(error.code, "LIX_ACCOUNT_DISABLED");

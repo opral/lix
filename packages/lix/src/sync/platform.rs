@@ -15,7 +15,7 @@ mod wasm;
 mod wasm_http;
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use native::sleep;
+pub(crate) use native::{executor_neutral_sleep, sleep};
 #[cfg(not(target_family = "wasm"))]
 pub(super) use native::{SyncTask, spawn_sync_task};
 #[cfg(not(target_family = "wasm"))]
@@ -23,7 +23,7 @@ pub(super) type HttpSyncTransport = super::http::HttpSyncTransport<reqwest::Clie
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use native_http::{AuthorityHttp, authority_http};
 #[cfg(target_family = "wasm")]
-pub(crate) use wasm::sleep;
+pub(crate) use wasm::{executor_neutral_sleep, sleep};
 #[cfg(target_family = "wasm")]
 pub(super) use wasm::{SyncTask, spawn_sync_task};
 #[cfg(target_family = "wasm")]

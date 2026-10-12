@@ -173,7 +173,7 @@ where
         "undo_roundtrip" => {
             for index in 0..WORKLOAD_COMMITS / 2 {
                 edit_rows(main, 0, window, index + 1).await;
-                main.execute("SELECT commit_id FROM lix_undo()", &[])
+                main.execute("SELECT commit_id FROM lix_undo()")
                     .await
                     .expect("undo duplication-audit commit");
             }
@@ -361,22 +361,20 @@ where
     let mut written = 0usize;
     while written < count {
         let batch = (count - written).min(SEED_BATCH_ROWS);
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin duplication-audit edit");
         for offset in 0..batch {
             let index = start + written + offset;
             transaction
-                .execute(
-                    "UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
-                    &[
-                        Value::Text(format!(
-                            r#"{{"seed":{index},"generation":{generation},"pad":"{PAD}"}}"#
-                        )),
-                        Value::Text(row_path(index)),
-                    ],
-                )
+                .execute("UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2")
+                .params(&[
+                    Value::Text(format!(
+                        r#"{{"seed":{index},"generation":{generation},"pad":"{PAD}"}}"#
+                    )),
+                    Value::Text(row_path(index)),
+                ])
                 .await
                 .expect("stage duplication-audit edit");
         }
@@ -394,17 +392,15 @@ async fn restore_rows<S>(session: &Lix<S>, start: usize, count: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin duplication-audit restore");
     for offset in 0..count {
         let index = start + offset;
         transaction
-            .execute(
-                "UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
-                &[Value::Text(seed_value(index)), Value::Text(row_path(index))],
-            )
+            .execute("UPDATE dup_fixture SET value = CAST($1 AS JSONB) WHERE path = $2")
+            .params(&[Value::Text(seed_value(index)), Value::Text(row_path(index))])
             .await
             .expect("stage duplication-audit restore");
     }
@@ -439,8 +435,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register duplication-audit schema");
 }
@@ -452,17 +448,15 @@ where
     let mut written = 0usize;
     while written < rows {
         let batch = (rows - written).min(SEED_BATCH_ROWS);
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin duplication-audit seed");
         for offset in 0..batch {
             let index = written + offset;
             transaction
-                .execute(
-                    "INSERT INTO dup_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                    &[Value::Text(row_path(index)), Value::Text(seed_value(index))],
-                )
+                .execute("INSERT INTO dup_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))")
+                .params(&[Value::Text(row_path(index)), Value::Text(seed_value(index))])
                 .await
                 .expect("stage duplication-audit seed row");
         }

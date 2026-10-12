@@ -108,6 +108,11 @@ path = "benches/row_pk_layout.rs"
 harness = false
 
 [[bench]]
+name = "inlang_project_scale"
+path = "benches/inlang_project_scale.rs"
+harness = false
+
+[[bench]]
 name = "registered_row_returning"
 path = "benches/registered_row_returning.rs"
 harness = false

@@ -151,10 +151,7 @@ async fn candidate_install_warms_dependencies_without_publishing_admission() {
         .await
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path, content) VALUES('/candidate-install.txt', CAST('text' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file(path, content) VALUES('/candidate-install.txt', CAST('text' AS BYTEA))")
         .await
         .unwrap();
     let leased = authority
@@ -289,10 +286,7 @@ async fn candidate_install_prefetches_graph_metadata_without_publishing_controls
         .await
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path, content) VALUES('/candidate-graph.txt', CAST('text' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file(path, content) VALUES('/candidate-graph.txt', CAST('text' AS BYTEA))")
         .await
         .unwrap();
     let leased = authority

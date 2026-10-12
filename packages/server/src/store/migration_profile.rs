@@ -261,20 +261,17 @@ async fn stage_v81(manager: &LixRuntimeManager, physical: &str) {
         "primary_key": ["id"],
         "unique": [["label"]]
     });
-    seed.execute(
-        "INSERT INTO lix_registered_schema(value) VALUES ($1)",
-        &[lix_sdk::Value::Jsonb(schema.into())],
-    )
-    .await
-    .unwrap();
+    seed.execute("INSERT INTO lix_registered_schema(value) VALUES ($1)")
+        .params(&[lix_sdk::Value::Jsonb(schema.into())])
+        .await
+        .unwrap();
     let values = (0..PROFILE_ROWS)
         .map(|index| format!("('id-{index}', 'label-{index}')"))
         .collect::<Vec<_>>()
         .join(",");
-    seed.execute(
-        &format!("INSERT INTO migration_profile_index(id,label) VALUES {values}"),
-        &[],
-    )
+    seed.execute(&format!(
+        "INSERT INTO migration_profile_index(id,label) VALUES {values}"
+    ))
     .await
     .unwrap();
     seed.close().await.unwrap();

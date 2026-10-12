@@ -464,7 +464,9 @@ pub(crate) fn decode_sync_row_payload(
         Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION) => true,
         Some(crate::row_payload::COMPRESSED_ENGINE_ROW_PAYLOAD_VERSION) => {
             crate::row_payload::decompress_engine_row_payload(&bytes)
-                .map_err(|error| invalid(format!("invalid sync snapshotPayload: {}", error.message)))?
+                .map_err(|error| {
+                    invalid(format!("invalid sync snapshotPayload: {}", error.message))
+                })?
                 .first()
                 .copied()
                 == Some(crate::plugin::wire::typed::ENGINE_ROW_PAYLOAD_VERSION)
@@ -615,10 +617,8 @@ impl SyncCommit {
             if member.schema_key.is_empty() {
                 return invalid("sync commit member schemaKey must not be empty");
             }
-            if crate::storage_codec::id_string::uuid_bytes_from_canonical(
-                &member.change_account_id,
-            )
-            .is_none()
+            if crate::storage_codec::id_string::uuid_bytes_from_canonical(&member.change_account_id)
+                .is_none()
             {
                 return invalid("sync commit member changeAccountId must be a canonical UUID");
             }
@@ -944,9 +944,7 @@ mod tests {
         });
         let typed = crate::row_payload::TypedRow::from_normalized_json(plan, &row_pk, &snapshot)
             .expect("normalize builtin row");
-        let stored_payload = typed
-            .durable_payload()
-            .expect("compact builtin payload");
+        let stored_payload = typed.durable_payload().expect("compact builtin payload");
         let alternate_payload = crate::plugin::wire::typed::encode_native_row_payload(
             &typed.schema_fingerprint,
             &typed.row_pk,
@@ -1016,15 +1014,11 @@ mod tests {
         let historical = lix_schema::CompiledSchema::compile(&historical_schema)
             .expect("compile historical schema");
         let row_pk = RowPk::single("old-row");
-        let historical_row = lix_schema::Row::from([(
-            "key",
-            lix_schema::Value::Text("old-row".to_owned()),
-        )]);
-        let payload_bytes = crate::plugin::wire::typed::encode_engine_row_payload(
-            &historical,
-            &historical_row,
-        )
-        .expect("encode historical compact row");
+        let historical_row =
+            lix_schema::Row::from([("key", lix_schema::Value::Text("old-row".to_owned()))]);
+        let payload_bytes =
+            crate::plugin::wire::typed::encode_engine_row_payload(&historical, &historical_row)
+                .expect("encode historical compact row");
         let payload = encode_sync_row_payload_bytes(&payload_bytes);
         let snapshot = serde_json::json!({"key": "old-row", "value": null});
 
@@ -1067,18 +1061,17 @@ mod tests {
 
     async fn exported_key_value_commit() -> (Lix, SyncCommit) {
         let lix = crate::open_lix().await.expect("open lix");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))",
-            &[
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
                 crate::Value::Text("sync-commit-codec".to_owned()),
                 crate::Value::Text("{\"answer\":42}".to_owned()),
-            ],
-        )
-        .with_origin_key("sync-commit-codec-origin")
-        .await
-        .expect("write commit fixture");
+            ])
+            .with_origin_key("sync-commit-codec-origin")
+            .await
+            .expect("write commit fixture");
         let commit_id = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("load fixture head")
             .rows()[0]
@@ -1154,18 +1147,12 @@ mod tests {
             .await
             .expect("switch source branch");
         source
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('codec-source', 'selected')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('codec-source', 'selected')")
             .await
             .expect("write source branch");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('codec-target', 'authored')",
-            &[],
-        )
-        .await
-        .expect("write target branch");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('codec-target', 'authored')")
+            .await
+            .expect("write target branch");
         let merge = lix
             .merge_branch(crate::MergeBranchOptions {
                 source_branch_id: source_branch.id,
@@ -1220,18 +1207,12 @@ mod tests {
             .await
             .expect("switch first source branch");
         source
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('nested-source', 'selected')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('nested-source', 'selected')")
             .await
             .expect("write first source branch");
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('nested-main', 'authored')",
-            &[],
-        )
-        .await
-        .expect("write main branch");
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('nested-main', 'authored')")
+            .await
+            .expect("write main branch");
         let first = lix
             .merge_branch(crate::MergeBranchOptions {
                 source_branch_id: source_branch.id,
@@ -1261,10 +1242,7 @@ mod tests {
             .await
             .expect("switch second target branch");
         target
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('nested-target', 'authored')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('nested-target', 'authored')")
             .await
             .expect("write second target branch");
         let nested = target
@@ -1294,13 +1272,13 @@ mod tests {
         let lix = crate::open_lix().await.expect("open checkpoint fixture");
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-source', 'selected')",
-            &[],
         )
         .await
         .expect("write checkpoint interval");
         lix.create_checkpoint().await.expect("create checkpoint");
         let checkpoint_id = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .expect("load checkpoint head")
             .rows()[0]

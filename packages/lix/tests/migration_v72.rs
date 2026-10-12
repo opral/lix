@@ -92,7 +92,8 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
             .all(|event| !matches!(event.phase, OpenPhase::Migrating | OpenPhase::Validating))
     );
     let accounts = lix
-        .execute("SELECT id, profile_uri FROM lix_account ORDER BY id", &[])
+        .query("SELECT id, profile_uri FROM lix_account ORDER BY id")
+        .all()
         .await
         .expect("migrated account rows should expose profile_uri");
     assert!(!accounts.rows().is_empty());
@@ -106,13 +107,11 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
 
     let profile_uri = "https://profiles.example/anonymous.json";
     let updated = lix
-        .execute(
-            "UPDATE lix_account SET profile_uri = $1 WHERE id = $2",
-            &[
-                Value::Text(profile_uri.to_owned()),
-                Value::Text(ANONYMOUS_ACCOUNT_ID.to_owned()),
-            ],
-        )
+        .execute("UPDATE lix_account SET profile_uri = $1 WHERE id = $2")
+        .params(&[
+            Value::Text(profile_uri.to_owned()),
+            Value::Text(ANONYMOUS_ACCOUNT_ID.to_owned()),
+        ])
         .await
         .expect("profile_uri update should succeed");
     assert_eq!(updated.rows_affected(), 1);
@@ -133,10 +132,9 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
     assert_eq!(lix.open_report().migration, None);
     assert!(!lix.open_report().initialized);
     let result = lix
-        .execute(
-            "SELECT profile_uri FROM lix_account WHERE id = $1",
-            &[Value::Text(ANONYMOUS_ACCOUNT_ID.to_owned())],
-        )
+        .query("SELECT profile_uri FROM lix_account WHERE id = $1")
+        .params(&[Value::Text(ANONYMOUS_ACCOUNT_ID.to_owned())])
+        .all()
         .await
         .expect("profile_uri should remain queryable after cold reopen");
     assert_eq!(

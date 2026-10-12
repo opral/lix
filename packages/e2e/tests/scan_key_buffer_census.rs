@@ -57,12 +57,10 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
         ],
         "primary_key": ["id"],
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
-    .await
-    .expect("register census schema");
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
+        .await
+        .expect("register census schema");
 
     // Stay below the per-transaction packed-base admission threshold so the
     // measured read remains a full hot-state prefix scan.
@@ -78,7 +76,11 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
             params.push(Value::Text(format!("/census/{ordinal:09}")));
             params.push(Value::Integer(i64::try_from(*ordinal).expect("fits i64")));
         }
-        let result = lix.execute(&sql, &params).await.expect("seed census rows");
+        let result = lix
+            .execute(&sql)
+            .params(&params)
+            .await
+            .expect("seed census rows");
         assert!(
             result.rows_affected() > 0,
             "a seed statement that affects no rows produces the same zero counters as a route that never ran"
@@ -92,7 +94,8 @@ async fn a_scan_allocates_far_fewer_key_buffers_than_it_returns_rows() {
     let _ = take_hot_scan_refcount_census();
 
     let result = lix
-        .execute(&format!("SELECT id, ordinal FROM {SCHEMA_KEY}"), &[])
+        .query(&format!("SELECT id, ordinal FROM {SCHEMA_KEY}"))
+        .all()
         .await
         .expect("scan census rows");
     assert_eq!(

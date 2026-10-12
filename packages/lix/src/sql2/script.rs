@@ -53,10 +53,7 @@ struct ParsedStatement {
 /// modes, savepoints, rollback, nested controls, and empty transactions are
 /// rejected. PostgreSQL-style numbered placeholders retain their request-wide
 /// positions.
-pub fn parse_sql_script(
-    sql: &str,
-    provided_param_count: usize,
-) -> Result<SqlScriptPlan, LixError> {
+pub fn parse_sql_script(sql: &str, provided_param_count: usize) -> Result<SqlScriptPlan, LixError> {
     let statements = parse_statements(sql)?;
     if statements.is_empty() {
         return Err(LixError::new(
@@ -96,6 +93,33 @@ pub fn parse_sql_script(
     };
 
     build_atomic_plan(executable, provided_param_count)
+}
+
+/// What remote handles check before sending SQL to the server, with the
+/// parser and routing the engine uses: `query()` must not write, and
+/// `execute_many()` must not return rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatementClass {
+    pub(crate) read_only: bool,
+    /// The statement produces rows: a query, an `EXPLAIN`, or `RETURNING`.
+    pub(crate) returns_rows: bool,
+}
+
+pub(crate) fn classify_statement(sql: &str) -> Result<StatementClass, LixError> {
+    let statements = parse_statements(sql)?;
+    let [statement] = statements.as_slice() else {
+        return Err(LixError::new(
+            LixError::CODE_PARSE_ERROR,
+            "Lix SQL only supports one statement per call",
+        ));
+    };
+    // Unsupported statements (SET, CREATE TABLE, a data-modifying CTE)
+    // fail as unsupported, not as writes a read API refuses.
+    let route = super::bind_statement_route(&statement.statement)?;
+    Ok(StatementClass {
+        read_only: route == super::BoundStatementRoute::Read,
+        returns_rows: super::statement_returns_rows(&statement.statement),
+    })
 }
 
 fn parse_statements(sql: &str) -> Result<Vec<ParsedStatement>, LixError> {
@@ -301,6 +325,51 @@ mod tests {
                 sql: "SELECT $1".to_string(),
                 params: 0..1,
             }]
+        );
+    }
+
+    #[test]
+    fn classifies_reads_and_writes() {
+        let classes = [
+            "SELECT 1",
+            "INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')",
+            "SELECT uuidv7()",
+            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            "DELETE FROM lix_key_value RETURNING key",
+        ]
+        .map(|sql| classify_statement(sql).unwrap())
+        .map(|class| (class.read_only, class.returns_rows));
+        assert_eq!(
+            classes,
+            [
+                (true, true),
+                (false, false),
+                (true, true),
+                (false, true),
+                (false, true)
+            ]
+        );
+        assert!(classify_statement("SELECT 1; SELECT 2").is_err());
+        for unsupported in [
+            "WITH d AS (DELETE FROM lix_key_value RETURNING key) SELECT key FROM d",
+            "EXPLAIN SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            "EXPLAIN ANALYZE INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')",
+            "SET search_path = public",
+            "CREATE TABLE t (a INT)",
+            "BEGIN",
+        ] {
+            assert_eq!(
+                classify_statement(unsupported).unwrap_err().code,
+                LixError::CODE_UNSUPPORTED_SQL,
+                "{unsupported}"
+            );
+        }
+        assert_eq!(
+            classify_statement("EXPLAIN SELECT 1").unwrap(),
+            StatementClass {
+                read_only: true,
+                returns_rows: true
+            }
         );
     }
 

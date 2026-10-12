@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 
 test("serializes SQL integers and JSONB numbers as JavaScript numbers", async () => {
-	const { openLix, Value } = await import("@lix-js/sdk");
+	const { openLix, Value, json: jsonParam } = await import("@lix-js/sdk");
 	const lix = await openLix();
 	try {
 		const integers = await lix.execute(
@@ -18,7 +18,7 @@ test("serializes SQL integers and JSONB numbers as JavaScript numbers", async ()
 			nested: [2, { ok: true }],
 			nullish: null,
 		};
-		const jsonb = await lix.execute("SELECT $1 AS payload", [json]);
+		const jsonb = await lix.execute("SELECT $1 AS payload", [jsonParam(json)]);
 		expect(jsonb.rows[0]?.payload).toEqual(json);
 
 		const real = await lix.execute("SELECT $1 AS value", [Value.real(1e20)]);

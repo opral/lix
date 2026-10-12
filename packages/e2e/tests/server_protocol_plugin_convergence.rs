@@ -19,20 +19,16 @@ async fn same_base_server_protocol_plugin_updates_conflict_then_retry() {
         .await
         .expect("open setup Lix");
     setup
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
-                Value::Blob(json_plugin_archive().into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
+            Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
+            Value::Blob(json_plugin_archive().into()),
+        ])
         .await
         .expect("install JSON plugin");
     setup
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)",
-            &[Value::Blob(br#"{"value":"base"}"#.to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)")
+        .params(&[Value::Blob(br#"{"value":"base"}"#.to_vec().into())])
         .await
         .expect("write base JSON file");
 
@@ -132,12 +128,12 @@ async fn same_base_server_protocol_plugin_updates_conflict_then_retry() {
         .await
         .expect("open verification Lix");
     let forks = verifier
-        .execute(
+        .query(
             "SELECT parent_commit_ids ->> 0 AS parent_id, COUNT(*) AS children \
              FROM lix_commit WHERE parent_commit_ids ->> 0 IS NOT NULL \
              GROUP BY parent_commit_ids ->> 0 HAVING COUNT(*) > 1",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     assert_eq!(forks.len(), 0, "remote writers must not fork history");

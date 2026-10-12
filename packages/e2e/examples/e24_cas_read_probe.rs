@@ -119,7 +119,10 @@ async fn main() {
                 ));
             }
             sql.push_str(" ON CONFLICT (path) DO UPDATE SET content = excluded.content");
-            lix.execute(&sql, &params).await.expect("seed import");
+            lix.execute(&sql)
+                .params(&params)
+                .await
+                .expect("seed import");
             cursor += n;
         }
         println!(
@@ -145,7 +148,8 @@ async fn main() {
 
         let t = Instant::now();
         let rows = lix
-            .execute("SELECT path, content FROM lix_file", &[])
+            .query("SELECT path, content FROM lix_file")
+            .all()
             .await
             .expect("full-tree read");
         let mut payloads: Vec<(String, Vec<u8>)> = Vec::with_capacity(asset_count);

@@ -396,10 +396,7 @@ mod tests {
         let lix = open_lix().await.unwrap();
         for count in [0, 16, 64] {
             for index in 0..count {
-                lix.execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                    &[Value::Text(format!("entry-{index}")), Value::Text("x".repeat(1024))],
-                ).await.unwrap();
+                lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value").params(&[Value::Text(format!("entry-{index}")), Value::Text("x".repeat(1024))]).await.unwrap();
             }
             if count > 0 {
                 for index in 0..8 {
@@ -476,10 +473,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            lix.execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &params,
-            )
+            lix.execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
+            .params(&params)
             .await
             .unwrap();
         }
@@ -563,23 +560,29 @@ mod tests {
             for index in 0..history {
                 lix.execute(
                     "UPDATE lix_key_value SET value = $1 WHERE key = 'descriptor-row-000000'",
-                    &[Value::Text(format!("history-{index}"))],
                 )
+                .params(&[Value::Text(format!("history-{index}"))])
                 .await
                 .unwrap();
             }
             if schemas > 0 {
-                let statements = (0..schemas).map(|index| crate::ExecuteBatchStatement {
-                    label: None,
-                    sql: "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1, true)".into(),
-                    params: vec![Value::Jsonb(serde_json::json!({
-                        "$schema": "https://lix.dev/schema-v1.json",
-                        "key": format!("descriptor_schema_{index}"),
-                        "columns": [{"name":"id", "type":"text", "nullable":false}],
-                        "primary_key": ["id"],
-                    }).into())],
-                }).collect::<Vec<_>>();
-                lix.execute_batch(&statements).await.unwrap();
+                let param_sets = (0..schemas).map(|index| {
+                    [Value::Jsonb(
+                        serde_json::json!({
+                            "$schema": "https://lix.dev/schema-v1.json",
+                            "key": format!("descriptor_schema_{index}"),
+                            "columns": [{"name":"id", "type":"text", "nullable":false}],
+                            "primary_key": ["id"],
+                        })
+                        .into(),
+                    )]
+                });
+                lix.execute_many(
+                    "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES ($1, true)",
+                    param_sets,
+                )
+                .await
+                .unwrap();
             }
             // Rooted checkpoints put large current state into its native tree;
             // fixture construction and materialization are outside the timer.

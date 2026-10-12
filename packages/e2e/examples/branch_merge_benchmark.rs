@@ -853,14 +853,15 @@ where
 
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
-        lix.execute(
+        lix.query(
             "SELECT id, diff_type \
              FROM lix_diff('branch_bench_row', $1, $2) ORDER BY id",
-            &[
-                Value::Text(preview.base_commit_id.clone()),
-                Value::Text(preview.target_head_commit_id.clone()),
-            ],
         )
+        .params(&[
+            Value::Text(preview.base_commit_id.clone()),
+            Value::Text(preview.target_head_commit_id.clone()),
+        ])
+        .all()
         .await
         .expect("historical row diff")
     })
@@ -889,10 +890,8 @@ where
     let delete_branches_measure = measure_async(|| async {
         for branch_id in &fanout_branch_ids {
             let result = lix
-                .execute(
-                    "DELETE FROM lix_branch WHERE id = $1",
-                    &[Value::Text(branch_id.clone())],
-                )
+                .execute("DELETE FROM lix_branch WHERE id = $1")
+                .params(&[Value::Text(branch_id.clone())])
                 .await
                 .expect("delete fanout branch");
             assert_eq!(result.rows_affected(), 1);
@@ -1185,10 +1184,7 @@ where
         ],
         "primary_key": ["id"],
     });
-    let result = lix.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-        &[Value::Text(schema.to_string())],
-    ).await.expect("register benchmark schema");
+    let result = lix.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())]).await.expect("register benchmark schema");
     assert_eq!(result.rows_affected(), 1);
 }
 
@@ -1196,7 +1192,7 @@ async fn seed_rows<StorageImpl>(lix: &Lix<StorageImpl>, cfg: &Config)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("begin benchmark seed transaction");
@@ -1213,7 +1209,8 @@ where
             params.push(Value::Text(payload("base", index, cfg.payload_bytes)));
         }
         let result = transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("seed benchmark rows");
         assert_eq!(result.rows_affected() as usize, end - start);
@@ -1233,15 +1230,13 @@ where
     }
     for commit in 0..cfg.history {
         let index = cfg.rows - 1 - (commit % (cfg.rows - cfg.changes * 2).max(1));
-        lix.execute(
-            "UPDATE branch_bench_row SET value = $1 WHERE id = $2",
-            &[
+        lix.execute("UPDATE branch_bench_row SET value = $1 WHERE id = $2")
+            .params(&[
                 Value::Text(payload("history", commit, cfg.payload_bytes)),
                 Value::Text(row_id(index)),
-            ],
-        )
-        .await
-        .expect("seed common history");
+            ])
+            .await
+            .expect("seed common history");
     }
 }
 
@@ -1362,24 +1357,19 @@ async fn apply_ops<StorageImpl>(
     let commit_count = requested_commits.min(ops.len());
     let chunk_size = ops.len().div_ceil(commit_count);
     for chunk in ops.chunks(chunk_size) {
-        let mut transaction = lix
+        let transaction = lix
             .begin_transaction()
             .await
             .expect("begin divergent commit");
         for (id, value) in chunk {
             match value {
                 RowValue::Present(value) => {
-                    transaction.execute(
-                    "INSERT INTO branch_bench_row (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = excluded.value",
-                    &[Value::Text((*id).clone()), Value::Text((*value).clone())],
-                ).await.expect("apply row upsert");
+                    transaction.execute("INSERT INTO branch_bench_row (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = excluded.value").params(&[Value::Text((*id).clone()), Value::Text((*value).clone())]).await.expect("apply row upsert");
                 }
                 RowValue::Absent => {
                     transaction
-                        .execute(
-                            "DELETE FROM branch_bench_row WHERE id = $1",
-                            &[Value::Text((*id).clone())],
-                        )
+                        .execute("DELETE FROM branch_bench_row WHERE id = $1")
+                        .params(&[Value::Text((*id).clone())])
                         .await
                         .expect("apply row delete");
                 }
@@ -1455,7 +1445,8 @@ async fn read_rows<StorageImpl>(lix: &Lix<StorageImpl>) -> BTreeMap<String, Stri
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute("SELECT id, value FROM branch_bench_row ORDER BY id", &[])
+    lix.query("SELECT id, value FROM branch_bench_row ORDER BY id")
+        .all()
         .await
         .expect("read benchmark rows")
         .rows()
@@ -1473,13 +1464,12 @@ async fn commit_parent_count<StorageImpl>(lix: &Lix<StorageImpl>, commit_id: &st
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT parent_commit_ids FROM lix_commit WHERE id = $1",
-        &[Value::Text(commit_id.to_owned())],
-    )
-    .await
-    .expect("query merge parents")
-    .rows()[0]
+    lix.query("SELECT parent_commit_ids FROM lix_commit WHERE id = $1")
+        .params(&[Value::Text(commit_id.to_owned())])
+        .all()
+        .await
+        .expect("query merge parents")
+        .rows()[0]
         .get::<serde_json::Value>("parent_commit_ids")
         .expect("merge parents should decode as JSON")
         .as_array()
@@ -1491,13 +1481,12 @@ async fn branch_head<StorageImpl>(lix: &Lix<StorageImpl>, branch_id: &str) -> St
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT commit_id FROM lix_branch WHERE id = $1",
-        &[Value::Text(branch_id.to_owned())],
-    )
-    .await
-    .expect("query branch head")
-    .rows()[0]
+    lix.query("SELECT commit_id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id.to_owned())])
+        .all()
+        .await
+        .expect("query branch head")
+        .rows()[0]
         .get::<String>("commit_id")
         .expect("branch head commit id")
 }
@@ -1506,14 +1495,13 @@ async fn branch_exists<StorageImpl>(lix: &Lix<StorageImpl>, branch_id: &str) -> 
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    !lix.execute(
-        "SELECT id FROM lix_branch WHERE id = $1",
-        &[Value::Text(branch_id.to_owned())],
-    )
-    .await
-    .expect("query branch existence")
-    .rows()
-    .is_empty()
+    !lix.query("SELECT id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id.to_owned())])
+        .all()
+        .await
+        .expect("query branch existence")
+        .rows()
+        .is_empty()
 }
 
 async fn install_all_plugins<StorageImpl>(lix: &Lix<StorageImpl>)
@@ -1535,23 +1523,19 @@ async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, bytes: Vec<
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[Value::Text(path.to_owned()), Value::Blob(bytes.into())],
-    ).await.unwrap_or_else(|error| panic!("write plugin benchmark file {path}: {error:?}"));
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content").params(&[Value::Text(path.to_owned()), Value::Blob(bytes.into())]).await.unwrap_or_else(|error| panic!("write plugin benchmark file {path}: {error:?}"));
 }
 
 async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .unwrap_or_else(|error| panic!("read plugin benchmark file {path}: {error:?}"))
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .unwrap_or_else(|error| panic!("read plugin benchmark file {path}: {error:?}"))
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("file data")
 }
@@ -1580,10 +1564,9 @@ where
     let mut result = BTreeMap::new();
     for path in paths {
         let change_id = lix
-            .execute(
-                "SELECT lixcol_change_id FROM lix_file WHERE path = $1",
-                &[Value::Text(path.clone())],
-            )
+            .query("SELECT lixcol_change_id FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(path.clone())])
+            .all()
             .await
             .expect("read file change id")
             .rows()[0]
@@ -1711,13 +1694,12 @@ async fn file_id_at_path<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Str
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT id FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("query file id")
-    .rows()[0]
+    lix.query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("query file id")
+        .rows()[0]
         .get::<String>("id")
         .expect("file id")
 }
@@ -1728,10 +1710,11 @@ where
 {
     let text_id = file_id_at_path(lix, "/merge.txt").await;
     let text_rows = lix
-        .execute(
+        .query(
             "SELECT id, content_base64 FROM text_line WHERE lixcol_file_id = $1 ORDER BY order_key",
-            &[Value::Text(text_id.clone())],
         )
+        .params(&[Value::Text(text_id.clone())])
+        .all()
         .await
         .expect("query text lines");
     let text_index = if target {
@@ -1753,22 +1736,17 @@ where
     } else {
         original.replace("beta", "BETA")
     };
-    lix.execute(
-        "UPDATE text_line SET content_base64 = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE text_line SET content_base64 = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Text(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text_value)),
             Value::Text(text_row_id),
             Value::Text(text_id),
-        ],
-    )
-    .await
-    .expect("edit text semantic line");
+        ])
+        .await
+        .expect("edit text semantic line");
 
     let markdown_id = file_id_at_path(lix, "/merge.md").await;
-    let markdown_rows = lix.execute(
-        "SELECT id, payload_json FROM markdown_node WHERE lixcol_file_id = $1 AND kind = 'paragraph' ORDER BY order_key",
-        &[Value::Text(markdown_id.clone())],
-    ).await.expect("query Markdown nodes");
+    let markdown_rows = lix.query("SELECT id, payload_json FROM markdown_node WHERE lixcol_file_id = $1 AND kind = 'paragraph' ORDER BY order_key").params(&[Value::Text(markdown_id.clone())]).all().await.expect("query Markdown nodes");
     let markdown_index = if target {
         0
     } else {
@@ -1784,30 +1762,24 @@ where
     } else {
         original_payload.replace("beta", "BETA")
     };
-    lix.execute(
-        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Text(payload),
             Value::Text(markdown_row_id),
             Value::Text(markdown_id),
-        ],
-    )
-    .await
-    .expect("edit Markdown semantic node");
+        ])
+        .await
+        .expect("edit Markdown semantic node");
 
     let json_id = file_id_at_path(lix, "/merge.json").await;
     let json_value = if target { r#""target""# } else { r#""source""# };
-    lix.execute(
-        "UPDATE json_object_member SET scalar_json = $1 WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2",
-        &[Value::Text(json_value.to_owned()), Value::Text(json_id)],
-    ).await.expect("edit JSON semantic member");
+    lix.execute("UPDATE json_object_member SET scalar_json = $1 WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $2").params(&[Value::Text(json_value.to_owned()), Value::Text(json_id)]).await.expect("edit JSON semantic member");
 
     let csv_id = file_id_at_path(lix, "/merge.csv").await;
     let csv_rows = lix
-        .execute(
-            "SELECT id FROM csv_row WHERE lixcol_file_id = $1 ORDER BY order_key",
-            &[Value::Text(csv_id.clone())],
-        )
+        .query("SELECT id FROM csv_row WHERE lixcol_file_id = $1 ORDER BY order_key")
+        .params(&[Value::Text(csv_id.clone())])
+        .all()
         .await
         .expect("query CSV rows");
     let csv_index = if target { 0 } else { csv_rows.rows().len() - 1 };
@@ -1819,27 +1791,24 @@ where
     } else {
         json!(["beta", "TWO"])
     };
-    lix.execute(
-        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
+    lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3")
+        .params(&[
             Value::Jsonb(cells.into()),
             Value::Text(csv_row_id),
             Value::Text(csv_id),
-        ],
-    )
-    .await
-    .expect("edit CSV semantic row");
+        ])
+        .await
+        .expect("edit CSV semantic row");
 
     let drawing_id = file_id_at_path(lix, "/merge.excalidraw").await;
     let element_id = if target { "a" } else { "b" };
     let original = lix
-        .execute(
-            "SELECT element_json FROM excalidraw_element WHERE id = $1 AND lixcol_file_id = $2",
-            &[
-                Value::Text(element_id.to_owned()),
-                Value::Text(drawing_id.clone()),
-            ],
-        )
+        .query("SELECT element_json FROM excalidraw_element WHERE id = $1 AND lixcol_file_id = $2")
+        .params(&[
+            Value::Text(element_id.to_owned()),
+            Value::Text(drawing_id.clone()),
+        ])
+        .all()
         .await
         .expect("query Excalidraw element")
         .rows()[0]
@@ -1857,12 +1826,12 @@ where
     );
     lix.execute(
         "UPDATE excalidraw_element SET element_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
-        &[
-            Value::Text(replacement),
-            Value::Text(element_id.to_owned()),
-            Value::Text(drawing_id),
-        ],
     )
+    .params(&[
+        Value::Text(replacement),
+        Value::Text(element_id.to_owned()),
+        Value::Text(drawing_id),
+    ])
     .await
     .expect("edit Excalidraw semantic element");
 }
@@ -1946,7 +1915,8 @@ where
     ] {
         let sql = format!("SELECT COUNT(*) AS count FROM {table}");
         let count = lix
-            .execute(&sql, &[])
+            .query(&sql)
+            .all()
             .await
             .expect("query semantic row count")
             .rows()[0]

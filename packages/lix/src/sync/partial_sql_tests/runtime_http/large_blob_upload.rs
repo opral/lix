@@ -32,10 +32,8 @@ async fn file_above_former_64_mib_limit_uploads_bounded_chunks_and_reuses_remote
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/large.bin',$1)",
-            &[Value::Blob(bytes::Bytes::from_static(b"old").into())],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/large.bin',$1)")
+        .params(&[Value::Blob(bytes::Bytes::from_static(b"old").into())])
         .await
         .unwrap();
     let server = open_lix()

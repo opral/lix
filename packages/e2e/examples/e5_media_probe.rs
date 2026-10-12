@@ -84,7 +84,7 @@ const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 async fn seed(session: &Lix<RocksDB>, files: usize, asset_bytes: usize) -> f64 {
     let started = Instant::now();
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin seed transaction");
@@ -120,7 +120,8 @@ async fn seed(session: &Lix<RocksDB>, files: usize, asset_bytes: usize) -> f64 {
             params.push(Value::Blob(asset(index, asset_bytes).into()));
         }
         transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("seed asset batch");
         start = end;
@@ -133,7 +134,8 @@ async fn seed(session: &Lix<RocksDB>, files: usize, asset_bytes: usize) -> f64 {
 async fn read_all(session: &Lix<RocksDB>) -> (f64, u64, u64) {
     let started = Instant::now();
     let result = session
-        .execute("SELECT path, content FROM lix_file", &[])
+        .query("SELECT path, content FROM lix_file")
+        .all()
         .await
         .expect("read every file");
     let mut bytes = 0_u64;
@@ -217,7 +219,7 @@ async fn mode_commit(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usi
 
         let started_at = now_millis();
         let started = Instant::now();
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin agent commit");
@@ -233,7 +235,8 @@ async fn mode_commit(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usi
         }
         sql.push_str(" ON CONFLICT (path) DO UPDATE SET content = excluded.content");
         transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("agent edit");
         transaction.commit().await.expect("commit agent edit");
@@ -296,7 +299,10 @@ async fn mode_agent(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usiz
             params.push(Value::Blob(asset(cursor + k, asset_bytes).into()));
         }
         sql.push_str(" ON CONFLICT (path) DO UPDATE SET content = excluded.content");
-        lix.execute(&sql, &params).await.expect("import batch");
+        lix.execute(&sql)
+            .params(&params)
+            .await
+            .expect("import batch");
         cursor += n;
     }
     let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
@@ -327,16 +333,19 @@ async fn mode_agent(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usiz
 
         let started_at = now_millis();
         let started = Instant::now();
-        lix.execute(&sql, &params).await.expect("agent commit");
+        lix.execute(&sql)
+            .params(&params)
+            .await
+            .expect("agent commit");
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         println!("e5_agent round={round} ms={ms:.3} start_unix_ms={started_at}");
         samples.push(ms);
 
         let after = active_commit(&lix).await;
-        lix.execute(
-            &format!("SELECT COUNT(*) FROM lix_diff('lix_file', '{before}', '{after}')"),
-            &[],
-        )
+        lix.query(&format!(
+            "SELECT COUNT(*) FROM lix_diff('lix_file', '{before}', '{after}')"
+        ))
+        .all()
         .await
         .expect("diff versus parent");
     }
@@ -368,7 +377,8 @@ async fn mode_agent(dir: PathBuf, asset_bytes: usize, files: usize, rounds: usiz
 
 async fn active_commit(lix: &Lix<RocksDB>) -> String {
     let result = lix
-        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .query("SELECT lix_active_branch_commit_id()")
+        .all()
         .await
         .expect("read active commit id");
     match &result.rows()[0].values()[0] {

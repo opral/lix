@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::Statistics;
-use futures_util::stream::BoxStream;
 
 use crate::LixError;
 use crate::hot_state::{
@@ -51,24 +50,21 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
     /// unfiltered scan without materializing every row identity. `None` keeps
     /// callers on the ordinary scan path when the reader cannot prove the
     /// complete visible scope from committed controls.
-    async fn exact_count(
-        &self,
-        _request: HotStateScanRequest,
-    ) -> Result<Option<u64>, LixError> {
+    async fn exact_count(&self, _request: HotStateScanRequest) -> Result<Option<u64>, LixError> {
         Ok(None)
     }
 
-    /// Returns at most `candidate_limit` primary keys from a durable
-    /// current-base page or a bounded authenticated packed-leaf prefix. This
-    /// is a candidate source for unordered LIMIT only; providers re-read every
-    /// candidate through the current hot-state visibility path before exposing
-    /// it. `None` means no bounded candidate proof applies and the ordinary
-    /// scan must run.
-    async fn scan_row_limit_candidates(
+    /// Sizes one ordered primary-key page: an inclusive upper primary key such
+    /// that reading the request's interval from its lower bound through that
+    /// key visits about `target_rows` stored rows. A cost model only, never a
+    /// visibility claim — providers read the chosen interval through the
+    /// exact hot-state path. `None` reads the remainder of the interval at
+    /// once, which is always correct.
+    async fn row_pk_page_horizon(
         &self,
         _request: HotStateScanRequest,
-        _candidate_limit: usize,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        _target_rows: usize,
+    ) -> Result<Option<RowPk>, LixError> {
         Ok(None)
     }
 
@@ -91,23 +87,6 @@ pub(crate) trait RowSnapshotReader: Send + Sync {
         &self,
         _request: HotStateScanRequest,
     ) -> Result<Option<crate::tracked_state::ExclusiveRowSnapshotBatch>, LixError> {
-        Ok(None)
-    }
-
-    /// Returns bounded raw-snapshot pages for a committed full scan. Readers
-    /// return `None` when the current generation cannot be proven as a stream
-    /// of disjoint immutable bases plus a bounded exact HOT overlay. Unlike
-    /// `scan_row_snapshots`, page batches do not promise a global primary-key
-    /// order; SQL providers using this capability must advertise no ordering.
-    async fn scan_row_snapshot_pages(
-        &self,
-        _request: HotStateScanRequest,
-    ) -> Result<
-        Option<
-            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
-        >,
-        LixError,
-    > {
         Ok(None)
     }
 
@@ -223,24 +202,21 @@ impl<S> RowSnapshotReader for CurrentRowSnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    async fn exact_count(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<Option<u64>, LixError> {
+    async fn exact_count(&self, request: HotStateScanRequest) -> Result<Option<u64>, LixError> {
         self.hot_state
             .reader(self.store.clone())
             .exact_count_with_bounded_global_overlay(&request)
             .await
     }
 
-    async fn scan_row_limit_candidates(
+    async fn row_pk_page_horizon(
         &self,
         request: HotStateScanRequest,
-        candidate_limit: usize,
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        target_rows: usize,
+    ) -> Result<Option<RowPk>, LixError> {
         self.hot_state
             .reader(self.store.clone())
-            .scan_direct_row_limit_candidates(&request, candidate_limit)
+            .row_pk_page_horizon(&request, target_rows)
             .await
     }
 
@@ -267,24 +243,6 @@ where
         self.hot_state
             .reader(self.store.clone())
             .scan_direct_row_snapshots(&request)
-            .await
-    }
-
-    async fn scan_row_snapshot_pages(
-        &self,
-        request: HotStateScanRequest,
-    ) -> Result<
-        Option<
-            BoxStream<'static, Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>>,
-        >,
-        LixError,
-    > {
-        if !direct_row_snapshot_request(&request) {
-            return Ok(None);
-        }
-        self.hot_state
-            .reader(self.store.clone())
-            .scan_direct_row_snapshot_pages(&request)
             .await
     }
 

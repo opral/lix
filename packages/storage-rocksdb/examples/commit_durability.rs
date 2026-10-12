@@ -17,11 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut samples = Vec::new();
             for index in 0..220 {
                 let started = Instant::now();
-                lix.execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, 'true'::jsonb)",
-                    &[Value::Text(format!("write-{index}"))],
-                )
-                .await?;
+                lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, 'true'::jsonb)")
+                    .params(&[Value::Text(format!("write-{index}"))])
+                    .await?;
                 if index >= 20 {
                     samples.push(started.elapsed());
                 }

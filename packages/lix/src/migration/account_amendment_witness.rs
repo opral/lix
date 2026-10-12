@@ -209,10 +209,7 @@ mod tests {
                 .with_storage(storage.clone())
                 .await
                 .unwrap();
-            lix.execute(
-                "INSERT INTO lix_key_value(key,value,lixcol_untracked) VALUES('protected','original',$1)",
-                &[crate::Value::Boolean(untracked)],
-            ).await.unwrap();
+            lix.execute("INSERT INTO lix_key_value(key,value,lixcol_untracked) VALUES('protected','original',$1)").params(&[crate::Value::Boolean(untracked)]).await.unwrap();
             let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
                 .await
                 .unwrap();
@@ -220,12 +217,9 @@ mod tests {
             let witness = capture(&adapter, options).await.unwrap();
             let target = crate::schema::seed_schema_definition("lix_account").unwrap();
             witness.verify(&adapter, options, target).await.unwrap();
-            lix.execute(
-                "UPDATE lix_key_value SET value='changed' WHERE key='protected'",
-                &[],
-            )
-            .await
-            .unwrap();
+            lix.execute("UPDATE lix_key_value SET value='changed' WHERE key='protected'")
+                .await
+                .unwrap();
             let error = witness.verify(&adapter, options, target).await.unwrap_err();
             assert_eq!(error.code, "LIX_MIGRATION_PRESERVATION_FAILED");
             lix.close().await.unwrap();

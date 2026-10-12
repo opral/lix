@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use lix::common::{LixTimestamp, MutationIdentity};
-use lix::row_pk::RowPk;
 use lix::hot_state::MaterializedHotStateRow;
 use lix::plugin::runtime::{
     BoundCreateContext, PluginActorKey, reserve_create_row, validate_create_reservation,
 };
+use lix::row_pk::RowPk;
 use lix::{Lix, LixError, Memory, Value, open_lix};
 
 #[tokio::test]
@@ -21,10 +21,9 @@ async fn create_reservations_survive_repository_reopen() {
         .expect("fixture file writes");
 
     let file = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_string())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .all()
         .await
         .expect("fixture identity reads");
     let file_id = file.rows()[0].get::<String>("id").expect("file id");
@@ -89,17 +88,14 @@ async fn create_reservations_survive_repository_reopen() {
         .expect_err("a reused namespace with another proof must remain rejected after reopen");
     assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
 
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_string())],
-    )
-    .await
-    .expect("file tombstones with its durable reservations");
+    lix.execute("DELETE FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_string())])
+        .await
+        .expect("file tombstones with its durable reservations");
     let remaining = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = $1 AND lixcol_file_id = $2",
-            &[Value::Text(reservation_key), Value::Text(file_id.clone())],
-        )
+        .query("SELECT COUNT(*) AS count FROM lix_key_value WHERE key = $1 AND lixcol_file_id = $2")
+        .params(&[Value::Text(reservation_key), Value::Text(file_id.clone())])
+        .all()
         .await
         .expect("reservation deletion reads")
         .rows()[0]
@@ -116,8 +112,8 @@ async fn write_file(lix: &Lix<Memory>, path: &str, content: Vec<u8>) -> Result<(
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[Value::Text(path.to_string()), Value::Blob(content.into())],
     )
+    .params(&[Value::Text(path.to_string()), Value::Blob(content.into())])
     .await?;
     Ok(())
 }
@@ -128,14 +124,15 @@ async fn load_reservation(
     file_id: &str,
 ) -> MaterializedHotStateRow {
     let result = lix
-        .execute(
+        .query(
             "SELECT key, value, lixcol_author_id, lixcol_file_id, lixcol_untracked \
              FROM lix_key_value WHERE key = $1 AND lixcol_file_id = $2",
-            &[
-                Value::Text(reservation_key.to_string()),
-                Value::Text(file_id.to_string()),
-            ],
         )
+        .params(&[
+            Value::Text(reservation_key.to_string()),
+            Value::Text(file_id.to_string()),
+        ])
+        .all()
         .await
         .expect("durable reservation reads after reopen");
     assert_eq!(result.rows().len(), 1, "one durable reservation remains");

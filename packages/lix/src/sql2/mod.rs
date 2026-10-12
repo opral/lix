@@ -6,6 +6,7 @@ mod catalog;
 mod change_materialization;
 mod checkpoint_function;
 mod context;
+mod cooperative;
 mod dialect;
 mod dml;
 mod error;
@@ -19,9 +20,11 @@ mod plan;
 mod planning_cache;
 mod providers;
 #[cfg(test)]
-pub(crate) use providers::{take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work};
-#[cfg(test)]
 pub(crate) use providers::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
+#[cfg(test)]
+pub(crate) use providers::{
+    take_checkpoint_retirement_work, take_mainline_metadata_work, take_mainline_work,
+};
 mod read_only;
 mod result_metadata;
 mod row_batch;
@@ -41,14 +44,14 @@ mod udfs;
 mod value_contract;
 mod write_normalization;
 
-#[cfg(feature = "storage-benches")]
 pub(crate) use error::datafusion_error_to_lix_error;
+pub(crate) use script::classify_statement;
 
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
-    statement_has_durable_runtime_function,
+    statement_has_durable_runtime_function, statement_has_returning, statement_returns_rows,
 };
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
@@ -64,10 +67,9 @@ pub(crate) use context::{
     WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
-#[cfg(feature = "storage-benches")]
 pub(crate) use exec::{
-    BatchRowCursor, execute_read_statement_in_session_with_batch_stream,
-    execute_read_statement_in_session_with_collected_batches,
+    PageLimits, ResultPager, batch_public_bytes,
+    execute_read_statement_in_session_with_batch_stream,
 };
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
@@ -79,7 +81,7 @@ pub(crate) use exec::{
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
     prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
+    prepare_read_session, query_result_from_batches,
     query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
@@ -104,14 +106,12 @@ pub(crate) use planning_cache::{
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
-    ProviderSelection, read_provider_selection, register_read_table_functions,
-    register_write_read_relations,
-    execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
+    ProviderSelection, execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_exact_lix_file_size_batch_read,
-    execute_exact_schema_batch_read,
-    execute_exact_schema_point_read, execute_fast_lix_file_path_writes,
-    execute_fast_lix_file_prepared_path_write,
+    execute_exact_schema_batch_read, execute_exact_schema_point_read,
+    execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
+    read_provider_selection, register_read_table_functions, register_write_read_relations,
 };
 pub(crate) use result_metadata::result_column_type;
 pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
@@ -128,20 +128,17 @@ mod aggregate_statistics;
 pub(crate) use plan::read::execute_native_read;
 pub(crate) use plan::read::statement::ExactFilesystemRead;
 pub(crate) use plan::read::statement::{
-    exact_file_content_id_read, exact_file_content_id_uses_nonfull_content,
-    exact_filesystem_read_interest_route,
-    exact_filesystem_read_route,
-};
-pub(crate) use plan::read::statement::{
-    ExactFileContentIdRead, LateLixFileProjection, StatementReadPlan,
+    ExactFileContentIdRead, LateLixFileProjection, NativeReadPlan, StatementReadPlan,
     is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read,
     plan_read_statement,
 };
+pub(crate) use plan::read::statement::{
+    exact_file_content_id_read, exact_file_content_id_uses_nonfull_content,
+    exact_filesystem_read_interest_route, exact_filesystem_read_route,
+};
 
 pub(crate) use providers::{
-    exact_id_file_content_interest, lix_file_content_scan_request,
-    prepare_native_diff_interest, validate_bounded_history_recipe_shape,
-    prepare_native_file_content_inputs,
-    prepare_native_file_content_interest,
-    prepare_native_file_metadata_interest,
+    exact_id_file_content_interest, lix_file_content_scan_request, prepare_native_diff_interest,
+    prepare_native_file_content_inputs, prepare_native_file_content_interest,
+    prepare_native_file_metadata_interest, validate_bounded_history_recipe_shape,
 };

@@ -7955,19 +7955,15 @@ mod do_nothing_duplicate_input_tests {
     #[tokio::test]
     async fn first_new_identity_wins_and_only_inserted_rows_are_returned() {
         let lix = crate::open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('existing','original')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES('existing','original')")
+            .await
+            .unwrap();
         let result = lix
             .execute(
                 "INSERT INTO lix_key_value(key,value) VALUES \
              ('first','winner'),('existing','ignored'),('first','loser'),\
              ('second','second-winner'),('second','second-loser') \
              ON CONFLICT(key) DO NOTHING RETURNING key,value",
-                &[],
             )
             .await
             .unwrap();
@@ -7989,7 +7985,7 @@ mod do_nothing_duplicate_input_tests {
                 ("second".to_owned(), serde_json::json!("second-winner")),
             ]
         );
-        let stored = lix.execute("SELECT key,value FROM lix_key_value WHERE key IN ('first','second','existing') ORDER BY key", &[])
+        let stored = lix.query("SELECT key,value FROM lix_key_value WHERE key IN ('first','second','existing') ORDER BY key").all()
             .await.unwrap();
         let stored = stored
             .rows()

@@ -31,17 +31,6 @@ where
     build_read_session_with_active_head(ctx, None, statements).await
 }
 
-pub(crate) async fn build_read_session_at_head<C>(
-    ctx: &C,
-    active_head: BranchHead,
-    statements: &[DataFusionStatement],
-) -> Result<PooledReadSession, LixError>
-where
-    C: SqlExecutionContext + ?Sized,
-{
-    build_read_session_with_active_head(ctx, Some(active_head), statements).await
-}
-
 async fn build_read_session_with_active_head<C>(
     ctx: &C,
     active_head: Option<BranchHead>,

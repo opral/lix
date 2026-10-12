@@ -168,7 +168,6 @@ async fn run_concurrent_global_creation(newer_global: bool) {
     authority
         .execute(
             "INSERT INTO lix_key_value(key,value) VALUES('resident','unchanged'),('race','before')",
-            &[],
         )
         .await
         .unwrap();
@@ -422,7 +421,7 @@ async fn run_concurrent_global_creation(newer_global: bool) {
         .unwrap();
     // These parameterized scopes were not retained before adoption, so their
     // first foreground observations still hydrate their newly requested inputs.
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(4);
     let reads = async {
         for (key, expected) in [("race", "after-capture"), ("resident", "unchanged")] {
             let mut events = sb

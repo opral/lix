@@ -220,7 +220,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             updated_at: test_timestamp(),
             ref_change_id: branch_ref_change_id,
             author_id: BranchHeadControl::author_id_bytes(crate::ANONYMOUS_ACCOUNT_ID)
-            .expect("anonymous account ID is canonical"),
+                .expect("anonymous account ID is canonical"),
         },
     )
     .expect("direct branch-head control should stage");
@@ -1035,4 +1035,25 @@ pub(crate) fn tracked_change_from_materialized(
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
         origin_key: None,
     })
+}
+
+/// Rows of a session-level [`crate::ExecuteResult`] or a public
+/// [`crate::QueryResult`], so test helpers accept either.
+#[cfg(test)]
+pub(crate) trait ResultRows {
+    fn result_rows(&self) -> &[crate::Row];
+}
+
+#[cfg(test)]
+impl ResultRows for crate::ExecuteResult {
+    fn result_rows(&self) -> &[crate::Row] {
+        self.rows()
+    }
+}
+
+#[cfg(test)]
+impl ResultRows for crate::QueryResult {
+    fn result_rows(&self) -> &[crate::Row] {
+        self.rows()
+    }
 }

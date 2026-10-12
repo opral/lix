@@ -17,10 +17,21 @@ The default in-memory storage works in browsers and Node.js:
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
-const result = await lix.execute("SELECT $1 AS message", ["hello"]);
-console.log(result.rows[0]?.message);
+await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+	"greeting",
+	"hello",
+]);
+const row = await lix.queryOne("SELECT value FROM lix_key_value WHERE key = $1", [
+	"greeting",
+]);
+console.log(row?.value);
 await lix.close();
 ```
+
+`query()`, `queryOne()` and `stream()` read and never write; `execute()` runs
+any statement and `executeMany()` runs one statement for many parameter sets.
+`transaction(fn)` runs several statements against one consistent state. See the
+[JavaScript API reference](../../docs/js-api-reference.md).
 
 ## OpenTelemetry spans
 

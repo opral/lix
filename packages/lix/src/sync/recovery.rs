@@ -380,10 +380,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 .count();
             let receipt = serde_json::json!({"branchId": branch_id, "restoredFiles": restored_files, "restoredRows": rows.len(), "sourceHeadCommitId": branch.head_commit_id, "sourceCheckpointCommitId": branch.checkpoint_commit_id, "captureDigest": capture_digest.to_hex().to_string() });
             let existing = self
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = $1",
-                    &[Value::Text(receipt_key.clone())],
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = $1")
+                .params(&[Value::Text(receipt_key.clone())])
+                .all()
                 .await?;
             if let Some(existing) = existing.rows().first() {
                 let saved = existing.get::<serde_json::Value>("value")?;
@@ -394,10 +393,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                     ));
                 }
                 let branch_exists = self
-                    .execute(
-                        "SELECT id FROM lix_branch WHERE id = $1",
-                        &[Value::Text(branch_id.clone())],
-                    )
+                    .query("SELECT id FROM lix_branch WHERE id = $1")
+                    .params(&[Value::Text(branch_id.clone())])
+                    .all()
                     .await?;
                 if branch_exists.rows().is_empty() {
                     result.unresolved.push(format!("Previously recovered branch {branch_id} was deleted; the original source is still retained"));
@@ -577,10 +575,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 // Another recovery caller may have won the atomic insert.
                 // Accept only its exact receipt, never rewrite its branch.
                 let saved = self
-                    .execute(
-                        "SELECT value FROM lix_key_value WHERE key = $1",
-                        &[Value::Text(receipt_key.clone())],
-                    )
+                    .query("SELECT value FROM lix_key_value WHERE key = $1")
+                    .params(&[Value::Text(receipt_key.clone())])
+                    .all()
                     .await?;
                 if saved
                     .rows()
@@ -592,10 +589,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                     return Err(error);
                 }
                 let branch_exists = self
-                    .execute(
-                        "SELECT id FROM lix_branch WHERE id = $1",
-                        &[Value::Text(branch_id.clone())],
-                    )
+                    .query("SELECT id FROM lix_branch WHERE id = $1")
+                    .params(&[Value::Text(branch_id.clone())])
+                    .all()
                     .await?;
                 if branch_exists.rows().is_empty() {
                     return Err(error);
@@ -895,12 +891,10 @@ mod tests {
     async fn recovery_export_omits_unavailable_file_payload_but_preserves_blob_reference() {
         use crate::storage_adapter::{StorageWrite as _, StorageWriteOptions};
         let lix = crate::open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/cold.txt', $1)",
-            &[Value::Blob(b"cold file content".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/cold.txt', $1)")
+            .params(&[Value::Blob(b"cold file content".to_vec().into())])
+            .await
+            .unwrap();
         let adapter = lix.storage_adapter();
         let source = ReplicaRecoverySource {
             id: "cold-test".to_owned(),
@@ -970,29 +964,22 @@ mod tests {
     async fn recovery_restores_files_and_generic_rows_without_overwriting_active_branch_or_local_only_data()
      {
         let lix = crate::open_lix().await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/notes.txt', $1)",
-            &[Value::Blob(b"offline edit".to_vec().into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('draft', 'offline note')",
-            &[],
-        )
-        .await
-        .unwrap();
-        lix.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('private', 'local secret', true)", &[]).await.unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/notes.txt', $1)")
+            .params(&[Value::Blob(b"offline edit".to_vec().into())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('draft', 'offline note')")
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('private', 'local secret', true)").await.unwrap();
         lix.create_checkpoint().await.unwrap();
-        lix.execute(
-            "UPDATE lix_key_value SET value = 'uncheckpointed note' WHERE key = 'draft'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value = 'uncheckpointed note' WHERE key = 'draft'")
+            .await
+            .unwrap();
         let original_branch = lix.active_branch_id().await.unwrap();
         let original_file = lix
-            .execute("SELECT id FROM lix_file WHERE path = '/notes.txt'", &[])
+            .query("SELECT id FROM lix_file WHERE path = '/notes.txt'")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -1032,18 +1019,13 @@ mod tests {
             Some(&source_branch.head_commit_id),
             source_branch.checkpoint_commit_id.as_ref()
         );
-        lix.execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/notes.txt'",
-            &[Value::Blob(b"new server content".to_vec().into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "UPDATE lix_key_value SET value = 'new server note' WHERE key = 'draft'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_file SET content = $1 WHERE path = '/notes.txt'")
+            .params(&[Value::Blob(b"new server content".to_vec().into())])
+            .await
+            .unwrap();
+        lix.execute("UPDATE lix_key_value SET value = 'new server note' WHERE key = 'draft'")
+            .await
+            .unwrap();
         let (first, concurrent) = tokio::join!(
             lix.restore_recovery_export(&export),
             lix.restore_recovery_export(&export)
@@ -1053,13 +1035,11 @@ mod tests {
         assert!(receipt.restored_rows > 0);
         assert_eq!(lix.active_branch_id().await.unwrap(), original_branch);
         assert_eq!(
-            lix.execute(
-                "SELECT content FROM lix_file WHERE path = '/notes.txt'",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()[0]
+            lix.query("SELECT content FROM lix_file WHERE path = '/notes.txt'")
+                .all()
+                .await
+                .unwrap()
+                .rows()[0]
                 .values()[0],
             Value::Blob(b"new server content".to_vec().into())
         );
@@ -1069,10 +1049,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             recovered
-                .execute(
-                    "SELECT id, content FROM lix_file WHERE path = '/notes.txt'",
-                    &[]
-                )
+                .query("SELECT id, content FROM lix_file WHERE path = '/notes.txt'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -1081,7 +1059,8 @@ mod tests {
         );
         assert_eq!(
             recovered
-                .execute("SELECT value FROM lix_key_value WHERE key = 'draft'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key = 'draft'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -1089,20 +1068,16 @@ mod tests {
             Value::Jsonb(serde_json::json!("uncheckpointed note").into())
         );
         recovered
-            .execute(
-                "UPDATE lix_file SET content = $1 WHERE path = '/notes.txt'",
-                &[Value::Blob(b"reviewed recovery".to_vec().into())],
-            )
+            .execute("UPDATE lix_file SET content = $1 WHERE path = '/notes.txt'")
+            .params(&[Value::Blob(b"reviewed recovery".to_vec().into())])
             .await
             .unwrap();
         let retry = lix.restore_recovery_export(&export).await.unwrap();
         assert_eq!(retry.branch_ids, receipt.branch_ids);
         assert_eq!(
             recovered
-                .execute(
-                    "SELECT content FROM lix_file WHERE path = '/notes.txt'",
-                    &[]
-                )
+                .query("SELECT content FROM lix_file WHERE path = '/notes.txt'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -1128,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_restores_plugin_registry_and_schema_without_public_write_bypass() {
         let lix = crate::open_lix().await.unwrap();
-        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_test.lixplugin', $1)", &[Value::Blob(crate::plugin::runtime::recovery_test_plugin_archive().into())]).await.unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_test.lixplugin', $1)").params(&[Value::Blob(crate::plugin::runtime::recovery_test_plugin_archive().into())]).await.unwrap();
         let adapter = lix.storage_adapter();
         let export = export_source(
             &adapter,
@@ -1152,7 +1127,6 @@ mod tests {
         let result = lix
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('lix_plugin_registry_v2', '{}')",
-                &[],
             )
             .await;
         assert!(
@@ -1165,7 +1139,7 @@ mod tests {
             .open_internal_session(&receipt.branch_ids[0], lix.active_account_id())
             .await
             .unwrap();
-        let schemas = recovered.execute("SELECT schema_key FROM lix_registered_schema WHERE schema_key = 'plugin_test_note'", &[]).await.unwrap();
+        let schemas = recovered.query("SELECT schema_key FROM lix_registered_schema WHERE schema_key = 'plugin_test_note'").all().await.unwrap();
         assert_eq!(schemas.rows().len(), 1);
         recovered.close().await.unwrap();
         lix.close().await.unwrap();
@@ -1181,22 +1155,17 @@ mod tests {
             .read_to_end(&mut plugin_bytes)
             .unwrap();
         let lix = crate::open_lix().await.unwrap();
-        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_markdown.lixplugin', $1)", &[Value::Blob(plugin_bytes.into())]).await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/notes.md', $1)",
-            &[Value::Blob(
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_markdown.lixplugin', $1)").params(&[Value::Blob(plugin_bytes.into())]).await.unwrap();
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ('/notes.md', $1)")
+            .params(&[Value::Blob(
                 b"# Offline heading\n\nUnsynchronized text.\n"
                     .to_vec()
                     .into(),
-            )],
-        )
-        .await
-        .unwrap();
+            )])
+            .await
+            .unwrap();
         lix.create_checkpoint().await.unwrap();
-        lix.execute(
-            "UPDATE markdown_node SET payload_json = $1 WHERE kind = 'paragraph'",
-            &[Value::Text(serde_json::json!({"inline": [{"type": "text", "value": "Semantic edit after checkpoint."}]}).to_string())],
-        ).await.unwrap();
+        lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE kind = 'paragraph'").params(&[Value::Text(serde_json::json!({"inline": [{"type": "text", "value": "Semantic edit after checkpoint."}]}).to_string())]).await.unwrap();
         let original_branch = lix.active_branch_id().await.unwrap();
         let adapter = lix.storage_adapter();
         let mut export = export_source(
@@ -1219,12 +1188,10 @@ mod tests {
                 .any(|row| row.file_id.is_some()),
             "actual structured rows must be present"
         );
-        lix.execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/notes.md'",
-            &[Value::Blob(b"# Server content\n".to_vec().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_file SET content = $1 WHERE path = '/notes.md'")
+            .params(&[Value::Blob(b"# Server content\n".to_vec().into())])
+            .await
+            .unwrap();
         // Force exact raw-CAS recovery: current semantic rendering differs from
         // the checkpoint payload, which is still available in the active CAS.
         let markdown_blob = export
@@ -1243,7 +1210,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             recovered
-                .execute("SELECT content FROM lix_file WHERE path = '/notes.md'", &[])
+                .query("SELECT content FROM lix_file WHERE path = '/notes.md'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]

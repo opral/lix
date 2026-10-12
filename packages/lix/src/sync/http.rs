@@ -539,6 +539,8 @@ where
         let response = response.await?;
         if !session_gone(&response) {
             if (200..300).contains(&response.status) {
+                // Only a successful response is progress for demand waiters.
+                super::runtime::note_transport_progress(response.body.len());
                 let mut session = self.session.lock().await;
                 if session.id == id && !session.invalid {
                     session.retry_delay = std::time::Duration::from_secs(1);

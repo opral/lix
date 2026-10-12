@@ -281,12 +281,9 @@ mod tests {
     async fn initial_anchor_case(complete: bool, selected_stale: bool, global_stale: bool) {
         let lix = crate::open_lix().await.unwrap();
         let before = lix.partial_replica_descriptor(None).await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('wave-key','value')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('wave-key','value')")
+            .await
+            .unwrap();
         let after = lix.partial_replica_descriptor(None).await.unwrap();
         let commit = crate::sync::export_sync_commit(&lix, &after.selected_branch.head.commit_id)
             .await
@@ -323,10 +320,7 @@ mod tests {
                 .await
                 .unwrap();
             global
-                .execute(
-                    "INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')",
-                    &[],
-                )
+                .execute("INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')")
                 .await
                 .unwrap();
         }

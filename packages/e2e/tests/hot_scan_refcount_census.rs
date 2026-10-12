@@ -37,12 +37,10 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
         ],
         "primary_key": ["id"],
     });
-    lix.execute(
-        "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-        &[Value::Text(schema.to_string())],
-    )
-    .await
-    .expect("register census schema");
+    lix.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
+        .await
+        .expect("register census schema");
 
     for chunk in (0..ROWS).collect::<Vec<_>>().chunks(500) {
         let mut sql = format!("INSERT INTO {SCHEMA_KEY} (id, ordinal, lane) VALUES ");
@@ -57,13 +55,17 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
             params.push(Value::Integer(i64::try_from(*ordinal).expect("fits i64")));
             params.push(Value::Text(format!("lane-{:02}", ordinal % 8)));
         }
-        let result = lix.execute(&sql, &params).await.expect("seed census rows");
+        let result = lix
+            .execute(&sql)
+            .params(&params)
+            .await
+            .expect("seed census rows");
         assert!(
             result.rows_affected() > 0,
             "a seed statement that affects no rows produces the same zero counters as a route that never ran"
         );
     }
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("drive the census fixture to packed-base steady state");
 
@@ -74,15 +76,14 @@ async fn a_full_scan_clones_a_bounded_number_of_shared_handles_per_row() {
     // row's snapshot and filters it — the shape that used to rebuild the whole
     // materialized batch row by row.
     let result = lix
-        .execute(
-            &format!(
-                "SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"
-            ),
-            &[
-                Value::Integer(0),
-                Value::Integer(i64::try_from(ROWS).expect("fits i64")),
-            ],
-        )
+        .query(&format!(
+            "SELECT id, ordinal, lane FROM {SCHEMA_KEY} WHERE ordinal >= $1 AND ordinal < $2"
+        ))
+        .params(&[
+            Value::Integer(0),
+            Value::Integer(i64::try_from(ROWS).expect("fits i64")),
+        ])
+        .all()
         .await
         .expect("scan census rows");
     assert_eq!(

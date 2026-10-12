@@ -122,7 +122,6 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     // the exact bytes from the semantic snapshot at an earlier commit.
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('git-text-history-sidecar', 'later')",
-        &[],
     )
     .await
     .expect("history sidecar should commit");
@@ -271,11 +270,11 @@ where
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-        &[
-            Value::Text(path.to_owned()),
-            Value::Blob(data.to_vec().into()),
-        ],
     )
+    .params(&[
+        Value::Text(path.to_owned()),
+        Value::Blob(data.to_vec().into()),
+    ])
     .await?;
     Ok(())
 }
@@ -285,10 +284,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("file read should succeed");
     result.rows().first().map(|row| {
@@ -302,10 +300,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text(path.to_owned())],
-        )
+        .query("SELECT id FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
         .await
         .expect("file ID query should succeed");
     assert_eq!(result.len(), 1, "expected one file at {path}");
@@ -318,7 +315,8 @@ async fn active_branch_head<StorageImpl>(lix: &lix::Lix<StorageImpl>) -> String
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+    lix.query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .expect("active branch head should load")
         .rows()[0]
@@ -335,14 +333,15 @@ async fn assert_history_file<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
+        .query(
             "SELECT content FROM lix_as_of('lix_file', $1) \
              WHERE id = $2",
-            &[
-                Value::Text(as_of_commit_id.to_owned()),
-                Value::Text(file_id.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Text(as_of_commit_id.to_owned()),
+            Value::Text(file_id.to_owned()),
+        ])
+        .all()
         .await
         .expect("file history should render");
     let rendered = result
@@ -362,11 +361,12 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
+        .query(
             "SELECT id, order_key, content, content_base64, line_ending \
              FROM text_line WHERE lixcol_file_id = $1",
-            &[Value::Text(file_id.to_owned())],
         )
+        .params(&[Value::Text(file_id.to_owned())])
+        .all()
         .await
         .expect("Git text rows should query");
     let mut rows = result
@@ -411,11 +411,12 @@ async fn assert_plugin_owned<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let owners = lix
-        .execute(
+        .query(
             "SELECT key FROM lix_key_value \
              WHERE lixcol_file_id = $1 AND key = 'lix_plugin_owner_v2'",
-            &[Value::Text(file_id.to_owned())],
         )
+        .params(&[Value::Text(file_id.to_owned())])
+        .all()
         .await
         .expect("plugin owner query should succeed");
     assert_eq!(owners.len() == 1, expected);
@@ -480,24 +481,19 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
     write_file(&lix, path, b"first\nlast\n").await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
     let rows = git_text_rows(&lix, &file_id).await;
-    lix.execute(
-        "UPDATE text_line SET content = 'edited' WHERE id = $1 AND lixcol_file_id = $2",
-        &[
+    lix.execute("UPDATE text_line SET content = 'edited' WHERE id = $1 AND lixcol_file_id = $2")
+        .params(&[
             Value::Text(rows[0].id.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), b"edited\nlast\n");
-    lix.execute(
-        "INSERT INTO text_line (content, order_key, lixcol_file_id) VALUES ('middle', lix_order_between($1, $2), $3)",
-        &[
+    lix.execute("INSERT INTO text_line (content, order_key, lixcol_file_id) VALUES ('middle', lix_order_between($1, $2), $3)").params(&[
             Value::Text(rows[0].order_key.clone()),
             Value::Text(rows[1].order_key.clone()),
             Value::Text(file_id.clone()),
-        ],
-    )
+        ])
     .await
     .unwrap();
     assert_eq!(
@@ -508,8 +504,8 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
     // keep accepted bytes and identity state coherent for the next operation.
     lix.execute(
         "UPDATE text_line SET order_key = '20' WHERE content = 'middle' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
     )
+    .params(&[Value::Text(file_id.clone())])
     .await
     .unwrap();
     assert_eq!(
@@ -517,19 +513,23 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
         b"middle\nedited\nlast\n"
     );
     let before_rejection = git_text_rows(&lix, &file_id).await;
-    assert!(lix.execute("UPDATE text_line SET line_ending = '' WHERE content = 'middle' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())]).await.is_err());
+    assert!(
+        lix.execute(
+            "UPDATE text_line SET line_ending = '' WHERE content = 'middle' AND lixcol_file_id = $1"
+        )
+        .params(&[Value::Text(file_id.clone())])
+        .await
+        .is_err()
+    );
     assert_eq!(git_text_rows(&lix, &file_id).await, before_rejection);
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         b"middle\nedited\nlast\n"
     );
-    lix.execute(
-        "DELETE FROM text_line WHERE content = 'middle' AND lixcol_file_id = $1",
-        &[Value::Text(file_id.clone())],
-    )
-    .await
-    .unwrap();
+    lix.execute("DELETE FROM text_line WHERE content = 'middle' AND lixcol_file_id = $1")
+        .params(&[Value::Text(file_id.clone())])
+        .await
+        .unwrap();
     let historical = active_branch_head(&lix).await;
     write_file(&lix, path, b"edited\nFINAL\n").await.unwrap();
     lix.close().await.unwrap();
@@ -539,8 +539,7 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
         b"edited\nFINAL\n"
     );
     assert_history_file(&reopened, &historical, &file_id, b"edited\nlast\n").await;
-    reopened.execute("UPDATE text_line SET content = 'again' WHERE content = 'FINAL' AND lixcol_file_id = $1",
-        &[Value::Text(file_id)]).await.unwrap();
+    reopened.execute("UPDATE text_line SET content = 'again' WHERE content = 'FINAL' AND lixcol_file_id = $1").params(&[Value::Text(file_id)]).await.unwrap();
     assert_eq!(
         read_file(&reopened, path).await.unwrap(),
         b"edited\nagain\n"
@@ -758,16 +757,14 @@ async fn text_sql_scaling_probe() {
         }
         for n in 0..3 {
             let start = Instant::now();
-            lix.execute(
-                "UPDATE text_line SET content = $1 WHERE lixcol_file_id = $2 AND id = $3",
-                &[
+            lix.execute("UPDATE text_line SET content = $1 WHERE lixcol_file_id = $2 AND id = $3")
+                .params(&[
                     Value::Text(format!("SQL edit {n}")),
                     Value::Text(file_id.clone()),
                     Value::Text(id.clone()),
-                ],
-            )
-            .await
-            .unwrap();
+                ])
+                .await
+                .unwrap();
             sql_samples.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         file_samples.sort_by(f64::total_cmp);
@@ -798,16 +795,14 @@ async fn late_nul_uses_byte_fallback_and_survives_sql_and_reopen() {
     assert!(rows[0].content.is_none());
     assert_eq!(render_rows(&rows), bytes);
     bytes[8_001] = b'L';
-    lix.execute(
-        "UPDATE text_line SET content_base64 = $1 WHERE lixcol_file_id = $2 AND id = $3",
-        &[
+    lix.execute("UPDATE text_line SET content_base64 = $1 WHERE lixcol_file_id = $2 AND id = $3")
+        .params(&[
             Value::Text(URL_SAFE_NO_PAD.encode(&bytes[..bytes.len() - 1])),
             Value::Text(file_id.clone()),
             Value::Text(rows[0].id.clone()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix.close().await.unwrap();
     let reopened = open_lix().with_storage(storage).await.unwrap();
     assert_eq!(read_file(&reopened, path).await.unwrap(), bytes);

@@ -19,7 +19,7 @@ pub use error::{Error, ErrorKind};
 pub use jsonb::{
     Jsonb, JsonbError, append_jsonb_equality_key, binary_to_json_string, jsonb_equality_key,
     normalize_jsonb_number, validate_binary, validate_canonical_json_text,
-    validated_binary_to_json_string,
+    validate_verbatim_canonical_json_text, validated_binary_to_json_string,
 };
 pub use model::{
     Column, DataType, DeleteAction, ForeignKey, ForeignKeyReference, RowRefConstraint, Schema,

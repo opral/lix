@@ -41,7 +41,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) sync_mode: SyncModeState,
-    pub(super) sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    pub(super) sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     pub(super) has_started_statement: bool,
     pub(super) has_written_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
@@ -143,7 +143,7 @@ where
 {
     pub(crate) fn with_sync_demand_sender(
         mut self,
-        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sender: Option<crate::sync::SyncDemandSender>,
     ) -> Self {
         if let Some(transaction) = self.transaction.as_mut() {
             transaction.set_sync_demand_sender(sender.clone());
@@ -190,6 +190,37 @@ where
         }
         self.transaction_mut()?
             .restore_branch_ref(branch_id, expected_head_commit_id, target_commit_id)
+            .await
+    }
+
+    /// Parses a statement for a read-only call inside this transaction.
+    pub(crate) fn parse_read_only_statement(
+        &self,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> Result<(), LixError> {
+        self.ensure_session_open()?;
+        if let Some(operation) = &self.session.account_insertion {
+            operation.ensure_sql(sql, params)?;
+        }
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        super::execute::reject_non_read(&statement)
+    }
+
+    /// Pages a result this transaction already read. Transaction streams see
+    /// the transaction's state when they open, including its staged writes.
+    pub(crate) async fn open_materialized_stream(
+        &self,
+        result: crate::ExecuteResult,
+        limits: super::PageLimits,
+    ) -> Result<super::RowStream, LixError> {
+        self.session
+            .open_materialized_query_stream(
+                std::future::ready(Ok(result)),
+                limits,
+                None,
+                || Ok(()),
+            )
             .await
     }
 

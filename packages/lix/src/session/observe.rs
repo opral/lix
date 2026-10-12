@@ -57,7 +57,7 @@ where
     sequence: u64,
     last_rows: Option<ExecuteResult>,
     last_shared_content: Option<ObserveSharedContent>,
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     terminal_error: Option<(ObserveSessionScope, LixError)>,
     closed: bool,
 }
@@ -68,7 +68,7 @@ where
 {
     pub(crate) fn with_sync_demand_sender(
         mut self,
-        sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     ) -> Self {
         self.sync_demand_tx = sync_demand_tx;
         self
@@ -320,7 +320,7 @@ where
         session: &SessionContext<StorageImpl>,
         sql: &str,
         params: &[Value],
-        sync_demand_tx: Option<&tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sync_demand_tx: Option<&crate::sync::SyncDemandSender>,
     ) -> Result<ExecuteResult, LixError> {
         let mut retry = crate::sync::SyncDemandRetry::default();
         loop {

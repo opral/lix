@@ -8,9 +8,10 @@ pub(crate) mod lix_path;
 pub(crate) mod metadata;
 mod read_budget;
 pub(crate) mod read_retry;
-#[cfg(test)]
-pub(crate) use read_budget::{MAX_READ_RESULT_BYTES, MAX_READ_RESULT_ROWS};
-pub(crate) use read_budget::{ReadResultBudget, with_read_deadline};
+pub(crate) use read_budget::{
+    DEFAULT_MAX_RESULT_BYTES, ReadLimits, ReadResultBudget, current_read_limits, not_unique,
+    public_row_bytes, with_read_limits,
+};
 pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;
 pub(crate) mod types;

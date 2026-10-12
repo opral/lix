@@ -6,6 +6,7 @@ mod blobs;
 mod http;
 mod observe;
 mod snapshot;
+mod sql;
 mod sse;
 pub(crate) mod wire;
 
@@ -142,6 +143,8 @@ pub struct ProtocolTransaction<H> {
     core: ClientCore<H>,
     transaction_id: String,
     active: AtomicBool,
+    /// Set when an `execute_many` failed after staging some parameter sets.
+    rollback_only: AtomicBool,
 }
 
 impl<H> std::fmt::Debug for ProtocolTransaction<H> {
@@ -659,6 +662,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     core: self.clone(),
                     transaction_id: begun.transaction_id,
                     active: AtomicBool::new(true),
+                    rollback_only: AtomicBool::new(false),
                 })
             })
             .await
@@ -1075,6 +1079,14 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
 
     pub async fn commit(&self) -> Result<crate::CommitReceipt, LixError> {
         self.assert_active()?;
+        if self.rollback_only.load(Ordering::Acquire) {
+            let _ = self.rollback().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_TRANSACTION_STATE,
+                "an execute_many (JS: executeMany) in this transaction failed after staging \
+                 part of its parameter sets; the transaction was rolled back",
+            ));
+        }
         self.core
             .enqueue(|| async {
                 self.assert_active()?;

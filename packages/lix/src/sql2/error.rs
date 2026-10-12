@@ -79,6 +79,15 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         return error;
     }
 
+    // `SELECT a, a`: DataFusion refuses two output columns of one name.
+    if lower.contains("projections require unique expression names")
+        || lower.contains("duplicate unqualified field name")
+        || lower.contains("duplicate qualified field name")
+    {
+        return LixError::new(LixError::CODE_AMBIGUOUS_COLUMN, message)
+            .with_hint("Alias the columns so every name is unique, e.g. SELECT a AS a1, a AS a2.");
+    }
+
     if looks_like_unsupported_dialect(&lower) {
         return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
             .with_hint("Use PostgreSQL JSONB operators -> and ->> for JSON access, and placeholders like ?, ? or $1, $2, ...");

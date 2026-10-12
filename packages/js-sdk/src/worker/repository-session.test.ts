@@ -35,14 +35,17 @@ function fixture() {
 				session.receive({
 					id: message.id,
 					ok: true,
-					value: [
-						"openAnotherSession",
-						"observe",
-						"beginTransaction",
-						"exportSnapshot",
-					].includes(message.operation.kind)
-						? resource++
-						: undefined,
+					value:
+						message.operation.kind === "stream"
+							? { streamId: resource++, columns: ["n"], page: { columns: [], rows: [[]], rowsAffected: 0, notices: [] } }
+							: [
+										"openAnotherSession",
+										"observe",
+										"beginTransaction",
+										"exportSnapshot",
+									].includes(message.operation.kind)
+								? resource++
+								: undefined,
 					context: ["open", "openAnotherSession", "switchBranch"].includes(
 						message.operation.kind,
 					)
@@ -417,4 +420,61 @@ test("standalone replica conversion does not require an open session", async () 
 			operation: expect.objectContaining({ kind: "replica.convert" }),
 		}),
 	]);
+});
+
+test("query streams map to the owner's id and do not survive owner loss", async () => {
+	const f = fixture();
+	await f.open();
+	const open = f.request({ kind: "stream", sql: "SELECT 1", params: [] });
+	await tick();
+	const streamId = (f.result(open).value as { streamId: number }).streamId;
+	f.pause();
+	const pending = f.request({ kind: "stream.next", streamId });
+	await tick();
+	expect((f.sent.at(-1) as WorkerRequest).operation).toEqual({
+		kind: "stream.next",
+		streamId: 10,
+	});
+	const releasing = f.request({ kind: "stream.close", streamId });
+	await tick();
+	// A pull in flight when the owner dies fails: its snapshot died with it.
+	// A release in flight succeeds: the owner took the state with it.
+	f.session.lost();
+	expect(f.result(pending)).toMatchObject({ ok: false });
+	expect(f.result(releasing)).toMatchObject({ ok: true });
+	f.resume();
+	f.session.connected();
+	await tick();
+	const stale = f.request({ kind: "stream.next", streamId });
+	expect(f.result(stale)).toMatchObject({
+		ok: false,
+		error: { code: "LIX_ERROR_QUERY_STREAM_LOST" },
+	});
+	const cancel = f.request({ kind: "stream.close", streamId });
+	expect(f.result(cancel)).toMatchObject({ ok: true });
+});
+
+test("releases are admitted when the pending budget is full", async () => {
+	const f = fixture();
+	await f.open();
+	const open = f.request({ kind: "stream", sql: "SELECT 1", params: [] });
+	await tick();
+	const streamId = (f.result(open).value as { streamId: number }).streamId;
+	f.pause();
+	for (let i = 0; i < 160; i++) f.request({ kind: "query", sql: "SELECT 1", params: [] });
+	const refused = f.request({ kind: "query", sql: "SELECT 1", params: [] });
+	expect(f.output).toContainEqual(
+		expect.objectContaining({
+			id: refused,
+			ok: false,
+			error: expect.objectContaining({ code: "LIX_WORKER_QUEUE_FULL" }),
+		}),
+	);
+	const release = f.request({ kind: "stream.close", streamId });
+	expect(
+		f.output.some((message) => "ok" in message && message.id === release && !message.ok),
+	).toBe(false);
+	expect(f.sent).toContainEqual(
+		expect.objectContaining({ operation: expect.objectContaining({ kind: "stream.close" }) }),
+	);
 });

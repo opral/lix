@@ -80,7 +80,7 @@ async fn candidate_root_prepares_new_match_without_changing_published_current_st
         .unwrap()
         .unwrap();
     drop(read);
-    authority.execute("INSERT INTO lix_key_value (key, value) VALUES ('future-match', 'new'), ('other-match', 'other')", &[]).await.unwrap();
+    authority.execute("INSERT INTO lix_key_value (key, value) VALUES ('future-match', 'new'), ('other-match', 'other')").await.unwrap();
     let read = before_read.begin_read(Default::default()).await.unwrap();
     let new_selected = BranchHeadControlContext::new()
         .reader(&read)

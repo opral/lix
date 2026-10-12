@@ -51,14 +51,15 @@ where
     let mut retained = 0;
     for size in sizes {
         while retained < size {
-            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value", &[Value::Text(retained.to_string())]).await?;
-            lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/profile-history.txt', $2) ON CONFLICT (id) DO UPDATE SET content = excluded.content", &[Value::Text(PROFILE_FILE_ID.into()), Value::Blob(retained.to_string().into_bytes().into())]).await?;
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value").params(&[Value::Text(retained.to_string())]).await?;
+            lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/profile-history.txt', $2) ON CONFLICT (id) DO UPDATE SET content = excluded.content").params(&[Value::Text(PROFILE_FILE_ID.into()), Value::Blob(retained.to_string().into_bytes().into())]).await?;
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                 .await?;
             retained += 1;
         }
         let anchor = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await?
             .rows()[0]
             .get::<String>("id")?;
@@ -102,17 +103,18 @@ where
         // Grow distinct working rows without checkpointing, then time the
         // actual full capture once. Empty follow-ups are not substitutes.
         for index in 0..size {
-            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value", &[Value::Text(format!("working-{index}")), Value::Text(size.to_string())]).await?;
+            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value").params(&[Value::Text(format!("working-{index}")), Value::Text(size.to_string())]).await?;
         }
         let started = Instant::now();
-        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await?;
         println!(
             "{}",
             serde_json::json!({"backend":backend,"operation":"full_checkpoint","working_rows":size,"elapsed_us":started.elapsed().as_micros()})
         );
         let working = lix
-            .execute("SELECT count(*) AS n FROM lix_diff('lix_key_value')", &[])
+            .query("SELECT count(*) AS n FROM lix_diff('lix_key_value')")
+            .all()
             .await?;
         assert_eq!(working.rows()[0].get::<i64>("n")?, 0);
         retained += 1;
@@ -130,7 +132,7 @@ async fn measure<S: Storage + Clone + Send + Sync + 'static>(
     let mut rows = 0;
     for iteration in 0..24 {
         let started = Instant::now();
-        let result = lix.execute(sql, parameters).await?;
+        let result = lix.query(sql).params(parameters).all().await?;
         let elapsed = started.elapsed().as_micros();
         rows = result.len();
         if iteration >= 3 {

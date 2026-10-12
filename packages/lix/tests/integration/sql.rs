@@ -90,8 +90,8 @@ macro_rules! simulation_test {
     };
 }
 
-mod bigint_predicate;
 mod array_any;
+mod bigint_predicate;
 mod case_returning;
 mod case_returning_types;
 mod checkpoint;
@@ -123,10 +123,10 @@ mod recovery_regressions;
 mod recursive_ctes;
 mod row_ref;
 mod row_refs;
-mod sql_expression_fuzz;
 mod schema_expression_amendment;
 mod schema_history;
 mod schema_view;
+mod sql_expression_fuzz;
 mod state_at;
 mod subquery_reads;
 mod subquery_writes;
@@ -150,12 +150,12 @@ async fn select_rows(
     rows_from_result(result)
 }
 
-fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+fn assert_rows_eq(result: impl Into<ExecuteResult>, expected: Vec<Vec<Value>>) {
     assert_eq!(rows_from_result(result), expected);
 }
 
-fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
-    let row_set = result;
+fn rows_from_result(result: impl Into<ExecuteResult>) -> Vec<Vec<Value>> {
+    let row_set: ExecuteResult = result.into();
     row_set
         .rows()
         .iter()

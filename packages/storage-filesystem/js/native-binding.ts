@@ -9,15 +9,20 @@ import type {
 	LixStorageConfig,
 	LixBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 	SyncServerBindingOptions,
 	TelemetryDispatch,
 	TelemetryParentContext,
 	OpenProgressDispatch,
 	SnapshotRestoreBinding,
+	BindingParam,
+	BindingReadOptions,
 } from "@lix-js/sdk/storage-runtime";
 import { restoreSnapshot } from "@lix-js/sdk/storage-runtime";
 
 type NativeAddon = {
+	/** Cancels the read started with `{ cancelToken: token }`. */
+	cancelRequest(token: number): void;
 	convertFilesystemReplicaToPartial(
 		path: string,
 		syncAllFiles: boolean,
@@ -117,6 +122,77 @@ function normalizeNativeObserveEvents(
 	}) as ObserveEventsBinding;
 }
 
+type NativeReadOptions = BindingReadOptions & { cancelToken?: number };
+type NativeRead<T> = (
+	sql: string,
+	params: BindingParam[],
+	options?: NativeReadOptions,
+) => Promise<T>;
+
+let nextCancelToken = 1;
+
+/**
+ * Turns a read's `signal` into the addon's cancel token: aborting it calls
+ * `cancelRequest`, which drops the read's engine future. The call rejects
+ * with the signal's reason, like the wasm binding.
+ */
+function cancellableRead<T>(read: NativeRead<T>) {
+	return async (
+		sql: string,
+		params: BindingParam[],
+		options?: BindingReadOptions,
+		signal?: AbortSignal,
+	): Promise<T> => {
+		if (!signal) return read(sql, params, options);
+		signal.throwIfAborted();
+		const token = nextCancelToken;
+		nextCancelToken = nextCancelToken >= 0xffff_fffe ? 1 : nextCancelToken + 1;
+		const onAbort = () => loadAddon().cancelRequest(token);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await read(sql, params, { ...options, cancelToken: token });
+		} catch (error) {
+			if (signal.aborted) throw signal.reason;
+			throw error;
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	};
+}
+
+/** Adds signal support to the `query`/`stream` of a reader object. */
+function cancellableReader<T extends object>(reader: T): T {
+	const target = reader as T & {
+		query: NativeRead<unknown>;
+		stream: NativeRead<QueryStreamBinding>;
+	};
+	return new Proxy(target, {
+		get(target, property, receiver) {
+			if (property === "query")
+				return cancellableRead(target.query.bind(target));
+			if (property === "stream")
+				return cancellableRead(async (sql, params, options) =>
+					normalizeNativeQueryStream(
+						await target.stream(sql, params, options),
+					),
+				);
+			const value = Reflect.get(target, property, receiver) as unknown;
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+/** The addon's `QueryStream` class resolves `null` at the end of a stream. */
+function normalizeNativeQueryStream(
+	stream: QueryStreamBinding,
+): QueryStreamBinding {
+	return {
+		columns: stream.columns,
+		next: () => stream.next(),
+		cancel: () => stream.cancel(),
+	};
+}
+
 function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 	return new Proxy(binding, {
 		get(target, property, receiver) {
@@ -144,6 +220,20 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
 				) => normalizeNativeObserveEvents(await target.observe(sql, params));
+			}
+			if (property === "query" || property === "stream") {
+				return Reflect.get(cancellableReader(target), property);
+			}
+			if (property === "beginTransaction") {
+				return async () => cancellableReader(await target.beginTransaction());
+			}
+			if (property === "openAnotherSession") {
+				return async (...args: Parameters<LixBinding["openAnotherSession"]>) =>
+					normalizeNativeBinding(
+						(await target.openAnotherSession(
+							...args,
+						)) as unknown as NativeLixBinding,
+					);
 			}
 			const value = Reflect.get(target, property, receiver) as unknown;
 			return typeof value === "function" ? value.bind(target) : value;

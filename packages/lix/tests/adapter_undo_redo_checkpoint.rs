@@ -9,10 +9,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(key.to_string())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(key.to_string())])
+        .all()
         .await
         .expect("key-value row reads");
     result
@@ -38,42 +37,30 @@ pub async fn stage_checkpointed_a_and_undo_b<S>(lix: &Lix<S>) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ($1, 'a0'), ($2, 'b0')",
-        &[
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, 'a0'), ($2, 'b0')")
+        .params(&[
             Value::Text(A_KEY.to_string()),
             Value::Text(B_KEY.to_string()),
-        ],
-    )
-    .await
-    .expect("seed rows commit");
-    lix.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-        &[],
-    )
-    .await
-    .expect("seed checkpoint commits");
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'a1' WHERE key = $1",
-        &[Value::Text(A_KEY.to_string())],
-    )
-    .await
-    .expect("A commits");
-    lix.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-        &[],
-    )
-    .await
-    .expect("A checkpoint commits");
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'b1' WHERE key = $1",
-        &[Value::Text(B_KEY.to_string())],
-    )
-    .await
-    .expect("B commits");
+        ])
+        .await
+        .expect("seed rows commit");
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
+        .await
+        .expect("seed checkpoint commits");
+    lix.execute("UPDATE lix_key_value SET value = 'a1' WHERE key = $1")
+        .params(&[Value::Text(A_KEY.to_string())])
+        .await
+        .expect("A commits");
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
+        .await
+        .expect("A checkpoint commits");
+    lix.execute("UPDATE lix_key_value SET value = 'b1' WHERE key = $1")
+        .params(&[Value::Text(B_KEY.to_string())])
+        .await
+        .expect("B commits");
     assert_values(lix, "a1", "b1").await;
 
-    lix.execute("SELECT commit_id FROM lix_undo()", &[])
+    lix.execute("SELECT commit_id FROM lix_undo()")
         .await
         .expect("B undoes");
     assert_values(lix, "a1", "b0").await;
@@ -91,7 +78,7 @@ where
         .await
         .expect("cold repository switches to the branch after undo");
     assert_values(lix, "a1", "b0").await;
-    lix.execute("SELECT commit_id FROM lix_redo()", &[])
+    lix.execute("SELECT commit_id FROM lix_redo()")
         .await
         .expect("B redoes after cold reopen");
     assert_values(lix, "a1", "b1").await;

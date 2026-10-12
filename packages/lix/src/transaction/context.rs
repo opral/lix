@@ -846,7 +846,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
     sync_role: crate::sync::SyncRole,
-    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    sync_demand_tx: Option<crate::sync::SyncDemandSender>,
     sync_replica_remote_id: Option<Arc<str>>,
     partial_replica_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     await_durable_commit: bool,
@@ -940,6 +940,22 @@ impl TransactionMutationJournal {
     }
 }
 
+/// Test hook: a flush of a non-empty mutation journal waits here (after it
+/// took the journal) while a pause is installed.
+#[cfg(test)]
+pub(crate) static FLUSH_PAUSE: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicBool>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn flush_pause_for_test() {
+    let pause = FLUSH_PAUSE.lock().unwrap().clone();
+    if let Some((release, reached)) = pause {
+        reached.store(true, Ordering::SeqCst);
+        release.notified().await;
+    }
+}
+
 /// State which must be restored when `RETURNING` evaluation fails after a
 /// write has been staged in an explicit SQL transaction.
 pub(crate) struct SqlStatementCheckpoint {
@@ -951,6 +967,12 @@ pub(crate) struct SqlStatementCheckpoint {
     pending_undo_baseline: Option<commit::UndoBaselinePublication>,
     successful_undo_redo: bool,
     native_migration_validation: bool,
+    /// Deterministic-mode sequence values the rolled-back statements drew
+    /// are handed out again, as if they never ran.
+    functions: Option<crate::functions::FunctionProviderCheckpoint>,
+    /// Rows the rolled-back statements read no longer count for conflict
+    /// detection.
+    reads: SqlReadSetCheckpoint,
 }
 
 #[derive(Clone)]
@@ -1597,226 +1619,28 @@ where
         error: &LixError,
         hydrated: &crate::sync::HydratedInputs,
     ) -> Result<bool, LixError> {
-        if !hydrated.keys.is_empty() || !hydrated.blob_manifests.is_empty() {
-            let read = self
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await?;
-            let mut keys = hydrated.keys.clone();
-            let mut prefixes = Vec::new();
-            let staged_manifest_presence = self
-                .staged_writes
-                .has_staged_file_bytes_many(&hydrated.blob_manifests)?;
-            if staged_manifest_presence.len() != hydrated.blob_manifests.len() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "transaction staged blob presence returned an invalid result cardinality",
-                ));
-            }
-            for (blob, staged) in hydrated
-                .blob_manifests
-                .iter()
-                .zip(staged_manifest_presence)
-            {
-                let manifest_key =
-                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(blob.as_bytes()));
-                let resident = if staged {
-                    true
-                } else {
-                    StorageAdapterRead::get_many(
-                        &self.opening_read,
-                        &[crate::storage_adapter::StorageGetManyRequest {
-                            space: crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
-                            keys: std::slice::from_ref(&manifest_key),
-                            opts: Default::default(),
-                        }],
-                    )
-                    .await?
-                    .values
-                    .first()
-                    .is_some_and(|value| value.is_some())
-                };
-                if !resident {
-                    // The operation receipt already names the chunks actually
-                    // delivered. A canonical manifest may describe unrequested
-                    // range chunks, and present chunks have no demand marker.
-                    // Neither is a required resident input of this receipt.
-                    keys.push((crate::binary_cas::BINARY_CAS_MANIFEST_SPACE, manifest_key));
-                    prefixes.push(Bytes::copy_from_slice(blob.as_bytes()));
-                }
-            }
-            if keys.is_empty() && prefixes.is_empty() {
-                return Ok(false);
-            }
-            for (space, key) in &keys {
-                let result = StorageAdapterRead::get_many(
-                    &read,
-                    &[crate::storage_adapter::StorageGetManyRequest {
-                        space: *space,
-                        keys: std::slice::from_ref(key),
-                        opts: Default::default(),
-                    }],
-                )
-                .await?;
-                if result.values.first().is_none_or(Option::is_none) {
-                    return Err(LixError::new(
-                        LixError::CODE_TRANSACTION_CONFLICT,
-                        "transaction snapshot inputs are no longer retained by the authority",
-                    ));
-                }
-            }
-            // SAFETY: like opening_read, the fallback drops before the retained
-            // Arc storage. It only fills immutable coordinates installed by the
-            // pinned fulfillment response.
-            let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
-            self.opening_read = self.opening_read.with_hydrated_keys(read, keys);
-            for prefix in prefixes {
-                self.opening_read = self.opening_read.clone().with_hydrated_prefix(
-                    crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-                    prefix,
-                );
-            }
-            return Ok(true);
-        }
-        enum OptionalNative {
-            Object(crate::tracked_state::NativeObjectRef),
-            Metadata(crate::tracked_state::NativeMetadataRef),
-        }
-        let mut optional = BTreeMap::new();
-        let mut keys = Vec::new();
-        let objects = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
-            .or_else(|| {
-                crate::tracked_state::NativeObjectRef::from_missing_error(error)
-                    .ok()
-                    .flatten()
-                    .map(|address| vec![address])
-            });
-        if let Some(objects) = objects {
-            let required =
-                crate::tracked_state::NativeHistoryFrontier::required_len(error, objects.len())?;
-            for (index, address) in objects.into_iter().enumerate() {
-                if index >= required {
-                    optional.insert(keys.len(), OptionalNative::Object(address));
-                }
-                keys.push((
-                    address.space(),
-                    crate::storage_adapter::StorageKey(Bytes::from(address.storage_key())),
-                ));
-            }
-        }
-        let metadata = crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
-            .or_else(|| {
-                crate::tracked_state::NativeMetadataRef::from_missing_error(error)
-                    .ok()
-                    .flatten()
-                    .map(|address| vec![address])
-            });
-        if let Some(metadata) = metadata {
-            let required =
-                crate::tracked_state::NativeHistoryFrontier::required_len(error, metadata.len())?;
-            for (index, address) in metadata.into_iter().enumerate() {
-                if index >= required {
-                    optional.insert(keys.len(), OptionalNative::Metadata(address.clone()));
-                }
-                keys.push((
-                    crate::sync::native_metadata_storage_space(&address),
-                    crate::sync::native_metadata_storage_key(&address)?,
-                ));
-            }
-        }
-        let blobs = crate::binary_cas::BlobManifestsRequired::from_error(error)?
-            .map(|required| required.0)
-            .unwrap_or_default();
-        if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
-            let ids = error
-                .details
-                .as_ref()
-                .and_then(|details| details.get("chunkIds"))
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand has no IDs")
-                })?;
-            for id in ids {
-                let id = id.as_str().ok_or_else(|| {
-                    LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand ID is not text")
-                })?;
-                let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
-                let key =
-                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
-                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_SPACE, key.clone()));
-                // The availability marker and immutable payload are published
-                // atomically. Referenced-content preparation reads the marker.
-                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE, key));
-            }
-        }
-        if keys.is_empty() && blobs.is_empty() {
-            return Ok(false);
-        }
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await?;
-        let mut omitted = BTreeSet::new();
-        for (index, (space, key)) in keys.iter().enumerate() {
-            let result = StorageAdapterRead::get_many(
-                &read,
-                &[crate::storage_adapter::StorageGetManyRequest {
-                    space: *space,
-                    keys: std::slice::from_ref(key),
-                    opts: Default::default(),
-                }],
-            )
-            .await;
-            // A failed speculative batch may leave optional inputs absent or
-            // corrupt. Extend the pinned snapshot only with validated optional
-            // bytes; never turn their failure into a required-query conflict.
-            if let Some(input) = optional.get(&index) {
-                let valid = match &result {
-                    Ok(result) => match result.values.first() {
-                        Some(Some(crate::storage_adapter::StorageProjectedValue::FullValue(
-                            bytes,
-                        ))) => match input {
-                            OptionalNative::Object(address) => address.validate(bytes).is_ok(),
-                            OptionalNative::Metadata(address) => {
-                                crate::sync::validate_native_metadata_bytes(address, bytes).is_ok()
-                            }
-                        },
-                        _ => false,
-                    },
-                    Err(_) => false,
-                };
-                if !valid {
-                    omitted.insert(index);
-                }
-                continue;
-            }
-            let result = result?;
-            if result.values.first().is_none_or(Option::is_none) {
-                return Err(LixError::new(
+        let staged_writes = Arc::clone(&self.staged_writes);
+        let extended = extend_pinned_read_with_hydrated_inputs(
+            &self.storage,
+            &self.opening_read,
+            error,
+            hydrated,
+            |manifests| staged_writes.has_staged_file_bytes_many(manifests),
+            || {
+                LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
                     "transaction snapshot inputs are no longer retained by the authority",
-                ));
+                )
+            },
+        )
+        .await?;
+        match extended {
+            Some(extended) => {
+                self.opening_read = extended;
+                Ok(true)
             }
+            None => Ok(false),
         }
-        keys = keys
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, key)| (!omitted.contains(&index)).then_some(key))
-            .collect();
-        for blob in &blobs {
-            keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, *blob).await?);
-        }
-        // SAFETY: like opening_read, the fallback drops before the retained
-        // Arc storage. It only fills exact native input misses in that read.
-        let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
-        self.opening_read = self.opening_read.with_hydrated_keys(read, keys);
-        for blob in blobs {
-            self.opening_read = self.opening_read.clone().with_hydrated_prefix(
-                crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-                Bytes::copy_from_slice(blob.as_bytes()),
-            );
-        }
-        Ok(true)
     }
 
     /// Stages an empty local commit only when this coherent transaction opened
@@ -2931,7 +2755,7 @@ where
     /// mutations only; durable publication remains exclusively in commit_prepared.
     pub(crate) fn set_sync_demand_sender(
         &mut self,
-        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+        sender: Option<crate::sync::SyncDemandSender>,
     ) {
         self.sync_demand_tx = sender;
         if self.sync_demand_tx.is_some() && self.sync_role == crate::sync::SyncRole::PartialReplica
@@ -3471,6 +3295,8 @@ where
             pending_undo_baseline: self.pending_undo_baseline.clone(),
             successful_undo_redo: self.successful_undo_redo,
             native_migration_validation: self.native_migration_validation,
+            functions: self.functions.statement_checkpoint(),
+            reads: self.sql_read_set.checkpoint(),
         })
     }
 
@@ -3489,8 +3315,14 @@ where
             pending_undo_baseline,
             successful_undo_redo,
             native_migration_validation,
+            functions,
+            reads,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
+        if let Some(functions) = functions {
+            self.functions.restore_statement_checkpoint(functions);
+        }
+        self.sql_read_set.restore(reads);
         self.filesystem_path_index_epoch
             .store(filesystem_path_index_epoch, Ordering::SeqCst);
         // The cache is derived from the discarded post-image. Evict it rather
@@ -9626,10 +9458,16 @@ where
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
+        // The flush takes the journal before it awaits storage. Until it
+        // finishes the transaction is poisoned, so a flush dropped midway (a
+        // cancelled read) leaves a commit that fails instead of one that
+        // silently drops the journal's rows.
+        self.mutation_journal_terminal_error = Some(LixError::new(
+            LixError::CODE_INVALID_TRANSACTION_STATE,
+            "a cancelled operation interrupted staging this transaction's writes; roll it back",
+        ));
         let result = self.flush_mutation_journal_inner(finalize_tail).await;
-        if let Err(error) = &result {
-            self.mutation_journal_terminal_error = Some(error.clone());
-        }
+        self.mutation_journal_terminal_error = result.as_ref().err().cloned();
         result
     }
 
@@ -9640,6 +9478,8 @@ where
         if journal.identity_offsets.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        flush_pause_for_test().await;
         self.ensure_plugin_generation_read_guard().await;
         #[cfg(feature = "storage-benches")]
         let identity_arena_bytes = journal.identity_arena.len();
@@ -9917,15 +9757,77 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
+        fn returned_file_path_projection(
+            statement: &mut DataFusionStatement,
+            template: &DataFusionStatement,
+            content_index: usize,
+        ) -> Option<(usize, usize)> {
+            use datafusion::sql::sqlparser::ast::{Ident, SelectItem, SetExpr, Statement};
+            let DataFusionStatement::Statement(template) = template else {
+                return None;
+            };
+            let Statement::Query(template) = template.as_ref() else {
+                return None;
+            };
+            let SetExpr::Select(template) = template.body.as_ref() else {
+                return None;
+            };
+            let SelectItem::ExprWithAlias { expr, .. } = &template.projection[content_index] else {
+                return None;
+            };
+            let DataFusionStatement::Statement(original) = statement else {
+                return None;
+            };
+            let Statement::Query(original) = original.as_mut() else {
+                return None;
+            };
+            let SetExpr::Select(original) = original.body.as_mut() else {
+                return None;
+            };
+            let path_index = original.projection.len();
+            let mut alias = "__lix_returned_file_path".to_owned();
+            while original.projection.iter().any(|item| {
+                matches!(item,
+                SelectItem::ExprWithAlias { alias: existing, .. }
+                    if existing.value.eq_ignore_ascii_case(&alias))
+            }) {
+                alias.push('_');
+            }
+            original.projection.push(SelectItem::ExprWithAlias {
+                expr: expr.clone(),
+                alias: Ident::with_quote('"', alias),
+            });
+            Some((path_index, content_index))
+        }
+
         let read_store = self.opening_read();
         let capture = self.hot_state.capture_foreground_read_interests();
         let hot_state = capture.as_ref().map_or_else(
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
-        let file_view_collector = crate::sql2::plan_read_statement(&statement, &params)
-            .acknowledge_file_views
-            .then(|| self.transaction_file_views.fork_for_read());
+        // Providers may hydrate files before WHERE/LIMIT. Keep their paths
+        // through execution so only returned bytes refresh session observations.
+        let mut statement = statement;
+        let read_plan = crate::sql2::plan_read_statement(&statement, &params);
+        let acknowledgement = read_plan
+            .late_content
+            .as_ref()
+            .filter(|plan| plan.projection.acknowledges_content())
+            .and_then(|plan| {
+                returned_file_path_projection(
+                    &mut statement,
+                    plan.statement.as_ref(),
+                    plan.data_column_index,
+                )
+            });
+        let sql = if acknowledgement.is_some() {
+            statement.to_string()
+        } else {
+            sql
+        };
+        let file_view_collector =
+            acknowledgement.map(|_| self.transaction_file_views.fork_for_read());
 
         if let Some((_, capture)) = &capture {
             crate::session::seed_foreground_filesystem_interest(
@@ -9949,15 +9851,37 @@ where
         .await;
         self.record_sql_reads = previous_recording;
         match result {
-            Ok(result) => {
+            Ok((mut result, resolved_statement)) => {
                 if let Some((_, capture)) = capture {
                     capture.publish_capture()?;
                 }
-                if let Some(file_view_collector) = file_view_collector {
-                    self.transaction_file_views
-                        .apply_mutations(file_view_collector.plugin_file_mutations());
+                if let Some((path_index, content_index)) = acknowledgement {
+                    let mut returned_paths = BTreeSet::new();
+                    for row in &mut result.rows {
+                        let path = row.remove(path_index);
+                        if !matches!(row[content_index], Value::Null)
+                            && let Value::Text(path) = path
+                        {
+                            returned_paths.insert(path.to_string());
+                        }
+                    }
+                    result.columns.remove(path_index);
+                    if !result.column_types.is_empty() {
+                        result.column_types.remove(path_index);
+                    }
+                    if let Some(collector) = file_view_collector {
+                        self.transaction_file_views.apply_mutations(
+                            collector
+                                .plugin_file_mutations()
+                                .into_iter()
+                                .filter(|mutation| {
+                                    matches!(mutation, SessionFileViewMutation::Set { view, .. }
+                                    if returned_paths.contains(&view.path))
+                                }),
+                        );
+                    }
                 }
-                Ok(result)
+                Ok((result, resolved_statement))
             }
             Err(error) => Err(crate::sync::annotate_read_fulfillment_capture(
                 error,
@@ -21404,4 +21328,230 @@ fallback={large_fallback} decoded={large_decoded}"
             "the raw appended row should follow both prepared semantic groups"
         );
     }
+}
+
+/// Extends a pinned read with immutable inputs a partial replica just
+/// hydrated, without advancing the pinned snapshot: only exact native inputs
+/// named by `error` are read from a fresh view, everything else stays on
+/// `opening_read`. `staged_manifests` reports which demanded blob manifests
+/// the caller already holds staged. Returns `None` when `error` names no
+/// such input. `conflict` builds the error for inputs the authority no longer
+/// retains.
+pub(crate) async fn extend_pinned_read_with_hydrated_inputs<StorageImpl>(
+storage: &StorageAdapter<StorageImpl>,
+opening_read: &SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+error: &LixError,
+hydrated: &crate::sync::HydratedInputs,
+staged_manifests: impl FnOnce(&[BlobId]) -> Result<Vec<bool>, LixError>,
+conflict: impl Fn() -> LixError,
+) -> Result<Option<SharedStorageAdapterRead<StorageImpl::Read<'static>>>, LixError>
+where
+StorageImpl: Storage + 'static,
+{
+    if !hydrated.keys.is_empty() || !hydrated.blob_manifests.is_empty() {
+        let read = storage.begin_read(StorageReadOptions::default()).await?;
+        let mut keys = hydrated.keys.clone();
+        let mut prefixes = Vec::new();
+        let staged_manifest_presence = staged_manifests(&hydrated.blob_manifests)?;
+        if staged_manifest_presence.len() != hydrated.blob_manifests.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction staged blob presence returned an invalid result cardinality",
+            ));
+        }
+        for (blob, staged) in hydrated
+            .blob_manifests
+            .iter()
+            .zip(staged_manifest_presence)
+        {
+            let manifest_key =
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(blob.as_bytes()));
+            let resident = if staged {
+                true
+            } else {
+                StorageAdapterRead::get_many(
+                    opening_read,
+                    &[crate::storage_adapter::StorageGetManyRequest {
+                        space: crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+                        keys: std::slice::from_ref(&manifest_key),
+                        opts: Default::default(),
+                    }],
+                )
+                .await?
+                .values
+                .first()
+                .is_some_and(|value| value.is_some())
+            };
+            if !resident {
+                // The operation receipt already names the chunks actually
+                // delivered. A canonical manifest may describe unrequested
+                // range chunks, and present chunks have no demand marker.
+                // Neither is a required resident input of this receipt.
+                keys.push((crate::binary_cas::BINARY_CAS_MANIFEST_SPACE, manifest_key));
+                prefixes.push(Bytes::copy_from_slice(blob.as_bytes()));
+            }
+        }
+        if keys.is_empty() && prefixes.is_empty() {
+            return Ok(None);
+        }
+        for (space, key) in &keys {
+            let result = StorageAdapterRead::get_many(
+                &read,
+                &[crate::storage_adapter::StorageGetManyRequest {
+                    space: *space,
+                    keys: std::slice::from_ref(key),
+                    opts: Default::default(),
+                }],
+            )
+            .await?;
+            if result.values.first().is_none_or(Option::is_none) {
+                return Err(conflict());
+            }
+        }
+        // SAFETY: like opening_read, the fallback drops before the retained
+        // Arc storage. It only fills immutable coordinates installed by the
+        // pinned fulfillment response.
+        let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+        let mut extended = opening_read.with_hydrated_keys(read, keys);
+        for prefix in prefixes {
+            extended = extended.with_hydrated_prefix(
+                crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                prefix,
+            );
+        }
+        return Ok(Some(extended));
+    }
+    enum OptionalNative {
+        Object(crate::tracked_state::NativeObjectRef),
+        Metadata(crate::tracked_state::NativeMetadataRef),
+    }
+    let mut optional = BTreeMap::new();
+    let mut keys = Vec::new();
+    let objects = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
+        .or_else(|| {
+            crate::tracked_state::NativeObjectRef::from_missing_error(error)
+                .ok()
+                .flatten()
+                .map(|address| vec![address])
+        });
+    if let Some(objects) = objects {
+        let required =
+            crate::tracked_state::NativeHistoryFrontier::required_len(error, objects.len())?;
+        for (index, address) in objects.into_iter().enumerate() {
+            if index >= required {
+                optional.insert(keys.len(), OptionalNative::Object(address));
+            }
+            keys.push((
+                address.space(),
+                crate::storage_adapter::StorageKey(Bytes::from(address.storage_key())),
+            ));
+        }
+    }
+    let metadata = crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
+        .or_else(|| {
+            crate::tracked_state::NativeMetadataRef::from_missing_error(error)
+                .ok()
+                .flatten()
+                .map(|address| vec![address])
+        });
+    if let Some(metadata) = metadata {
+        let required =
+            crate::tracked_state::NativeHistoryFrontier::required_len(error, metadata.len())?;
+        for (index, address) in metadata.into_iter().enumerate() {
+            if index >= required {
+                optional.insert(keys.len(), OptionalNative::Metadata(address.clone()));
+            }
+            keys.push((
+                crate::sync::native_metadata_storage_space(&address),
+                crate::sync::native_metadata_storage_key(&address)?,
+            ));
+        }
+    }
+    let blobs = crate::binary_cas::BlobManifestsRequired::from_error(error)?
+        .map(|required| required.0)
+        .unwrap_or_default();
+    if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+        let ids = error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("chunkIds"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand has no IDs")
+            })?;
+        for id in ids {
+            let id = id.as_str().ok_or_else(|| {
+                LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand ID is not text")
+            })?;
+            let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
+            let key =
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
+            keys.push((crate::binary_cas::BINARY_CAS_CHUNK_SPACE, key.clone()));
+            // The availability marker and immutable payload are published
+            // atomically. Referenced-content preparation reads the marker.
+            keys.push((crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE, key));
+        }
+    }
+    if keys.is_empty() && blobs.is_empty() {
+        return Ok(None);
+    }
+    let read = storage.begin_read(StorageReadOptions::default()).await?;
+    let mut omitted = BTreeSet::new();
+    for (index, (space, key)) in keys.iter().enumerate() {
+        let result = StorageAdapterRead::get_many(
+            &read,
+            &[crate::storage_adapter::StorageGetManyRequest {
+                space: *space,
+                keys: std::slice::from_ref(key),
+                opts: Default::default(),
+            }],
+        )
+        .await;
+        // A failed speculative batch may leave optional inputs absent or
+        // corrupt. Extend the pinned snapshot only with validated optional
+        // bytes; never turn their failure into a required-query conflict.
+        if let Some(input) = optional.get(&index) {
+            let valid = match &result {
+                Ok(result) => match result.values.first() {
+                    Some(Some(crate::storage_adapter::StorageProjectedValue::FullValue(
+                        bytes,
+                    ))) => match input {
+                        OptionalNative::Object(address) => address.validate(bytes).is_ok(),
+                        OptionalNative::Metadata(address) => {
+                            crate::sync::validate_native_metadata_bytes(address, bytes).is_ok()
+                        }
+                    },
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if !valid {
+                omitted.insert(index);
+            }
+            continue;
+        }
+        let result = result?;
+        if result.values.first().is_none_or(Option::is_none) {
+            return Err(conflict());
+        }
+    }
+    keys = keys
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, key)| (!omitted.contains(&index)).then_some(key))
+        .collect();
+    for blob in &blobs {
+        keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, *blob).await?);
+    }
+    // SAFETY: like opening_read, the fallback drops before the retained
+    // Arc storage. It only fills exact native input misses in that read.
+    let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+    let mut extended = opening_read.with_hydrated_keys(read, keys);
+    for blob in blobs {
+        extended = extended.with_hydrated_prefix(
+            crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+            Bytes::copy_from_slice(blob.as_bytes()),
+        );
+    }
+    Ok(Some(extended))
 }

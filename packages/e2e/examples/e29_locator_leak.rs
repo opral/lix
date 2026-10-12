@@ -71,8 +71,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register locator schema");
 }
@@ -132,13 +132,11 @@ async fn main() {
         register_schema(&session).await;
 
         session
-            .execute(
-                "INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text("/agent/file".to_owned()),
-                    Value::Text(serde_json::json!({ "revision": 0 }).to_string()),
-                ],
-            )
+            .execute("INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text("/agent/file".to_owned()),
+                Value::Text(serde_json::json!({ "revision": 0 }).to_string()),
+            ])
             .await
             .expect("insert the first revision");
 
@@ -159,30 +157,26 @@ async fn main() {
         for revision in 1..=rewrites {
             if insert_arm {
                 session
-                    .execute(
-                        "INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                        &[
-                            Value::Text(format!("/agent/file-{revision}")),
-                            Value::Text(serde_json::json!({ "revision": revision }).to_string()),
-                        ],
-                    )
+                    .execute("INSERT INTO locator_row (path, value) VALUES ($1, CAST($2 AS JSONB))")
+                    .params(&[
+                        Value::Text(format!("/agent/file-{revision}")),
+                        Value::Text(serde_json::json!({ "revision": revision }).to_string()),
+                    ])
                     .await
                     .expect("insert a distinct row");
             } else {
                 session
-                    .execute(
-                        "UPDATE locator_row SET value = CAST($2 AS JSONB) WHERE path = $1",
-                        &[
-                            Value::Text("/agent/file".to_owned()),
-                            Value::Text(serde_json::json!({ "revision": revision }).to_string()),
-                        ],
-                    )
+                    .execute("UPDATE locator_row SET value = CAST($2 AS JSONB) WHERE path = $1")
+                    .params(&[
+                        Value::Text("/agent/file".to_owned()),
+                        Value::Text(serde_json::json!({ "revision": revision }).to_string()),
+                    ])
                     .await
                     .expect("rewrite the same row");
             }
             if checkpoint_every > 0 && revision % checkpoint_every == 0 {
                 session
-                    .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+                    .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                     .await
                     .expect("create a checkpoint");
             }
@@ -192,7 +186,7 @@ async fn main() {
             // last one needs a successor before its predecessors are provably
             // retirable.
             session
-                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
                 .await
                 .expect("create the releasing checkpoint");
         }
@@ -234,7 +228,8 @@ async fn main() {
         // Which surviving locators name a change the public ledger no longer
         // carries? Those are the dangling ones.
         let live_change_ids = session
-            .execute("SELECT id FROM lix_change", &[])
+            .query("SELECT id FROM lix_change")
+            .all()
             .await
             .expect("read the public change ledger")
             .rows()
@@ -261,10 +256,9 @@ async fn main() {
         // What does a read that follows a dangling locator do?
         for id in dangling.iter().take(3) {
             let outcome = match session
-                .execute(
-                    "SELECT id FROM lix_change WHERE id = $1",
-                    &[Value::Text(id.clone())],
-                )
+                .query("SELECT id FROM lix_change WHERE id = $1")
+                .params(&[Value::Text(id.clone())])
+                .all()
                 .await
             {
                 Ok(rows) if rows.rows().is_empty() => "clean_miss".to_owned(),

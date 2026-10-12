@@ -396,12 +396,10 @@ where
         "delete_gc_1pct" => {
             let branch = create_branch(main, "branch-0").await;
             modify_rows(lix, &branch, 0, one_percent).await;
-            main.execute(
-                "DELETE FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.clone())],
-            )
-            .await
-            .expect("delete branch-sharing branch");
+            main.execute("DELETE FROM lix_branch WHERE id = $1")
+                .params(&[Value::Text(branch.clone())])
+                .await
+                .expect("delete branch-sharing branch");
             let adapter = StorageAdapter::new(storage.clone());
             collect_repository_gc_for_bench(&adapter)
                 .await
@@ -447,20 +445,18 @@ where
     let mut written = 0usize;
     while written < count {
         let batch = (count - written).min(SEED_BATCH_ROWS);
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin branch-sharing modification");
         for offset in 0..batch {
             let index = start + written + offset;
             transaction
-                .execute(
-                    "UPDATE branch_fixture SET value = CAST($1 AS JSONB) WHERE path = $2",
-                    &[
-                        Value::Text(format!(r#"{{"seed":{index},"edited":true,"pad":"{PAD}"}}"#)),
-                        Value::Text(row_path(index)),
-                    ],
-                )
+                .execute("UPDATE branch_fixture SET value = CAST($1 AS JSONB) WHERE path = $2")
+                .params(&[
+                    Value::Text(format!(r#"{{"seed":{index},"edited":true,"pad":"{PAD}"}}"#)),
+                    Value::Text(row_path(index)),
+                ])
                 .await
                 .expect("stage branch-sharing modification");
         }
@@ -495,8 +491,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register branch-sharing schema");
 }
@@ -508,20 +504,18 @@ where
     let mut written = 0usize;
     while written < rows {
         let batch = (rows - written).min(SEED_BATCH_ROWS);
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin branch-sharing seed");
         for offset in 0..batch {
             let index = written + offset;
             transaction
-                .execute(
-                    "INSERT INTO branch_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                    &[
-                        Value::Text(row_path(index)),
-                        Value::Text(format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)),
-                    ],
-                )
+                .execute("INSERT INTO branch_fixture (path, value) VALUES ($1, CAST($2 AS JSONB))")
+                .params(&[
+                    Value::Text(row_path(index)),
+                    Value::Text(format!(r#"{{"seed":{index},"pad":"{PAD}"}}"#)),
+                ])
                 .await
                 .expect("stage branch-sharing seed row");
         }

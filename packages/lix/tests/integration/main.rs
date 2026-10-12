@@ -7,7 +7,6 @@ mod correlated_hot_state_perf;
 mod corruption_fuzz;
 mod durable_function_fast_path;
 mod engine;
-mod execute_batch_benchmark;
 mod filesystem_fuzz;
 mod fs_api;
 mod independent_transactions;

@@ -531,12 +531,9 @@ mod tests {
         let lix = open_lix().await.unwrap();
         let descriptor = lix.partial_replica_descriptor(None).await.unwrap();
         let branch_id = descriptor.selected_branch.branch_id.clone();
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('uploaded-local', 'accepted')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('uploaded-local', 'accepted')")
+            .await
+            .unwrap();
         let uploaded = lix
             .partial_replica_descriptor(None)
             .await
@@ -546,12 +543,9 @@ mod tests {
             .commit_id;
         // A newer native local commit already exists when the older upload is
         // acknowledged. This is a bookkeeping fixture, not a partial SQL proof.
-        lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('newer-local', 'retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('newer-local', 'retained')")
+            .await
+            .unwrap();
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let before = crate::branch::BranchHeadControlContext::new()

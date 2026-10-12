@@ -45,10 +45,9 @@ async fn partial_browser_profile_authority() {
                 .collect::<Vec<_>>()
                 .join(",");
             authority
-                .execute(
-                    &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                    &[],
-                )
+                .execute(&format!(
+                    "INSERT INTO lix_key_value (key, value) VALUES {values}"
+                ))
                 .await
                 .unwrap();
         }
@@ -64,10 +63,8 @@ async fn partial_browser_profile_authority() {
         }
         for commit in 0..history {
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value = $1 WHERE key = 'partial-open-000000'",
-                    &[Value::Text(format!("history-{commit}"))],
-                )
+                .execute("UPDATE lix_key_value SET value = $1 WHERE key = 'partial-open-000000'")
+                .params(&[Value::Text(format!("history-{commit}"))])
                 .await
                 .unwrap();
         }

@@ -30,7 +30,7 @@ perf stat -x, \
 ```
 
 The fixture installs the production Markdown component before timing, then
-executes one public `execute_batch` statement containing 1,184 fresh Markdown
+runs one `execute` call: a single multi-row `INSERT` of 1,184 fresh Markdown
 documents. It verifies the committed file count, semantic rows, and exact bytes
 from the first and last files. CSV, Git-text, and Excalidraw run the same
 capacity-plus-one conformance check. A sequential Git-text fixture imports 17

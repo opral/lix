@@ -138,12 +138,28 @@ impl LixError {
     /// A SQL column name could not be resolved in the available projection.
     pub const CODE_COLUMN_NOT_FOUND: &'static str = "LIX_COLUMN_NOT_FOUND";
 
+    /// A row lookup by name matched several result columns.
+    pub const CODE_AMBIGUOUS_COLUMN: &'static str = "LIX_ERROR_AMBIGUOUS_COLUMN";
+
     /// A SQL write violated a primary-key, unique, NOT NULL, or other
     /// relational constraint.
     pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";
 
-    /// A SQL write targeted a read-only internal/component surface.
+    /// A SQL write targeted a read-only internal/component surface, or a
+    /// statement that writes was passed to a read API (`query`, `stream`).
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
+
+    /// A buffered result exceeded its byte cap. Nothing was returned.
+    pub const CODE_RESULT_TOO_LARGE: &'static str = "LIX_ERROR_RESULT_TOO_LARGE";
+
+    /// A single-row read matched more than one row.
+    pub const CODE_NOT_UNIQUE: &'static str = "LIX_ERROR_NOT_UNIQUE";
+
+    /// A single-row read that requires a row matched none.
+    pub const CODE_NO_ROWS: &'static str = "LIX_ERROR_NO_ROWS";
+
+    /// The snapshot was closed; it serves no further reads.
+    pub const CODE_SNAPSHOT_CLOSED: &'static str = "LIX_ERROR_SNAPSHOT_CLOSED";
 
     /// A partial replica cannot prove completeness for a global history surface.
     /// Single read statements may be retried against the configured authority.

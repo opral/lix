@@ -83,7 +83,9 @@ impl RuntimeReadPlan {
 async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut tables = BTreeSet::new();
     plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
+        if let LogicalPlan::TableScan(scan) = node
+            && super::exec::datafusion::is_detached_scan_source(&scan.source)
+        {
             tables.insert(scan.table_name.clone());
         }
         Ok(TreeNodeRecursion::Continue)
@@ -103,6 +105,10 @@ async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> R
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
+        // Statement-local sources (a recursive CTE's work table) stay as is.
+        if !super::exec::datafusion::is_detached_scan_source(&scan.source) {
+            return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+        }
         scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "cached SQL plan provider '{}' is unavailable",
@@ -160,8 +166,8 @@ pub(crate) async fn collect_plan_with_schema(
 /// Create a pull-based stream from a DataFusion physical plan without
 /// collecting its output batches first. The caller owns the stream and may
 /// stop polling it early; dropping the stream then drops the underlying scan
-/// futures as well.
-#[cfg(feature = "storage-benches")]
+/// futures as well. No read-result budget applies: streamed reads are bounded
+/// by their consumer's page window instead of by total result size.
 pub(crate) async fn stream_plan(
     state: &SessionState,
     logical_plan: RuntimeReadPlan,
@@ -587,7 +593,7 @@ async fn collect_bounded_read_stream(
 ) -> Result<()> {
     while let Some(batch) = stream.try_next().await? {
         budget
-            .charge(batch.get_array_memory_size(), batch.num_rows())
+            .charge(super::batch_public_bytes(&batch), batch.num_rows())
             .map_err(super::error::lix_error_to_datafusion_error)?;
         batches.push(batch);
     }
@@ -600,18 +606,17 @@ mod read_output_tests {
     #[tokio::test]
     async fn result_collection_stops_polling_before_retaining_oversized_batch() {
         use datafusion::arrow::{
-            array::NullArray,
+            array::Int64Array,
             datatypes::{DataType, Field, Schema},
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Null, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(NullArray::new(
-                crate::common::MAX_READ_RESULT_ROWS + 1,
-            ))],
+            vec![Arc::new(Int64Array::from_iter_values(0..1_000))],
         )
         .unwrap();
+        let batch_bytes = crate::sql2::batch_public_bytes(&batch);
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = polls.clone();
         let stream = RecordBatchStreamAdapter::new(
@@ -622,13 +627,15 @@ mod read_output_tests {
             }),
         );
         let mut result = Vec::new();
-        let error =
-            collect_bounded_read_stream(Box::pin(stream), &mut Default::default(), &mut result)
-                .await
-                .unwrap_err();
+        let mut budget = crate::common::ReadResultBudget::new(crate::common::ReadLimits::bytes(
+            batch_bytes - 1,
+        ));
+        let error = collect_bounded_read_stream(Box::pin(stream), &mut budget, &mut result)
+            .await
+            .unwrap_err();
         assert_eq!(
             crate::sql2::error::datafusion_error_to_lix_error(error).code,
-            "LIX_READ_RESOURCE_EXHAUSTED"
+            crate::LixError::CODE_RESULT_TOO_LARGE
         );
         assert!(result.is_empty());
         assert_eq!(polls.load(Ordering::SeqCst), 1);
@@ -651,7 +658,6 @@ async fn collect_adapted_input_plan(
     Ok(batches)
 }
 
-#[cfg(feature = "storage-benches")]
 fn stream_adapted_input_plan(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -688,7 +694,9 @@ pub(crate) fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn
     let mut scan_counts = HashMap::new();
     collect_statement_scan_counts(&plan, &mut scan_counts);
     let mut caches = HashMap::new();
-    adapt_runtime_plan_inner(plan, &scan_counts, &mut caches)
+    let plan = adapt_runtime_plan_inner(plan, &scan_counts, &mut caches)?;
+    // Last, so every rewrite above still sees the plain leaves it inspects.
+    super::cooperative::wrap_leaves(plan)
 }
 
 fn collect_statement_scan_counts(
@@ -734,10 +742,17 @@ fn adapt_runtime_plan_inner(
         .filter(|key| scan_counts.get(*key).copied().unwrap_or_default() > 1)
         .cloned()
     {
-        let state = caches
-            .entry(key)
-            .or_insert_with(|| Arc::new(StatementScanCacheState::new(Arc::clone(&plan))))
-            .clone();
+        let state = match caches.get(&key) {
+            Some(state) => Arc::clone(state),
+            None => {
+                // The cache's own input yields too; see `wrap_leaves`.
+                let state = Arc::new(StatementScanCacheState::new(
+                    super::cooperative::wrap_leaves(Arc::clone(&plan))?,
+                ));
+                caches.insert(key, Arc::clone(&state));
+                state
+            }
+        };
         return Ok(Arc::new(StatementScanCacheExec::new(state)));
     }
 
@@ -813,7 +828,8 @@ fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Execut
 /// The scan a probe side reads its rows from, if the operators above it in
 /// that side neither rename its columns nor add rows to it.
 ///
-/// DataFusion puts a cooperative-yielding wrapper over every leaf and may put
+/// DataFusion (and Lix's [`super::cooperative::YieldingExec`]) put a
+/// cooperative-yielding wrapper over every leaf, and DataFusion may put
 /// batch coalescing or a residual filter between the join and the scan. All
 /// three pass their input's schema through unchanged, so a join key names the
 /// same scan column through any chain of them, and all three only ever emit a
@@ -836,7 +852,7 @@ fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&SpecScanExec> {
 fn probe_passthrough(plan: &dyn ExecutionPlan) -> bool {
     matches!(
         plan.name(),
-        "CooperativeExec" | "CoalesceBatchesExec" | "FilterExec"
+        "CooperativeExec" | "YieldingExec" | "CoalesceBatchesExec" | "FilterExec"
     )
 }
 

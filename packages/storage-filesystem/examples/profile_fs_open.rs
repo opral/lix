@@ -141,7 +141,8 @@ async fn run_read_benchmark(storage: &FilesystemStorage, workspace: &Path) -> Re
 
     let all_started = Instant::now();
     let all_files = lix
-        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
+        .query("SELECT path, content FROM lix_file ORDER BY path")
+        .all()
         .await
         .expect("profile read benchmark should read all files");
     let all_files_ms = duration_ms(all_started.elapsed());
@@ -188,10 +189,9 @@ async fn time_read_paths(lix: &lix::Lix<FilesystemStorage>, files: &[&BenchFile]
     let mut bytes = 0u64;
     for file in files {
         let result = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text(file.lix_path.clone())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(file.lix_path.clone())])
+            .all()
             .await
             .expect("profile read benchmark should read file");
         let row = result

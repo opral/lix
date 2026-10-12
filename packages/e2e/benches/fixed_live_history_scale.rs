@@ -216,10 +216,9 @@ where
             Operation::ExactRead => {
                 let result = self
                     .session
-                    .execute(
-                        "SELECT path, value FROM fixed_live WHERE path = $1",
-                        &[Value::Text(live_path(self.live_rows / 2))],
-                    )
+                    .query("SELECT path, value FROM fixed_live WHERE path = $1")
+                    .params(&[Value::Text(live_path(self.live_rows / 2))])
+                    .all()
                     .await
                     .expect("exact read");
                 assert_eq!(black_box(result.rows().len()), 1);
@@ -227,7 +226,8 @@ where
             Operation::EnumerateLive => {
                 let result = self
                     .session
-                    .execute("SELECT path, value FROM fixed_live ORDER BY path", &[])
+                    .query("SELECT path, value FROM fixed_live ORDER BY path")
+                    .all()
                     .await
                     .expect("enumerate live rows");
                 assert_eq!(black_box(result.rows().len()), self.live_rows);
@@ -235,13 +235,11 @@ where
             Operation::UpdateOne => {
                 let result = self
                     .session
-                    .execute(
-                        "UPDATE fixed_live SET value = CAST($1 AS JSONB) WHERE path = $2",
-                        &[
-                            Value::Text(format!(r#"{{"update":{}}}"#, self.sequence)),
-                            Value::Text(live_path(self.live_rows / 2)),
-                        ],
-                    )
+                    .execute("UPDATE fixed_live SET value = CAST($1 AS JSONB) WHERE path = $2")
+                    .params(&[
+                        Value::Text(format!(r#"{{"update":{}}}"#, self.sequence)),
+                        Value::Text(live_path(self.live_rows / 2)),
+                    ])
                     .await
                     .expect("update one");
                 assert_eq!(black_box(result.rows_affected()), 1);
@@ -250,13 +248,11 @@ where
                 let path = format!("/insert/{:08}", self.sequence);
                 let result = self
                     .session
-                    .execute(
-                        "INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                        &[
-                            Value::Text(path),
-                            Value::Text(format!(r#"{{"insert":{}}}"#, self.sequence)),
-                        ],
-                    )
+                    .execute("INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))")
+                    .params(&[
+                        Value::Text(path),
+                        Value::Text(format!(r#"{{"insert":{}}}"#, self.sequence)),
+                    ])
                     .await
                     .expect("insert one");
                 assert_eq!(black_box(result.rows_affected()), 1);
@@ -265,10 +261,8 @@ where
                 let path = self.delete_paths.pop().expect("prepared delete row");
                 let result = self
                     .session
-                    .execute(
-                        "DELETE FROM fixed_live WHERE path = $1",
-                        &[Value::Text(path)],
-                    )
+                    .execute("DELETE FROM fixed_live WHERE path = $1")
+                    .params(&[Value::Text(path)])
                     .await
                     .expect("delete one");
                 assert_eq!(black_box(result.rows_affected()), 1);
@@ -280,10 +274,8 @@ where
         for index in 0..count {
             let path = format!("/delete/{index:08}");
             self.session
-                .execute(
-                    "INSERT INTO fixed_live (path, value) VALUES ($1, CAST('null' AS JSONB))",
-                    &[Value::Text(path.clone())],
-                )
+                .execute("INSERT INTO fixed_live (path, value) VALUES ($1, CAST('null' AS JSONB))")
+                .params(&[Value::Text(path.clone())])
                 .await
                 .expect("prepare delete row");
             self.delete_paths.push(path);
@@ -394,10 +386,7 @@ where
         "primary_key": ["path"],
     });
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register schema");
 }
@@ -406,16 +395,14 @@ async fn seed_live_rows<S>(session: &Lix<S>, live_rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin live seed");
+    let transaction = session.begin_transaction().await.expect("begin live seed");
     for index in 0..live_rows {
         transaction
-            .execute(
-                "INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text(live_path(index)),
-                    Value::Text(format!(r#"{{"seed":{index}}}"#)),
-                ],
-            )
+            .execute("INSERT INTO fixed_live (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text(live_path(index)),
+                Value::Text(format!(r#"{{"seed":{index}}}"#)),
+            ])
             .await
             .expect("seed live row");
     }

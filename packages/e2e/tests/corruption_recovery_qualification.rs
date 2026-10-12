@@ -180,22 +180,16 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         .with_storage(database.clone())
         .await
         .expect("open healthy workspace");
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('corruption-probe', 'before')",
-        &[],
-    )
-    .await
-    .expect("insert healthy probe");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('corruption-probe', 'before')")
+        .await
+        .expect("insert healthy probe");
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("create checkpoint");
     let checkpoint_head = active_head(&lix).await;
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'after' WHERE key = 'corruption-probe'",
-        &[],
-    )
-    .await
-    .expect("update healthy probe");
+    lix.execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'corruption-probe'")
+        .await
+        .expect("update healthy probe");
     let updated_head = active_head(&lix).await;
     lix.close().await.expect("close seeded workspace");
     drop(lix);
@@ -209,18 +203,17 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         .expect("cold reopen healthy workspace");
     assert_probe_value(&lix, "after").await;
     let diff = lix
-        .execute(
-            "SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)",
-            &[Value::Text(checkpoint_head), Value::Text(updated_head)],
-        )
+        .query("SELECT COUNT(*) AS entries FROM lix_diff('lix_key_value', $1, $2)")
+        .params(&[Value::Text(checkpoint_head), Value::Text(updated_head)])
+        .all()
         .await
         .expect("healthy diff should survive reopen");
     assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-    lix.execute("SELECT commit_id FROM lix_undo()", &[])
+    lix.execute("SELECT commit_id FROM lix_undo()")
         .await
         .expect("healthy undo should survive reopen");
     assert_probe_value(&lix, "before").await;
-    lix.execute("SELECT commit_id FROM lix_redo()", &[])
+    lix.execute("SELECT commit_id FROM lix_redo()")
         .await
         .expect("healthy redo should survive reopen");
     assert_probe_value(&lix, "after").await;
@@ -236,7 +229,7 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
     let database = B::open(path);
     let error = match open_lix().with_storage(database.clone()).await {
         Ok(lix) => {
-            let result = lix.execute("SELECT * FROM lix_key_value", &[]).await;
+            let result = lix.query("SELECT * FROM lix_key_value").all().await;
             let _ = lix.close().await;
             drop(lix);
             result.expect_err("corrupt branch control must fail on first read")
@@ -259,26 +252,20 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("open tracked-tree fixture");
     for index in 0..8 {
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tree-{index}', 'value-{index}')"
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_key_value (key, value) VALUES ('tree-{index}', 'value-{index}')"
+        ))
         .await
         .expect("insert tracked-tree fixture row");
     }
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint tracked-tree fixture");
     let checkpoint_head = active_head(&lix).await;
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'updated' WHERE key = 'tree-7'",
-        &[],
-    )
-    .await
-    .expect("update tracked-tree fixture row");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+    lix.execute("UPDATE lix_key_value SET value = 'updated' WHERE key = 'tree-7'")
+        .await
+        .expect("update tracked-tree fixture row");
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("checkpoint updated tracked-tree fixture");
     let updated_head = active_head(&lix).await;
@@ -293,22 +280,21 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
         .await
         .expect("cold reopen healthy tracked tree");
     let healthy = lix
-        .execute(
-            "SELECT key, value FROM lix_key_value WHERE key LIKE 'tree-%' ORDER BY key",
-            &[],
-        )
+        .query("SELECT key, value FROM lix_key_value WHERE key LIKE 'tree-%' ORDER BY key")
+        .all()
         .await
         .expect("healthy tracked tree should survive cold reopen");
     assert_eq!(healthy.rows().len(), 8, "healthy tracked tree row count");
     let healthy_diff = lix
-        .execute(
+        .query(
             "SELECT 'lix_key_value' AS schema_key, diff_type \
              FROM lix_diff('lix_key_value', $1, $2)",
-            &[
-                Value::Text(checkpoint_head.clone()),
-                Value::Text(updated_head.clone()),
-            ],
         )
+        .params(&[
+            Value::Text(checkpoint_head.clone()),
+            Value::Text(updated_head.clone()),
+        ])
+        .all()
         .await
         .expect("healthy tracked-tree diff should survive cold reopen");
     assert_eq!(
@@ -330,11 +316,12 @@ async fn qualify_tracked_tree_chunk<B: DurableBackend>() {
     let error = match open_lix().with_storage(database.clone()).await {
         Ok(lix) => {
             let result = lix
-                .execute(
+                .query(
                     "SELECT 'lix_key_value' AS schema_key, diff_type \
                      FROM lix_diff('lix_key_value', $1, $2)",
-                    &[Value::Text(checkpoint_head), Value::Text(updated_head)],
                 )
+                .params(&[Value::Text(checkpoint_head), Value::Text(updated_head)])
+                .all()
                 .await;
             let _ = lix.close().await;
             drop(lix);
@@ -424,7 +411,8 @@ async fn qualify_binary_payload_chunk<B: DurableBackend>() {
 }
 
 async fn active_head<B: Storage + Clone + Send + Sync + 'static>(lix: &Lix<B>) -> String {
-    lix.execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+    lix.query("SELECT lix_active_branch_commit_id() AS commit_id")
+        .all()
         .await
         .expect("load active head")
         .rows()[0]
@@ -434,10 +422,8 @@ async fn active_head<B: Storage + Clone + Send + Sync + 'static>(lix: &Lix<B>) -
 
 async fn assert_probe_value<B: Storage + Clone + Send + Sync + 'static>(lix: &Lix<B>, value: &str) {
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'corruption-probe'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'corruption-probe'")
+        .all()
         .await
         .expect("read corruption probe");
     assert_eq!(

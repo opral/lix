@@ -87,6 +87,12 @@ pub(crate) async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// Sleeps on any executor: engine operations may be driven by executors
+/// without a Tokio reactor (bindings, commit coordinator threads).
+pub(crate) async fn executor_neutral_sleep(duration: Duration) {
+    futures_timer::Delay::new(duration).await;
+}
+
 struct WorkerDone {
     finished: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,

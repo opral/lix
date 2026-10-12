@@ -243,10 +243,8 @@ async fn run<S>(
             let cpu_before = CpuSnapshot::now();
             let started = Instant::now();
             let result = session
-                .execute(
-                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-                    &params,
-                )
+                .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+                .params(&params)
                 .await
                 .expect("timed publication should commit");
             let latency_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -289,10 +287,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[Value::Text(path.to_owned()), Value::Blob(payload.into())],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[Value::Text(path.to_owned()), Value::Blob(payload.into())])
         .await
         .expect("setup publication should commit");
 }

@@ -14,7 +14,7 @@ export function registerPluginExecutionContract(
   describe(`${name} plugin execution`, () => {
     test("CSV detects file edits, renders SQL edits, and merges independent rows", async () => {
       const sdk = await loadSdk();
-      const { openLix } = sdk;
+      const { openLix, json } = sdk;
       const lix = await openLix();
       try {
         const csv = (await loadArchives()).find(
@@ -41,7 +41,7 @@ export function registerPluginExecutionContract(
         const draft = await lix.createBranch({ name: "Plugin draft" });
         await lix.switchBranch({ branchId: draft.id });
         await lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2", [
-          ["Ada", "39"],
+          json(["Ada", "39"]),
           rows[1]!.id as string,
         ]);
         expect(await read(lix, "/people.csv")).toBe(
@@ -49,7 +49,7 @@ export function registerPluginExecutionContract(
         );
         await lix.switchBranch({ branchId: main });
         await lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2", [
-          ["Grace", "40"],
+          json(["Grace", "40"]),
           rows[2]!.id as string,
         ]);
         expect(
@@ -72,7 +72,7 @@ export function registerPluginExecutionContract(
 
     test("CSV merges different cells of the same row through the plugin column merger", async () => {
       const sdk = await loadSdk();
-      const { openLix } = sdk;
+      const { openLix, json } = sdk;
       const lix = await openLix();
       try {
         const csv = (await loadArchives()).find(
@@ -89,12 +89,12 @@ export function registerPluginExecutionContract(
         const draft = await lix.createBranch({ name: "Edit name" });
         await lix.switchBranch({ branchId: draft.id });
         await lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2", [
-          ["Ada Lovelace", "36"],
+          json(["Ada Lovelace", "36"]),
           id,
         ]);
         await lix.switchBranch({ branchId: main });
         await lix.execute("UPDATE csv_row SET cells = $1 WHERE id = $2", [
-          ["Ada", "37"],
+          json(["Ada", "37"]),
           id,
         ]);
         await lix.mergeBranch({ sourceBranchId: draft.id });
@@ -115,7 +115,7 @@ export function registerPluginExecutionContract(
         try {
           await reopened.execute(
             "UPDATE csv_row SET cells = $1 WHERE id = $2",
-            [["Ada Lovelace", "38"], id],
+            [json(["Ada Lovelace", "38"]), id],
           );
           expect(await read(reopened, "/same-row.csv")).toBe(
             "name,age\nAda Lovelace,38\n",
@@ -130,7 +130,7 @@ export function registerPluginExecutionContract(
 
     test("Markdown detects nodes and renders a SQL edit after snapshot restore", async () => {
       const sdk = await loadSdk();
-      const { openLix } = sdk;
+      const { openLix, json } = sdk;
       const source = await openLix();
       let restored: Lix | undefined;
       try {

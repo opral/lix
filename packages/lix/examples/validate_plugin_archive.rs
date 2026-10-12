@@ -22,23 +22,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let archive = std::fs::read(path)?;
     let lix = open_lix().await?;
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.into()),
-        ],
-    )
-    .await?;
+        ])
+        .await?;
     // Trigger the compiled guest, not only the ZIP/manifest parser.
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(sample_path.into()),
             Value::Blob(sample.as_bytes().to_vec().into()),
-        ],
-    )
-    .await?;
+        ])
+        .await?;
     let table = match key.as_str() {
         "plugin_json" => "json_root",
         "plugin_csv" => "csv_row",
@@ -48,7 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!("plugin key was validated above"),
     };
     if lix
-        .execute(&format!("SELECT * FROM {table}"), &[])
+        .query(&format!("SELECT * FROM {table}"))
+        .all()
         .await?
         .rows()
         .is_empty()

@@ -115,6 +115,7 @@ pub(crate) mod order_preserving_key;
 // nothing.
 #[cfg(any(test, feature = "storage-benches"))]
 pub mod registered_spaces;
+mod query;
 mod schema;
 pub mod snapshot;
 #[cfg(any(feature = "server-protocol", feature = "server-protocol-client"))]
@@ -163,12 +164,10 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 mod lifecycle;
 pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
-    Durability,
-    CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
-    ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
-    ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
-    RemoteLix, RemoteExecuteBuilder, RemoteLixTransaction, RemoteObserveEvents,
-    RemoteOpenAnotherSessionBuilder, RemoteTransactionExecuteBuilder, RemoteExecuteBatchBuilder, open_lix,
+    CallbackOpenProgressSink, Durability, Lix, LixTransaction, ObserveEvents,
+    OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder, RemoteLix,
+    RemoteLixTransaction, RemoteObserveEvents, RemoteOpenAnotherSessionBuilder, RemoteOpenLixBuilder,
+    ServerOptions, UnconfiguredOpenLixBuilder, open_lix,
 };
 pub use open_types::{
     OpenMigration, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, OpenScope,
@@ -204,11 +203,27 @@ pub use session::{
     MergeChangeStats, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{
-    CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
-    TryFromValue,
+    ColumnIndex, CommitReceipt, CommitSpan, ExecuteResult, ObserveEvent, QueryResult, ResultRowRef,
+    Row, RowStream, TryFromValue,
 };
+pub(crate) use session::{ExecuteBatchResult, ExecuteBatchStatement};
+pub use query::{Execute, ExecuteMany, Query};
+
+/// Internal bridge for workspace bindings and storage adapters. Not a supported SDK API.
 #[doc(hidden)]
-pub use session::CoherentReadBatch;
+pub mod internal {
+    use crate::{Lix, LixError};
+    use crate::storage_adapter::Storage;
+
+    pub use crate::query::Snapshot;
+
+    pub async fn open_read_snapshot<S>(lix: &Lix<S>) -> Result<Snapshot, LixError>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        lix.snapshot().await
+    }
+}
 pub(crate) use session::{
     ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,
     FileUploadProgress,

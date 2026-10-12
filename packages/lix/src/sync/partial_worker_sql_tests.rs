@@ -213,10 +213,9 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key,value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key,value) VALUES {values}"
+            ))
             .await
             .unwrap();
         authority
@@ -325,6 +324,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                         LixError::unknown("queued resident demand"),
                     ),
                     response,
+                    progress: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -354,7 +354,14 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                 "newer"
             );
             assert_eq!(
-                value(authority.execute(select, &[key.clone()]).await.unwrap()),
+                value(
+                    authority
+                        .query(select)
+                        .params(&[key.clone()])
+                        .all()
+                        .await
+                        .unwrap()
+                ),
                 "newer"
             );
             assert_eq!(client.pushes.load(Ordering::SeqCst), 3);
@@ -377,20 +384,17 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
         .collect::<Vec<_>>()
         .join(",");
     authority
-        .execute(
-            &format!("INSERT INTO lix_key_value (key,value) VALUES {values}"),
-            &[],
-        )
+        .execute(&format!(
+            "INSERT INTO lix_key_value (key,value) VALUES {values}"
+        ))
         .await
         .unwrap();
     // A nontrivial first-parent lane makes preparation exercise ancestors
     // beyond the immediate baseline parent/jump pair needed by one write.
     for index in 0..40 {
         authority
-            .execute(
-                "UPDATE lix_key_value SET value = $1 WHERE key = 'upload-000000'",
-                &[Value::Text(format!("baseline-{index}"))],
-            )
+            .execute("UPDATE lix_key_value SET value = $1 WHERE key = 'upload-000000'")
+            .params(&[Value::Text(format!("baseline-{index}"))])
             .await
             .unwrap();
     }
@@ -451,7 +455,7 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
         .unwrap();
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender.clone());
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -483,7 +487,13 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
         "successful preparation must certify the bounded baseline frontier"
     );
     assert_eq!(
-        value(lix.execute(select, &[key.clone()]).await.unwrap()),
+        value(
+            lix.query(select)
+                .params(&[key.clone()])
+                .all()
+                .await
+                .unwrap()
+        ),
         "baseline-39",
         "frontier preparation must not execute a mutation as a side effect"
     );
@@ -527,7 +537,7 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
     client.offline.store(true, Ordering::SeqCst);
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -549,13 +559,15 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
         "the prepared selected/global graph frontier must survive adapter and engine reopen"
     );
     for index in 0..30 {
-        lix.execute(
-            update,
-            &[key.clone(), Value::Text(format!("prepared-{index}"))],
-        )
-        .await
-        .unwrap();
-        lix.execute(select, &[key.clone()]).await.unwrap();
+        lix.execute(update)
+            .params(&[key.clone(), Value::Text(format!("prepared-{index}"))])
+            .await
+            .unwrap();
+        lix.query(select)
+            .params(&[key.clone()])
+            .all()
+            .await
+            .unwrap();
     }
     assert_eq!(
         client.offline_native_attempts.load(Ordering::SeqCst),
@@ -564,7 +576,7 @@ async fn explicit_offline_editing_preparation_allows_first_local_edit_offline() 
     );
     assert_eq!(client.pushes.load(Ordering::SeqCst), 0);
     assert_eq!(
-        value(lix.execute(select, &[key]).await.unwrap()),
+        value(lix.query(select).params(&[key]).all().await.unwrap()),
         "prepared-29"
     );
     shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
@@ -577,13 +589,11 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
     let file_id = "dddddddd-0000-8000-8000-000000000004";
     let authority = Arc::new(open_lix().await.unwrap());
     authority
-        .execute(
-            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/offline.txt', $2)",
-            &[
-                Value::Text(file_id.to_owned()),
-                Value::Blob(b"online baseline".to_vec().into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/offline.txt', $2)")
+        .params(&[
+            Value::Text(file_id.to_owned()),
+            Value::Blob(b"online baseline".to_vec().into()),
+        ])
         .await
         .unwrap();
     authority
@@ -639,7 +649,7 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
         .unwrap();
     let (shutdown, shutdown_rx) =
         tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
     let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender);
     let worker = tokio::spawn(
         crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -655,10 +665,9 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
     );
 
     let initial = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.to_owned())],
-        )
+        .query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file_id.to_owned())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -685,7 +694,7 @@ async fn explicit_offline_editing_preparation_allows_first_file_edit_after_reope
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     let engine = Arc::new(engine);
     let raw_session = session.clone();
-    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let (sender, _receiver) = crate::sync::runtime::sync_demand_channel(1);
     let lix = Lix::from_partial_engine_for_test(engine, session, sender);
     let edit = raw_session
         .execute(
@@ -959,10 +968,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('seed','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('seed','before')")
             .await
             .unwrap();
         let leased = authority
@@ -1036,7 +1042,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
             .unwrap();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
             old.clone(),
@@ -1060,6 +1066,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
                             LixError::unknown("resident foreground demand"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1075,10 +1082,7 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
                 );
             }
             authority
-                .execute(
-                    "INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')",
-                    &[],
-                )
+                .execute("INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')")
                 .await
                 .unwrap();
             client.changed.notify_one();
@@ -1138,10 +1142,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('seed','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('seed','before')")
             .await
             .unwrap();
         let leased = authority
@@ -1258,7 +1259,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
             .unwrap();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::runtime::sync_demand_channel(4);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
             old.clone(),
@@ -1289,6 +1290,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                             LixError::unknown("resident foreground demand"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1309,20 +1311,15 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                 "the first foreground demand batch must be served from local native state"
             );
             authority
-                .execute(
-                    "INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')",
-                    &[],
-                )
+                .execute("INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')")
                 .await
                 .unwrap();
             authority
-                .execute(
-                    "INSERT INTO lix_file (path,content) VALUES ($1,$2)",
-                    &[
-                        Value::Text("/worker-transfer.md".into()),
-                        Value::Blob(b"moving file diff transfer".to_vec().into()),
-                    ],
-                )
+                .execute("INSERT INTO lix_file (path,content) VALUES ($1,$2)")
+                .params(&[
+                    Value::Text("/worker-transfer.md".into()),
+                    Value::Blob(b"moving file diff transfer".to_vec().into()),
+                ])
                 .await
                 .unwrap();
             let target_head = authority
@@ -1366,6 +1363,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                             LixError::unknown("resident demand during reconciliation transfer"),
                         ),
                         response,
+                        progress: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -1473,6 +1471,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                                 LixError::unknown("resident demand during retired cleanup"),
                             ),
                             response,
+                            progress: Default::default(),
                         })
                         .await
                         .unwrap();
@@ -1584,8 +1583,7 @@ async fn run_candidate_transfer_scenario(scenario: CandidateTransferScenario) {
                 1
             };
             assert_eq!(
-                matching_requests,
-                expected_requests,
+                matching_requests, expected_requests,
                 "retained completion reuses one recipe; retirement makes one replacement"
             );
             assert_eq!(
@@ -1704,10 +1702,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')")
             .await
             .unwrap();
         let leased = authority
@@ -1764,10 +1759,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         }
         if advance_authority || dirty {
             authority
-                .execute(
-                    "UPDATE lix_key_value SET value='after' WHERE key='lease-read'",
-                    &[],
-                )
+                .execute("UPDATE lix_key_value SET value='after' WHERE key='lease-read'")
                 .await
                 .unwrap();
         }
@@ -1809,7 +1801,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         };
         let (response, done) = tokio::sync::oneshot::channel();
         sender
-            .send(crate::sync::runtime::SyncDemand { request, response })
+            .send(crate::sync::runtime::SyncDemand { request, response, progress: Default::default() })
             .await
             .unwrap();
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -1866,7 +1858,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
                                 .unwrap_or_else(|| panic!("unexpected SQL error: {error:?}"));
                         let (response, done) = tokio::sync::oneshot::channel();
                         sender
-                            .send(crate::sync::runtime::SyncDemand { request, response })
+                            .send(crate::sync::runtime::SyncDemand { request, response, progress: Default::default() })
                             .await
                             .unwrap();
                         done.await.unwrap().unwrap();
@@ -1909,10 +1901,7 @@ async fn expired_background_renewal_refreshes_unchanged_authority_without_long_p
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')")
             .await
             .unwrap();
         let mut leased = authority

@@ -11,21 +11,20 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_rocksdb_reopen() {
         .await
         .expect("open repository");
 
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+        .params(&[
             Value::Text("/adapter.bin".to_string()),
             Value::Text("aé—".to_string()),
-        ],
-    )
-    .await
-    .expect("insert text through an explicit BYTEA cast");
+        ])
+        .await
+        .expect("insert text through an explicit BYTEA cast");
     let lengths = lix
-        .execute(
+        .query(
             "SELECT length(content) AS characters, OCTET_LENGTH(content) AS octets \
              FROM lix_file WHERE path = $1",
-            &[Value::Text("/adapter.bin".to_string())],
         )
+        .params(&[Value::Text("/adapter.bin".to_string())])
+        .all()
         .await
         .expect("read character and byte lengths");
     assert_eq!(
@@ -41,17 +40,16 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_rocksdb_reopen() {
         6
     );
 
-    lix.execute(
-        "UPDATE lix_file SET content = $2 WHERE path = $1",
-        &[
+    lix.execute("UPDATE lix_file SET content = $2 WHERE path = $1")
+        .params(&[
             Value::Text("/adapter.bin".to_string()),
             Value::Blob(vec![0xff, 0x00, 0x61].into()),
-        ],
-    )
-    .await
-    .expect("update with a direct binary parameter");
+        ])
+        .await
+        .expect("update with a direct binary parameter");
     let error = lix
-        .execute("SELECT X'41'", &[])
+        .query("SELECT X'41'")
+        .all()
         .await
         .expect_err("legacy SQL hex literals should be rejected");
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -66,10 +64,9 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_rocksdb_reopen() {
         .await
         .expect("reopen repository");
     let result = lix
-        .execute(
-            "SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1",
-            &[Value::Text("/adapter.bin".to_string())],
-        )
+        .query("SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1")
+        .params(&[Value::Text("/adapter.bin".to_string())])
+        .all()
         .await
         .expect("read binary content after reopen");
     assert_eq!(

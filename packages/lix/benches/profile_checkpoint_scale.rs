@@ -22,7 +22,7 @@ use lix::storage::Storage;
 use lix::storage_bench::{
     CheckpointForegroundAccounting, checkpoint_foreground_is_active, measure_checkpoint_foreground,
 };
-use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
+use lix::{Lix, Value, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -449,7 +449,8 @@ where
         )));
         params.push(Value::Text(format!("benchmark-branch-{branch_index:05}")));
     }
-    lix.execute(&sql, &params)
+    lix.execute(&sql)
+        .params(&params)
         .await
         .expect("insert checkpoint benchmark branches");
 }
@@ -478,7 +479,8 @@ where
         params.push(Value::Text(format!("/files/{file_index:05}.bin")));
         params.push(Value::Blob(payload(0, file_index, FILE_BYTES).into()));
     }
-    lix.execute(&sql, &params)
+    lix.execute(&sql)
+        .params(&params)
         .await
         .expect("insert checkpoint benchmark files");
 }
@@ -801,21 +803,15 @@ async fn update_file_group<S>(
 ) where
     S: BenchmarkStorage,
 {
-    let mut statements = Vec::with_capacity(files_per_auto_commit);
-    for offset in 0..files_per_auto_commit {
+    let param_sets = (0..files_per_auto_commit).map(|offset| {
         let file_index =
             benchmark_file_index(file_count, checkpoint_index, auto_commit_index, offset);
-        statements.push(ExecuteBatchStatement {
-            label: None,
-            sql: "UPDATE lix_file SET content = $1 WHERE id = $2".to_string(),
-            params: vec![
-                Value::Blob(payload(checkpoint_index, file_index, FILE_BYTES).into()),
-                Value::Text(benchmark_file_id(file_index)),
-            ],
-        });
-    }
-
-    lix.execute_batch(&statements)
+        [
+            Value::Blob(payload(checkpoint_index, file_index, FILE_BYTES).into()),
+            Value::Text(benchmark_file_id(file_index)),
+        ]
+    });
+    lix.execute_many("UPDATE lix_file SET content = $1 WHERE id = $2", param_sets)
         .await
         .expect("update checkpoint benchmark file group");
 }
@@ -840,8 +836,9 @@ where
 {
     ALLOCATION_CALLS.with(|calls| calls.set(0));
     ALLOCATED_BYTES.with(|bytes| bytes.set(0));
-    let checkpoint =
-        IntoFuture::into_future(lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[]));
+    let checkpoint = IntoFuture::into_future(
+        lix.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)"),
+    );
     let (result, storage) = measure_checkpoint_foreground(checkpoint).await;
     result.expect("create benchmark checkpoint");
     let accounting = ForegroundAccounting {
@@ -963,7 +960,9 @@ where
     S: BenchmarkStorage,
 {
     let result = lix
-        .execute(sql, parameters)
+        .query(sql)
+        .params(parameters)
+        .all()
         .await
         .expect("execute count query");
     let count = result
@@ -979,10 +978,7 @@ async fn working_base_commit_id<S>(lix: &Lix<S>) -> String
 where
     S: BenchmarkStorage,
 {
-    lix.execute(
-        "SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-        &[],
-    )
+    lix.query("SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
     .await
     .expect("read the active branch working baseline")
     .rows()
@@ -997,11 +993,12 @@ where
     S: BenchmarkStorage,
 {
     let result = lix
-        .execute(
+        .query(
             "SELECT count(*) AS count \
              FROM lix_diff('lix_file', $1, lix_active_branch_commit_id())",
-            &[Value::Text(checkpoint_commit_id.to_owned())],
         )
+        .params(&[Value::Text(checkpoint_commit_id.to_owned())])
+        .all()
         .await
         .expect("execute checkpoint-to-head file diff count query");
     let count = result
@@ -1017,7 +1014,8 @@ async fn load_file_payloads<S>(lix: &Lix<S>) -> BTreeMap<String, Vec<u8>>
 where
     S: BenchmarkStorage,
 {
-    lix.execute("SELECT id, content FROM lix_file ORDER BY id", &[])
+    lix.query("SELECT id, content FROM lix_file ORDER BY id")
+        .all()
         .await
         .expect("load checkpoint benchmark file payloads")
         .rows()
@@ -1271,7 +1269,8 @@ where
         .expect("open checkpoint surface lix");
     let open_elapsed = open_start.elapsed();
     let anchor = lix
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .expect("read checkpoint surface anchor")
         .rows()[0]
@@ -1358,7 +1357,9 @@ async fn row_count<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> usize
 where
     S: BenchmarkStorage,
 {
-    lix.execute(sql, parameters)
+    lix.query(sql)
+        .params(parameters)
+        .all()
         .await
         .expect("execute row-count query")
         .rows()

@@ -63,42 +63,36 @@ async fn checkpoint_log_retirement_interest_profile() {
     authority
         .execute(
             "INSERT INTO lix_file(path, content) VALUES ('/checkpoint-profile/retired.txt', $1)",
-            &[Value::Blob(b"retired seed".to_vec().into())],
         )
+        .params(&[Value::Blob(b"retired seed".to_vec().into())])
         .await
         .unwrap();
     let retired_checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
     authority
-        .execute(
-            "SELECT commit_id FROM lix_undo($1)",
-            &[Value::Text(retired_checkpoint.clone())],
-        )
+        .execute("SELECT commit_id FROM lix_undo($1)")
+        .params(&[Value::Text(retired_checkpoint.clone())])
         .await
         .unwrap();
     for index in 0..DEPTH {
         authority
-            .execute(
-                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/checkpoint-profile/{index}.txt")),
-                    Value::Blob(vec![index as u8; 128].into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file(path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/checkpoint-profile/{index}.txt")),
+                Value::Blob(vec![index as u8; 128].into()),
+            ])
             .await
             .unwrap();
         authority.create_checkpoint().await.unwrap();
     }
-    let expected = authority.execute(&sql, &[]).await.unwrap();
+    let expected = authority.query(&sql).all().await.unwrap();
     assert_eq!(
         expected.rows().len(),
         DEPTH,
         "fixture must create real file checkpoints"
     );
     let checkpoint_count = authority
-        .execute(
-            "SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint",
-            &[],
-        )
+        .query("SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -111,7 +105,8 @@ async fn checkpoint_log_retirement_interest_profile() {
         .map(|row| row.get::<String>("commit_id").unwrap())
         .collect::<BTreeSet<_>>();
     let authority_head = authority
-        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .query("SELECT lix_active_branch_commit_id() AS id")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -119,13 +114,17 @@ async fn checkpoint_log_retirement_interest_profile() {
         .unwrap();
     let explicit_sql = sql.replacen("lix_log()", &format!("lix_log('{authority_head}')"), 1);
     let authority_storage = authority.storage_adapter();
-    let authority_read = authority_storage.begin_read(Default::default()).await.unwrap();
+    let authority_read = authority_storage
+        .begin_read(Default::default())
+        .await
+        .unwrap();
     let retired_key = crate::tracked_state::TrackedStateKey {
         schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
         file_id: None,
         row_pk: crate::row_pk::RowPk::uuid_from_canonical(&retired_checkpoint).unwrap(),
     };
-    let mut retired_state = crate::tracked_state::TrackedStateContext::new().reader(&authority_read);
+    let mut retired_state =
+        crate::tracked_state::TrackedStateContext::new().reader(&authority_read);
     let retired_rows = retired_state
         .load_projected_batch_at_commit(
             &authority_head,
@@ -139,10 +138,9 @@ async fn checkpoint_log_retirement_interest_profile() {
         "a real retired checkpoint must leave an UNDO_STATE owner in the graph"
     );
     let retired_log = authority
-        .execute(
-            "SELECT is_checkpoint FROM lix_log() WHERE commit_id = $1",
-            &[Value::Text(retired_checkpoint)],
-        )
+        .query("SELECT is_checkpoint FROM lix_log() WHERE commit_id = $1")
+        .params(&[Value::Text(retired_checkpoint)])
+        .all()
         .await
         .unwrap();
     assert!(
@@ -157,7 +155,8 @@ async fn checkpoint_log_retirement_interest_profile() {
             row_pk: crate::row_pk::RowPk::uuid_from_canonical(commit_id).unwrap(),
         })
         .collect::<Vec<_>>();
-    let mut tracked_state = crate::tracked_state::TrackedStateContext::new().reader(&authority_read);
+    let mut tracked_state =
+        crate::tracked_state::TrackedStateContext::new().reader(&authority_read);
     let retirement_rows = tracked_state
         .load_projected_batch_at_commit(
             &authority_head,
@@ -415,7 +414,10 @@ async fn checkpoint_log_retirement_interest_profile() {
                         projection,
                         untracked,
                         include_tombstones,
-                    } if rows.iter().any(|row| row.schema_key == crate::undo_redo::UNDO_STATE_SCHEMA_KEY) => {
+                    } if rows
+                        .iter()
+                        .any(|row| row.schema_key == crate::undo_redo::UNDO_STATE_SCHEMA_KEY) =>
+                    {
                         Some((rows, projection, untracked, include_tombstones))
                     }
                     _ => None,
@@ -464,7 +466,7 @@ async fn checkpoint_log_retirement_interest_profile() {
             let mut page_profiles = Vec::new();
             for page_limit in [10, 20, 40] {
                 let page_sql = format!("{query_prefix} LIMIT {page_limit}");
-                let expected_page = authority.execute(&page_sql, &[]).await.unwrap();
+                let expected_page = authority.query(&page_sql).all().await.unwrap();
                 let page_started = Instant::now();
                 let actual_page = session.execute(&page_sql, &[]).await.unwrap();
                 let page_ms = page_started.elapsed().as_secs_f64() * 1000.;

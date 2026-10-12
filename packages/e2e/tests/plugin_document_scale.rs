@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Lix, Value, open_lix};
+use lix::{Lix, Value, open_lix};
 
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
 
@@ -70,26 +70,26 @@ async fn sequential_batches_survive_observation_cache_eviction() {
         .expect("document-scale workspace should open");
     install_plugin(&lix, "plugin_text", &build_git_text_v2_plugin_archive()).await;
 
-    lix.execute_batch(&[file_insert_statement(
+    let (sql, params) = file_insert_statement(
         "txt",
         (0..DOCUMENTS).map(|index| format!("before {index}\n").into_bytes()),
-    )])
-    .await
-    .expect("the first batch should exceed the Store working set");
+    );
+    lix.execute(&sql)
+        .params(params)
+        .await
+        .expect("the first batch should exceed the Store working set");
 
-    let updates = (0..DOCUMENTS)
-        .map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_string(),
-            params: vec![
+    lix.execute_many(
+        "UPDATE lix_file SET content = $1 WHERE path = $2",
+        (0..DOCUMENTS).map(|index| {
+            [
                 Value::Blob(format!("after {index}\n").into_bytes().into()),
                 Value::Text(format!("/scale-document-{index:04}.txt")),
-            ],
-        })
-        .collect::<Vec<_>>();
-    lix.execute_batch(&updates)
-        .await
-        .expect("retained observations must survive cache eviction between batches");
+            ]
+        }),
+    )
+    .await
+    .expect("retained observations must survive cache eviction between batches");
 
     for index in 0..DOCUMENTS {
         assert_eq!(
@@ -118,26 +118,24 @@ async fn assert_format_scales(
     let first = documents.first().cloned().unwrap();
     let last = documents.last().cloned().unwrap();
     let input_bytes = documents.iter().map(Vec::len).sum::<usize>();
-    let statement = file_insert_statement(extension, documents);
+    let (sql, params) = file_insert_statement(extension, documents);
     let started = Instant::now();
-    let results = lix
-        .execute_batch(&[statement])
+    let inserted = lix
+        .execute(&sql)
+        .params(params)
         .await
-        .expect("an atomic import must not be bounded by the live actor working set")
-        .results;
+        .expect("an atomic import must not be bounded by the live actor working set");
     let elapsed = started.elapsed();
     eprintln!(
         "plugin_document_scale format={extension} documents={expected_count} input_bytes={input_bytes} elapsed_ms={:.3} per_document_us={:.3}",
         elapsed.as_secs_f64() * 1_000.0,
         elapsed.as_secs_f64() * 1_000_000.0 / expected_count as f64,
     );
-    assert_eq!(results[0].rows_affected(), expected_count as u64);
+    assert_eq!(inserted.rows_affected(), expected_count as u64);
 
     let files = lix
-        .execute(
-            "SELECT COUNT(*) AS count FROM lix_file WHERE path LIKE '/scale-document-%'",
-            &[],
-        )
+        .query("SELECT COUNT(*) AS count FROM lix_file WHERE path LIKE '/scale-document-%'")
+        .all()
         .await
         .expect("imported documents should query");
     assert_eq!(
@@ -145,10 +143,8 @@ async fn assert_format_scales(
         expected_count as i64
     );
     let semantic_rows = lix
-        .execute(
-            &format!("SELECT COUNT(*) AS count FROM {semantic_table}"),
-            &[],
-        )
+        .query(&format!("SELECT COUNT(*) AS count FROM {semantic_table}"))
+        .all()
         .await
         .expect("semantic rows should query");
     assert!(
@@ -177,7 +173,7 @@ async fn assert_format_scales(
 fn file_insert_statement(
     extension: &str,
     documents: impl IntoIterator<Item = Vec<u8>>,
-) -> ExecuteBatchStatement {
+) -> (String, Vec<Value>) {
     let mut sql = String::from("INSERT INTO lix_file (path, content) VALUES ");
     let mut params = Vec::new();
     for (index, document) in documents.into_iter().enumerate() {
@@ -192,24 +188,19 @@ fn file_insert_statement(
         )));
         params.push(Value::Blob(document.into()));
     }
-    ExecuteBatchStatement {
-        sql,
-        params,
-        label: None,
-    }
+    (sql, params)
 }
 
 async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT content FROM lix_file WHERE path = $1",
-        &[Value::Text(path.to_owned())],
-    )
-    .await
-    .expect("imported file should read")
-    .rows()[0]
+    lix.query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.to_owned())])
+        .all()
+        .await
+        .expect("imported file should read")
+        .rows()[0]
         .get::<Vec<u8>>("content")
         .expect("imported file data should be bytes")
 }
@@ -218,15 +209,13 @@ async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive:
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .params(&[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
-        ],
-    )
-    .await
-    .expect("reference plugin should install");
+        ])
+        .await
+        .expect("reference plugin should install");
 }
 
 fn build_markdown_plugin_archive() -> Vec<u8> {

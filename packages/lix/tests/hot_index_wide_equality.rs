@@ -12,29 +12,24 @@ async fn indexed_in_above_sixty_four_values_keeps_storage_reads_bounded() -> Res
                 {"name":"value","type":"text","nullable":false}],
             "primary_key":["id"], "unique":[["value"]]
         });
-        db.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-            &[Value::Text(schema.to_string())],
-        )
-        .await?;
+        db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+            .params(&[Value::Text(schema.to_string())])
+            .await?;
         let rows = (0..n)
             .map(|id| format!("({id},'value{id}')"))
             .collect::<Vec<_>>()
             .join(",");
-        db.execute(
-            &format!("INSERT INTO wide_index(id,value) VALUES {rows}"),
-            &[],
-        )
-        .await?;
+        db.execute(&format!("INSERT INTO wide_index(id,value) VALUES {rows}"))
+            .await?;
         let values = (0..70)
             .map(|id| format!("'absent{id}'"))
             .collect::<Vec<_>>()
             .join(",");
         let (result, census) = measure_checkpoint_foreground(async {
-            db.execute(
-                &format!("SELECT id FROM wide_index WHERE value IN ({values})"),
-                &[],
-            )
+            db.query(&format!(
+                "SELECT id FROM wide_index WHERE value IN ({values})"
+            ))
+            .all()
             .await
         })
         .await;
@@ -62,20 +57,15 @@ async fn many_absent_index_values_fall_back_before_opening_range_per_key() -> Re
             {"name":"value","type":"text","nullable":false}],
         "primary_key":["id"], "unique":[["value"]]
     });
-    db.execute(
-        "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
-        &[Value::Text(schema.to_string())],
-    )
-    .await?;
+    db.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)")
+        .params(&[Value::Text(schema.to_string())])
+        .await?;
     let rows = (0..100)
         .map(|id| format!("({id},'present{id}')"))
         .collect::<Vec<_>>()
         .join(",");
-    db.execute(
-        &format!("INSERT INTO absent_index(id,value) VALUES {rows}"),
-        &[],
-    )
-    .await?;
+    db.execute(&format!("INSERT INTO absent_index(id,value) VALUES {rows}"))
+        .await?;
     let mut counts = Vec::new();
     for count in [256, 4096] {
         let values = (0..count)
@@ -84,7 +74,7 @@ async fn many_absent_index_values_fall_back_before_opening_range_per_key() -> Re
             .join(",");
         let sql = format!("SELECT id FROM absent_index WHERE value IN ({values})");
         let (result, census) =
-            measure_checkpoint_foreground(async { db.execute(&sql, &[]).await }).await;
+            measure_checkpoint_foreground(async { db.query(&sql).all().await }).await;
         assert!(result?.rows().is_empty());
         assert!(
             census.scan_starts < 64,

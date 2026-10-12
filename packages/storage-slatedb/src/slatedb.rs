@@ -6987,18 +6987,13 @@ mod tests {
         for index in 0u64..(65 * 1024 * 1024 / 32) {
             content.extend_from_slice(blake3::hash(&index.to_be_bytes()).as_bytes());
         }
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES('/preserved.bin',$1)",
-            &[lix::Value::Blob(Bytes::from(content.clone()).into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('preserved','before')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file(path,content) VALUES('/preserved.bin',$1)")
+            .params(&[lix::Value::Blob(Bytes::from(content.clone()).into())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES('preserved','before')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         current.flush().await.unwrap();
         let snapshot = current
@@ -7112,18 +7107,12 @@ mod tests {
             .unwrap();
         for (index, expected) in content.chunks(4 * 1024 * 1024).enumerate() {
             let start = (index * 4 * 1024 * 1024) as i64 + 1;
-            let file = lix.execute(
-                "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice FROM lix_file WHERE path='/preserved.bin'",
-                &[lix::Value::Integer(start), lix::Value::Integer(expected.len() as i64)],
-            ).await.unwrap();
+            let file = lix.query("SELECT SUBSTRING(content FROM $1 FOR $2) AS slice FROM lix_file WHERE path='/preserved.bin'").params(&[lix::Value::Integer(start), lix::Value::Integer(expected.len() as i64)]).all().await.unwrap();
             assert_eq!(file.rows()[0].get::<Vec<u8>>("slice").unwrap(), expected);
         }
-        lix.execute(
-            "UPDATE lix_key_value SET value='after' WHERE key='preserved'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value='after' WHERE key='preserved'")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         upgraded.flush().await.unwrap();
         drop(upgraded);
@@ -7135,7 +7124,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            lix.execute("SELECT value FROM lix_key_value WHERE key='preserved'", &[])
+            lix.query("SELECT value FROM lix_key_value WHERE key='preserved'")
+                .all()
                 .await
                 .unwrap()
                 .rows()[0]
@@ -7143,10 +7133,7 @@ mod tests {
                 .unwrap(),
             serde_json::json!("after")
         );
-        let tail = lix.execute(
-            "SELECT SUBSTRING(content FROM $1 FOR 1024) AS slice FROM lix_file WHERE path='/preserved.bin'",
-            &[lix::Value::Integer((content.len() - 1024) as i64 + 1)],
-        ).await.unwrap();
+        let tail = lix.query("SELECT SUBSTRING(content FROM $1 FOR 1024) AS slice FROM lix_file WHERE path='/preserved.bin'").params(&[lix::Value::Integer((content.len() - 1024) as i64 + 1)]).all().await.unwrap();
         assert_eq!(
             tail.rows()[0].get::<Vec<u8>>("slice").unwrap(),
             &content[content.len() - 1024..]

@@ -135,10 +135,7 @@ async fn merged_fixture() -> (
     .await
     .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('remote-new','remote-R')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('remote-new','remote-R')")
         .await
         .unwrap();
     let remote = authority.partial_replica_descriptor(None).await.unwrap();

@@ -54,10 +54,9 @@ async fn measure(rows: usize, sql: &str, params: Vec<Value>) -> HotScanRouteCens
         .map(|index| format!("('seed-{index:06}', '\"v0\"')"))
         .collect::<Vec<_>>()
         .join(", ");
-    lix.execute(
-        &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-        &[],
-    )
+    lix.execute(&format!(
+        "INSERT INTO lix_key_value (key, value) VALUES {values}"
+    ))
     .await
     .expect("fixture rows should commit");
 
@@ -65,7 +64,8 @@ async fn measure(rows: usize, sql: &str, params: Vec<Value>) -> HotScanRouteCens
     // fixture did is attributed to it.
     let _ = take_hot_scan_route_census();
     let result = lix
-        .execute(sql, &params)
+        .execute(sql)
+        .params(&params)
         .await
         .unwrap_or_else(|error| panic!("statement `{sql}` should execute: {error:?}"));
     let census = take_hot_scan_route_census()[CRUD_PHASE_WRITE_READ];

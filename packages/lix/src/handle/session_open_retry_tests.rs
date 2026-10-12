@@ -66,13 +66,13 @@ async fn child_session_retries_expired_admission_reads_without_retaining_failed_
             child.active_branch_id().await.unwrap(),
             root.active_branch_id().await.unwrap()
         );
-        child.execute("SELECT 1", &[]).await.unwrap();
+        child.query("SELECT 1").all().await.unwrap();
         child.close().await.unwrap();
         drop(child);
         assert_eq!(Arc::strong_count(&root.engine), baseline);
     }
     assert_eq!(storage.failures.load(Ordering::SeqCst), 4);
-    root.execute("SELECT 1", &[]).await.unwrap();
+    root.query("SELECT 1").all().await.unwrap();
     root.close().await.unwrap();
 }
 
@@ -100,6 +100,6 @@ async fn child_session_preserves_real_storage_errors_and_parent_lifecycle() {
     assert_eq!(Arc::strong_count(&root.engine), baseline);
     let child = root.open_another_session().await.unwrap();
     child.close().await.unwrap();
-    root.execute("SELECT 1", &[]).await.unwrap();
+    root.query("SELECT 1").all().await.unwrap();
     root.close().await.unwrap();
 }

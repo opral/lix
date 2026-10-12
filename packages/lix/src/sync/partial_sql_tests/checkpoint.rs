@@ -10,16 +10,14 @@ async fn fresh_partial_log_hydrates_checkpoint_conversation_metadata() {
                 'Sparse metadata fixture',\
                 '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB\
             )",
-            &[],
         )
         .await
         .unwrap();
     let checkpoint_id = created.rows()[0].get::<String>("commit_id").unwrap();
     let expected = authority
-        .execute(
-            "SELECT conversation_id FROM lix_log() WHERE commit_id = $1",
-            &[Value::Text(checkpoint_id.clone())],
-        )
+        .query("SELECT conversation_id FROM lix_log() WHERE commit_id = $1")
+        .params(&[Value::Text(checkpoint_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -135,7 +133,7 @@ async fn background_checkpoint_upload_hydrates_missing_exact_locator() {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
-        .execute("INSERT INTO lix_key_value(key,value) VALUES('offline-checkpoint','base'),('sparse-origin','authority-owned'),('unselected-third','keep')", &[])
+        .execute("INSERT INTO lix_key_value(key,value) VALUES('offline-checkpoint','base'),('sparse-origin','authority-owned'),('unselected-third','keep')")
         .await
         .unwrap();
 
@@ -284,10 +282,7 @@ async fn background_checkpoint_upload_hydrates_missing_exact_locator() {
         .await
         .unwrap();
     source
-        .execute(
-            "UPDATE lix_key_value SET value='authority-imported' WHERE key='sparse-origin'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='authority-imported' WHERE key='sparse-origin'")
         .await
         .unwrap();
     let mut import = source
@@ -317,10 +312,8 @@ async fn background_checkpoint_upload_hydrates_missing_exact_locator() {
     imported_member.change_id = imported_change.clone();
     authority.push_sync_repository(&import).await.unwrap();
     let authoritative_change = authority
-        .execute(
-            "SELECT lixcol_change_id FROM lix_key_value WHERE key='sparse-origin'",
-            &[],
-        )
+        .query("SELECT lixcol_change_id FROM lix_key_value WHERE key='sparse-origin'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -572,10 +565,9 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool,
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .unwrap();
         let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
@@ -839,14 +831,15 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool,
         );
         if described {
             let description = authority
-                .execute(
+                .query(
                     "SELECT c.title, m.body
                      FROM lix_log() AS l
                      JOIN lix_conversation AS c ON c.id = l.conversation_id
                      JOIN lix_comment AS m ON m.conversation_id = c.id
                      WHERE l.commit_id = $1",
-                    &[Value::Text(prepared.upload.target.checkpoint.clone())],
                 )
+                .params(&[Value::Text(prepared.upload.target.checkpoint.clone())])
+                .all()
                 .await
                 .expect("checkpoint description must sync to authority");
             assert_eq!(description.len(), 1);
@@ -884,10 +877,9 @@ async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool,
             assert_eq!(
                 value(
                     authority
-                        .execute(
-                            "SELECT value FROM lix_key_value WHERE key = $1",
-                            &[Value::Text(format!("partial-demand-{index:06}"))]
-                        )
+                        .query("SELECT value FROM lix_key_value WHERE key = $1")
+                        .params(&[Value::Text(format!("partial-demand-{index:06}"))])
+                        .all()
                         .await
                         .unwrap()
                 ),

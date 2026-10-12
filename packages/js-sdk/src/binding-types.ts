@@ -4,7 +4,6 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteOptions,
-	LixBatchOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
@@ -53,6 +52,51 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
+/** Options of a buffered read or stream. */
+export type BindingReadOptions = {
+	/** Byte cap of a buffered result; `Infinity` opts out, omitted keeps 64 MiB. */
+	maxBytes?: number;
+	/** At most one row (`queryOne`): more reject `LIX_ERROR_NOT_UNIQUE`; not byte-capped. */
+	single?: boolean;
+};
+
+/** Options of `execute` and `executeMany`. */
+export type BindingExecuteOptions = Omit<ExecuteOptions, "maxBytes" | "signal"> & {
+	maxBytes?: number;
+};
+
+/**
+ * One open read stream. It opens with its first page buffered; `next()`
+ * resolves null/undefined once exhausted. `cancel()` resolves once the engine
+ * has stopped and the stream's read state is released.
+ */
+export type QueryStreamBinding = {
+	readonly columns: string[];
+	next(): Promise<BindingExecuteResult | null | undefined>;
+	cancel(): void | Promise<void>;
+};
+
+/**
+ * Reads of one state: the latest state per call or a
+ * transaction. Aborting `signal` cancels the read in the engine: its work
+ * stops within a time slice and the call rejects with the signal's reason.
+ */
+export type ReaderBinding = {
+	query(
+		sql: string,
+		params: BindingParam[],
+		options?: BindingReadOptions,
+		signal?: AbortSignal,
+	): Promise<BindingExecuteResult>;
+	/** Resolves once the statement is planned and its first page has arrived. */
+	stream(
+		sql: string,
+		params: BindingParam[],
+		options?: BindingReadOptions,
+		signal?: AbortSignal,
+	): Promise<QueryStreamBinding>;
+};
+
 export type SnapshotExportBinding = {
 	next(): Promise<Uint8Array | null | undefined>;
 	cancel(): void | Promise<void>;
@@ -65,13 +109,7 @@ export type SnapshotRestoreBinding<T> = {
 	cancel(): void | Promise<void>;
 };
 
-export type BindingBatchStatement = {
-	sql: string;
-	params: BindingParam[];
-	label?: string;
-};
-
-export type LixBinding = {
+export type LixBinding = ReaderBinding & {
 	createHosted?(
 		server: HostedServerBindingOptions,
 	): Promise<import("./types.js").HostedLix>;
@@ -84,12 +122,14 @@ export type LixBinding = {
 	execute(
 		sql: string,
 		params: BindingParam[],
-		options?: ExecuteOptions,
+		options?: BindingExecuteOptions,
 	): Promise<BindingExecuteResult>;
-	executeBatch(
-		statements: BindingBatchStatement[],
-		options?: LixBatchOptions,
-	): Promise<{ results: BindingExecuteResult[]; commit?: CommitSpan | null }>;
+	executeMany(
+		sql: string,
+		paramSets: BindingParam[][],
+		options?: BindingExecuteOptions,
+	): Promise<{ rowsAffected: number }>;
+	/** Pins the current state for several reads. */
 	observe(
 		sql: string,
 		params: BindingParam[],
@@ -119,12 +159,17 @@ export type LixBinding = {
 	flushTelemetry?(): Promise<void>;
 };
 
-export type LixTransactionBinding = {
+export type LixTransactionBinding = ReaderBinding & {
 	execute(
 		sql: string,
 		params: BindingParam[],
-		options?: ExecuteOptions,
+		options?: BindingExecuteOptions,
 	): Promise<BindingExecuteResult>;
+	executeMany(
+		sql: string,
+		paramSets: BindingParam[][],
+		options?: BindingExecuteOptions,
+	): Promise<{ rowsAffected: number }>;
 	commit(): Promise<{ commit?: CommitSpan | null }>;
 	rollback(): Promise<void>;
 };

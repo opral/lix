@@ -30,3 +30,25 @@ test("opening and closing have finite budgets; observation waits remain long-liv
 		operationDeadline({ kind: "observe.next", observeId: 1 }),
 	).toBeUndefined();
 });
+test("stream and transaction reads have no fatal deadline and never report an unknown write outcome", () => {
+	const reads = [
+		{ kind: "stream", sql: "SELECT 1", params: [] },
+		{ kind: "stream.next", streamId: 1 },
+		{ kind: "stream.close", streamId: 1 },
+		{ kind: "query", sql: "SELECT 1", params: [] },
+		{ kind: "transaction.stream", transactionId: 1, sql: "SELECT 1", params: [] },
+	] as const;
+	const error = new Error("owner died");
+	for (const operation of reads) {
+		expect(operationDeadline(operation)).toBeUndefined();
+		expect(lostOperationError(operation, error)).toBe(error);
+	}
+	// A buffered read of the latest state has no fatal deadline either.
+	expect(operationDeadline({ kind: "query", sql: "SELECT 1", params: [] })).toBeUndefined();
+	expect(
+		operationDeadline({ kind: "transaction.query", transactionId: 1, sql: "SELECT 1", params: [] }),
+	).toBeUndefined();
+	expect(lostOperationError({ kind: "executeMany", sql: "INSERT", paramSets: [] }, error)).toMatchObject({
+		code: "LIX_WRITE_OUTCOME_UNKNOWN",
+	});
+});

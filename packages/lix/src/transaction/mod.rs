@@ -4,6 +4,8 @@ mod branch_heads;
 mod commit;
 mod commit_coordinator;
 mod context;
+#[cfg(test)]
+pub(crate) use context::FLUSH_PAUSE;
 mod normalization;
 mod read_set;
 mod schema_resolver;
@@ -45,6 +47,7 @@ pub(crate) use context::TransactionCommitOutcome;
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;
 pub(crate) use context::commit_transaction_cohort;
+pub(crate) use context::extend_pinned_read_with_hydrated_inputs;
 #[cfg(feature = "storage-benches")]
 pub(crate) use context::open_transaction;
 pub(crate) use context::open_transaction_with_account_scope;

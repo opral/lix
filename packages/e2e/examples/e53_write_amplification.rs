@@ -24,6 +24,7 @@
 //!
 //! Usage: `e53_write_amplification [rows_per_commit] [commits] [report_every]`
 
+use lix::Value;
 use lix::storage::Storage;
 use lix::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix::storage_bench::{
@@ -31,7 +32,6 @@ use lix::storage_bench::{
     probe_hot_generation_planes, take_crud_physical_write_accounting, take_hot_retire_invocations,
     take_packed_base_publication_census,
 };
-use lix::{ExecuteBatchStatement, Value};
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 
@@ -50,7 +50,7 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(50);
-    // Seeded via execute_batch in ONE commit. PACKED_CURRENT_BASE_MIN_ROWS is a
+    // Seeded via execute_many in ONE commit. PACKED_CURRENT_BASE_MIN_ROWS is a
     // floor on rows staged by a single transaction, so this is the knob that
     // decides whether a packed base exists before the incremental lane starts.
     // 500 is the `untracked_state_crud` chunk size -- deliberately just under
@@ -98,19 +98,17 @@ async fn main() {
 
     if seed_rows > 0 {
         let sql = "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))";
-        let statements = (0..seed_rows)
-            .map(|row_index| ExecuteBatchStatement {
-                label: None,
-                sql: sql.to_string(),
-                params: vec![
+        let param_sets = (0..seed_rows)
+            .map(|row_index| {
+                [
                     Value::Text(format!("/seed/{row_index:08}")),
                     Value::Text(format!(r#"{{"seed":{row_index}}}"#)),
-                ],
+                ]
             })
             .collect::<Vec<_>>();
         let start = std::time::Instant::now();
         session
-            .execute_batch(&statements)
+            .execute_many(sql, param_sets)
             .await
             .expect("seed batch");
         let seed_nanos = start.elapsed().as_nanos();
@@ -211,16 +209,14 @@ async fn commit_batch<S>(session: &Lix<S>, batch: usize, rows: usize)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session.begin_transaction().await.expect("begin commit");
+    let transaction = session.begin_transaction().await.expect("begin commit");
     for index in 0..rows {
         transaction
-            .execute(
-                "INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))",
-                &[
-                    Value::Text(format!("/inc/{batch:08}/{index:08}")),
-                    Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
-                ],
-            )
+            .execute("INSERT INTO e53_amp (path, value) VALUES ($1, CAST($2 AS JSONB))")
+            .params(&[
+                Value::Text(format!("/inc/{batch:08}/{index:08}")),
+                Value::Text(format!(r#"{{"batch":{batch},"index":{index}}}"#)),
+            ])
             .await
             .expect("insert row");
     }
@@ -241,10 +237,7 @@ where
         "primary_key": ["path"],
     });
     session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register schema");
 }

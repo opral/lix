@@ -20,36 +20,29 @@ cargo add tokio --features macros,rt-multi-thread
 async fn main() -> Result<(), lix::LixError> {
     let lix = lix::open_lix().await?;
 
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-        &[
-            lix::Value::Text("/hello.txt".to_owned()),
-            lix::Value::Blob(b"Hello".as_slice().into()),
-        ],
-    )
-    .await?;
-    lix.execute(
-        "UPDATE lix_file SET content = $1 WHERE path = $2",
-        &[
-            lix::Value::Blob(b"Hello from Lix".as_slice().into()),
-            lix::Value::Text("/hello.txt".to_owned()),
-        ],
-    )
-    .await?;
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+        .bind("/hello.txt")
+        .bind(lix::Value::Blob(b"Hello".as_slice().into()))
+        .await?;
+    lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2")
+        .bind(lix::Value::Blob(b"Hello from Lix".as_slice().into()))
+        .bind("/hello.txt")
+        .await?;
 
     let history = lix
-        .execute(
+        .query(
             "SELECT from_path, to_path, diff_type, lixcol_position \
              FROM lix_history('lix_file') \
              WHERE from_path = $1 OR to_path = $1 \
              ORDER BY lixcol_position",
-            &[lix::Value::Text("/hello.txt".to_owned())],
         )
+        .bind("/hello.txt")
+        .all()
         .await?;
 
     println!("{} versions", history.rows().len());
 
-    let undone = lix.execute("SELECT commit_id FROM lix_undo()", &[]).await?;
+    let undone = lix.execute("SELECT commit_id FROM lix_undo()").await?;
     println!("undo receipt {:?}", undone.rows().first());
     lix.close().await?;
     Ok(())
@@ -58,7 +51,7 @@ async fn main() -> Result<(), lix::LixError> {
 
 Every tracked write becomes a commit automatically. You never run a commit command. Position `0` is the head commit. Higher positions walk back through the first-parent chain.
 
-`execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.execute_batch`. Do not concatenate SQL into one script string.
+`query()` reads and never writes; its terminals are `all()`, `one()`, `optional()` and `stream()`. `execute()` runs any single statement. To run several statements atomically, use `lix.begin_transaction()`; to run one statement with many parameter sets, use `lix.execute_many()`. Do not concatenate SQL into one script string.
 
 The repository is in memory and disappears when the process ends. To keep it on disk, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See [Storage](./persistence.md).
 

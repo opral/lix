@@ -74,16 +74,16 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES \
              ($1, 'shared-source'), ($2, 'shared-target')",
-            &[
-                Value::Text(SOURCE_KEY.to_owned()),
-                Value::Text(TARGET_KEY.to_owned()),
-            ],
         )
+        .params(&[
+            Value::Text(SOURCE_KEY.to_owned()),
+            Value::Text(TARGET_KEY.to_owned()),
+        ])
         .await
         .expect("insert shared rows");
         fork_commit_id = active_commit_id(&main).await;
         checkpoint_commit_id = main
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .expect("checkpoint target branch")
             .rows()[0]
@@ -124,10 +124,8 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
             ],
         );
         source
-            .execute(
-                "UPDATE lix_key_value SET value = 'source' WHERE key = $1",
-                &[Value::Text(SOURCE_KEY.to_owned())],
-            )
+            .execute("UPDATE lix_key_value SET value = 'source' WHERE key = $1")
+            .params(&[Value::Text(SOURCE_KEY.to_owned())])
             .await
             .expect("publish disjoint source edit");
         source_commit_id = active_commit_id(&source).await;
@@ -139,12 +137,10 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
             commit_base_id(&main, &source_commit_id).await,
             refresh_base_commit_id,
         );
-        main.execute(
-            "UPDATE lix_key_value SET value = 'target' WHERE key = $1",
-            &[Value::Text(TARGET_KEY.to_owned())],
-        )
-        .await
-        .expect("publish disjoint target edit");
+        main.execute("UPDATE lix_key_value SET value = 'target' WHERE key = $1")
+            .params(&[Value::Text(TARGET_KEY.to_owned())])
+            .await
+            .expect("publish disjoint target edit");
 
         source.close().await.expect("close source session");
         main.close().await.expect("close main session");
@@ -222,10 +218,9 @@ where
         .await
         .expect("active branch resolves");
     let result = lix
-        .execute(
-            "SELECT commit_id FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch_id)],
-        )
+        .query("SELECT commit_id FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch_id)])
+        .all()
         .await
         .expect("active commit reads");
     result.rows()[0]
@@ -237,41 +232,39 @@ async fn commit_parent_edges<S>(lix: &Lix<S>, commit_id: &str) -> Vec<(String, i
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT parent_commit_ids FROM lix_commit WHERE id = $1",
-        &[Value::Text(commit_id.to_owned())],
-    )
-    .await
-    .expect("ordered checkpoint parents read")
-    .rows()[0]
-    .get::<serde_json::Value>("parent_commit_ids")
-    .expect("parent IDs decode as JSON")
-    .as_array()
-    .expect("parent IDs form an array")
-    .iter()
-    .enumerate()
-    .map(|(order, parent)| {
-        (
-            parent.as_str().expect("parent ID decodes").to_owned(),
-            i64::try_from(order).expect("parent order fits an integer"),
-        )
-    })
-    .collect()
+    lix.query("SELECT parent_commit_ids FROM lix_commit WHERE id = $1")
+        .params(&[Value::Text(commit_id.to_owned())])
+        .all()
+        .await
+        .expect("ordered checkpoint parents read")
+        .rows()[0]
+        .get::<serde_json::Value>("parent_commit_ids")
+        .expect("parent IDs decode as JSON")
+        .as_array()
+        .expect("parent IDs form an array")
+        .iter()
+        .enumerate()
+        .map(|(order, parent)| {
+            (
+                parent.as_str().expect("parent ID decodes").to_owned(),
+                i64::try_from(order).expect("parent order fits an integer"),
+            )
+        })
+        .collect()
 }
 
 async fn commit_base_id<S>(lix: &Lix<S>, commit_id: &str) -> String
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix.execute(
-        "SELECT base_commit_id FROM lix_commit WHERE id = $1",
-        &[Value::Text(commit_id.to_owned())],
-    )
-    .await
-    .expect("commit base reads")
-    .rows()[0]
-    .get::<String>("base_commit_id")
-    .expect("local commit has a base commit")
+    lix.query("SELECT base_commit_id FROM lix_commit WHERE id = $1")
+        .params(&[Value::Text(commit_id.to_owned())])
+        .all()
+        .await
+        .expect("commit base reads")
+        .rows()[0]
+        .get::<String>("base_commit_id")
+        .expect("local commit has a base commit")
 }
 
 async fn assert_value<S>(lix: &Lix<S>, key: &str, expected: &str)
@@ -279,10 +272,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1",
-            &[Value::Text(key.to_owned())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1")
+        .params(&[Value::Text(key.to_owned())])
+        .all()
         .await
         .expect("merged value reads");
     assert_eq!(

@@ -27,8 +27,8 @@ const V72_FILESYSTEM_SNAPSHOT: &[u8] =
 /// Asserts every file row's `directory_id` resolves among the same tree's
 /// directory rows — the closure invariant the v75 migration repairs.
 fn assert_files_resolve_directories(
-    files: &lix::ExecuteResult,
-    directories: &lix::ExecuteResult,
+    files: &lix::QueryResult,
+    directories: &lix::QueryResult,
     context: &str,
 ) {
     let directory_ids: HashSet<String> = directories
@@ -64,10 +64,8 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     assert!(lix.open_report().migration.is_none());
 
     let checkpoints = lix
-        .execute(
-            "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position",
-            &[],
-        )
+        .query("SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position")
+        .all()
         .await
         .expect("checkpoint listing");
     // Bootstrap checkpoint + full + partial.
@@ -83,19 +81,17 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         // Every file descriptor in the checkpoint tree must resolve its
         // ancestor directories within the same tree.
         let files = lix
-            .execute(
-                "SELECT id, name, directory_id FROM lix_as_of('lix_file', $1)",
-                &[Value::Text(commit_id.clone())],
-            )
+            .query("SELECT id, name, directory_id FROM lix_as_of('lix_file', $1)")
+            .params(&[Value::Text(commit_id.clone())])
+            .all()
             .await
             .unwrap_or_else(|error| {
                 panic!("lix_as_of('lix_file') at {commit_id} should read: {error}")
             });
         let directories = lix
-            .execute(
-                "SELECT id FROM lix_as_of('lix_directory', $1)",
-                &[Value::Text(commit_id.clone())],
-            )
+            .query("SELECT id FROM lix_as_of('lix_directory', $1)")
+            .params(&[Value::Text(commit_id.clone())])
+            .all()
             .await
             .unwrap_or_else(|error| {
                 panic!("lix_as_of('lix_directory') at {commit_id} should read: {error}")
@@ -107,10 +103,11 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         );
 
         // The path-projecting read the product runs on every checkpoint open.
-        lix.execute(
+        lix.query(
             "SELECT row_ref, id, to_path FROM lix_diff('lix_file', lix_root_commit_id(), $1)",
-            &[Value::Text(commit_id.clone())],
         )
+        .params(&[Value::Text(commit_id.clone())])
+        .all()
         .await
         .unwrap_or_else(|error| panic!("root diff with paths at {commit_id} should read: {error}"));
     }
@@ -121,15 +118,12 @@ async fn checkpointed_directories_survive_the_v74_migration() {
     // previous checkpoint already contained.
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/notes/today.md', CAST('note' AS BYTEA))",
-        &[],
     )
     .await
     .expect("create /notes/today.md on the migrated repository");
     let new_file = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = '/notes/today.md'",
-            &[],
-        )
+        .query("SELECT id FROM lix_file WHERE path = '/notes/today.md'")
+        .all()
         .await
         .expect("read new file id");
     let new_file_id = new_file.rows()[0].get::<String>("id").expect("file id");
@@ -139,8 +133,8 @@ async fn checkpointed_directories_survive_the_v74_migration() {
              SELECT row_ref
              FROM lix_diff('lix_file')
              WHERE id = $1))",
-            &[Value::Text(new_file_id)],
         )
+        .params(&[Value::Text(new_file_id)])
         .await
         .expect("partial checkpoint on the migrated repository");
     let partial_commit_id = partial.rows()[0]
@@ -148,10 +142,9 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         .expect("partial checkpoint commit id");
 
     let files = lix
-        .execute(
-            "SELECT name, directory_id FROM lix_as_of('lix_file', $1)",
-            &[Value::Text(partial_commit_id.clone())],
-        )
+        .query("SELECT name, directory_id FROM lix_as_of('lix_file', $1)")
+        .params(&[Value::Text(partial_commit_id.clone())])
+        .all()
         .await
         .expect("file tree at the post-migration checkpoint");
     let file_names: Vec<String> = files
@@ -167,10 +160,9 @@ async fn checkpointed_directories_survive_the_v74_migration() {
         );
     }
     let directories = lix
-        .execute(
-            "SELECT id, name FROM lix_as_of('lix_directory', $1)",
-            &[Value::Text(partial_commit_id.clone())],
-        )
+        .query("SELECT id, name FROM lix_as_of('lix_directory', $1)")
+        .params(&[Value::Text(partial_commit_id.clone())])
+        .all()
         .await
         .expect("directory tree at the post-migration checkpoint");
     let directory_names: Vec<String> = directories

@@ -140,12 +140,9 @@ mod tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        seed.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES ('auto-upgrade','preserved')",
-            &[],
-        )
-        .await
-        .unwrap();
+        seed.execute("INSERT INTO lix_key_value(key,value) VALUES ('auto-upgrade','preserved')")
+            .await
+            .unwrap();
         seed.close().await.unwrap();
         drop(seed);
         let authority = lix_sdk::open_lix()
@@ -251,10 +248,8 @@ mod tests {
         assert_eq!(source_marker.as_ref(), b"tracked-default-branch.v80");
         let lix = lix_sdk::open_lix().with_storage(storage).await.unwrap();
         let result = lix
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key='auto-upgrade'",
-                &[],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key='auto-upgrade'")
+            .all()
             .await
             .unwrap();
         assert_eq!(

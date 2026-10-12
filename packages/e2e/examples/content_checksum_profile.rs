@@ -48,19 +48,18 @@ async fn profile<S: Storage + Clone + Send + Sync + 'static>(
             .collect::<Vec<_>>();
         let expected = format!("{:x}", Sha256::digest(&bytes));
         let path = format!("/profile-{size}.bin");
-        lix.execute(
-            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-            &[Value::Text(path.clone()), Value::Blob(bytes.into())],
-        )
-        .await?;
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[Value::Text(path.clone()), Value::Blob(bytes.into())])
+            .await?;
         let params = [Value::Text(path)];
         let mut reads = Vec::new();
         let mut hashes = Vec::new();
         // Warm both plans and verify the digest before timing. These are warm
         // process/storage measurements, not cold disk or HTTP transfer timings.
-        lix.execute(READ, &params).await?;
+        lix.query(READ).params(&params).all().await?;
         assert_eq!(
-            lix.execute(HASH, &params).await?.rows()[0].get::<String>("content_sha256")?,
+            lix.query(HASH).params(&params).all().await?.rows()[0]
+                .get::<String>("content_sha256")?,
             expected
         );
         for iteration in 0..20 {
@@ -72,7 +71,9 @@ async fn profile<S: Storage + Clone + Send + Sync + 'static>(
             } {
                 let started = Instant::now();
                 let result = lix
-                    .execute(if hashing { HASH } else { READ }, &params)
+                    .query(if hashing { HASH } else { READ })
+                    .params(&params)
+                    .all()
                     .await?;
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 assert_eq!(result.rows().len(), 1);

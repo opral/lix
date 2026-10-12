@@ -26,30 +26,79 @@ macro_rules! wasm_session_methods {
                 crate::wasm::execute_result_to_js(result)
             }
 
-            #[wasm_bindgen(js_name = executeBatch)]
-            pub async fn execute_batch(
+            /// A buffered read of the latest committed state; writes reject.
+            #[wasm_bindgen(js_name = query)]
+            pub async fn query(
                 &self,
-                statements: JsValue,
+                sql: String,
+                params: JsValue,
+                options: Option<JsValue>,
+                signal: Option<JsValue>,
+            ) -> Result<JsValue, JsValue> {
+                crate::wasm::abortable(signal, async {
+                    let params = crate::wasm::values_from_js(params)?;
+                    let options = crate::wasm::read_options_from_js(options)?;
+                    let result = self
+                        .instrument_operation(crate::session::SessionOperations::query(
+                            &self.inner,
+                            &sql,
+                            &params,
+                            options,
+                        ))
+                        .await
+                        .map_err(crate::wasm::lix_error_to_js)?;
+                    crate::wasm::execute_result_to_js(result)
+                })
+                .await
+            }
+
+            /// Opens a read stream. Resolves once the first page has arrived,
+            /// so planning errors reject here.
+            #[wasm_bindgen(js_name = stream)]
+            pub async fn stream(
+                &self,
+                sql: String,
+                params: JsValue,
+                options: Option<JsValue>,
+                signal: Option<JsValue>,
+            ) -> Result<crate::wasm::WasmQueryStream, JsValue> {
+                crate::wasm::abortable(signal, async {
+                    let params = crate::wasm::values_from_js(params)?;
+                    let max_bytes = crate::wasm::read_max_bytes_from_js(options)?;
+                    let stream = self
+                        .instrument_operation(crate::session::SessionOperations::stream(
+                            &self.inner,
+                            &sql,
+                            &params,
+                            max_bytes,
+                        ))
+                        .await
+                        .map_err(crate::wasm::lix_error_to_js)?;
+                    Ok(crate::wasm::WasmQueryStream::new(stream))
+                })
+                .await
+            }
+
+            /// Runs one statement once per parameter set, atomically.
+            #[wasm_bindgen(js_name = executeMany)]
+            pub async fn execute_many(
+                &self,
+                sql: String,
+                param_sets: JsValue,
                 options: Option<JsValue>,
             ) -> Result<JsValue, JsValue> {
-                let statements = crate::wasm::batch_statements_from_js(statements)?;
+                let param_sets = crate::wasm::param_sets_from_js(param_sets)?;
                 let options = crate::wasm::session_execute_options_from_js(options)?;
-                let results = self
-                    .instrument_operation(crate::session::SessionOperations::execute_batch(
+                let rows_affected = self
+                    .instrument_operation(crate::session::SessionOperations::execute_many(
                         &self.inner,
-                        &statements,
+                        &sql,
+                        param_sets,
                         options,
                     ))
                     .await
                     .map_err(crate::wasm::lix_error_to_js)?;
-                let commit = results.commit;
-                let results = results
-                    .results
-                    .into_iter()
-                    .map(crate::wasm::ExecuteResultDto::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                crate::wasm::to_js(&crate::wasm::ExecuteBatchResultDto { results, commit })
+                crate::wasm::rows_affected_to_js(rows_affected)
             }
 
             #[wasm_bindgen(js_name = syncHealth)]

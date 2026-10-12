@@ -45,10 +45,7 @@ async fn recorded_merge_receipt_preserves_newer_local_tip_and_original_confirmat
     .await
     .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')")
         .await
         .unwrap();
     let request = captured_request(&authority, &engine, &old).await;
@@ -228,10 +225,7 @@ async fn merge_capture_racing_a_local_write_fails_without_creating_an_attempt() 
     .await
     .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')")
         .await
         .unwrap();
     let request = captured_request(&authority, &engine, &old).await;
@@ -296,10 +290,7 @@ async fn merge_capture_invalidates_staged_ack_and_keeps_global_lane_available() 
     .await
     .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES('remote-only','R')")
         .await
         .unwrap();
     let request = captured_request(&authority, &engine, &old).await;

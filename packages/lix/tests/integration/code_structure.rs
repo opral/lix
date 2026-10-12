@@ -2307,7 +2307,9 @@ fn current_shared_persistence_root_files() -> Vec<String> {
 }
 
 fn is_sql2_runtime_owner_path(relative_path: &str) -> bool {
-    relative_path == "sql2/runtime.rs"
+    // `cooperative.rs` is the runtime's yielding wrapper: it executes a
+    // plan's leaves only to interleave yields into their streams.
+    relative_path == "sql2/runtime.rs" || relative_path == "sql2/cooperative.rs"
 }
 
 fn current_sql2_datafusion_physical_execution_owner_violations() -> Vec<SqlRuntimeOwnershipViolation>

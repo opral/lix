@@ -36,10 +36,7 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('local','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('local','before')")
             .await
             .unwrap();
         let target = authority
@@ -128,8 +125,7 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
                 .code,
             "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
         );
-        let (demand_tx, demand_rx) =
-            tokio::sync::mpsc::channel::<crate::sync::runtime::SyncDemand>(1);
+        let (demand_tx, demand_rx) = crate::sync::sync_demand_channel(1);
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
@@ -224,7 +220,8 @@ async fn branch_switch_awaits_pending_source_and_restarts_expired_candidate() {
                 "expired descriptor is replaced within the original switch"
             );
             let confirmed = authority
-                .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                .query("SELECT value FROM lix_key_value WHERE key='local'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(

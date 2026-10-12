@@ -693,6 +693,69 @@ pub(crate) fn visit_native_row_payload<'a>(
     )
 }
 
+/// Returns the schema fingerprint and exact row frame of a protocol-v69
+/// storage payload when that frame is already in the canonical encoding that
+/// [`encode_native_row_payload_with_identity`] would emit for the decoded row.
+///
+/// `None` means only that the bytes are not provably verbatim-canonical (other
+/// payload versions, invalid wire, unsorted columns, or JSONB numbers that the
+/// decoder re-renders); callers must then fall back to a full decode and
+/// re-encode. The check is allocation-free.
+pub(crate) fn verbatim_canonical_storage_row_frame(bytes: &[u8]) -> Option<([u8; 32], &[u8])> {
+    if bytes.first().copied() != Some(STORAGE_ROW_PAYLOAD_VERSION) {
+        return None;
+    }
+    let schema_fingerprint = visit_native_row_payload_with_validation(
+        bytes,
+        NativePayloadValidation::Verbatim,
+        |_, _| {},
+        |_, _| {},
+    )
+    .ok()?;
+    // Version byte, fingerprint, and the big-endian frame length precede the
+    // row frame; the validator proved the frame ends exactly at the payload end.
+    let row_frame = bytes.get(1 + 32 + 4..)?;
+    Some((schema_fingerprint, row_frame))
+}
+
+/// Feeds the exact bytes [`encode_native_row_payload_with_identity`] emits for
+/// one identity component into `sink`, or returns `false` when that encoder
+/// would reject it.
+pub(crate) fn canonical_identity_key_frame(
+    value: BorrowedNativeValue<'_>,
+    mut sink: impl FnMut(&[u8]),
+) -> bool {
+    match value {
+        BorrowedNativeValue::Text(text) => {
+            if text.len() > MAX_TEXT_BYTES || text.contains('\0') {
+                return false;
+            }
+            sink(&(5 + text.len() as u32).to_be_bytes());
+            sink(&[1]);
+            sink(&(text.len() as u32).to_le_bytes());
+            sink(text.as_bytes());
+        }
+        BorrowedNativeValue::Uuid(value) => {
+            sink(&17_u32.to_be_bytes());
+            sink(&[2]);
+            sink(value.as_bytes());
+        }
+        BorrowedNativeValue::Int8(value) => {
+            sink(&9_u32.to_be_bytes());
+            sink(&[3]);
+            sink(&value.to_be_bytes());
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Version byte and the maximum key count accepted by the self-contained
+/// identity encoding.
+pub(crate) const NATIVE_IDENTITY_PAYLOAD_VERSION: u8 = NATIVE_ROW_PAYLOAD_VERSION;
+pub(crate) const NATIVE_IDENTITY_MAX_KEY_COMPONENTS: usize = MAX_KEY_COMPONENTS as usize;
+pub(crate) const NATIVE_IDENTITY_PAYLOAD_MAX_BYTES: usize = NATIVE_ROW_PAYLOAD_MAX_BYTES;
+
 /// Streams a payload whose full native wire was validated unchanged by
 /// [`ValidatedNativePayload::try_new`]. Schema and storage-envelope binding
 /// remain consumer responsibilities and are intentionally not certified here.
@@ -712,7 +775,18 @@ pub(crate) fn visit_validated_native_row_payload<'a>(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativePayloadValidation {
     Full,
+    /// Full validation that additionally rejects canonical JSONB text whose
+    /// numbers the decoder would re-render. A payload accepted in this mode
+    /// re-encodes byte-for-byte after a decode round trip.
+    Verbatim,
     Certified,
+}
+
+impl NativePayloadValidation {
+    #[inline]
+    fn is_full(self) -> bool {
+        matches!(self, Self::Full | Self::Verbatim)
+    }
 }
 
 fn visit_native_row_payload_with_validation<'a>(
@@ -721,12 +795,12 @@ fn visit_native_row_payload_with_validation<'a>(
     mut visit_key: impl FnMut(usize, BorrowedNativeValue<'a>),
     mut visit_field: impl FnMut(&'a str, BorrowedNativeValue<'a>),
 ) -> Result<[u8; 32], Error> {
-    if validation == NativePayloadValidation::Full && bytes.len() > NATIVE_ROW_PAYLOAD_MAX_BYTES {
+    if validation.is_full() && bytes.len() > NATIVE_ROW_PAYLOAD_MAX_BYTES {
         return Err(Error::Invalid("typed row payload exceeds its size limit"));
     }
     let mut offset = 0usize;
     let version = take_payload_bytes(bytes, &mut offset, 1)?[0];
-    if validation == NativePayloadValidation::Full
+    if validation.is_full()
         && !matches!(
             version,
             NATIVE_ROW_PAYLOAD_VERSION | STORAGE_ROW_PAYLOAD_VERSION
@@ -741,7 +815,7 @@ fn visit_native_row_payload_with_validation<'a>(
         .expect("fixed fingerprint width");
     if version == NATIVE_ROW_PAYLOAD_VERSION {
         let key_count = read_payload_u32(bytes, &mut offset)? as usize;
-        if validation == NativePayloadValidation::Full
+        if validation.is_full()
             && (key_count == 0
                 || key_count > MAX_KEY_COMPONENTS as usize
                 || key_count > bytes.len() / 5)
@@ -754,10 +828,10 @@ fn visit_native_row_payload_with_validation<'a>(
             let frame = take_payload_frame(bytes, &mut offset)?;
             let mut reader = Reader::new(frame);
             let value = reader.borrowed_value_with_validation(validation)?;
-            if validation == NativePayloadValidation::Full {
+            if validation.is_full() {
                 reader.finish()?;
             }
-            if validation == NativePayloadValidation::Full
+            if validation.is_full()
                 && !matches!(
                     value,
                     BorrowedNativeValue::Text(_)
@@ -774,27 +848,25 @@ fn visit_native_row_payload_with_validation<'a>(
     }
 
     let row_frame = take_payload_frame(bytes, &mut offset)?;
-    if validation == NativePayloadValidation::Full && offset != bytes.len() {
+    if validation.is_full() && offset != bytes.len() {
         return Err(Error::Invalid("typed row payload has trailing bytes"));
     }
     let mut reader = Reader::new(row_frame);
     let field_count = reader.u32()?;
-    if validation == NativePayloadValidation::Full && field_count > MAX_COLUMNS {
+    if validation.is_full() && field_count > MAX_COLUMNS {
         return Err(Error::Invalid("typed row has too many columns"));
     }
     let mut previous_name = None;
     for _ in 0..field_count {
         let name = reader.borrowed_text_with_validation(validation)?;
-        if validation == NativePayloadValidation::Full
-            && previous_name.is_some_and(|previous| previous >= name)
-        {
+        if validation.is_full() && previous_name.is_some_and(|previous| previous >= name) {
             return Err(Error::Invalid("typed row contains a duplicate column"));
         }
         let value = reader.borrowed_value_with_validation(validation)?;
         visit_field(name, value);
         previous_name = Some(name);
     }
-    if validation == NativePayloadValidation::Full {
+    if validation.is_full() {
         reader.finish()?;
     }
     Ok(schema_fingerprint)
@@ -1759,7 +1831,7 @@ impl<'a> Reader<'a> {
             4 => {
                 let value =
                     f64::from_be_bytes(self.exact(8)?.try_into().expect("eight-byte float"));
-                if validation == NativePayloadValidation::Full
+                if validation.is_full()
                     && (!value.is_finite() || (value == 0.0 && value.is_sign_negative()))
                 {
                     return Err(Error::Invalid("typed row float8 is not canonical"));
@@ -1768,18 +1840,21 @@ impl<'a> Reader<'a> {
             }
             5 => {
                 let value = self.u8()?;
-                if validation == NativePayloadValidation::Full && value > 1 {
+                if validation.is_full() && value > 1 {
                     return Err(Error::Invalid("typed row boolean is not canonical"));
                 }
                 BorrowedNativeValue::Boolean(value != 0)
             }
             6 => {
                 let length = self.u32()? as usize;
-                if validation == NativePayloadValidation::Full && length > MAX_TEXT_BYTES {
+                if validation.is_full() && length > MAX_TEXT_BYTES {
                     return Err(Error::Invalid("typed row variable value is too large"));
                 }
                 let value = self.exact(length)?;
-                let value = if validation == NativePayloadValidation::Full {
+                let value = if validation == NativePayloadValidation::Verbatim {
+                    lix_schema::validate_verbatim_canonical_json_text(value)
+                        .map_err(|error| Error::Invalid(error.0))?
+                } else if validation.is_full() {
                     lix_schema::validate_canonical_json_text(value)
                         .map_err(|error| Error::Invalid(error.0))?
                 } else {
@@ -1806,13 +1881,13 @@ impl<'a> Reader<'a> {
         validation: NativePayloadValidation,
     ) -> Result<&'a str, Error> {
         let bytes = self.bytes_value_with_validation(validation)?;
-        let value = if validation == NativePayloadValidation::Full {
+        let value = if validation.is_full() {
             std::str::from_utf8(bytes).map_err(|_| Error::Invalid("typed row text is not UTF-8"))?
         } else {
             // SAFETY: `ValidatedNativePayload` proves this exact framed text.
             unsafe { std::str::from_utf8_unchecked(bytes) }
         };
-        if validation == NativePayloadValidation::Full && value.contains('\0') {
+        if validation.is_full() && value.contains('\0') {
             return Err(Error::Invalid("typed row text contains an interior NUL"));
         }
         Ok(value)
@@ -1832,7 +1907,7 @@ impl<'a> Reader<'a> {
         validation: NativePayloadValidation,
     ) -> Result<&'a [u8], Error> {
         let length = self.u32()? as usize;
-        if validation == NativePayloadValidation::Full && length > MAX_TEXT_BYTES {
+        if validation.is_full() && length > MAX_TEXT_BYTES {
             return Err(Error::Invalid("typed row variable value is too large"));
         }
         Ok(self.exact(length)?)

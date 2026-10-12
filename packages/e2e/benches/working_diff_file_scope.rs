@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use lix::Value;
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Value};
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 use lix_storage_slatedb::SlateDB;
@@ -164,7 +164,7 @@ async fn run<StorageImpl>(
     seed_rows(&session, &file_ids, rows_per_file).await;
 
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .expect("create working-diff file-scope checkpoint");
 
@@ -198,10 +198,7 @@ async fn run<StorageImpl>(
 
     let probe_file = file_ids[0].clone();
     let checkpoint = session
-        .execute(
-            "SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
-            &[],
-        )
+        .query("SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()").all()
         .await
         .expect("load benchmark checkpoint")
         .rows()[0]
@@ -310,7 +307,9 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(sql, params)
+        .query(sql)
+        .params(params)
+        .all()
         .await
         .expect("working-diff query should succeed")
         .len()
@@ -333,8 +332,8 @@ where
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
         )
+        .params(&[Value::Text(schema.to_string())])
         .await
         .expect("register working-diff file-scope schema");
 }
@@ -343,7 +342,7 @@ async fn seed_files<StorageImpl>(session: &Lix<StorageImpl>, file_ids: &[String]
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut transaction = session
+    let transaction = session
         .begin_transaction()
         .await
         .expect("begin file seed transaction");
@@ -368,7 +367,8 @@ where
             params.push(Value::Text("seed".to_string()));
         }
         transaction
-            .execute(&sql, &params)
+            .execute(&sql)
+            .params(&params)
             .await
             .expect("seed working-diff file-scope files");
     }
@@ -386,7 +386,7 @@ async fn seed_rows<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     for (file_index, file) in file_ids.iter().enumerate() {
-        let mut transaction = session
+        let transaction = session
             .begin_transaction()
             .await
             .expect("begin row seed transaction");
@@ -412,7 +412,8 @@ async fn seed_rows<StorageImpl>(
                 params.push(Value::Text(file.clone()));
             }
             transaction
-                .execute(&sql, &params)
+                .execute(&sql)
+                .params(&params)
                 .await
                 .expect("seed working-diff file-scope rows");
         }
@@ -434,21 +435,17 @@ async fn dirty_rows<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut pending: Vec<ExecuteBatchStatement> = Vec::with_capacity(changes_per_commit);
+    let mut pending: Vec<[Value; 2]> = Vec::with_capacity(changes_per_commit);
     for (file_index, count) in plan {
         assert!(
             *count <= rows_per_file,
             "cannot dirty {count} rows in a file seeded with {rows_per_file}"
         );
         for row_index in 0..*count {
-            pending.push(ExecuteBatchStatement {
-                label: None,
-                sql: format!("UPDATE {SCHEMA_KEY} SET value = $1 WHERE id = $2"),
-                params: vec![
-                    Value::Text("dirty".to_string()),
-                    Value::Text(row_id(*file_index, row_index)),
-                ],
-            });
+            pending.push([
+                Value::Text("dirty".to_string()),
+                Value::Text(row_id(*file_index, row_index)),
+            ]);
             if pending.len() >= changes_per_commit {
                 flush(session, &mut pending).await;
             }
@@ -457,23 +454,25 @@ async fn dirty_rows<StorageImpl>(
     flush(session, &mut pending).await;
 }
 
-async fn flush<StorageImpl>(session: &Lix<StorageImpl>, pending: &mut Vec<ExecuteBatchStatement>)
+async fn flush<StorageImpl>(session: &Lix<StorageImpl>, pending: &mut Vec<[Value; 2]>)
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if pending.is_empty() {
         return;
     }
-    let results = session
-        .execute_batch(pending)
+    let expected = pending.len();
+    let affected = session
+        .execute_many(
+            &format!("UPDATE {SCHEMA_KEY} SET value = $1 WHERE id = $2"),
+            pending.drain(..),
+        )
         .await
-        .expect("dirty working-diff rows")
-        .results;
-    assert!(
-        results.iter().all(|result| result.rows_affected() == 1),
+        .expect("dirty working-diff rows");
+    assert_eq!(
+        affected as usize, expected,
         "every dirtying update must affect exactly one row"
     );
-    pending.clear();
 }
 
 fn file_id(index: usize) -> String {

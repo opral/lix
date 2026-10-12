@@ -59,7 +59,15 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_TABLE_NOT_FOUND` | A SQL table or view name could not be resolved. |
 | `LIX_COLUMN_NOT_FOUND` | A SQL column name could not be resolved in the available projection. |
 | `LIX_CONSTRAINT_VIOLATION` | A SQL write violated a primary-key, unique, NOT NULL, or other relational constraint. |
-| `LIX_ERROR_READ_ONLY` | A SQL write targeted a read-only internal/component surface. |
+| `LIX_ERROR_READ_ONLY` | A statement that writes (or calls a durable function such as `lix_create_checkpoint()`) ran through a read API (`query()`, `queryOne()`, `stream()`, a snapshot), or a SQL write targeted a read-only internal/component surface. Run writes with `execute()`. |
+| `LIX_ERROR_RESULT_TOO_LARGE` | A buffered result (`query()` rows, `execute()` rows, a buffered stream's first page) exceeded its byte cap (`max_bytes`, JS `maxBytes`; 64 MiB of result memory by default). Nothing was returned; a write whose `RETURNING` rows exceed it did not commit. `details.maxBytes` is the cap. |
+| `LIX_ERROR_NOT_UNIQUE` | `one()`/`optional()` (JS `queryOne()`) found more than one row. |
+| `LIX_ERROR_NO_ROWS` | Rust `one()` found no row. Use `optional()` when the row may be absent. |
+| `LIX_ERROR_AMBIGUOUS_COLUMN` | A result has two columns with the same name, so rows cannot be keyed by name. Alias the columns. |
+| `LIX_ERROR_SNAPSHOT_CLOSED` | A read used a snapshot after it closed, or the snapshot closed while the read ran. |
+| `LIX_ERROR_CANCELLED` | The caller cancelled a read (JS: aborted its signal, or closed its snapshot or Lix). The engine stopped the work. |
+| `LIX_ERROR_QUERY_STREAM_LOST` | A stream pull named a stream the worker no longer holds (its owner was replaced or it was released). Start a new stream. |
+| `LIX_ERROR_SYNC_TRANSPORT_STALLED` | A hydration demand's transport made no progress for 60 seconds. `details.retryable` is `true`; the read did not observe partial state. |
 | `LIX_UNSUPPORTED_SQL` | SQL syntax is valid, but the feature is intentionally outside the Lix SQL surface. |
 | `LIX_UNSUPPORTED_SQL_RUNTIME_PLAN` | SQL planning succeeded far enough to produce a physical runtime shape that the current engine target cannot execute safely. |
 | `LIX_STORAGE_ERROR` | Storage I/O failed. |
@@ -121,7 +129,9 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_DIALECT_UNSUPPORTED` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_DIFF_HOT_UNAVAILABLE` | [packages/lix/src/sql2/providers/diff.rs](../packages/lix/src/sql2/providers/diff.rs) |
 | `LIX_ERROR_ALREADY_INITIALIZED` | [packages/lix/src/engine.rs](../packages/lix/src/engine.rs) |
+| `LIX_ERROR_AMBIGUOUS_COLUMN` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_CACHE_CLEANUP` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
+| `LIX_ERROR_CANCELLED` | [packages/js-bindings/wasm.rs](../packages/js-bindings/wasm.rs) |
 | `LIX_ERROR_CAPACITY` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_CLOSED` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_FILE_NOT_FOUND` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
@@ -137,6 +147,8 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_MIGRATION_LIMIT_EXCEEDED` | [packages/lix/src/hot_state/tracked_head/hot.rs](../packages/lix/src/hot_state/tracked_head/hot.rs) |
 | `LIX_ERROR_MIGRATION_SCHEMA_INCOMPATIBLE` | [packages/lix/src/migration/api.rs](../packages/lix/src/migration/api.rs) |
 | `LIX_ERROR_NOT_INITIALIZED` | [packages/lix/src/engine.rs](../packages/lix/src/engine.rs) |
+| `LIX_ERROR_NOT_UNIQUE` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
+| `LIX_ERROR_NO_ROWS` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_PATH_DOT_SEGMENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |
 | `LIX_ERROR_PATH_EMPTY_SEGMENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |
 | `LIX_ERROR_PATH_INVALID_DIRECTORY_PARENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |
@@ -156,15 +168,19 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_PROTOCOL_SESSION_INVALID` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_PROTOCOL_SESSION_REQUIRED` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_PROTOCOL_SNAPSHOT_CAPACITY` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
+| `LIX_ERROR_QUERY_STREAM_LOST` | [packages/js-sdk/src/worker/repository-session.ts](../packages/js-sdk/src/worker/repository-session.ts) |
+| `LIX_ERROR_QUERY_STREAM_NEXT_IN_FLIGHT` | [packages/js-bindings/wasm.rs](../packages/js-bindings/wasm.rs) |
 | `LIX_ERROR_READ_ONLY` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_RECOVERING` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_REPLICA_REPLACEMENT_UNAVAILABLE` | [packages/lix/src/sync/repository.rs](../packages/lix/src/sync/repository.rs) |
-| `LIX_ERROR_REPOSITORY_UPGRADE` | [packages/lix/src/migration/epoch.rs](../packages/lix/src/migration/epoch.rs) |
 | `LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED` | [packages/lix/src/init.rs](../packages/lix/src/init.rs) |
+| `LIX_ERROR_REPOSITORY_UPGRADE` | [packages/lix/src/migration/epoch.rs](../packages/lix/src/migration/epoch.rs) |
 | `LIX_ERROR_REQUEST_BODY_TOO_LARGE` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
+| `LIX_ERROR_RESULT_TOO_LARGE` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_SCHEMA_DEFINITION` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_SCHEMA_VALIDATION` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_SHUTTING_DOWN` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
+| `LIX_ERROR_SNAPSHOT_CLOSED` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_SYNC_CAS_NOT_FOUND` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_SYNC_DEMAND_STALLED` | [packages/lix/src/sync/runtime.rs](../packages/lix/src/sync/runtime.rs) |
 | `LIX_ERROR_SYNC_ITEM_TOO_LARGE` | [packages/lix/src/observe_invalidation.rs](../packages/lix/src/observe_invalidation.rs) |
@@ -172,6 +188,7 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_SYNC_RESPONSE_TOO_LARGE` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE` | [packages/lix/src/sync/runtime.rs](../packages/lix/src/sync/runtime.rs) |
 | `LIX_ERROR_SYNC_TRANSPORT` | [packages/lix/src/sync/http.rs](../packages/lix/src/sync/http.rs) |
+| `LIX_ERROR_SYNC_TRANSPORT_STALLED` | [packages/lix/src/sync/runtime.rs](../packages/lix/src/sync/runtime.rs) |
 | `LIX_ERROR_SYNC_WRITE_REJECTED` | [packages/lix/src/sync/runtime.rs](../packages/lix/src/sync/runtime.rs) |
 | `LIX_ERROR_TIMEOUT` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_UNAUTHENTICATED` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |

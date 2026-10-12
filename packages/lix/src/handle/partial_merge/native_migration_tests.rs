@@ -10,10 +10,8 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
         .unwrap();
     let schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"migration_unique_probe","columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],"primary_key":["id"],"unique":[["value"]]});
     authority
-        .execute(
-            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
         .await
         .unwrap();
     let branch = authority
@@ -37,17 +35,11 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
         .head
         .commit_id;
     authority
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')")
         .await
         .unwrap();
     source
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('local','same')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('local','same')")
         .await
         .unwrap();
     let remote = authority.partial_replica_descriptor(None).await.unwrap();
@@ -110,10 +102,8 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
         .unwrap();
     let schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"migration_unique_probe","columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],"primary_key":["id"],"unique":[["value"]]});
     authority
-        .execute(
-            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
         .await
         .unwrap();
     let branch = authority
@@ -137,17 +127,11 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
         .head
         .commit_id;
     authority
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')")
         .await
         .unwrap();
     source
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('local','different')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('local','different')")
         .await
         .unwrap();
     let remote = authority.partial_replica_descriptor(None).await.unwrap();
@@ -180,19 +164,15 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
         .await
         .unwrap();
     let rows = authority
-        .execute(
-            "SELECT id FROM migration_unique_probe WHERE value='different'",
-            &[],
-        )
+        .query("SELECT id FROM migration_unique_probe WHERE value='different'")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.rows().len(), 1);
     assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "local");
     let remote_rows = authority
-        .execute(
-            "SELECT id FROM migration_unique_probe WHERE value='same'",
-            &[],
-        )
+        .query("SELECT id FROM migration_unique_probe WHERE value='same'")
+        .all()
         .await
         .unwrap();
     assert_eq!(remote_rows.rows().len(), 1);
@@ -338,15 +318,13 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
     let child = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"migration_fk_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"migration_fk_parent","columns":["id"]}}]});
     for schema in [parent, child] {
         authority
-            .execute(
-                "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-                &[Value::Text(schema.to_string())],
-            )
+            .execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+            .params(&[Value::Text(schema.to_string())])
             .await
             .unwrap();
     }
     authority
-        .execute("INSERT INTO migration_fk_parent(id) VALUES('parent')", &[])
+        .execute("INSERT INTO migration_fk_parent(id) VALUES('parent')")
         .await
         .unwrap();
     let branch = authority
@@ -370,14 +348,11 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
         .head
         .commit_id;
     authority
-        .execute(
-            "INSERT INTO migration_fk_child(id,parent_id) VALUES('child','parent')",
-            &[],
-        )
+        .execute("INSERT INTO migration_fk_child(id,parent_id) VALUES('child','parent')")
         .await
         .unwrap();
     source
-        .execute("DELETE FROM migration_fk_parent WHERE id='parent'", &[])
+        .execute("DELETE FROM migration_fk_parent WHERE id='parent'")
         .await
         .unwrap();
     let remote = authority.partial_replica_descriptor(None).await.unwrap();
@@ -552,10 +527,8 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
         .unwrap();
     let schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"migration_unique_probe","columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],"primary_key":["id"],"unique":[["value"]]});
     authority
-        .execute(
-            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))")
+        .params(&[Value::Text(schema.to_string())])
         .await
         .unwrap();
     let branch = authority
@@ -579,17 +552,11 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
         .head
         .commit_id;
     authority
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('remote','same')")
         .await
         .unwrap();
     source
-        .execute(
-            "INSERT INTO migration_unique_probe(id,value) VALUES('local','different')",
-            &[],
-        )
+        .execute("INSERT INTO migration_unique_probe(id,value) VALUES('local','different')")
         .await
         .unwrap();
     let remote = authority.partial_replica_descriptor(None).await.unwrap();
@@ -622,19 +589,15 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
         .await
         .unwrap();
     let rows = authority
-        .execute(
-            "SELECT id FROM migration_unique_probe WHERE value='different'",
-            &[],
-        )
+        .query("SELECT id FROM migration_unique_probe WHERE value='different'")
+        .all()
         .await
         .unwrap();
     assert_eq!(rows.rows().len(), 1);
     assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "local");
     let remote_rows = authority
-        .execute(
-            "SELECT id FROM migration_unique_probe WHERE value='same'",
-            &[],
-        )
+        .query("SELECT id FROM migration_unique_probe WHERE value='same'")
+        .all()
         .await
         .unwrap();
     assert_eq!(remote_rows.rows().len(), 1);
@@ -671,8 +634,13 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
                 ref_updates: vec![crate::sync::SyncRefUpdate {
                     branch_id: branch.id.clone(),
                     author_id: Some(source_before.selected_branch.author_id.clone()),
-                    ref_change_id: Some(crate::changelog::ChangeId::for_test_label("partial-migration-target-ref").to_string()),
-                    expected_ref_change_id: Some(source_before.selected_branch.ref_change_id.clone()),
+                    ref_change_id: Some(
+                        crate::changelog::ChangeId::for_test_label("partial-migration-target-ref")
+                            .to_string(),
+                    ),
+                    expected_ref_change_id: Some(
+                        source_before.selected_branch.ref_change_id.clone(),
+                    ),
                     expected_head_commit_id: Some(local.clone()),
                     expected_checkpoint_commit_id: Some(
                         source_before.selected_branch.checkpoint.commit_id,
@@ -704,10 +672,7 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
     .unwrap();
     drop(read);
     authority
-        .execute(
-            "UPDATE migration_unique_probe SET value='new-remote' WHERE id='remote'",
-            &[],
-        )
+        .execute("UPDATE migration_unique_probe SET value='new-remote' WHERE id='remote'")
         .await
         .unwrap();
     let mut writes = adapter.new_write_set();

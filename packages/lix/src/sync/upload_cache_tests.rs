@@ -2,7 +2,8 @@
 // real durable receipts, local writes, and authoritative ref publication.
 
 async fn upload_cache_head(lix: &Lix<Memory>) -> String {
-    lix.execute("SELECT lix_active_branch_commit_id() AS head", &[])
+    lix.query("SELECT lix_active_branch_commit_id() AS head")
+        .all()
         .await
         .expect("head query")
         .rows()[0]
@@ -25,7 +26,7 @@ async fn cached_upload_sql_checkpoint_before_first_page_preserves_source_order()
             "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         } else {
             "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='checkpoint-first-a'))"
-        }, &[]).await.unwrap();
+        }).await.unwrap();
         let target = upload_cache_head(&replica).await;
         let mut cache = None;
         let mut uploaded = BTreeSet::new();
@@ -94,7 +95,7 @@ async fn legacy_checkpoint_known_wire_import_is_independent_of_local_nomination(
         } else {
             "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         };
-        let checkpoint = authority.execute(sql, &[]).await.unwrap().rows()[0]
+        let checkpoint = authority.execute(sql).await.unwrap().rows()[0]
             .get::<String>("commit_id")
             .unwrap();
         let other = open_lix()
@@ -152,7 +153,7 @@ async fn snapshot_omitted_source_survives_gc_then_hydrates_normal_history() {
         "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='omitted-source'))",
     ] {
         let authority = open_lix().await.unwrap();
-        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('omitted-source','preserved'),('omitted-other','retained')", &[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('omitted-source','preserved'),('omitted-other','retained')").await.unwrap();
         let source = upload_cache_head(&authority).await;
         let source_body = export_sync_commit(&authority, &source)
             .await
@@ -165,7 +166,7 @@ async fn snapshot_omitted_source_survives_gc_then_hydrates_normal_history() {
                 ChangeId::parse_lix(&member.change_id, "snapshot authored change").unwrap()
             })
             .collect::<Vec<_>>();
-        authority.execute(sql, &[]).await.unwrap();
+        authority.execute(sql).await.unwrap();
         let head = upload_cache_head(&authority).await;
         let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
         let replica = replica_from_snapshot(&authority, &snapshot).await;
@@ -378,13 +379,13 @@ async fn materialized_legacy_alias_is_shared_by_incorporation_and_cycle_proofs()
 async fn authority_rejects_complete_source_cycle_through_existing_deferred_checkpoint() {
     let authority = open_lix().await.unwrap();
     write_key_value(&authority, "cycle-native", "unchanged").await;
-    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))").await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     let mut body = export_sync_commit(&authority, &checkpoint)
         .await
         .unwrap()
         .unwrap();
     let source = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
@@ -499,7 +500,7 @@ async fn checkpoint_source_certificate_preserves_recreated_row_lifetimes() {
             write_key_value(&authority, "recreated", "base").await;
             if deleted_base {
                 authority
-                    .execute("DELETE FROM lix_key_value WHERE key='recreated'", &[])
+                    .execute("DELETE FROM lix_key_value WHERE key='recreated'")
                     .await
                     .unwrap();
             }
@@ -508,7 +509,7 @@ async fn checkpoint_source_certificate_preserves_recreated_row_lifetimes() {
             let replica = replica_from_snapshot(&authority, &snapshot).await;
             if !deleted_base {
                 replica
-                    .execute("DELETE FROM lix_key_value WHERE key='recreated'", &[])
+                    .execute("DELETE FROM lix_key_value WHERE key='recreated'")
                     .await
                     .unwrap();
             }
@@ -517,17 +518,14 @@ async fn checkpoint_source_certificate_preserves_recreated_row_lifetimes() {
             write_key_value(&replica, "unselected-lifetime", "working").await;
             write_key_value(&replica, "transient-before-checkpoint", "temporary").await;
             replica
-                .execute(
-                    "DELETE FROM lix_key_value WHERE key='transient-before-checkpoint'",
-                    &[],
-                )
+                .execute("DELETE FROM lix_key_value WHERE key='transient-before-checkpoint'")
                 .await
                 .unwrap();
             replica.execute(if full {
                 "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
             } else {
                 "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='recreated'))"
-            }, &[]).await.unwrap();
+            }).await.unwrap();
             let target = upload_cache_head(&replica).await;
             let mut cache = None;
             for _ in 0..32 {
@@ -712,7 +710,7 @@ async fn cached_upload_checkpoint_midwave_survives_gc_and_keeps_generation() {
         let generation = cache.as_ref().unwrap().plan.generation();
         replica.execute(if scoped {
             "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
-        } else { "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)" }, &[])
+        } else { "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)" })
             .await.expect("checkpoint while body upload is in flight");
         let checkpoint_head = upload_cache_head(&replica).await;
         assert_ne!(checkpoint_head, captured_head);
@@ -925,10 +923,8 @@ async fn cached_upload_deleted_and_recreated_branch_cannot_publish_old_intent() 
     frontier_apply_upload(&authority, &replica, &first).await;
     cache.as_mut().unwrap().acknowledge().unwrap();
     replica
-        .execute(
-            "DELETE FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch.id.clone())],
-        )
+        .execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch.id.clone())])
         .await
         .expect("delete captured branch");
     replica
@@ -996,13 +992,11 @@ async fn cached_upload_multiple_branch_deletes_share_one_atomic_generation() {
     frontier_apply_upload(&authority, &replica, &first).await;
     cache.as_mut().unwrap().acknowledge().unwrap();
     replica
-        .execute(
-            "DELETE FROM lix_branch WHERE id IN ($1, $2)",
-            &[
-                Value::Text(branches[0].clone()),
-                Value::Text(branches[1].clone()),
-            ],
-        )
+        .execute("DELETE FROM lix_branch WHERE id IN ($1, $2)")
+        .params(&[
+            Value::Text(branches[0].clone()),
+            Value::Text(branches[1].clone()),
+        ])
         .await
         .expect("multiple branch deletions share one generation key");
     let request = replica
@@ -1023,13 +1017,12 @@ async fn cached_upload_multiple_branch_deletes_share_one_atomic_generation() {
     cache.as_mut().unwrap().acknowledge().unwrap();
     assert!(
         authority
-            .execute(
-                "SELECT id FROM lix_branch WHERE id IN ($1, $2)",
-                &[
-                    Value::Text(branches[0].clone()),
-                    Value::Text(branches[1].clone())
-                ],
-            )
+            .query("SELECT id FROM lix_branch WHERE id IN ($1, $2)")
+            .params(&[
+                Value::Text(branches[0].clone()),
+                Value::Text(branches[1].clone())
+            ])
+            .all()
             .await
             .unwrap()
             .rows()
@@ -1056,10 +1049,8 @@ async fn cached_upload_recreated_branch_invalidates_an_already_captured_deletion
     }
     let replacement_head = upload_cache_head(&replica).await;
     replica
-        .execute(
-            "DELETE FROM lix_branch WHERE id = $1",
-            &[Value::Text(branch.id.clone())],
-        )
+        .execute("DELETE FROM lix_branch WHERE id = $1")
+        .params(&[Value::Text(branch.id.clone())])
         .await
         .expect("delete an authority-known branch before capturing the wave");
     let mut cache = None;
@@ -1124,13 +1115,12 @@ async fn cached_upload_recreated_branch_invalidates_an_already_captured_deletion
     assert!(rebuilt && published_replacement);
     for lix in [&authority, &replica] {
         assert_eq!(
-            lix.execute(
-                "SELECT name FROM lix_branch WHERE id = $1",
-                &[Value::Text(branch.id.clone())]
-            )
-            .await
-            .unwrap()
-            .rows()[0]
+            lix.query("SELECT name FROM lix_branch WHERE id = $1")
+                .params(&[Value::Text(branch.id.clone())])
+                .all()
+                .await
+                .unwrap()
+                .rows()[0]
                 .get::<String>("name")
                 .unwrap(),
             "recreated-during-upload"

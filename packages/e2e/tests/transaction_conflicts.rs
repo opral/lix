@@ -24,51 +24,44 @@ async fn workspace() -> Lix {
         archive.start_file(path, options).unwrap();
         archive.write_all(content).unwrap();
     }
-    lix.execute(
-        "INSERT INTO lix_file(path,content) VALUES($1,$2)",
-        &[
+    lix.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)")
+        .params(&[
             Value::Text("/.lix/plugins/plugin_markdown.lixplugin".into()),
             Value::Blob(archive.finish().unwrap().into_inner().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     lix
 }
 
 async fn insert_file(lix: &Lix, path: &str, content: &str) -> String {
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, $2) RETURNING id",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2) RETURNING id")
+        .params(&[
             Value::Text(path.into()),
             Value::Blob(content.as_bytes().to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap()
-    .rows()[0]
+        ])
+        .await
+        .unwrap()
+        .rows()[0]
         .get("id")
         .unwrap()
 }
 
 async fn write_file(lix: &Lix, id: &str, content: &str) {
-    lix.execute(
-        "UPDATE lix_file SET content = $2 WHERE id = $1",
-        &[
+    lix.execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
             Value::Text(id.into()),
             Value::Blob(content.as_bytes().to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
 }
 
 async fn file_text(lix: &Lix, id: &str) -> String {
     let bytes: Vec<u8> = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE id = $1",
-            &[Value::Text(id.into())],
-        )
+        .query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(id.into())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -78,13 +71,12 @@ async fn file_text(lix: &Lix, id: &str) -> String {
 }
 
 async fn node_count(lix: &Lix, file_id: &str) -> i64 {
-    lix.execute(
-        "SELECT count(*) AS n FROM markdown_node WHERE lixcol_file_id = $1",
-        &[Value::Text(file_id.into())],
-    )
-    .await
-    .unwrap()
-    .rows()[0]
+    lix.query("SELECT count(*) AS n FROM markdown_node WHERE lixcol_file_id = $1")
+        .params(&[Value::Text(file_id.into())])
+        .all()
+        .await
+        .unwrap()
+        .rows()[0]
         .get("n")
         .unwrap()
 }
@@ -94,16 +86,14 @@ async fn markdown_write_conflicts_with_a_concurrent_write_to_other_blocks_of_the
     let lix = workspace().await;
     let file = insert_file(&lix, "/doc.md", "# Title\n\nFirst.\n\nSecond.\n").await;
 
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "UPDATE lix_file SET content = $2 WHERE id = $1",
-        &[
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
             Value::Text(file.clone()),
             Value::Blob(b"# Title\n\nFirst, edited.\n\nSecond.\n".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     // The concurrent edit touches a different paragraph; the plugin still
     // re-derived the whole file from stale content in the transaction.
     write_file(&lix, &file, "# Title\n\nFirst.\n\nSecond, concurrent.\n").await;
@@ -138,26 +128,22 @@ async fn markdown_writes_to_different_files_rebase_onto_each_other() {
     let b = insert_file(&lix, "/b.md", "# B\n\nOne.\n").await;
     let other = lix.open_another_session().await.unwrap();
 
-    let mut first = lix.begin_transaction().await.unwrap();
-    let mut second = other.begin_transaction().await.unwrap();
+    let first = lix.begin_transaction().await.unwrap();
+    let second = other.begin_transaction().await.unwrap();
     first
-        .execute(
-            "UPDATE lix_file SET content = $2 WHERE id = $1",
-            &[
-                Value::Text(a.clone()),
-                Value::Blob(b"# A\n\nOne.\n\nTwo.\n".to_vec().into()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
+            Value::Text(a.clone()),
+            Value::Blob(b"# A\n\nOne.\n\nTwo.\n".to_vec().into()),
+        ])
         .await
         .unwrap();
     second
-        .execute(
-            "UPDATE lix_file SET content = $2 WHERE id = $1",
-            &[
-                Value::Text(b.clone()),
-                Value::Blob(b"# B\n\nOne, edited.\n".to_vec().into()),
-            ],
-        )
+        .execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
+            Value::Text(b.clone()),
+            Value::Blob(b"# B\n\nOne, edited.\n".to_vec().into()),
+        ])
         .await
         .unwrap();
     first.commit().await.unwrap();
@@ -184,48 +170,35 @@ async fn markdown_writes_to_different_files_rebase_onto_each_other() {
 async fn markdown_write_and_dependent_row_update_rebase_over_unrelated_writes() {
     let lix = workspace().await;
     let file = insert_file(&lix, "/doc.md", "# Doc\n\nBody.\n").await;
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('doc-target', 'old')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('doc-target', 'old')")
+        .await
+        .unwrap();
 
     // Atelier's shape: save a file and retarget rows that depend on it in
     // one transaction while unrelated writes (a reply, a pasted image, an
     // edit of another document) land concurrently.
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "UPDATE lix_file SET content = $2 WHERE id = $1",
-        &[
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
             Value::Text(file.clone()),
             Value::Blob(b"# Doc\n\nBody, saved.\n".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
-    tx.execute(
-        "UPDATE lix_key_value SET value = 'new' WHERE key = 'doc-target'",
-        &[],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('reply', 'hi')",
-        &[],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
+    tx.execute("UPDATE lix_key_value SET value = 'new' WHERE key = 'doc-target'")
+        .await
+        .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('reply', 'hi')")
+        .await
+        .unwrap();
     insert_file(&lix, "/image.png", "png").await;
     insert_file(&lix, "/other.md", "# Other\n").await;
 
     tx.commit().await.unwrap();
     assert_eq!(file_text(&lix, &file).await, "# Doc\n\nBody, saved.\n");
     let target: serde_json::Value = lix
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'doc-target'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'doc-target'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -236,10 +209,9 @@ async fn markdown_write_and_dependent_row_update_rebase_over_unrelated_writes() 
 
 async fn read_path(lix: &Lix, path: &str) -> String {
     let bytes: Vec<u8> = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = $1",
-            &[Value::Text(path.into())],
-        )
+        .query("SELECT content FROM lix_file WHERE path = $1")
+        .params(&[Value::Text(path.into())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -249,15 +221,13 @@ async fn read_path(lix: &Lix, path: &str) -> String {
 }
 
 async fn write_path(lix: &Lix, path: &str, content: &str) -> Result<(), LixError> {
-    lix.execute(
-        "UPDATE lix_file SET content = $2 WHERE path = $1",
-        &[
+    lix.execute("UPDATE lix_file SET content = $2 WHERE path = $1")
+        .params(&[
             Value::Text(path.into()),
             Value::Blob(content.as_bytes().to_vec().into()),
-        ],
-    )
-    .await
-    .map(|_| ())
+        ])
+        .await
+        .map(|_| ())
 }
 
 /// #1904 repro 1: bytes read inside an explicit transaction are the base for
@@ -277,9 +247,10 @@ async fn transaction_read_is_the_base_for_its_markdown_write() {
         .replace("Bravo 1.", "Bravo 2.");
     write_path(&b, "/doc.md", &text).await.unwrap();
 
-    let mut tx = a.begin_transaction().await.unwrap();
+    let tx = a.begin_transaction().await.unwrap();
     let bytes: Vec<u8> = tx
-        .execute("SELECT content FROM lix_file WHERE path = '/doc.md'", &[])
+        .query("SELECT content FROM lix_file WHERE path = '/doc.md'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -288,12 +259,10 @@ async fn transaction_read_is_the_base_for_its_markdown_write() {
     let text = String::from_utf8(bytes)
         .unwrap()
         .replace("Alpha.", "Alpha A.");
-    tx.execute(
-        "UPDATE lix_file SET content = $1 WHERE path = '/doc.md'",
-        &[Value::Blob(text.into_bytes().into())],
-    )
-    .await
-    .expect("the transaction's own read must be a valid plugin base");
+    tx.execute("UPDATE lix_file SET content = $1 WHERE path = '/doc.md'")
+        .params(&[Value::Blob(text.into_bytes().into())])
+        .await
+        .expect("the transaction's own read must be a valid plugin base");
     tx.commit().await.unwrap();
 
     assert_eq!(
@@ -317,13 +286,11 @@ async fn autocommit_markdown_write_replays_after_a_concurrent_commit_of_the_same
         let a_text = replace_line(&a_text, "Alpha", &format!("Alpha {round}."));
         let b_text = read_path(&b, "/doc.md").await;
         let b_text = replace_line(&b_text, "Bravo", &format!("Bravo {round}."));
-        let mut tx = a.begin_transaction().await.unwrap();
-        tx.execute(
-            "UPDATE lix_file SET content = $1 WHERE path = '/doc.md'",
-            &[Value::Blob(a_text.into_bytes().into())],
-        )
-        .await
-        .unwrap();
+        let tx = a.begin_transaction().await.unwrap();
+        tx.execute("UPDATE lix_file SET content = $1 WHERE path = '/doc.md'")
+            .params(&[Value::Blob(a_text.into_bytes().into())])
+            .await
+            .unwrap();
         let (a_commit, b_write) = tokio::join!(tx.commit(), write_path(&b, "/doc.md", &b_text));
         b_write.unwrap_or_else(|error| panic!("round {round}: b's write was lost: {error:?}"));
         let content = read_path(&a, "/doc.md").await;
@@ -365,11 +332,12 @@ const REPLY: &str = "01950000-0000-7000-8000-00000000c102";
 const REPLY_BODY: &str = r#"{"_type":"zettel_doc","blocks":[{"_type":"zettel_block","_key":"p1","style":"normal","markDefs":[],"children":[{"_type":"zettel_span","_key":"s1","text":"reply","marks":[]}]}]}"#;
 
 async fn first_paragraph_node(lix: &Lix, file_id: &str) -> String {
-    lix.execute(
+    lix.query(
         "SELECT id FROM markdown_node WHERE lixcol_file_id = $1 AND kind = 'paragraph' \
          ORDER BY order_key LIMIT 1",
-        &[Value::Text(file_id.into())],
     )
+    .params(&[Value::Text(file_id.into())])
+    .all()
     .await
     .unwrap()
     .rows()[0]
@@ -387,39 +355,37 @@ async fn markdown_save_and_conversation_retarget_commit_after_a_concurrent_reply
     let block = first_paragraph_node(&lix, &file).await;
     lix.execute(
         "INSERT INTO lix_conversation (id, target) VALUES ($1, lix_row_ref('lix_file', NULL, $2))",
-        &[Value::Text(CONVERSATION.into()), Value::Text(file.clone())],
     )
+    .params(&[Value::Text(CONVERSATION.into()), Value::Text(file.clone())])
     .await
     .unwrap();
 
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "UPDATE lix_file SET content = $2 WHERE id = $1",
-        &[
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.execute("UPDATE lix_file SET content = $2 WHERE id = $1")
+        .params(&[
             Value::Text(file.clone()),
             Value::Blob(b"# Doc\n\nBody, saved.\n".to_vec().into()),
-        ],
-    )
-    .await
-    .unwrap();
+        ])
+        .await
+        .unwrap();
     tx.execute(
         "UPDATE lix_conversation SET target = lix_row_ref('markdown_node', $2, $3) WHERE id = $1",
-        &[
-            Value::Text(CONVERSATION.into()),
-            Value::Text(file.clone()),
-            Value::Text(block.clone()),
-        ],
     )
+    .params(&[
+        Value::Text(CONVERSATION.into()),
+        Value::Text(file.clone()),
+        Value::Text(block.clone()),
+    ])
     .await
     .unwrap();
     lix.execute(
         "INSERT INTO lix_comment (id, conversation_id, body) VALUES ($1, $2, CAST($3 AS JSONB))",
-        &[
-            Value::Text(REPLY.into()),
-            Value::Text(CONVERSATION.into()),
-            Value::Text(REPLY_BODY.into()),
-        ],
     )
+    .params(&[
+        Value::Text(REPLY.into()),
+        Value::Text(CONVERSATION.into()),
+        Value::Text(REPLY_BODY.into()),
+    ])
     .await
     .unwrap();
     insert_file(&lix, "/image.png", "png").await;
@@ -428,23 +394,23 @@ async fn markdown_save_and_conversation_retarget_commit_after_a_concurrent_reply
     tx.commit().await.unwrap();
     assert_eq!(file_text(&lix, &file).await, "# Doc\n\nBody, saved.\n");
     let retargeted = lix
-        .execute(
+        .query(
             "SELECT CAST(target AS TEXT) = CAST(lix_row_ref('markdown_node', $2, $3) AS TEXT) \
              AS retargeted FROM lix_conversation WHERE id = $1",
-            &[
-                Value::Text(CONVERSATION.into()),
-                Value::Text(file.clone()),
-                Value::Text(block.clone()),
-            ],
         )
+        .params(&[
+            Value::Text(CONVERSATION.into()),
+            Value::Text(file.clone()),
+            Value::Text(block.clone()),
+        ])
+        .all()
         .await
         .unwrap();
     assert!(retargeted.rows()[0].get::<bool>("retargeted").unwrap());
     let replies = lix
-        .execute(
-            "SELECT id FROM lix_comment WHERE conversation_id = $1",
-            &[Value::Text(CONVERSATION.into())],
-        )
+        .query("SELECT id FROM lix_comment WHERE conversation_id = $1")
+        .params(&[Value::Text(CONVERSATION.into())])
+        .all()
         .await
         .unwrap();
     assert_eq!(replies.rows().len(), 1);
@@ -459,37 +425,29 @@ async fn reading_markdown_content_conflicts_with_a_concurrent_edit_of_that_file(
     let file = insert_file(&lix, "/doc.md", "# Doc\n\nFirst.\n\nSecond.\n").await;
     let other = insert_file(&lix, "/other.md", "# Other\n").await;
 
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "SELECT content FROM lix_file WHERE id = $1",
-        &[Value::Text(file.clone())],
-    )
-    .await
-    .unwrap();
-    tx.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('summary', 'two paragraphs')",
-        &[],
-    )
-    .await
-    .unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file.clone())])
+        .all()
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO lix_key_value (key, value) VALUES ('summary', 'two paragraphs')")
+        .await
+        .unwrap();
     write_file(&lix, &file, "# Doc\n\nFirst.\n\nSecond.\n\nThird.\n").await;
     let error = tx.commit().await.unwrap_err();
     assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT, "{error:?}");
 
     // An edit of a different file does not interfere with the same read.
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "SELECT content FROM lix_file WHERE id = $1",
-        &[Value::Text(file.clone())],
-    )
-    .await
-    .unwrap();
-    tx.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('summary', 'three paragraphs')",
-        &[],
-    )
-    .await
-    .unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.query("SELECT content FROM lix_file WHERE id = $1")
+        .params(&[Value::Text(file.clone())])
+        .all()
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO lix_key_value (key, value) VALUES ('summary', 'three paragraphs')")
+        .await
+        .unwrap();
     write_file(&lix, &other, "# Other, edited\n").await;
     tx.commit().await.unwrap();
 }

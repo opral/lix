@@ -252,20 +252,19 @@ async fn checkpoint_incorporation_requires_complete_state_not_selected_sources()
         let lix = crate::open_lix().await.unwrap();
         lix.execute(
             "INSERT INTO lix_key_value(key,value) VALUES ('selected','zero'),('remaining','zero')",
-            &[],
         )
         .await
         .unwrap();
         for index in 0..5 {
-            lix.execute(
-                &format!("UPDATE lix_key_value SET value='value-{index}' WHERE key='selected'"),
-                &[],
-            )
+            lix.execute(&format!(
+                "UPDATE lix_key_value SET value='value-{index}' WHERE key='selected'"
+            ))
             .await
             .unwrap();
         }
         let source = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -276,11 +275,12 @@ async fn checkpoint_incorporation_requires_complete_state_not_selected_sources()
         } else {
             "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='selected'))"
         };
-        let checkpoint = lix.execute(checkpoint_sql, &[]).await.unwrap().rows()[0]
+        let checkpoint = lix.execute(checkpoint_sql).await.unwrap().rows()[0]
             .get::<String>("commit_id")
             .unwrap();
         let head = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -321,14 +321,12 @@ async fn checkpoint_incorporation_requires_complete_state_not_selected_sources()
             "both a full checkpoint and a partial checkpoint's working continuation retain the complete source"
         );
         drop(read);
-        lix.execute(
-            "UPDATE lix_key_value SET value='later' WHERE key='remaining'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value='later' WHERE key='remaining'")
+            .await
+            .unwrap();
         let later = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -361,21 +359,20 @@ async fn recent_divergence_incorporation_does_not_scan_old_authority_history() {
         authority
             .execute(
                 "INSERT INTO lix_key_value(key,value) VALUES('local','base'),('remote','base')",
-                &[],
             )
             .await
             .unwrap();
         for index in 0..old_commits {
             authority
-                .execute(
-                    &format!("UPDATE lix_key_value SET value='old-{index}' WHERE key='remote'"),
-                    &[],
-                )
+                .execute(&format!(
+                    "UPDATE lix_key_value SET value='old-{index}' WHERE key='remote'"
+                ))
                 .await
                 .unwrap();
         }
         let base = authority
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -386,14 +383,12 @@ async fn recent_divergence_incorporation_does_not_scan_old_authority_history() {
             .await
             .unwrap();
         local
-            .execute(
-                "UPDATE lix_key_value SET value='incoming' WHERE key='local'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='incoming' WHERE key='local'")
             .await
             .unwrap();
         let incoming = local
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -410,14 +405,12 @@ async fn recent_divergence_incorporation_does_not_scan_old_authority_history() {
         .unwrap();
         drop(local_read);
         authority
-            .execute(
-                "UPDATE lix_key_value SET value='authority' WHERE key='remote'",
-                &[],
-            )
+            .execute("UPDATE lix_key_value SET value='authority' WHERE key='remote'")
             .await
             .unwrap();
         let remote = authority
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]

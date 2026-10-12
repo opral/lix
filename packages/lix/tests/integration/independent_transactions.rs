@@ -25,30 +25,26 @@ async fn expect_no_event(events: &mut ObserveEvents) {
 #[tokio::test]
 async fn public_transaction_keeps_parent_reads_and_observers_on_committed_state() {
     let lix = open_lix().await.unwrap();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/source/note.txt', CAST('keep me' AS BYTEA))",
-        &[],
-    )
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/source/note.txt', CAST('keep me' AS BYTEA))")
     .await
     .unwrap();
     let mut existing = lix.observe(FILES_SQL, &[]).unwrap();
     let initial = next_event(&mut existing).await;
 
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
         .execute(
             "UPDATE lix_file SET path = '/target/source/note.txt' WHERE path = '/source/note.txt'",
-            &[],
         )
         .await
         .unwrap();
-    let staged = transaction.execute(FILES_SQL, &[]).await.unwrap();
+    let staged = transaction.query(FILES_SQL).all().await.unwrap();
     assert_eq!(
         staged.rows()[0].get::<String>("path").unwrap(),
         "/target/source/note.txt"
     );
 
-    let committed = lix.execute(FILES_SQL, &[]).await.unwrap();
+    let committed = lix.query(FILES_SQL).all().await.unwrap();
     assert_eq!(
         committed.rows()[0].values(),
         initial.rows.rows()[0].values()
@@ -75,35 +71,29 @@ async fn public_transaction_keeps_parent_reads_and_observers_on_committed_state(
 #[tokio::test]
 async fn public_transaction_rollback_publishes_no_partial_changes_and_observer_recovers() {
     let lix = open_lix().await.unwrap();
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/one.txt', CAST('one' AS BYTEA)), ('/two.txt', CAST('two' AS BYTEA))",
-        &[],
-    )
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/one.txt', CAST('one' AS BYTEA)), ('/two.txt', CAST('two' AS BYTEA))")
     .await
     .unwrap();
     let mut events = lix.observe(FILES_SQL, &[]).unwrap();
     let initial = next_event(&mut events).await;
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     transaction
-        .execute("DELETE FROM lix_file WHERE path = '/one.txt'", &[])
+        .execute("DELETE FROM lix_file WHERE path = '/one.txt'")
         .await
         .unwrap();
     transaction
-        .execute(
-            "UPDATE lix_file SET path = '/moved/two.txt' WHERE path = '/two.txt'",
-            &[],
-        )
+        .execute("UPDATE lix_file SET path = '/moved/two.txt' WHERE path = '/two.txt'")
         .await
         .unwrap();
     expect_no_event(&mut events).await;
     transaction.rollback().await.unwrap();
-    let committed = lix.execute(FILES_SQL, &[]).await.unwrap();
+    let committed = lix.query(FILES_SQL).all().await.unwrap();
     assert_eq!(committed.rows().len(), 2);
     for (actual, expected) in committed.rows().iter().zip(initial.rows.rows()) {
         assert_eq!(actual.values(), expected.values());
     }
     expect_no_event(&mut events).await;
-    lix.execute("DELETE FROM lix_file WHERE path = '/one.txt'", &[])
+    lix.execute("DELETE FROM lix_file WHERE path = '/one.txt'")
         .await
         .unwrap();
     let changed = next_event(&mut events).await;
@@ -119,51 +109,44 @@ async fn public_transaction_rollback_publishes_no_partial_changes_and_observer_r
 #[tokio::test]
 async fn public_transaction_and_parent_writes_have_independent_overlays() {
     let lix = open_lix().await.unwrap();
-    let mut first = lix.begin_transaction().await.unwrap();
+    let first = lix.begin_transaction().await.unwrap();
     assert!(
         lix.clone().begin_transaction().await.is_err(),
         "aliases share one explicit transaction slot"
     );
     let other = lix.open_another_session().await.unwrap();
-    let mut second = other.begin_transaction().await.unwrap();
+    let second = other.begin_transaction().await.unwrap();
     first
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('first', 'first')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('first', 'first')")
         .await
         .unwrap();
     second
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('second', 'second')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('second', 'second')")
         .await
         .unwrap();
     assert!(
         second
-            .execute("SELECT key FROM lix_key_value WHERE key = 'first'", &[])
+            .query("SELECT key FROM lix_key_value WHERE key = 'first'")
+            .all()
             .await
             .unwrap()
             .rows()
             .is_empty()
     );
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('parent', 'parent')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('parent', 'parent')")
+        .await
+        .unwrap();
     first.commit().await.unwrap();
     assert_eq!(
         second.commit().await.unwrap_err().code,
         lix::LixError::CODE_TRANSACTION_CONFLICT
     );
     // Reopen and revalidate the read on the now-current snapshot before replaying.
-    let mut retry = other.begin_transaction().await.unwrap();
+    let retry = other.begin_transaction().await.unwrap();
     assert_eq!(
         retry
-            .execute("SELECT key FROM lix_key_value WHERE key = 'first'", &[])
+            .query("SELECT key FROM lix_key_value WHERE key = 'first'")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -172,25 +155,23 @@ async fn public_transaction_and_parent_writes_have_independent_overlays() {
     );
     assert!(
         retry
-            .execute("SELECT key FROM lix_key_value WHERE key = 'second'", &[])
+            .query("SELECT key FROM lix_key_value WHERE key = 'second'")
+            .all()
             .await
             .unwrap()
             .rows()
             .is_empty()
     );
     retry
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('second', 'second')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('second', 'second')")
         .await
         .unwrap();
     retry.commit().await.unwrap();
     let result = lix
-        .execute(
+        .query(
             "SELECT key FROM lix_key_value WHERE key IN ('first', 'second', 'parent') ORDER BY key",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     let keys: Vec<String> = result
@@ -230,17 +211,15 @@ async fn public_transaction_retains_origin_branch_and_account_when_parent_switch
         })
         .await
         .unwrap();
-    let mut transaction = lix.begin_transaction().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     lix.switch_branch(SwitchBranchOptions {
         branch_id: other.id.clone(),
     })
     .await
     .unwrap();
     let context = transaction
-        .execute(
-            "SELECT lix_active_branch_id() AS branch_id, lix_active_account_id() AS account_id",
-            &[],
-        )
+        .query("SELECT lix_active_branch_id() AS branch_id, lix_active_account_id() AS account_id")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -252,43 +231,34 @@ async fn public_transaction_retains_origin_branch_and_account_when_parent_switch
         AUTHOR
     );
     transaction
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('origin-only', 'value')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('origin-only', 'value')")
         .await
         .unwrap();
     transaction.commit().await.unwrap();
     assert_eq!(lix.active_branch_id().await.unwrap(), other.id);
     assert!(
-        lix.execute(
-            "SELECT key FROM lix_key_value WHERE key = 'origin-only'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'origin-only'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
     lix.switch_branch(SwitchBranchOptions { branch_id: origin })
         .await
         .unwrap();
     assert_eq!(
-        lix.execute(
-            "SELECT key FROM lix_key_value WHERE key = 'origin-only'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .len(),
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'origin-only'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .len(),
         1
     );
     let attribution = lix
-        .execute(
-            "SELECT account_id FROM lix_change WHERE schema_key = 'lix_key_value'",
-            &[],
-        )
+        .query("SELECT account_id FROM lix_change WHERE schema_key = 'lix_key_value'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -304,19 +274,17 @@ async fn public_transaction_blocks_parent_close_until_commit_rollback_or_drop() 
     for completion in ["commit", "rollback", "drop"] {
         let lix = open_lix().await.unwrap();
         let alias = lix.clone();
-        let mut transaction = lix.begin_transaction().await.unwrap();
+        let transaction = lix.begin_transaction().await.unwrap();
         transaction
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('pending', 'value')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('pending', 'value')")
             .await
             .unwrap();
         alias
             .close()
             .await
             .expect_err("a parent alias must not close a live transaction");
-        lix.execute("SELECT 1", &[])
+        lix.query("SELECT 1")
+            .all()
             .await
             .expect("rejected close must leave parent usable");
         match completion {
@@ -327,7 +295,8 @@ async fn public_transaction_blocks_parent_close_until_commit_rollback_or_drop() 
             _ => drop(transaction),
         }
         let committed = lix
-            .execute("SELECT key FROM lix_key_value WHERE key = 'pending'", &[])
+            .query("SELECT key FROM lix_key_value WHERE key = 'pending'")
+            .all()
             .await
             .unwrap();
         assert_eq!(committed.rows().len(), usize::from(completion == "commit"));
@@ -338,7 +307,8 @@ async fn public_transaction_blocks_parent_close_until_commit_rollback_or_drop() 
             .await
             .unwrap();
         alias.close().await.unwrap();
-        lix.execute("SELECT 1", &[])
+        lix.query("SELECT 1")
+            .all()
             .await
             .expect_err("parent aliases must share close state");
     }
@@ -348,27 +318,18 @@ async fn public_transaction_blocks_parent_close_until_commit_rollback_or_drop() 
 async fn explicit_transaction_receipt_describes_the_durable_transition() {
     let lix = open_lix().await.unwrap();
     let seed = lix
-        .execute(
-            "INSERT INTO lix_file (path, content) VALUES ('/receipt.txt', CAST('A' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file (path, content) VALUES ('/receipt.txt', CAST('A' AS BYTEA))")
         .await
         .unwrap();
     let before = seed.commit().unwrap().after().to_owned();
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     let first = tx
-        .execute(
-            "UPDATE lix_file SET content = CAST('B' AS BYTEA) WHERE path = '/receipt.txt' RETURNING content",
-            &[],
-        )
+        .execute("UPDATE lix_file SET content = CAST('B' AS BYTEA) WHERE path = '/receipt.txt' RETURNING content")
         .await
         .unwrap();
     assert!(first.commit().is_none());
     let second = tx
-        .execute(
-            "UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE path = '/receipt.txt' RETURNING content",
-            &[],
-        )
+        .execute("UPDATE lix_file SET content = CAST('A' AS BYTEA) WHERE path = '/receipt.txt' RETURNING content")
         .await
         .unwrap();
     assert!(second.commit().is_none());
@@ -376,13 +337,12 @@ async fn explicit_transaction_receipt_describes_the_durable_transition() {
     let span = receipt.commit.unwrap();
     assert_eq!(span.before(), before);
     let diff = lix
-        .execute(
-            "SELECT id FROM lix_diff('lix_file', $1, $2)",
-            &[
-                Value::Text(span.before().to_owned()),
-                Value::Text(span.after().to_owned()),
-            ],
-        )
+        .query("SELECT id FROM lix_diff('lix_file', $1, $2)")
+        .params(&[
+            Value::Text(span.before().to_owned()),
+            Value::Text(span.after().to_owned()),
+        ])
+        .all()
         .await
         .unwrap();
     assert!(diff.rows().is_empty());
@@ -391,18 +351,13 @@ async fn explicit_transaction_receipt_describes_the_durable_transition() {
 #[tokio::test]
 async fn explicit_read_guard_accepts_unrelated_concurrent_changes() {
     let lix = open_lix().await.unwrap();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('guard-target', 'A')",
-        &[],
-    )
-    .await
-    .unwrap();
-    let mut tx = lix.begin_transaction().await.unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('guard-target', 'A')")
+        .await
+        .unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     let guarded = tx
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'guard-target'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = 'guard-target'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -411,24 +366,18 @@ async fn explicit_read_guard_accepts_unrelated_concurrent_changes() {
     );
     // This write is disjoint from the guarded row and from the eventual
     // insert, so the guarded decision is still current at commit (#1900).
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('unrelated', 'X')",
-        &[],
-    )
-    .await
-    .unwrap();
-    tx.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('guard-result', 'B')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('unrelated', 'X')")
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO lix_key_value (key, value) VALUES ('guard-result', 'B')")
+        .await
+        .unwrap();
     assert!(tx.commit().await.unwrap().commit.is_some());
     let keys = lix
-        .execute(
+        .query(
             "SELECT key FROM lix_key_value WHERE key IN ('guard-result', 'unrelated') ORDER BY key",
-            &[],
         )
+        .all()
         .await
         .unwrap()
         .rows()
@@ -441,32 +390,30 @@ async fn explicit_read_guard_accepts_unrelated_concurrent_changes() {
 #[tokio::test]
 async fn explicit_read_guard_detects_phantoms_but_read_only_commit_remains_valid() {
     let lix = open_lix().await.unwrap();
-    let mut guarded = lix.begin_transaction().await.unwrap();
+    let guarded = lix.begin_transaction().await.unwrap();
     assert!(
         guarded
-            .execute("SELECT id FROM lix_file WHERE path = '/missing.txt'", &[])
+            .query("SELECT id FROM lix_file WHERE path = '/missing.txt'")
+            .all()
             .await
             .unwrap()
             .rows()
             .is_empty()
     );
     let read_only_session = lix.open_another_session().await.unwrap();
-    let mut read_only = read_only_session.begin_transaction().await.unwrap();
+    let read_only = read_only_session.begin_transaction().await.unwrap();
     read_only
-        .execute("SELECT id FROM lix_file WHERE path = '/missing.txt'", &[])
+        .query("SELECT id FROM lix_file WHERE path = '/missing.txt'")
+        .all()
         .await
         .unwrap();
     lix.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/missing.txt', CAST('concurrent' AS BYTEA))",
-        &[],
     )
     .await
     .unwrap();
     guarded
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('phantom-side-effect', 'never')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key, value) VALUES ('phantom-side-effect', 'never')")
         .await
         .unwrap();
     assert_eq!(
@@ -474,10 +421,11 @@ async fn explicit_read_guard_detects_phantoms_but_read_only_commit_remains_valid
         lix::LixError::CODE_TRANSACTION_CONFLICT
     );
     assert_eq!(read_only.commit().await.unwrap().commit, None);
-    let mut retry = lix.begin_transaction().await.unwrap();
+    let retry = lix.begin_transaction().await.unwrap();
     assert_eq!(
         retry
-            .execute("SELECT id FROM lix_file WHERE path = '/missing.txt'", &[])
+            .query("SELECT id FROM lix_file WHERE path = '/missing.txt'")
+            .all()
             .await
             .unwrap()
             .rows()
@@ -486,31 +434,28 @@ async fn explicit_read_guard_detects_phantoms_but_read_only_commit_remains_valid
     );
     retry.rollback().await.unwrap();
     assert!(
-        lix.execute(
-            "SELECT key FROM lix_key_value WHERE key = 'phantom-side-effect'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'phantom-side-effect'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
 }
 
 #[tokio::test]
 async fn rejected_checkpoint_preserves_staged_write_and_commit_receipt() {
     let lix = open_lix().await.unwrap();
-    let seed = lix.execute("INSERT INTO lix_file (path, content) VALUES ('/checkpoint.txt', CAST('before' AS BYTEA))", &[]).await.unwrap();
+    let seed = lix.execute("INSERT INTO lix_file (path, content) VALUES ('/checkpoint.txt', CAST('before' AS BYTEA))").await.unwrap();
     let before = seed.commit().unwrap().after().to_owned();
-    let mut tx = lix.begin_transaction().await.unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
     tx.execute(
         "UPDATE lix_file SET content = CAST('after' AS BYTEA) WHERE path = '/checkpoint.txt'",
-        &[],
     )
     .await
     .unwrap();
     let checkpoint_error = tx
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap_err();
     assert_eq!(checkpoint_error.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -518,28 +463,23 @@ async fn rejected_checkpoint_preserves_staged_write_and_commit_receipt() {
     assert_eq!(receipt.before(), before);
     assert_ne!(receipt.before(), receipt.after());
     let content = lix
-        .execute(
-            "SELECT content FROM lix_file WHERE path = '/checkpoint.txt'",
-            &[],
-        )
+        .query("SELECT content FROM lix_file WHERE path = '/checkpoint.txt'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
         content.rows()[0].get::<Vec<u8>>("content").unwrap(),
         b"after"
     );
-    let mut checkpoint_only = lix.begin_transaction().await.unwrap();
+    let checkpoint_only = lix.begin_transaction().await.unwrap();
     checkpoint_only
-        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     assert!(checkpoint_only.commit().await.unwrap().commit.is_some());
-    let mut no_op = lix.begin_transaction().await.unwrap();
+    let no_op = lix.begin_transaction().await.unwrap();
     no_op
-        .execute(
-            "UPDATE lix_file SET path = '/never.txt' WHERE path = '/absent.txt'",
-            &[],
-        )
+        .execute("UPDATE lix_file SET path = '/never.txt' WHERE path = '/absent.txt'")
         .await
         .unwrap();
     let span = no_op.commit().await.unwrap().commit.unwrap();
@@ -549,42 +489,29 @@ async fn rejected_checkpoint_preserves_staged_write_and_commit_receipt() {
 #[tokio::test]
 async fn explicit_guard_rechecks_target_edits_before_publishing_side_effects() {
     let lix = open_lix().await.unwrap();
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('guard-target-edit', 'A')",
-        &[],
-    )
-    .await
-    .unwrap();
-    let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "SELECT value FROM lix_key_value WHERE key = 'guard-target-edit'",
-        &[],
-    )
-    .await
-    .unwrap();
-    lix.execute(
-        "UPDATE lix_key_value SET value = 'C' WHERE key = 'guard-target-edit'",
-        &[],
-    )
-    .await
-    .unwrap();
-    tx.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('guard-side-effect', 'B')",
-        &[],
-    )
-    .await
-    .unwrap();
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('guard-target-edit', 'A')")
+        .await
+        .unwrap();
+    let tx = lix.begin_transaction().await.unwrap();
+    tx.query("SELECT value FROM lix_key_value WHERE key = 'guard-target-edit'")
+        .all()
+        .await
+        .unwrap();
+    lix.execute("UPDATE lix_key_value SET value = 'C' WHERE key = 'guard-target-edit'")
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO lix_key_value (key, value) VALUES ('guard-side-effect', 'B')")
+        .await
+        .unwrap();
     assert_eq!(
         tx.commit().await.unwrap_err().code,
         lix::LixError::CODE_TRANSACTION_CONFLICT
     );
-    let mut retry = lix.begin_transaction().await.unwrap();
+    let retry = lix.begin_transaction().await.unwrap();
     assert_eq!(
         retry
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'guard-target-edit'",
-                &[]
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = 'guard-target-edit'")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -594,14 +521,12 @@ async fn explicit_guard_rechecks_target_edits_before_publishing_side_effects() {
     );
     retry.rollback().await.unwrap();
     assert!(
-        lix.execute(
-            "SELECT key FROM lix_key_value WHERE key = 'guard-side-effect'",
-            &[]
-        )
-        .await
-        .unwrap()
-        .rows()
-        .is_empty()
+        lix.query("SELECT key FROM lix_key_value WHERE key = 'guard-side-effect'")
+            .all()
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
     );
 }
 
@@ -609,16 +534,19 @@ async fn explicit_guard_rechecks_target_edits_before_publishing_side_effects() {
 async fn explicit_first_prepared_write_returns_a_receipt() {
     let lix = open_lix().await.unwrap();
     // Warm the public insert shape before opening independent transaction handles.
-    lix.execute(
-        "INSERT INTO lix_key_value (key, value) VALUES ('warm-receipt', 'one')",
-        &[],
+    lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('warm-receipt', 'one')")
+        .await
+        .unwrap();
+    let warm = lix.begin_transaction().await.unwrap();
+    warm.execute("INSERT INTO lix_key_value (key, value) VALUES ('tx-warm-receipt', 'one')")
+        .await
+        .unwrap();
+    warm.execute(
+        "UPDATE lix_key_value SET value = 'two' WHERE key = 'tx-warm-receipt' RETURNING key",
     )
     .await
     .unwrap();
-    lix.execute_batch(&[
-        lix::ExecuteBatchStatement { label: None, sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-warm-receipt', 'one')".into(), params: vec![] },
-        lix::ExecuteBatchStatement { label: None, sql: "UPDATE lix_key_value SET value = 'two' WHERE key = 'batch-warm-receipt' RETURNING key".into(), params: vec![] },
-    ]).await.unwrap();
+    warm.commit().await.unwrap();
     for (sql, params) in [
         (
             "INSERT INTO lix_key_value (key, value) VALUES ('prepared-receipt', 'one')",
@@ -633,14 +561,15 @@ async fn explicit_first_prepared_write_returns_a_receipt() {
         ),
     ] {
         let before = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("id")
             .unwrap();
-        let mut tx = lix.begin_transaction().await.unwrap();
-        let staged = tx.execute(sql, &params).await.unwrap();
+        let tx = lix.begin_transaction().await.unwrap();
+        let staged = tx.execute(sql).params(&params).await.unwrap();
         assert_eq!(staged.rows_affected(), 1);
         assert!(staged.commit().is_none());
         let span = tx
@@ -652,7 +581,8 @@ async fn explicit_first_prepared_write_returns_a_receipt() {
         assert_eq!(span.before(), before);
         assert_ne!(span.before(), span.after());
         let after = lix
-            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .query("SELECT lix_active_branch_commit_id() AS id")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -665,16 +595,15 @@ async fn explicit_first_prepared_write_returns_a_receipt() {
 #[tokio::test]
 async fn concurrent_explicit_commit_receipts_contain_only_their_own_file() {
     let lix = open_lix().await.unwrap();
-    let mut left = lix.begin_transaction().await.unwrap();
+    let left = lix.begin_transaction().await.unwrap();
     let right_session = lix.open_another_session().await.unwrap();
-    let mut right = right_session.begin_transaction().await.unwrap();
+    let right = right_session.begin_transaction().await.unwrap();
     left.execute(
         "INSERT INTO lix_file (path, content) VALUES ('/receipt-left.txt', CAST('left' AS BYTEA))",
-        &[],
     )
     .await
     .unwrap();
-    right.execute("INSERT INTO lix_file (path, content) VALUES ('/receipt-right.txt', CAST('right' AS BYTEA))", &[]).await.unwrap();
+    right.execute("INSERT INTO lix_file (path, content) VALUES ('/receipt-right.txt', CAST('right' AS BYTEA))").await.unwrap();
     let (left, right) = tokio::join!(left.commit(), right.commit());
     for (receipt, path) in [
         (left.unwrap(), "/receipt-left.txt"),
@@ -682,13 +611,12 @@ async fn concurrent_explicit_commit_receipts_contain_only_their_own_file() {
     ] {
         let span = receipt.commit.unwrap();
         let diff = lix
-            .execute(
-                "SELECT to_path FROM lix_diff('lix_file', $1, $2)",
-                &[
-                    Value::Text(span.before().into()),
-                    Value::Text(span.after().into()),
-                ],
-            )
+            .query("SELECT to_path FROM lix_diff('lix_file', $1, $2)")
+            .params(&[
+                Value::Text(span.before().into()),
+                Value::Text(span.after().into()),
+            ])
+            .all()
             .await
             .unwrap();
         assert_eq!(diff.rows().len(), 1);
@@ -709,95 +637,75 @@ async fn repeated_updates_return_the_published_transaction_commit_id() {
     let session = open_lix().await.unwrap();
     register_commit_counter(&session).await;
 
-    for explicit in [false, true] {
-        let inserted = session
-            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)", &[])
-            .await
-            .unwrap();
-        let previous_commit = inserted.commit().unwrap().after().to_string();
-        let sql = "UPDATE commit_counter SET n = n + 1 WHERE id = 'a' \
-                       RETURNING OLD.n AS before_n, NEW.n AS after_n, \
-                       OLD.lixcol_commit_id AS before_commit, \
-                       NEW.lixcol_commit_id AS after_commit, lixcol_commit_id";
-        let (results, commit) = if explicit {
-            let mut transaction = session.begin_transaction().await.unwrap();
-            let first = transaction.execute(sql, &[]).await.unwrap();
-            let second = transaction.execute(sql, &[]).await.unwrap();
-            let receipt = transaction.commit().await.unwrap();
-            (vec![first, second], receipt.commit.unwrap())
-        } else {
-            let statement = || lix::ExecuteBatchStatement {
-                sql: sql.into(),
-                params: vec![],
-                label: None,
-            };
-            let batch = session
-                .execute_batch(&[statement(), statement()])
-                .await
-                .unwrap();
-            (batch.results, batch.commit.unwrap())
-        };
-        assert_eq!(commit.before(), previous_commit);
-        assert_ne!(commit.after(), previous_commit);
-        for (index, result) in results.into_iter().enumerate() {
-            assert_rows_eq(
-                result,
-                vec![vec![
-                    Value::Integer(index as i64),
-                    Value::Integer(index as i64 + 1),
-                    Value::Text(if index == 0 {
-                        previous_commit.clone()
-                    } else {
-                        commit.after().into()
-                    }),
-                    Value::Text(commit.after().into()),
-                    Value::Text(commit.after().into()),
-                ]],
-            );
-        }
-        let head = session
-            .execute("SELECT lix_active_branch_commit_id()", &[])
-            .await
-            .unwrap();
-        assert_rows_eq(head, vec![vec![Value::Text(commit.after().into())]]);
-        let persisted = session
-            .execute(
-                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
-                &[],
-            )
-            .await
-            .unwrap();
+    let inserted = session
+        .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)")
+        .await
+        .unwrap();
+    let previous_commit = inserted.commit().unwrap().after().to_string();
+    let sql = "UPDATE commit_counter SET n = n + 1 WHERE id = 'a' \
+               RETURNING OLD.n AS before_n, NEW.n AS after_n, \
+               OLD.lixcol_commit_id AS before_commit, \
+               NEW.lixcol_commit_id AS after_commit, lixcol_commit_id";
+    let transaction = session.begin_transaction().await.unwrap();
+    let first = transaction.execute(sql).await.unwrap();
+    let second = transaction.execute(sql).await.unwrap();
+    let receipt = transaction.commit().await.unwrap();
+    let (results, commit) = (vec![first, second], receipt.commit.unwrap());
+    assert_eq!(commit.before(), previous_commit);
+    assert_ne!(commit.after(), previous_commit);
+    for (index, result) in results.into_iter().enumerate() {
         assert_rows_eq(
-            persisted,
-            vec![vec![Value::Integer(2), Value::Text(commit.after().into())]],
-        );
-
-        // A deletion returns the old row's provenance, not its own commit.
-        let deleted = session
-            .execute(
-                "DELETE FROM commit_counter WHERE id = 'a' \
-                 RETURNING OLD.lixcol_commit_id, NEW.lixcol_commit_id, lixcol_commit_id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_ne!(deleted.commit().unwrap().after(), commit.after());
-        assert_rows_eq(
-            deleted,
+            result,
             vec![vec![
+                Value::Integer(index as i64),
+                Value::Integer(index as i64 + 1),
+                Value::Text(if index == 0 {
+                    previous_commit.clone()
+                } else {
+                    commit.after().into()
+                }),
                 Value::Text(commit.after().into()),
-                Value::Null,
                 Value::Text(commit.after().into()),
             ]],
         );
     }
+    let head = session
+        .query("SELECT lix_active_branch_commit_id()")
+        .all()
+        .await
+        .unwrap();
+    assert_rows_eq(head.into(), vec![vec![Value::Text(commit.after().into())]]);
+    let persisted = session
+        .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
+        .all()
+        .await
+        .unwrap();
+    assert_rows_eq(
+        persisted.into(),
+        vec![vec![Value::Integer(2), Value::Text(commit.after().into())]],
+    );
+
+    // A deletion returns the old row's provenance, not its own commit.
+    let deleted = session
+        .execute(
+            "DELETE FROM commit_counter WHERE id = 'a' \
+             RETURNING OLD.lixcol_commit_id, NEW.lixcol_commit_id, lixcol_commit_id",
+        )
+        .await
+        .unwrap();
+    assert_ne!(deleted.commit().unwrap().after(), commit.after());
+    assert_rows_eq(
+        deleted,
+        vec![vec![
+            Value::Text(commit.after().into()),
+            Value::Null,
+            Value::Text(commit.after().into()),
+        ]],
+    );
 }
 
 async fn register_commit_counter(session: &lix::Lix) {
-    session.execute(
-        r#"INSERT INTO lix_registered_schema (value) VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"commit_counter","columns":[{"name":"id","type":"text","nullable":false},{"name":"n","type":"int8","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
-        &[],
-    ).await.unwrap();
+    session.execute(r#"INSERT INTO lix_registered_schema (value) VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"commit_counter","columns":[{"name":"id","type":"text","nullable":false},{"name":"n","type":"int8","nullable":false}],"primary_key":["id"]}' AS JSONB))"#).await.unwrap();
 }
 
 #[tokio::test]
@@ -807,18 +715,17 @@ async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
         register_commit_counter(&session).await;
         if initially_present {
             session
-                .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)", &[])
+                .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)")
                 .await
                 .unwrap();
         }
-        let mut tx = session.begin_transaction().await.unwrap();
+        let tx = session.begin_transaction().await.unwrap();
         let inserted_commit = if initially_present {
             None
         } else {
             let inserted = tx
                 .execute(
                     "INSERT INTO commit_counter (id, n) VALUES ('a', 0) RETURNING lixcol_commit_id",
-                    &[],
                 )
                 .await
                 .unwrap();
@@ -829,23 +736,18 @@ async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
             )
         };
         let first = tx
-            .execute(
-                "UPDATE commit_counter SET n = 1 WHERE id = 'a' RETURNING lixcol_commit_id",
-                &[],
-            )
+            .execute("UPDATE commit_counter SET n = 1 WHERE id = 'a' RETURNING lixcol_commit_id")
             .await
             .unwrap();
         let reserved = first.rows()[0].get::<String>("lixcol_commit_id").unwrap();
         if let Some(inserted_commit) = inserted_commit {
             assert_eq!(inserted_commit, reserved);
         }
-        let error = tx.execute("UPDATE commit_counter SET n = 100 WHERE id = 'a' RETURNING lixcol_commit_id, CAST(id AS BIGINT)", &[]).await.unwrap_err();
+        let error = tx.execute("UPDATE commit_counter SET n = 100 WHERE id = 'a' RETURNING lixcol_commit_id, CAST(id AS BIGINT)").await.unwrap_err();
         assert_eq!(error.code, "LIX_TYPE_MISMATCH");
         let after_error = tx
-            .execute(
-                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
-                &[],
-            )
+            .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
+            .all()
             .await
             .unwrap();
         assert_eq!(after_error.rows()[0].get::<i64>("n").unwrap(), 1);
@@ -856,10 +758,7 @@ async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
             reserved
         );
         let deleted = tx
-            .execute(
-                "DELETE FROM commit_counter WHERE id = 'a' RETURNING lixcol_commit_id",
-                &[],
-            )
+            .execute("DELETE FROM commit_counter WHERE id = 'a' RETURNING lixcol_commit_id")
             .await
             .unwrap();
         assert_eq!(
@@ -869,7 +768,6 @@ async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
         let inserted = tx
             .execute(
                 "INSERT INTO commit_counter (id, n) VALUES ('a', 2) RETURNING lixcol_commit_id",
-                &[],
             )
             .await
             .unwrap();
@@ -882,10 +780,8 @@ async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
         let receipt = tx.commit().await.unwrap();
         assert_eq!(receipt.commit.unwrap().after(), reserved);
         let persisted = session
-            .execute(
-                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
-                &[],
-            )
+            .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
+            .all()
             .await
             .unwrap();
         assert_eq!(persisted.rows()[0].get::<i64>("n").unwrap(), 2);
@@ -906,16 +802,16 @@ async fn reinserted_new_row_cannot_overwrite_a_concurrent_insert() {
     ] {
         let session = open_lix().await.unwrap();
         register_commit_counter(&session).await;
-        let mut tx = session.begin_transaction().await.unwrap();
-        tx.execute(first_insert, &[]).await.unwrap();
-        tx.execute("DELETE FROM commit_counter WHERE id = 'a'", &[])
+        let tx = session.begin_transaction().await.unwrap();
+        tx.execute(first_insert).await.unwrap();
+        tx.execute("DELETE FROM commit_counter WHERE id = 'a'")
             .await
             .unwrap();
-        tx.execute("INSERT INTO commit_counter (id, n) VALUES ('a', 1)", &[])
+        tx.execute("INSERT INTO commit_counter (id, n) VALUES ('a', 1)")
             .await
             .unwrap();
         let concurrent = session
-            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 2)", &[])
+            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 2)")
             .await
             .unwrap();
         assert_eq!(
@@ -923,10 +819,8 @@ async fn reinserted_new_row_cannot_overwrite_a_concurrent_insert() {
             lix::LixError::CODE_TRANSACTION_CONFLICT
         );
         let persisted = session
-            .execute(
-                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
-                &[],
-            )
+            .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
+            .all()
             .await
             .unwrap();
         assert_eq!(persisted.rows()[0].get::<i64>("n").unwrap(), 2);

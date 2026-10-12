@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::{fmt::Write as _, ops::Range};
 
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, ExecuteResult, LixError, Value};
+use lix::{ExecuteResult, LixError, Value};
 use lix::{Lix, open_lix};
 
 #[cfg(feature = "slatedb")]
@@ -65,22 +65,26 @@ async fn execute_parameter_batch<S>(
     lix: &Lix<S>,
     sql: Arc<str>,
     parameters: SharedParameterBatch,
-) -> Result<Vec<ExecuteResult>, LixError>
+) -> Result<u64, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let statements = parameters
-        .rows
-        .iter()
-        .map(|params| ExecuteBatchStatement {
-            label: None,
-            sql: sql.to_string(),
-            params: params.clone(),
-        })
-        .collect::<Vec<_>>();
-    lix.execute_batch(&statements)
+    lix.execute_many(&sql, parameters.rows.iter().cloned())
         .await
-        .map(|batch| batch.results)
+}
+
+/// Runs literal SQL statements in one explicit transaction.
+async fn execute_in_transaction<S>(lix: &Lix<S>, statements: &[String]) -> Result<u64, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let transaction = lix.begin_transaction().await?;
+    let mut affected = 0;
+    for sql in statements {
+        affected += transaction.execute(sql).await?.rows_affected();
+    }
+    transaction.commit().await?;
+    Ok(affected)
 }
 
 /// Folds one public cell into an accumulator, reading the whole payload.
@@ -257,9 +261,11 @@ enum FixtureShape {
     Olap,
 }
 
+/// How `update_all` writes.
 enum UpdateWorkload {
+    /// One literal UPDATE per row, in one transaction.
     Transaction(Vec<String>),
-    ExecuteBatch(Vec<ExecuteBatchStatement>),
+    /// One bound UPDATE with a parameter set per row (`execute_many`).
     PreparedDml(SharedParameterBatch),
 }
 
@@ -747,10 +753,7 @@ where
             self.bound_insert_all_batch.clone(),
         )
         .await
-        .expect("execute tracked-state CRUD bound insert batch")
-        .iter()
-        .map(ExecuteResult::rows_affected)
-        .sum::<u64>();
+        .expect("execute tracked-state CRUD bound insert batch");
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -811,15 +814,12 @@ where
             self.bound_seed_json_batch.clone(),
         )
         .await
-        .expect("execute tracked-state CRUD generated JSON seed batch")
-        .iter()
-        .map(ExecuteResult::rows_affected)
-        .sum::<u64>();
+        .expect("execute tracked-state CRUD generated JSON seed batch");
         assert_eq!(affected as usize, self.row_count);
     }
 
     async fn seed_olap_rows(&self) {
-        let mut transaction = self
+        let transaction = self
             .session
             .begin_transaction()
             .await
@@ -828,7 +828,7 @@ where
         for start in (0..self.row_count).step_by(OLAP_ROWS_PER_STATEMENT) {
             let end = (start + OLAP_ROWS_PER_STATEMENT).min(self.row_count);
             affected += transaction
-                .execute(&olap_insert_sql(start..end), &[])
+                .execute(&olap_insert_sql(start..end))
                 .await
                 .expect("execute typed OLAP seed statement")
                 .rows_affected();
@@ -897,17 +897,14 @@ where
                     .expect("OLAP parameter batch is rectangular"),
             )
             .await
-            .unwrap_or_else(|error| panic!("execute typed OLAP mutation batch '{sql}': {error:?}"))
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
+            .unwrap_or_else(|error| panic!("execute typed OLAP mutation batch '{sql}': {error:?}"));
             assert_eq!(
                 usize::try_from(affected).expect("OLAP mutation count fits usize"),
                 expected_affected
             );
         }
 
-        let mut transaction = self
+        let transaction = self
             .session
             .begin_transaction()
             .await
@@ -915,7 +912,7 @@ where
         let mut deleted = 0_u64;
         for ordinals in delete_ordinals.chunks(OLAP_ROWS_PER_STATEMENT) {
             deleted += transaction
-                .execute(&olap_delete_sql(ordinals), &[])
+                .execute(&olap_delete_sql(ordinals))
                 .await
                 .expect("execute typed OLAP delete statement")
                 .rows_affected();
@@ -929,7 +926,7 @@ where
             mutation_count(self.row_count, 2, stride)
         );
 
-        let mut transaction = self
+        let transaction = self
             .session
             .begin_transaction()
             .await
@@ -939,7 +936,7 @@ where
         for start in (self.row_count..insert_end).step_by(OLAP_ROWS_PER_STATEMENT) {
             let end = (start + OLAP_ROWS_PER_STATEMENT).min(insert_end);
             inserted += transaction
-                .execute(&olap_insert_sql(start..end), &[])
+                .execute(&olap_insert_sql(start..end))
                 .await
                 .expect("execute typed OLAP replacement insert statement")
                 .rows_affected();
@@ -1032,7 +1029,7 @@ where
         let sql = format!(
             "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', CAST('{{\"lane\":\"untracked\"}}' AS JSONB), true)"
         );
-        let affected = execute(&self.session, &sql).await.rows_affected();
+        let affected = write(&self.session, &sql).await.rows_affected();
         assert_eq!(affected, 1, "insert untracked overlay probe");
     }
 
@@ -1088,47 +1085,21 @@ where
     async fn update_all(&self) -> usize {
         let expected_rows = match &self.update_all_workload {
             UpdateWorkload::Transaction(statements) => statements.len(),
-            UpdateWorkload::ExecuteBatch(_) => self.row_count,
             UpdateWorkload::PreparedDml(rows) => rows.row_count(),
         };
         let affected: u64 = match &self.update_all_workload {
-            UpdateWorkload::Transaction(statements) => self
-                .session
-                .execute_batch(
-                    &statements
-                        .iter()
-                        .map(|sql| ExecuteBatchStatement {
-                            label: None,
-                            sql: sql.clone(),
-                            params: Vec::new(),
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                .expect("execute tracked-state CRUD scalar SQL batch")
-                .results
-                .into_iter()
-                .map(|result| result.rows_affected())
-                .sum(),
-            UpdateWorkload::ExecuteBatch(statements) => self
-                .session
-                .execute_batch(statements)
-                .await
-                .expect("execute tracked-state CRUD SQL batch")
-                .results
-                .into_iter()
-                .map(|result| result.rows_affected())
-                .sum(),
+            UpdateWorkload::Transaction(statements) => {
+                execute_in_transaction(&self.session, statements)
+                    .await
+                    .expect("execute tracked-state CRUD scalar SQL transaction")
+            }
             UpdateWorkload::PreparedDml(parameter_rows) => execute_parameter_batch(
                 &self.session,
                 Arc::from(BOUND_UPDATE_ALL_SQL),
                 parameter_rows.clone(),
             )
             .await
-            .expect("execute tracked-state CRUD SQL parameter batch")
-            .into_iter()
-            .map(|result| result.rows_affected())
-            .sum(),
+            .expect("execute tracked-state CRUD SQL parameter batch"),
         };
         assert_eq!(affected as usize, expected_rows);
         affected as usize
@@ -1160,10 +1131,7 @@ where
         )
         .await
         .expect("execute tracked-state CRUD bound update batch");
-        let affected = results
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
+        let affected = results;
         assert_eq!(affected as usize, row_count);
         affected as usize
     }
@@ -1196,17 +1164,14 @@ where
         )
         .await
         .expect("execute spread tracked-state CRUD bound update batch");
-        let affected = results
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
+        let affected = results;
         assert_eq!(affected as usize, row_count);
         affected as usize
     }
 
     #[expect(clippy::cast_possible_truncation)]
     async fn update_one_by_pk(&self) -> usize {
-        let affected = execute(&self.session, &self.update_one_by_pk_sql)
+        let affected = write(&self.session, &self.update_one_by_pk_sql)
             .await
             .rows_affected();
         assert_eq!(affected, 1);
@@ -1215,7 +1180,7 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn delete_all(&self) -> usize {
-        let affected = execute(&self.session, &self.delete_all_sql)
+        let affected = write(&self.session, &self.delete_all_sql)
             .await
             .rows_affected();
         assert_eq!(affected as usize, self.visible_row_count);
@@ -1224,7 +1189,7 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn delete_one_by_pk(&self) -> usize {
-        let affected = execute(&self.session, &self.delete_one_by_pk_sql)
+        let affected = write(&self.session, &self.delete_one_by_pk_sql)
             .await
             .rows_affected();
         assert_eq!(affected, 1);
@@ -1690,38 +1655,25 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
     if !matches!(shape, FixtureShape::FullCrud) {
         return UpdateWorkload::Transaction(Vec::new());
     }
-    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API").as_deref() {
-        Ok("execute_batch") => UpdateWorkload::ExecuteBatch(literal_update_batch(rows)),
-        Ok("execute_batch_parameterized") => {
-            UpdateWorkload::ExecuteBatch(parameterized_update_batch(rows))
-        }
-        Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected execute_batch or execute_batch_parameterized"
-        ),
-        Err(_) => {
-            let scalar_rows = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT")
-                .ok()
-                .map(|value| {
-                    value.parse::<usize>().unwrap_or_else(|_| {
-                        panic!(
-                            "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be an integer between 1 and {}, got '{value}'",
-                            rows.len()
-                        )
-                    })
-                });
-            if let Some(scalar_rows) = scalar_rows {
-                assert!(
-                    (1..=rows.len()).contains(&scalar_rows),
-                    "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+    let scalar_rows = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().unwrap_or_else(|_| {
+                panic!(
+                    "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be an integer between 1 and {}, got '{value}'",
                     rows.len()
-                );
-                UpdateWorkload::Transaction(
-                    rows[..scalar_rows].iter().map(update_row_sql).collect(),
                 )
-            } else {
-                UpdateWorkload::PreparedDml(prepared_update_rows(rows))
-            }
-        }
+            })
+        });
+    if let Some(scalar_rows) = scalar_rows {
+        assert!(
+            (1..=rows.len()).contains(&scalar_rows),
+            "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+            rows.len()
+        );
+        UpdateWorkload::Transaction(rows[..scalar_rows].iter().map(update_row_sql).collect())
+    } else {
+        UpdateWorkload::PreparedDml(prepared_update_rows(rows))
     }
 }
 
@@ -1733,29 +1685,6 @@ fn prepared_update_rows(rows: &[WorkloadRow]) -> SharedParameterBatch {
         ]
     }))
     .expect("prepared update parameter batch is rectangular")
-}
-
-fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
-    rows.iter()
-        .map(|row| ExecuteBatchStatement {
-            label: None,
-            sql: BOUND_UPDATE_ALL_SQL.to_string(),
-            params: vec![
-                Value::Text(row.updated_value_json.clone()),
-                Value::Text(row.path.clone()),
-            ],
-        })
-        .collect()
-}
-
-fn literal_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
-    rows.iter()
-        .map(|row| ExecuteBatchStatement {
-            label: None,
-            sql: update_row_sql(row),
-            params: Vec::new(),
-        })
-        .collect()
 }
 
 /// Profile-only unified-current-state fixture switch. `one_unrelated` keeps
@@ -1828,10 +1757,7 @@ where
         "primary_key": ["path"],
     });
     let affected = session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register json_pointer schema")
         .rows_affected();
@@ -1852,10 +1778,7 @@ where
         "primary_key": ["path"],
     });
     let affected = session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register tracked_crud_insert schema")
         .rows_affected();
@@ -1879,22 +1802,32 @@ where
         "primary_key": ["id"],
     });
     let affected = session
-        .execute(
-            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)",
-            &[Value::Text(schema.to_string())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (CAST($1 AS JSONB), false, false)").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register olap_row schema")
         .rows_affected();
     assert_eq!(affected, 1);
 }
 
+/// Runs one read under the default buffered cap.
 async fn execute<StorageImpl>(session: &Lix<StorageImpl>, sql: &str) -> ExecuteResult
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(sql, &[])
+        .query(sql)
+        .all()
+        .await
+        .expect("execute tracked-state crud SQL")
+        .into()
+}
+
+async fn write<StorageImpl>(session: &Lix<StorageImpl>, sql: &str) -> ExecuteResult
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute(sql)
         .await
         .expect("execute tracked-state crud SQL")
 }

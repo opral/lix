@@ -23,7 +23,7 @@ async fn complete_unwrapped_memory_storage_session_future_is_send() {
     is_send(&source.open_storage_session_inner(storage.clone()));
     is_send(&source.open_storage_session(storage.clone()));
     let child = source.open_storage_session(storage).await.unwrap();
-    child.execute("SELECT 1", &[]).await.unwrap();
+    child.query("SELECT 1").all().await.unwrap();
     child.close().await.unwrap();
     source.close().await.unwrap();
 }

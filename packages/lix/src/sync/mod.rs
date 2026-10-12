@@ -200,8 +200,12 @@ pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
     replica_repository_identity,
 };
+// Named by the feature-gated partial-replica tests.
+#[allow(unused_imports)]
+pub(crate) use runtime::SyncDemand;
 pub(crate) use runtime::{
-    HydratedInputs, SyncDemand, SyncDemandRetry, SyncRuntime, prepare_offline_editing,
+    HydratedInputs, SyncDemandRetry, SyncDemandSender, SyncRuntime, prepare_offline_editing,
+    sync_demand_channel,
 };
 pub(crate) use upload_plan::{
     SYNC_UPLOAD_GENERATION_SPACE, stage_invalidate as stage_upload_plan_invalidation,

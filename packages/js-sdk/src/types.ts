@@ -1,3 +1,4 @@
+/// <reference lib="esnext.disposable" preserve="true" />
 export type RemoteLixFetch = (
 	input: RequestInfo | URL,
 	init?: RequestInit,
@@ -245,9 +246,49 @@ export type JsonValue =
 	| readonly JsonValue[]
 	| { readonly [key: string]: JsonValue };
 
-export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
+/**
+ * A SQL parameter: `null`, a boolean, a finite number, a string, a
+ * `Uint8Array`, a `Value`, or a JSON value wrapped with `json(value)`. Anything
+ * else (plain objects, arrays, `Date`, `undefined`, `NaN`, `Infinity`) throws
+ * `LIX_INVALID_PARAM` instead of being coerced.
+ */
+export type SqlParam =
+	| null
+	| boolean
+	| number
+	| string
+	| Uint8Array
+	| import("./value.js").Value;
 
-export type ExecuteOptions = {
+/** A result row: column name to decoded value. */
+export type Row = Record<string, unknown>;
+
+/** Cancels the call. A read rejects with the signal's reason. */
+export type CallOptions = {
+	signal?: AbortSignal;
+};
+
+/** Options of `query()`. */
+export type QueryOptions = CallOptions & {
+	/**
+	 * Byte cap of the buffered result (default 64 MiB): the memory the engine
+	 * holds for its rows. `Infinity` opts out. Exceeding it rejects with
+	 * `LIX_ERROR_RESULT_TOO_LARGE`. On a remote Lix the cap is checked when the
+	 * response arrives; the server's own response limit applies first.
+	 */
+	maxBytes?: number;
+};
+
+/** Options of `stream()`. Aborting closes the stream. */
+export type StreamOptions = CallOptions & {
+	/**
+	 * Byte cap for the few statements that must buffer before their first page
+	 * (file content, transaction and partial-replica reads). Default 64 MiB.
+	 */
+	maxBytes?: number;
+};
+
+export type WriteOptions = {
 	originKey?: string;
 	/**
 	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
@@ -255,35 +296,31 @@ export type ExecuteOptions = {
 	 * Does not control explicit transactions, read recovery, or transport retries.
 	 */
 	maxAutoCommitRetries?: number;
-	/** Returns positional arrays instead of plain objects. Defaults to "object". */
-	rowMode?: "object" | "array";
 	/**
 	 * Stable identity for one logical remote SQL mutation. Supply the same key
 	 * when retrying after a lost response; remote Lix generates one per call
 	 * when this is omitted. This is sent as `Idempotency-Key`, not SQL options.
 	 */
 	idempotencyKey?: string;
-};
-
-export type LixBatchStatement = {
-	sql: string;
-	params?: readonly SqlParam[];
-	label?: string;
-};
-
-export type LixBatchOptions = {
-	originKey?: string;
 	/**
-	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
-	 * Zero fails on the first failed attempt. Omit to retain default recovery budgets.
-	 * Does not control explicit transactions, read recovery, or transport retries.
+	 * Aborting before the statement is sent prevents it from running. Once it
+	 * is running, the call settles with its real outcome.
 	 */
-	maxAutoCommitRetries?: number;
-	/** Returns positional arrays instead of plain objects. Defaults to "object". */
-	rowMode?: "object" | "array";
-	/** See {@link ExecuteOptions.idempotencyKey}. */
-	idempotencyKey?: string;
+	signal?: AbortSignal;
 };
+
+/** Options of `execute()`. */
+export type ExecuteOptions = WriteOptions & {
+	/**
+	 * Byte cap of the returned rows (default 64 MiB); `Infinity` opts out.
+	 * Not supported on a remote Lix (rejects `LIX_INVALID_PARAM`): the server
+	 * applies its default cap before it commits.
+	 */
+	maxBytes?: number;
+};
+
+/** Options of `executeMany()`. */
+export type ExecuteManyOptions = WriteOptions;
 
 export type ResultColumnType = LixValue["kind"];
 
@@ -292,9 +329,6 @@ export type ResultColumn = {
 	type: ResultColumnType;
 };
 
-export type ResultObjectRow = Record<string, unknown>;
-export type ResultArrayRow = unknown[];
-export type ResultRow = ResultObjectRow | ResultArrayRow;
 
 /**
  * The active-branch commits a write moved between.
@@ -309,9 +343,7 @@ export type CommitSpan = {
 	after: string;
 };
 
-export type StatementResult<TRow extends object = ResultObjectRow> = {
-	statementIndex?: number;
-	label?: string;
+export type StatementResult<TRow extends object = Row> = {
 	columns: ResultColumn[];
 	rows: TRow[];
 	rowsAffected: number;
@@ -322,7 +354,7 @@ export type StatementResult<TRow extends object = ResultObjectRow> = {
 	}>;
 };
 
-export type ExecuteResult<TRow extends object = ResultObjectRow> =
+export type ExecuteResult<TRow extends object = Row> =
 	StatementResult<TRow> & CommitReceipt;
 
 export type CommitReceipt = {
@@ -336,6 +368,11 @@ export type TransactionOptions = {
 	 * `LIX_TRANSACTION_CONFLICT`. Defaults to 3; `0` fails on the first conflict.
 	 */
 	maxRetries?: number;
+	/**
+	 * Aborting before the commit starts rolls the transaction back and the
+	 * call rejects with the reason; a commit already in flight completes.
+	 */
+	signal?: AbortSignal;
 };
 
 export type TransactionResult<T> = CommitReceipt & {
@@ -345,13 +382,45 @@ export type TransactionResult<T> = CommitReceipt & {
 	retries: number;
 };
 
-export type ExecuteBatchStatementResult<TRow extends object = ResultObjectRow> =
-	StatementResult<TRow> & { statementIndex: number };
+/**
+ * A forward-only cursor over a read's rows. Iterate it for rows or call
+ * `pages()` for arrays of rows; both share one cursor. `break`, `return()`,
+ * `close()` or `await using` release it.
+ */
+export interface RowStream<TRow extends object = Row>
+	extends AsyncIterable<TRow>,
+		AsyncDisposable {
+	readonly columns: readonly string[];
+	/** The same cursor as pages. The first page is small; later pages are <= 4096 rows / 1 MiB. */
+	pages(): AsyncIterableIterator<TRow[]>;
+	/** Idempotent. Resolves once the engine has stopped and the read state is released. */
+	close(): Promise<void>;
+}
 
-export type ExecuteBatchResult<TRow extends object = ResultObjectRow> = {
-	results: readonly ExecuteBatchStatementResult<TRow>[];
-	commit: CommitSpan | null;
-};
+/** Reads at one state: the latest committed state per call or a transaction. */
+export interface Reader {
+	/** Reads only (writes reject with `LIX_ERROR_READ_ONLY`). Buffered and all-or-nothing. */
+	query<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options?: QueryOptions,
+	): Promise<TRow[]>;
+	/**
+	 * At most one row: `undefined` if there is none; rejects `LIX_ERROR_NOT_UNIQUE`
+	 * if there are more. Reads at most two rows, so it takes no `maxBytes`.
+	 */
+	queryOne<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options?: CallOptions,
+	): Promise<TRow | undefined>;
+	/** Resolves once the statement is planned and its first page has arrived. */
+	stream<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options?: StreamOptions,
+	): Promise<RowStream<TRow>>;
+}
 
 export type ObserveEvent = {
 	sequence: number;

@@ -239,9 +239,8 @@ where
     fn spawn_driver(&self) -> Result<(), LixError> {
         let coordinator = self.clone();
         crate::background_task::spawn("lix-commit-coordinator", move || async move {
-            // `background_task` block_on-pins this future on a default 2 MiB
-            // thread. Keep `drive` itself on the heap so commit wrappers cannot
-            // inflate that stack.
+            // Keep `drive` itself on the heap so commit wrappers cannot consume
+            // the engine-owned thread's reserved stack with a large future.
             Box::pin(coordinator.drive()).await;
         })
     }

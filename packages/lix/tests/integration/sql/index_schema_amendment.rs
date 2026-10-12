@@ -13,16 +13,10 @@ async fn schema_amendment_preserves_inherited_indexed_rows() {
         ],
         "primary_key": ["id"], "unique": [["label"]]
     });
-    db.execute(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES ($1, false, false)",
-        &[Value::Jsonb(schema.clone().into())],
-    ).await.unwrap();
-    db.execute(
-        "INSERT INTO amended_note (id, label) VALUES ('old', 'old')",
-        &[],
-    )
-    .await
-    .unwrap();
+    db.execute("INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES ($1, false, false)").params(&[Value::Jsonb(schema.clone().into())]).await.unwrap();
+    db.execute("INSERT INTO amended_note (id, label) VALUES ('old', 'old')")
+        .await
+        .unwrap();
     let branch = db
         .create_branch(CreateBranchOptions {
             id: None,
@@ -41,26 +35,22 @@ async fn schema_amendment_preserves_inherited_indexed_rows() {
             schema["description"] = "Compatible metadata amendment".into();
             db.execute(
                 "UPDATE lix_registered_schema SET value = $1 WHERE schema_key = 'amended_note'",
-                &[Value::Jsonb(schema.clone().into())],
             )
+            .params(&[Value::Jsonb(schema.clone().into())])
             .await
             .unwrap();
-            db.execute(
-                "INSERT INTO amended_note (id, label) VALUES ('new', 'new')",
-                &[],
-            )
-            .await
-            .unwrap();
+            db.execute("INSERT INTO amended_note (id, label) VALUES ('new', 'new')")
+                .await
+                .unwrap();
         }
         let indexed = db
-            .execute("SELECT id FROM amended_note WHERE label = 'old'", &[])
+            .query("SELECT id FROM amended_note WHERE label = 'old'")
+            .all()
             .await
             .unwrap();
         let scanned = db
-            .execute(
-                "SELECT id FROM amended_note WHERE concat('', label) = 'old'",
-                &[],
-            )
+            .query("SELECT id FROM amended_note WHERE concat('', label) = 'old'")
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -69,10 +59,7 @@ async fn schema_amendment_preserves_inherited_indexed_rows() {
         );
         assert_eq!(indexed.len(), 1);
         let duplicate = db
-            .execute(
-                "INSERT INTO amended_note (id, label) VALUES ('duplicate', 'old')",
-                &[],
-            )
+            .execute("INSERT INTO amended_note (id, label) VALUES ('duplicate', 'old')")
             .await
             .expect_err("inherited unique value must stay visible to validation");
         assert_eq!(duplicate.code, lix::LixError::CODE_UNIQUE);

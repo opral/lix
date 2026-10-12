@@ -481,14 +481,11 @@ mod tests {
     async fn native_mixed_family_batch_preserves_order_and_rejects_incomplete_responses() {
         let authority = open_lix().await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('native-fixture', 'value')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('native-fixture', 'value')")
             .await
             .unwrap();
         authority
-            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap();
         let adapter = authority.storage_adapter();

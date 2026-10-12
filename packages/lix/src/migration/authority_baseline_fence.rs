@@ -11,7 +11,8 @@ use crate::{
 use bytes::Bytes;
 const PRE_LEASE_AUTHORITY_MARKER: &[u8] = b"certified-authority-v4";
 pub(super) fn is_previous_authority_marker(marker: &[u8]) -> bool {
-    marker == PRE_LEASE_AUTHORITY_MARKER || marker == b"certified-authority-v5-native-baseline-leases"
+    marker == PRE_LEASE_AUTHORITY_MARKER
+        || marker == b"certified-authority-v5-native-baseline-leases"
 }
 
 /// Explicitly upgrades an existing authority to support partial-replica baseline leases.
@@ -241,7 +242,10 @@ mod tests {
         // Ordinary admission must reject such a receipt; the migration writer
         // seeds the historical layout that the upgrade must inspect.
         use crate::storage_adapter::StorageWrite as _;
-        let mut write = adapter.begin_migration_write(Default::default()).await.unwrap();
+        let mut write = adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
         writes.lower_into(&mut write).await.unwrap();
         write.commit().await.unwrap();
         drop(adapter);
@@ -464,12 +468,9 @@ mod tests {
             .with_storage(storage.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('authority-upgrade','kept')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('authority-upgrade','kept')")
+            .await
+            .unwrap();
         let adapter = lix.storage_adapter();
         let mut seed = adapter.new_write_set();
         seed.put(

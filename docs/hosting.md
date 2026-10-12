@@ -36,7 +36,7 @@ let repository = create_lix()
 let remote = open_lix()
     .with_server(ServerOptions::new(&repository.url))
     .await?;
-remote.execute("SELECT * FROM lix_file", &[]).await?;
+remote.query("SELECT * FROM lix_file").all().await?;
 remote.close().await?;
 
 // Use a durable adapter supplied by a storage package.

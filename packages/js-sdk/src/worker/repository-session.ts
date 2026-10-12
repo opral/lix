@@ -1,10 +1,12 @@
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isReleaseOperation,
 	type WorkerInput,
 	type WorkerRequest,
 	type WorkerOperation,
 	type WorkerResponse,
+	type WorkerStreamOpened,
 } from "./protocol.js";
 import { repositoryError, OPEN_TIMEOUT_MS } from "./repository-protocol.js";
 import { lostOperationError } from "./request-lifecycle.js";
@@ -15,7 +17,8 @@ import {
 } from "./operation-scheduler.js";
 type Context = { branchId: string; accountId: string };
 type Reply = Extract<WorkerResponse, { ok: boolean }>;
-/** Logical handles survive owner generations; transactions and snapshot streams do not. */
+/** Logical handles survive owner generations; transactions, snapshot streams
+ * and query streams do not (their snapshot belonged to the lost owner). */
 export class RepositorySession {
 	private epoch = 0;
 	private ready = false;
@@ -38,6 +41,7 @@ export class RepositorySession {
 	>();
 	private transactions = new Map<number, number>();
 	private exports = new Map<number, number>();
+	private queryStreams = new Map<number, number>();
 	private callbacks = new Map<number, number>();
 	private callbackIds = new Map<number, number>();
 	private requests = new Map<number, WorkerRequest>();
@@ -69,6 +73,7 @@ export class RepositorySession {
 		this.internal.clear();
 		this.transactions.clear();
 		this.exports.clear();
+		this.queryStreams.clear();
 		const replay: WorkerRequest[] = [];
 		const closingObservations = new Set(
 			Array.from(this.requests.values()).flatMap((request) =>
@@ -125,6 +130,12 @@ export class RepositorySession {
 			else if (kind === "close") {
 				this.sessions.delete(request.sessionId);
 				this.output({ id: request.id, ok: true });
+			} else if (
+				kind === "stream.close" ||
+				kind === "exportSnapshot.cancel"
+			) {
+				// The lost owner took the released state with it.
+				this.output({ id: request.id, ok: true, value: undefined });
 			} else
 				this.output({
 					id: request.id,
@@ -242,6 +253,10 @@ export class RepositorySession {
 				this.cancelObserverRegistration(message.requestId);
 				return;
 			}
+			if (message.kind === "request.cancel") {
+				this.cancelRead(message.requestId);
+				return;
+			}
 			if ("requestId" in message) {
 				const requestId = this.callbacks.get(message.requestId);
 				if (requestId !== undefined) this.send({ ...message, requestId });
@@ -265,7 +280,9 @@ export class RepositorySession {
 			}
 			return;
 		}
+		// Releases are exempt, as in the client and the host.
 		if (
+			!isReleaseOperation(message.operation) &&
 			this.queue.length + this.requests.size >= WORKER_CLIENT_MAX_PENDING
 		) {
 			this.output({
@@ -320,12 +337,30 @@ export class RepositorySession {
 			}
 			if ("exportId" in operation) {
 				const remote = this.exports.get(operation.exportId);
+				if (remote === undefined && operation.kind === "exportSnapshot.cancel") {
+					this.output({ id: message.id, ok: true, value: undefined });
+					return;
+				}
 				if (remote === undefined)
 					throw repositoryError(
 						"LIX_SNAPSHOT_LOST",
 						"Snapshot stream belonged to a previous repository owner; start a new export",
 					);
 				operation.exportId = remote;
+			}
+			if ("streamId" in operation) {
+				const remote = this.queryStreams.get(operation.streamId);
+				if (remote === undefined) {
+					if (operation.kind === "stream.close") {
+						this.output({ id: message.id, ok: true, value: undefined });
+						return;
+					}
+					throw repositoryError(
+						"LIX_ERROR_QUERY_STREAM_LOST",
+						"Query stream belonged to a previous repository owner; start a new stream",
+					);
+				}
+				operation.streamId = remote;
 			}
 			if ("observeId" in operation) {
 				if (operation.kind !== "observe.close") {
@@ -511,6 +546,19 @@ export class RepositorySession {
 		} else if (operation.kind === "exportSnapshot") {
 			value = this.nextResource++;
 			this.exports.set(value as number, message.value as number);
+		} else if (
+			operation.kind === "stream" ||
+			operation.kind === "transaction.stream"
+		) {
+			const opened = message.value as WorkerStreamOpened;
+			if (opened.page === null) value = opened;
+			else {
+				const streamId = this.nextResource++;
+				this.queryStreams.set(streamId, opened.streamId);
+				value = { ...opened, streamId };
+			}
+		} else if (operation.kind === "stream.next") {
+			if (value == null) this.queryStreams.delete(operation.streamId);
 		} else if (operation.kind === "close")
 			this.sessions.delete(request.sessionId);
 		else if (
@@ -520,7 +568,36 @@ export class RepositorySession {
 			this.transactions.delete(operation.transactionId);
 		else if (operation.kind === "exportSnapshot.cancel")
 			this.exports.delete(operation.exportId);
+		else if (operation.kind === "stream.close")
+			this.queryStreams.delete(operation.streamId);
 		this.output({ ...message, id: request.id, value });
+	}
+	/** Forwards a read cancel to the owner, or drops a read not sent yet. */
+	private cancelRead(requestId: number): void {
+		const queued = this.queue.findIndex(
+			(message) => "id" in message && message.id === requestId,
+		);
+		if (queued >= 0) {
+			this.queue.splice(queued, 1);
+			this.clearQueueTimer(requestId);
+			this.output({
+				id: requestId,
+				ok: false,
+				error: serializeWorkerError(
+					Object.assign(new Error("The read was cancelled"), {
+						name: "AbortError",
+						code: "LIX_ERROR_CANCELLED",
+					}),
+				),
+			});
+			return;
+		}
+		for (const [wireId, request] of this.requests) {
+			if (request.id === requestId) {
+				this.send({ kind: "request.cancel", requestId: wireId });
+				return;
+			}
+		}
 	}
 	close() {
 		this.stopped = true;

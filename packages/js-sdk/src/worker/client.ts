@@ -15,10 +15,12 @@ import {
 	openDirectLixBinding,
 } from "#worker-factory";
 import type {
+	BindingExecuteResult,
 	LixBinding,
 	LixStorageConfig,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	QueryStreamBinding,
 	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
@@ -31,11 +33,14 @@ import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isCancellableRead,
+	isReleaseOperation,
 	isSessionCloseRequest,
 	type WorkerConnection,
 	type WorkerNotification,
 	type WorkerOperation,
 	type WorkerResponse,
+	type WorkerStreamOpened,
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
@@ -45,7 +50,7 @@ type SyncServerRuntimeOptions = LixServerOptions & {
 
 type PendingRequest = {
 	operation: WorkerOperation;
-	category: "ordinary" | "observer-close" | "control";
+	category: "ordinary" | "observer-close" | "control" | "release";
 	timer?: ReturnType<typeof setTimeout>;
 	abortSignal?: AbortSignal;
 	abortListener?: () => void;
@@ -69,9 +74,9 @@ function workerOperationCategory(
 	operation: WorkerOperation,
 ): PendingRequest["category"] {
 	if (operation.kind === "observe.close") return "observer-close";
+	if (isReleaseOperation(operation)) return "release";
 	if (
 		operation.kind === "close" ||
-		operation.kind === "exportSnapshot.cancel" ||
 		operation.kind === "transaction.commit" ||
 		operation.kind === "transaction.rollback" ||
 		operation.kind === "openSnapshot.finish"
@@ -385,9 +390,21 @@ function wrapTelemetryParentTransaction(
 	const prepareOperation = () =>
 		binding.setTelemetryParent(readTelemetryParent(parentContext));
 	return {
+		query: (sql, params, options, signal) => {
+			prepareOperation();
+			return transaction.query(sql, params, options, signal);
+		},
+		stream: (sql, params, options, signal) => {
+			prepareOperation();
+			return transaction.stream(sql, params, options, signal);
+		},
 		execute: (sql, params, options) => {
 			prepareOperation();
 			return transaction.execute(sql, params, options);
+		},
+		executeMany: (sql, paramSets, options) => {
+			prepareOperation();
+			return transaction.executeMany(sql, paramSets, options);
 		},
 		commit: () => {
 			prepareOperation();
@@ -483,10 +500,26 @@ export function workerBinding(
 			lease.retain();
 			return workerBinding(client, lease, openedSessionId);
 		},
+		query: (sql, params, options, signal) =>
+			request({ kind: "query", sql, params, options }, undefined, signal),
+		stream: async (sql, params, options, signal) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>(
+					{
+						kind: "stream",
+						sql,
+						params,
+						options,
+					},
+					undefined,
+					signal,
+				),
+			),
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
-		executeBatch: (statements, options) =>
-			request({ kind: "executeBatch", statements, options }),
+		executeMany: (sql, paramSets, options) =>
+			request({ kind: "executeMany", sql, paramSets, options }),
 		observe: async (sql, params, options) => {
 			const initialParent = client.currentTelemetryParent();
 			const observeId = await request<number>(
@@ -564,11 +597,80 @@ export function workerBinding(
 	};
 }
 
+/** The open response carries the first page, so the first pull is local. */
+function workerQueryStreamBinding(
+	request: RequestWorker,
+	opened: WorkerStreamOpened,
+): QueryStreamBinding {
+	const { streamId, columns } = opened;
+	let firstPage: BindingExecuteResult | null | undefined = opened.page;
+	// A first page of null means the worker already ended and released it.
+	let finished = opened.page === null;
+	return {
+		columns,
+		next: async () => {
+			if (firstPage !== undefined) {
+				const page = firstPage;
+				firstPage = undefined;
+				if (page !== null) return page;
+			}
+			if (finished) return undefined;
+			const page = await request<BindingExecuteResult | undefined>({
+				kind: "stream.next",
+				streamId,
+			});
+			if (page == null) finished = true;
+			return page;
+		},
+		cancel: async () => {
+			firstPage = undefined;
+			if (finished) return;
+			finished = true;
+			await request({ kind: "stream.close", streamId });
+		},
+	};
+}
+
 function workerTransactionBinding(
 	request: RequestWorker,
 	transactionId: number,
 ): LixTransactionBinding {
 	return {
+		query: (sql, params, options, signal) =>
+			request(
+				{
+					kind: "transaction.query",
+					transactionId,
+					sql,
+					params,
+					options,
+				},
+				undefined,
+				signal,
+			),
+		stream: async (sql, params, options, signal) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>(
+					{
+						kind: "transaction.stream",
+						transactionId,
+						sql,
+						params,
+						options,
+					},
+					undefined,
+					signal,
+				),
+			),
+		executeMany: (sql, paramSets, options) =>
+			request({
+				kind: "transaction.executeMany",
+				transactionId,
+				sql,
+				paramSets,
+				options,
+			}),
 		execute: (sql, params, options) =>
 			request({
 				kind: "transaction.execute",
@@ -703,7 +805,12 @@ export class LixWorkerClient {
 		telemetryParent?: TelemetryParentContext,
 		signal?: AbortSignal,
 	): Promise<T> {
-		if (signal?.aborted) return Promise.reject(observerRegistrationCancelledError());
+		if (signal?.aborted)
+			return Promise.reject(
+				operation.kind === "observe"
+					? observerRegistrationCancelledError()
+					: signal.reason,
+			);
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
@@ -711,17 +818,20 @@ export class LixWorkerClient {
 		let controlPending = 0;
 		let observerClosePending = 0;
 		let ordinaryPending = 0;
+		let releasePending = 0;
 		for (const pending of this.pending.values()) {
 			if (pending.category === "control") controlPending++;
 			else if (pending.category === "observer-close") observerClosePending++;
+			else if (pending.category === "release") releasePending++;
 			else ordinaryPending++;
 		}
 		if (
-			this.pending.size >= WORKER_CLIENT_MAX_PENDING ||
+			category !== "release" &&
+			(this.pending.size - releasePending >= WORKER_CLIENT_MAX_PENDING ||
 			(category === "control" && controlPending >= WORKER_CLIENT_MAX_CONTROL_PENDING) ||
 			(category === "observer-close" &&
 				observerClosePending >= WORKER_CLIENT_MAX_OBSERVER_CLOSE_PENDING) ||
-			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING)
+			(category === "ordinary" && ordinaryPending >= WORKER_CLIENT_MAX_ORDINARY_PENDING))
 		) {
 			return Promise.reject(workerQueueFullError());
 		}
@@ -776,6 +886,14 @@ export class LixWorkerClient {
 				};
 				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
 				if (signal.aborted) pendingRequest.abortListener();
+			} else if (this.pending.has(id) && signal && isCancellableRead(operation)) {
+				pendingRequest.abortListener = () => {
+					// The host stops the read in the engine and then settles the
+					// request, so it stays counted until the engine has let go.
+					if (this.pending.has(id))
+						this.notify({ kind: "request.cancel", requestId: id });
+				};
+				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
 			}
 		});
 	}

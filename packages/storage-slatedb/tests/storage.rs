@@ -87,29 +87,21 @@ async fn assert_cached_explicit_directory_transaction() {
         .with_storage(storage.clone())
         .await
         .expect("open cached transaction repository");
-    lix.execute(
-        "INSERT INTO lix_directory (path) VALUES ('/source/empty')",
-        &[],
-    )
-    .await
-    .expect("create directory and empty descendant");
+    lix.execute("INSERT INTO lix_directory (path) VALUES ('/source/empty')")
+        .await
+        .expect("create directory and empty descendant");
     let content = vec![0x61_u8; 128 * 1024];
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ('/source/note.bin', $1)",
-        &[Value::Blob(content.clone().into())],
-    )
-    .await
-    .expect("create file before explicit transaction");
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ('/source/note.bin', $1)")
+        .params(&[Value::Blob(content.clone().into())])
+        .await
+        .expect("create file before explicit transaction");
 
-    let mut transaction = lix
+    let transaction = lix
         .begin_transaction()
         .await
         .expect("begin explicit transaction");
     transaction
-        .execute(
-            "UPDATE lix_directory SET path = '/target' WHERE path = '/source'",
-            &[],
-        )
+        .execute("UPDATE lix_directory SET path = '/target' WHERE path = '/source'")
         .await
         .expect("stage directory move");
     transaction
@@ -117,12 +109,12 @@ async fn assert_cached_explicit_directory_transaction() {
         .await
         .expect("commit cached directory move");
 
-    let mut rollback = lix
+    let rollback = lix
         .begin_transaction()
         .await
         .expect("begin rollback transaction");
     rollback
-        .execute("DELETE FROM lix_directory WHERE path = '/target'", &[])
+        .execute("DELETE FROM lix_directory WHERE path = '/target'")
         .await
         .expect("stage directory deletion");
     rollback
@@ -143,7 +135,8 @@ async fn assert_cached_explicit_directory_transaction() {
         .await
         .expect("cold reopen cached transaction repository");
     let file = reopened
-        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
+        .query("SELECT path, content FROM lix_file ORDER BY path")
+        .all()
         .await
         .expect("read moved file after cold reopen");
     assert_eq!(file.len(), 2);
@@ -157,7 +150,8 @@ async fn assert_cached_explicit_directory_transaction() {
     );
     assert_eq!(file.rows()[1].get::<Vec<u8>>("content").unwrap(), content);
     let directories = reopened
-        .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+        .query("SELECT path FROM lix_directory ORDER BY path")
+        .all()
         .await
         .expect("read empty descendant after cold reopen");
     assert_eq!(
@@ -276,21 +270,20 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         .await
         .expect("open repository");
 
-    lix.execute(
-        "INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))",
-        &[
+    lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, CAST($2 AS BYTEA))")
+        .params(&[
             Value::Text("/adapter.bin".to_string()),
             Value::Text("aé—".to_string()),
-        ],
-    )
-    .await
-    .expect("insert text through an explicit BYTEA cast");
+        ])
+        .await
+        .expect("insert text through an explicit BYTEA cast");
     let lengths = lix
-        .execute(
+        .query(
             "SELECT length(content) AS characters, OCTET_LENGTH(content) AS octets \
              FROM lix_file WHERE path = $1",
-            &[Value::Text("/adapter.bin".to_string())],
         )
+        .params(&[Value::Text("/adapter.bin".to_string())])
+        .all()
         .await
         .expect("read character and byte lengths");
     assert_eq!(
@@ -306,17 +299,16 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         6
     );
 
-    lix.execute(
-        "UPDATE lix_file SET content = $2 WHERE path = $1",
-        &[
+    lix.execute("UPDATE lix_file SET content = $2 WHERE path = $1")
+        .params(&[
             Value::Text("/adapter.bin".to_string()),
             Value::Blob(vec![0xff, 0x00, 0x61].into()),
-        ],
-    )
-    .await
-    .expect("update with a direct binary parameter");
+        ])
+        .await
+        .expect("update with a direct binary parameter");
     let error = lix
-        .execute("SELECT X'41'", &[])
+        .query("SELECT X'41'")
+        .all()
         .await
         .expect_err("legacy SQL hex literals should be rejected");
     assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -331,10 +323,9 @@ async fn file_sql_bytea_hard_cut_roundtrips_after_slatedb_reopen() {
         .await
         .expect("reopen repository");
     let result = lix
-        .execute(
-            "SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1",
-            &[Value::Text("/adapter.bin".to_string())],
-        )
+        .query("SELECT content, OCTET_LENGTH(content) AS octets FROM lix_file WHERE path = $1")
+        .params(&[Value::Text("/adapter.bin".to_string())])
+        .all()
         .await
         .expect("read binary content after reopen");
     assert_eq!(

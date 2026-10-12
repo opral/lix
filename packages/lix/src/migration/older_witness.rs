@@ -934,12 +934,9 @@ mod tests {
             .with_storage(session.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('witness-user','retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('witness-user','retained')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         let mut records = capture(&session, MigrationOptions::default())
             .await
@@ -987,12 +984,9 @@ mod tests {
             .with_storage(session.clone())
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value(key,value) VALUES('native-checkpoint','retained')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value) VALUES('native-checkpoint','retained')")
+            .await
+            .unwrap();
         let checkpoint = lix
             .create_checkpoint()
             .await

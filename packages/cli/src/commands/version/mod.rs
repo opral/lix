@@ -7,7 +7,7 @@ use crate::cli::version::{VersionCommand, VersionSubcommand};
 use crate::db::LocalLix;
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix::{ExecuteResult, Row as LixRow, Value};
+use lix::{QueryResult, Row as LixRow, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VersionLookup<'a> {
@@ -46,10 +46,11 @@ pub(super) fn resolve_active_version_ref(lix: &LocalLix) -> Result<ResolvedVersi
 }
 
 fn resolve_version_by_id(lix: &LocalLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
-    let result = crate::db::block_on(lix.execute(
-        "SELECT id, name FROM lix_branch WHERE id = $1 LIMIT 1",
-        &[Value::Text(id.to_string())],
-    ))
+    let result = crate::db::block_on(
+        lix.query("SELECT id, name FROM lix_branch WHERE id = $1 LIMIT 1")
+            .params(&[Value::Text(id.to_string())])
+            .all(),
+    )
     .map_err(|error| CliError::msg(error.to_string()))?;
     let rows = statement_rows(&result)?;
     let Some(row) = rows.first() else {
@@ -63,10 +64,11 @@ fn resolve_version_by_id(lix: &LocalLix, id: &str) -> Result<ResolvedVersionRef,
 }
 
 fn resolve_version_by_name(lix: &LocalLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
-    let result = crate::db::block_on(lix.execute(
-        "SELECT id, name FROM lix_branch WHERE name = $1 ORDER BY id",
-        &[Value::Text(name.to_string())],
-    ))
+    let result = crate::db::block_on(
+        lix.query("SELECT id, name FROM lix_branch WHERE name = $1 ORDER BY id")
+            .params(&[Value::Text(name.to_string())])
+            .all(),
+    )
     .map_err(|error| CliError::msg(error.to_string()))?;
     let rows = statement_rows(&result)?;
     match rows {
@@ -91,7 +93,7 @@ fn resolve_version_by_name(lix: &LocalLix, name: &str) -> Result<ResolvedVersion
 }
 
 #[expect(clippy::unnecessary_wraps)]
-fn statement_rows(result: &ExecuteResult) -> Result<&[LixRow], CliError> {
+fn statement_rows(result: &QueryResult) -> Result<&[LixRow], CliError> {
     Ok(result.rows())
 }
 
@@ -113,7 +115,7 @@ mod tests {
     use crate::app::AppContext;
     use crate::cli::version::{CreateVersionCommand, MergeVersionCommand, SwitchVersionCommand};
     use crate::db::{init_lix_at, open_lix_at};
-    use lix::{CreateBranchOptions, ExecuteResult, Value};
+    use lix::{CreateBranchOptions, QueryResult, Value};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,7 +134,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
-    fn text_at(result: &ExecuteResult, row: usize, col: usize) -> String {
+    fn text_at(result: &QueryResult, row: usize, col: usize) -> String {
         match result.rows().get(row).and_then(|row| row.get_index(col)) {
             Some(Value::Text(value)) => {
                 serde_json::from_str::<String>(value).unwrap_or_else(|_| value.clone())
@@ -169,10 +171,9 @@ mod tests {
         };
 
         let lix = open_lix_at(&path).expect("initial open should succeed");
-        crate::db::block_on(lix.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('greeting', 'hello')",
-            &[],
-        ))
+        crate::db::block_on(
+            lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('greeting', 'hello')"),
+        )
         .expect("main insert should succeed");
 
         create::run(
@@ -199,13 +200,13 @@ mod tests {
         let lix = open_lix_at(&path).expect("open on feature should succeed");
         crate::db::block_on(lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('feature_key', 'feature_val')",
-            &[],
         ))
         .expect("feature insert should succeed");
 
         let lix = open_lix_at(&path).expect("open for id lookup should succeed");
         let main_id_result = crate::db::block_on(
-            lix.execute("SELECT id FROM lix_branch WHERE name = 'main' LIMIT 1", &[]),
+            lix.query("SELECT id FROM lix_branch WHERE name = 'main' LIMIT 1")
+                .all(),
         )
         .expect("main id lookup should succeed");
         let main_id = text_at(&main_id_result, 0, 0);
@@ -222,7 +223,7 @@ mod tests {
         .expect("fast-forward merge should succeed");
 
         let reopened = open_lix_at(&path).expect("database should reopen after fast-forward merge");
-        let select_result = crate::db::block_on(reopened.execute("SELECT 1", &[]))
+        let select_result = crate::db::block_on(reopened.query("SELECT 1").all())
             .expect("reopened query should succeed");
         assert_eq!(text_at(&select_result, 0, 0), "1");
 
@@ -235,10 +236,11 @@ mod tests {
         )
         .expect("switch back to main should succeed");
         let reopened = open_lix_at(&path).expect("main reopen should succeed");
-        let feature_result = crate::db::block_on(reopened.execute(
-            "SELECT value FROM lix_key_value WHERE key = 'feature_key' LIMIT 1",
-            &[],
-        ))
+        let feature_result = crate::db::block_on(
+            reopened
+                .query("SELECT value FROM lix_key_value WHERE key = 'feature_key' LIMIT 1")
+                .all(),
+        )
         .expect("feature key query should succeed");
         assert_eq!(text_at(&feature_result, 0, 0), "feature_val");
 

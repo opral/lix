@@ -100,5 +100,5 @@ async fn terminal_error_preserves_pending_edits(mismatch: LixError) {
         .sync_mode()
         .admit_partial_replica(state, crate::sync::partial_replica_write_capability());
     assert!(value(fresh.execute(select, &[]).await.unwrap()).contains("pending"));
-    assert!(value(authority.execute(select, &[]).await.unwrap()).contains("before"));
+    assert!(value(authority.query(select).all().await.unwrap()).contains("before"));
 }

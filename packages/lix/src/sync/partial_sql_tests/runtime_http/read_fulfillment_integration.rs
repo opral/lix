@@ -221,13 +221,11 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
         })
         .collect::<Vec<_>>();
     authority
-        .execute(
-            "INSERT INTO lix_file(path,content) VALUES('/pinned.bin',$1),('/tx.bin',$2)",
-            &[
-                Value::Blob(old_content.clone().into()),
-                Value::Blob(vec![19u8; 512 * 1024].into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file(path,content) VALUES('/pinned.bin',$1),('/tx.bin',$2)")
+        .params(&[
+            Value::Blob(old_content.clone().into()),
+            Value::Blob(vec![19u8; 512 * 1024].into()),
+        ])
         .await
         .unwrap();
 
@@ -306,7 +304,7 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
@@ -335,10 +333,7 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
         .await
         .expect("partial replica should open an independent global-branch session");
     let default_branch = global_session
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = $1 AND lixcol_file_id IS NULL AND lixcol_untracked = false",
-            &[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key = $1 AND lixcol_file_id IS NULL AND lixcol_untracked = false").params(&[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())]).all()
         .await
         .expect("global session should hydrate the repository default branch");
     assert_eq!(default_branch.rows().len(), 1);
@@ -377,10 +372,11 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     // query is cold; the second query remains pinned after the authority
     // advances, and a staged write must still shadow both reads locally.
     let tx_content = vec![19u8; 512 * 1024];
-    let mut transaction = replica.begin_transaction().await.unwrap();
+    let transaction = replica.begin_transaction().await.unwrap();
     log.lock().unwrap().clear();
     let first = transaction
-        .execute("SELECT content FROM lix_file WHERE path='/tx.bin'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/tx.bin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -410,7 +406,8 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
     .await;
 
     let second = transaction
-        .execute("SELECT content FROM lix_file WHERE path='/tx.bin'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/tx.bin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -423,14 +420,13 @@ async fn cold_global_session_and_ranged_reads_use_read_fulfillment() {
         "the HydratedInputs receipt must make the second transaction read local"
     );
     transaction
-        .execute(
-            "UPDATE lix_file SET content=$1 WHERE path='/tx.bin'",
-            &[Value::Blob(b"transaction pending".to_vec().into())],
-        )
+        .execute("UPDATE lix_file SET content=$1 WHERE path='/tx.bin'")
+        .params(&[Value::Blob(b"transaction pending".to_vec().into())])
         .await
         .unwrap();
     let staged = transaction
-        .execute("SELECT content FROM lix_file WHERE path='/tx.bin'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/tx.bin'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -551,20 +547,15 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     let mut checkpoint_ids = Vec::new();
     for index in 0..4 {
         authority
-            .execute(
-                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
-                &[
-                    Value::Text(format!("/conversation-checkpoint-{index}.txt")),
-                    Value::Blob(format!("checkpoint {index}").into_bytes().into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file(path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/conversation-checkpoint-{index}.txt")),
+                Value::Blob(format!("checkpoint {index}").into_bytes().into()),
+            ])
             .await
             .unwrap();
         let checkpoint_id = authority
-            .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-                &[],
-            )
+            .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
             .await
             .unwrap()
             .rows()[0]
@@ -574,12 +565,12 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
             .execute(
                 "INSERT INTO lix_conversation (id, target, title, lixcol_global) \
                  VALUES ($1, lix_row_ref('lix_commit', NULL, $2), $3, true)",
-                &[
-                    Value::Text(CONVERSATION_IDS[index].to_owned()),
-                    Value::Text(checkpoint_id.clone()),
-                    Value::Text(format!("Qualification {index}")),
-                ],
             )
+            .params(&[
+                Value::Text(CONVERSATION_IDS[index].to_owned()),
+                Value::Text(checkpoint_id.clone()),
+                Value::Text(format!("Qualification {index}")),
+            ])
             .await
             .unwrap();
         checkpoint_ids.push(checkpoint_id);
@@ -590,27 +581,19 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     // useful decoys: authority candidate scans may be broader, but SQL's
     // residual predicates must still define the result.
     authority
-        .execute(
-            "INSERT INTO lix_file(path, content) VALUES ('/conversation-outside-range.txt', CAST('outside' AS BYTEA))",
-            &[],
-        )
+        .execute("INSERT INTO lix_file(path, content) VALUES ('/conversation-outside-range.txt', CAST('outside' AS BYTEA))")
         .await
         .unwrap();
     let outside_checkpoint = authority
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-            &[],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     let local_file_id = authority
-        .execute(
-            "SELECT id FROM lix_file WHERE path = '/conversation-checkpoint-0.txt'",
-            &[],
-        )
+        .query("SELECT id FROM lix_file WHERE path = '/conversation-checkpoint-0.txt'")
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -621,13 +604,13 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
             "INSERT INTO lix_conversation (id, target, title, lixcol_global) \
              VALUES ($1, lix_row_ref('lix_commit', NULL, $2), 'Outside qualification', true), \
                     ($3, lix_row_ref('lix_file', NULL, $4), 'Local decoy', false)",
-            &[
-                Value::Text(OUTSIDE_CONVERSATION_ID.to_owned()),
-                Value::Text(outside_checkpoint),
-                Value::Text(LOCAL_CONVERSATION_ID.to_owned()),
-                Value::Text(local_file_id),
-            ],
         )
+        .params(&[
+            Value::Text(OUTSIDE_CONVERSATION_ID.to_owned()),
+            Value::Text(outside_checkpoint),
+            Value::Text(LOCAL_CONVERSATION_ID.to_owned()),
+            Value::Text(local_file_id),
+        ])
         .await
         .unwrap();
 
@@ -652,7 +635,7 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
         .cloned()
         .map(Value::Text)
         .collect::<Vec<_>>();
-    let authority_rows = authority.execute(query, &params).await.unwrap();
+    let authority_rows = authority.query(query).params(&params).all().await.unwrap();
     assert_eq!(authority_rows.rows().len(), 4);
     let expected = checkpoint_ids
         .iter()
@@ -684,17 +667,14 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
         "unique": [["ordinal"]]
     });
     authority
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
-            &[Value::Text(serde_json::to_string(&range_schema).unwrap())],
-        )
+        .execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))")
+        .params(&[Value::Text(serde_json::to_string(&range_schema).unwrap())])
         .await
         .unwrap();
     authority
         .execute(
             "INSERT INTO candidate_range_probe (id, ordinal) VALUES \
              ('below', -1), ('first', 0), ('middle', 1), ('last', 2), ('above', 3)",
-            &[],
         )
         .await
         .unwrap();
@@ -769,7 +749,7 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
             );
             storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
             let worker_storage = storage;
             let worker_state = state;
             let worker_transport = transport.clone();
@@ -794,7 +774,9 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     let (replica, worker) = open_cold_replica(log.clone()).await;
 
     let rows = replica
-        .execute(query, &params)
+        .query(query)
+        .params(&params)
+        .all()
         .await
         .expect("cold sparse target-IN query should hydrate its global conversations");
     let results = rows
@@ -849,7 +831,9 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     let (limited_replica, limited_worker) = open_cold_replica(limited_log.clone()).await;
     let limited_query = format!("{query} LIMIT 4");
     let limited_rows = limited_replica
-        .execute(&limited_query, &params)
+        .query(&limited_query)
+        .params(&params)
+        .all()
         .await
         .expect("cold target-IN query with LIMIT should hydrate its candidates");
     let limited_results = limited_rows
@@ -871,7 +855,7 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     // Exercise a genuine declared-column range on another empty replica.
     let range_query = "SELECT id FROM candidate_range_probe \
                        WHERE ordinal BETWEEN 0 AND 2 ORDER BY id";
-    let authority_range = authority.execute(range_query, &[]).await.unwrap();
+    let authority_range = authority.query(range_query).all().await.unwrap();
     let expected_range = authority_range
         .rows()
         .iter()
@@ -881,7 +865,8 @@ async fn cold_sparse_checkpoint_conversations_hydrate_through_target_in_scan() {
     let range_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (range_replica, range_worker) = open_cold_replica(range_log.clone()).await;
     let range_rows = range_replica
-        .execute(range_query, &[])
+        .query(range_query)
+        .all()
         .await
         .expect("cold indexed integer range should hydrate its candidates");
     let range_results = range_rows
@@ -996,7 +981,7 @@ async fn run_production_cold_global_probe(
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
     let worker_transport = transport.clone();
@@ -1021,10 +1006,7 @@ async fn run_production_cold_global_probe(
             .await?;
         let mut first_error = None;
         let default_branch = global
-            .execute(
-                "SELECT value FROM lix_key_value WHERE key = $1 AND lixcol_file_id IS NULL AND lixcol_untracked = false",
-                &[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())],
-            )
+            .query("SELECT value FROM lix_key_value WHERE key = $1 AND lixcol_file_id IS NULL AND lixcol_untracked = false").params(&[Value::Text(crate::init::DEFAULT_BRANCH_KEY.to_owned())]).all()
             .await;
         match default_branch {
             Ok(rows) if rows.rows().len() == 1 => {
@@ -1046,10 +1028,7 @@ async fn run_production_cold_global_probe(
             }
         }
         let account_rows = global
-            .execute(
-                "SELECT id FROM lix_account WHERE lixcol_untracked = false LIMIT 10",
-                &[],
-            )
+            .query("SELECT id FROM lix_account WHERE lixcol_untracked = false LIMIT 10").all()
             .await;
         match account_rows {
             Ok(rows) => eprintln!("production_probe global_accounts=ok rows={}", rows.rows().len()),
@@ -1124,15 +1103,12 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
     let large_bytes = vec![0x19; 300 * 1024];
     let small_bytes = vec![0x5a; 16 * 1024];
     authority
-        .execute(
-            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)",
-            &[
+        .execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/preview-large', $2), ($3, '/preview-small', $4)").params(&[
                 Value::Text(large_id.into()),
                 Value::Blob(large_bytes.clone().into()),
                 Value::Text(small_id.into()),
                 Value::Blob(small_bytes.clone().into()),
-            ],
-        )
+            ])
         .await
         .unwrap();
     let large_blob_id = crate::binary_cas::BlobId::from_content(&large_bytes).to_hex();
@@ -1203,7 +1179,7 @@ async fn bounded_preview_and_native_diagnostic_queries_work_over_partial_http() 
         crate::sync::partial_replica_write_capability(),
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+    let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
     let replica = Lix::from_partial_engine_for_test(Arc::clone(&engine), session, sender);
     let worker_storage = storage.clone();
     let worker_state = state.clone();
@@ -1309,19 +1285,17 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         // Several commits between checkpoints expose multiple dependency layers.
         for edit in 0..3 {
             authority
-                .execute(
-                    "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
-                    &[
-                        Value::Text(format!(
-                            "/bounded-history/checkpoint-{checkpoint}/{edit}.txt"
-                        )),
-                        Value::Blob(
-                            format!("checkpoint {checkpoint} edit {edit}")
-                                .into_bytes()
-                                .into(),
-                        ),
-                    ],
-                )
+                .execute("INSERT INTO lix_file(path, content) VALUES ($1, $2)")
+                .params(&[
+                    Value::Text(format!(
+                        "/bounded-history/checkpoint-{checkpoint}/{edit}.txt"
+                    )),
+                    Value::Blob(
+                        format!("checkpoint {checkpoint} edit {edit}")
+                            .into_bytes()
+                            .into(),
+                    ),
+                ])
                 .await
                 .unwrap();
         }
@@ -1329,20 +1303,16 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     }
     let mixed_conversation_id = uuid::Uuid::now_v7().to_string();
     authority
-        .execute(
-            "INSERT INTO lix_conversation(id, target, title, lixcol_global) VALUES ($1, lix_row_ref('lix_commit', NULL, $2), 'Mixed History recovery', true)",
-            &[
+        .execute("INSERT INTO lix_conversation(id, target, title, lixcol_global) VALUES ($1, lix_row_ref('lix_commit', NULL, $2), 'Mixed History recovery', true)").params(&[
                 Value::Text(mixed_conversation_id.clone()),
                 Value::Text(checkpoint_ids.last().unwrap().clone()),
-            ],
-        )
+            ])
         .await
         .unwrap();
     let mixed_conversation_change_id = authority
-        .execute(
-            "SELECT lixcol_change_id FROM lix_conversation WHERE id = $1",
-            &[Value::Text(mixed_conversation_id.clone())],
-        )
+        .query("SELECT lixcol_change_id FROM lix_conversation WHERE id = $1")
+        .params(&[Value::Text(mixed_conversation_id.clone())])
+        .all()
         .await
         .unwrap()
         .rows()[0]
@@ -1366,10 +1336,10 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let params = std::iter::once(Value::Text(selected[0].clone()))
         .chain(selected.iter().cloned().map(Value::Text))
         .collect::<Vec<_>>();
-    let expected = authority.execute(&sql, &params).await.unwrap();
-    let values = |result: &ExecuteResult| {
+    let expected = authority.query(&sql).params(&params).all().await.unwrap();
+    let values = |result: &dyn crate::test_support::ResultRows| {
         result
-            .rows()
+            .result_rows()
             .iter()
             .map(|row| {
                 (
@@ -1462,7 +1432,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
             );
             storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(16);
+            let (sender, mut receiver) = crate::sync::sync_demand_channel(16);
             let worker_storage = storage.clone();
             let worker_state = state.clone();
             let worker_transport = transport.clone();
@@ -1487,7 +1457,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let (replica, worker, ..) = open_cold_replica(log.clone()).await;
     log.lock().unwrap().clear();
     let started = Instant::now();
-    let cold = replica.execute(&sql, &params).await.unwrap();
+    let cold = replica.query(&sql).params(&params).all().await.unwrap();
     assert_eq!(values(&cold), values(&expected));
     let requests = log.lock().unwrap().clone();
     let physical = requests
@@ -1515,7 +1485,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         })
     );
     log.lock().unwrap().clear();
-    let warm = replica.execute(&sql, &params).await.unwrap();
+    let warm = replica.query(&sql).params(&params).all().await.unwrap();
     assert_eq!(values(&warm), values(&expected));
     assert!(
         log.lock().unwrap().is_empty(),
@@ -1543,12 +1513,13 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // one range request per missing commit/mutation object.
     let fixed_to = checkpoint_ids.last().unwrap().clone();
     let parent_rows = authority
-        .execute(
+        .query(
             "SELECT lixcol_from_commit_id AS parent_commit_id \
              FROM lix_history('lix_file', $1) \
              WHERE lixcol_to_commit_id = $1 LIMIT 1",
-            &[Value::Text(fixed_to.clone())],
         )
+        .params(&[Value::Text(fixed_to.clone())])
+        .all()
         .await
         .unwrap();
     let fixed_from = parent_rows.rows()[0]
@@ -1559,13 +1530,15 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
          ORDER BY coalesce(to_path, from_path), id";
     let fixed_diff_params = [Value::Text(fixed_from), Value::Text(fixed_to)];
     let fixed_diff_expected = authority
-        .execute(&fixed_diff_sql, &fixed_diff_params)
+        .query(&fixed_diff_sql)
+        .params(&fixed_diff_params)
+        .all()
         .await
         .unwrap();
     assert!(!fixed_diff_expected.rows().is_empty());
-    let diff_values = |result: &ExecuteResult| {
+    let diff_values = |result: &dyn crate::test_support::ResultRows| {
         result
-            .rows()
+            .result_rows()
             .iter()
             .map(|row| {
                 (
@@ -1585,7 +1558,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         diff_log.lock().unwrap().clear();
         let started = Instant::now();
         let diff_rows = diff_replica
-            .execute(&fixed_diff_sql, &fixed_diff_params)
+            .query(&fixed_diff_sql)
+            .params(&fixed_diff_params)
+            .all()
             .await
             .unwrap();
         let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1619,7 +1594,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         );
         diff_log.lock().unwrap().clear();
         let warm = diff_replica
-            .execute(&fixed_diff_sql, &fixed_diff_params)
+            .query(&fixed_diff_sql)
+            .params(&fixed_diff_params)
+            .all()
             .await
             .unwrap();
         assert_eq!(diff_values(&warm), diff_values(&fixed_diff_expected));
@@ -1637,14 +1614,18 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // error.
     let reverse_diff_params = [fixed_diff_params[1].clone(), fixed_diff_params[0].clone()];
     let reverse_diff_expected = authority
-        .execute(&fixed_diff_sql, &reverse_diff_params)
+        .query(&fixed_diff_sql)
+        .params(&reverse_diff_params)
+        .all()
         .await
         .unwrap();
     let reverse_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (reverse_replica, reverse_worker, ..) = open_cold_replica(reverse_log.clone()).await;
     reverse_log.lock().unwrap().clear();
     let reverse_rows = reverse_replica
-        .execute(&fixed_diff_sql, &reverse_diff_params)
+        .query(&fixed_diff_sql)
+        .params(&reverse_diff_params)
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -1677,13 +1658,20 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // directory identities rather than file IDs. Each checkpoint introduced
     // one directory, so this exercises actual rows rather than an empty scan.
     let directory_sql = sql.replace("'lix_file'", "'lix_directory'");
-    let directory_expected = authority.execute(&directory_sql, &params).await.unwrap();
+    let directory_expected = authority
+        .query(&directory_sql)
+        .params(&params)
+        .all()
+        .await
+        .unwrap();
     assert_eq!(directory_expected.rows().len(), 10);
     let directory_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (directory_replica, directory_worker, ..) = open_cold_replica(directory_log.clone()).await;
     directory_log.lock().unwrap().clear();
     let directory_rows = directory_replica
-        .execute(&directory_sql, &params)
+        .query(&directory_sql)
+        .params(&params)
+        .all()
         .await
         .unwrap();
     assert_eq!(values(&directory_rows), values(&directory_expected));
@@ -1699,7 +1687,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     assert_eq!(
         values(
             &directory_replica
-                .execute(&directory_sql, &params)
+                .query(&directory_sql)
+                .params(&params)
+                .all()
                 .await
                 .unwrap()
         ),
@@ -1724,7 +1714,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     )
     .await;
     pinned_log.lock().unwrap().clear();
-    let pinned_rows = pinned.execute(&sql, &params).await.unwrap();
+    let pinned_rows = pinned.query(&sql).params(&params).all().await.unwrap();
     assert_eq!(values(&pinned_rows), values(&expected));
     assert!(
         pinned_rows
@@ -1744,7 +1734,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     pinned_log.lock().unwrap().clear();
     assert_eq!(
-        values(&pinned.execute(&sql, &params).await.unwrap()),
+        values(&pinned.query(&sql).params(&params).all().await.unwrap()),
         values(&expected)
     );
     assert!(pinned_log.lock().unwrap().is_empty());
@@ -1758,7 +1748,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let (historical, historical_worker, ..) = open_cold_replica(historical_log.clone()).await;
     historical_log.lock().unwrap().clear();
     assert_eq!(
-        values(&historical.execute(&sql, &params).await.unwrap()),
+        values(&historical.query(&sql).params(&params).all().await.unwrap()),
         values(&expected)
     );
     assert_eq!(
@@ -1777,14 +1767,15 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let (advancing, advancing_worker, _, advancing_state, _, _) =
         open_cold_replica(advancing_log.clone()).await;
     advancing
-        .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+        .query("SELECT id, path FROM lix_file ORDER BY path")
+        .all()
         .await
         .unwrap();
     advancing
         .execute(
             "INSERT INTO lix_file(path, content) VALUES ('/unpublished-history-anchor.txt', $1)",
-            &[Value::Blob(b"unpublished anchor".to_vec().into())],
         )
+        .params(&[Value::Blob(b"unpublished anchor".to_vec().into())])
         .await
         .unwrap();
     let unpublished_anchor = advancing.create_checkpoint().await.unwrap().commit_id;
@@ -1797,7 +1788,12 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .chain(selected.iter().cloned().map(Value::Text))
         .collect::<Vec<_>>();
     advancing_log.lock().unwrap().clear();
-    let advancing_rows = advancing.execute(&sql, &advancing_params).await.unwrap();
+    let advancing_rows = advancing
+        .query(&sql)
+        .params(&advancing_params)
+        .all()
+        .await
+        .unwrap();
     assert_eq!(values(&advancing_rows), values(&expected));
     let advancing_requests = fulfillment_requests(&advancing_log);
     assert_eq!(
@@ -1842,7 +1838,14 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     advancing_log.lock().unwrap().clear();
     assert_eq!(
-        values(&advancing.execute(&sql, &advancing_params).await.unwrap()),
+        values(
+            &advancing
+                .query(&sql)
+                .params(&advancing_params)
+                .all()
+                .await
+                .unwrap()
+        ),
         values(&expected)
     );
     assert!(advancing_log.lock().unwrap().is_empty());
@@ -1855,14 +1858,13 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     let private_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (private, private_worker, ..) = open_cold_replica(private_log.clone()).await;
     private
-        .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+        .query("SELECT id, path FROM lix_file ORDER BY path")
+        .all()
         .await
         .unwrap();
     private
-        .execute(
-            "INSERT INTO lix_file(path, content) VALUES ('/private-history.txt', $1)",
-            &[Value::Blob(b"local checkpoint".to_vec().into())],
-        )
+        .execute("INSERT INTO lix_file(path, content) VALUES ('/private-history.txt', $1)")
+        .params(&[Value::Blob(b"local checkpoint".to_vec().into())])
         .await
         .unwrap();
     let private_checkpoint = private.create_checkpoint().await.unwrap().commit_id;
@@ -1873,7 +1875,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .collect::<Vec<_>>();
     private_log.lock().unwrap().clear();
     let private_rows = private
-        .execute(&private_sql, &private_params)
+        .query(&private_sql)
+        .params(&private_params)
+        .all()
         .await
         .unwrap();
     let private_values = values(&private_rows);
@@ -1925,7 +1929,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     assert_eq!(
         values(
             &private
-                .execute(&private_sql, &private_params)
+                .query(&private_sql)
+                .params(&private_params)
+                .all()
                 .await
                 .unwrap()
         ),
@@ -2049,10 +2055,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     mixed_log.lock().unwrap().clear();
     let recovered = mixed
-        .execute(
-            "SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false",
-            &[Value::Text(mixed_conversation_id.clone())],
-        )
+        .query("SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false")
+        .params(&[Value::Text(mixed_conversation_id.clone())])
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -2213,10 +2218,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     overflow_log.lock().unwrap().clear();
     assert_eq!(
         overflow
-            .execute(
-                "SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false",
-                &[Value::Text(mixed_conversation_id)],
-            )
+            .query("SELECT title FROM lix_conversation WHERE id = $1 AND lixcol_untracked = false")
+            .params(&[Value::Text(mixed_conversation_id)])
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -2238,8 +2242,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     // Compare against the preexisting count so fixture setup cannot hide a
     // change already present in the working set.
     let working_diff_sql = "SELECT count(*) AS file_count FROM lix_diff('lix_file')";
-    let authority_working_count =
-        |result: &ExecuteResult| result.rows()[0].get::<i64>("file_count").unwrap();
+    let authority_working_count = |result: &dyn crate::test_support::ResultRows| {
+        result.result_rows()[0].get::<i64>("file_count").unwrap()
+    };
     let before_working_edits =
         authority_execute(&server, authority.lix_id(), working_diff_sql, &[]).await;
     let before_count = authority_working_count(&before_working_edits);
@@ -2276,10 +2281,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     ) = open_cold_replica(working_log.clone()).await;
     working_log.lock().unwrap().clear();
     let working_started = Instant::now();
-    let cold_working = working_replica
-        .execute(working_diff_sql, &[])
-        .await
-        .unwrap();
+    let cold_working = working_replica.query(working_diff_sql).all().await.unwrap();
     let cold_working_count = authority_working_count(&cold_working);
     assert_eq!(cold_working_count, expected_working_count);
     let working_requests = working_log.lock().unwrap().clone();
@@ -2324,12 +2326,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     assert_eq!(working_pointer_calls, 0);
     working_log.lock().unwrap().clear();
     assert_eq!(
-        authority_working_count(
-            &working_replica
-                .execute(working_diff_sql, &[])
-                .await
-                .unwrap()
-        ),
+        authority_working_count(&working_replica.query(working_diff_sql).all().await.unwrap()),
         expected_working_count
     );
     assert!(
@@ -2350,8 +2347,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         )
         .await;
         selected_file_ids.push(
-            selected_file
-                .rows()[0]
+            selected_file.rows()[0]
                 .get::<String>("id")
                 .unwrap()
                 .to_owned(),
@@ -2412,11 +2408,17 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .cloned()
         .map(Value::Text)
         .collect::<Vec<_>>();
-    let exact_values = |result: &ExecuteResult| {
-        result.rows().iter().map(|row| (
-            row.get::<String>("id").unwrap(),
-            row.get::<String>("diff_type").unwrap(),
-        )).collect::<Vec<_>>()
+    let exact_values = |result: &dyn crate::test_support::ResultRows| {
+        result
+            .result_rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("id").unwrap(),
+                    row.get::<String>("diff_type").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
     };
     let exact_working_expected = authority_execute(
         &server,
@@ -2426,21 +2428,20 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     )
     .await;
     let exact_log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (
-        exact_replica,
-        exact_worker,
-        exact_storage,
-        exact_state,
-        _exact_transport,
-        _exact_engine,
-    ) = open_cold_replica_with_delay(exact_log.clone(), 100).await;
+    let (exact_replica, exact_worker, exact_storage, exact_state, _exact_transport, _exact_engine) =
+        open_cold_replica_with_delay(exact_log.clone(), 100).await;
     exact_log.lock().unwrap().clear();
     let exact_started = Instant::now();
     let exact_working = exact_replica
-        .execute(exact_working_diff_sql, &exact_working_diff_params)
+        .query(exact_working_diff_sql)
+        .params(&exact_working_diff_params)
+        .all()
         .await
         .unwrap();
-    assert_eq!(exact_values(&exact_working), exact_values(&exact_working_expected));
+    assert_eq!(
+        exact_values(&exact_working),
+        exact_values(&exact_working_expected)
+    );
     assert!(
         exact_started.elapsed() < std::time::Duration::from_secs(3),
         "exact selected-head diff should close under a held 100ms network"
@@ -2475,18 +2476,16 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .head
         .row_pk_index_root_id
         .expect("selected fixture head has a row-PK root");
-    let root_key = StorageKey(bytes::Bytes::copy_from_slice(
-        &selected_head_row_pk_root,
-    ));
+    let root_key = StorageKey(bytes::Bytes::copy_from_slice(&selected_head_row_pk_root));
     let read = exact_storage.begin_read(Default::default()).await.unwrap();
     let root_values = PointReadPlan::new(
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         std::slice::from_ref(&root_key),
     )
-        .materialize(&read, Default::default())
-        .await
-        .unwrap()
-        .value;
+    .materialize(&read, Default::default())
+    .await
+    .unwrap()
+    .value;
     assert!(
         root_values.first().is_some_and(|value| value.is_some()),
         "exact diff closure must retain its selected-head row-PK root"
@@ -2496,7 +2495,9 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     assert_eq!(
         exact_values(
             &exact_replica
-                .execute(exact_working_diff_sql, &exact_working_diff_params)
+                .query(exact_working_diff_sql)
+                .params(&exact_working_diff_params)
+                .all()
                 .await
                 .unwrap()
         ),
@@ -2567,10 +2568,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
         .partial_admission()
         .expect("normal candidate publication keeps replica admission");
     assert_eq!(adopted.descriptor().cursor, next_cursor);
-    let candidate_rows = working_replica
-        .execute(working_diff_sql, &[])
-        .await
-        .unwrap();
+    let candidate_rows = working_replica.query(working_diff_sql).all().await.unwrap();
     assert_eq!(
         authority_working_count(&candidate_rows),
         next_expected_count,
@@ -2616,12 +2614,7 @@ async fn bounded_checkpoint_file_history_discovers_native_closure() {
     );
     working_log.lock().unwrap().clear();
     assert_eq!(
-        authority_working_count(
-            &working_replica
-                .execute(working_diff_sql, &[])
-                .await
-                .unwrap()
-        ),
+        authority_working_count(&working_replica.query(working_diff_sql).all().await.unwrap()),
         next_expected_count
     );
     assert!(working_log.lock().unwrap().is_empty());

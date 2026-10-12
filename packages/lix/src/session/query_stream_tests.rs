@@ -1,0 +1,938 @@
+//! Behavior of `Query::stream` against the buffered read path.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use crate::common::public_row_bytes;
+use crate::session::PageLimits;
+use crate::storage::{
+    BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, MemoryRead, MemoryWrite,
+    ReadOptions, ScanCursor, Storage, StorageError, StorageRead, StorageSessionToken, StorageSpace,
+    WriteOptions,
+};
+use crate::{Lix, LixError, Memory, Row, RowStream, Value, open_lix};
+
+/// Memory storage that counts live read views, so tests can prove a stream
+/// releases its pinned snapshot.
+#[derive(Clone, Debug, Default)]
+struct CountingStorage {
+    inner: Memory,
+    live_reads: Arc<AtomicUsize>,
+    opened_reads: Arc<AtomicUsize>,
+    /// Point and scan requests fail with `ReadExpired` while this is nonzero;
+    /// each failure consumes one.
+    expiring_requests: Arc<AtomicUsize>,
+    /// While set, point and scan requests of read views opened before
+    /// `stall_before` wait; newer views (other operations) are unaffected.
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    stall_before: Arc<AtomicUsize>,
+}
+
+impl CountingStorage {
+    /// Stalls every read view opened so far.
+    fn stall_open_reads(&self) {
+        self.stall_before
+            .store(self.opened_reads.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.stalled.store(true, Ordering::SeqCst);
+    }
+}
+
+struct CountingRead {
+    inner: MemoryRead,
+    live_reads: Arc<AtomicUsize>,
+    expiring_requests: Arc<AtomicUsize>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    stall_before: Arc<AtomicUsize>,
+    ordinal: usize,
+}
+
+impl CountingRead {
+    async fn stall(&self) {
+        while self.stalled.load(Ordering::SeqCst)
+            && self.ordinal < self.stall_before.load(Ordering::SeqCst)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn expire(&self) -> Result<(), StorageError> {
+        let expired = self
+            .expiring_requests
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        if expired {
+            return Err(StorageError::ReadExpired);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CountingRead {
+    fn drop(&mut self) {
+        self.live_reads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl StorageRead for CountingRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.inner.snapshot_cache_key()
+    }
+
+    async fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> Result<GetManyResult, StorageError> {
+        self.stall().await;
+        self.expire()?;
+        self.inner.get_many(requests).await
+    }
+
+    async fn get_many_bounded(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        budget: crate::storage::ReadBudget,
+    ) -> Result<GetManyResult, StorageError> {
+        self.inner.get_many_bounded(requests, budget).await
+    }
+
+    async fn get_many_bounded_prefix(
+        &self,
+        requests: &[GetManyRequest<'_>],
+        offset: usize,
+        max_slots: usize,
+        budget: crate::storage::ReadBudget,
+    ) -> Result<crate::storage::GetManyPrefixResult, StorageError> {
+        self.inner
+            .get_many_bounded_prefix(requests, offset, max_slots, budget)
+            .await
+    }
+
+    async fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> Result<ScanCursor<'_>, StorageError> {
+        self.stall().await;
+        self.expire()?;
+        self.inner.begin_scan(space, range, opts).await
+    }
+}
+
+impl Storage for CountingStorage {
+    type Read<'a>
+        = CountingRead
+    where
+        Self: 'a;
+    type Write<'a>
+        = MemoryWrite
+    where
+        Self: 'a;
+
+    async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
+        self.inner.acquire_session().await
+    }
+
+    async fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
+        self.inner.acquire_partial_replica_owner(token).await
+    }
+
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        let inner = self.inner.begin_read(opts).await?;
+        self.live_reads.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.opened_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(CountingRead {
+            inner,
+            live_reads: Arc::clone(&self.live_reads),
+            expiring_requests: Arc::clone(&self.expiring_requests),
+            stalled: Arc::clone(&self.stalled),
+            stall_before: Arc::clone(&self.stall_before),
+            ordinal,
+        })
+    }
+
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        self.inner.begin_write(opts).await
+    }
+}
+
+async fn register_schema(
+    lix: &Lix<impl Storage + Clone + Send + Sync + 'static>,
+    key: &str,
+    columns: &str,
+) {
+    lix.execute(&format!(
+            "INSERT INTO lix_registered_schema (value) VALUES (CAST('{{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+             \"key\":\"{key}\",\"columns\":[{columns}],\"primary_key\":[\"id\"]}}' AS JSONB))"
+        ))
+    .await
+    .unwrap_or_else(|error| panic!("register {key}: {error:?}"));
+}
+
+const ITEMS: usize = 1_500;
+const TAGS: usize = 900;
+
+/// `item(id, grp, label, payload)` and `tag(id, item_id, name)`.
+async fn seeded<S>(storage: S) -> Lix<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let lix = open_lix().with_storage(storage).await.expect("open lix");
+    register_schema(
+        &lix,
+        "stream_item",
+        "{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},\
+         {\"name\":\"grp\",\"type\":\"int8\",\"nullable\":false},\
+         {\"name\":\"label\",\"type\":\"text\",\"nullable\":true},\
+         {\"name\":\"payload\",\"type\":\"jsonb\",\"nullable\":false}",
+    )
+    .await;
+    register_schema(
+        &lix,
+        "stream_tag",
+        "{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},\
+         {\"name\":\"item_id\",\"type\":\"text\",\"nullable\":false},\
+         {\"name\":\"name\",\"type\":\"text\",\"nullable\":false}",
+    )
+    .await;
+    insert_items(&lix, 0..ITEMS).await;
+    let tags = (0..TAGS)
+        .map(|index| {
+            vec![
+                Value::Text(format!("tag-{index:05}")),
+                Value::Text(format!("item-{:05}", (index * 7) % ITEMS)),
+                Value::Text(format!("name-{}", index % 13)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    insert_rows(&lix, "stream_tag", &["id", "item_id", "name"], tags).await;
+    lix
+}
+
+async fn insert_items<S>(lix: &Lix<S>, range: std::ops::Range<usize>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let rows = range
+        .map(|index| {
+            vec![
+                Value::Text(format!("item-{index:05}")),
+                Value::Integer((index % 17) as i64),
+                if index % 11 == 0 {
+                    Value::Null
+                } else {
+                    Value::Text(format!("label {index} {}", "x".repeat(index % 40)))
+                },
+                Value::Jsonb(
+                    crate::Json::parse(&format!("{{\"n\":{index},\"tags\":[\"a\",\"b\"]}}"))
+                        .unwrap(),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    insert_rows(lix, "stream_item", &["id", "grp", "label", "payload"], rows).await;
+}
+
+async fn insert_rows<S>(lix: &Lix<S>, table: &str, columns: &[&str], rows: Vec<Vec<Value>>)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    for chunk in rows.chunks(250) {
+        let mut sql = format!("INSERT INTO {table} ({}) VALUES ", columns.join(", "));
+        let mut parameter = 1;
+        for (row_index, _) in chunk.iter().enumerate() {
+            if row_index > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders = (0..columns.len())
+                .map(|_| {
+                    let placeholder = format!("${parameter}");
+                    parameter += 1;
+                    placeholder
+                })
+                .collect::<Vec<_>>();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+        }
+        let params = chunk.iter().flatten().cloned().collect::<Vec<_>>();
+        lix.execute(&sql)
+            .params(&params)
+            .await
+            .unwrap_or_else(|error| panic!("insert into {table}: {error:?}"));
+    }
+}
+
+/// Pages cut only by `bytes`, so small fixtures still span many pages.
+fn byte_pages(bytes: usize) -> PageLimits {
+    PageLimits {
+        first_rows: usize::MAX,
+        rows: usize::MAX,
+        bytes,
+    }
+}
+
+async fn drain(stream: &mut RowStream) -> Result<Vec<Vec<Row>>, LixError> {
+    let mut pages = Vec::new();
+    while let Some(page) = stream.next_page().await? {
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+fn page_rows(pages: &[Vec<Row>]) -> Vec<Vec<Value>> {
+    pages
+        .iter()
+        .flat_map(|page| page.iter().map(|row| row.values().to_vec()))
+        .collect()
+}
+
+async fn with_timeout<T>(label: &str, future: impl IntoFuture<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), future.into_future())
+        .await
+        .unwrap_or_else(|_| panic!("{label} did not finish within 30s"))
+}
+
+#[tokio::test]
+async fn streamed_pages_match_buffered_execute_across_query_shapes() {
+    let lix = seeded(Memory::new()).await;
+    let shapes: &[(&str, Vec<Value>)] = &[
+        (
+            "SELECT id, grp, label, payload FROM stream_item ORDER BY id",
+            vec![],
+        ),
+        ("SELECT label, id FROM stream_item", vec![]),
+        (
+            "SELECT id, grp FROM stream_item WHERE grp = $1 AND label IS NOT NULL",
+            vec![Value::Integer(3)],
+        ),
+        (
+            "SELECT id FROM stream_item WHERE id = $1",
+            vec![Value::Text("item-00042".into())],
+        ),
+        (
+            "SELECT id, payload ->> 'n' AS n FROM stream_item ORDER BY grp DESC, id",
+            vec![],
+        ),
+        (
+            "SELECT i.id, i.grp, t.name FROM stream_item i JOIN stream_tag t ON t.item_id = i.id ORDER BY t.id",
+            vec![],
+        ),
+        (
+            "SELECT i.id, t.id AS tag_id FROM stream_item i LEFT JOIN stream_tag t ON t.item_id = i.id ORDER BY i.id, t.id",
+            vec![],
+        ),
+        (
+            "SELECT grp, COUNT(*) AS n, MAX(id) AS last FROM stream_item GROUP BY grp ORDER BY grp",
+            vec![],
+        ),
+        ("SELECT COUNT(*) FROM stream_item", vec![]),
+        (
+            "SELECT id FROM stream_item ORDER BY id DESC LIMIT 37",
+            vec![],
+        ),
+        (
+            "SELECT id FROM stream_item ORDER BY id LIMIT 25 OFFSET 1000",
+            vec![],
+        ),
+        ("SELECT DISTINCT name FROM stream_tag ORDER BY name", vec![]),
+        (
+            "SELECT id FROM stream_item WHERE grp < 2 UNION ALL SELECT id FROM stream_tag WHERE name = 'name-1' ORDER BY id",
+            vec![],
+        ),
+        (
+            "WITH busy AS (SELECT item_id FROM stream_tag GROUP BY item_id HAVING COUNT(*) > 0) \
+             SELECT id FROM stream_item WHERE id IN (SELECT item_id FROM busy) ORDER BY id",
+            vec![],
+        ),
+        ("SELECT id FROM stream_item WHERE grp = 999", vec![]),
+    ];
+    for (sql, params) in shapes {
+        let buffered = lix.query(sql).params(params).all().await.expect(sql);
+        let mut stream = lix
+            .query(sql)
+            .params(params)
+            .page_limits(byte_pages(4 * 1024))
+            .stream()
+            .await
+            .expect(sql);
+        assert_eq!(stream.columns(), buffered.columns(), "{sql}");
+        assert_eq!(stream.column_types(), buffered.column_types(), "{sql}");
+        let pages = drain(&mut stream).await.expect(sql);
+        assert!(pages.iter().all(|page| !page.is_empty()), "{sql}");
+        assert!(
+            pages
+                .iter()
+                .all(|page| page[0].columns() == buffered.columns()),
+            "{sql}"
+        );
+        let mut streamed = page_rows(&pages);
+        let mut expected = buffered
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        if !sql.contains("ORDER BY") {
+            let key = |row: &Vec<Value>| format!("{row:?}");
+            streamed.sort_by_key(key);
+            expected.sort_by_key(key);
+        }
+        assert_eq!(streamed, expected, "{sql}");
+        if expected.len() == ITEMS {
+            assert!(pages.len() > 10, "{sql} should span many pages");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pages_stay_within_the_page_byte_bound() {
+    let lix = seeded(Memory::new()).await;
+    for page_bytes in [1, 700, 16 * 1024] {
+        let mut stream = lix
+            .query("SELECT id, grp, label FROM stream_item ORDER BY id")
+            .page_limits(byte_pages(page_bytes))
+            .stream()
+            .await
+            .unwrap();
+        let pages = drain(&mut stream).await.unwrap();
+        assert_eq!(page_rows(&pages).len(), ITEMS);
+        for page in &pages {
+            let bytes = page
+                .iter()
+                .map(|row| public_row_bytes(row.values()))
+                .sum::<usize>();
+            assert!(
+                bytes <= page_bytes || page.len() == 1,
+                "{page_bytes}-byte page held {} rows / {bytes} bytes",
+                page.len()
+            );
+        }
+        if page_bytes == 1 {
+            assert_eq!(pages.len(), ITEMS, "every row is its own page");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancel_drop_and_exhaustion_release_the_pinned_snapshot() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let idle = storage.live_reads.load(Ordering::SeqCst);
+    let sql = "SELECT id, label FROM stream_item ORDER BY id";
+
+    let mut stream = lix
+        .query(sql)
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    assert!(stream.next_page().await.unwrap().is_some());
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    assert_eq!(lix.running_query_stream_count_for_test(), 1);
+    stream.close().await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+    assert_eq!(lix.running_query_stream_count_for_test(), 0);
+
+    let mut stream = lix
+        .query(sql)
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    assert!(stream.next_page().await.unwrap().is_some());
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    drop(stream);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+
+    // Opening pins the snapshot (the first page is already buffered);
+    // dropping the stream frees it.
+    let stream = lix.query(sql).stream().await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    drop(stream);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+
+    let mut stream = lix
+        .query(sql)
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    drain(&mut stream).await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+    assert_eq!(lix.running_query_stream_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn idle_stream_does_not_block_writes_and_keeps_its_snapshot() {
+    let lix = seeded(Memory::new()).await;
+    let other = lix.open_another_session().await.unwrap();
+    let mut stream = lix
+        .query("SELECT id, grp, label FROM stream_item ORDER BY id")
+        .page_limits(byte_pages(1024))
+        .stream()
+        .await
+        .unwrap();
+    let first = stream.next_page().await.unwrap().expect("first page");
+    let snapshot = lix
+        .query("SELECT id, grp, label FROM stream_item ORDER BY id")
+        .all()
+        .await
+        .unwrap();
+
+    // Same handle and an independent session both commit while the stream
+    // is idle between pulls.
+    with_timeout("same-handle insert", insert_items(&lix, ITEMS..ITEMS + 300)).await;
+    with_timeout(
+        "same-handle update",
+        lix.execute("UPDATE stream_item SET label = 'changed' WHERE grp = 1"),
+    )
+    .await
+    .unwrap();
+    with_timeout(
+        "other-session delete",
+        other.execute("DELETE FROM stream_item WHERE grp = 2"),
+    )
+    .await
+    .unwrap();
+
+    let mut rows = page_rows(std::slice::from_ref(&first));
+    rows.extend(page_rows(&drain(&mut stream).await.unwrap()));
+    let expected = snapshot
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected, "the stream reads only its opening snapshot");
+
+    let now = lix
+        .query("SELECT COUNT(*) FROM stream_item")
+        .all()
+        .await
+        .unwrap();
+    assert_ne!(now.rows()[0].values(), &[Value::Integer(ITEMS as i64)]);
+    other.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_the_handle_cancels_open_streams() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let idle = storage.live_reads.load(Ordering::SeqCst);
+    let mut started = lix
+        .query("SELECT id FROM stream_item ORDER BY id")
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    assert!(started.next_page().await.unwrap().is_some());
+    let mut unstarted = lix
+        .query("SELECT id FROM stream_tag")
+        .stream()
+        .await
+        .unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 2);
+
+    with_timeout("close", lix.close()).await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+    for stream in [&mut started, &mut unstarted] {
+        // The next pull fails, even though rows of the first page were
+        // already buffered, and every later pull fails the same way.
+        let error = stream.next_page().await.unwrap_err();
+        assert_eq!(error.code, LixError::CODE_CLOSED);
+        assert_eq!(
+            stream.try_next().await.unwrap_err().code,
+            LixError::CODE_CLOSED
+        );
+    }
+    let error = lix
+        .query("SELECT id FROM stream_item")
+        .stream()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_CLOSED);
+}
+
+#[tokio::test]
+async fn streams_are_read_only() {
+    let lix = seeded(Memory::new()).await;
+    for sql in [
+        "INSERT INTO stream_tag (id, item_id, name) VALUES ('x', 'item-00001', 'x')",
+        "UPDATE stream_item SET grp = 0",
+        "DELETE FROM stream_tag",
+    ] {
+        let error = lix.query(sql).stream().await.unwrap_err();
+        assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
+    }
+    let count = lix
+        .query("SELECT COUNT(*) FROM stream_tag")
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(count.rows()[0].values(), &[Value::Integer(TAGS as i64)]);
+    let error = lix
+        .query("SELECT nope FROM stream_item")
+        .stream()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+}
+
+#[tokio::test]
+async fn file_content_reads_are_paged_from_a_buffered_result() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    for index in 0..12 {
+        lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)")
+            .params(&[
+                Value::Text(format!("/docs/file-{index:02}.txt")),
+                Value::Blob(vec![b'a' + index as u8; 3_000].into()),
+            ])
+            .await
+            .unwrap();
+    }
+    for (sql, params) in [
+        ("SELECT path, content FROM lix_file ORDER BY path", vec![]),
+        (
+            "SELECT path, content FROM lix_file WHERE path = $1",
+            vec![Value::Text("/docs/file-03.txt".into())],
+        ),
+        ("SELECT path FROM lix_file ORDER BY path", vec![]),
+    ] {
+        let buffered = lix.query(sql).params(&params).all().await.unwrap();
+        let mut stream = lix
+            .query(sql)
+            .params(&params)
+            .page_limits(byte_pages(4_000))
+            .stream()
+            .await
+            .unwrap();
+        assert_eq!(stream.columns(), buffered.columns());
+        let pages = drain(&mut stream).await.unwrap();
+        let expected = buffered
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(page_rows(&pages), expected, "{sql}");
+        if sql.contains("content") && expected.len() > 1 {
+            assert_eq!(pages.len(), expected.len(), "one 3 KB file per 4 KB page");
+        }
+    }
+}
+
+#[tokio::test]
+async fn streams_exceed_the_buffered_read_budget() {
+    let lix = seeded(Memory::new()).await;
+    // More than a million rows: buffered reads have no row budget, only a
+    // byte cap (which charges each row's cost) that callers may lift.
+    let rows = 1_001_000;
+    let sql = format!("SELECT value FROM generate_series(1, {rows})");
+    assert_eq!(
+        lix.query(&sql)
+            .max_bytes(usize::MAX)
+            .all()
+            .await
+            .unwrap()
+            .len(),
+        rows
+    );
+    let mut stream = lix.query(&sql).stream().await.unwrap();
+    let mut seen = 0usize;
+    let mut pages = 0usize;
+    let mut last = 0i64;
+    while let Some(page) = stream.next_page().await.unwrap() {
+        pages += 1;
+        for row in &page {
+            let Value::Integer(value) = row.values()[0] else {
+                panic!("unexpected value {:?}", row.values());
+            };
+            assert_eq!(value, last + 1);
+            last = value;
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, rows);
+    assert!(pages > 1);
+
+    // 70 rows of ~1 MiB text exceed the 64 MiB byte budget.
+    let big = "SELECT id, repeat('x', 1048576) AS blob FROM stream_item ORDER BY id LIMIT 70";
+    let error = lix.query(big).all().await.unwrap_err();
+    assert_eq!(error.code, LixError::CODE_RESULT_TOO_LARGE);
+    let mut stream = lix.query(big).stream().await.unwrap();
+    let pages = drain(&mut stream).await.unwrap();
+    let rows = page_rows(&pages);
+    assert_eq!(rows.len(), 70);
+    assert!(pages.len() >= 70, "each 1 MiB row needs its own 1 MiB page");
+}
+
+#[tokio::test]
+async fn expiry_before_the_first_page_retries_and_after_it_surfaces() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let sql = "SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag";
+    let buffered = lix.query(sql).all().await.unwrap();
+
+    // The first attempt expires before any page exists: the stream restarts
+    // from a fresh snapshot and still returns the complete result.
+    storage.expiring_requests.store(1, Ordering::SeqCst);
+    let opened = storage.opened_reads.load(Ordering::SeqCst);
+    let mut stream = lix
+        .query(sql)
+        .page_limits(byte_pages(2048))
+        .stream()
+        .await
+        .unwrap();
+    let pages = drain(&mut stream).await.unwrap();
+    assert_eq!(storage.expiring_requests.load(Ordering::SeqCst), 0);
+    assert!(
+        storage.opened_reads.load(Ordering::SeqCst) >= opened + 2,
+        "retried on a new read"
+    );
+    let mut streamed = page_rows(&pages);
+    let mut expected = buffered
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    streamed.sort_by_key(|row| format!("{row:?}"));
+    expected.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(streamed, expected);
+
+    // Once a page was handed out, expiry ends the stream instead of silently
+    // restarting it (which could duplicate rows the caller already holds).
+    let mut stream = lix
+        .query(sql)
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    assert!(stream.next_page().await.unwrap().is_some());
+    let opened = storage.opened_reads.load(Ordering::SeqCst);
+    storage
+        .expiring_requests
+        .store(usize::MAX, Ordering::SeqCst);
+    let error = loop {
+        match stream.next_page().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the second table must be read after the first page"),
+            Err(error) => break error,
+        }
+    };
+    storage.expiring_requests.store(0, Ordering::SeqCst);
+    assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+    assert_eq!(
+        storage.opened_reads.load(Ordering::SeqCst),
+        opened,
+        "no retry after a page"
+    );
+    // The error is latched: later pulls fail the same way.
+    assert_eq!(
+        stream.next_page().await.unwrap_err().code,
+        LixError::CODE_STORAGE_READ_EXPIRED
+    );
+    assert_eq!(lix.running_query_stream_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn only_statements_that_need_the_whole_result_are_paged_from_a_buffer() {
+    let lix = seeded(Memory::new()).await;
+    for (sql, materialized) in [
+        ("SELECT id, label FROM stream_item", false),
+        ("SELECT id FROM stream_item WHERE id = 'item-00001'", false),
+        ("SELECT path FROM lix_file", false),
+        ("SELECT path, content FROM lix_file", true),
+        ("SELECT content FROM lix_file WHERE path = '/a.txt'", true),
+    ] {
+        let route = lix.query_stream_route_for_test(sql, &[]).unwrap();
+        assert_eq!(
+            route == crate::session::QueryStreamRoute::Materialized,
+            materialized,
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_pull_releases_its_session_guard() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    // Consume the buffered first page so the next pull needs the producer.
+    stream.next_page().await.unwrap().expect("first page");
+    storage.stall_open_reads();
+    // Rows already produced keep flowing; pull until one parks on storage.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), stream.try_next()).await {
+            Ok(Ok(Some(_))) => {}
+            Ok(other) => panic!("the stream must park on stalled storage: {other:?}"),
+            Err(_) => break,
+        }
+    }
+    // The abandoned pull must not keep writers or close waiting.
+    with_timeout(
+        "write after a cancelled pull",
+        lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1"),
+    )
+    .await
+    .unwrap();
+    storage.stalled.store(false, Ordering::SeqCst);
+    // The stream still works and still reads its own snapshot.
+    assert!(stream.try_next().await.unwrap().is_some());
+    drop(stream);
+    with_timeout("close after a cancelled pull", lix.close())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_abandoned_stream_poll_releases_its_session_guard() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    stream.next_page().await.unwrap().expect("first page");
+    storage.stall_open_reads();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
+            Ok(Some(Ok(_))) => {}
+            Ok(other) => panic!("the stream must park on stalled storage: {other:?}"),
+            Err(_) => break,
+        }
+    }
+    with_timeout(
+        "write after an abandoned Stream poll",
+        lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1"),
+    )
+    .await
+    .unwrap();
+    storage.stalled.store(false, Ordering::SeqCst);
+    assert!(stream.next().await.unwrap().is_ok());
+}
+
+/// A `Stream` poll that parks on admission (a writer is running) must keep
+/// its wakeup: when the writer finishes, the same `next()` resumes.
+#[tokio::test]
+async fn a_stream_poll_blocked_on_admission_wakes_after_the_writer() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    stream.next_page().await.unwrap().expect("first page");
+    // Stall every read, including the writer's: the writer stays in progress.
+    storage.stall_before.store(usize::MAX, Ordering::SeqCst);
+    storage.stalled.store(true, Ordering::SeqCst);
+    let writer = {
+        let lix = lix.clone();
+        tokio::spawn(async move {
+            lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1")
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One `next()`, awaited across the writer: it parks on admission.
+    let pull = tokio::spawn(async move {
+        let row = stream.next().await;
+        (row.map(|row| row.is_ok()), stream)
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    storage.stalled.store(false, Ordering::SeqCst);
+    with_timeout("the writer", writer).await.unwrap().unwrap();
+    let (row, _stream) = with_timeout("the parked Stream poll", pull).await.unwrap();
+    assert_eq!(row, Some(true));
+}
+
+#[tokio::test]
+async fn a_stream_error_is_latched() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let sql = "SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag";
+    let open = || {
+        lix.query(sql)
+            .page_limits(byte_pages(256))
+            .stream()
+    };
+    let mut stream = open().await.unwrap();
+    storage
+        .expiring_requests
+        .store(usize::MAX, Ordering::SeqCst);
+    let error = loop {
+        match stream.next_page().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("an error must not end the stream normally"),
+            Err(error) => break error,
+        }
+    };
+    for _ in 0..2 {
+        assert_eq!(stream.next_page().await.unwrap_err().code, error.code);
+        assert_eq!(stream.try_next().await.unwrap_err().code, error.code);
+    }
+    storage.expiring_requests.store(0, Ordering::SeqCst);
+
+    // The Stream impl yields the error once, then ends.
+    let mut stream = open().await.unwrap();
+    storage
+        .expiring_requests
+        .store(usize::MAX, Ordering::SeqCst);
+    let mut errors = 0;
+    while let Some(item) = stream.next().await {
+        errors += usize::from(item.is_err());
+    }
+    storage.expiring_requests.store(0, Ordering::SeqCst);
+    assert_eq!(errors, 1);
+}
+
+#[tokio::test]
+async fn closing_or_dropping_a_snapshot_releases_its_read_view() {
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let idle = storage.live_reads.load(Ordering::SeqCst);
+
+    let snapshot = lix.snapshot().await.unwrap();
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    let stream = snapshot
+        .query("SELECT id FROM stream_item")
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    snapshot.close().await.unwrap();
+    assert_eq!(
+        storage.live_reads.load(Ordering::SeqCst),
+        idle,
+        "close releases the view, including the one its stream was reading"
+    );
+    drop(stream);
+
+    // Without close: the view lives while a handle or stream holds it.
+    let snapshot = lix.snapshot().await.unwrap();
+    let mut stream = snapshot
+        .query("SELECT id FROM stream_item")
+        .page_limits(byte_pages(256))
+        .stream()
+        .await
+        .unwrap();
+    drop(snapshot);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle + 1);
+    while stream.try_next().await.unwrap().is_some() {}
+    drop(stream);
+    assert_eq!(storage.live_reads.load(Ordering::SeqCst), idle);
+}

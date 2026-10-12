@@ -1,5 +1,5 @@
 import { expect, test, vi } from "vitest";
-import type { LixBinding, ObserveEventsBinding } from "../binding-types.js";
+import type { LixBinding, ObserveEventsBinding, TelemetryParentContext } from "../binding-types.js";
 import type {
 	WorkerHostEndpoint,
 	WorkerInput,
@@ -1856,3 +1856,290 @@ test("worker teardown disables its session DELETE lane after owner detach fails"
     response: { mode: "buffered", maxBytes: 128 },
   })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
 });
+
+test("streams open with their first page, pull on their own lane, and close with the session", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const execute = deferred<void>();
+	const page = {
+		columns: [{ name: "n", type: "integer" }],
+		rows: [[{ kind: "integer", value: 1 }]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const streams: { cancel: ReturnType<typeof vi.fn>; next: ReturnType<typeof vi.fn> }[] = [];
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		async execute() {
+			await execute.promise;
+			return { columns: [], rows: [], rowsAffected: 1, notices: [] };
+		},
+		async stream() {
+			const stream = {
+				columns: ["n"],
+				next: vi.fn(async () => page),
+				cancel: vi.fn(async () => {}),
+			};
+			streams.push(stream);
+			return stream;
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "stream", sql: "SELECT n", params: [], options: { maxBytes: 64 } },
+	});
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({
+			id: 2,
+			ok: true,
+			value: { streamId: 1, columns: ["n"], page },
+		}),
+	);
+
+	// A write occupying the session lane does not hold up a pull.
+	receive({ id: 3, sessionId: 0, operation: { kind: "execute", sql: "UPDATE t", params: [] } });
+	receive({ id: 4, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 4, ok: true, value: page }));
+	expect(responses.some((message) => "id" in message && message.id === 3 && "ok" in message)).toBe(false);
+	execute.resolve();
+	await vi.waitFor(() => expect(responses.some((message) => "ok" in message && message.id === 3)).toBe(true));
+
+	receive({ id: 5, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({
+			id: 5,
+			ok: true,
+			value: { streamId: 2, columns: ["n"], page },
+		}),
+	);
+	receive({ id: 6, sessionId: 0, operation: { kind: "stream.close", streamId: 2 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 6, ok: true }));
+	expect(streams[1].cancel).toHaveBeenCalledOnce();
+
+	// A pull of a stream the worker no longer holds is a lost stream, never
+	// a silent end of rows.
+	receive({ id: 8, sessionId: 0, operation: { kind: "stream.next", streamId: 2 } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 8,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_ERROR_QUERY_STREAM_LOST" }),
+			}),
+		),
+	);
+
+	receive({ id: 7, sessionId: 0, operation: { kind: "close" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 7, ok: true }));
+	expect(streams[0].cancel).toHaveBeenCalledOnce();
+	expect(streams[1].cancel).toHaveBeenCalledOnce();
+	expect(binding.close).toHaveBeenCalledOnce();
+});
+
+test("a stream pull waiting behind slow pulls never times out in the queue", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const page = {
+		columns: [{ name: "n", type: "integer" }],
+		rows: [[{ kind: "integer", value: 1 }]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const slow = deferred<typeof page>();
+	let opened = 0;
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		async stream() {
+			const ordinal = ++opened;
+			let pulls = 0;
+			return {
+				columns: ["n"],
+				next: async () => (pulls++ === 0 || ordinal === 2 ? page : slow.promise),
+				cancel: async () => {},
+			};
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		new WorkerOperationScheduler({ maxPullActive: 1, queueWaitMs: 20 }),
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	for (const id of [2, 3]) {
+		receive({ id, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
+		await vi.waitFor(() =>
+			expect(responses).toContainEqual(expect.objectContaining({ id, ok: true })),
+		);
+	}
+	// Stream 1's pull holds the only pull slot; stream 2's pull queues.
+	receive({ id: 4, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
+	receive({ id: 5, sessionId: 0, operation: { kind: "stream.next", streamId: 2 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.queued", id: 5 }));
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	expect(responses.some((message) => "ok" in message && message.id === 5)).toBe(false);
+	slow.resolve(page);
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 4, ok: true, value: page }));
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: page }));
+});
+
+test("pulls of open streams never wait behind long reads in the independent pool", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const page = {
+		columns: [{ name: "n", type: "integer" }],
+		rows: [[{ kind: "integer", value: 1 }]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const longReads = deferred<typeof page>();
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		query: () => longReads.promise,
+		async stream() {
+			return { columns: ["n"], next: async () => page, cancel: async () => {} };
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		new WorkerOperationScheduler({ maxIndependentActive: 1 }),
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(expect.objectContaining({ id: 2, ok: true })),
+	);
+	// A long read fills the only independent slot.
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "query", sql: "SELECT long", params: [] },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 4 }));
+	receive({ id: 5, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: page }));
+	expect(responses.some((message) => "ok" in message && message.id === 4)).toBe(false);
+	longReads.resolve(page);
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(expect.objectContaining({ id: 4, ok: true })),
+	);
+});
+
+
+test.each(["success", "open failure", "first page failure"])(
+	"stream opening propagates and clears the telemetry parent on %s",
+	async (outcome) => {
+		const parent = {
+			traceparent: "00-11111111111111111111111111111111-1111111111111111-01",
+		};
+		let activeParent: TelemetryParentContext | undefined;
+		const parents: Array<TelemetryParentContext | undefined> = [];
+		const responses: WorkerResponse[] = [];
+		let receive!: (message: WorkerInput) => void;
+		const binding = {
+			setTelemetryParent(value?: TelemetryParentContext) {
+				activeParent = value;
+				parents.push(value);
+			},
+			async stream() {
+				await Promise.resolve();
+				expect(activeParent).toEqual(parent);
+				if (outcome === "open failure") throw new Error("open failed");
+				return {
+					columns: [],
+					async next() {
+						await Promise.resolve();
+						expect(activeParent).toEqual(parent);
+						if (outcome === "first page failure") throw new Error("page failed");
+						return null;
+					},
+					async cancel() {},
+				};
+			},
+		} as unknown as LixBinding;
+		startWorkerHost(
+			{
+				postMessage: (message) => responses.push(message),
+				onMessage: (listener) => (receive = listener),
+			},
+			async () => binding,
+		);
+		receive({
+			id: 1,
+			sessionId: 0,
+			operation: {
+				kind: "open",
+				storage: { kind: "memory" },
+				telemetryEnabled: true,
+				progressEnabled: false,
+			},
+		});
+		await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+		receive({
+			id: 2,
+			sessionId: 0,
+			telemetryParent: parent,
+			operation: { kind: "stream", sql: "SELECT 1", params: [] },
+		});
+		await vi.waitFor(() =>
+			expect(responses).toContainEqual(expect.objectContaining({
+				id: 2,
+				ok: outcome === "success",
+			})),
+		);
+		expect(parents).toEqual([parent, undefined]);
+		expect(activeParent).toBeUndefined();
+	},
+);

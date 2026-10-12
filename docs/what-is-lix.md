@@ -26,20 +26,17 @@ Code lives in Git. Documents, design files, and media live in Drive, Figma, and 
 
 ```ts
 // A script, a 4.8 GB video, and an app table in one transaction.
-await lix.executeBatch([
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/automations/weekly-report.js", source],
-  },
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/media/launch.mp4", video],
-  },
-  {
-    sql: "UPDATE orders SET status = 'shipped' WHERE id = $1",
-    params: [1002],
-  },
-]);
+await lix.transaction(async (tx) => {
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+    "/automations/weekly-report.js",
+    source,
+  ]);
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+    "/media/launch.mp4",
+    video,
+  ]);
+  await tx.execute("UPDATE orders SET status = 'shipped' WHERE id = $1", [1002]);
+});
 ```
 
 ### Give each customer a repository

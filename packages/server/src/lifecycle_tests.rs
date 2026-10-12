@@ -129,18 +129,12 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let source = lix_sdk::open_lix().await.unwrap();
     source
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('hosted-snapshot','preserved')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('hosted-snapshot','preserved')")
         .await
         .unwrap();
-    source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('untracked-app-state','keep-me',true)", &[]).await.unwrap();
+    source.execute("INSERT INTO lix_key_value (key,value,lixcol_untracked) VALUES ('untracked-app-state','keep-me',true)").await.unwrap();
     source
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-            &[],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     let mut snapshot = Vec::new();
@@ -185,10 +179,8 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
         .await
         .unwrap();
     let result = restored
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key='hosted-snapshot'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key='hosted-snapshot'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -196,10 +188,8 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
         Value::String("preserved".to_owned())
     );
     let untracked = restored
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key='untracked-app-state'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key='untracked-app-state'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -242,28 +232,23 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         .await
         .unwrap();
     source
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('local-before-hosting','retained')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('local-before-hosting','retained')")
         .await
         .unwrap();
     source
-        .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
-            &[],
-        )
+        .execute("SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)")
         .await
         .unwrap();
     let original_history = source
-        .execute("SELECT id FROM lix_commit", &[])
+        .query("SELECT id FROM lix_commit")
+        .all()
         .await
         .unwrap();
     let original_rows = source
-        .execute(
+        .query(
             "SELECT row_ref FROM lix_history('lix_key_value') WHERE key = 'local-before-hosting'",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     let hosted = lix_sdk::create_lix()
@@ -279,7 +264,8 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         .await
         .expect("reopen the original local storage after hosting");
     let current_history = original
-        .execute("SELECT id FROM lix_commit", &[])
+        .query("SELECT id FROM lix_commit")
+        .all()
         .await
         .unwrap();
     let ids = current_history
@@ -305,10 +291,8 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         .await
         .expect("open a sparse replica of the hosted copy");
     let data = synced
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key='local-before-hosting'",
-            &[],
-        )
+        .query("SELECT value FROM lix_key_value WHERE key='local-before-hosting'")
+        .all()
         .await
         .unwrap();
     assert_eq!(
@@ -316,10 +300,10 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         Value::String("retained".to_owned())
     );
     let hosted_rows = synced
-        .execute(
+        .query(
             "SELECT row_ref FROM lix_history('lix_key_value') WHERE key = 'local-before-hosting'",
-            &[],
         )
+        .all()
         .await
         .unwrap();
     let row_refs = hosted_rows

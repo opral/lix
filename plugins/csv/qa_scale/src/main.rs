@@ -33,22 +33,18 @@ async fn main() {
     for count in counts.split(',').map(|n| n.parse::<usize>().unwrap()) {
         let storage = Memory::new();
         let lix = open_lix().with_storage(storage.clone()).await.unwrap();
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES($1,$2)",
-            &[
+        lix.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)")
+            .params(&[
                 Value::Text("/.lix/plugins/plugin_csv.lixplugin".into()),
                 Value::Blob(archive.clone().into()),
-            ],
-        )
-        .await
-        .unwrap();
+            ])
+            .await
+            .unwrap();
         let compile_start = Instant::now();
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES('/warmup.csv',$1)",
-            &[Value::Blob(Vec::new().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file(path,content) VALUES('/warmup.csv',$1)")
+            .params(&[Value::Blob(Vec::new().into())])
+            .await
+            .unwrap();
         println!(
             "component_warmup_ms={:.3}",
             compile_start.elapsed().as_secs_f64() * 1000.0
@@ -56,17 +52,16 @@ async fn main() {
         let mut bytes = b"0123456789,abcdefghij,0123456789,abcdefghij\r\n".repeat(count);
         println!("rows={count} bytes={}", bytes.len());
         let start = Instant::now();
-        lix.execute(
-            "INSERT INTO lix_file(path,content) VALUES('/scale.csv',$1)",
-            &[Value::Blob(bytes.clone().into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_file(path,content) VALUES('/scale.csv',$1)")
+            .params(&[Value::Blob(bytes.clone().into())])
+            .await
+            .unwrap();
         println!("import_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
         if std::env::var_os("CSV_QA_SKIP_SPARSE").is_none() {
             let start = Instant::now();
             let rows = lix
-                .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 2", &[])
+                .query("SELECT id FROM csv_row ORDER BY order_key LIMIT 2")
+                .all()
                 .await
                 .unwrap();
             println!(
@@ -83,12 +78,10 @@ async fn main() {
                 };
                 let cells = format!(r#"["0123456789","{replacement}","0123456789","abcdefghij"]"#);
                 let start = Instant::now();
-                lix.execute(
-                    "UPDATE csv_row SET cells=$1 WHERE id=$2",
-                    &[Value::Text(cells), first.clone()],
-                )
-                .await
-                .unwrap();
+                lix.execute("UPDATE csv_row SET cells=$1 WHERE id=$2")
+                    .params(&[Value::Text(cells), first.clone()])
+                    .await
+                    .unwrap();
                 println!(
                     "sql_edit_{}_ms={:.3}",
                     iteration + 1,
@@ -97,16 +90,14 @@ async fn main() {
                 bytes[11] = replacement.as_bytes()[0];
             }
             let start = Instant::now();
-            lix.execute(
-                "UPDATE csv_row SET cells=$1 WHERE id=$2 OR id=$3",
-                &[
+            lix.execute("UPDATE csv_row SET cells=$1 WHERE id=$2 OR id=$3")
+                .params(&[
                     Value::Text(r#"["0123456789","xbcdefghij","0123456789","abcdefghij"]"#.into()),
                     first.clone(),
                     second,
-                ],
-            )
-            .await
-            .unwrap();
+                ])
+                .await
+                .unwrap();
             println!(
                 "sql_two_edit_ms={:.3}",
                 start.elapsed().as_secs_f64() * 1000.0
@@ -115,7 +106,8 @@ async fn main() {
             bytes[45 + 11] = b'x';
             let start = Instant::now();
             let read = lix
-                .execute("SELECT content FROM lix_file WHERE path='/scale.csv'", &[])
+                .query("SELECT content FROM lix_file WHERE path='/scale.csv'")
+                .all()
                 .await
                 .unwrap();
             println!("read_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
@@ -126,12 +118,10 @@ async fn main() {
                     serde_json::to_string(replacement).unwrap()
                 );
                 let start = Instant::now();
-                lix.execute(
-                    "UPDATE csv_row SET cells=$1 WHERE id=$2",
-                    &[Value::Text(cells), first.clone()],
-                )
-                .await
-                .unwrap();
+                lix.execute("UPDATE csv_row SET cells=$1 WHERE id=$2")
+                    .params(&[Value::Text(cells), first.clone()])
+                    .await
+                    .unwrap();
                 println!(
                     "sql_variable_edit_ms={:.3}",
                     start.elapsed().as_secs_f64() * 1000.0
@@ -149,7 +139,8 @@ async fn main() {
                 let rendered = format!("0123456789,{encoded},0123456789,abcdefghij\r\n");
                 bytes.splice(..old_first_row_len, rendered.bytes());
                 let read = lix
-                    .execute("SELECT content FROM lix_file WHERE path='/scale.csv'", &[])
+                    .query("SELECT content FROM lix_file WHERE path='/scale.csv'")
+                    .all()
                     .await
                     .unwrap();
                 assert_eq!(read.rows()[0].get::<Vec<u8>>("content").unwrap(), bytes);
@@ -157,18 +148,17 @@ async fn main() {
             let third_row = bytes.windows(2).position(|w| w == b"\r\n").unwrap() + 2 + 45;
             bytes[third_row + 11] = b'w';
             let start = Instant::now();
-            lix.execute(
-                "UPDATE lix_file SET content=$1 WHERE path='/scale.csv'",
-                &[Value::Blob(bytes.clone().into())],
-            )
-            .await
-            .unwrap();
+            lix.execute("UPDATE lix_file SET content=$1 WHERE path='/scale.csv'")
+                .params(&[Value::Blob(bytes.clone().into())])
+                .await
+                .unwrap();
             println!(
                 "file_edit_after_sql_ms={:.3}",
                 start.elapsed().as_secs_f64() * 1000.0
             );
             let read = lix
-                .execute("SELECT content FROM lix_file WHERE path='/scale.csv'", &[])
+                .query("SELECT content FROM lix_file WHERE path='/scale.csv'")
+                .all()
                 .await
                 .unwrap();
             assert_eq!(read.rows()[0].get::<Vec<u8>>("content").unwrap(), bytes);
@@ -190,7 +180,8 @@ async fn main() {
 
 async fn verify(lix: &Lix<Memory>, bytes: &[u8]) {
     let read = lix
-        .execute("SELECT content FROM lix_file WHERE path='/scale.csv'", &[])
+        .query("SELECT content FROM lix_file WHERE path='/scale.csv'")
+        .all()
         .await
         .unwrap();
     assert_eq!(read.rows()[0].get::<Vec<u8>>("content").unwrap(), bytes);
@@ -198,17 +189,16 @@ async fn verify(lix: &Lix<Memory>, bytes: &[u8]) {
 async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
     let mut failures = 0;
     let rows = lix
-        .execute(
-            "SELECT id, order_key FROM csv_row ORDER BY order_key LIMIT 2",
-            &[],
-        )
+        .query("SELECT id, order_key FROM csv_row ORDER BY order_key LIMIT 2")
+        .all()
         .await
         .unwrap();
     let first = rows.rows()[0].get_index(0).unwrap().clone();
     let second = rows.rows()[1].get_index(0).unwrap().clone();
     let start = Instant::now();
     match lix
-        .execute("DELETE FROM csv_row WHERE id=$1", &[first])
+        .execute("DELETE FROM csv_row WHERE id=$1")
+        .params(&[first])
         .await
     {
         Ok(_) => {
@@ -226,16 +216,15 @@ async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
     }
     verify(lix, bytes).await;
     let before_reorder = lix
-        .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 2", &[])
+        .query("SELECT id FROM csv_row ORDER BY order_key LIMIT 2")
+        .all()
         .await
         .unwrap();
     let second_index = usize::from(before_reorder.rows()[0].get_index(0).unwrap() != &second);
     let start = Instant::now();
     match lix
-        .execute(
-            "UPDATE csv_row SET order_key='fffffffffffffffe' WHERE id=$1",
-            &[second],
-        )
+        .execute("UPDATE csv_row SET order_key='fffffffffffffffe' WHERE id=$1")
+        .params(&[second])
         .await
     {
         Ok(_) => {
@@ -259,7 +248,8 @@ async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
     }
     verify(lix, bytes).await;
     let file = lix
-        .execute("SELECT id FROM lix_file WHERE path='/scale.csv'", &[])
+        .query("SELECT id FROM lix_file WHERE path='/scale.csv'")
+        .all()
         .await
         .unwrap();
     let file_id = file.rows()[0].get_index(0).unwrap().clone();
@@ -267,8 +257,8 @@ async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
     match lix
         .execute(
             "INSERT INTO csv_row(order_key,cells,lixcol_file_id) VALUES('ffffffffffffffff',$1,$2)",
-            &[Value::Text(r#"["appended","row"]"#.into()), file_id],
         )
+        .params(&[Value::Text(r#"["appended","row"]"#.into()), file_id])
         .await
     {
         Ok(_) => {
@@ -294,7 +284,7 @@ async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
         "SELECT id FROM csv_row ORDER BY order_key LIMIT {}",
         4097 * stride
     );
-    let selected = lix.execute(&select_sql, &[]).await.unwrap();
+    let selected = lix.query(&select_sql).all().await.unwrap();
     let changed_count = selected.rows().len().div_ceil(stride);
     let mut params = vec![Value::Text(r#"["bulk"]"#.into())];
     params.extend(
@@ -310,7 +300,7 @@ async fn structural(lix: &Lix<Memory>, bytes: &mut Vec<u8>) -> usize {
         .join(",");
     let sql = format!("UPDATE csv_row SET cells=$1 WHERE id IN ({predicate})");
     let start = Instant::now();
-    match lix.execute(&sql, &params).await {
+    match lix.execute(&sql).params(&params).await {
         Ok(_) => {
             let elapsed = start.elapsed();
             let mut expected = Vec::with_capacity(bytes.len());

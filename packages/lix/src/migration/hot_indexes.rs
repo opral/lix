@@ -345,18 +345,13 @@ mod tests {
                 {"name": "label", "type": "text", "nullable": false}
             ], "primary_key": ["id"], "unique": [["label"]]
         });
-        lix.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1)",
-            &[crate::Value::Jsonb(schema.into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO migration_index(id,label) VALUES ('a','before')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1)")
+            .params(&[crate::Value::Jsonb(schema.into())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO migration_index(id,label) VALUES ('a','before')")
+            .await
+            .unwrap();
         lix.close().await.unwrap();
         super::super::epoch::stage_repository_format_for_test(&storage, false, 81)
             .await
@@ -393,28 +388,28 @@ mod tests {
         assert_eq!(report.expected_content_digest, report.after_content_digest);
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
         assert_eq!(
-            lix.execute("SELECT id FROM migration_index WHERE label = 'before'", &[])
+            lix.query("SELECT id FROM migration_index WHERE label = 'before'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
                 .len(),
             1
         );
-        lix.execute(
-            "UPDATE migration_index SET label = 'after' WHERE id = 'a'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE migration_index SET label = 'after' WHERE id = 'a'")
+            .await
+            .unwrap();
         assert!(
-            lix.execute("SELECT id FROM migration_index WHERE label = 'before'", &[])
+            lix.query("SELECT id FROM migration_index WHERE label = 'before'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
                 .is_empty()
         );
         assert_eq!(
-            lix.execute("SELECT id FROM migration_index WHERE label = 'after'", &[])
+            lix.query("SELECT id FROM migration_index WHERE label = 'after'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -438,22 +433,14 @@ mod tests {
                 {"name": "label", "type": "text", "nullable": false}
             ], "primary_key": ["id"], "unique": [["label"]]
         });
-        lix.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1)",
-            &[crate::Value::Jsonb(schema.into())],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO migration_lane_index(id,label) VALUES ('tracked','tracked')",
-            &[],
-        )
-        .await
-        .unwrap();
-        lix.execute(
-            "INSERT INTO migration_lane_index(id,label,lixcol_untracked) VALUES ('local','local',true)",
-            &[],
-        )
+        lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1)")
+            .params(&[crate::Value::Jsonb(schema.into())])
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO migration_lane_index(id,label) VALUES ('tracked','tracked')")
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO migration_lane_index(id,label,lixcol_untracked) VALUES ('local','local',true)")
         .await
         .unwrap();
         lix.close().await.unwrap();
@@ -483,10 +470,7 @@ mod tests {
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
         for (label, expected) in [("tracked", false), ("local", true)] {
             let result = lix
-                .execute(
-                    "SELECT id FROM migration_lane_index WHERE label = $1 AND lixcol_untracked = $2",
-                    &[crate::Value::Text(label.into()), crate::Value::Boolean(expected)],
-                )
+                .query("SELECT id FROM migration_lane_index WHERE label = $1 AND lixcol_untracked = $2").params(&[crate::Value::Text(label.into()), crate::Value::Boolean(expected)]).all()
                 .await
                 .unwrap();
             let rows = result.rows();
@@ -520,13 +504,11 @@ mod tests {
                         "on_delete":action
                     }]);
                 }
-                lix.execute(
-                    "INSERT INTO lix_registered_schema(value) VALUES ($1)",
-                    &[crate::Value::Jsonb(schema.into())],
-                )
-                .await
-                .unwrap();
-                lix.execute(&format!("INSERT INTO {key}(id,moment,label) VALUES ('row',CAST('2026-01-02T03:04:05Z' AS TIMESTAMPTZ),'same')"), &[]).await.unwrap();
+                lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1)")
+                    .params(&[crate::Value::Jsonb(schema.into())])
+                    .await
+                    .unwrap();
+                lix.execute(&format!("INSERT INTO {key}(id,moment,label) VALUES ('row',CAST('2026-01-02T03:04:05Z' AS TIMESTAMPTZ),'same')")).await.unwrap();
             }
             lix.close().await.unwrap();
             super::super::epoch::stage_repository_format_for_test(&storage, false, 81)
@@ -534,12 +516,13 @@ mod tests {
                 .unwrap();
             let lix = crate::open_lix().with_storage(storage).await.unwrap();
             let deleted = lix
-                .execute("DELETE FROM migration_parent WHERE id='row'", &[])
+                .execute("DELETE FROM migration_parent WHERE id='row'")
                 .await;
             if action == "cascade" {
                 deleted.unwrap();
                 assert!(
-                    lix.execute("SELECT id FROM migration_child", &[])
+                    lix.query("SELECT id FROM migration_child")
+                        .all()
                         .await
                         .unwrap()
                         .rows()
@@ -551,7 +534,8 @@ mod tests {
                     "migrated timestamp FK must still restrict deletion"
                 );
                 assert_eq!(
-                    lix.execute("SELECT id FROM migration_child", &[])
+                    lix.query("SELECT id FROM migration_child")
+                        .all()
                         .await
                         .unwrap()
                         .rows()
@@ -576,17 +560,15 @@ mod tests {
             "primary_key":["id"], "unique":[["label"]]
         });
         for global in [false, true] {
-            lix.execute(
-                "INSERT INTO lix_registered_schema(value,lixcol_global) VALUES ($1,$2)",
-                &[
+            lix.execute("INSERT INTO lix_registered_schema(value,lixcol_global) VALUES ($1,$2)")
+                .params(&[
                     crate::Value::Jsonb(schema.clone().into()),
                     crate::Value::Boolean(global),
-                ],
-            )
-            .await
-            .unwrap();
+                ])
+                .await
+                .unwrap();
         }
-        lix.execute("INSERT INTO migration_global_index(id,label,lixcol_global) VALUES ('global','global-label',true)", &[]).await.unwrap();
+        lix.execute("INSERT INTO migration_global_index(id,label,lixcol_global) VALUES ('global','global-label',true)").await.unwrap();
         for index in 0..3 {
             lix.create_branch(crate::CreateBranchOptions {
                 id: None,
@@ -695,7 +677,8 @@ mod tests {
 
         let lix = crate::open_lix().with_storage(storage).await.unwrap();
         let result = lix
-            .execute("SELECT id FROM migration_profile", &[])
+            .query("SELECT id FROM migration_profile")
+            .all()
             .await
             .unwrap();
         assert_eq!(result.rows().len(), row_count);
@@ -721,12 +704,10 @@ mod tests {
             "primary_key": ["id"],
             "unique": [["label"]]
         });
-        lix.execute(
-            "INSERT INTO lix_registered_schema(value) VALUES ($1)",
-            &[crate::Value::Jsonb(schema.into())],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1)")
+            .params(&[crate::Value::Jsonb(schema.into())])
+            .await
+            .unwrap();
         let mut insert = String::from("INSERT INTO migration_profile(id,label) VALUES ");
         for index in 0..row_count {
             if index != 0 {
@@ -734,7 +715,7 @@ mod tests {
             }
             write!(insert, "('row-{index:08}','label-{index:08}')").unwrap();
         }
-        lix.execute(&insert, &[]).await.unwrap();
+        lix.execute(&insert).await.unwrap();
         lix.close().await.unwrap();
         super::super::epoch::stage_repository_format_for_test(&storage, false, 81)
             .await

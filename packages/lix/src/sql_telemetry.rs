@@ -2,7 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::telemetry::{
-    ActiveTelemetrySpan, SQL_BATCH, SQL_COHERENT_READ_BATCH, SQL_QUERY, Status,
+    ActiveTelemetrySpan, SQL_BATCH, SQL_QUERY, Status,
     TelemetryAttribute, TelemetrySink, TelemetrySpanStart,
 };
 use crate::{ExecuteResult, LixError};
@@ -126,8 +126,6 @@ pub(crate) fn start_batch<'a>(
     let sink = sink?;
     let execution_kind = if descriptor == &SQL_BATCH {
         "batch"
-    } else if descriptor == &SQL_COHERENT_READ_BATCH {
-        "coherent_read_batch"
     } else {
         return None;
     };
@@ -711,21 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn coherent_read_batches_accept_query_shape_attributes() {
-        let sink: Arc<dyn TelemetrySink> = Arc::new(
-            crate::telemetry::CallbackTelemetrySink::new(|_| {}),
-        );
-        start_batch(
-            Some(&sink),
-            &SQL_COHERENT_READ_BATCH,
-            2,
-            ["SELECT 'private' AS value", "SELECT 42 AS value"].into_iter(),
-        )
-        .expect("coherent read telemetry span")
-        .finish(Status::Unset, Vec::new());
-    }
-
-    #[test]
     fn one_statement_batch_uses_query_span_for_the_full_operation() {
         let span = batch_start(&SQL_BATCH, 1, &["SELECT 'private' AS value"]);
         assert_eq!(span.name, "lix.sql.query");
@@ -733,17 +716,6 @@ mod tests {
         assert_eq!(i64_attribute(&span, "lix.batch.index"), Some(0));
         assert_eq!(i64_attribute(&span, "db.operation.batch.size"), None);
         assert_eq!(string_attribute(&span, "otel.name"), Some("SELECT"));
-
-        let sink: Arc<dyn TelemetrySink> = Arc::new(
-            crate::telemetry::CallbackTelemetrySink::new(|_| {}),
-        );
-        assert!(start_batch(
-            Some(&sink),
-            &SQL_COHERENT_READ_BATCH,
-            1,
-            std::iter::once("SELECT 'private' AS value"),
-        )
-        .is_none());
     }
 
     #[test]

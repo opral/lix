@@ -236,10 +236,7 @@ mod tests {
         use super::super::*;
         let authority = crate::open_lix().await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('head-fallback', 'before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('head-fallback', 'before')")
             .await
             .unwrap();
         let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
@@ -266,10 +263,7 @@ mod tests {
         use super::super::*;
         let authority = crate::open_lix().await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('cached-candidate', 'before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('cached-candidate', 'before')")
             .await
             .unwrap();
         let descriptor = authority.partial_replica_descriptor(None).await.unwrap();

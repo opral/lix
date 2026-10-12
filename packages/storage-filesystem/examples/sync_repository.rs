@@ -19,7 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.sync_disk_to_lix().await?;
 
         let files = lix
-            .execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .query("SELECT path FROM lix_file ORDER BY path")
+            .all()
             .await?;
         println!("{} repository files", files.rows().len());
 

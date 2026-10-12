@@ -33,14 +33,7 @@ where
             crate::init::REPOSITORY_PROTOCOL_V83,
         )
     };
-    super::publish::publish(
-        adapter,
-        revision,
-        source,
-        target,
-        plan,
-    )
-    .await?;
+    super::publish::publish(adapter, revision, source, target, plan).await?;
     Ok(())
 }
 
@@ -69,9 +62,7 @@ where
 mod tests {
     use bytes::Bytes;
 
-    use crate::storage_adapter::{
-        Memory, StorageSession, StorageKey, StorageValue,
-    };
+    use crate::storage_adapter::{Memory, StorageKey, StorageSession, StorageValue};
 
     #[tokio::test]
     async fn v82_controls_upgrade_and_repository_reopens() {
@@ -96,22 +87,33 @@ mod tests {
         drop(read);
         let mut writes = adapter.new_write_set();
         for (branch_id, control) in &controls {
-            let (key, value) = crate::branch::encode_v82_control_for_test(branch_id, control)
-                .unwrap();
+            let (key, value) =
+                crate::branch::encode_v82_control_for_test(branch_id, control).unwrap();
             writes.put(
                 crate::branch::BRANCH_HEAD_CONTROL_SPACE,
                 StorageKey(Bytes::from(key)),
-                StorageValue { bytes: Bytes::from(value) },
+                StorageValue {
+                    bytes: Bytes::from(value),
+                },
             );
         }
-        adapter.commit_write_set(writes, Default::default()).await.unwrap();
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
         let report = crate::migration::migrate_repository(storage.clone())
             .await
             .unwrap();
         assert_eq!(report.before.format, Some(82));
-        assert_eq!(report.after.format, Some(crate::init::CURRENT_FORMAT_VERSION));
-        let lix = crate::open_lix().with_storage(storage.clone()).await.unwrap();
-        let rows = lix.execute("SELECT id FROM lix_branch", &[]).await.unwrap();
+        assert_eq!(
+            report.after.format,
+            Some(crate::init::CURRENT_FORMAT_VERSION)
+        );
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        let rows = lix.query("SELECT id FROM lix_branch").all().await.unwrap();
         assert!(!rows.is_empty());
         lix.close().await.unwrap();
         let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)

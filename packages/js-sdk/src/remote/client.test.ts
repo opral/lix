@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { gunzipSync } from "fflate";
-import { openLix } from "../index.js";
+import { json, openLix } from "../index.js";
 import { openRemoteLixBinding } from "./client.js";
 
 test.each([
@@ -418,7 +418,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 			7,
 			1.5,
 			"text",
-			{ nested: [1, false] },
+			json({ nested: [1, false] }),
 			new Uint8Array([1, 2, 3]),
 		],
 		{ originKey: "remote-test" },
@@ -528,7 +528,7 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 	await lix.close();
 });
 
-test("remote executeBatch uses the first-class atomic batch endpoint", async () => {
+test("remote executeMany uses the atomic batch endpoint", async () => {
 	const requests: Request[] = [];
 	const lix = await openLix({
 		server: {
@@ -544,62 +544,57 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 							sessionId: "session-1",
 						})
 					: Response.json({ commit: null, results: [
-							{
-								statementIndex: 0,
-								label: "first",
-								columns: [{ name: "value", type: "integer" }],
-								rows: [[{ kind: "int", value: 1 }]],
-								rowsAffected: 0,
-								notices: [],
-							},
-							{
-								statementIndex: 1,
-								columns: [{ name: "value", type: "text" }],
-								rows: [[{ kind: "text", value: "two" }]],
-								rowsAffected: 0,
-								notices: [],
-							},
+							{ statementIndex: 0, columns: [], rows: [], rowsAffected: 1, notices: [] },
+							{ statementIndex: 1, columns: [], rows: [], rowsAffected: 1, notices: [] },
 						] });
 			},
 		},
 	});
 
-	const results = await lix.executeBatch(
-		[
-			{ label: "first", sql: "SELECT $1 AS value", params: [1] },
-			{ sql: "SELECT $1 AS value", params: ["two"] },
-		],
-		{ originKey: "batch-test" },
-	);
-	expect(results.results.map((result) => result.rows[0]?.value)).toEqual([
-		1,
-		"two",
-	]);
-	expect(results.results.map((result) => [result.statementIndex, result.label])).toEqual([
-		[0, "first"],
-		[1, undefined],
-	]);
+	expect(
+		await lix.executeMany(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+			[
+				["a", 1],
+				["b", "two"],
+			],
+			{ originKey: "batch-test" },
+		),
+	).toEqual({ rowsAffected: 2 });
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
 		"/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/execute-batch",
 	);
 	expect(requests[1]?.headers.get("idempotency-key")).toMatch(
 		/^[0-9a-f-]{36}$/,
 	);
-	expect(await requests[1]?.json()).toEqual({
+	expect(await requests[1]?.json()).toMatchObject({
 		statements: [
 			{
-				label: "first",
-				sql: "SELECT $1 AS value",
-				params: [{ kind: "int", value: 1 }],
+				sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+				params: [
+					{ kind: "text", value: "a" },
+					{ kind: "int", value: 1 },
+				],
 			},
 			{
-				sql: "SELECT $1 AS value",
-				params: [{ kind: "text", value: "two" }],
+				sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+				params: [
+					{ kind: "text", value: "b" },
+					{ kind: "text", value: "two" },
+				],
 			},
 		],
 		options: { originKey: "batch-test" },
 	});
-
+	// A statement that returns rows never reaches the server.
+	const sent = requests.length;
+	await expect(lix.executeMany("SELECT $1", [[1]])).rejects.toMatchObject({
+		code: "LIX_INVALID_PARAM",
+	});
+	await expect(lix.query("DELETE FROM lix_key_value")).rejects.toMatchObject({
+		code: "LIX_ERROR_READ_ONLY",
+	});
+	expect(requests).toHaveLength(sent);
 	await lix.close();
 });
 
@@ -861,7 +856,7 @@ test("Lix Server Protocol v3 uses blob splices without capability negotiation", 
 	expect(bodies[1]?.cacheBlobs).toBe(true);
 });
 
-test("remote executeBatch uses blob splices for stable statement slots", async () => {
+test("remote executeMany uses blob splices for stable statement slots", async () => {
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
@@ -881,12 +876,8 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 	const first = new Uint8Array(32 * 1024).fill(97);
 	const second = new Uint8Array(first);
 	second[second.byteLength - 1] = 98;
-	const statement = (blob: Uint8Array) => [
-		{ sql: "UPDATE lix_file SET content = $1", params: [blob] },
-	];
-
-	await lix.executeBatch(statement(first));
-	await lix.executeBatch(statement(second));
+	await lix.executeMany("UPDATE lix_file SET content = $1", [[first]]);
+	await lix.executeMany("UPDATE lix_file SET content = $1", [[second]]);
 	await lix.close();
 
 	const statements = bodies[1]?.statements as Array<{
@@ -1869,6 +1860,27 @@ test("close waits for queued operations before deleting the remote session", asy
 	releaseExecute.resolve();
 	await Promise.all([executing, closing]);
 	expect(order).toEqual(["execute-start", "execute-finish", "delete"]);
+});
+
+test("remote streams are rejected explicitly without contacting the server", async () => {
+	const requests: string[] = [];
+	const lix = await openLix({
+		server: {
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(`${request.method} ${new URL(request.url).pathname}`);
+				return handshakeResponse();
+			},
+		},
+	});
+	const opened = requests.length;
+	await expect(lix.stream("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_UNSUPPORTED_REMOTE_OPERATION",
+		details: { operation: "stream" },
+	});
+	expect(requests).toHaveLength(opened);
+	await lix.close();
 });
 
 function handshakeResponse() {

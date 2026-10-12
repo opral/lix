@@ -274,10 +274,7 @@ mod tests {
     async fn public_partial_handle_opens_bounded_hydrates_sql_and_reopens_offline() {
         let authority = open_lix().await.unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('partial-handle', 'warm')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key, value) VALUES ('partial-handle', 'warm')")
             .await
             .unwrap();
         let repository_id = authority.lix_id().to_owned();
@@ -485,10 +482,28 @@ mod tests {
         );
         let sql = "SELECT value FROM lix_key_value WHERE key = $1";
         let params = [Value::Text("partial-handle".into())];
-        assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
+        assert_eq!(
+            lix.query(sql)
+                .params(&params)
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
         let warm = requests.load(Ordering::SeqCst);
         assert!(warm > 3, "cold SQL must demand missing native inputs");
-        assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
+        assert_eq!(
+            lix.query(sql)
+                .params(&params)
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
         assert_eq!(requests.load(Ordering::SeqCst), warm);
         let mut online_snapshot = Vec::new();
         lix.export_snapshot()
@@ -516,7 +531,17 @@ mod tests {
                 .is_err(),
             "root close must retain ownership through live child sessions"
         );
-        assert_eq!(child.execute(sql, &params).await.unwrap().rows().len(), 1);
+        assert_eq!(
+            child
+                .query(sql)
+                .params(&params)
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             warm,
@@ -531,7 +556,9 @@ mod tests {
         );
         assert_eq!(
             backing_session
-                .execute(sql, &params)
+                .query(sql)
+                .params(&params)
+                .all()
                 .await
                 .unwrap()
                 .rows()
@@ -589,11 +616,28 @@ mod tests {
             "partial restoration preserves exact local inputs and journals"
         );
         assert_eq!(
-            restored.execute(sql, &params).await.unwrap().rows().len(),
+            restored
+                .query(sql)
+                .params(&params)
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
             1
         );
         restored.close().await.unwrap();
-        assert_eq!(offline.execute(sql, &params).await.unwrap().rows().len(), 1);
+        assert_eq!(
+            offline
+                .query(sql)
+                .params(&params)
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             warm + 1,

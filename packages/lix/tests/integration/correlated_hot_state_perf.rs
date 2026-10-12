@@ -1,3 +1,4 @@
+use crate::test_support::ResultRows;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
@@ -12,7 +13,7 @@ use lix::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, WriteOptions,
 };
-use lix::{ExecuteResult, Lix, Value, open_lix};
+use lix::{Lix, Value, open_lix};
 use serde::Serialize;
 
 const FILES_ENV: &str = "LIX_CORRELATED_HOT_STATE_PERF_FILES";
@@ -342,10 +343,9 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
             .collect::<Vec<_>>()
             .join(",");
         let result = session
-            .execute(
-                &format!("INSERT INTO lix_file (id, path, content) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_file (id, path, content) VALUES {values}"
+            ))
             .await
             .expect("benchmark files should insert");
         assert_eq!(
@@ -356,7 +356,8 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
     }
 
     let count = session
-        .execute("SELECT id FROM lix_file", &[])
+        .query("SELECT id FROM lix_file")
+        .all()
         .await
         .expect("setup row count should be readable");
     assert_eq!(count.len(), config.files, "setup should seed every file");
@@ -373,7 +374,8 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
 async fn validate_seed_snapshot(snapshot: &[u8], expected_files: usize) {
     let (_, session) = open_case(snapshot).await;
     let rows = session
-        .execute("SELECT id FROM lix_file", &[])
+        .query("SELECT id FROM lix_file")
+        .all()
         .await
         .expect("input seed row count should be readable");
     assert_eq!(
@@ -443,12 +445,14 @@ async fn profile_select(
 
     for _ in 0..warmups {
         session
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect("profile select warmup should succeed");
     }
     let validation = session
-        .execute(sql, &[])
+        .query(sql)
+        .all()
         .await
         .expect("profile select validation should succeed");
     validate_data(&validation, ids, &[0]);
@@ -477,7 +481,8 @@ async fn profile_select(
     for _ in 0..profile.iterations {
         final_result = Some(
             session
-                .execute(sql, &[])
+                .query(sql)
+                .all()
                 .await
                 .expect("profile select should succeed"),
         );
@@ -511,7 +516,8 @@ async fn measure_select(
     let (storage, session) = open_case(seed_snapshot).await;
     for _ in 0..warmups {
         let result = session
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect("select warmup should succeed");
         validate_data(&result, ids, &[0]);
@@ -522,7 +528,8 @@ async fn measure_select(
         let before = storage.stats();
         let started = Instant::now();
         let result = session
-            .execute(sql, &[])
+            .query(sql)
+            .all()
             .await
             .expect("timed select should succeed");
         let duration_ns = elapsed_ns(started);
@@ -550,7 +557,8 @@ async fn measure_update(
     for iteration in 0..warmups {
         let data = update_data(iteration);
         let result = session
-            .execute(update_sql, &[Value::Blob(data.clone().into())])
+            .execute(update_sql)
+            .params(&[Value::Blob(data.clone().into())])
             .await
             .expect("update warmup should succeed");
         assert_eq!(
@@ -566,7 +574,8 @@ async fn measure_update(
         let before = storage.stats();
         let started = Instant::now();
         let result = session
-            .execute(update_sql, &[Value::Blob(data.clone().into())])
+            .execute(update_sql)
+            .params(&[Value::Blob(data.clone().into())])
             .await
             .expect("timed update should succeed");
         let duration_ns = elapsed_ns(started);
@@ -598,13 +607,15 @@ async fn validate_selected_data(
     expected_data: &[u8],
 ) {
     let result = session
-        .execute(select_sql, &[])
+        .query(select_sql)
+        .all()
         .await
         .expect("updated data should be readable");
     validate_data(&result, ids, expected_data);
 }
 
-fn validate_data(result: &ExecuteResult, ids: &[String], expected_data: &[u8]) {
+fn validate_data(result: &impl ResultRows, ids: &[String], expected_data: &[u8]) {
+    let result = result.result_rows();
     assert_eq!(
         result.len(),
         ids.len(),
@@ -613,7 +624,7 @@ fn validate_data(result: &ExecuteResult, ids: &[String], expected_data: &[u8]) {
     let expected = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
 
-    for row in result.rows() {
+    for row in result {
         let [Value::Text(id), Value::Blob(data)] = row.values() else {
             panic!("expected [text id, blob data], got {:?}", row.values());
         };
@@ -793,9 +804,7 @@ impl Storage for CountingStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 

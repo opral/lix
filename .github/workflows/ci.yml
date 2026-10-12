@@ -630,7 +630,7 @@ jobs:
         if: matrix.runtime == 'native'
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang mold
+          sudo apt-get install -y llvm-dev libclang-dev clang mold gdb
 
       - name: Install mold for WebAssembly host tooling
         if: matrix.runtime == 'browser' && steps.binary-cache.outputs.reuse != 'true'
@@ -723,7 +723,32 @@ jobs:
       - name: Run native JS SDK tests
         if: matrix.runtime == 'native'
         working-directory: packages/js-sdk
-        run: npm exec -- vitest run
+        run: |
+          sudo sysctl -w "kernel.core_pattern=$RUNNER_TEMP/lix-native-core-%p"
+          ulimit -c unlimited
+          npm exec -- vitest run --reporter=verbose
+
+      - name: Diagnose native worker crashes
+        if: failure() && matrix.runtime == 'native'
+        run: |
+          mkdir -p "$RUNNER_TEMP/lix-native-diagnostics"
+          for core in "$RUNNER_TEMP"/lix-native-core-*; do
+            gdb --batch -ex 'set print frame-arguments none' \
+              -ex 'info threads' -ex 'thread apply all bt' \
+              "$(command -v node)" "$core" \
+              > "$RUNNER_TEMP/lix-native-diagnostics/$(basename "$core").txt" 2>&1 || true
+          done
+          cp packages/storage-filesystem/lix_storage_filesystem.node \
+            "$RUNNER_TEMP/lix-native-diagnostics/" 2>/dev/null || true
+
+      - name: Upload native worker diagnostics
+        if: failure() && matrix.runtime == 'native'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-worker-diagnostics-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lix-native-diagnostics
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Verify installed native SDK upgrades released repositories
         if: matrix.runtime == 'native'

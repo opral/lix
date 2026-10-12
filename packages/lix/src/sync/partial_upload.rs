@@ -465,8 +465,7 @@ async fn seed_upload_receipt_fixture<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     writes: crate::storage_adapter::StorageWriteSet,
     guards: Vec<StoragePrecondition>,
-)
-where
+) where
     S: crate::storage_adapter::Storage,
 {
     use crate::storage::StorageWrite as _;
@@ -501,12 +500,9 @@ mod tests {
         )
         .unwrap();
         for index in 0..3 {
-            lix.execute(
-                &format!(
-                    "INSERT INTO lix_key_value (key, value) VALUES ('upload-{index}', 'value')"
-                ),
-                &[],
-            )
+            lix.execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES ('upload-{index}', 'value')"
+            ))
             .await
             .unwrap();
         }
@@ -733,10 +729,7 @@ mod paging_and_resume_tests {
             .await
             .unwrap();
         global
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('global-wave-one','one')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('global-wave-one','one')")
             .await
             .unwrap();
         let g1 = lix
@@ -744,17 +737,11 @@ mod paging_and_resume_tests {
             .await
             .unwrap()
             .global_branch;
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('selected-wave','value')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('selected-wave','value')")
+            .await
+            .unwrap();
         global
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('global-wave-two','two')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('global-wave-two','two')")
             .await
             .unwrap();
         let g2 = lix
@@ -881,12 +868,9 @@ mod created_ref_prefix_tests {
             })
             .await
             .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('prefix-source','pending')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('prefix-source','pending')")
+            .await
+            .unwrap();
         let second = lix
             .create_branch(crate::CreateBranchOptions {
                 id: None,
@@ -896,12 +880,9 @@ mod created_ref_prefix_tests {
             .await
             .unwrap();
         // A later selected edit must not strand the already captured child S.
-        lix.execute(
-            "UPDATE lix_key_value SET value='later' WHERE key='prefix-source'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value='later' WHERE key='prefix-source'")
+            .await
+            .unwrap();
         let storage = lix.storage_adapter();
         let mut writes = storage.new_write_set();
         let mut guards = super::super::partial_push_state::stage_initial_partial_push_states(
@@ -1242,12 +1223,9 @@ mod confirmed_global_base_tests {
         })
         .await
         .unwrap();
-        lix.execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('older-basis','S')",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('older-basis','S')")
+            .await
+            .unwrap();
         lix.create_branch(crate::CreateBranchOptions {
             id: None,
             name: "basis-L2".into(),
@@ -1263,12 +1241,9 @@ mod confirmed_global_base_tests {
         })
         .await
         .unwrap();
-        lix.execute(
-            "UPDATE lix_key_value SET value='S2' WHERE key='older-basis'",
-            &[],
-        )
-        .await
-        .unwrap();
+        lix.execute("UPDATE lix_key_value SET value='S2' WHERE key='older-basis'")
+            .await
+            .unwrap();
         let storage = lix.storage_adapter();
         let mut writes = storage.new_write_set();
         let mut guards = super::super::partial_push_state::stage_initial_partial_push_states(

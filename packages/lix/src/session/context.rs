@@ -186,6 +186,8 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) sync_mode: SyncModeState,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub(super) query_streams: Arc<super::query_stream::QueryStreamRegistry>,
+    pub(super) read_snapshots: Arc<super::read_snapshot::ReadSnapshotRegistry>,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -287,6 +289,8 @@ where
             sync_mode,
             plugin_host,
             telemetry,
+            query_streams: Arc::default(),
+            read_snapshots: Arc::default(),
             transaction_manager,
         }
     }
@@ -312,8 +316,19 @@ where
     /// successful writes are committed before their operation returns.
     pub async fn close(&self) -> Result<(), LixError> {
         self.transaction_manager.close().await?;
+        // Streams register before re-checking that the session is open, and
+        // the manager rejects that check from here on, so every stream that
+        // could still pull is cancelled now and releases its read snapshot.
+        self.query_streams.cancel_all(closed_error);
+        self.read_snapshots.close_all();
         self.observe_invalidation.bump();
         Ok(())
+    }
+
+    /// Streams of this session whose producer still pins a read snapshot.
+    #[cfg(test)]
+    pub(crate) fn running_query_stream_count_for_test(&self) -> usize {
+        self.query_streams.running_count()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -538,16 +553,6 @@ where
         // Send by the Storage contract; the compiler obstruction is the
         // higher-ranked shared reference carried by a borrowing adapter.
         unsafe { super::AssumeSendFuture::new(async move { self.active_branch_id().await }) }
-    }
-
-    #[doc(hidden)]
-    pub async fn storage_mutation_revision(&self) -> Result<Option<Vec<u8>>, LixError> {
-        let _operation_guard = self.begin_waitable_session_operation().await?;
-        Ok(self
-            .storage
-            .load_mutation_revision()
-            .await?
-            .map(|revision| revision.to_vec()))
     }
 
     pub(super) async fn active_branch_id_from_reader<S>(
@@ -1195,7 +1200,7 @@ mod tests {
             error.details.as_ref().unwrap()["missingNativeObject"],
             original.details.as_ref().unwrap()["missingNativeObject"]
         );
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, mut receiver) = crate::sync::sync_demand_channel(1);
         let mut retry = crate::sync::SyncDemandRetry::default();
         let rejected = tokio::time::timeout(
             Duration::from_secs(1),

@@ -387,6 +387,134 @@ impl TrackedStateTree {
     ///
     /// The encoded lower bound is intersected with ordinary filter ranges so
     /// internal subtrees at or before the continuation are never loaded.
+    /// Counts the keys of `schema_key` inside a primary-key window as ordered
+    /// spans `(first_key, last_key, entries)`, read from child summaries
+    /// wherever possible, as a cost model for sizing ordered pages.
+    ///
+    /// Children are visited in key order. The walk descends only into a
+    /// child that crosses a file-scope boundary or holds more than an eighth
+    /// of `target_rows` entries, and it stops visiting a file scope once that
+    /// scope's spans reach `target_rows` entries, because the scope's later
+    /// spans end at larger keys. Counts include tombstones: the result is an
+    /// estimate, never a visibility claim.
+    pub(crate) async fn row_pk_window_spans(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        schema_key: &str,
+        window: &super::RowPkWindow,
+        target_rows: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64)>, LixError> {
+        let target_rows = u64::try_from(target_rows).unwrap_or(u64::MAX);
+        let mut walk = RowPkWindowSpanWalk {
+            schema_key,
+            window,
+            ranges: normalize_scan_ranges(
+                window
+                    .schema_key_ranges(schema_key)
+                    .into_iter()
+                    .map(|range| EncodedScanRange {
+                        start: range.start,
+                        end: range.end,
+                    })
+                    .collect(),
+            ),
+            granularity: (target_rows / 8).max(64),
+            target_rows,
+            scope_rows: BTreeMap::new(),
+            spans: Vec::new(),
+        };
+        self.row_pk_window_span_node(store, *root_id.as_bytes(), &mut walk)
+            .await?;
+        Ok(walk.spans)
+    }
+
+    fn row_pk_window_span_node<'a, 'w, S>(
+        &'a self,
+        store: &'a S,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        walk: &'a mut RowPkWindowSpanWalk<'w>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+        'w: 'a,
+    {
+        Box::pin(async move {
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
+                    for index in 0..leaf.len() {
+                        let entry = leaf.entry(index).ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                "tracked-state leaf entry disappeared during a span walk",
+                            )
+                        })?;
+                        if !encoded_key_in_scan_ranges(entry.key, &walk.ranges) {
+                            continue;
+                        }
+                        let key = decode_key_borrowed(entry.key)?;
+                        if key.schema_key != walk.schema_key || !walk.window.contains(&key.row_pk) {
+                            continue;
+                        }
+                        let rows = walk
+                            .scope_rows
+                            .entry(key.file_id.map(std::borrow::Cow::into_owned))
+                            .or_insert(0);
+                        if *rows >= walk.target_rows {
+                            continue;
+                        }
+                        *rows += 1;
+                        walk.spans.push((entry.key.to_vec(), entry.key.to_vec(), 1));
+                    }
+                }
+                DecodedNodeRef::Internal(internal) => {
+                    for child in internal.children() {
+                        if !child_summary_overlaps_scan_ranges(child, &walk.ranges)
+                            || !walk.window.span_may_intersect(&child.first_key, &child.last_key)
+                        {
+                            continue;
+                        }
+                        let scope = match (
+                            decode_key_borrowed(&child.first_key),
+                            decode_key_borrowed(&child.last_key),
+                        ) {
+                            (Ok(first), Ok(last))
+                                if first.schema_key == walk.schema_key
+                                    && last.schema_key == walk.schema_key
+                                    && first.file_id == last.file_id =>
+                            {
+                                Some(first.file_id.map(std::borrow::Cow::into_owned))
+                            }
+                            _ => None,
+                        };
+                        let Some(scope) = scope else {
+                            self.row_pk_window_span_node(store, child.child_hash, walk)
+                                .await?;
+                            continue;
+                        };
+                        let rows = walk.scope_rows.get(&scope).copied().unwrap_or(0);
+                        if rows >= walk.target_rows {
+                            continue;
+                        }
+                        if child.subtree_count > walk.granularity {
+                            self.row_pk_window_span_node(store, child.child_hash, walk)
+                                .await?;
+                            continue;
+                        }
+                        *walk.scope_rows.entry(scope).or_insert(0) += child.subtree_count;
+                        walk.spans.push((
+                            child.first_key.to_vec(),
+                            child.last_key.to_vec(),
+                            child.subtree_count,
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) async fn scan_after(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -433,6 +561,8 @@ impl TrackedStateTree {
                 if ranges.is_empty() {
                     return Ok(Vec::new());
                 }
+                // Raising every start to the cursor can make ranges overlap.
+                ranges = normalize_scan_ranges(ranges);
             }
         }
         let key_decode_hint = scan_key_decode_hint(request, &ranges);
@@ -461,11 +591,13 @@ impl TrackedStateTree {
         // Subtree counts are storage data. A corrupt count must not turn a
         // best-effort scan allocation hint into a capacity panic.
         let _ = rows.try_reserve_exact(reserve);
+        let row_pks = crate::tracked_state::RowPkLookup::new(&request.row_pks);
         self.scan_node(
             store,
             *root_id.as_bytes(),
             request,
             &ranges,
+            &row_pks,
             key_decode_hint,
             &mut rows,
         )
@@ -1873,6 +2005,7 @@ impl TrackedStateTree {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &'a TrackedStateTreeScanRequest,
         ranges: &'a [EncodedScanRange],
+        row_pks: &'a crate::tracked_state::RowPkLookup<'a>,
         key_decode_hint: Option<ScanKeyDecodeHint<'a>>,
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
@@ -1905,7 +2038,7 @@ impl TrackedStateTree {
                             )?,
                             None => decode_key(entry.key)?,
                         };
-                        if key_decode_hint.is_none() && !key_matches_scan_filters(request, &key) {
+                        if key_decode_hint.is_none() && !key_matches_scan_filters(request, row_pks, &key) {
                             continue;
                         }
                         let Some(value) =
@@ -1932,6 +2065,7 @@ impl TrackedStateTree {
                                     child.child_hash,
                                     request,
                                     ranges,
+                                    row_pks,
                                     key_decode_hint,
                                     rows,
                                 )
@@ -2770,6 +2904,7 @@ impl<'a> OrderedTreeAssembler<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct EncodedScanRange {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
@@ -3179,6 +3314,17 @@ fn push_level_summary(levels: &mut Vec<Vec<ChildSummary>>, level: usize, summary
     levels[level].push(summary);
 }
 
+/// Traversal state of [`TrackedStateTree::row_pk_window_spans`].
+struct RowPkWindowSpanWalk<'w> {
+    schema_key: &'w str,
+    window: &'w super::RowPkWindow,
+    ranges: Vec<EncodedScanRange>,
+    granularity: u64,
+    target_rows: u64,
+    scope_rows: BTreeMap<Option<String>, u64>,
+    spans: Vec<(Vec<u8>, Vec<u8>, u64)>,
+}
+
 fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
     if request.schema_keys.is_empty() {
         return Vec::new();
@@ -3225,7 +3371,19 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
                 .iter()
                 .any(|filter| matches!(filter, NullableKeyFilter::Any))
         {
-            ranges.push(prefix_scan_range(encode_schema_key_prefix(schema_key)));
+            if let Some(window) = request_row_pk_window(request) {
+                // Every file scope holds its own window of the interval: read
+                // the exact unfiled window and the file-scoped remainder, which
+                // `child_summary_overlaps_request` narrows per scope.
+                ranges.extend(window.schema_key_ranges(schema_key).into_iter().map(
+                    |range| EncodedScanRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                ));
+            } else {
+                ranges.push(prefix_scan_range(encode_schema_key_prefix(schema_key)));
+            }
             continue;
         }
 
@@ -3247,7 +3405,38 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
             ));
         }
     }
-    ranges
+    normalize_scan_ranges(ranges)
+}
+
+/// Sorts ranges by start and merges overlapping or adjacent ones.
+///
+/// Every range list handed to the scan helpers is normalized, so membership
+/// and overlap tests can binary search instead of probing each range. That
+/// matters for identity-bound scans: an index probe over `fk IN (...)` binds
+/// one exact range per matching row, and the scan tests every visited key.
+fn normalize_scan_ranges(mut ranges: Vec<EncodedScanRange>) -> Vec<EncodedScanRange> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+    ranges.sort_unstable_by(|left, right| left.start.cmp(&right.start));
+    let mut merged: Vec<EncodedScanRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            let touches = last
+                .end
+                .as_ref()
+                .is_none_or(|end| range.start.as_slice() <= end.as_slice());
+            if touches {
+                last.end = match (last.end.take(), range.end) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    _ => None,
+                };
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 fn scan_key_decode_hint<'a>(
@@ -3326,6 +3515,20 @@ fn row_pk_scan_range(
     EncodedScanRange { start, end }
 }
 
+/// The primary-key interval of a scan that names no exact identities; exact
+/// identities already bind their own point ranges.
+fn request_row_pk_window(
+    request: &TrackedStateTreeScanRequest,
+) -> Option<crate::tracked_state::RowPkWindow> {
+    if !request.row_pks.is_empty() {
+        return None;
+    }
+    crate::tracked_state::RowPkWindow::from_bounds(
+        request.row_pk_lower.as_ref(),
+        request.row_pk_upper.as_ref(),
+    )
+}
+
 fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = bytes.to_vec();
     for index in (0..out.len()).rev() {
@@ -3347,6 +3550,21 @@ fn child_summary_overlaps_request(
     ranges: &[EncodedScanRange],
 ) -> bool {
     if !child_summary_overlaps_scan_ranges(child, ranges) {
+        return false;
+    }
+    if request.row_pks.is_empty()
+        && (request.file_ids.is_empty()
+            || request
+                .file_ids
+                .iter()
+                .any(|owner| matches!(owner, NullableKeyFilter::Any)))
+        && !crate::tracked_state::span_may_intersect_row_pk_bounds(
+            request.row_pk_lower.as_ref(),
+            request.row_pk_upper.as_ref(),
+            &child.first_key,
+            &child.last_key,
+        )
+    {
         return false;
     }
     if !request.schema_keys.is_empty()
@@ -3383,30 +3601,48 @@ fn child_summary_overlaps_request(
     })
 }
 
+/// `ranges` must be normalized (see [`normalize_scan_ranges`]): sorted and
+/// disjoint, so ends ascend with starts and both tests can binary search.
 fn child_summary_overlaps_scan_ranges(child: &ChildSummary, ranges: &[EncodedScanRange]) -> bool {
-    ranges.is_empty()
-        || ranges.iter().any(|range| {
-            child.last_key.as_ref() >= range.start.as_slice()
-                && range
-                    .end
-                    .as_ref()
-                    .is_none_or(|end| child.first_key.as_ref() < end.as_slice())
-        })
+    if ranges.is_empty() {
+        return true;
+    }
+    let first = child.first_key.as_ref();
+    // Skip every range that ends at or before the child's first key; the next
+    // one overlaps iff it starts at or before the child's last key.
+    let index = ranges.partition_point(|range| {
+        range
+            .end
+            .as_ref()
+            .is_some_and(|end| end.as_slice() <= first)
+    });
+    ranges
+        .get(index)
+        .is_some_and(|range| range.start.as_slice() <= child.last_key.as_ref())
 }
 
+/// `ranges` must be normalized (see [`normalize_scan_ranges`]).
 fn encoded_key_in_scan_ranges(key: &[u8], ranges: &[EncodedScanRange]) -> bool {
-    ranges.is_empty()
-        || ranges.iter().any(|range| {
-            key >= range.start.as_slice()
-                && range.end.as_ref().is_none_or(|end| key < end.as_slice())
-        })
+    if ranges.is_empty() {
+        return true;
+    }
+    let index = ranges.partition_point(|range| range.start.as_slice() <= key);
+    index > 0
+        && ranges[index - 1]
+            .end
+            .as_ref()
+            .is_none_or(|end| key < end.as_slice())
 }
 
-fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &TrackedStateKey) -> bool {
+fn key_matches_scan_filters(
+    request: &TrackedStateTreeScanRequest,
+    row_pks: &crate::tracked_state::RowPkLookup<'_>,
+    key: &TrackedStateKey,
+) -> bool {
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&key.schema_key) {
         return false;
     }
-    if !request.row_pks.is_empty() && !request.row_pks.contains(&key.row_pk) {
+    if !row_pks.contains(&key.row_pk) {
         return false;
     }
     if !crate::tracked_state::row_pk_satisfies_bounds(
@@ -5122,6 +5358,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_pk_window_spans_size_a_page_without_walking_the_tail() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let file_id = "01920000-0000-7000-8000-0000000000a3";
+        let mut mutations = (0..3000)
+            .map(|index| {
+                mutation_owned(
+                    key("schema-s", None, &format!("r{index:05}")),
+                    value(&format!("span-null-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        mutations.extend((0..600).map(|index| {
+            mutation_owned(
+                key("schema-s", Some(file_id), &format!("r{:05}", index * 5)),
+                value(&format!("span-file-{index}"), Some("{}")),
+            )
+        }));
+        mutations.extend((0..1000).map(|index| {
+            mutation_owned(
+                key("schema-t", None, &format!("r{index:05}")),
+                value(&format!("span-other-{index}"), Some("{}")),
+            )
+        }));
+        let result = apply_mutations_for_test(&tree, &storage, None, mutations, None)
+            .await
+            .expect("span fixture should apply");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("span read should open");
+        let window = crate::tracked_state::RowPkWindow {
+            lower: Some(crate::tracked_state::RowPkRangeBound {
+                row_pk: RowPk::single("r01000"),
+                inclusive: false,
+            }),
+            upper: None,
+        };
+        let target = 400;
+        let spans = tree
+            .row_pk_window_spans(&store, &result.root_id, "schema-s", &window, target)
+            .await
+            .expect("span walk should succeed");
+        let counted = spans.iter().map(|span| span.2).sum::<u64>();
+        // The unfiled scope is counted to the target and the file scope's
+        // 399 window keys in full: far fewer than the 2,398 keys of the tail.
+        assert!(counted >= target as u64 + 399, "counted {counted}");
+        assert!(counted < 1200, "the walk read the tail: counted {counted}");
+        let horizon = crate::tracked_state::row_pk_page_horizon(
+            &window,
+            spans
+                .iter()
+                .map(|(first, last, rows)| {
+                    (
+                        crate::tracked_state::row_pk_span_end("schema-s", &window, first, last),
+                        *rows as usize,
+                    )
+                })
+                .collect(),
+            target,
+        )
+        .expect("the tail holds more than one page");
+        let page = tree
+            .scan(
+                &store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-s".to_owned()],
+                    row_pk_lower: window.lower.clone(),
+                    row_pk_upper: Some(crate::tracked_state::RowPkRangeBound {
+                        row_pk: horizon,
+                        inclusive: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("page scan should succeed");
+        // The window sized for 400 rows holds about that many: never fewer
+        // than one span short, never the whole tail.
+        assert!(page.len() >= target / 2, "page holds {}", page.len());
+        assert!(page.len() <= 3 * target, "page holds {}", page.len());
+    }
+
+    #[tokio::test]
     async fn scan_schema_file_primary_key_range_honors_open_closed_and_empty_bounds() {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
@@ -6584,5 +6905,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(presence, vec![Some(false), None]);
+    }
+}
+
+#[cfg(test)]
+mod scan_range_tests {
+    use super::*;
+    use crate::row_pk::RowPk;
+    use bytes::Bytes;
+
+    /// The pre-normalization semantics: probe every range.
+    fn linear_key_in(key: &[u8], ranges: &[EncodedScanRange]) -> bool {
+        ranges.is_empty()
+            || ranges.iter().any(|range| {
+                key >= range.start.as_slice()
+                    && range.end.as_ref().is_none_or(|end| key < end.as_slice())
+            })
+    }
+
+    fn linear_child_overlaps(first: &[u8], last: &[u8], ranges: &[EncodedScanRange]) -> bool {
+        ranges.is_empty()
+            || ranges.iter().any(|range| {
+                last >= range.start.as_slice()
+                    && range.end.as_ref().is_none_or(|end| first < end.as_slice())
+            })
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn key(&mut self) -> Vec<u8> {
+            let len = 1 + (self.next() % 3) as usize;
+            (0..len).map(|_| (self.next() % 6) as u8).collect()
+        }
+    }
+
+    #[test]
+    fn normalized_binary_search_matches_linear_range_probing() {
+        let mut rng = Lcg(7);
+        for case in 0..2_000 {
+            let count = (rng.next() % 12) as usize;
+            let ranges = (0..count)
+                .map(|_| {
+                    let start = rng.key();
+                    let end = match rng.next() % 5 {
+                        0 => None,
+                        1 => lexicographic_successor(&start),
+                        _ => {
+                            let end = rng.key();
+                            Some(if end > start { end } else { start.iter().copied().chain([9]).collect() })
+                        }
+                    };
+                    EncodedScanRange { start, end }
+                })
+                .collect::<Vec<_>>();
+            let normalized = normalize_scan_ranges(ranges.clone());
+            assert!(
+                normalized.windows(2).all(|pair| pair[0]
+                    .end
+                    .as_ref()
+                    .is_some_and(|end| end.as_slice() < pair[1].start.as_slice())),
+                "case {case}: normalized ranges must be sorted and disjoint: {normalized:?}"
+            );
+            for _ in 0..40 {
+                let key = rng.key();
+                assert_eq!(
+                    encoded_key_in_scan_ranges(&key, &normalized),
+                    linear_key_in(&key, &ranges),
+                    "case {case}: key {key:?} ranges {ranges:?}"
+                );
+                let (a, b) = (rng.key(), rng.key());
+                let (first, last) = if a <= b { (a, b) } else { (b, a) };
+                let child = ChildSummary {
+                    first_key: Bytes::from(first.clone()),
+                    last_key: Bytes::from(last.clone()),
+                    child_hash: [0; TRACKED_STATE_HASH_BYTES],
+                    subtree_count: 1,
+                };
+                assert_eq!(
+                    child_summary_overlaps_scan_ranges(&child, &normalized),
+                    linear_child_overlaps(&first, &last, &ranges),
+                    "case {case}: child {first:?}..={last:?} ranges {ranges:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_pk_lookup_matches_list_membership_at_both_sizes() {
+        for size in [0usize, 3, 16, 17, 500] {
+            let row_pks = (0..size).map(|i| RowPk::single(format!("pk-{i}"))).collect::<Vec<_>>();
+            let lookup = crate::tracked_state::RowPkLookup::new(&row_pks);
+            for probe in 0..size + 5 {
+                let row_pk = RowPk::single(format!("pk-{probe}"));
+                assert_eq!(
+                    lookup.contains(&row_pk),
+                    row_pks.is_empty() || row_pks.contains(&row_pk),
+                    "size {size} probe {probe}"
+                );
+            }
+        }
     }
 }

@@ -20,7 +20,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use futures_util::FutureExt;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 
@@ -31,7 +31,7 @@ use crate::hot_state::MaterializedHotStateBatch;
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
-    HotStateReader, HotStateRowFilter, HotStateScanRequest, MIN_UNORDERED_LIMIT_CANDIDATES,
+    HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
@@ -66,10 +66,43 @@ use super::spec::{
 };
 use super::values::{optional_bool_value, optional_string_value, string_expr_literal};
 
-const MAX_UNORDERED_LIMIT_PUSHDOWN: usize = 1024;
-const LIMIT_CANDIDATE_BUDGET: usize = 4096;
-const LIMIT_RECHECK_CHUNK_SIZE: usize = 512;
-const LIMIT_CANDIDATE_MINIMUM_PAGE: usize = MIN_UNORDERED_LIMIT_CANDIDATES;
+/// Rows one ordered primary-key window targets when no fetch bounds the scan.
+const ORDERED_PRIMARY_KEY_PAGE_ROWS: usize = 8192;
+
+#[cfg(test)]
+thread_local! {
+    static PRIMARY_KEY_WINDOW_ROWS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static PRIMARY_KEY_WINDOWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The stored rows one primary-key window targets.
+fn primary_key_window_rows() -> usize {
+    #[cfg(test)]
+    if let Some(rows) = PRIMARY_KEY_WINDOW_ROWS.get() {
+        return rows;
+    }
+    ORDERED_PRIMARY_KEY_PAGE_ROWS
+}
+
+/// Overrides this thread's window target until the guard drops, so tests can
+/// place window boundaries anywhere in a small fixture.
+#[cfg(test)]
+pub(super) fn set_primary_key_window_rows(rows: usize) -> impl Drop {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRIMARY_KEY_WINDOW_ROWS.set(self.0);
+        }
+    }
+    Restore(PRIMARY_KEY_WINDOW_ROWS.replace(Some(rows)))
+}
+
+/// Primary-key windows this thread has read so far.
+#[cfg(test)]
+pub(super) fn primary_key_windows_read() -> usize {
+    PRIMARY_KEY_WINDOWS_READ.get()
+}
 
 pub(super) fn hidden_registered_schema_row(schema_key: &str, row_pk: &RowPk) -> bool {
     schema_key == "lix_registered_schema"
@@ -382,25 +415,256 @@ impl SchemaSpec {
         Ok((projected_schema, request, row_filters))
     }
 
+    /// Plans the ordered primary-key route for `planned_limit`, rebinding the
+    /// source whenever DataFusion pushes a fetch into the scan.
+    fn ordered_primary_key_scan(
+        &self,
+        column: Option<String>,
+        any_rows: bool,
+        schema: SchemaRef,
+        request: HotStateScanRequest,
+        row_filters: Vec<RowFilter>,
+        batch_projection: RowBatchProjection,
+        planned_limit: Option<usize>,
+    ) -> PlannedScan {
+        let plan = OrderedPrimaryKeyScan {
+            reader: self.row_snapshot_reader.clone(),
+            hot_state: Arc::clone(&self.hot_state),
+            spec: Arc::clone(&self.spec),
+            schema: Arc::clone(&schema),
+            column: column.clone(),
+            any_rows,
+            request,
+            row_filters,
+            batch_projection,
+            write_ctx: self.write_ctx.clone(),
+        };
+        let build = move |fetch: Option<usize>| {
+            let fetch = match (planned_limit, fetch) {
+                (Some(planned), Some(fetch)) => Some(planned.min(fetch)),
+                (planned, None) => planned,
+                (None, fetch) => fetch,
+            };
+            ordered_primary_key_scan_source(plan.clone(), fetch)
+        };
+        let source = build(None).with_fetch_rebind(build);
+        PlannedScan {
+            schema,
+            source,
+            ordering: column,
+        }
+    }
+
+    /// Chooses the storage route of a scan that carries no exact primary-key
+    /// range: exact counts, columnar layouts, primary-key windows for every
+    /// committed scan the page horizon can size, or one read of the selected
+    /// rows (identity sets, file or retention selectors, transactions).
+    async fn plan_scan_routes(
+        &self,
+        schema: SchemaRef,
+        mut request: HotStateScanRequest,
+        row_filters: Vec<RowFilter>,
+        batch_projection: RowBatchProjection,
+        filters: &[Expr],
+    ) -> Result<PlannedScan> {
+        let staged_read_context = self.write_ctx.clone();
+        let private_registry = self.spec.schema_key == "lix_registered_schema";
+        // Older repositories contain private bootstrap registrations. Apply
+        // their visibility policy before LIMIT, so a scan still returns the
+        // requested number of public rows.
+        if private_registry {
+            request.limit = None;
+        }
+        let direct_primary_key_projection = !private_registry
+            && direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        let direct_primary_key_reader = direct_primary_key_projection
+            .then(|| self.row_snapshot_reader.clone())
+            .flatten();
+        let direct_snapshot_reader = (!private_registry
+            && direct_row_batch_eligible(&schema, &request, &row_filters))
+        .then(|| self.row_snapshot_reader.clone())
+        .flatten();
+        let direct_snapshot_decoder = direct_snapshot_reader
+            .as_ref()
+            .map(|_| {
+                RowProjectionDecoder::with_schema_amendments(
+                    &self.spec,
+                    schema.fields().iter().map(|field| field.name().as_str()),
+                )
+                .map(Arc::new)
+                .map_err(row_projection_error_to_datafusion_error)
+            })
+            .transpose()?;
+        if self.write_ctx.is_none()
+            && !private_registry
+            && schema.fields().is_empty()
+            && filters.is_empty()
+            && row_filters.is_empty()
+            && let Some(reader) = self.row_snapshot_reader.as_ref()
+            && let Some(count) = reader
+                .exact_count(request.clone())
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            && let Ok(count) = usize::try_from(count)
+        {
+            return Ok(PlannedScan {
+                schema: Arc::clone(&schema),
+                ordering: None,
+                source: exact_count_scan_source(schema, count)?,
+            });
+        }
+        let mut columnar_request = request.clone();
+        // LIMIT is a relational operator, not a storage-layout capability.
+        // Ask the reader whether the same filtered/projection scan has a
+        // columnar layout; DataFusion retains the semantic LimitExec above it.
+        columnar_request.limit = None;
+        if !private_registry
+            && let Some(reader) = self.row_snapshot_reader.as_ref()
+            && row_columnar_projection_eligible(&schema)
+            && let Some(layout) = reader
+                .plan_row_columnar_scan(columnar_request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            && let Some(projection) = row_columnar_projection(&layout.manifest, &schema, &self.spec)
+        {
+            let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
+            return Ok(PlannedScan {
+                schema: Arc::clone(&schema),
+                ordering: None,
+                source: Box::pin(row_columnar_scan_source(
+                    Arc::clone(reader),
+                    layout,
+                    projection,
+                    group_indices,
+                    schema,
+                    Arc::clone(&self.spec),
+                    row_filters,
+                ))
+                .await?,
+            });
+        }
+        // Every other unlimited committed scan the page horizon can size is
+        // read as ascending primary-key windows, each one exact
+        // visibility-resolved read against the statement's snapshot. Peak
+        // memory is one window instead of the collection, and the first batch
+        // is ready after the first window.
+        if request.limit.is_none()
+            && self.row_snapshot_reader.is_some()
+            && primary_key_windows_eligible(&self.spec)
+            && primary_key_windowed_request(&request)
+        {
+            return Ok(self.ordered_primary_key_scan(
+                ordered_primary_key_column(&self.spec).map(str::to_owned),
+                false,
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                None,
+            ));
+        }
+        Ok(PlannedScan {
+            schema: Arc::clone(&schema),
+            ordering: None,
+            source: scan_row_source(
+                Arc::clone(&schema),
+                (
+                    Arc::clone(&self.spec),
+                    Arc::clone(&self.hot_state),
+                    schema,
+                    request,
+                    row_filters,
+                    batch_projection,
+                    direct_primary_key_reader,
+                    direct_snapshot_reader,
+                    direct_snapshot_decoder,
+                    direct_primary_key_projection,
+                    staged_read_context,
+                ),
+                |(
+                    spec,
+                    hot_state,
+                    schema,
+                    request,
+                    row_filters,
+                    batch_projection,
+                    direct_primary_key_reader,
+                    direct_snapshot_reader,
+                    direct_snapshot_decoder,
+                    direct_primary_key_projection,
+                    staged_read_context,
+                )| async move {
+                    if direct_primary_key_projection
+                        && let Some(direct_primary_key_reader) = direct_primary_key_reader.as_ref()
+                        && let Some(row_pks) = direct_primary_key_reader
+                            .scan_row_primary_keys(request.clone())
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                    {
+                        record_rows_examined(row_pks.len());
+                        return row_primary_key_record_batch(&spec, schema, row_pks);
+                    }
+                    if let Some(direct_snapshot_reader) = direct_snapshot_reader {
+                        let decoder = direct_snapshot_decoder
+                            .as_ref()
+                            .expect("direct snapshot reader has a planned decoder");
+                        // A certified segment binds its layout to the old
+                        // schema. Re-enter materialization on amendment so
+                        // every row is fully validated under the new schema.
+                        if let Some(rows) = direct_snapshot_reader
+                            .scan_row_snapshots(request.clone())
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .filter(|rows| row_snapshot_batch_matches_opening_schema(&spec, rows))
+                        {
+                            record_rows_examined(rows.len());
+                            return row_snapshot_record_batch(decoder, schema, rows);
+                        }
+                    }
+                    // Protocol v69 has no outer JSON row snapshot. Going
+                    // through `scan_row_snapshots` would decode the typed
+                    // payload, serialize it to JSON, then parse that JSON back
+                    // into Arrow. The authoritative mixed-row materializer
+                    // below instead retains raw durable payload bytes.
+                    let rows = hot_state
+                        .scan_batch(&request)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    // Before `row_filters` run: this is the row count a
+                    // predicate without an indexed access path pays for.
+                    record_rows_examined(rows.len());
+                    Box::pin(row_record_batch_with_staged_schemas(
+                        staged_read_context.as_ref(),
+                        &spec,
+                        schema,
+                        rows,
+                        &row_filters,
+                        batch_projection,
+                    ))
+                    .await
+                },
+            ),
+        })
+    }
+
     fn returning_key_from_batch(
         &self,
         batch: &RecordBatch,
         row_index: usize,
-    ) -> Result<RowReturningKey> {
-        let row_pk = row_pk_from_primary_key_columns(
+    ) -> Result<RowSlotKey> {
+        RowSlotKey::from_batch(
             batch,
             row_index,
             &self.spec,
+            &self.branch_binding,
             SchemaRowIdentityUse::UpdateReturning,
-        )?;
-        let branch_id = String::new();
-        Ok(RowReturningKey { row_pk, branch_id })
+        )
     }
 
     async fn returning_post_image(
         &self,
         write_ctx: &SqlWriteContext,
-        keys: &[RowReturningKey],
+        keys: &[RowSlotKey],
     ) -> Result<RecordBatch> {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
@@ -417,6 +681,20 @@ impl SchemaSpec {
             .map(|key| key.row_pk.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect();
+        // The same primary key exists once per file scope. Narrow the read to
+        // the file scopes this statement updated. The primary-key × file-scope
+        // request may still return untouched slots; the post-image is indexed
+        // by the complete slot below, so those rows are never selected.
+        request.filter.file_ids = keys
+            .iter()
+            .map(|key| key.file_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|file_id| match file_id {
+                None => crate::NullableKeyFilter::Null,
+                Some(file_id) => crate::NullableKeyFilter::Value(file_id),
+            })
             .collect();
         let rows = WriteContextHotStateReader::new(write_ctx.clone())
             .scan_batch(&request)
@@ -575,16 +853,69 @@ impl SchemaSpec {
     }
 }
 
+/// The live-state slot one visible row occupies.
+///
+/// A primary key identifies a row only within one lane and one file scope:
+/// the same primary key legitimately exists once unfiled and once in every
+/// file, and a global row is distinct from a branch-local one. The visible
+/// scan of one branch never yields two rows for one slot (a branch-local row
+/// shadows the global row of the same slot, and tracked and untracked rows
+/// cannot share a slot), so the slot is the identity every UPDATE handoff
+/// between its source scan and its staged write must key by.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RowReturningKey {
-    row_pk: RowPk,
+struct RowSlotKey {
     branch_id: String,
+    file_id: Option<String>,
+    row_pk: RowPk,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RowUpdateSnapshotKey {
-    row_pk: RowPk,
-    branch_id: String,
+impl RowSlotKey {
+    fn from_row(row: crate::hot_state::MaterializedHotStateRowRef<'_>) -> Self {
+        Self {
+            branch_id: if row.global() {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                row.branch_id().to_string()
+            },
+            file_id: row.file_id().map(str::to_owned),
+            row_pk: row.row_pk().clone(),
+        }
+    }
+
+    /// Reads the slot of a row the schema surface produced. The lane and file
+    /// scope columns are required: a batch without them cannot distinguish
+    /// rows that share a primary key, so it must not silently collapse them.
+    fn from_batch(
+        batch: &RecordBatch,
+        row_index: usize,
+        spec: &SchemaSurfaceSpec,
+        branch_binding: &BranchBinding,
+        purpose: SchemaRowIdentityUse,
+    ) -> Result<Self> {
+        let context = purpose.label();
+        for column in ["lixcol_global", "lixcol_file_id"] {
+            if batch.schema().index_of(column).is_err() {
+                return Err(DataFusionError::Execution(format!(
+                    "{context} source batch for schema '{}' is missing identity column '{column}'",
+                    spec.schema_key
+                )));
+            }
+        }
+        let global =
+            optional_bool_value(batch, row_index, "lixcol_global", context)?.unwrap_or(false);
+        Ok(Self {
+            branch_id: if global {
+                GLOBAL_BRANCH_ID.to_string()
+            } else {
+                branch_binding
+                    .active_branch_id()
+                    .expect("active row surface has an active branch")
+                    .to_owned()
+            },
+            file_id: optional_string_value(batch, row_index, "lixcol_file_id", context)?,
+            row_pk: row_pk_from_primary_key_columns(batch, row_index, spec, purpose)?,
+        })
+    }
 }
 
 /// A generic UPDATE source may already have a native row payload. Keep that
@@ -596,7 +927,7 @@ enum RowUpdateSnapshot {
     Typed(Arc<WasmTypedRow>),
 }
 
-type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowUpdateSnapshotKey, RowUpdateSnapshot>>>;
+type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowSlotKey, RowUpdateSnapshot>>>;
 
 fn capture_row_update_snapshots(
     rows: &MaterializedHotStateBatch,
@@ -628,15 +959,10 @@ fn capture_row_update_snapshots(
                 .into();
             RowUpdateSnapshot::Json(snapshot)
         };
-        let key = RowUpdateSnapshotKey {
-            row_pk: row.row_pk().clone(),
-            branch_id: if row.global() {
-                GLOBAL_BRANCH_ID.to_string()
-            } else {
-                row.branch_id().to_string()
-            },
-        };
-        if captured.insert(key, snapshot).is_some() {
+        if captured
+            .insert(RowSlotKey::from_row(row), snapshot)
+            .is_some()
+        {
             return Err(DataFusionError::Execution(
                 "UPDATE schema surface source contains duplicate row identity".to_string(),
             ));
@@ -661,7 +987,14 @@ impl TableSpec for SchemaSpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = RowPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = RowFilterAnalyzer::new(&self.spec);
-        if ExactFileIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
+        if ExactFileIdFilterAnalyzer.supports(filter)
+            || primary_key_analyzer.supports(filter)
+            || exact_primary_key_range_filter(&self.spec, filter)
+        {
+            // A primary-key range is exact because every scan carrying one is
+            // planned on the ordered primary-key route, which reads the
+            // interval through the authoritative visibility path and also
+            // re-applies it as a row predicate.
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -724,270 +1057,92 @@ impl TableSpec for SchemaSpec {
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let (schema, mut request, row_filters) =
+        let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
-        let staged_read_context = self.write_ctx.clone();
-        let private_registry = self.spec.schema_key == "lix_registered_schema";
-        // Older repositories contain private bootstrap registrations. Apply
-        // their visibility policy before LIMIT, so a scan still returns the
-        // requested number of public rows.
-        if private_registry {
-            request.limit = None;
+        let ordered_column = ordered_primary_key_column(&self.spec);
+        // `filter_pushdown` reported this range as exact, so no route that may
+        // ignore primary-key bounds can serve the scan. The ordered route
+        // reads the interval exactly on every storage shape and declares the
+        // primary-key order it produces; the declaration depends only on the
+        // statement's filters.
+        if let Some(column) = ordered_column
+            && filters
+                .iter()
+                .any(|filter| exact_primary_key_range_filter(&self.spec, filter))
+        {
+            return Ok(self.ordered_primary_key_scan(
+                Some(column.to_owned()),
+                false,
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                limit,
+            ));
         }
-        let direct_primary_key_projection = !private_registry
-            && direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
-        let direct_primary_key_reader = direct_primary_key_projection
-            .then(|| self.row_snapshot_reader.clone())
-            .flatten();
-        // DataFusion supplies `limit` to a TableProvider scan only when its
-        // physical optimizer proves the fetch can cross the operators above
-        // this scan. A durable-root page may choose any valid rows only for
-        // this unordered shape; ORDER BY, residual predicates, and identity
-        // probes keep their ordinary plan and scan path.
-        let direct_limit_candidate_reader = unordered_limit_candidates_eligible(
-            &self.spec,
-            &schema,
-            &request,
-            filters,
-            &row_filters,
-            private_registry,
-        )
-        .then(|| self.row_snapshot_reader.clone())
-        .flatten();
-        let direct_snapshot_reader = (!private_registry
-            && direct_row_batch_eligible(&schema, &request, &row_filters))
-        .then(|| self.row_snapshot_reader.clone())
-        .flatten();
-        let direct_snapshot_decoder = direct_snapshot_reader
-            .as_ref()
-            .map(|_| {
-                RowProjectionDecoder::with_schema_amendments(
-                    &self.spec,
-                    schema.fields().iter().map(|field| field.name().as_str()),
-                )
-                .map(Arc::new)
-                .map_err(row_projection_error_to_datafusion_error)
-            })
-            .transpose()?;
-        if self.write_ctx.is_none()
-            && !private_registry
-            && schema.fields().is_empty()
+        // An unfiltered committed collection scan with a pushed-down LIMIT may
+        // return any rows, so it reads the first primary-key windows until the
+        // limit is met instead of resolving the whole collection. Windows exist
+        // for every primary-key type; only a string key also declares order.
+        // Transactions keep their limited staged scan: without a committed
+        // reader there is no window horizon.
+        if limit.is_some()
             && filters.is_empty()
-            && row_filters.is_empty()
-            && let Some(reader) = self.row_snapshot_reader.as_ref()
-            && let Some(count) = reader
-                .exact_count(request.clone())
-                .await
-                .map_err(lix_error_to_datafusion_error)?
-            && let Ok(count) = usize::try_from(count)
+            && self.row_snapshot_reader.is_some()
+            && primary_key_windows_eligible(&self.spec)
+            && collection_request(&request)
         {
-            return Ok(PlannedScan {
-                schema: Arc::clone(&schema),
-                ordering: None,
-                source: exact_count_scan_source(schema, count)?,
-            });
+            let mut request = request;
+            request.limit = None;
+            return Ok(self.ordered_primary_key_scan(
+                ordered_column.map(str::to_owned),
+                true,
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+                limit,
+            ));
         }
-        let mut columnar_request = request.clone();
-        // LIMIT is a relational operator, not a storage-layout capability.
-        // Ask the reader whether the same filtered/projection scan has a
-        // columnar layout; DataFusion retains the semantic LimitExec above it.
-        columnar_request.limit = None;
-        if !private_registry
-            && let Some(reader) = self.row_snapshot_reader.as_ref()
-            && row_columnar_projection_eligible(&schema)
-            && let Some(layout) = reader
-                .plan_row_columnar_scan(columnar_request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?
-            && let Some(projection) = row_columnar_projection(&layout.manifest, &schema, &self.spec)
-        {
-            let group_indices = row_columnar_group_indices(&layout.manifest, &row_filters);
-            return Ok(PlannedScan {
-                schema: Arc::clone(&schema),
-                ordering: None,
-                source: Box::pin(row_columnar_scan_source(
-                    Arc::clone(reader),
-                    layout,
-                    projection,
-                    group_indices,
-                    schema,
-                    Arc::clone(&self.spec),
-                    row_filters,
-                ))
-                .await?,
-            });
-        }
-        if request.limit.is_none()
-            && let (Some(reader), Some(decoder)) = (
-                direct_snapshot_reader.as_ref(),
-                direct_snapshot_decoder.as_ref(),
-            )
-        {
-            return Ok(PlannedScan {
-                schema: Arc::clone(&schema),
-                ordering: None,
-                source: row_snapshot_pages_scan_source(
-                    Arc::clone(reader),
-                    Arc::clone(&self.hot_state),
-                    Arc::clone(&self.spec),
-                    Arc::clone(&schema),
-                    request,
-                    row_filters,
-                    batch_projection,
-                    staged_read_context,
-                    Arc::clone(decoder),
-                    direct_primary_key_projection,
-                ),
-            });
-        }
-        Ok(PlannedScan {
-            schema: Arc::clone(&schema),
-            ordering: None,
-            source: scan_row_source(
+        // Any other collection scan keeps its route and offers the ordered
+        // route as an alternative. DataFusion's sort pushdown swaps it in
+        // only for a statement that sorts by the key (`ORDER BY id LIMIT n`),
+        // so the ordering is still declared by query shape alone. Identity
+        // sets keep their point-read route and DataFusion's sort: they are
+        // already bounded, and sorting them is no scan work.
+        let Some(column) = ordered_column.filter(|_| {
+            request.filter.row_pks.is_empty()
+                && matches!(request.filter.rows, HotStateRowFilter::All)
+        }) else {
+            return self
+                .plan_scan_routes(schema, request, row_filters, batch_projection, filters)
+                .await;
+        };
+        let mut ordered_request = request.clone();
+        ordered_request.limit = None;
+        let ordered = self
+            .ordered_primary_key_scan(
+                Some(column.to_owned()),
+                false,
                 Arc::clone(&schema),
-                (
-                    Arc::clone(&self.spec),
-                    Arc::clone(&self.hot_state),
-                    schema,
-                    request,
-                    row_filters,
-                    batch_projection,
-                    direct_primary_key_reader,
-                    direct_limit_candidate_reader,
-                    direct_snapshot_reader,
-                    direct_snapshot_decoder,
-                    direct_primary_key_projection,
-                    staged_read_context,
-                ),
-                |(
-                    spec,
-                    hot_state,
-                    schema,
-                    request,
-                    row_filters,
-                    batch_projection,
-                    direct_primary_key_reader,
-                    direct_limit_candidate_reader,
-                    direct_snapshot_reader,
-                    direct_snapshot_decoder,
-                    direct_primary_key_projection,
-                    staged_read_context,
-                )| async move {
-                    if let Some(reader) = direct_limit_candidate_reader.as_ref()
-                        && let Some(candidate_pks) = reader
-                            .scan_row_limit_candidates(request.clone(), LIMIT_CANDIDATE_BUDGET)
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                        && let Some(rows) = recheck_unordered_limit_candidates(
-                            hot_state.as_ref(),
-                            &request,
-                            candidate_pks,
-                            request
-                                .limit
-                                .expect("candidate route requires a finite limit"),
-                        )
-                        .await?
-                    {
-                        record_rows_examined(rows.len());
-                        if direct_primary_key_projection {
-                            return row_primary_key_record_batch(
-                                &spec,
-                                schema,
-                                rows.iter().map(|row| row.row_pk().clone()).collect(),
-                            );
-                        }
-                        return Box::pin(row_record_batch_with_staged_schemas(
-                            staged_read_context.as_ref(),
-                            &spec,
-                            schema,
-                            rows,
-                            &row_filters,
-                            batch_projection,
-                        ))
-                        .await;
-                    }
-                    if direct_primary_key_projection
-                        && let Some(direct_primary_key_reader) = direct_primary_key_reader.as_ref()
-                        && let Some(row_pks) = direct_primary_key_reader
-                            .scan_row_primary_keys(request.clone())
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                    {
-                        record_rows_examined(row_pks.len());
-                        return row_primary_key_record_batch(&spec, schema, row_pks);
-                    }
-                    if let Some(direct_snapshot_reader) = direct_snapshot_reader {
-                        let decoder = direct_snapshot_decoder
-                            .as_ref()
-                            .expect("direct snapshot reader has a planned decoder");
-                        let direct_rows = direct_snapshot_reader
-                            .scan_row_snapshots(request.clone())
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?;
-                        // A certified segment binds its layout to the old
-                        // schema. Re-enter materialization on amendment so
-                        // every row is fully validated under the new schema.
-                        let direct_rows = direct_rows.filter(|rows| match rows {
-                            crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(
-                                rows,
-                            ) => rows.segments().all(|segment| {
-                                segment.projection().schema_fingerprint() == spec.schema_fingerprint
-                            }),
-                            _ => true,
-                        });
-                        if let Some(rows) = direct_rows {
-                            record_rows_examined(rows.len());
-                            let columns = match rows {
-                            crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(
-                                rows,
-                            ) => decoder.decode_certified_native_projection_batch(&rows),
-                            crate::tracked_state::ExclusiveRowSnapshotBatch::DescribedNative(
-                                rows,
-                            ) => decoder.decode_owned_validated_native_payload_arrow_columns(
-                                rows.into_rows(),
-                            ),
-                            crate::tracked_state::ExclusiveRowSnapshotBatch::ValidatedNative(
-                                rows,
-                            ) => decoder.decode_validated_native_payload_arrow_columns(
-                                rows.iter().map(|(row_pk, payload)| (payload, row_pk)),
-                            ),
-                            crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) => {
-                                decoder.decode_durable_payload_arrow_columns(
-                                    rows.iter()
-                                        .map(|(row_pk, payload)| (payload.as_ref(), row_pk)),
-                                )
-                            }
-                        }
-                        .map_err(row_projection_error_to_datafusion_error)?;
-                            return RecordBatch::try_new(schema, columns)
-                                .map_err(DataFusionError::from);
-                        }
-                    }
-                    // Protocol v69 has no outer JSON row snapshot. Going
-                    // through `scan_row_snapshots` would decode the typed
-                    // payload, serialize it to JSON, then parse that JSON back
-                    // into Arrow. The authoritative mixed-row materializer
-                    // below instead retains raw durable payload bytes.
-                    let rows = hot_state
-                        .scan_batch(&request)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                    // Before `row_filters` run: this is the row count a
-                    // predicate without an indexed access path pays for.
-                    record_rows_examined(rows.len());
-                    Box::pin(row_record_batch_with_staged_schemas(
-                        staged_read_context.as_ref(),
-                        &spec,
-                        schema,
-                        rows,
-                        &row_filters,
-                        batch_projection,
-                    ))
-                    .await
-                },
-            ),
-        })
+                ordered_request,
+                row_filters.clone(),
+                batch_projection,
+                None,
+            )
+            .source;
+        let mut planned = self
+            .plan_scan_routes(schema, request, row_filters, batch_projection, filters)
+            .await?;
+        // The windowed route already declares the key order.
+        if planned.ordering.is_some() {
+            return Ok(planned);
+        }
+        planned.source = planned
+            .source
+            .with_ordered_rebind(column, move || ordered.clone());
+        Ok(planned)
     }
 
     // Rejects at plan time so validate-only
@@ -1962,24 +2117,15 @@ fn row_update_stage_rows_from_batch(
     })?;
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
     for row_index in 0..batch.num_rows() {
-        let global =
-            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE schema surface")?
-                .unwrap_or(false);
-        let branch_id = if global {
-            GLOBAL_BRANCH_ID.to_string()
-        } else {
-            branch_binding
-                .active_branch_id()
-                .expect("active row surface has an active branch")
-                .to_owned()
-        };
-        let row_pk =
-            row_pk_from_primary_key_columns(batch, row_index, spec, SchemaRowIdentityUse::Update)?;
+        let slot = RowSlotKey::from_batch(
+            batch,
+            row_index,
+            spec,
+            branch_binding,
+            SchemaRowIdentityUse::Update,
+        )?;
         let snapshot = update_snapshots
-            .get(&RowUpdateSnapshotKey {
-                row_pk: row_pk.clone(),
-                branch_id: branch_id.clone(),
-            })
+            .get(&slot)
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "UPDATE schema surface is missing its source snapshot for schema '{}'",
@@ -2049,9 +2195,15 @@ fn row_update_stage_rows_from_batch(
                 Some(row_update_metadata(&raw, spec)?)
             }
         };
-        let file_id =
-            optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE schema surface")?
-                .map(Into::into);
+        let RowSlotKey {
+            branch_id,
+            file_id,
+            row_pk,
+        } = slot;
+        let global =
+            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE schema surface")?
+                .unwrap_or(false);
+        let file_id = file_id.map(Into::into);
         let untracked = optional_bool_value(
             batch,
             row_index,
@@ -2903,6 +3055,7 @@ impl<'a> RowFilterAnalyzer<'a> {
         Some(RowFilter::ColumnIn {
             column: column_name.to_string(),
             column_type,
+            index: ColumnInIndex::new(column_type, &values),
             values,
         })
     }
@@ -2987,6 +3140,88 @@ enum RowFilterValue {
     String(String),
 }
 
+/// Hash index over a `ColumnIn` literal list.
+///
+/// Residual predicates are evaluated per row, so probing a long `IN (...)`
+/// list linearly costs rows × values: an identity-batched read of 15,000
+/// variants by `message_id IN (...)` spent most of its time here. Text and
+/// integer columns, the exact-equality cases, get a hash set; every other
+/// pairing (UUID text, numeric widening, timestamps) keeps the linear typed
+/// comparison, so semantics are unchanged.
+#[derive(Debug, Clone, Default)]
+struct ColumnInIndex {
+    strings: Option<Arc<HashSet<String>>>,
+    integers: Option<Arc<HashSet<i64>>>,
+}
+
+impl ColumnInIndex {
+    /// Lists this short stay linear; hashing would only add overhead.
+    const MIN_VALUES: usize = 8;
+
+    fn new(column_type: SchemaColumnType, values: &[RowFilterValue]) -> Self {
+        if values.len() < Self::MIN_VALUES {
+            return Self::default();
+        }
+        match column_type {
+            SchemaColumnType::String | SchemaColumnType::RowRef => values
+                .iter()
+                .map(|value| match value {
+                    RowFilterValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<HashSet<_>>>()
+                .map_or_else(Self::default, |strings| Self {
+                    strings: Some(Arc::new(strings)),
+                    integers: None,
+                }),
+            SchemaColumnType::Integer => values
+                .iter()
+                .map(|value| match value {
+                    RowFilterValue::Integer(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<HashSet<_>>>()
+                .map_or_else(Self::default, |integers| Self {
+                    strings: None,
+                    integers: Some(Arc::new(integers)),
+                }),
+            _ => Self::default(),
+        }
+    }
+
+    /// Membership of a typed row value; `None` defers to the linear typed
+    /// comparison (which also reports incompatible value types).
+    fn contains_row_value(&self, actual: &lix_schema::Value) -> Option<bool> {
+        match (actual, &self.strings, &self.integers) {
+            (lix_schema::Value::Null, Some(_), _) | (lix_schema::Value::Null, _, Some(_)) => {
+                Some(false)
+            }
+            (lix_schema::Value::Text(actual), Some(strings), _) => {
+                Some(strings.contains(actual.as_str()))
+            }
+            (lix_schema::Value::Int8(actual), _, Some(integers)) => Some(integers.contains(actual)),
+            _ => None,
+        }
+    }
+
+    /// Membership of a decoded filter value; `None` defers to the linear path.
+    fn contains_filter_value(&self, actual: &RowFilterValue) -> Option<bool> {
+        match (actual, &self.strings, &self.integers) {
+            (RowFilterValue::String(actual), Some(strings), _) => Some(strings.contains(actual)),
+            (RowFilterValue::Integer(actual), _, Some(integers)) => Some(integers.contains(actual)),
+            _ => None,
+        }
+    }
+}
+
+/// The index is derived from `values`, which `RowFilter`'s equality already
+/// compares.
+impl PartialEq for ColumnInIndex {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum RowFilter {
     ColumnEq {
@@ -2998,6 +3233,8 @@ enum RowFilter {
         column: String,
         column_type: SchemaColumnType,
         values: Vec<RowFilterValue>,
+        /// Hash index over `values`, derived from them; see [`ColumnInIndex`].
+        index: ColumnInIndex,
     },
     /// One half-bounded comparison against a literal.
     ///
@@ -3152,11 +3389,14 @@ impl RowFilter {
                 column,
                 column_type,
                 values,
+                index,
             } => Ok(
                 row_snapshot_value(snapshot, schema_key, column, *column_type)?.is_some_and(
                     |actual| {
-                        values.iter().any(|expected| {
-                            row_filter_values_equal(&actual, expected, *column_type)
+                        index.contains_filter_value(&actual).unwrap_or_else(|| {
+                            values.iter().any(|expected| {
+                                row_filter_values_equal(&actual, expected, *column_type)
+                            })
                         })
                     },
                 ),
@@ -3189,7 +3429,14 @@ impl RowFilter {
                 column,
                 column_type,
                 values,
+                index,
             } => {
+                if let Some(hit) = row
+                    .get(column)
+                    .and_then(|actual| index.contains_row_value(actual))
+                {
+                    return Ok(hit);
+                }
                 for expected in values {
                     if row_typed_filter_value_eq(row, schema_key, column, *column_type, expected)? {
                         return Ok(true);
@@ -3865,6 +4112,257 @@ fn exact_identity_residual<'a>(
         .collect()
 }
 
+/// The primary-key column whose order the ordered primary-key route can
+/// produce: one top-level string key component of a public, stored schema.
+/// SQL string comparison and the typed key order are both byte order there.
+fn ordered_primary_key_column(spec: &SchemaSurfaceSpec) -> Option<&str> {
+    if !primary_key_windows_eligible(spec) {
+        return None;
+    }
+    let columns = top_level_primary_key_columns(spec);
+    let [column] = columns.as_slice() else {
+        return None;
+    };
+    simple_string_primary_key_index(spec, column)?;
+    Some(column)
+}
+
+/// Whether primary-key windows can serve this schema: every public stored
+/// schema can; the private registry and derived schemas cannot.
+fn primary_key_windows_eligible(spec: &SchemaSurfaceSpec) -> bool {
+    spec.schema_key != "lix_registered_schema"
+        && !crate::hot_state::is_derived_schema(&spec.schema_key)
+}
+
+/// A scan of the whole collection of one schema in one branch: no identity,
+/// file, retention, global, constraint or declared-column selector.
+fn collection_request(request: &HotStateScanRequest) -> bool {
+    primary_key_windowed_request(request)
+        && request.filter.row_pk_lower.is_none()
+        && request.filter.row_pk_upper.is_none()
+}
+
+/// A scan of one schema in one branch, optionally within a primary-key
+/// interval, whose page horizon is sized over the whole schema: no identity,
+/// file, retention, global, constraint or declared-column selector.
+fn primary_key_windowed_request(request: &HotStateScanRequest) -> bool {
+    matches!(request.filter.rows, HotStateRowFilter::All)
+        && request.filter.schema_keys.len() == 1
+        && request.filter.branch_ids.len() == 1
+        && request.filter.row_pks.is_empty()
+        && request.filter.file_ids.is_empty()
+        && request.filter.untracked.is_none()
+        && request.filter.global.is_none()
+        && request.filter.constraints.is_empty()
+        && request.filter.declared_column_eq.is_none()
+        && request.filter.declared_column_range.is_none()
+        && !request.filter.include_tombstones
+}
+
+/// Whether `filter` is a range over exactly the ordered primary-key column
+/// (`id > $1`, `id <= $2`, `BETWEEN`, or a conjunction of those).
+fn exact_primary_key_range_filter(spec: &SchemaSurfaceSpec, filter: &Expr) -> bool {
+    fn primary_key_range_only(filter: &RowFilter, column: &str) -> bool {
+        match filter {
+            RowFilter::ColumnRange {
+                column: range_column,
+                value: RowFilterValue::String(_),
+                ..
+            } => range_column == column,
+            RowFilter::And(left, right) => {
+                primary_key_range_only(left, column) && primary_key_range_only(right, column)
+            }
+            _ => false,
+        }
+    }
+    let Some(column) = ordered_primary_key_column(spec) else {
+        return false;
+    };
+    RowFilterAnalyzer::new(spec)
+        .analyze(filter)
+        .is_some_and(|filter| primary_key_range_only(&filter, column))
+}
+
+/// Execution state of one planned ordered primary-key scan.
+#[derive(Clone)]
+struct OrderedPrimaryKeyScan {
+    reader: Option<Arc<dyn RowSnapshotReader>>,
+    hot_state: Arc<dyn HotStateReader>,
+    spec: Arc<SchemaSurfaceSpec>,
+    schema: SchemaRef,
+    /// The string key column whose order is declared, when there is one.
+    column: Option<String>,
+    /// The statement accepts any `fetch` qualifying rows (an unordered
+    /// LIMIT), so a remainder window may let storage stop at the fetch.
+    any_rows: bool,
+    request: HotStateScanRequest,
+    row_filters: Vec<RowFilter>,
+    batch_projection: RowBatchProjection,
+    write_ctx: Option<SqlWriteContext>,
+}
+
+/// Reads a primary-key interval in key order as a sequence of disjoint,
+/// ascending windows, stopping once `fetch` rows have been produced.
+///
+/// Each window is an ordinary exact hot-state read of a narrower interval,
+/// so HOT overlays, packed and root bases, tombstones, untracked rows, file
+/// scopes, global fallback and transaction-staged rows resolve exactly as in
+/// any scan. The reader's page horizon only decides where a window ends;
+/// without one (transactions, partial replicas, layouts that cannot be
+/// narrowed) the first window is the whole interval. Every window is sorted
+/// by primary key before it is emitted, so the declared order holds on every
+/// path, and storage work is proportional to the windows read rather than to
+/// the collection.
+///
+/// Without a fetch this is how every committed full scan is read: the stream
+/// holds one window at a time, so a query stream's peak memory is one window
+/// and its first batch is ready after the first window. All windows read
+/// through the statement's hot-state reader, i.e. the one storage snapshot
+/// the statement pinned, so a write committed between two pulls is never
+/// observed by a later window.
+fn ordered_primary_key_scan_source(
+    plan: OrderedPrimaryKeyScan,
+    fetch: Option<usize>,
+) -> super::spec::ScanSource {
+    struct WindowState {
+        lower: Option<crate::tracked_state::RowPkRangeBound>,
+        emitted: usize,
+        done: bool,
+    }
+    let stream_schema = Arc::clone(&plan.schema);
+    batch_stream_source(Arc::clone(&plan.schema), 1, move |_partition, _context| {
+        let plan = plan.clone();
+        let initial = WindowState {
+            lower: plan.request.filter.row_pk_lower.clone(),
+            emitted: 0,
+            done: fetch == Some(0),
+        };
+        let windows = stream::try_unfold(initial, move |mut state| {
+            let plan = plan.clone();
+            async move {
+                loop {
+                    if state.done {
+                        return Ok(None);
+                    }
+                    let remaining = fetch.map(|fetch| fetch.saturating_sub(state.emitted));
+                    let target_rows = remaining.unwrap_or_else(primary_key_window_rows);
+                    let mut request = plan.request.clone();
+                    request.filter.row_pk_lower = state.lower.clone();
+                    let horizon = match plan.reader.as_ref() {
+                        Some(reader) => reader
+                            .row_pk_page_horizon(request.clone(), target_rows)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        None => None,
+                    }
+                    // A horizon must advance past the lower bound and end
+                    // before the upper bound, or the window is the remainder.
+                    .filter(|horizon| {
+                        crate::tracked_state::row_pk_satisfies_bounds(
+                            horizon,
+                            request.filter.row_pk_lower.as_ref(),
+                            None,
+                        ) && request
+                            .filter
+                            .row_pk_upper
+                            .as_ref()
+                            .is_none_or(|upper| horizon < &upper.row_pk)
+                    });
+                    match horizon.as_ref() {
+                        Some(horizon) => {
+                            request.filter.row_pk_upper =
+                                Some(crate::tracked_state::RowPkRangeBound {
+                                    row_pk: horizon.clone(),
+                                    inclusive: true,
+                                });
+                        }
+                        // The remainder in one read: an unordered LIMIT lets
+                        // storage stop at the fetch; an ordered read must
+                        // resolve the remainder before taking its prefix.
+                        None if plan.any_rows && plan.row_filters.is_empty() => {
+                            request.limit = remaining;
+                        }
+                        None => {}
+                    }
+                    #[cfg(test)]
+                    PRIMARY_KEY_WINDOWS_READ.set(PRIMARY_KEY_WINDOWS_READ.get() + 1);
+                    let rows = plan
+                        .hot_state
+                        .scan_batch(&request)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    record_rows_examined(rows.len());
+                    let batch = Box::pin(row_record_batch_with_staged_schemas(
+                        plan.write_ctx.as_ref(),
+                        &plan.spec,
+                        Arc::clone(&plan.schema),
+                        rows,
+                        &plan.row_filters,
+                        plan.batch_projection,
+                    ))
+                    .await?;
+                    let batch = match plan.column.as_deref() {
+                        Some(column) => sort_record_batch_by_column(batch, column)?,
+                        None => batch,
+                    };
+                    let batch = match remaining {
+                        Some(remaining) if batch.num_rows() > remaining => {
+                            batch.slice(0, remaining)
+                        }
+                        _ => batch,
+                    };
+                    state.emitted = state.emitted.saturating_add(batch.num_rows());
+                    match horizon {
+                        Some(horizon) => {
+                            state.lower = Some(crate::tracked_state::RowPkRangeBound {
+                                row_pk: horizon,
+                                inclusive: false,
+                            });
+                        }
+                        None => state.done = true,
+                    }
+                    if fetch.is_some_and(|fetch| state.emitted >= fetch) {
+                        state.done = true;
+                    }
+                    if batch.num_rows() > 0 {
+                        return Ok(Some((batch, state)));
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&stream_schema),
+            windows,
+        )))
+    })
+}
+
+/// Orders one window by its primary-key column. Windows from the exact path
+/// are usually already ordered; only an unordered one pays for a sort. A
+/// projection without the column carries no ordering obligation.
+fn sort_record_batch_by_column(batch: RecordBatch, column: &str) -> Result<RecordBatch> {
+    let Ok(index) = batch.schema().index_of(column) else {
+        return Ok(batch);
+    };
+    let keys = batch.column(index);
+    let Some(strings) = keys.as_any().downcast_ref::<StringArray>() else {
+        return Err(DataFusionError::Internal(format!(
+            "ordered primary-key column '{column}' is not Utf8"
+        )));
+    };
+    use datafusion::arrow::array::Array as _;
+    if (1..strings.len()).all(|row| strings.value(row - 1) <= strings.value(row)) {
+        return Ok(batch);
+    }
+    let indices = datafusion::arrow::compute::sort_to_indices(keys, None, None)?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| datafusion::arrow::compute::take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(DataFusionError::from)
+}
+
 fn direct_row_batch_eligible(
     schema: &Schema,
     request: &HotStateScanRequest,
@@ -3899,110 +4397,6 @@ fn direct_row_batch_eligible(
             .all(|field| !field.name().starts_with("lixcol_"))
 }
 
-fn row_snapshot_pages_scan_source(
-    reader: Arc<dyn RowSnapshotReader>,
-    hot_state: Arc<dyn HotStateReader>,
-    spec: Arc<SchemaSurfaceSpec>,
-    schema: SchemaRef,
-    request: HotStateScanRequest,
-    row_filters: Vec<RowFilter>,
-    batch_projection: RowBatchProjection,
-    write_ctx: Option<SqlWriteContext>,
-    decoder: Arc<RowProjectionDecoder>,
-    direct_primary_key_projection: bool,
-) -> super::spec::ScanSource {
-    let stream_schema = Arc::clone(&schema);
-    batch_stream_source(schema, 1, move |_partition, _context| {
-        let reader = Arc::clone(&reader);
-        let hot_state = Arc::clone(&hot_state);
-        let spec = Arc::clone(&spec);
-        let schema = Arc::clone(&stream_schema);
-        let request = request.clone();
-        let row_filters = row_filters.clone();
-        let write_ctx = write_ctx.clone();
-        let decoder = Arc::clone(&decoder);
-        let direct_primary_key_projection = direct_primary_key_projection;
-        let pages = stream::once(async move {
-            if let Some(pages) = reader
-                .scan_row_snapshot_pages(request.clone())
-                .await
-                .map_err(lix_error_to_datafusion_error)?
-            {
-                let page_spec = Arc::clone(&spec);
-                let page_decoder = Arc::clone(&decoder);
-                let page_schema = Arc::clone(&schema);
-                let pages = pages.map(move |page| {
-                    page.map_err(lix_error_to_datafusion_error)
-                        .and_then(|rows| {
-                            if !row_snapshot_batch_matches_opening_schema(&page_spec, &rows) {
-                                return Err(DataFusionError::Execution(
-                                    "streamed row snapshot page does not match the opening schema"
-                                        .to_owned(),
-                                ));
-                            }
-                            record_rows_examined(rows.len());
-                            if direct_primary_key_projection {
-                                row_snapshot_page_primary_key_record_batch(
-                                    &page_spec,
-                                    Arc::clone(&page_schema),
-                                    rows,
-                                )
-                            } else {
-                                row_snapshot_record_batch(
-                                    &page_spec,
-                                    &page_decoder,
-                                    Arc::clone(&page_schema),
-                                    rows,
-                                )
-                            }
-                        })
-                });
-                return Ok::<_, DataFusionError>(pages.boxed());
-            }
-            if direct_primary_key_projection
-                && let Some(row_pks) = reader
-                    .scan_row_primary_keys(request.clone())
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            {
-                record_rows_examined(row_pks.len());
-                let batch = row_primary_key_record_batch(&spec, Arc::clone(&schema), row_pks)?;
-                return Ok(stream::once(async move { Ok(batch) }).boxed());
-            }
-            if let Some(rows) = reader
-                .scan_row_snapshots(request.clone())
-                .await
-                .map_err(lix_error_to_datafusion_error)?
-                .filter(|rows| row_snapshot_batch_matches_opening_schema(&spec, rows))
-            {
-                record_rows_examined(rows.len());
-                let batch = row_snapshot_record_batch(&spec, &decoder, Arc::clone(&schema), rows)?;
-                return Ok(stream::once(async move { Ok(batch) }).boxed());
-            }
-            let rows = hot_state
-                .scan_batch(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            record_rows_examined(rows.len());
-            let batch = row_record_batch_with_staged_schemas(
-                write_ctx.as_ref(),
-                &spec,
-                Arc::clone(&schema),
-                rows,
-                &row_filters,
-                batch_projection,
-            )
-            .await?;
-            Ok(stream::once(async move { Ok(batch) }).boxed())
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&stream_schema),
-            pages,
-        )))
-    })
-}
-
 fn row_snapshot_batch_matches_opening_schema(
     spec: &SchemaSurfaceSpec,
     rows: &crate::tracked_state::ExclusiveRowSnapshotBatch,
@@ -4016,7 +4410,6 @@ fn row_snapshot_batch_matches_opening_schema(
 }
 
 fn row_snapshot_record_batch(
-    _spec: &SchemaSurfaceSpec,
     decoder: &RowProjectionDecoder,
     schema: SchemaRef,
     rows: crate::tracked_state::ExclusiveRowSnapshotBatch,
@@ -4042,23 +4435,6 @@ fn row_snapshot_record_batch(
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
-fn row_snapshot_page_primary_key_record_batch(
-    spec: &SchemaSurfaceSpec,
-    schema: SchemaRef,
-    rows: crate::tracked_state::ExclusiveRowSnapshotBatch,
-) -> Result<RecordBatch> {
-    let crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(rows) = rows else {
-        return Err(DataFusionError::Internal(
-            "packed primary-key stream returned a non-raw snapshot page".to_owned(),
-        ));
-    };
-    row_primary_key_record_batch(
-        spec,
-        schema,
-        rows.into_iter().map(|(row_pk, _)| row_pk).collect(),
-    )
-}
-
 /// A provider-level physical projection: all requested columns are simple
 /// string primary-key components stored verbatim in the current-state key.
 /// DataFusion still plans and executes every relational operator above this
@@ -4079,97 +4455,6 @@ fn direct_primary_key_projection_eligible(
             .fields()
             .iter()
             .all(|field| simple_string_primary_key_index(spec, field.name()).is_some())
-}
-
-fn unordered_limit_candidates_eligible(
-    spec: &SchemaSurfaceSpec,
-    schema: &Schema,
-    request: &HotStateScanRequest,
-    filters: &[Expr],
-    row_filters: &[RowFilter],
-    private_registry: bool,
-) -> bool {
-    let Some(limit) = request.limit else {
-        return false;
-    };
-    !private_registry
-        && !crate::hot_state::is_derived_schema(&spec.schema_key)
-        && (1..=MAX_UNORDERED_LIMIT_PUSHDOWN).contains(&limit)
-        && !schema.fields().is_empty()
-        && filters.is_empty()
-        && row_filters.is_empty()
-        && matches!(request.filter.rows, HotStateRowFilter::All)
-        && request.filter.schema_keys.len() == 1
-        && request.filter.branch_ids.len() == 1
-        && request.filter.row_pks.is_empty()
-        && request.filter.row_pk_lower.is_none()
-        && request.filter.row_pk_upper.is_none()
-        && request.filter.file_ids.is_empty()
-        && request.filter.untracked.is_none()
-        && request.filter.global.is_none()
-        && request.filter.constraints.is_empty()
-        && request.filter.declared_column_eq.is_none()
-        && request.filter.declared_column_range.is_none()
-        && !request.filter.include_tombstones
-}
-
-async fn recheck_unordered_limit_candidates(
-    hot_state: &dyn HotStateReader,
-    original_request: &HotStateScanRequest,
-    mut candidate_pks: Vec<RowPk>,
-    limit: usize,
-) -> Result<Option<MaterializedHotStateBatch>> {
-    if !(1..=MAX_UNORDERED_LIMIT_PUSHDOWN).contains(&limit)
-        || candidate_pks.is_empty()
-        || candidate_pks.len() > LIMIT_CANDIDATE_BUDGET
-    {
-        return Ok(None);
-    }
-
-    // Candidate pages are key-unique by construction. Keep a defensive
-    // dedupe here so a malformed or future source cannot duplicate SQL rows.
-    let mut seen = HashSet::with_capacity(candidate_pks.len());
-    candidate_pks.retain(|row_pk| seen.insert(row_pk.clone()));
-    if candidate_pks.len() < limit.max(LIMIT_CANDIDATE_MINIMUM_PAGE) {
-        // Small scans are cheaper through the existing path, and an undersized
-        // candidate set cannot amortize visibility rechecks over stale keys.
-        return Ok(None);
-    }
-    let mut verified = Vec::with_capacity(limit);
-    let mut offset = 0;
-    let mut chunk_size = limit.min(LIMIT_RECHECK_CHUNK_SIZE).max(1);
-    while offset < candidate_pks.len() && verified.len() < limit {
-        let end = offset.saturating_add(chunk_size).min(candidate_pks.len());
-        let candidate_chunk = &candidate_pks[offset..end];
-        let mut request = original_request.clone();
-        request.filter.row_pks = candidate_chunk.to_vec();
-        request.filter.row_pk_lower = None;
-        request.filter.row_pk_upper = None;
-        request.filter.file_ids = vec![crate::NullableKeyFilter::Null];
-        request.limit = None;
-        let rows = hot_state
-            .scan_batch(&request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        let verified_before_chunk = verified.len();
-        for row in rows.iter() {
-            if !row.deleted() && row.file_id().is_none() {
-                verified.push(row.to_owned());
-                if verified.len() >= limit {
-                    verified.truncate(limit);
-                    return Ok(Some(MaterializedHotStateBatch::from_rows(verified)));
-                }
-            }
-        }
-        if verified.len() - verified_before_chunk < candidate_chunk.len() {
-            chunk_size = chunk_size.saturating_mul(2).min(LIMIT_RECHECK_CHUNK_SIZE);
-        }
-        offset = end;
-    }
-    // A stale/deleted/overridden prefix can consume the bounded candidate
-    // budget. In that case, run the original complete scan so the LIMIT still
-    // returns the same number of rows whenever enough current rows exist.
-    Ok(None)
 }
 
 fn simple_string_primary_key_index(spec: &SchemaSurfaceSpec, column_name: &str) -> Option<usize> {
@@ -4869,6 +5154,18 @@ fn jsonb_sql_equality_key(value: &str) -> Result<String> {
 }
 
 #[cfg(test)]
+#[path = "schema_pk_window_tests.rs"]
+mod pk_window_tests;
+
+#[cfg(test)]
+#[path = "schema_file_scope_dml_tests.rs"]
+mod file_scope_dml_tests;
+
+#[cfg(test)]
+#[path = "schema_window_stream_tests.rs"]
+mod window_stream_tests;
+
+#[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
     #[tokio::test]
@@ -4877,10 +5174,11 @@ mod tests {
             .with_storage(crate::Memory::new())
             .await
             .unwrap();
-        lix.execute("INSERT INTO lix_file(id,path) VALUES ('01920000-0000-7000-8000-0000000000a1','/scope-a'), ('01920000-0000-7000-8000-0000000000a2','/scope-b')", &[]).await.unwrap();
-        lix.execute("INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES ('shared-pk','none',NULL), ('shared-pk','a','01920000-0000-7000-8000-0000000000a1'), ('shared-pk','b','01920000-0000-7000-8000-0000000000a2')", &[]).await.unwrap();
+        lix.execute("INSERT INTO lix_file(id,path) VALUES ('01920000-0000-7000-8000-0000000000a1','/scope-a'), ('01920000-0000-7000-8000-0000000000a2','/scope-b')").await.unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES ('shared-pk','none',NULL), ('shared-pk','a','01920000-0000-7000-8000-0000000000a1'), ('shared-pk','b','01920000-0000-7000-8000-0000000000a2')").await.unwrap();
         let result = lix
-            .execute("SELECT value FROM lix_key_value WHERE key='shared-pk'", &[])
+            .query("SELECT value FROM lix_key_value WHERE key='shared-pk'")
+            .all()
             .await
             .unwrap();
         let values = result
@@ -4898,32 +5196,28 @@ mod tests {
             std::collections::BTreeSet::from(["none".to_owned(), "a".to_owned(), "b".to_owned()])
         );
         assert!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 0",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()
-            .is_empty()
+            lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 0")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .is_empty()
         );
         assert_eq!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 1",
-                &[]
-            )
-            .await
-            .unwrap()
-            .rows()
-            .len(),
+            lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 1")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
             1
         );
-        assert_eq!(lix.execute("SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id='01920000-0000-7000-8000-0000000000a1'", &[]).await.unwrap().rows().len(), 1);
+        assert_eq!(lix.query("SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id='01920000-0000-7000-8000-0000000000a1'").all().await.unwrap().rows().len(), 1);
         assert_eq!(
-            lix.execute(
-                "SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id IS NULL",
-                &[]
+            lix.query(
+                "SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id IS NULL"
             )
+            .all()
             .await
             .unwrap()
             .rows()
@@ -4941,60 +5235,47 @@ mod tests {
             .unwrap();
         let file_a = "01920000-0000-7000-8000-0000000000a1";
         let file_b = "01920000-0000-7000-8000-0000000000a2";
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_file(id,path) VALUES ('{file_a}','/range-a'), ('{file_b}','/range-b')"
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_file(id,path) VALUES ('{file_a}','/range-a'), ('{file_b}','/range-b')"
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES \
+        lix.execute(&format!(
+            "INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES \
                  ('range-2','local-null-r2',NULL), \
                  ('range-2','local-a-r2','{file_a}'), \
                  ('range-3','local-a-r3','{file_a}'), \
                  ('range-2','local-b-r2','{file_b}'), \
                  ('range-3','local-b-r3','{file_b}')"
-            ),
-            &[],
-        )
+        ))
         .await
         .unwrap();
         // A global file-backed row needs its owner in the global branch.
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{file_b}','/global-range-b',TRUE)"
-            ),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_file(id,path,lixcol_global) VALUES ('{file_b}','/global-range-b',TRUE)"
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!(
-                "INSERT INTO lix_key_value(key,value,lixcol_file_id,lixcol_global) VALUES \
+        lix.execute(&format!(
+            "INSERT INTO lix_key_value(key,value,lixcol_file_id,lixcol_global) VALUES \
                  ('range-2','global-null-r2',NULL,TRUE), \
                  ('range-3','global-null-r3',NULL,TRUE), \
                  ('range-3','global-b-r3','{file_b}',TRUE)",
-            ),
-            &[],
-        )
+        ))
         .await
         .unwrap();
-        lix.execute(
-            &format!("DELETE FROM lix_key_value WHERE key='range-3' AND lixcol_file_id='{file_b}'"),
-            &[],
-        )
+        lix.execute(&format!(
+            "DELETE FROM lix_key_value WHERE key='range-3' AND lixcol_file_id='{file_b}'"
+        ))
         .await
         .unwrap();
 
         let result = lix
-            .execute(
+            .query(
                 "SELECT key, value, lixcol_file_id, lixcol_global \
                  FROM lix_key_value WHERE key >= 'range-2' AND key < 'range-4'",
-                &[],
             )
+            .all()
             .await
             .unwrap();
         let rows = result
@@ -5082,10 +5363,6 @@ mod tests {
 
     use super::super::spec::SpecTableProvider;
     use super::row_record_batch;
-    use super::{
-        LIMIT_CANDIDATE_MINIMUM_PAGE, LIMIT_RECHECK_CHUNK_SIZE, recheck_unordered_limit_candidates,
-        unordered_limit_candidates_eligible,
-    };
     use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
@@ -5103,58 +5380,6 @@ mod tests {
     struct EmptyHotStateReader;
     struct EmptyBranchRefReader;
     struct ActiveBranchRefReader;
-
-    struct LimitRecheckHotStateReader {
-        rows: Vec<MaterializedHotStateRow>,
-        requests: Mutex<Vec<HotStateScanRequest>>,
-    }
-
-    struct LimitCandidateCallCounter(Arc<AtomicUsize>);
-
-    struct UnorderedSnapshotPages(Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl crate::sql2::RowSnapshotReader for UnorderedSnapshotPages {
-        async fn scan_row_snapshot_pages(
-            &self,
-            request: HotStateScanRequest,
-        ) -> Result<
-            Option<
-                futures_util::stream::BoxStream<
-                    'static,
-                    Result<crate::tracked_state::ExclusiveRowSnapshotBatch, LixError>,
-                >,
-            >,
-            LixError,
-        > {
-            assert!(
-                request.limit.is_none(),
-                "ORDER BY must retain its fetch above the scan"
-            );
-            self.0.fetch_add(1, Ordering::Relaxed);
-            let pages = [[3, 2].as_slice(), [0, 1, 4].as_slice()]
-                .into_iter()
-                .map(|indices| {
-                    Ok(crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(
-                        indices
-                            .iter()
-                            .map(|index| {
-                                (
-                                    TestRowPk::single(format!("candidate-{index}")),
-                                    Bytes::from_static(
-                                        b"key-only projection must not decode this payload",
-                                    ),
-                                )
-                            })
-                            .collect(),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            Ok(Some(futures_util::StreamExt::boxed(
-                futures_util::stream::iter(pages),
-            )))
-        }
-    }
 
     #[derive(Default)]
     struct TestCachingRowSnapshotReader {
@@ -5256,62 +5481,6 @@ mod tests {
             _request: &HotStateScanRequest,
         ) -> Result<MaterializedHotStateBatch, LixError> {
             Ok(vec![].into())
-        }
-    }
-
-    #[async_trait]
-    impl HotStateReader for LimitRecheckHotStateReader {
-        async fn load_exact_batch(
-            &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
-        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
-        }
-
-        async fn scan_batch(
-            &self,
-            request: &HotStateScanRequest,
-        ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.requests
-                .lock()
-                .expect("limit recheck request lock")
-                .push(request.clone());
-            assert!(
-                request.limit.is_none(),
-                "candidate rechecks must be unbounded"
-            );
-            assert_eq!(
-                request.filter.file_ids,
-                vec![crate::NullableKeyFilter::Null]
-            );
-            assert!(request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE);
-            let rows = self
-                .rows
-                .iter()
-                .filter(|row| {
-                    row.schema_key == request.filter.schema_keys[0]
-                        && request.filter.row_pks.contains(&row.row_pk)
-                        && row.file_id.is_none()
-                })
-                .cloned()
-                .collect();
-            Ok(MaterializedHotStateBatch::from_rows(rows))
-        }
-    }
-
-    #[async_trait]
-    impl crate::sql2::RowSnapshotReader for LimitCandidateCallCounter {
-        async fn scan_row_limit_candidates(
-            &self,
-            _request: HotStateScanRequest,
-            _candidate_limit: usize,
-        ) -> Result<Option<Vec<TestRowPk>>, LixError> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(
-                (0..LIMIT_CANDIDATE_MINIMUM_PAGE)
-                    .map(|index| TestRowPk::single(format!("candidate-{index}")))
-                    .collect(),
-            ))
         }
     }
 
@@ -5496,318 +5665,6 @@ mod tests {
         MaterializedHotStateBatch::from_rows(rows)
     }
 
-    fn unordered_limit_request(limit: Option<usize>) -> HotStateScanRequest {
-        HotStateScanRequest {
-            filter: HotStateFilter {
-                schema_keys: vec!["project_message".to_owned()],
-                branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_owned()],
-                ..HotStateFilter::default()
-            },
-            projection: HotStateProjection {
-                columns: vec!["snapshot".to_owned()],
-            },
-            limit,
-        }
-    }
-
-    #[test]
-    fn candidate_limit_route_requires_an_unfiltered_finite_fetch() {
-        let spec = row_insert_spec_with_primary_key();
-        let schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
-        let request = unordered_limit_request(Some(100));
-        assert!(unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &request,
-            &[],
-            &[],
-            false,
-        ));
-
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &unordered_limit_request(None),
-            &[],
-            &[],
-            false,
-        ));
-        let mut exact_identity = request.clone();
-        exact_identity
-            .filter
-            .row_pks
-            .push(TestRowPk::single("point"));
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &exact_identity,
-            &[],
-            &[],
-            false,
-        ));
-        let mut file_filtered = request.clone();
-        file_filtered.filter.file_ids = vec![crate::NullableKeyFilter::Null];
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &file_filtered,
-            &[],
-            &[],
-            false,
-        ));
-        let mut global_filtered = request;
-        global_filtered.filter.global = Some(true);
-        assert!(!unordered_limit_candidates_eligible(
-            &spec,
-            &schema,
-            &global_filtered,
-            &[],
-            &[],
-            false,
-        ));
-    }
-
-    #[tokio::test]
-    async fn unordered_limit_projects_primary_keys_without_snapshot_payloads() {
-        let session = SessionContext::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut row = live_row();
-        row.row_pk = TestRowPk::single("candidate-0");
-        row.snapshot_content = None;
-        row.metadata = None;
-        let reader = Arc::new(LimitRecheckHotStateReader {
-            rows: vec![row],
-            requests: Mutex::new(Vec::new()),
-        });
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
-            row_insert_spec_with_primary_key(),
-            reader.clone(),
-            active_branch_ref(),
-            "branch-a".to_owned(),
-            Some(Arc::new(LimitCandidateCallCounter(Arc::clone(&calls)))),
-        )));
-        session
-            .register_table("project_message", Arc::new(provider))
-            .expect("register schema provider");
-        let batches = session
-            .sql("SELECT id FROM project_message LIMIT 1")
-            .await
-            .expect("plan key-only limit")
-            .collect()
-            .await
-            .expect("project identity without snapshot payload");
-        let values = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("primary key should be utf8");
-        assert_eq!(values.value(0), "candidate-0");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(reader.requests.lock().expect("request lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn ordered_limit_does_not_use_unordered_candidate_reader() {
-        let session = SessionContext::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
-            row_insert_spec_with_primary_key(),
-            Arc::new(EmptyHotStateReader),
-            active_branch_ref(),
-            "branch-a".to_owned(),
-            Some(Arc::new(LimitCandidateCallCounter(Arc::clone(&calls)))),
-        )));
-        session
-            .register_table("project_message", Arc::new(provider))
-            .expect("register schema provider");
-
-        let frame = session
-            .sql("SELECT body FROM project_message ORDER BY id LIMIT 3")
-            .await
-            .expect("plan ordered query");
-        frame.collect().await.expect("execute ordered query");
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            0,
-            "DataFusion must retain the sort above the full scan"
-        );
-    }
-
-    #[tokio::test]
-    async fn ordered_limit_sorts_across_unordered_snapshot_pages() {
-        let session = SessionContext::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = SpecTableProvider::new(Arc::new(super::SchemaSpec::active(
-            row_insert_spec_with_primary_key(),
-            Arc::new(EmptyHotStateReader),
-            active_branch_ref(),
-            "branch-a".to_owned(),
-            Some(Arc::new(UnorderedSnapshotPages(Arc::clone(&calls)))),
-        )));
-        session
-            .register_table("project_message", Arc::new(provider))
-            .expect("register schema provider");
-        let batches = session
-            .sql("SELECT id FROM project_message ORDER BY id LIMIT 3")
-            .await
-            .expect("plan ordered page")
-            .collect()
-            .await
-            .expect("sort globally across snapshot pages");
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("primary key should be utf8")
-                    .iter()
-                    .map(|value| value.expect("primary key must be non-null").to_owned())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values, ["candidate-0", "candidate-1", "candidate-2"]);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn candidate_limit_rechecks_global_staged_and_tombstone_winners_in_bounded_chunks() {
-        let mut global_winner = live_row();
-        global_winner.row_pk = TestRowPk::single("candidate-global");
-        global_winner.global = true;
-        global_winner.snapshot_content = Some(r#"{"body":"global winner"}"#.into());
-
-        let mut tombstone = live_row();
-        tombstone.row_pk = TestRowPk::single("candidate-deleted");
-        tombstone.deleted = true;
-
-        // This row stands for a transaction-local current winner. The helper
-        // sees it only through the authoritative HotStateReader recheck, never
-        // through the committed root candidate source.
-        let mut staged_winner = live_row();
-        staged_winner.row_pk = TestRowPk::single("candidate-staged");
-        staged_winner.snapshot_content = Some(r#"{"body":"staged winner"}"#.into());
-
-        let mut last_winner = live_row();
-        last_winner.row_pk = TestRowPk::single("candidate-last");
-        let reader = LimitRecheckHotStateReader {
-            rows: vec![global_winner, tombstone, staged_winner, last_winner],
-            requests: Mutex::new(Vec::new()),
-        };
-        let mut candidates = (0..512)
-            .map(|index| TestRowPk::single(format!("stale-{index}")))
-            .collect::<Vec<_>>();
-        candidates.extend([
-            TestRowPk::single("candidate-global"),
-            TestRowPk::single("candidate-deleted"),
-            TestRowPk::single("candidate-staged"),
-            TestRowPk::single("candidate-last"),
-        ]);
-
-        let rows = recheck_unordered_limit_candidates(
-            &reader,
-            &unordered_limit_request(Some(3)),
-            candidates.clone(),
-            3,
-        )
-        .await
-        .expect("recheck should succeed")
-        .expect("three authoritative live rows should fill LIMIT");
-        let keys = rows
-            .iter()
-            .map(|row| row.row_pk().clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                TestRowPk::single("candidate-global"),
-                TestRowPk::single("candidate-staged"),
-                TestRowPk::single("candidate-last"),
-            ]
-        );
-        assert!(rows.row(0).global());
-        assert_eq!(
-            rows.row(1)
-                .snapshot_content()
-                .expect("staged fixture has content")
-                .as_str(),
-            r#"{"body":"staged winner"}"#
-        );
-        {
-            let requests = reader.requests.lock().expect("request lock");
-            assert!(
-                requests.len() > 2,
-                "short pages should expand the next read"
-            );
-            assert_eq!(requests[0].filter.row_pks.len(), 3);
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| request.filter.row_pks.len() <= LIMIT_RECHECK_CHUNK_SIZE)
-            );
-            // The last chunk contains only the remaining keys and can be shorter
-            // than the preceding chunk, even though the adaptive target grows.
-            assert!(
-                requests[..requests.len() - 1]
-                    .windows(2)
-                    .all(|pair| { pair[0].filter.row_pks.len() <= pair[1].filter.row_pks.len() })
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request.filter.row_pks.len())
-                    .sum::<usize>(),
-                candidates.len()
-            );
-            assert!(requests.iter().all(|request| request.limit.is_none()));
-            assert!(requests.iter().all(|request| {
-                request.filter.file_ids == vec![crate::NullableKeyFilter::Null]
-            }));
-        }
-
-        let insufficient = recheck_unordered_limit_candidates(
-            &reader,
-            &unordered_limit_request(Some(2)),
-            vec![
-                TestRowPk::single("candidate-global"),
-                TestRowPk::single("candidate-deleted"),
-            ],
-            2,
-        )
-        .await
-        .expect("recheck should succeed");
-        assert!(
-            insufficient.is_none(),
-            "a short candidate result must request the complete fallback scan"
-        );
-
-        let small_reader = LimitRecheckHotStateReader {
-            rows: Vec::new(),
-            requests: Mutex::new(Vec::new()),
-        };
-        assert!(
-            recheck_unordered_limit_candidates(
-                &small_reader,
-                &unordered_limit_request(Some(1)),
-                (0..LIMIT_CANDIDATE_MINIMUM_PAGE - 1)
-                    .map(|index| TestRowPk::single(format!("small-{index}")))
-                    .collect(),
-                1,
-            )
-            .await
-            .expect("small candidate page should decline")
-            .is_none()
-        );
-        assert!(
-            small_reader
-                .requests
-                .lock()
-                .expect("request lock")
-                .is_empty(),
-            "small scans should decline before current-state hydration"
-        );
-    }
-
     fn row_insert_spec_with_primary_key() -> Arc<SchemaSurfaceSpec> {
         Arc::new(
             derive_schema_surface_spec_from_schema(&json!({
@@ -5920,22 +5777,6 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("identity column should be utf8");
         assert_eq!(values.value(0), "identity-1");
-
-        let page = super::row_snapshot_page_primary_key_record_batch(
-            &spec,
-            Arc::clone(&schema),
-            crate::tracked_state::ExclusiveRowSnapshotBatch::Raw(vec![(
-                crate::row_pk::RowPk::single("identity-2"),
-                Bytes::from_static(b"this is intentionally not a row payload"),
-            )]),
-        )
-        .expect("streamed identity projection should not decode the payload");
-        let values = page
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("identity column should be utf8");
-        assert_eq!(values.value(0), "identity-2");
 
         let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
         assert!(!super::direct_primary_key_projection_eligible(
@@ -6520,6 +6361,7 @@ mod tests {
                     column: "middle".to_string(),
                     column_type: SchemaColumnType::String,
                     values: vec![super::RowFilterValue::String("y".to_string())],
+                    index: super::ColumnInIndex::default(),
                 }),
             )),
             Box::new(super::RowFilter::And(
@@ -7900,6 +7742,7 @@ mod tests {
                 column: "lane".to_string(),
                 column_type: SchemaColumnType::String,
                 values: vec![super::RowFilterValue::String("a".to_string())],
+                index: super::ColumnInIndex::default(),
             },
         ];
 
@@ -8697,5 +8540,127 @@ mod tests {
         .expect("retry should populate cache");
 
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod column_in_index_tests {
+    use super::*;
+
+    fn column_in(
+        column_type: SchemaColumnType,
+        values: Vec<RowFilterValue>,
+        indexed: bool,
+    ) -> RowFilter {
+        RowFilter::ColumnIn {
+            column: "c".to_owned(),
+            column_type,
+            index: if indexed {
+                ColumnInIndex::new(column_type, &values)
+            } else {
+                ColumnInIndex::default()
+            },
+            values,
+        }
+    }
+
+    fn assert_same_typed(
+        column_type: SchemaColumnType,
+        values: Vec<RowFilterValue>,
+        rows: &[lix_schema::Row],
+    ) {
+        let indexed = column_in(column_type, values.clone(), true);
+        let linear = column_in(column_type, values, false);
+        for row in rows {
+            assert_eq!(
+                indexed.matches_typed(row, "s").unwrap(),
+                linear.matches_typed(row, "s").unwrap(),
+                "row {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_text_in_list_matches_linear_typed_semantics() {
+        let uuid = "01920000-0000-7000-8000-0000000000a1";
+        let mut values = (0..20)
+            .map(|i| RowFilterValue::String(format!("v{i}")))
+            .collect::<Vec<_>>();
+        values.push(RowFilterValue::String(uuid.to_owned()));
+        let row = |value: lix_schema::Value| lix_schema::Row::from([("c".to_owned(), value)]);
+        let rows = [
+            row(lix_schema::Value::Text("v3".to_owned())),
+            row(lix_schema::Value::Text("v30".to_owned())),
+            row(lix_schema::Value::Null),
+            // UUID-typed values compare through parsing, so the index defers.
+            row(lix_schema::Value::Uuid(
+                uuid::Uuid::parse_str(uuid).unwrap(),
+            )),
+            lix_schema::Row::from([("other".to_owned(), lix_schema::Value::Text("v3".to_owned()))]),
+        ];
+        assert!(matches!(
+            column_in(SchemaColumnType::String, values.clone(), true),
+            RowFilter::ColumnIn {
+                index: ColumnInIndex {
+                    strings: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_same_typed(SchemaColumnType::String, values, &rows);
+    }
+
+    #[test]
+    fn indexed_integer_in_list_matches_linear_typed_semantics() {
+        let values = (0..20).map(RowFilterValue::Integer).collect::<Vec<_>>();
+        let row = |value: lix_schema::Value| lix_schema::Row::from([("c".to_owned(), value)]);
+        assert_same_typed(
+            SchemaColumnType::Integer,
+            values,
+            &[
+                row(lix_schema::Value::Int8(5)),
+                row(lix_schema::Value::Int8(99)),
+                row(lix_schema::Value::Null),
+            ],
+        );
+    }
+
+    #[test]
+    fn indexed_in_list_matches_linear_snapshot_semantics() {
+        let values = (0..20)
+            .map(|i| RowFilterValue::String(format!("v{i}")))
+            .collect::<Vec<_>>();
+        let indexed = column_in(SchemaColumnType::String, values.clone(), true);
+        let linear = column_in(SchemaColumnType::String, values, false);
+        for snapshot in [
+            serde_json::json!({"c": "v7"}),
+            serde_json::json!({"c": "nope"}),
+            serde_json::json!({"c": null}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                indexed.matches_snapshot(Some(&snapshot), "s").unwrap(),
+                linear.matches_snapshot(Some(&snapshot), "s").unwrap(),
+                "snapshot {snapshot}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_in_lists_stay_linear() {
+        let values = (0..3)
+            .map(|i| RowFilterValue::String(format!("v{i}")))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            column_in(SchemaColumnType::String, values, true),
+            RowFilter::ColumnIn {
+                index: ColumnInIndex {
+                    strings: None,
+                    integers: None
+                },
+                ..
+            }
+        ));
     }
 }

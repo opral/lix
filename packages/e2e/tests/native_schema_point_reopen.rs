@@ -66,23 +66,20 @@ async fn native_schema_point_survives_cold_reopen<S: ReopenStorage>() {
             ],
             "primary_key": ["id"]
         });
-        lix.execute(
-            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
-            &[Value::Text(schema.to_string())],
-        )
+        lix.execute("INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))").params(&[Value::Text(schema.to_string())])
         .await
         .expect("register native point schema");
-        lix.execute(
-            &format!("INSERT INTO {SCHEMA_KEY} (id, payload) VALUES ($1, CAST($2 AS JSONB))"),
-            &[Value::Text("row-a".into()), Value::Text(initial.into())],
-        )
+        lix.execute(&format!(
+            "INSERT INTO {SCHEMA_KEY} (id, payload) VALUES ($1, CAST($2 AS JSONB))"
+        ))
+        .params(&[Value::Text("row-a".into()), Value::Text(initial.into())])
         .await
         .expect("insert native point row");
         assert_point(&lix, initial).await;
-        lix.execute(
-            &format!("UPDATE {SCHEMA_KEY} SET payload = CAST($2 AS JSONB) WHERE id = $1"),
-            &[Value::Text("row-a".into()), Value::Text(expected.into())],
-        )
+        lix.execute(&format!(
+            "UPDATE {SCHEMA_KEY} SET payload = CAST($2 AS JSONB) WHERE id = $1"
+        ))
+        .params(&[Value::Text("row-a".into()), Value::Text(expected.into())])
         .await
         .expect("replace native point row under a new authenticated root");
         assert_point(&lix, expected).await;
@@ -110,10 +107,11 @@ async fn assert_point<S: Storage + Clone + Send + Sync + 'static>(
     expected: &str,
 ) {
     let result = lix
-        .execute(
-            &format!("SELECT payload AS body FROM {SCHEMA_KEY} WHERE id = $1 LIMIT 1"),
-            &[Value::Text("row-a".into())],
-        )
+        .query(&format!(
+            "SELECT payload AS body FROM {SCHEMA_KEY} WHERE id = $1 LIMIT 1"
+        ))
+        .params(&[Value::Text("row-a".into())])
+        .all()
         .await
         .expect("read native point row");
     assert_eq!(result.columns(), ["body"]);

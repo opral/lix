@@ -219,13 +219,11 @@ pub(crate) async fn stage_renew_native_baseline_lease(
     stage(writes, &lease)?;
     Ok((
         lease,
-        vec![
-            StoragePrecondition::KeyValueEquals {
-                space: NATIVE_BASELINE_LEASE_SPACE,
-                key: key(lease_id)?,
-                expected: raw,
-            },
-        ],
+        vec![StoragePrecondition::KeyValueEquals {
+            space: NATIVE_BASELINE_LEASE_SPACE,
+            key: key(lease_id)?,
+            expected: raw,
+        }],
     ))
 }
 pub(super) struct NativeBaselineRetention {
@@ -430,7 +428,7 @@ mod tests {
             retained_native_baseline_roots(&read, renewed.expires_at_ms)
                 .await
                 .unwrap(),
-                roots,
+            roots,
             "expired v2 rows retain roots until GC commits their deletion"
         );
     }
@@ -451,10 +449,7 @@ mod tests {
             .await
             .unwrap();
         writer
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('leased-native-only','kept')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('leased-native-only','kept')")
             .await
             .unwrap();
         let descriptor = lix
@@ -500,12 +495,10 @@ mod tests {
             .unwrap();
         writer.close().await.unwrap();
         drop(writer);
-        lix.execute(
-            "DELETE FROM lix_branch WHERE id=$1",
-            &[crate::Value::Text(branch.id)],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_branch WHERE id=$1")
+            .params(&[crate::Value::Text(branch.id)])
+            .await
+            .unwrap();
         for expired in [false, true] {
             if expired {
                 lease.expires_at_ms = 1;
@@ -588,10 +581,8 @@ mod tests {
             .map(|index| ((index * 29 + 17) % 251) as u8)
             .collect::<Vec<_>>();
         writer
-            .execute(
-                "INSERT INTO lix_file (path,content) VALUES ('/leased-only.bin',$1)",
-                &[crate::Value::Blob(content.clone().into())],
-            )
+            .execute("INSERT INTO lix_file (path,content) VALUES ('/leased-only.bin',$1)")
+            .params(&[crate::Value::Blob(content.clone().into())])
             .await
             .unwrap();
         let blob = crate::binary_cas::BlobId::from_content(&content);
@@ -649,12 +640,10 @@ mod tests {
             .unwrap();
         writer.close().await.unwrap();
         drop(writer);
-        lix.execute(
-            "DELETE FROM lix_branch WHERE id=$1",
-            &[crate::Value::Text(branch.id)],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_branch WHERE id=$1")
+            .params(&[crate::Value::Text(branch.id)])
+            .await
+            .unwrap();
         for expired in [false, true] {
             if expired {
                 lease.expires_at_ms = 1;
@@ -753,10 +742,7 @@ mod tests {
             .await
             .unwrap();
         writer
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('expired-lease-only','row')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('expired-lease-only','row')")
             .await
             .unwrap();
         let descriptor = lix
@@ -815,12 +801,10 @@ mod tests {
             .unwrap();
         writer.close().await.unwrap();
         drop(writer);
-        lix.execute(
-            "DELETE FROM lix_branch WHERE id=$1",
-            &[crate::Value::Text(branch.id)],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_branch WHERE id=$1")
+            .params(&[crate::Value::Text(branch.id)])
+            .await
+            .unwrap();
         // Three bounded GC slices delete these 384 earlier legacy lease rows.
         // The target remains present while its root is reclaimed, exercising
         // the persisted legacy generation boundary.
@@ -838,12 +822,12 @@ mod tests {
         let mut renewal = adapter.new_write_set();
         assert_eq!(
             stage_renew_native_baseline_lease(
-            &read,
-            &mut renewal,
-            &lease.lease_id,
-            lix.active_account_id(),
-            2,
-        )
+                &read,
+                &mut renewal,
+                &lease.lease_id,
+                lix.active_account_id(),
+                2,
+            )
             .await
             .unwrap_err()
             .code,
@@ -852,14 +836,9 @@ mod tests {
         );
         let original = load(&read, &lease.lease_id).await.unwrap().unwrap().1;
         assert!(
-            require_native_baseline_lease(
-                &read,
-                &lease.lease_id,
-                lix.active_account_id(),
-                2,
-            )
-            .await
-            .is_err(),
+            require_native_baseline_lease(&read, &lease.lease_id, lix.active_account_id(), 2,)
+                .await
+                .is_err(),
             "legacy leases cannot authorize reads"
         );
         drop(read);
@@ -938,10 +917,7 @@ mod tests {
             .await
             .unwrap();
         writer
-            .execute(
-                "INSERT INTO lix_key_value (key,value) VALUES ('v2-expired-lease-only','row')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value (key,value) VALUES ('v2-expired-lease-only','row')")
             .await
             .unwrap();
         let descriptor = lix
@@ -987,12 +963,10 @@ mod tests {
             .unwrap();
         writer.close().await.unwrap();
         drop(writer);
-        lix.execute(
-            "DELETE FROM lix_branch WHERE id=$1",
-            &[crate::Value::Text(branch.id)],
-        )
-        .await
-        .unwrap();
+        lix.execute("DELETE FROM lix_branch WHERE id=$1")
+            .params(&[crate::Value::Text(branch.id)])
+            .await
+            .unwrap();
 
         // The selected expired page contains 128 keys. The target sorts after
         // them and remains in storage during this sweep.
@@ -1029,13 +1003,10 @@ mod tests {
         );
         let mut gc = adapter.new_write_set();
         let mut gc_guards = Vec::new();
-        let plan = super::super::stage_repository_gc_with_preconditions(
-            read,
-            &mut gc,
-            &mut gc_guards,
-        )
-            .await
-            .unwrap();
+        let plan =
+            super::super::stage_repository_gc_with_preconditions(read, &mut gc, &mut gc_guards)
+                .await
+                .unwrap();
         assert!(plan.sweep.has_more, "lease cleanup keeps GC debt due");
         adapter
             .commit_write_set(
@@ -1049,7 +1020,9 @@ mod tests {
             .unwrap();
 
         let read = adapter.begin_read(Default::default()).await.unwrap();
-        let retained = load_native_baseline_retention(&read, u64::MAX).await.unwrap();
+        let retained = load_native_baseline_retention(&read, u64::MAX)
+            .await
+            .unwrap();
         assert!(retained.roots.contains(&head));
         assert!(
             crate::tracked_state::load_commit_state_authority_ids(&read, &[head])
@@ -1072,9 +1045,10 @@ mod tests {
             .await
             .unwrap();
         let read = adapter.begin_read(Default::default()).await.unwrap();
-        let renewed = require_native_baseline_lease(&read, &lease.lease_id, lix.active_account_id(), 2)
-            .await
-            .unwrap();
+        let renewed =
+            require_native_baseline_lease(&read, &lease.lease_id, lix.active_account_id(), 2)
+                .await
+                .unwrap();
         assert!(renewed.expires_at_ms > lease.expires_at_ms);
         assert!(
             retained_native_baseline_roots(&read, 2)

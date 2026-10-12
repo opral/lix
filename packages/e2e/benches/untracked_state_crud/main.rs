@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use lix::Value;
 use lix::storage::{
     BeginScanOptions, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue,
     PutBatch, ReadOptions, ScanChunk, ScanCursor, SpaceId, Storage, StorageError, StorageRead,
@@ -27,7 +28,6 @@ use lix::storage_adapter::{
     StorageCoreProjection, StorageGetOptions, StoragePrefix, StorageReadOptions, StorageSpace,
     StorageValue, StorageWriteOptions,
 };
-use lix::{ExecuteBatchStatement, Value};
 use lix::{Lix, open_lix};
 use lix_storage_rocksdb::RocksDB;
 #[cfg(feature = "slatedb")]
@@ -1112,7 +1112,7 @@ where
         sql_string(JSON_POINTER_SCHEMA_JSON)
     );
     let affected = session
-        .execute(&sql, &[])
+        .execute(&sql)
         .await
         .expect("register json_pointer schema")
         .rows_affected();
@@ -1134,7 +1134,7 @@ async fn insert_untracked_json_pointer_rows<StorageImpl>(
     for chunk in rows.chunks(chunk_size) {
         let sql = insert_untracked_json_pointer_sql(chunk);
         let affected = session
-            .execute(&sql, &[])
+            .execute(&sql)
             .await
             .expect("insert untracked json_pointer rows")
             .rows_affected();
@@ -1148,24 +1148,19 @@ async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let statements = rows
-        .iter()
-        .map(|row| ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), true)".to_owned(),
-            params: vec![
-                Value::Text(row.path.clone()),
-                Value::Text(row.value_json.clone()),
-            ],
-        })
-        .collect::<Vec<_>>();
-    let results = session
-        .execute_batch(&statements)
+    let affected = session
+        .execute_many(
+            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ($1, CAST($2 AS JSONB), true)",
+            rows.iter().map(|row| {
+                [
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ]
+            }),
+        )
         .await
-        .expect("batch insert untracked json_pointer rows")
-        .results;
-    assert_eq!(results.len(), rows.len());
-    assert!(results.iter().all(|result| result.rows_affected() == 1));
+        .expect("batch insert untracked json_pointer rows");
+    assert_eq!(affected as usize, rows.len());
 }
 
 async fn update_untracked_json_pointer_rows<StorageImpl>(
@@ -1176,7 +1171,7 @@ async fn update_untracked_json_pointer_rows<StorageImpl>(
 {
     let sql = update_untracked_json_pointer_sql(rows);
     let affected = session
-        .execute(&sql, &[])
+        .execute(&sql)
         .await
         .expect("update untracked json_pointer rows")
         .rows_affected();
@@ -1188,10 +1183,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     session
-        .execute(
-            "DELETE FROM json_pointer WHERE lixcol_untracked = true",
-            &[],
-        )
+        .execute("DELETE FROM json_pointer WHERE lixcol_untracked = true")
         .await
         .expect("delete untracked json_pointer rows")
         .rows_affected() as usize

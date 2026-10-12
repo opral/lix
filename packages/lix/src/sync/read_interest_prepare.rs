@@ -36,8 +36,10 @@ fn consume_history_graph_node_budget(remaining: &mut usize) -> bool {
 
 #[derive(Default)]
 struct ReturnedExecutableRows {
-    by_branch:
-        std::collections::BTreeMap<String, std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>>,
+    by_branch: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>,
+    >,
     count: usize,
 }
 
@@ -56,7 +58,8 @@ fn merge_returned_executable_rows(
         if destination.count >= crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS {
             return Err(crate::plugin::runtime::executable_dependency_work_bound());
         }
-        destination.by_branch
+        destination
+            .by_branch
             .entry(branch.clone())
             .or_default()
             .insert(key.clone());
@@ -162,9 +165,8 @@ where
     // Diff identities are prepared separately from the exact mutation
     // frontier: they need only their selected-head point paths, never mutation
     // predecessor or successor expansion.
-    let mut selected_head_diff_keys = std::collections::BTreeSet::<
-        crate::tracked_state::TrackedStateKey,
-    >::new();
+    let mut selected_head_diff_keys =
+        std::collections::BTreeSet::<crate::tracked_state::TrackedStateKey>::new();
     // A live row's canonical ChangeLocator is not part of its row-PK point
     // path. Retain only IDs from visible after-rows in the exact leased-head
     // diff; deleted keys remain in the point frontier but prove no locator.
@@ -377,13 +379,16 @@ where
                     branch_id.as_deref(),
                     to,
                 )?;
-                let collect_selected_head_keys = matches!(
-                    &purpose,
-                    NativeReadPreparationPurpose::Authority { .. }
-                ) && branch_id.as_deref()
-                    == Some(descriptor.selected_branch.branch_id.as_str())
-                    && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
-                    && descriptor.selected_branch.head.row_pk_index_root_id.is_some();
+                let collect_selected_head_keys =
+                    matches!(&purpose, NativeReadPreparationPurpose::Authority { .. })
+                        && branch_id.as_deref()
+                            == Some(descriptor.selected_branch.branch_id.as_str())
+                        && to.as_str() == descriptor.selected_branch.head.commit_id.as_str()
+                        && descriptor
+                            .selected_branch
+                            .head
+                            .row_pk_index_root_id
+                            .is_some();
                 let collect_working_diff_candidates = collect_selected_head_keys
                     && is_working_diff
                     && !*retain_payloads
@@ -1188,20 +1193,17 @@ mod tests {
             .await
             .unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_file(path, content) VALUES ($1, $2)",
-                &[
-                    crate::Value::Text("/locator-frontier.txt".into()),
-                    crate::Value::Blob(bytes::Bytes::from_static(b"locator frontier").into()),
-                ],
-            )
+            .execute("INSERT INTO lix_file(path, content) VALUES ($1, $2)")
+            .params(&[
+                crate::Value::Text("/locator-frontier.txt".into()),
+                crate::Value::Blob(bytes::Bytes::from_static(b"locator frontier").into()),
+            ])
             .await
             .unwrap();
         let selected = authority
-            .execute(
-                "SELECT lixcol_change_id FROM lix_file WHERE path = $1",
-                &[crate::Value::Text("/locator-frontier.txt".into())],
-            )
+            .query("SELECT lixcol_change_id FROM lix_file WHERE path = $1")
+            .params(&[crate::Value::Text("/locator-frontier.txt".into())])
+            .all()
             .await
             .unwrap();
         let change_id = crate::changelog::ChangeId::parse_lix(
@@ -1212,10 +1214,7 @@ mod tests {
         )
         .unwrap();
         let storage = authority.storage_adapter();
-        let read = storage
-            .begin_read(Default::default())
-            .await
-            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
         let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_inputs = inputs.clone();
         let sink = move |input| {
@@ -1281,19 +1280,18 @@ mod tests {
         let first = ("branch-a".to_owned(), key("file-a"));
         let second = ("branch-b".to_owned(), key("file-b"));
         let mut union = ReturnedExecutableRows::default();
-        merge_returned_executable_rows(
-            &mut union,
-            &[first.clone(), second.clone(), first.clone()],
-        )
-        .unwrap();
+        merge_returned_executable_rows(&mut union, &[first.clone(), second.clone(), first.clone()])
+            .unwrap();
         assert_eq!(union.count, 2);
 
         union.count = crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS;
-        assert!(merge_returned_executable_rows(
-            &mut union,
-            &[("branch-c".to_owned(), key("file-c"))],
-        )
-        .is_err());
-        assert_eq!(union.count, crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS);
+        assert!(
+            merge_returned_executable_rows(&mut union, &[("branch-c".to_owned(), key("file-c"))],)
+                .is_err()
+        );
+        assert_eq!(
+            union.count,
+            crate::plugin::runtime::MAX_EXECUTABLE_OWNER_ROWS
+        );
     }
 }

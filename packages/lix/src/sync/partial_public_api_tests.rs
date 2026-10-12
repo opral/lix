@@ -9,10 +9,10 @@ use crate::sync::SyncTransportFuture;
 use crate::sync::http::{HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse};
 use crate::sync::partial_state::PartialReplicaState;
 use crate::{Lix, LixError, Memory, open_lix};
+use futures_util::FutureExt as _;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use futures_util::FutureExt as _;
 
 #[derive(Default)]
 struct FirstDemandBarrier {
@@ -208,7 +208,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         let backing = Memory::new();
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
-        authority.execute("INSERT INTO lix_key_value(key,value) VALUES('edit','before')", &[]).await.unwrap();
+        authority.execute("INSERT INTO lix_key_value(key,value) VALUES('edit','before')").await.unwrap();
         authority.upsert_file_content("/cold.bin", if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else { b"cold contents".to_vec() }).await.unwrap();
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
         let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), object_fetches: Arc::default(), fresh_descriptors: Arc::default(), live_updates: None, first_demand_barrier: None };
@@ -231,12 +231,12 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
         transport.bind_native_baseline_lease(old.baseline_lease()).unwrap();
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::sync_demand_channel(4);
         let lix = Lix::from_partial_engine_for_test(engine.clone(), session, sender.clone());
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(storage.clone(), old.clone(), Some(transport),
             || Box::pin(async {Err(LixError::unknown("unexpected reconnect"))}), shutdown_rx, receiver, None, Some(engine.clone()));
         let caller = async {
-            if dirty { lix.execute("UPDATE lix_key_value SET value='local' WHERE key='edit'", &[]).await.unwrap(); }
+            if dirty { lix.execute("UPDATE lix_key_value SET value='local' WHERE key='edit'").await.unwrap(); }
             if advanced { authority_sql(&client.server, authority.lix_id(), None, "UPDATE lix_key_value SET value='remote' WHERE key='edit'").await; }
             client.expire.store(transaction == 0, Ordering::SeqCst);
             client.lose_session.store(transaction == 7, Ordering::SeqCst);
@@ -262,12 +262,12 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
                 ).await.unwrap();
                 assert!(push.prepared.is_some(), "selected ordinary attempt is durably frozen");
                 drop(read);
-                let server_value = authority.execute("SELECT value FROM lix_key_value WHERE key='edit'", &[]).await.unwrap();
+                let server_value = authority.query("SELECT value FROM lix_key_value WHERE key='edit'").all().await.unwrap();
                 assert_eq!(server_value.rows()[0].get::<serde_json::Value>("value").unwrap(), "before", "the frozen request has not been sent");
             }
             if transaction == 3 || transaction == 6 {
                 let local_global = lix.open_another_session().with_branch(crate::GLOBAL_BRANCH_ID).await.unwrap();
-                local_global.execute("INSERT INTO lix_key_value(key,value) VALUES('global-race','local')", &[]).await.unwrap();
+                local_global.execute("INSERT INTO lix_key_value(key,value) VALUES('global-race','local')").await.unwrap();
                 authority_sql(&client.server, authority.lix_id(), Some(crate::GLOBAL_BRANCH_ID), "INSERT INTO lix_key_value(key,value) VALUES('global-race','server')").await;
                 client.expire.store(true, Ordering::SeqCst);
             }
@@ -276,22 +276,22 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
             let started = std::time::Instant::now();
             let sql = "SELECT content FROM lix_file WHERE path='/cold.bin'";
             let result = if transaction == 1 || transaction == 2 || transaction == 5 {
-                let mut tx = lix.begin_transaction().await.expect("open cold partial transaction");
-                let result = tx.execute(sql, &[]).await.expect("cold file SQL hydrates inside the pinned transaction");
+                let tx = lix.begin_transaction().await.expect("open cold partial transaction");
+                let result = tx.query(sql).all().await.expect("cold file SQL hydrates inside the pinned transaction");
                 let before_inner_warm = client.fetches.load(Ordering::SeqCst);
-                let warm = tx.execute(sql, &[]).await.unwrap();
+                let warm = tx.query(sql).all().await.unwrap();
                 assert_eq!(result, warm);
                 assert_eq!(before_inner_warm, client.fetches.load(Ordering::SeqCst), "same transaction warm SQL needs no network");
                 if transaction == 5 {
-                    tx.execute("UPDATE lix_file SET content=$1 WHERE path='/cold.bin'", &[crate::Value::Blob(b"committed transaction contents".to_vec().into())]).await.expect("cold file mutation hydrates before commit");
-                    let staged = tx.execute(sql, &[]).await.unwrap();
+                    tx.execute("UPDATE lix_file SET content=$1 WHERE path='/cold.bin'").params(&[crate::Value::Blob(b"committed transaction contents".to_vec().into())]).await.expect("cold file mutation hydrates before commit");
+                    let staged = tx.query(sql).all().await.unwrap();
                     tx.commit().await.expect("explicit file mutation commits once");
                     staged
                 } else {
                     tx.rollback().await.unwrap();
                     result
                 }
-            } else { lix.execute(sql, &[]).await.expect("normal awaited SQL recovers without application retries") };
+            } else { lix.query(sql).all().await.expect("normal awaited SQL recovers without application retries") };
             let elapsed_us = started.elapsed().as_micros();
             if !dirty && !advanced && transaction == 0 {
                 assert_eq!(client.fresh_descriptors.load(Ordering::SeqCst) - descriptors_before, 1,
@@ -301,28 +301,28 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
             assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(),
                 if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else if transaction == 5 { b"committed transaction contents".to_vec() } else { b"cold contents".to_vec() });
             let before = client.fetches.load(Ordering::SeqCst);
-            let warm = lix.execute(sql, &[]).await.unwrap();
+            let warm = lix.query(sql).all().await.unwrap();
             assert_eq!(result, warm);
             if transaction == 1 || transaction == 2 || transaction == 5 {
                 // The outer session has a different read/auto-commit boundary;
                 // warm it once, then require its own repeated query to be local.
                 let before_outer_warm = client.fetches.load(Ordering::SeqCst);
-                let warm_again = lix.execute(sql, &[]).await.unwrap();
+                let warm_again = lix.query(sql).all().await.unwrap();
                 assert_eq!(warm, warm_again);
                 assert_eq!(before_outer_warm, client.fetches.load(Ordering::SeqCst), "same outer session warm SQL needs no network");
             } else {
                 assert_eq!(before, client.fetches.load(Ordering::SeqCst), "warm SQL performs no foreground fetch");
             }
-            let value = lix.execute("SELECT value FROM lix_key_value WHERE key='edit'", &[]).await.unwrap();
+            let value = lix.query("SELECT value FROM lix_key_value WHERE key='edit'").all().await.unwrap();
             assert!(format!("{value:?}").contains(if dirty {"local"} else if advanced {"remote"} else {"before"}));
             eprintln!("{}", serde_json::json!({"profile":"public_recovery", "dirty":dirty,"advanced":advanced,"elapsed_us":elapsed_us,"native_requests":before - fetches_before,"transaction":transaction}));
             if transaction == 3 || transaction == 6 {
                 let global = lix.open_another_session().with_branch(crate::GLOBAL_BRANCH_ID).await.unwrap();
-                let value = global.execute("SELECT value FROM lix_key_value WHERE key='global-race'", &[]).await.unwrap();
+                let value = global.query("SELECT value FROM lix_key_value WHERE key='global-race'").all().await.unwrap();
                 assert_eq!(value.rows()[0].get::<serde_json::Value>("value").unwrap(), "server", "unmergeable GLOBAL state follows the authority inside awaited SQL");
             }
             if transaction == 6 {
-                let accepted = authority.execute("SELECT value FROM lix_key_value WHERE key='edit'", &[]).await.unwrap();
+                let accepted = authority.query("SELECT value FROM lix_key_value WHERE key='edit'").all().await.unwrap();
                 assert_eq!(accepted.rows()[0].get::<serde_json::Value>("value").unwrap(), "local", "GLOBAL divergence must not starve the frozen selected upload");
             }
             shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
@@ -339,10 +339,7 @@ async fn partial_observe_waits_for_demand_then_ignores_same_epoch_availability()
         let authority = open_lix().with_storage(backing.clone()).await.unwrap();
         authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
         authority
-            .execute(
-                "INSERT INTO lix_key_value(key,value) VALUES('observe-target','before')",
-                &[],
-            )
+            .execute("INSERT INTO lix_key_value(key,value) VALUES('observe-target','before')")
             .await
             .unwrap();
         authority
@@ -425,7 +422,7 @@ async fn partial_observe_waits_for_demand_then_ignores_same_epoch_availability()
         let object_transport = transport.clone();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = crate::sync::sync_demand_channel(4);
         let lix = Lix::from_partial_engine_for_test(engine.clone(), session.clone(), sender.clone());
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
@@ -533,7 +530,7 @@ async fn partial_observe_waits_for_demand_then_ignores_same_epoch_availability()
                 "same-epoch dependency availability must not emit an observer event"
             );
             let update = "UPDATE lix_key_value SET value='after' WHERE key='observe-target'";
-            lix.execute(update, &[]).await.unwrap();
+            lix.execute(update).await.unwrap();
             authority_sql(&client.server, authority.lix_id(), None, update).await;
             let authority_after = authority_sql(&client.server, authority.lix_id(), None, sql).await;
             let visible = after_availability

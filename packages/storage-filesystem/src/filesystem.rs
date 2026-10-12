@@ -33,6 +33,9 @@ use crate::RocksDBFilesystem;
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 const LIX_DIRECTORY_GITIGNORE: &[u8] = b"*\n";
 const FILESYSTEM_POLL_INTERVAL: Duration = Duration::from_secs(15);
+// This thread executes the engine's write/validation graph and RocksDB reads.
+// Match the native engine actors rather than inheriting Rust's small default.
+const FILESYSTEM_ENGINE_STACK_SIZE: usize = 32 * 1024 * 1024;
 const FILE_UPSERT_BATCH_MAX_ROWS: usize = 500;
 const FILE_UPSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FILESYSTEM_PARALLEL_SNAPSHOT_MAX_WORKERS: usize = 8;
@@ -314,6 +317,14 @@ struct LixRevision {
     active_branch_id: String,
     active_branch_commit_id: String,
     storage_mutation_revision: Option<Vec<u8>>,
+}
+
+fn lix_revision(snapshot: &lix::internal::Snapshot) -> LixRevision {
+    LixRevision {
+        active_branch_id: snapshot.active_branch_id().to_owned(),
+        active_branch_commit_id: snapshot.commit_id().to_owned(),
+        storage_mutation_revision: snapshot.storage_mutation_revision().map(<[u8]>::to_vec),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,6 +710,7 @@ impl FilesystemSupervisor {
         let worker_state = Arc::clone(&state);
         let worker = thread::Builder::new()
             .name("lix-sdk-filesystem-sync".to_string())
+            .stack_size(FILESYSTEM_ENGINE_STACK_SIZE)
             .spawn(move || filesystem_worker(worker_state, event_rx, poll_filesystem, debouncer))
             .map_err(|error| {
                 LixError::new(
@@ -945,20 +957,17 @@ impl FilesystemState {
     async fn collect_lix_snapshot_read(&self) -> Result<LixSnapshotRead, LixError> {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
-        let statements: [(&str, &[Value]); 2] = [
-            ("SELECT path FROM lix_directory ORDER BY path", &[]),
-            ("SELECT path, content FROM lix_file ORDER BY path", &[]),
-        ];
-        let batch = self.lix.execute_coherent_read_batch(&statements).await?;
-        let [directories, files] = batch.results.try_into().map_err(|results: Vec<_>| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "coherent filesystem snapshot read returned {} result sets",
-                    results.len()
-                ),
-            )
-        })?;
+        // Both reads and the revision come from one pinned Lix state.
+        let lix_snapshot = lix::internal::open_read_snapshot(&self.lix).await?;
+        let directories = lix_snapshot
+            .query("SELECT path FROM lix_directory ORDER BY path")
+            .all()
+            .await?;
+        let files = lix_snapshot
+            .query("SELECT path, content FROM lix_file ORDER BY path")
+            .max_bytes(usize::MAX)
+            .all()
+            .await?;
         for row in directories.rows() {
             snapshot.directories.insert(row.get::<String>("path")?);
         }
@@ -967,24 +976,16 @@ impl FilesystemState {
             let data = row.get::<Vec<u8>>("content")?;
             snapshot.files.insert(path, data);
         }
-
-        Ok(LixSnapshotRead {
-            snapshot,
-            revision: LixRevision {
-                active_branch_id: batch.active_branch_id,
-                active_branch_commit_id: batch.active_branch_commit_id,
-                storage_mutation_revision: batch.storage_mutation_revision,
-            },
-        })
+        let revision = lix_revision(&lix_snapshot);
+        lix_snapshot.close().await?;
+        Ok(LixSnapshotRead { snapshot, revision })
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let batch = self.lix.execute_coherent_read_batch(&[]).await?;
-        Ok(LixRevision {
-            active_branch_id: batch.active_branch_id,
-            active_branch_commit_id: batch.active_branch_commit_id,
-            storage_mutation_revision: batch.storage_mutation_revision,
-        })
+        let lix_snapshot = lix::internal::open_read_snapshot(&self.lix).await?;
+        let revision = lix_revision(&lix_snapshot);
+        lix_snapshot.close().await?;
+        Ok(revision)
     }
 
     async fn apply_local_snapshot_to_lix_with_filter(
@@ -1018,10 +1019,8 @@ impl FilesystemState {
                 }
                 needs_fresh_lix_read = true;
                 self.lix
-                    .execute(
-                        "DELETE FROM lix_file WHERE path = $1",
-                        &[Value::Text(path.clone())],
-                    )
+                    .execute("DELETE FROM lix_file WHERE path = $1")
+                    .params(&[Value::Text(path.clone())])
                     .await?;
             }
         }
@@ -1053,10 +1052,8 @@ impl FilesystemState {
             for path in directories_to_remove {
                 needs_fresh_lix_read = true;
                 self.lix
-                    .execute(
-                        "DELETE FROM lix_directory WHERE path = $1",
-                        &[Value::Text(path)],
-                    )
+                    .execute("DELETE FROM lix_directory WHERE path = $1")
+                    .params(&[Value::Text(path)])
                     .await?;
             }
         }
@@ -1078,8 +1075,8 @@ impl FilesystemState {
             self.lix
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
-                    &[Value::Text(path)],
                 )
+                .params(&[Value::Text(path)])
                 .await?;
         }
 
@@ -1126,7 +1123,7 @@ impl FilesystemState {
                 params.push(Value::Text((*path).to_string()));
                 params.push(Value::Blob((*data).to_vec().into()));
             }
-            self.lix.execute(&sql, &params).await?;
+            self.lix.execute(&sql).params(&params).await?;
             start = end;
         }
         Ok(())
@@ -2534,10 +2531,9 @@ mod tests {
         StorageImpl: Storage + Clone + Send + Sync + 'static,
     {
         let result = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text(path.to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text(path.to_string())])
+            .all()
             .await?;
         result
             .rows()
@@ -2557,8 +2553,8 @@ mod tests {
         lix.execute(
             "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
              ON CONFLICT (path) DO UPDATE SET content = excluded.content",
-            &[Value::Text(path.to_string()), Value::Blob(data.into())],
         )
+        .params(&[Value::Text(path.to_string()), Value::Blob(data.into())])
         .await?;
         Ok(())
     }
@@ -3018,10 +3014,8 @@ mod tests {
 
         state
             .lix
-            .execute(
-                "DELETE FROM lix_file WHERE path = $1",
-                &[Value::Text("/sql.txt".to_string())],
-            )
+            .execute("DELETE FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/sql.txt".to_string())])
             .await
             .unwrap();
         state.sync_disk_to_lix(true).await.unwrap();
@@ -3029,10 +3023,9 @@ mod tests {
         assert!(!tempdir.path().join("sql.txt").exists());
         let rows = state
             .lix
-            .execute(
-                "SELECT path FROM lix_file WHERE path = $1",
-                &[Value::Text("/sql.txt".to_string())],
-            )
+            .query("SELECT path FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/sql.txt".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(rows.len(), 0);
@@ -3134,10 +3127,9 @@ mod tests {
         storage.sync_disk_to_lix().await.unwrap();
 
         let tracked = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/tracked.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/tracked.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -3151,10 +3143,9 @@ mod tests {
         );
 
         let ignored = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/ignored.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/ignored.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(
@@ -3186,10 +3177,9 @@ mod tests {
 
         let lix = open_lix().with_storage(storage).await.unwrap();
         let tracked = lix
-            .execute(
-                "SELECT content FROM lix_file WHERE path = $1",
-                &[Value::Text("/tracked.md".to_string())],
-            )
+            .query("SELECT content FROM lix_file WHERE path = $1")
+            .params(&[Value::Text("/tracked.md".to_string())])
+            .all()
             .await
             .unwrap();
         assert_eq!(

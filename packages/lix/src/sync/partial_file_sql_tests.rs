@@ -91,7 +91,8 @@ async fn execute_file_hydrating(
     Err(LixError::unknown("file SQL demand budget exhausted"))
 }
 
-fn content(result: ExecuteResult) -> Vec<u8> {
+fn content(result: impl Into<ExecuteResult>) -> Vec<u8> {
+    let result: ExecuteResult = result.into();
     assert_eq!(
         result.rows().len(),
         1,
@@ -114,13 +115,13 @@ async fn parameterized_exact_id_full_content_is_captured_before_first_memory_mis
         .execute(
             "INSERT INTO lix_file (id, path, content, lixcol_metadata) \
              VALUES ($1, $2, $3, $4)",
-            &[
-                Value::Text(id.to_owned()),
-                Value::Text(path.to_owned()),
-                Value::Blob(bytes.clone().into()),
-                Value::Jsonb(metadata.clone().into()),
-            ],
         )
+        .params(&[
+            Value::Text(id.to_owned()),
+            Value::Text(path.to_owned()),
+            Value::Blob(bytes.clone().into()),
+            Value::Jsonb(metadata.clone().into()),
+        ])
         .await
         .unwrap();
     let (authority, engine, session, state) =
@@ -198,14 +199,12 @@ async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_file (id,path,content) VALUES ($1,$2,$3)",
-            &[
-                Value::Text(id.to_owned()),
-                Value::Text("/before.bin".to_owned()),
-                Value::Blob(bytes.clone().into()),
-            ],
-        )
+        .execute("INSERT INTO lix_file (id,path,content) VALUES ($1,$2,$3)")
+        .params(&[
+            Value::Text(id.to_owned()),
+            Value::Text("/before.bin".to_owned()),
+            Value::Blob(bytes.clone().into()),
+        ])
         .await
         .unwrap();
     let (authority, engine, session, old) =
@@ -256,13 +255,11 @@ async fn exact_id_content_interest_replays_moved_file_in_candidate_state() {
 
     let remote_bytes = vec![0x5a; 1024];
     authority
-        .execute(
-            "UPDATE lix_file SET path = '/after.bin', content = $2 WHERE id = $1",
-            &[
-                Value::Text(id.to_owned()),
-                Value::Blob(remote_bytes.clone().into()),
-            ],
-        )
+        .execute("UPDATE lix_file SET path = '/after.bin', content = $2 WHERE id = $1")
+        .params(&[
+            Value::Text(id.to_owned()),
+            Value::Blob(remote_bytes.clone().into()),
+        ])
         .await
         .unwrap();
     let next = Arc::new(
@@ -319,10 +316,9 @@ async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
             .collect::<Vec<_>>()
             .join(",");
         authority
-            .execute(
-                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
-                &[],
-            )
+            .execute(&format!(
+                "INSERT INTO lix_key_value (key, value) VALUES {values}"
+            ))
             .await
             .unwrap();
         // Exceed inline transfer admission so this gate exercises chunk demand.
@@ -335,7 +331,7 @@ async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
             })
             .collect::<Vec<_>>();
         let unrelated = vec![231u8; 1024 * 1024];
-        authority.execute("INSERT INTO lix_file (path, content) VALUES ('/target.bin', $1), ('/unrelated.bin', $2)", &[Value::Blob(original.clone().into()), Value::Blob(unrelated.clone().into())]).await.unwrap();
+        authority.execute("INSERT INTO lix_file (path, content) VALUES ('/target.bin', $1), ('/unrelated.bin', $2)").params(&[Value::Blob(original.clone().into()), Value::Blob(unrelated.clone().into())]).await.unwrap();
         let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
         let descriptor = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let state = PartialReplicaState::new(
@@ -472,10 +468,7 @@ async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
             controls_before_ack
         );
         assert_eq!(content(session.execute(sql, &[]).await.unwrap()), prepared);
-        assert_eq!(
-            content(authority.execute(sql, &[]).await.unwrap()),
-            prepared
-        );
+        assert_eq!(content(authority.query(sql).all().await.unwrap()), prepared);
         assert!(client.chunks.load(std::sync::atomic::Ordering::SeqCst) > 0);
         eprintln!(
             "partial file upload width={width} pushes={} chunks={}",

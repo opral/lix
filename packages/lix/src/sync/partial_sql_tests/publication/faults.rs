@@ -131,10 +131,7 @@ async fn prepared_fault_fixture_with_deadline(
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     authority
-        .execute(
-            "INSERT INTO lix_key_value (key,value) VALUES ('resident','before')",
-            &[],
-        )
+        .execute("INSERT INTO lix_key_value (key,value) VALUES ('resident','before')")
         .await
         .unwrap();
     let old = Arc::new(
@@ -189,10 +186,7 @@ async fn prepared_fault_fixture_with_deadline(
     .await
     .unwrap();
     authority
-        .execute(
-            "UPDATE lix_key_value SET value='remote' WHERE key='resident'",
-            &[],
-        )
+        .execute("UPDATE lix_key_value SET value='remote' WHERE key='resident'")
         .await
         .unwrap();
     let next = Arc::new(

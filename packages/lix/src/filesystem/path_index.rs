@@ -2424,25 +2424,23 @@ mod tests {
             .map(|index| format!("('/unrelated-{index:03}.bin', CAST('x' AS BYTEA))"))
             .collect::<Vec<_>>()
             .join(", ");
-        lix.execute(
-            &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
-            &[],
-        )
+        lix.execute(&format!(
+            "INSERT INTO lix_file (path, content) VALUES {values}"
+        ))
         .await
         .expect("unrelated descriptors should insert in one batch");
 
         let id = lix
-            .execute(
-                "SELECT id FROM lix_file WHERE path='/top/nested/a.bin'",
-                &[],
-            )
+            .query("SELECT id FROM lix_file WHERE path='/top/nested/a.bin'")
+            .all()
             .await
             .unwrap()
             .rows()[0]
             .get::<String>("id")
             .unwrap();
         let root_id = lix
-            .execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[])
+            .query("SELECT id FROM lix_file WHERE path='/root.bin'")
+            .all()
             .await
             .unwrap()
             .rows()[0]
@@ -2548,10 +2546,7 @@ mod tests {
             vec!["/top", "/top/nested", "/top/nested/a.bin"]
         );
         assert!(
-            Arc::ptr_eq(
-                &index,
-                &scoped_reader.path_index(&request).await.unwrap()
-            ),
+            Arc::ptr_eq(&index, &scoped_reader.path_index(&request).await.unwrap()),
             "scoped reads reuse the revision cache"
         );
         let root = request.clone().with_file_ids(Some(vec![root_id]));
