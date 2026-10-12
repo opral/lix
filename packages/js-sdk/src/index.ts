@@ -44,7 +44,6 @@ export type {
 	ResultColumnType,
 	Row,
 	RowStream,
-	Snapshot,
 	WriteOptions,
 	MergeBranchOptions,
 	MergeBranchOutcome,

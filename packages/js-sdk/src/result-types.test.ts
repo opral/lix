@@ -6,7 +6,6 @@ import type {
 	QueryOptions,
 	Reader,
 	RowStream,
-	Snapshot,
 } from "./index.js";
 
 interface CustomRow {
@@ -36,10 +35,6 @@ test("query, stream and execute accept interface rows and forwarded option union
 			const reader: Reader = transaction;
 			void reader.query("SELECT 1");
 			void transaction.execute("SELECT 1", [], executeOptions);
-		});
-		void lix.read(async (snapshot: Snapshot) => {
-			const reader: Reader = snapshot;
-			return reader.query<CustomRow>("SELECT 'ok' AS value");
 		});
 		void forwardExecute;
 	};

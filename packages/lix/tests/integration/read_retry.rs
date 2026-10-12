@@ -370,7 +370,9 @@ async fn working_review_snapshot_reports_an_expired_hot_epoch_read_as_retryable(
     // retryable error and the caller retries with a new snapshot.
     let heads = "SELECT working_base_commit_id AS before_commit_id, commit_id AS after_commit_id \
                  FROM lix_branch WHERE id = lix_active_branch_id()";
-    let snapshot = lix.snapshot().await.expect("open the review snapshot");
+    let snapshot = lix::internal::open_read_snapshot(&lix)
+        .await
+        .expect("open the review snapshot");
     snapshot.query(heads).one().await.unwrap();
     let error = snapshot
         .query("SELECT id, from_path, to_path FROM lix_diff('lix_file')")
@@ -392,7 +394,9 @@ async fn working_review_snapshot_reports_an_expired_hot_epoch_read_as_retryable(
     );
     snapshot.close().await.unwrap();
 
-    let snapshot = lix.snapshot().await.expect("reopen the review snapshot");
+    let snapshot = lix::internal::open_read_snapshot(&lix)
+        .await
+        .expect("reopen the review snapshot");
     snapshot.query(heads).one().await.unwrap();
     let diff = snapshot
         .query("SELECT id, from_path, to_path FROM lix_diff('lix_file')")
@@ -648,8 +652,7 @@ async fn snapshot_open_restarts_after_expiry_and_serves_every_read() {
         .expect("open Lix");
 
     storage.expire_next_read_call();
-    let snapshot = lix
-        .snapshot()
+    let snapshot = lix::internal::open_read_snapshot(&lix)
         .await
         .expect("the snapshot open should restart");
     let first = snapshot.query("SELECT 1 AS value").one().await.unwrap();

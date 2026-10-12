@@ -21,8 +21,8 @@ test("streams rows in browser WASM and closes on break and close", async () => {
 			break;
 		}
 
-		await lix.read(async (snapshot) => {
-			expect(await snapshot.queryOne("SELECT count(*) AS n FROM generate_series(1, 10)")).toEqual({ n: 10 });
+		await lix.transaction(async (tx) => {
+			expect(await tx.queryOne("SELECT count(*) AS n FROM generate_series(1, 10)")).toEqual({ n: 10 });
 		});
 
 		const open = await lix.stream(sql);

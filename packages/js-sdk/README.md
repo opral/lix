@@ -30,7 +30,7 @@ await lix.close();
 
 `query()`, `queryOne()` and `stream()` read and never write; `execute()` runs
 any statement and `executeMany()` runs one statement for many parameter sets.
-`read(fn)` and `snapshot()` read several statements at one state. See the
+`transaction(fn)` runs several statements against one consistent state. See the
 [JavaScript API reference](../../docs/js-api-reference.md).
 
 ## OpenTelemetry spans

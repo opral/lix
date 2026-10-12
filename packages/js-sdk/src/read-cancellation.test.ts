@@ -52,57 +52,6 @@ test("aborting an in-flight stream open stops its engine work", async () => {
 	}
 });
 
-test("aborting an in-flight snapshot query stops its engine work", async () => {
-	const lix = await openLix();
-	try {
-		const controller = new AbortController();
-		await lix.read(async (snapshot) => {
-			const reading = snapshot.query(LONG_READ, [], { signal: controller.signal });
-			await started();
-			controller.abort(new Error("stop snapshot read"));
-			await expect(within(3_000, reading)).rejects.toThrow("stop snapshot read");
-			expect(await within(3_000, snapshot.queryOne("SELECT 1 AS n"))).toEqual({ n: 1 });
-		});
-		await expectResponsive(lix);
-	} finally {
-		await lix.close();
-	}
-});
-
-test("aborting read() cancels the snapshot's reads in flight", async () => {
-	const lix = await openLix();
-	try {
-		const controller = new AbortController();
-		const reading = lix.read((snapshot) => snapshot.query(LONG_READ), {
-			signal: controller.signal,
-		});
-		await started();
-		controller.abort(new Error("stop read"));
-		await expect(within(3_000, reading)).rejects.toThrow("stop read");
-		await expectResponsive(lix);
-	} finally {
-		await lix.close();
-	}
-});
-
-test("closing a snapshot during a long read cancels the read", async () => {
-	const lix = await openLix();
-	try {
-		const snapshot = await lix.snapshot();
-		const reading = snapshot.query(LONG_READ);
-		// Settles while close() is awaited; observed below.
-		reading.catch(() => undefined);
-		await started();
-		await within(3_000, snapshot.close());
-		await expect(within(3_000, reading)).rejects.toMatchObject({
-			code: "LIX_ERROR_SNAPSHOT_CLOSED",
-		});
-		await expectResponsive(lix);
-	} finally {
-		await lix.close();
-	}
-});
-
 test("closing a Lix during a long read cancels the read", async () => {
 	const lix = await openLix();
 	const reading = lix.query(LONG_READ);
@@ -137,7 +86,7 @@ test("aborting a transaction cancels its read in flight and rolls back", async (
 	}
 });
 
-test("an open stream keeps pulling while four long snapshot reads run", async () => {
+test("an open stream keeps pulling while four long reads run", async () => {
 	const lix = await openLix();
 	try {
 		const rows = await lix.stream<{ n: number }>(
@@ -147,7 +96,7 @@ test("an open stream keeps pulling while four long snapshot reads run", async ()
 		expect((await pages.next()).done).toBe(false);
 		const controller = new AbortController();
 		const longReads = Array.from({ length: 4 }, () =>
-			lix.read((snapshot) => snapshot.query(LONG_READ), { signal: controller.signal }),
+			lix.query(LONG_READ, [], { signal: controller.signal }),
 		);
 		for (const read of longReads) read.catch(() => undefined);
 		await started();

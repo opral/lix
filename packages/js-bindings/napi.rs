@@ -1838,7 +1838,7 @@ impl NativeLixInner {
         }
     }
 
-    async fn read_snapshot(&self) -> std::result::Result<lix::Snapshot, LixError> {
+    async fn read_snapshot(&self) -> std::result::Result<lix::internal::Snapshot, LixError> {
         match self {
             Self::Memory(lix) => crate::session::SessionOperations::read_snapshot(lix).await,
             Self::FilesystemStorage(lix, _, _) => {
@@ -3560,7 +3560,7 @@ fn snapshot_closed_error() -> LixError {
 
 #[napi]
 impl NativeReadSnapshot {
-    fn new(snapshot: lix::Snapshot) -> io::Result<Self> {
+    fn new(snapshot: lix::internal::Snapshot) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let (commands, gate) = GatedSender::new(commands);
         thread::Builder::new()
@@ -3659,7 +3659,7 @@ impl Drop for NativeReadSnapshot {
 /// next. A close stops intake first, then waits for every read already handed
 /// out, so no command goes unsettled.
 fn run_read_snapshot_actor(
-    snapshot: lix::Snapshot,
+    snapshot: lix::internal::Snapshot,
     receiver: mpsc::Receiver<ReadSnapshotCommand>,
     gate: ActorGate,
 ) {

@@ -207,7 +207,23 @@ pub use session::{
     Row, RowStream, TryFromValue,
 };
 pub(crate) use session::{ExecuteBatchResult, ExecuteBatchStatement};
-pub use query::{Execute, ExecuteMany, Query, Snapshot};
+pub use query::{Execute, ExecuteMany, Query};
+
+/// Internal bridge for workspace bindings and storage adapters. Not a supported SDK API.
+#[doc(hidden)]
+pub mod internal {
+    use crate::{Lix, LixError};
+    use crate::storage_adapter::Storage;
+
+    pub use crate::query::Snapshot;
+
+    pub async fn open_read_snapshot<S>(lix: &Lix<S>) -> Result<Snapshot, LixError>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        lix.snapshot().await
+    }
+}
 pub(crate) use session::{
     ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,
     FileUploadProgress,

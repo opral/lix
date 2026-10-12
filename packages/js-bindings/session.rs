@@ -104,7 +104,7 @@ pub(crate) trait SessionOperations: Sized {
         max_bytes: Option<usize>,
     ) -> Result<lix::RowStream, LixError>;
     /// Pins the current state for several reads.
-    async fn read_snapshot(&self) -> Result<lix::Snapshot, LixError>;
+    async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError>;
     async fn close(&self) -> Result<(), LixError>;
     /// Runs any single statement.
     async fn execute(
@@ -229,8 +229,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
             .await
     }
 
-    async fn read_snapshot(&self) -> Result<lix::Snapshot, LixError> {
-        Lix::snapshot(self).await
+    async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError> {
+        lix::internal::open_read_snapshot(self).await
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -589,7 +589,7 @@ mod remote {
             Err(unsupported_remote("stream"))
         }
 
-        async fn read_snapshot(&self) -> Result<lix::Snapshot, LixError> {
+        async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError> {
             Err(unsupported_remote("snapshot"))
         }
 

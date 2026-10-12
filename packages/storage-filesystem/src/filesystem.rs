@@ -316,7 +316,7 @@ struct LixRevision {
     storage_mutation_revision: Option<Vec<u8>>,
 }
 
-fn lix_revision(snapshot: &lix::Snapshot) -> LixRevision {
+fn lix_revision(snapshot: &lix::internal::Snapshot) -> LixRevision {
     LixRevision {
         active_branch_id: snapshot.active_branch_id().to_owned(),
         active_branch_commit_id: snapshot.commit_id().to_owned(),
@@ -954,7 +954,7 @@ impl FilesystemState {
         let mut snapshot = Snapshot::default();
         snapshot.directories.insert("/".to_string());
         // Both reads and the revision come from one pinned Lix state.
-        let lix_snapshot = self.lix.snapshot().await?;
+        let lix_snapshot = lix::internal::open_read_snapshot(&self.lix).await?;
         let directories = lix_snapshot
             .query("SELECT path FROM lix_directory ORDER BY path")
             .all()
@@ -978,7 +978,7 @@ impl FilesystemState {
     }
 
     async fn collect_lix_revision(&self) -> Result<LixRevision, LixError> {
-        let lix_snapshot = self.lix.snapshot().await?;
+        let lix_snapshot = lix::internal::open_read_snapshot(&self.lix).await?;
         let revision = lix_revision(&lix_snapshot);
         lix_snapshot.close().await?;
         Ok(revision)

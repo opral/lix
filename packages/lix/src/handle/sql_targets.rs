@@ -1,5 +1,5 @@
 //! [`crate::query::SqlTarget`] for the public handles: the latest state of a
-//! [`Lix`], a pinned [`crate::Snapshot`], a [`LixTransaction`] and a
+//! [`Lix`], a pinned [`crate::query::Snapshot`], a [`LixTransaction`] and a
 //! [`RemoteLix`].
 
 use std::sync::Arc;
@@ -79,7 +79,7 @@ where
     }
 
     /// Starts a read of the latest committed state. Each call reads the state
-    /// current when it runs; use [`Self::snapshot`] for several reads at one
+    /// current when it runs; use a transaction for several reads at one
     /// state.
     ///
     /// A read never changes the repository and publishes no commit. One
@@ -111,7 +111,7 @@ where
     /// through the snapshot sees that state, and streams may be open
     /// concurrently. Snapshots never expire; close or drop them to release
     /// the state.
-    pub async fn snapshot(&self) -> Result<crate::Snapshot, LixError> {
+    pub(crate) async fn snapshot(&self) -> Result<crate::query::Snapshot, LixError> {
         // Opening reads only the branch head and storage revision, so a
         // partial replica can restart it after fetching missing inputs.
         let snapshot = self
@@ -128,7 +128,9 @@ where
                 }
             })
             .await?;
-        Ok(crate::Snapshot::new(Arc::new(LixSnapshot { snapshot })))
+        Ok(crate::query::Snapshot::new(Arc::new(LixSnapshot {
+            snapshot,
+        })))
     }
 
     /// The buffered read path behind [`crate::Query::all`]: local first, with
@@ -311,7 +313,8 @@ where
     }
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
-        let limits = ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
+        let limits =
+            ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
         // SAFETY: the future owns the handle Arc and the request.
         unsafe {
             boxed(async move { with_read_limits(limits, self.execute_latest(request)).await })
@@ -478,7 +481,8 @@ where
     }
 
     fn execute(self: Arc<Self>, request: ExecuteRequest) -> SqlFuture<ExecuteResult> {
-        let limits = ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
+        let limits =
+            ReadLimits::bytes(request.max_bytes).with_unique_columns(request.unique_columns);
         // SAFETY: the future owns the transaction Arc and the request.
         unsafe { boxed(async move { with_read_limits(limits, self.write(request)).await }) }
     }
@@ -502,7 +506,11 @@ impl SqlTarget for RemoteLix {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
             self.client
-                .query(&request.sql, &request.params, Some(request.limits.max_bytes))
+                .query(
+                    &request.sql,
+                    &request.params,
+                    Some(request.limits.max_bytes),
+                )
                 .await
         })
     }
@@ -565,7 +573,11 @@ impl SqlTarget for RemoteTransactionTarget {
     fn query(self: Arc<Self>, request: QueryRequest) -> SqlFuture<QueryResult> {
         Box::pin(async move {
             self.transaction()?
-                .query(&request.sql, &request.params, Some(request.limits.max_bytes))
+                .query(
+                    &request.sql,
+                    &request.params,
+                    Some(request.limits.max_bytes),
+                )
                 .await
         })
     }
@@ -613,10 +625,5 @@ impl RemoteLix {
     /// `stream()` fails with `LIX_UNSUPPORTED_REMOTE_OPERATION`.
     pub fn query(&self, sql: &str) -> crate::Query {
         crate::Query::new(Arc::new(self.clone()), sql)
-    }
-
-    /// Snapshots are not available on remote handles.
-    pub async fn snapshot(&self) -> Result<crate::Snapshot, LixError> {
-        Err(unsupported_remote_operation("snapshot()"))
     }
 }

@@ -1,4 +1,4 @@
-//! The SQL surface shared by [`crate::Lix`], [`Snapshot`] and transactions.
+//! The SQL surface shared by [`crate::Lix`] and transactions.
 //!
 //! One obvious way per job:
 //! - small reads: [`Query::all`], [`Query::one`], [`Query::optional`]: buffered
@@ -62,7 +62,7 @@ pub(crate) fn unsupported_remote_operation(operation: &str) -> LixError {
 }
 
 /// A read statement waiting to run. Created by `query(sql)` on a
-/// [`crate::Lix`], a [`Snapshot`] or a transaction.
+/// [`crate::Lix`] or a transaction.
 ///
 /// A `Query` does nothing until one of [`Self::all`], [`Self::one`],
 /// [`Self::optional`] or [`Self::stream`] is awaited. It never writes:
@@ -353,7 +353,7 @@ pub(crate) trait SnapshotTarget: SqlTarget {
 }
 
 /// One pinned repository state: every read and stream through it sees the
-/// same state, whatever commits meanwhile. Opened by [`crate::Lix::snapshot`].
+/// same state, whatever commits meanwhile. Used internally by bindings and storage adapters.
 ///
 /// Clones share the state. Any number of streams may be open at once, and a
 /// stream keeps reading after the handle that opened it is dropped. The state

@@ -8,7 +8,6 @@ import type {
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import {
 	LixRowStream,
-	LixSnapshot,
 	closedError,
 	executeOptions,
 	nativeParamSets,
@@ -45,7 +44,6 @@ import type {
 	ReplicaRecoveryReceipt,
 	Row,
 	RowStream,
-	Snapshot,
 	SqlParam,
 	StreamOptions,
 	SwitchBranchOptions,
@@ -124,7 +122,6 @@ export class Lix implements Reader {
 	readonly #observationDrains = new Set<Promise<void>>();
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
 	readonly #queryStreams = new WeakCollection<LixRowStream<object>>();
-	readonly #snapshots = new WeakCollection<LixSnapshot>();
 	/** Aborts on close(): reads in flight stop in the engine. */
 	readonly #closing = new AbortController();
 	readonly #reader: ReaderContext = {
@@ -219,51 +216,6 @@ export class Lix implements Reader {
 		options?: StreamOptions,
 	): Promise<RowStream<TRow>> {
 		return stream<TRow>(this.#reader, sql, params, options);
-	}
-
-	/**
-	 * Runs `fn` with a snapshot: every read in `fn` sees one state, and streams
-	 * may be open concurrently. The snapshot closes when `fn` settles. Aborting
-	 * `signal` closes it early; `fn`'s pending reads then reject.
-	 */
-	async read<R>(
-		fn: (snapshot: Snapshot) => Promise<R> | R,
-		options: CallOptions = {},
-	): Promise<R> {
-		if (typeof fn !== "function")
-			throw invalidArgument("read", "fn", "function", typeof fn);
-		const snapshot = await this.snapshot(options);
-		const abort = () => void snapshot.close().catch(() => undefined);
-		options.signal?.addEventListener("abort", abort, { once: true });
-		try {
-			const value = await fn(snapshot);
-			throwIfAborted(options.signal);
-			return value;
-		} catch (error) {
-			throwIfAborted(options.signal);
-			throw error;
-		} finally {
-			options.signal?.removeEventListener("abort", abort);
-			await snapshot.close();
-		}
-	}
-
-	/** Pins the current state for reads that outlive one callback. Close it when done. */
-	async snapshot(options: CallOptions = {}): Promise<Snapshot> {
-		throwIfAborted(options.signal);
-		const opening = this.#runOperation(() => this.binding.snapshot());
-		const binding = await withAbort(opening, options.signal).catch((error: unknown) => {
-			void opening.then((opened) => opened.close()).catch(() => undefined);
-			throw error;
-		});
-		let forget = () => {};
-		const snapshot = new LixSnapshot(binding, () => forget());
-		if (!this.#acceptingOperations) {
-			await snapshot.close();
-			throw closedError();
-		}
-		forget = this.#snapshots.add(snapshot);
-		return snapshot;
 	}
 
 	/**
@@ -662,11 +614,9 @@ export class Lix implements Reader {
 			const queryStreams = this.#queryStreams
 				.drain()
 				.map((stream) => stream.fail(closedError()));
-			const snapshots = this.#snapshots.drain().map((snapshot) => snapshot.close());
 			this.closePromise = (async () => {
 				await Promise.allSettled(observationDrains);
 				await Promise.allSettled(queryStreams);
-				await Promise.allSettled(snapshots);
 				await Promise.allSettled(
 					[...this.#snapshotExports].map((snapshot) => snapshot.cancel()),
 				);

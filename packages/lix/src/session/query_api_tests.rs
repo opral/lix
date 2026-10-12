@@ -436,8 +436,8 @@ fn query_types_are_send_and_static() {
     assert_send_static::<crate::Execute>();
     assert_send_static::<crate::ExecuteMany>();
     assert_send_static::<crate::RowStream>();
-    assert_send_static::<crate::Snapshot>();
-    assert_sync::<crate::Snapshot>();
+    assert_send_static::<crate::query::Snapshot>();
+    assert_sync::<crate::query::Snapshot>();
     assert_send_static::<crate::LixTransaction>();
     assert_sync::<crate::LixTransaction>();
     fn assert_stream<T: futures_core::stream::FusedStream + Unpin>() {}
@@ -784,7 +784,6 @@ async fn a_long_snapshot_read_yields_so_dropping_it_cancels_promptly() {
     snapshot.close().await.unwrap();
 }
 
-
 /// Outside Tokio's cooperative budget (the browser's executor has none), the
 /// engine still yields: no single poll of a long read runs past a few time
 /// slices, so cancels and other work interleave with it.
@@ -831,10 +830,13 @@ async fn a_failed_execute_many_rewinds_the_deterministic_sequence() {
             // Each set draws a file id from the sequence; the second
             // repeats the path and fails.
             let error = transaction
-                .execute_many("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
-                    [Value::from("/a.txt"), Value::Blob(b"a".to_vec().into())],
-                    [Value::from("/a.txt"), Value::Blob(b"b".to_vec().into())],
-                ])
+                .execute_many(
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                    [
+                        [Value::from("/a.txt"), Value::Blob(b"a".to_vec().into())],
+                        [Value::from("/a.txt"), Value::Blob(b"b".to_vec().into())],
+                    ],
+                )
                 .await
                 .unwrap_err();
             assert_ne!(error.code, LixError::CODE_INTERNAL_ERROR);
@@ -865,9 +867,11 @@ async fn a_read_cancelled_mid_flush_poisons_its_transaction() {
     )
     .await
     .unwrap();
-    lix.execute("INSERT INTO flush_probe (path, value) VALUES ('/a', '1'::jsonb), ('/b', '1'::jsonb)")
-        .await
-        .unwrap();
+    lix.execute(
+        "INSERT INTO flush_probe (path, value) VALUES ('/a', '1'::jsonb), ('/b', '1'::jsonb)",
+    )
+    .await
+    .unwrap();
     let transaction = lix.begin_transaction().await.unwrap();
     // Exact-key path-value updates are staged through the mutation journal.
     for path in ["/a", "/b"] {

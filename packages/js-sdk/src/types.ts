@@ -397,7 +397,7 @@ export interface RowStream<TRow extends object = Row>
 	close(): Promise<void>;
 }
 
-/** Reads at one state: the latest committed state per call, a snapshot, or a transaction. */
+/** Reads at one state: the latest committed state per call or a transaction. */
 export interface Reader {
 	/** Reads only (writes reject with `LIX_ERROR_READ_ONLY`). Buffered and all-or-nothing. */
 	query<TRow extends object = Row>(
@@ -420,12 +420,6 @@ export interface Reader {
 		params?: readonly SqlParam[],
 		options?: StreamOptions,
 	): Promise<RowStream<TRow>>;
-}
-
-/** A pinned state: every read through it sees the same state. */
-export interface Snapshot extends Reader, AsyncDisposable {
-	/** Closes its streams; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. */
-	close(): Promise<void>;
 }
 
 export type ObserveEvent = {

@@ -36,8 +36,10 @@ async fn public_execution_and_observation_futures_are_send() {
     assert_send(lix.begin_transaction());
     assert_send(lix.query("SELECT 1").all());
     assert_send(lix.query("SELECT 1").stream());
-    assert_send(lix.snapshot());
-    let snapshot = lix.snapshot().await.expect("open snapshot");
+    assert_send(lix::internal::open_read_snapshot(&lix));
+    let snapshot = lix::internal::open_read_snapshot(&lix)
+        .await
+        .expect("open snapshot");
     assert_send(snapshot.query("SELECT 1").all());
     assert_send(snapshot.close());
     assert_send(lix.switch_branch(SwitchBranchOptions {

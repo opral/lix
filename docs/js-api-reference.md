@@ -211,25 +211,6 @@ for await (const page of variants.pages()) render(page);
 
 Streams never write. A few statements must buffer before their first page: reads of file content (`lix_file.content`), reads inside a transaction, and reads on partial replicas. Those buffers are capped by `maxBytes` (64 MiB by default) and reject with `LIX_ERROR_RESULT_TOO_LARGE` beyond it. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
 
-### read() and snapshot()
-
-```ts
-const result = await lix.read(async (snapshot) => {
-  const branch = await snapshot.queryOne("SELECT commit_id FROM lix_branch WHERE id = lix_active_branch_id()");
-  const diff = await snapshot.query("SELECT * FROM lix_diff('lix_file')");
-  return { branch, diff };
-}, { signal? }?);
-
-const snapshot = await lix.snapshot();
-try {
-  // snapshot.query(), snapshot.queryOne(), snapshot.stream()
-} finally {
-  await snapshot.close();
-}
-```
-
-A snapshot pins one state: every read through it sees that state, even while other writes commit, and several streams may be open at once. `read(fn)` closes its snapshot when `fn` settles; `snapshot()` returns an owned snapshot for state that outlives one callback (`await using` works too). `close()` closes its streams and resolves once in-flight reads have released the state; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. Remote handles reject snapshots with `LIX_UNSUPPORTED_REMOTE_OPERATION`.
-
 ### execute()
 
 ```ts

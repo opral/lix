@@ -421,11 +421,11 @@ pub(super) fn rows_affected_to_js(rows_affected: u64) -> Result<JsValue, JsValue
 /// released the state.
 #[wasm_bindgen]
 pub struct WasmReadSnapshot {
-    inner: lix::Snapshot,
+    inner: lix::internal::Snapshot,
 }
 
 impl WasmReadSnapshot {
-    pub(crate) fn new(inner: lix::Snapshot) -> Self {
+    pub(crate) fn new(inner: lix::internal::Snapshot) -> Self {
         Self { inner }
     }
 }

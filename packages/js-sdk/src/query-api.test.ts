@@ -47,15 +47,11 @@ test("query returns rows, never writes, and caps buffered bytes", async () => {
 	}
 });
 
-test("snapshots and transactions apply maxBytes", async () => {
+test("transactions apply maxBytes", async () => {
 	const lix = await seeded(50);
 	const sql = "SELECT id, label FROM api_item";
 	const tooLarge = { code: "LIX_ERROR_RESULT_TOO_LARGE" };
 	try {
-		await lix.read(async (snapshot) => {
-			await expect(snapshot.query(sql, [], { maxBytes: 128 })).rejects.toMatchObject(tooLarge);
-			expect(await snapshot.query(sql, [], { maxBytes: Infinity })).toHaveLength(50);
-		});
 		await lix.transaction(async (tx) => {
 			await expect(tx.query(sql, [], { maxBytes: 128 })).rejects.toMatchObject(tooLarge);
 			expect(await tx.query(sql, [], { maxBytes: Infinity })).toHaveLength(50);
@@ -201,53 +197,6 @@ test("duplicate result column names throw on object rows", async () => {
 	}
 });
 
-test("a snapshot reads one state across writes and closes its streams", async () => {
-	const lix = await seeded();
-	try {
-		const snapshot = await lix.snapshot();
-		await lix.execute("INSERT INTO api_item (id, label) VALUES (50, 'later')");
-		const count = "SELECT count(*) AS n FROM api_item";
-		expect(await snapshot.queryOne(count)).toEqual({ n: 3 });
-		expect(await lix.queryOne(count)).toEqual({ n: 4 });
-		const rows = await snapshot.stream("SELECT id FROM api_item ORDER BY id");
-		const second = await snapshot.stream("SELECT id FROM api_item ORDER BY id DESC");
-		expect((await second.pages().next()).value).toEqual([{ id: 2 }, { id: 1 }, { id: 0 }]);
-		await snapshot.close();
-		await expect(rows.pages().next()).rejects.toMatchObject({
-			code: "LIX_ERROR_SNAPSHOT_CLOSED",
-		});
-		await expect(snapshot.query(count)).rejects.toMatchObject({
-			code: "LIX_ERROR_SNAPSHOT_CLOSED",
-		});
-	} finally {
-		await lix.close();
-	}
-});
-
-test("read() scopes a snapshot to its callback", async () => {
-	const lix = await seeded();
-	try {
-		let kept: { query(sql: string): Promise<unknown> } | undefined;
-		const counts = await lix.read(async (snapshot) => {
-			kept = snapshot;
-			const before = await snapshot.queryOne<{ n: number }>(
-				"SELECT count(*) AS n FROM api_item",
-			);
-			await lix.execute("INSERT INTO api_item (id, label) VALUES (60, 'x')");
-			const after = await snapshot.queryOne<{ n: number }>(
-				"SELECT count(*) AS n FROM api_item",
-			);
-			return [before!.n, after!.n];
-		});
-		expect(counts).toEqual([3, 3]);
-		await expect(kept!.query("SELECT 1")).rejects.toMatchObject({
-			code: "LIX_ERROR_SNAPSHOT_CLOSED",
-		});
-	} finally {
-		await lix.close();
-	}
-});
-
 test("transactions read their own writes and executeMany is all-or-nothing", async () => {
 	const lix = await seeded();
 	try {
@@ -322,15 +271,9 @@ test("reads reject multi-statement SQL", async () => {
 	}
 });
 
-test("concurrent snapshot and stream releases are never refused for backpressure", async () => {
+test("concurrent stream releases are never refused for backpressure", async () => {
 	const lix = await openLix();
 	try {
-		const reads = await Promise.allSettled(
-			Array.from({ length: 40 }, () =>
-				lix.read((snapshot) => snapshot.queryOne("SELECT 1 AS n")),
-			),
-		);
-		expect(reads.filter((read) => read.status === "rejected")).toEqual([]);
 		const streams = await Promise.allSettled(
 			Array.from({ length: 40 }, async () => {
 				for await (const row of await lix.stream(

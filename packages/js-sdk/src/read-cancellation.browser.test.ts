@@ -32,16 +32,6 @@ test("aborting a read in the browser worker stops its engine work", async () => 
 		await expect(within(3_000, reading)).rejects.toThrow("stop reading");
 		expect(await within(3_000, lix.queryOne("SELECT 1 AS n"))).toEqual({ n: 1 });
 
-		const snapshot = await lix.snapshot();
-		const pinned = snapshot.query(LONG_READ);
-		// Settles while close() is awaited; observed below.
-		pinned.catch(() => undefined);
-		await started();
-		await within(3_000, snapshot.close());
-		await expect(within(3_000, pinned)).rejects.toMatchObject({
-			code: "LIX_ERROR_SNAPSHOT_CLOSED",
-		});
-		expect(await within(3_000, lix.queryOne("SELECT 2 AS n"))).toEqual({ n: 2 });
 	} finally {
 		await lix.close();
 	}

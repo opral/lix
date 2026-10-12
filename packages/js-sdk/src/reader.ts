@@ -5,7 +5,6 @@ import type {
 	BindingParam,
 	BindingReadOptions,
 	QueryStreamBinding,
-	ReadSnapshotBinding,
 	ReaderBinding,
 } from "./binding-types.js";
 import { rowsOf } from "./result.js";
@@ -18,7 +17,6 @@ import type {
 	Reader,
 	Row,
 	RowStream,
-	Snapshot,
 	SqlParam,
 	StreamOptions,
 } from "./types.js";
@@ -40,10 +38,6 @@ function lixError(code: string, message: string, hint?: string): LixError {
 	error.code = code;
 	if (hint !== undefined) error.hint = hint;
 	return error;
-}
-
-export function snapshotClosedError(): LixError {
-	return lixError("LIX_ERROR_SNAPSHOT_CLOSED", "the snapshot is closed");
 }
 
 export function closedError(): LixError {
@@ -573,89 +567,6 @@ function assertUniqueColumns(columns: readonly string[]): void {
 			);
 		}
 		seen.add(column);
-	}
-}
-
-// A snapshot that is never closed still pins its state; release it.
-const snapshotFinalizer = new FinalizationRegistry<ReadSnapshotBinding>(
-	(binding) => void binding.close().catch(() => undefined),
-);
-
-/** A pinned state: every read through it sees the same state. */
-export class LixSnapshot implements Snapshot {
-	#closePromise: Promise<void> | undefined;
-	#closed = false;
-	readonly #closing = new AbortController();
-	readonly #streams = new WeakCollection<LixRowStream<object>>();
-	readonly #context: ReaderContext;
-
-	constructor(
-		private readonly binding: ReadSnapshotBinding,
-		private readonly onClose: () => void = () => undefined,
-	) {
-		snapshotFinalizer.register(this, binding, this);
-		this.#context = {
-			receiver: "snapshot",
-			run: (operation) =>
-				this.#closed ? Promise.reject(snapshotClosedError()) : operation(),
-			binding: () => this.binding,
-			adopt: (stream) => {
-				if (this.#closed) {
-					void stream.fail(snapshotClosedError()).catch(() => undefined);
-					throw snapshotClosedError();
-				}
-				stream.onClose(this.#streams.add(stream));
-				stream.retain(this);
-			},
-			signal: () => this.#closing.signal,
-		};
-	}
-
-	query<TRow extends object = Row>(
-		sql: string,
-		params?: readonly SqlParam[],
-		options?: QueryOptions,
-	): Promise<TRow[]> {
-		return query<TRow>(this.#context, sql, params, options);
-	}
-
-	queryOne<TRow extends object = Row>(
-		sql: string,
-		params?: readonly SqlParam[],
-		options?: CallOptions,
-	): Promise<TRow | undefined> {
-		return queryOne<TRow>(this.#context, sql, params, options);
-	}
-
-	stream<TRow extends object = Row>(
-		sql: string,
-		params?: readonly SqlParam[],
-		options?: StreamOptions,
-	): Promise<RowStream<TRow>> {
-		return stream<TRow>(this.#context, sql, params, options);
-	}
-
-	/** Idempotent. Closes its streams; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. */
-	close(): Promise<void> {
-		return (this.#closePromise ??= (async () => {
-			this.#closed = true;
-			// Stop reads in flight in the engine, so closing never waits on them.
-			this.#closing.abort(snapshotClosedError());
-			snapshotFinalizer.unregister(this);
-			const streams = this.#streams
-				.drain()
-				.map((stream) => stream.fail(snapshotClosedError()));
-			try {
-				await Promise.allSettled(streams);
-				await this.binding.close();
-			} finally {
-				this.onClose();
-			}
-		})());
-	}
-
-	[asyncDispose](): Promise<void> {
-		return this.close();
 	}
 }
 
