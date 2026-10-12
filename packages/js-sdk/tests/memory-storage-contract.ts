@@ -59,7 +59,8 @@ export function registerMemoryStorageContract({
 		});
 
 		test("round-trips values, blobs, and JSON and preserves structured errors", async () => {
-			const { openLix, Value } = await loadSdk();
+			const sdk = await loadSdk();
+			const { openLix, Value } = sdk;
 			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			try {
@@ -75,7 +76,9 @@ export function registerMemoryStorageContract({
 				});
 
 				const json = { nested: { ok: true }, items: [1, "two", null] };
-				const jsonResult = await lix.execute("SELECT $1 AS value", [json]);
+				const jsonResult = await lix.execute("SELECT $1 AS value", [
+					sdk.json(json),
+				]);
 				expect(jsonResult.rows[0]?.value).toEqual(json);
 				const returnedJson = jsonResult.rows[0]?.value as typeof json;
 				returnedJson.nested.ok = false;
@@ -263,139 +266,52 @@ export function registerMemoryStorageContract({
 			}
 		});
 
-		test("executes ordered atomic batches with per-statement parameters", async () => {
+		test("executeMany and transactions write atomically", async () => {
 			const { openLix } = await loadSdk();
 			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 
 			try {
-				const oneStatement = await lix.executeBatch([
-					{ sql: "SELECT $1 AS value", params: ["one statement"] },
-				]);
-				expect(oneStatement.results).toHaveLength(1);
-				expect(oneStatement.results[0]?.statementIndex).toBe(0);
-				expect(oneStatement.results[0]?.label).toBeUndefined();
-				expect(oneStatement.results[0]?.rows[0]?.value).toBe(
-					"one statement",
+				const inserted = await lix.executeMany(
+					"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+					Array.from({ length: 18 }, (_, index) => [
+						`many-${index}`,
+						String(index),
+					]),
 				);
-
-				const results = await lix.executeBatch([
-					{
-						label: "first",
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-a", "first"],
-					},
-					{
-						label: "first",
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-b", "second"],
-					},
-					{
-						sql: "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
-						params: ["batch-a", "batch-b"],
-					},
-				]);
-				expect(results.results).toHaveLength(3);
-				expect(results.results.map((result) => result.statementIndex)).toEqual([0, 1, 2]);
-				expect(results.results[0]?.label).toBe("first");
-				expect(results.results[1]?.label).toBe("first");
-				expect(results.results[2]?.label).toBeUndefined();
-				expect(results.results[0]?.rowsAffected).toBe(1);
-				expect(results.results[1]?.rowsAffected).toBe(1);
+				expect(inserted).toEqual({ rowsAffected: 18 });
 				expect(
-					results.results[2]?.rows.map((row) => row),
-				).toEqual([
-					{ key: "batch-a", value: "first" },
-					{ key: "batch-b", value: "second" },
-				]);
+					await lix.queryOne(
+						"SELECT count(*) AS n FROM lix_key_value WHERE key LIKE 'many-%'",
+					),
+				).toEqual({ n: 18 });
 
-				const eighteen = await lix.executeBatch(
-					Array.from({ length: 18 }, (_, index) => ({
-						label: `file-${index}`,
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: [`batch-eighteen-${index}`, String(index)],
-					})),
-				);
-				expect(eighteen.results.map((result) => result.statementIndex)).toEqual(
-					Array.from({ length: 18 }, (_, index) => index),
-				);
-				expect(eighteen.results.map((result) => result.label)).toEqual(
-					Array.from({ length: 18 }, (_, index) => `file-${index}`),
-				);
-
-				const omitted = await lix.executeBatch([
-					{
-						label: "intended-a",
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-omitted-a", "a"],
-					},
-					{
-						label: "intended-c",
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-omitted-c", "c"],
-					},
-				]);
-				expect(omitted.results.map((result) => result.label)).toEqual([
-					"intended-a",
-					"intended-c",
-				]);
-				expect(omitted.results.map((result) => result.statementIndex)).toEqual([0, 1]);
-
-				const returning = await lix.executeBatch([
-					{
-						label: "returning",
-						sql: "UPDATE lix_key_value SET value = $1 WHERE key = $2 RETURNING key, value",
-						params: ["updated", "batch-a"],
-					},
-				]);
-				expect(returning.results[0]?.statementIndex).toBe(0);
-				expect(returning.results[0]?.rowsAffected).toBe(1);
-				expect(returning.results[0]?.rows[0]).toEqual({
-					key: "batch-a",
-					value: "updated",
+				const { value: returning } = await lix.transaction(async (tx) => {
+					await tx.execute(
+						"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+						["tx-a", "first"],
+					);
+					return tx.execute(
+						"UPDATE lix_key_value SET value = $1 WHERE key = $2 RETURNING key, value",
+						["updated", "tx-a"],
+					);
 				});
-
-				const executeResult = await lix.execute("SELECT $1 AS value", [
-					"execute remains unchanged",
-				]);
-				expect(executeResult.rows[0]?.value).toBe(
-					"execute remains unchanged",
-				);
-
-				await expect(lix.executeBatch([])).rejects.toMatchObject({
-					name: "LixError",
-					code: "LIX_INVALID_ARGUMENT",
-					details: {
-						operation: "executeBatch",
-						argument: "statements",
-						expected: "non-empty array",
-						actual: "empty array",
-					},
-				});
+				expect(returning.rowsAffected).toBe(1);
+				expect(returning.rows[0]).toEqual({ key: "tx-a", value: "updated" });
 
 				await expect(
-					lix.executeBatch([
-						{
-							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-							params: ["batch-rolled-back", "before failure"],
-						},
-						{
-							sql: "SELECT id FROM lix_history('lix_file', 'one', 'two')",
-						},
-						{
-							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-							params: ["batch-not-run", "after failure"],
-						},
+					lix.transaction(async (tx) => {
+						await tx.execute(
+							"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+							["tx-rolled-back", "before failure"],
+						);
+						await tx.query("SELECT id FROM lix_history('lix_file', 'one', 'two')");
+					}),
+				).rejects.toMatchObject({ name: "LixError" });
+				expect(
+					await lix.query("SELECT key FROM lix_key_value WHERE key = $1", [
+						"tx-rolled-back",
 					]),
-				).rejects.toMatchObject({
-					name: "LixError",
-					code: "LIX_PARSE_ERROR",
-					details: { statementIndex: 1 },
-				});
-				const rolledBack = await lix.execute(
-					"SELECT key FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
-					["batch-rolled-back", "batch-not-run"],
-				);
-				expect(rolledBack.rows).toHaveLength(0);
+				).toHaveLength(0);
 			} finally {
 				await lix.close();
 			}
@@ -467,7 +383,7 @@ export function registerMemoryStorageContract({
 			await lix.close();
 		});
 
-		test("observe reports only the final committed batch state", async () => {
+		test("observe reports only the final committed executeMany state", async () => {
 			const { openLix } = await loadSdk();
 			const lix = await wait((openStorage ?? openLix)(), "open Lix");
 			const events = lix.observe(
@@ -487,16 +403,13 @@ export function registerMemoryStorageContract({
 				const updatePromise = events
 					.next()
 					.then((result) => (result.done ? undefined : result.value));
-				const batch = lix.executeBatch([
-					{
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-observe-a", "first"],
-					},
-					{
-						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-						params: ["batch-observe-b", "second"],
-					},
-				]);
+				const batch = lix.executeMany(
+					"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+					[
+						["batch-observe-a", "first"],
+						["batch-observe-b", "second"],
+					],
+				);
 				const update = await wait(updatePromise, "batch observation");
 				await wait(batch, "atomic batch");
 				expect(update?.sequence).toBe(1);

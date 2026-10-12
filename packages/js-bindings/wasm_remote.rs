@@ -347,6 +347,62 @@ impl WasmRemoteLix {
 
 #[wasm_bindgen]
 impl WasmRemoteLixTransaction {
+    #[wasm_bindgen(js_name = query)]
+    pub async fn query(
+        &mut self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let params = values_from_js(params)?;
+        let options = super::read_options_from_js(options)?;
+        let result =
+            crate::session::TransactionOperations::query(&mut self.inner, &sql, &params, options)
+                .await
+                .map_err(lix_error_to_js)?;
+        execute_result_to_js(result)
+    }
+
+    #[wasm_bindgen(js_name = stream)]
+    pub async fn stream(
+        &mut self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<super::WasmQueryStream, JsValue> {
+        let params = values_from_js(params)?;
+        let max_bytes = super::read_max_bytes_from_js(options)?;
+        let stream = crate::session::TransactionOperations::stream(
+            &mut self.inner,
+            &sql,
+            &params,
+            max_bytes,
+        )
+        .await
+        .map_err(lix_error_to_js)?;
+        Ok(super::WasmQueryStream::new(stream))
+    }
+
+    #[wasm_bindgen(js_name = executeMany)]
+    pub async fn execute_many(
+        &mut self,
+        sql: String,
+        param_sets: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let param_sets = super::param_sets_from_js(param_sets)?;
+        let options = super::session_execute_options_from_js(options)?;
+        let rows_affected = crate::session::TransactionOperations::execute_many(
+            &mut self.inner,
+            &sql,
+            param_sets,
+            options,
+        )
+        .await
+        .map_err(lix_error_to_js)?;
+        super::rows_affected_to_js(rows_affected)
+    }
+
     #[wasm_bindgen(js_name = execute)]
     pub async fn execute(
         &mut self,

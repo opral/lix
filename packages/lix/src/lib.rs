@@ -168,7 +168,8 @@ pub use handle::{
     OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder, RemoteLix,
     RemoteLixTransaction, RemoteObserveEvents, RemoteOpenAnotherSessionBuilder, RemoteOpenLixBuilder,
     ServerOptions, UnconfiguredOpenLixBuilder, open_lix,
-};pub use open_types::{
+};
+pub use open_types::{
     OpenMigration, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, OpenScope,
 };
 #[cfg(target_family = "wasm")]
@@ -202,9 +203,10 @@ pub use session::{
     MergeChangeStats, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{
-    ColumnIndex, CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult,
-    ObserveEvent, QueryResult, ResultRowRef, Row, RowStream, TryFromValue,
+    ColumnIndex, CommitReceipt, CommitSpan, ExecuteResult, ObserveEvent, QueryResult, ResultRowRef,
+    Row, RowStream, TryFromValue,
 };
+pub(crate) use session::{ExecuteBatchResult, ExecuteBatchStatement};
 pub use query::{Execute, ExecuteMany, Query, Snapshot};
 pub(crate) use session::{
     ExecuteIdempotency, ExecuteStatementMetadata, ExecutionDisposition, FileRead,

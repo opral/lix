@@ -13,11 +13,11 @@ use futures_util::future::{AbortHandle, Abortable};
 use js_sys::{Array, Function, Reflect};
 use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
-    BROWSER_TRANSPORT_CONFIG_HEADER, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOutcome, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
-    OpenProgressSink, OpenReport, OpenScope, ServerOptions, Value, open_lix,
-    register_browser_sync_transport, unregister_browser_sync_transport,
+    BROWSER_TRANSPORT_CONFIG_HEADER, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, Memory, MergeBranchOutcome,
+    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
+    OpenScope, ServerOptions, Value, open_lix, register_browser_sync_transport,
+    unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -257,6 +257,7 @@ impl Drop for WasmSnapshotExport {
 /// release the stream's read snapshot.
 #[wasm_bindgen]
 pub struct WasmQueryStream {
+    columns: Vec<String>,
     inner: RefCell<Option<lix::RowStream>>,
     finished: Cell<bool>,
     next_abort: RefCell<Option<AbortHandle>>,
@@ -265,6 +266,7 @@ pub struct WasmQueryStream {
 impl WasmQueryStream {
     pub(crate) fn new(stream: lix::RowStream) -> Self {
         Self {
+            columns: stream.columns().to_vec(),
             inner: RefCell::new(Some(stream)),
             finished: Cell::new(false),
             next_abort: RefCell::new(None),
@@ -274,6 +276,12 @@ impl WasmQueryStream {
 
 #[wasm_bindgen]
 impl WasmQueryStream {
+    /// The result's column names, known once the stream is open.
+    #[wasm_bindgen(getter)]
+    pub fn columns(&self) -> Vec<String> {
+        self.columns.clone()
+    }
+
     /// Resolves the next page (an execute result), or `undefined` once the
     /// stream is exhausted or cancelled.
     #[wasm_bindgen]
@@ -324,23 +332,97 @@ impl WasmQueryStream {
     }
 }
 
-pub(super) fn stream_page_bytes_from_js(
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOptionsDto {
+    max_bytes: Option<f64>,
+    #[serde(default)]
+    single: bool,
+}
+
+/// Reads `{ maxBytes, single }` from a buffered read's options.
+pub(super) fn read_options_from_js(
     options: Option<JsValue>,
-) -> Result<Option<usize>, JsValue> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct StreamOptionsDto {
-        page_bytes: Option<u64>,
-    }
+) -> Result<crate::session::ReadOptions, JsValue> {
     let Some(options) = options.filter(|value| !value.is_undefined() && !value.is_null()) else {
-        return Ok(None);
+        return Ok(crate::session::ReadOptions::default());
     };
-    let options: StreamOptionsDto = from_js(options)?;
-    // The engine validates the accepted range; saturate so oversized values
-    // reach that validation instead of wrapping.
-    Ok(options
-        .page_bytes
-        .map(|page_bytes| usize::try_from(page_bytes).unwrap_or(usize::MAX)))
+    let options: ReadOptionsDto = from_js(options)?;
+    Ok(crate::session::ReadOptions {
+        max_bytes: crate::session::max_bytes_option(options.max_bytes).map_err(lix_error_to_js)?,
+        single: options.single,
+    })
+}
+
+/// Reads `{ maxBytes }` from a stream's options.
+pub(super) fn read_max_bytes_from_js(options: Option<JsValue>) -> Result<Option<usize>, JsValue> {
+    Ok(read_options_from_js(options)?.max_bytes)
+}
+
+pub(super) fn rows_affected_to_js(rows_affected: u64) -> Result<JsValue, JsValue> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RowsAffectedDto {
+        rows_affected: f64,
+    }
+    to_js(&RowsAffectedDto {
+        rows_affected: js_number(rows_affected),
+    })
+}
+
+/// A pinned read state: every query and stream through it sees the same
+/// state. `close()` stops its streams and resolves once in-flight reads have
+/// released the state.
+#[wasm_bindgen]
+pub struct WasmReadSnapshot {
+    inner: lix::Snapshot,
+}
+
+impl WasmReadSnapshot {
+    pub(crate) fn new(inner: lix::Snapshot) -> Self {
+        Self { inner }
+    }
+}
+
+#[wasm_bindgen]
+impl WasmReadSnapshot {
+    #[wasm_bindgen(js_name = query)]
+    pub async fn query(
+        &self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let params = values_from_js(params)?;
+        let options = read_options_from_js(options)?;
+        let result = crate::session::run_query(self.inner.query(&sql).params(params), options)
+            .await
+            .map_err(lix_error_to_js)?;
+        execute_result_to_js(result)
+    }
+
+    #[wasm_bindgen(js_name = stream)]
+    pub async fn stream(
+        &self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<WasmQueryStream, JsValue> {
+        let params = values_from_js(params)?;
+        let max_bytes = read_max_bytes_from_js(options)?;
+        let mut query = self.inner.query(&sql).params(params);
+        if let Some(max_bytes) = max_bytes {
+            query = query.max_bytes(max_bytes);
+        }
+        Ok(WasmQueryStream::new(
+            query.stream().await.map_err(lix_error_to_js)?,
+        ))
+    }
+
+    #[wasm_bindgen(js_name = close)]
+    pub async fn close(&self) -> Result<(), JsValue> {
+        self.inner.close().await.map_err(lix_error_to_js)
+    }
 }
 
 enum WasmSnapshotInputMessage {
@@ -1161,6 +1243,62 @@ impl WasmLix {
 
 #[wasm_bindgen]
 impl WasmLixTransaction {
+    #[wasm_bindgen(js_name = query)]
+    pub async fn query(
+        &mut self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let params = values_from_js(params)?;
+        let options = read_options_from_js(options)?;
+        let result =
+            crate::session::TransactionOperations::query(&mut self.inner, &sql, &params, options)
+                .await
+                .map_err(lix_error_to_js)?;
+        execute_result_to_js(result)
+    }
+
+    #[wasm_bindgen(js_name = stream)]
+    pub async fn stream(
+        &mut self,
+        sql: String,
+        params: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<WasmQueryStream, JsValue> {
+        let params = values_from_js(params)?;
+        let max_bytes = read_max_bytes_from_js(options)?;
+        let stream = crate::session::TransactionOperations::stream(
+            &mut self.inner,
+            &sql,
+            &params,
+            max_bytes,
+        )
+        .await
+        .map_err(lix_error_to_js)?;
+        Ok(WasmQueryStream::new(stream))
+    }
+
+    #[wasm_bindgen(js_name = executeMany)]
+    pub async fn execute_many(
+        &mut self,
+        sql: String,
+        param_sets: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let param_sets = param_sets_from_js(param_sets)?;
+        let options = session_execute_options_from_js(options)?;
+        let rows_affected = crate::session::TransactionOperations::execute_many(
+            &mut self.inner,
+            &sql,
+            param_sets,
+            options,
+        )
+        .await
+        .map_err(lix_error_to_js)?;
+        rows_affected_to_js(rows_affected)
+    }
+
     #[wasm_bindgen(js_name = execute)]
     pub async fn execute(
         &mut self,
@@ -1313,11 +1451,22 @@ pub(super) struct OpenAnotherSessionOptionsDto {
     pub(super) account_id: Option<String>,
 }
 
-fn session_execute_options_from_js(
+pub(super) fn session_execute_options_from_js(
     options: Option<JsValue>,
 ) -> Result<crate::session::ExecuteOptions, JsValue> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MaxBytesDto {
+        max_bytes: Option<f64>,
+    }
     match options {
-        Some(value) if !value.is_null() && !value.is_undefined() => from_js(value),
+        Some(value) if !value.is_null() && !value.is_undefined() => {
+            let mut options: crate::session::ExecuteOptions = from_js(value.clone())?;
+            let limits: MaxBytesDto = from_js(value)?;
+            options.max_bytes =
+                crate::session::max_bytes_option(limits.max_bytes).map_err(lix_error_to_js)?;
+            Ok(options)
+        }
         _ => Ok(crate::session::ExecuteOptions::default()),
     }
 }
@@ -1597,45 +1746,14 @@ pub(super) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
         .map_err(lix_error_to_js)
 }
 
-pub(super) fn batch_statements_from_js(
-    value: JsValue,
-) -> Result<Vec<RsExecuteBatchStatement>, JsValue> {
+/// Reads `executeMany` parameter sets: an array of parameter arrays.
+pub(super) fn param_sets_from_js(value: JsValue) -> Result<Vec<Vec<Value>>, JsValue> {
     if !Array::is_array(&value) {
         return Err(lix_error_to_js(invalid_param(
-            "executeBatch statements must be an array",
+            "executeMany parameter sets must be an array of arrays",
         )));
     }
-    Array::from(&value)
-        .iter()
-        .enumerate()
-        .map(|(index, statement)| {
-            let sql = Reflect::get(&statement, &JsValue::from_str("sql"))
-                .ok()
-                .and_then(|value| value.as_string())
-                .ok_or_else(|| {
-                    lix_error_to_js(invalid_param(format!(
-                        "executeBatch statement at index {index} must include SQL text"
-                    )))
-                })?;
-            let params = Reflect::get(&statement, &JsValue::from_str("params"))?;
-            let params = if params.is_undefined() {
-                Vec::new()
-            } else {
-                values_from_js(params)?
-            };
-            let label = Reflect::get(&statement, &JsValue::from_str("label"))?;
-            let label = if label.is_undefined() {
-                None
-            } else {
-                Some(label.as_string().ok_or_else(|| {
-                    lix_error_to_js(invalid_param(format!(
-                        "executeBatch statement at index {index} label must be a string"
-                    )))
-                })?)
-            };
-            Ok(RsExecuteBatchStatement { sql, params, label })
-        })
-        .collect()
+    Array::from(&value).iter().map(values_from_js).collect()
 }
 
 impl TryFrom<LixValueDto> for Value {
@@ -2079,10 +2197,4 @@ pub async fn migrate_js_storage_repository(
     .await
     .map_err(lix_error_to_js)?;
     to_js(&report)
-}
-
-#[derive(Serialize)]
-pub(super) struct ExecuteBatchResultDto {
-    pub(super) results: Vec<ExecuteResultDto>,
-    pub(super) commit: Option<lix::CommitSpan>,
 }

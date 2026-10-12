@@ -14,9 +14,15 @@ const commitPolicy = {
 	"openSnapshot.finish": false,
 	openAnotherSession: false,
 	execute: true,
-	executeBatch: true,
+	executeMany: true,
+	query: false,
+	"readSnapshot.open": false,
+	"readSnapshot.close": false,
 	beginTransaction: false,
 	"transaction.execute": false,
+	"transaction.executeMany": false,
+	"transaction.query": false,
+	"transaction.stream": false,
 	"transaction.commit": true,
 	"transaction.rollback": false,
 	replicaRecoverySources: false,
@@ -38,7 +44,7 @@ const commitPolicy = {
 	"exportSnapshot.cancel": false,
 	stream: false,
 	"stream.next": false,
-	"stream.cancel": false,
+	"stream.close": false,
 	observe: false,
 	"observe.next": false,
 	"observe.close": false,
@@ -53,9 +59,19 @@ export function operationDeadline(
 ): number | undefined {
 	if (operation.kind === "observe.next") return undefined;
 	// One page may wait on a sort or aggregate over the whole input before its
-	// first row exists. Streams have no whole-operation deadline, and a pull is
-	// cancellable through `stream.cancel`, so a slow page must not be fatal.
-	if (operation.kind === "stream.next") return undefined;
+	// first row exists. Streams and snapshot reads have no whole-operation
+	// deadline and are closable (`stream.close`, `readSnapshot.close`), so a
+	// slow page or a slow read of a pinned state must not be fatal.
+	if (
+		operation.kind === "stream" ||
+		operation.kind === "stream.next" ||
+		operation.kind === "stream.close" ||
+		operation.kind === "transaction.stream" ||
+		operation.kind === "readSnapshot.open" ||
+		operation.kind === "readSnapshot.close" ||
+		(operation.kind === "query" && operation.readSnapshotId !== undefined)
+	)
+		return undefined;
 	if (operation.kind === "close") return 5_000;
 	if (operation.kind === "open") return 30_000;
 	return 60_000;

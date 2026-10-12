@@ -123,6 +123,7 @@ function normalizeNativeQueryStream(
 	stream: QueryStreamBinding,
 ): QueryStreamBinding {
 	return {
+		columns: stream.columns,
 		next: () => stream.next(),
 		cancel: () => stream.cancel(),
 	};

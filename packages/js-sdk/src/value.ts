@@ -73,6 +73,14 @@ export class Value {
 	}
 }
 
+/**
+ * Binds a JSON value as `jsonb`. Plain objects and arrays are not accepted as
+ * parameters on their own, so JSON is always explicit.
+ */
+export function json(value: JsonValue): Value {
+	return Value.jsonb(value);
+}
+
 export type NativeLixValue =
 	| Exclude<LixValue, { kind: "blob" }>
 	| { kind: "blob"; value?: null; blob: Uint8Array };
@@ -94,11 +102,9 @@ export function fromNativeValue(value: NativeLixValue): LixValue {
 	};
 }
 
-export function normalizeParam(
-	value: SqlParam,
-	index = 0,
-	seen = new WeakSet<object>(),
-): LixValue {
+export function normalizeParam(param: SqlParam, index = 0): LixValue {
+	// Runtime values come from untyped callers too; check them as `unknown`.
+	const value: unknown = param;
 	if (value instanceof Value) return fromNativeValue(value._toNative());
 	if (value === null) return { kind: "null", value: null };
 	if (typeof value === "boolean") return { kind: "boolean", value };
@@ -139,7 +145,11 @@ export function normalizeParam(
 	}
 	if (typeof value === "object" && value) {
 		if (value instanceof Date) {
-			throw invalidParam(index, "Date is not a valid SQL parameter", "Date");
+			throw invalidParam(
+				index,
+				"Date is not a valid SQL parameter; pass an ISO string or a number",
+				"Date",
+			);
 		}
 		if (ArrayBuffer.isView(value)) {
 			throw invalidParam(
@@ -148,8 +158,14 @@ export function normalizeParam(
 				value.constructor.name,
 			);
 		}
-		assertJsonSerializable(value, seen, index);
-		return { kind: "jsonb", value };
+		const actual = Array.isArray(value) ? "array" : "object";
+		const error = invalidParam(
+			index,
+			`${actual === "array" ? "an array" : "a plain object"} is not a valid SQL parameter; wrap JSON values with json(value)`,
+			actual,
+		);
+		error.hint = "Import { json } from '@lix-js/sdk' and pass json(value) to bind JSON.";
+		throw error;
 	}
 	throw invalidParam(
 		index,

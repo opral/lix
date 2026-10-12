@@ -12,6 +12,7 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 	QueryStreamBinding,
+	ReadSnapshotBinding,
 	SnapshotExportBinding,
 } from "../binding-types.js";
 import type {
@@ -25,6 +26,7 @@ import {
 	type WorkerInput,
 	type WorkerOperation,
 	type WorkerRequest,
+	type WorkerStreamOpened,
 	type WorkerSyncFetchRequest,
 	type WorkerSyncFetchResponse,
 	type WorkerSyncServerOptions,
@@ -84,6 +86,12 @@ export function startWorkerHost(
 	const queryStreams = new Map<
 		number,
 		{ binding: QueryStreamBinding; sessionId: number }
+	>();
+	let nextReadSnapshotId = 1;
+	// Read snapshots belong to one session too; closing it closes them.
+	const readSnapshots = new Map<
+		number,
+		{ binding: ReadSnapshotBinding; sessionId: number }
 	>();
 	const snapshotInputs = new Map<
 		number,
@@ -353,7 +361,7 @@ export function startWorkerHost(
 			message.operation.kind === "exportSnapshot.next" ||
 			message.operation.kind === "exportSnapshot.cancel" ||
 			message.operation.kind === "stream.next" ||
-			message.operation.kind === "stream.cancel"
+			message.operation.kind === "stream.close"
 		) {
 			if (message.operation.kind === "observe.next") {
 				const observeId = message.operation.observeId;
@@ -430,9 +438,9 @@ export function startWorkerHost(
 					undefined,
 					() => handleQueryStreamNext(streamId),
 				);
-			} else if (message.operation.kind === "stream.cancel") {
+			} else if (message.operation.kind === "stream.close") {
 				const streamId = message.operation.streamId;
-				void trackDirect(message, () => handleQueryStreamCancel(streamId));
+				void trackDirect(message, () => handleQueryStreamClose(streamId));
 			} else if (message.operation.kind === "exportSnapshot.next") {
 				const exportId = message.operation.exportId;
 				void scheduleLaneRequest(
@@ -445,6 +453,50 @@ export function startWorkerHost(
 				const exportId = message.operation.exportId;
 				void trackDirect(message, () => handleSnapshotCancel(exportId));
 			}
+			return;
+		}
+		if (message.operation.kind === "readSnapshot.close") {
+			const readSnapshotId = message.operation.readSnapshotId;
+			void trackDirect(message, () => handleReadSnapshotClose(readSnapshotId));
+			return;
+		}
+		if (
+			(message.operation.kind === "query" ||
+				message.operation.kind === "stream") &&
+			message.operation.readSnapshotId !== undefined
+		) {
+			// Reads of a pinned state run on the snapshot's own lane: they
+			// never wait behind the session's writes, and a slow read is not
+			// fatal.
+			const operation = message.operation;
+			const readSnapshotId = operation.readSnapshotId!;
+			void scheduleLaneRequest(
+				message,
+				`readSnapshot:${readSnapshotId}`,
+				undefined,
+				() => handleReadSnapshotRead(message.sessionId, readSnapshotId, operation),
+			);
+			return;
+		}
+		if (message.operation.kind === "stream") {
+			// Opening plans the statement and buffers its first page. It runs on
+			// its own lane so a slow first page never holds the session lane.
+			const operation = message.operation;
+			const sessionId = message.sessionId;
+			void scheduleLaneRequest(
+				message,
+				`stream.open:${message.id}`,
+				undefined,
+				async () =>
+					registerQueryStream(
+						sessionId,
+						await requiredLix(sessionId).stream(
+							operation.sql,
+							operation.params,
+							operation.options,
+						),
+					),
+			);
 			return;
 		}
 		if (message.operation.kind === "observe") {
@@ -795,11 +847,30 @@ export function startWorkerHost(
 					operation.params,
 					operation.options,
 				);
-			case "executeBatch":
-				return requiredLix(sessionId).executeBatch(
-					operation.statements,
+			case "executeMany":
+				return requiredLix(sessionId).executeMany(
+					operation.sql,
+					operation.paramSets,
 					operation.options,
 				);
+			case "query":
+				return requiredLix(sessionId).query(
+					operation.sql,
+					operation.params,
+					operation.options,
+				);
+			case "readSnapshot.open": {
+				const binding = await requiredLix(sessionId).snapshot();
+				if (!isSessionLive(sessionId)) {
+					await binding.close().catch(() => undefined);
+					throw workerStateError("Lix session is closing");
+				}
+				const readSnapshotId = nextReadSnapshotId++;
+				readSnapshots.set(readSnapshotId, { binding, sessionId });
+				return readSnapshotId;
+			}
+			case "readSnapshot.close":
+				throw workerStateError("snapshot close bypasses the finite operation queue");
 			case "beginTransaction": {
 				const binding = await requiredLix(sessionId).beginTransaction();
 				const transactionId = nextTransactionId++;
@@ -816,6 +887,26 @@ export function startWorkerHost(
 					operation.sql,
 					operation.params,
 					operation.options,
+				);
+			case "transaction.executeMany":
+				return requiredTransaction(
+					operation.transactionId,
+					sessionId,
+				).binding.executeMany(operation.sql, operation.paramSets, operation.options);
+			case "transaction.query":
+				return requiredTransaction(operation.transactionId, sessionId).binding.query(
+					operation.sql,
+					operation.params,
+					operation.options,
+				);
+			case "transaction.stream":
+				return registerQueryStream(
+					sessionId,
+					await requiredTransaction(operation.transactionId, sessionId).binding.stream(
+						operation.sql,
+						operation.params,
+						operation.options,
+					),
 				);
 			case "transaction.commit": {
 				const transaction = requiredTransaction(operation.transactionId, sessionId, true);
@@ -893,25 +984,13 @@ export function startWorkerHost(
 				snapshotExports.set(exportId, snapshot);
 				return exportId;
 			}
-			case "stream": {
-				const stream = await requiredLix(sessionId).stream(
-					operation.sql,
-					operation.params,
-					operation.options,
-				);
-				if (!isSessionLive(sessionId)) {
-					await Promise.resolve(stream.cancel()).catch(() => undefined);
-					throw workerStateError("Lix session is closing");
-				}
-				const streamId = nextQueryStreamId++;
-				queryStreams.set(streamId, { binding: stream, sessionId });
-				return streamId;
-			}
+			case "stream":
+				throw workerStateError("stream open uses its own lane");
 			case "stream.next":
 				throw workerStateError("stream pulls bypass the finite operation queue");
-			case "stream.cancel":
+			case "stream.close":
 				throw workerStateError(
-					"stream cancellation bypasses the finite operation queue",
+					"stream close bypasses the finite operation queue",
 				);
 			case "exportSnapshot.next":
 				throw workerStateError(
@@ -941,6 +1020,7 @@ export function startWorkerHost(
 					}
 					await closeObservationsForSession(sessionId);
 					await cancelQueryStreams(sessionId);
+					await closeReadSnapshots(sessionId);
 					await openLix.close();
 					sessions.delete(sessionId);
 					sessionLifetimes.delete(sessionId);
@@ -974,10 +1054,86 @@ export function startWorkerHost(
 		}
 	}
 
-	async function handleQueryStreamCancel(streamId: number): Promise<void> {
+	/**
+	 * Takes ownership of an opened stream and answers with its first page, so
+	 * opening costs one round trip. A stream that ended within that page is
+	 * released at once and never registered.
+	 */
+	async function registerQueryStream(
+		sessionId: number,
+		stream: QueryStreamBinding,
+	): Promise<WorkerStreamOpened> {
+		let page: Awaited<ReturnType<QueryStreamBinding["next"]>>;
+		try {
+			if (!isSessionLive(sessionId)) throw workerStateError("Lix session is closing");
+			page = await stream.next();
+		} catch (error) {
+			await Promise.resolve(stream.cancel()).catch(() => undefined);
+			throw error;
+		}
+		const columns = [...stream.columns];
+		if (page == null) {
+			await Promise.resolve(stream.cancel()).catch(() => undefined);
+			return { streamId: 0, columns, page: null };
+		}
+		if (!isSessionLive(sessionId)) {
+			await Promise.resolve(stream.cancel()).catch(() => undefined);
+			throw workerStateError("Lix session is closing");
+		}
+		const streamId = nextQueryStreamId++;
+		queryStreams.set(streamId, { binding: stream, sessionId });
+		return { streamId, columns, page };
+	}
+
+	/** Resolves once the engine has stopped and the stream's state is released. */
+	async function handleQueryStreamClose(streamId: number): Promise<void> {
 		const stream = queryStreams.get(streamId);
 		queryStreams.delete(streamId);
 		if (stream) await stream.binding.cancel();
+	}
+
+	async function handleReadSnapshotRead(
+		sessionId: number,
+		readSnapshotId: number,
+		operation: Extract<WorkerOperation, { kind: "query" | "stream" }>,
+	): Promise<unknown> {
+		const snapshot = readSnapshots.get(readSnapshotId);
+		if (!snapshot || snapshot.sessionId !== sessionId) {
+			const error = workerStateError("the snapshot is closed");
+			error.code = "LIX_SNAPSHOT_CLOSED";
+			throw error;
+		}
+		if (operation.kind === "query")
+			return snapshot.binding.query(operation.sql, operation.params, operation.options);
+		return registerQueryStream(
+			sessionId,
+			await snapshot.binding.stream(operation.sql, operation.params, operation.options),
+		);
+	}
+
+	/** Resolves once the snapshot's in-flight reads have released its state. */
+	async function handleReadSnapshotClose(readSnapshotId: number): Promise<void> {
+		const snapshot = readSnapshots.get(readSnapshotId);
+		readSnapshots.delete(readSnapshotId);
+		if (snapshot) await snapshot.binding.close();
+	}
+
+	/** Closes the read snapshots of one session, or of every session. */
+	async function closeReadSnapshots(sessionId?: number): Promise<void> {
+		const closed: Promise<void>[] = [];
+		const lanes = new Set<string>();
+		for (const [readSnapshotId, snapshot] of readSnapshots) {
+			if (sessionId !== undefined && snapshot.sessionId !== sessionId) continue;
+			readSnapshots.delete(readSnapshotId);
+			lanes.add(`readSnapshot:${readSnapshotId}`);
+			closed.push(Promise.resolve().then(() => snapshot.binding.close()));
+		}
+		operationScheduler.cancelQueued(
+			schedulerScope,
+			workerStateError("Lix session is closing"),
+			(work) => lanes.has(work.lane),
+		);
+		await Promise.allSettled(closed);
 	}
 
 	/** Cancels the streams of one session, or of every session. */
@@ -1124,6 +1280,7 @@ export function startWorkerHost(
           }
           snapshotExports.clear();
           await capture(() => cancelQueryStreams());
+          await capture(() => closeReadSnapshots());
           await capture(() => operationScheduler.drainScope(schedulerScope));
 		  await Promise.allSettled([
 		    ...registrations,

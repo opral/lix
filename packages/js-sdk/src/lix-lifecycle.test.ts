@@ -388,14 +388,11 @@ test.each(["commit", "rollback"] as const)(
 	},
 );
 
-test("batch and explicit transaction receipts survive the public boundary", async () => {
+test("execute and explicit transaction receipts survive the public boundary", async () => {
 	const span = { before: "before", after: "after" };
 	const statement = { columns: [], rows: [], rowsAffected: 1, notices: [] };
 	const binding = {
-		executeBatch: vi.fn(async () => ({
-			results: [{ ...statement, statementIndex: 0, commit: span }],
-			commit: span,
-		})),
+		execute: vi.fn(async () => ({ ...statement, commit: span })),
 		beginTransaction: vi.fn(async () => ({
 			execute: vi.fn(async () => statement),
 			commit: vi.fn(async () => ({ commit: span })),
@@ -403,12 +400,9 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
 	const lix = new Lix(binding);
-	const batch = await lix.executeBatch([
-		{ sql: "INSERT INTO example VALUES (1)" },
-	]);
-	expect(batch.commit).toEqual(span);
-	expect(batch.results).toHaveLength(1);
-	expect(batch.results[0]).not.toHaveProperty("commit");
+	const written = await lix.execute("INSERT INTO example VALUES (1)");
+	expect(written.commit).toEqual(span);
+	expect(written.rowsAffected).toBe(1);
 	const tx = await lix.beginTransaction();
 	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty(
 		"commit",

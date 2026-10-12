@@ -4,40 +4,49 @@ import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
-	QueryStreamBinding,
 } from "./binding-types.js";
+import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import {
-	normalizeOptionals,
-	wrapExecuteBatchResult,
-	wrapExecuteResult,
-} from "./result.js";
+	LixRowStream,
+	LixSnapshot,
+	closedError,
+	executeOptions,
+	nativeParamSets,
+	nativeParams,
+	query,
+	queryOne,
+	stream,
+	throwIfAborted,
+	withAbort,
+	type ReaderContext,
+} from "./reader.js";
 import { normalizeParam, toNativeValue } from "./value.js";
 import type {
+	CallOptions,
 	CreateBranchOptions,
 	CreateBranchReceipt,
+	ExecuteManyOptions,
 	ExecuteOptions,
 	ExecuteResult,
-	ExecuteBatchResult,
 	CommitReceipt,
 	StatementResult,
-	LixBatchOptions,
-	LixBatchStatement,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	ObserveEvent,
 	OpenAnotherSessionOptions,
-	QueryPage,
-	StreamOptions,
+	QueryOptions,
+	Reader,
 	LixOpenHostProfile,
 	LixOpenReport,
 	ReplicaRecoverySource,
 	ReplicaRecoveryExport,
 	ReplicaRecoveryReceipt,
+	Row,
+	RowStream,
+	Snapshot,
 	SqlParam,
-	ResultArrayRow,
-	ResultObjectRow,
-	ResultRow,
+	StreamOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
 	TransactionOptions,
@@ -55,10 +64,6 @@ const transactionFinalizer = new FinalizationRegistry<{
 });
 const observationFinalizer = new FinalizationRegistry<ObservationLifecycle>(
 	(lifecycle) => lifecycle.stop(),
-);
-// An abandoned, unexhausted stream still pins a read snapshot; release it.
-const queryStreamFinalizer = new FinalizationRegistry<QueryStreamLifecycle>(
-	(lifecycle) => void lifecycle.cancel().catch(() => undefined),
 );
 const hostedCreators = new WeakMap<
 	Lix,
@@ -100,7 +105,7 @@ function freezeHostProfile(profile: LixOpenHostProfile): LixOpenHostProfile {
 	});
 }
 
-export class Lix {
+export class Lix implements Reader {
 	readonly #openReport: LixOpenReport | undefined;
 	/** Immutable facts about this handle's successful opening. */
 	get openReport(): LixOpenReport {
@@ -117,7 +122,14 @@ export class Lix {
 	>();
 	readonly #observationDrains = new Set<Promise<void>>();
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
-	readonly #queryStreams = new Set<QueryStreamLifecycle>();
+	readonly #queryStreams = new Set<LixRowStream<object>>();
+	readonly #snapshots = new Set<LixSnapshot>();
+	readonly #reader: ReaderContext = {
+		receiver: "lix",
+		run: (operation) => this.#runOperation(operation),
+		binding: () => this.binding,
+		adopt: (stream) => this.#adoptStream(stream),
+	};
 	#nextObservationId = 0;
 	#transactionsOpening = 0;
 	#activeTransactions = 0;
@@ -167,72 +179,142 @@ export class Lix {
 		);
 	}
 
-	execute(
+	/**
+	 * Reads the latest committed state. Reads only: statements that write
+	 * reject with `LIX_ERROR_READ_ONLY`. The result is buffered and capped at
+	 * 64 MiB of row data (`maxBytes`); beyond it the call rejects with
+	 * `LIX_RESULT_TOO_LARGE`. Use `stream()` for large reads.
+	 */
+	query<TRow extends object = Row>(
 		sql: string,
-		params: SqlParam[] | undefined,
-		options: ExecuteOptions & { rowMode: "array" },
-	): Promise<ExecuteResult<ResultArrayRow>>;
-	execute<TRow extends object = ResultObjectRow>(
-		sql: string,
-		params?: SqlParam[],
-		options?: ExecuteOptions & { rowMode?: "object" },
-	): Promise<ExecuteResult<TRow>>;
-	execute(
-		sql: string,
-		params: SqlParam[] | undefined,
-		options?: ExecuteOptions,
-	): Promise<ExecuteResult<ResultRow>>;
-	async execute(
-		sql: string,
-		params: SqlParam[] = [],
-		options?: ExecuteOptions,
-	): Promise<ExecuteResult<ResultRow>> {
-		assertExecuteArgs("lix", sql, params, options);
-		const { rowMode = "object", ...bindingOptions } = options ?? {};
-		return this.#runOperation(async () =>
-			wrapExecuteResult(
-				await this.binding.execute(
-					sql,
-					params.map((param, index) =>
-						toNativeValue(normalizeParam(param, index)),
-					),
-					bindingOptions,
-				),
-				rowMode,
-			),
-		);
+		params?: readonly SqlParam[],
+		options?: QueryOptions,
+	): Promise<TRow[]> {
+		return query<TRow>(this.#reader, sql, params, options);
 	}
 
-	executeBatch(
-		statements: readonly LixBatchStatement[],
-		options: LixBatchOptions & { rowMode: "array" },
-	): Promise<ExecuteBatchResult<ResultArrayRow>>;
-	executeBatch(
-		statements: readonly LixBatchStatement[],
-		options?: LixBatchOptions & { rowMode?: "object" },
-	): Promise<ExecuteBatchResult<ResultObjectRow>>;
-	executeBatch(
-		statements: readonly LixBatchStatement[],
-		options?: LixBatchOptions,
-	): Promise<ExecuteBatchResult<ResultRow>>;
-	async executeBatch(
-		statements: readonly LixBatchStatement[],
-		options?: LixBatchOptions,
-	): Promise<ExecuteBatchResult<ResultRow>> {
-		const normalizedStatements = normalizeBatchStatements(statements, options);
-		const { rowMode = "object", ...bindingOptions } = options ?? {};
-		return this.#runOperation(async () => {
-			const results = await this.binding.executeBatch(
-				normalizedStatements,
-				bindingOptions,
+	/** At most one row: `undefined` when there is none; rejects `LIX_NOT_UNIQUE` when there are more. */
+	queryOne<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options?: CallOptions,
+	): Promise<TRow | undefined> {
+		return queryOne<TRow>(this.#reader, sql, params, options);
+	}
+
+	/**
+	 * Streams a read of the latest committed state with bounded memory. Resolves
+	 * once the statement is planned and its first page has arrived, so planning
+	 * errors reject here. No size cap and no deadline; the stream holds its
+	 * state until it ends or is closed (`close()`, `break`, `await using`,
+	 * aborting `signal`, or closing this Lix).
+	 */
+	stream<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options?: StreamOptions,
+	): Promise<RowStream<TRow>> {
+		return stream<TRow>(this.#reader, sql, params, options);
+	}
+
+	/**
+	 * Runs `fn` with a snapshot: every read in `fn` sees one state, and streams
+	 * may be open concurrently. The snapshot closes when `fn` settles. Aborting
+	 * `signal` closes it early; `fn`'s pending reads then reject.
+	 */
+	async read<R>(
+		fn: (snapshot: Snapshot) => Promise<R> | R,
+		options: CallOptions = {},
+	): Promise<R> {
+		if (typeof fn !== "function")
+			throw invalidArgument("read", "fn", "function", typeof fn);
+		const snapshot = await this.snapshot(options);
+		const abort = () => void snapshot.close().catch(() => undefined);
+		options.signal?.addEventListener("abort", abort, { once: true });
+		try {
+			const value = await fn(snapshot);
+			throwIfAborted(options.signal);
+			return value;
+		} catch (error) {
+			throwIfAborted(options.signal);
+			throw error;
+		} finally {
+			options.signal?.removeEventListener("abort", abort);
+			await snapshot.close();
+		}
+	}
+
+	/** Pins the current state for reads that outlive one callback. Close it when done. */
+	async snapshot(options: CallOptions = {}): Promise<Snapshot> {
+		throwIfAborted(options.signal);
+		const opening = this.#runOperation(() => this.binding.snapshot());
+		const binding = await withAbort(opening, options.signal).catch((error: unknown) => {
+			void opening.then(
+				(opened) => opened.close(),
+				() => undefined,
 			);
-			return {
-				results: results.results.map((result) =>
-					wrapExecuteBatchResult(result, rowMode),
-				),
-				commit: results.commit ?? null,
-			};
+			throw error;
 		});
+		const snapshot: LixSnapshot = new LixSnapshot(binding, () =>
+			this.#snapshots.delete(snapshot),
+		);
+		if (!this.#acceptingOperations) {
+			await snapshot.close();
+			throw closedError();
+		}
+		this.#snapshots.add(snapshot);
+		return snapshot;
+	}
+
+	/**
+	 * Runs any single statement: writes, DDL or reads. Resolves with the rows
+	 * (a read's result or `RETURNING` rows), `rowsAffected`, and the commit a
+	 * write published. Rows are buffered under the same 64 MiB cap as
+	 * `query()`. For reads, `query()` is the idiomatic form and never writes.
+	 */
+	async execute<TRow extends object = Row>(
+		sql: string,
+		params?: readonly SqlParam[],
+		options: ExecuteOptions = {},
+	): Promise<ExecuteResult<TRow>> {
+		assertSql("execute", "lix", sql);
+		const native = nativeParams("execute", "lix", params);
+		const bindingOptions = executeOptions("execute", "lix", options);
+		throwIfAborted(options.signal);
+		return wrapExecuteResult(
+			await this.#runOperation(() =>
+				this.binding.execute(sql, native, bindingOptions),
+			),
+		) as ExecuteResult<TRow>;
+	}
+
+	/**
+	 * Runs one statement once per parameter set, atomically and in one round
+	 * trip. Resolves with the total rows affected. The statement must not
+	 * return rows (no reads, no `RETURNING`).
+	 */
+	async executeMany(
+		sql: string,
+		paramSets: readonly (readonly SqlParam[])[],
+		options: ExecuteManyOptions = {},
+	): Promise<{ rowsAffected: number }> {
+		assertSql("executeMany", "lix", sql);
+		const native = nativeParamSets("lix", paramSets);
+		const bindingOptions = executeOptions("executeMany", "lix", options);
+		throwIfAborted(options.signal);
+		const { rowsAffected } = await this.#runOperation(() =>
+			this.binding.executeMany(sql, native, bindingOptions),
+		);
+		return { rowsAffected };
+	}
+
+	#adoptStream(stream: LixRowStream<object>): void {
+		if (!this.#acceptingOperations) {
+			void stream.fail(closedError());
+			return;
+		}
+		this.#queryStreams.add(stream);
+		stream.onClose(() => this.#queryStreams.delete(stream));
 	}
 
 	observe(
@@ -300,7 +382,8 @@ export class Lix {
 	 * never reruns). Any other error rolls back and rejects immediately.
 	 *
 	 * `fn` must not commit or roll back `tx` itself, and side effects outside
-	 * the transaction must tolerate a rerun.
+	 * the transaction must tolerate a rerun. Aborting `signal` always rolls
+	 * back: the call rejects with the signal's reason and never commits.
 	 */
 	async transaction<T>(
 		fn: (tx: LixTransaction) => Promise<T> | T,
@@ -318,14 +401,18 @@ export class Lix {
 				String(maxRetries),
 			);
 		}
+		const signal = options.signal;
 		for (let retries = 0; ; retries += 1) {
+			throwIfAborted(signal);
 			const tx = await this.beginTransaction();
 			try {
 				const value = await fn(tx);
+				throwIfAborted(signal);
 				const { commit } = await tx.commit();
 				return { value, commit, retries };
 			} catch (error) {
 				await tx.rollback().catch(() => undefined);
+				throwIfAborted(signal);
 				if (isTransactionConflict(error) && retries < maxRetries) continue;
 				if (isTransactionConflict(error))
 					annotateTransactionRetries(error, retries, maxRetries);
@@ -418,66 +505,6 @@ export class Lix {
 		options: CreateBranchOptions,
 	): Promise<CreateBranchReceipt> {
 		return this.#runOperation(() => this.binding.createBranch(options));
-	}
-
-	/**
-	 * Streams one read statement page by page from a single pinned snapshot.
-	 *
-	 * Unlike `execute()`, the result is not limited by the buffered read budget
-	 * (64 MiB / 1M rows) or the read deadline, so it suits bulk reads such as
-	 * loading a whole project. Each page holds at most `pageBytes` of row data.
-	 * The statement is planned on the first `next()`; writes are rejected.
-	 *
-	 * Breaking out of `for await`, calling `return()`, aborting `signal`, or
-	 * closing this Lix cancels the stream and releases its snapshot. A pull
-	 * after `close()` rejects with `LIX_ERROR_CLOSED`.
-	 */
-	stream(
-		sql: string,
-		params: SqlParam[] | undefined,
-		options: StreamOptions & { rowMode: "array" },
-	): AsyncIterableIterator<QueryPage<ResultArrayRow>>;
-	stream<TRow extends object = ResultObjectRow>(
-		sql: string,
-		params?: SqlParam[],
-		options?: StreamOptions & { rowMode?: "object" },
-	): AsyncIterableIterator<QueryPage<TRow>>;
-	stream(
-		sql: string,
-		params?: SqlParam[],
-		options?: StreamOptions,
-	): AsyncIterableIterator<QueryPage<ResultRow>>;
-	stream(
-		sql: string,
-		params: SqlParam[] = [],
-		options: StreamOptions = {},
-	): AsyncIterableIterator<QueryPage<ResultRow>> {
-		assertStreamArgs(sql, params, options);
-		this.#assertAcceptingOperations();
-		const { pageBytes, rowMode = "object", signal } = options;
-		const nativeParams = params.map((param, index) =>
-			toNativeValue(normalizeParam(param, index)),
-		);
-		const lifecycle = new QueryStreamLifecycle(
-			() =>
-				this.#runOperation(() =>
-					this.binding.stream(
-						sql,
-						nativeParams,
-						pageBytes === undefined ? undefined : { pageBytes },
-					),
-				),
-			rowMode,
-			() => {
-				this.#queryStreams.delete(lifecycle);
-				queryStreamFinalizer.unregister(lifecycle);
-			},
-			signal,
-		);
-		if (!signal?.aborted) this.#queryStreams.add(lifecycle);
-		const pages = new QueryPages<ResultRow>(lifecycle);
-		queryStreamFinalizer.register(pages, lifecycle, lifecycle);
-		return pages;
 	}
 
 	/** Streams this handle's state. Local partial replicas include their cached
@@ -627,12 +654,15 @@ export class Lix {
 			this.#observations.clear();
 			const observationDrains = [...this.#observationDrains];
 			const queryStreams = [...this.#queryStreams].map((stream) =>
-				stream.cancel(closedError()),
+				stream.fail(closedError()),
 			);
 			this.#queryStreams.clear();
+			const snapshots = [...this.#snapshots].map((snapshot) => snapshot.close());
+			this.#snapshots.clear();
 			this.closePromise = (async () => {
 				await Promise.allSettled(observationDrains);
 				await Promise.allSettled(queryStreams);
+				await Promise.allSettled(snapshots);
 				await Promise.allSettled(
 					[...this.#snapshotExports].map((snapshot) => snapshot.cancel()),
 				);
@@ -684,120 +714,6 @@ export class Lix {
 	#assertAcceptingOperations(): void {
 		if (this.#acceptingOperations) return;
 		throw closedError();
-	}
-}
-
-function closedError(): Error & { code: string } {
-	const error = new Error("Lix is closed") as Error & { code: string };
-	error.name = "LixError";
-	error.code = "LIX_ERROR_CLOSED";
-	return error;
-}
-
-class QueryPages<TRow extends object>
-	implements AsyncIterableIterator<QueryPage<TRow>>
-{
-	constructor(private readonly lifecycle: QueryStreamLifecycle) {}
-
-	[Symbol.asyncIterator](): AsyncIterableIterator<QueryPage<TRow>> {
-		return this;
-	}
-
-	next(): Promise<IteratorResult<QueryPage<TRow>>> {
-		return this.lifecycle.next() as Promise<IteratorResult<QueryPage<TRow>>>;
-	}
-
-	async return(): Promise<IteratorResult<QueryPage<TRow>>> {
-		await this.lifecycle.cancel();
-		return { done: true, value: undefined };
-	}
-}
-
-const STREAM_ENDED = Symbol("stream ended");
-
-/**
- * Pulls are serialized: a `next()` issued while another is pending waits for
- * it, so pages are always delivered in order. Cancelling settles a pending
- * pull at once, even if the binding has not answered yet, and releases the
- * engine stream.
- */
-class QueryStreamLifecycle {
-	#binding: Promise<QueryStreamBinding> | undefined;
-	#tail: Promise<unknown> = Promise.resolve();
-	#done = false;
-	#failure: unknown;
-	#cancelPromise: Promise<void> | undefined;
-	#ended!: () => void;
-	readonly #endedSignal = new Promise<typeof STREAM_ENDED>((resolve) => {
-		this.#ended = () => resolve(STREAM_ENDED);
-	});
-	readonly #abort = () =>
-		void this.cancel(this.signal?.reason).catch(() => undefined);
-
-	constructor(
-		private readonly open: () => Promise<QueryStreamBinding>,
-		private readonly rowMode: "object" | "array",
-		private readonly onFinish: () => void,
-		private readonly signal?: AbortSignal,
-	) {
-		if (signal?.aborted) {
-			this.#done = true;
-			this.#failure = signal.reason;
-			this.#ended();
-		} else signal?.addEventListener("abort", this.#abort, { once: true });
-	}
-
-	next(): Promise<IteratorResult<QueryPage<ResultRow>>> {
-		const pull = this.#tail.then(() => this.#pull());
-		this.#tail = pull.catch(() => undefined);
-		return pull;
-	}
-
-	async #pull(): Promise<IteratorResult<QueryPage<ResultRow>>> {
-		if (this.#done) return this.#end();
-		try {
-			this.#binding ??= this.open();
-			const binding = await Promise.race([this.#binding, this.#endedSignal]);
-			if (this.#done || binding === STREAM_ENDED) return this.#end();
-			const page = await Promise.race([binding.next(), this.#endedSignal]);
-			if (this.#done || page === STREAM_ENDED) return this.#end();
-			if (page == null) {
-				this.#finish();
-				return { done: true, value: undefined };
-			}
-			const result = wrapExecuteResult(page, this.rowMode);
-			return {
-				done: false,
-				value: { columns: result.columns, rows: result.rows },
-			};
-		} catch (error) {
-			if (this.#done) return this.#end();
-			await this.cancel().catch(() => undefined);
-			throw error;
-		}
-	}
-
-	#end(): IteratorResult<QueryPage<ResultRow>> {
-		if (this.#failure !== undefined) throw this.#failure;
-		return { done: true, value: undefined };
-	}
-
-	/** Ends the stream. With `failure`, pending and later pulls reject with it. */
-	cancel(failure?: unknown): Promise<void> {
-		if (!this.#done && failure !== undefined) this.#failure = failure;
-		this.#finish();
-		return (this.#cancelPromise ??= (async () => {
-			const binding = await this.#binding?.catch(() => undefined);
-			await binding?.cancel();
-		})());
-	}
-
-	#finish(): void {
-		if (this.#done) return;
-		this.#done = true;
-		this.#ended();
-		this.signal?.removeEventListener("abort", this.#abort);
-		this.onFinish();
 	}
 }
 
@@ -969,8 +885,14 @@ function annotateTransactionRetries(
 	}
 }
 
-export class LixTransaction {
+export class LixTransaction implements Reader {
 	private finished = false;
+	readonly #reader: ReaderContext = {
+		receiver: "lixTransaction",
+		run: (operation) => this.#run(operation),
+		binding: () => this.binding,
+		adopt: () => undefined,
+	};
 
 	constructor(
 		private readonly binding: LixTransactionBinding,
@@ -983,49 +905,75 @@ export class LixTransaction {
 		);
 	}
 
-	execute(
+	/** Reads the transaction's state, including its own writes. */
+	query<TRow extends object = Row>(
 		sql: string,
-		params: SqlParam[] | undefined,
-		options: ExecuteOptions & { rowMode: "array" },
-	): Promise<StatementResult<ResultArrayRow>>;
-	execute<TRow extends object = ResultObjectRow>(
+		params?: readonly SqlParam[],
+		options?: QueryOptions,
+	): Promise<TRow[]> {
+		return query<TRow>(this.#reader, sql, params, options);
+	}
+
+	queryOne<TRow extends object = Row>(
 		sql: string,
-		params?: SqlParam[],
-		options?: ExecuteOptions & { rowMode?: "object" },
-	): Promise<StatementResult<TRow>>;
-	execute(
+		params?: readonly SqlParam[],
+		options?: CallOptions,
+	): Promise<TRow | undefined> {
+		return queryOne<TRow>(this.#reader, sql, params, options);
+	}
+
+	/** Streams the transaction's state when it opens. The rows are buffered
+	 * before the first page, under `maxBytes` (default 64 MiB). */
+	stream<TRow extends object = Row>(
 		sql: string,
-		params: SqlParam[] | undefined,
-		options?: ExecuteOptions,
-	): Promise<StatementResult<ResultRow>>;
-	async execute(
+		params?: readonly SqlParam[],
+		options?: StreamOptions,
+	): Promise<RowStream<TRow>> {
+		return stream<TRow>(this.#reader, sql, params, options);
+	}
+
+	/** Runs any statement in this transaction. Writes become visible to others at `commit()`. */
+	async execute<TRow extends object = Row>(
 		sql: string,
-		params: SqlParam[] = [],
-		options?: ExecuteOptions,
-	): Promise<StatementResult<ResultRow>> {
-		if (this.finished) throw transactionClosedError();
-		assertExecuteArgs("lixTransaction", sql, params, options);
-		const { rowMode = "object", ...bindingOptions } = options ?? {};
+		params?: readonly SqlParam[],
+		options: ExecuteOptions = {},
+	): Promise<StatementResult<TRow>> {
+		assertSql("execute", "lixTransaction", sql);
+		const native = nativeParams("execute", "lixTransaction", params);
+		const bindingOptions = executeOptions("execute", "lixTransaction", options);
+		throwIfAborted(options.signal);
 		const { commit: _commit, ...statement } = wrapExecuteResult(
-			await this.binding
-				.execute(
-					sql,
-					params.map((param, index) =>
-						toNativeValue(normalizeParam(param, index)),
-					),
-					bindingOptions,
-				)
-				.catch((error: unknown) => {
-					if ((error as { code?: string })?.code === "LIX_TRANSACTION_LOST") {
-						this.finished = true;
-						transactionFinalizer.unregister(this);
-						this.onFinish();
-					}
-					throw error;
-				}),
-			rowMode,
+			await this.#run(() => this.binding.execute(sql, native, bindingOptions)),
 		);
-		return statement;
+		return statement as StatementResult<TRow>;
+	}
+
+	/** Stages one statement once per parameter set; all sets stage or none do. */
+	async executeMany(
+		sql: string,
+		paramSets: readonly (readonly SqlParam[])[],
+		options: ExecuteManyOptions = {},
+	): Promise<{ rowsAffected: number }> {
+		assertSql("executeMany", "lixTransaction", sql);
+		const native = nativeParamSets("lixTransaction", paramSets);
+		const bindingOptions = executeOptions("executeMany", "lixTransaction", options);
+		throwIfAborted(options.signal);
+		const { rowsAffected } = await this.#run(() =>
+			this.binding.executeMany(sql, native, bindingOptions),
+		);
+		return { rowsAffected };
+	}
+
+	async #run<T>(operation: () => Promise<T>): Promise<T> {
+		if (this.finished) throw transactionClosedError();
+		return operation().catch((error: unknown) => {
+			if ((error as { code?: string })?.code === "LIX_TRANSACTION_LOST") {
+				this.finished = true;
+				transactionFinalizer.unregister(this);
+				this.onFinish();
+			}
+			throw error;
+		});
 	}
 
 	async commit(): Promise<CommitReceipt> {
@@ -1067,114 +1015,6 @@ function transactionClosedError(): Error & { code: string } {
 	return error;
 }
 
-function assertExecuteArgs(
-	receiver: string,
-	sql: string,
-	params: SqlParam[],
-	options?: ExecuteOptions,
-) {
-	assertSqlArgs("execute", receiver, sql, params);
-	if (options === undefined) {
-		return;
-	}
-	if (!options || typeof options !== "object" || Array.isArray(options)) {
-		throw invalidArgument(
-			"execute",
-			"options",
-			"object",
-			typeof options,
-			receiver,
-		);
-	}
-	if (
-		options.maxAutoCommitRetries !== undefined &&
-		(!Number.isInteger(options.maxAutoCommitRetries) ||
-			options.maxAutoCommitRetries < 0 ||
-			options.maxAutoCommitRetries > 0xffff_ffff)
-	) {
-		throw invalidArgument(
-			"execute",
-			"options.maxAutoCommitRetries",
-			"integer between 0 and 4294967295",
-			typeof options.maxAutoCommitRetries,
-			receiver,
-		);
-	}
-	if (
-		options.originKey !== undefined &&
-		typeof options.originKey !== "string"
-	) {
-		throw invalidArgument(
-			"execute",
-			"options.originKey",
-			"string",
-			typeof options.originKey,
-			receiver,
-		);
-	}
-	if (
-		options.idempotencyKey !== undefined &&
-		typeof options.idempotencyKey !== "string"
-	) {
-		throw invalidArgument(
-			"execute",
-			"options.idempotencyKey",
-			"string",
-			typeof options.idempotencyKey,
-			receiver,
-		);
-	}
-	if (
-		options.rowMode !== undefined &&
-		options.rowMode !== "object" &&
-		options.rowMode !== "array"
-	) {
-		throw invalidArgument(
-			"execute",
-			"options.rowMode",
-			'"object" | "array"',
-			typeof options.rowMode,
-			receiver,
-		);
-	}
-}
-
-function assertStreamArgs(
-	sql: string,
-	params: SqlParam[],
-	options: StreamOptions,
-) {
-	assertSqlArgs("stream", "lix", sql, params);
-	if (!options || typeof options !== "object" || Array.isArray(options)) {
-		throw invalidArgument("stream", "options", "object", typeof options, "lix");
-	}
-	if (
-		options.pageBytes !== undefined &&
-		(!Number.isSafeInteger(options.pageBytes) || options.pageBytes < 1)
-	) {
-		throw invalidArgument(
-			"stream",
-			"options.pageBytes",
-			"positive integer",
-			typeof options.pageBytes,
-			"lix",
-		);
-	}
-	if (
-		options.rowMode !== undefined &&
-		options.rowMode !== "object" &&
-		options.rowMode !== "array"
-	) {
-		throw invalidArgument(
-			"stream",
-			"options.rowMode",
-			'"object" or "array"',
-			typeof options.rowMode,
-			"lix",
-		);
-	}
-}
-
 function assertSqlArgs(
 	operation: string,
 	receiver: string,
@@ -1195,150 +1035,7 @@ function assertSqlArgs(
 	}
 }
 
-function normalizeBatchStatements(
-	statements: readonly LixBatchStatement[],
-	options?: LixBatchOptions,
-) {
-	if (!Array.isArray(statements)) {
-		throw invalidArgument(
-			"executeBatch",
-			"statements",
-			"array",
-			typeof statements,
-		);
-	}
-	if (statements.length === 0) {
-		throw invalidArgument(
-			"executeBatch",
-			"statements",
-			"non-empty array",
-			"empty array",
-		);
-	}
-	assertBatchOptions(options);
-	return statements.map((statement, statementIndex) => {
-		try {
-			if (
-				!statement ||
-				typeof statement !== "object" ||
-				Array.isArray(statement)
-			) {
-				throw invalidArgument(
-					"executeBatch",
-					`statements[${statementIndex}]`,
-					"object",
-					Array.isArray(statement) ? "array" : typeof statement,
-				);
-			}
-			if (typeof statement.sql !== "string") {
-				throw invalidArgument(
-					"executeBatch",
-					`statements[${statementIndex}].sql`,
-					"string",
-					typeof statement.sql,
-				);
-			}
-			const params = statement.params ?? [];
-			if (!Array.isArray(params)) {
-				throw invalidArgument(
-					"executeBatch",
-					`statements[${statementIndex}].params`,
-					"array",
-					typeof params,
-				);
-			}
-			if (
-				statement.label !== undefined &&
-				typeof statement.label !== "string"
-			) {
-				throw invalidArgument(
-					"executeBatch",
-					`statements[${statementIndex}].label`,
-					"string",
-					typeof statement.label,
-				);
-			}
-			return {
-				sql: statement.sql,
-				params: params.map((param, parameterIndex) =>
-					toNativeValue(normalizeParam(param, parameterIndex)),
-				),
-				...(statement.label === undefined ? {} : { label: statement.label }),
-			};
-		} catch (error) {
-			throw withBatchStatementIndex(error, statementIndex);
-		}
-	});
-}
-
-function assertBatchOptions(options?: LixBatchOptions) {
-	if (options === undefined) return;
-	if (!options || typeof options !== "object" || Array.isArray(options)) {
-		throw invalidArgument("executeBatch", "options", "object", typeof options);
-	}
-	if (
-		options.maxAutoCommitRetries !== undefined &&
-		(!Number.isInteger(options.maxAutoCommitRetries) ||
-			options.maxAutoCommitRetries < 0 ||
-			options.maxAutoCommitRetries > 0xffff_ffff)
-	) {
-		throw invalidArgument(
-			"executeBatch",
-			"options.maxAutoCommitRetries",
-			"integer between 0 and 4294967295",
-			typeof options.maxAutoCommitRetries,
-		);
-	}
-	if (
-		options.originKey !== undefined &&
-		typeof options.originKey !== "string"
-	) {
-		throw invalidArgument(
-			"executeBatch",
-			"options.originKey",
-			"string",
-			typeof options.originKey,
-		);
-	}
-	if (
-		options.idempotencyKey !== undefined &&
-		typeof options.idempotencyKey !== "string"
-	) {
-		throw invalidArgument(
-			"executeBatch",
-			"options.idempotencyKey",
-			"string",
-			typeof options.idempotencyKey,
-		);
-	}
-	if (
-		options.rowMode !== undefined &&
-		options.rowMode !== "object" &&
-		options.rowMode !== "array"
-	) {
-		throw invalidArgument(
-			"lix.executeBatch",
-			"options.rowMode",
-			'"object" | "array"',
-			typeof options.rowMode,
-		);
-	}
-}
-
-function withBatchStatementIndex(
-	error: unknown,
-	statementIndex: number,
-): unknown {
-	if (!error || typeof error !== "object") return error;
-	const lixError = error as { details?: unknown };
-	const details = lixError.details;
-	lixError.details = {
-		...(details && typeof details === "object" && !Array.isArray(details)
-			? details
-			: details === undefined
-				? {}
-				: { cause: details }),
-		statementIndex,
-	};
-	return error;
+function assertSql(operation: string, receiver: string, sql: unknown): void {
+	if (typeof sql !== "string")
+		throw invalidArgument(operation, "sql", "string", typeof sql, receiver);
 }

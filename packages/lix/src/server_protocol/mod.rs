@@ -17,6 +17,9 @@ pub use handler::*;
 #[cfg(feature = "server-protocol-client")]
 pub mod client {
     pub use crate::authority_client::*;
+    /// The protocol's atomic statement batch, which serves remote
+    /// `execute_many`. Not part of the `Lix` API.
+    pub use crate::session::{ExecuteBatchResult, ExecuteBatchStatement};
 }
 
 #[cfg(feature = "server-protocol")]

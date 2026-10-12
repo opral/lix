@@ -4,7 +4,6 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteOptions,
-	LixBatchOptions,
 	MergeBranchOptions,
 	MergeBranchPreview,
 	MergeBranchReceipt,
@@ -53,15 +52,49 @@ export type BindingObserveEvent = {
 
 export type BindingParam = NativeLixValue;
 
-export type QueryStreamBindingOptions = {
-	/** Page size in public value bytes; the engine default applies when omitted. */
-	pageBytes?: number;
+/** Options of a buffered read or stream. */
+export type BindingReadOptions = {
+	/** Byte cap of a buffered result; `Infinity` opts out, omitted keeps 64 MiB. */
+	maxBytes?: number;
+	/** At most one row (`queryOne`): more reject `LIX_NOT_UNIQUE`; not byte-capped. */
+	single?: boolean;
 };
 
-/** One open read stream. `next()` resolves null/undefined once exhausted. */
+/** Options of `execute` and `executeMany`. */
+export type BindingExecuteOptions = Omit<ExecuteOptions, "maxBytes" | "signal"> & {
+	maxBytes?: number;
+};
+
+/**
+ * One open read stream. It opens with its first page buffered; `next()`
+ * resolves null/undefined once exhausted. `cancel()` resolves once the engine
+ * has stopped and the stream's read state is released.
+ */
 export type QueryStreamBinding = {
+	readonly columns: string[];
 	next(): Promise<BindingExecuteResult | null | undefined>;
 	cancel(): void | Promise<void>;
+};
+
+/** Reads of one state: the latest state per call, a snapshot, or a transaction. */
+export type ReaderBinding = {
+	query(
+		sql: string,
+		params: BindingParam[],
+		options?: BindingReadOptions,
+	): Promise<BindingExecuteResult>;
+	/** Resolves once the statement is planned and its first page has arrived. */
+	stream(
+		sql: string,
+		params: BindingParam[],
+		options?: BindingReadOptions,
+	): Promise<QueryStreamBinding>;
+};
+
+/** A pinned read state. `close()` stops its streams and resolves once
+ * in-flight reads have released the state. */
+export type ReadSnapshotBinding = ReaderBinding & {
+	close(): Promise<void>;
 };
 
 export type SnapshotExportBinding = {
@@ -76,13 +109,7 @@ export type SnapshotRestoreBinding<T> = {
 	cancel(): void | Promise<void>;
 };
 
-export type BindingBatchStatement = {
-	sql: string;
-	params: BindingParam[];
-	label?: string;
-};
-
-export type LixBinding = {
+export type LixBinding = ReaderBinding & {
 	createHosted?(
 		server: HostedServerBindingOptions,
 	): Promise<import("./types.js").HostedLix>;
@@ -95,23 +122,20 @@ export type LixBinding = {
 	execute(
 		sql: string,
 		params: BindingParam[],
-		options?: ExecuteOptions,
+		options?: BindingExecuteOptions,
 	): Promise<BindingExecuteResult>;
-	executeBatch(
-		statements: BindingBatchStatement[],
-		options?: LixBatchOptions,
-	): Promise<{ results: BindingExecuteResult[]; commit?: CommitSpan | null }>;
+	executeMany(
+		sql: string,
+		paramSets: BindingParam[][],
+		options?: BindingExecuteOptions,
+	): Promise<{ rowsAffected: number }>;
+	/** Pins the current state for several reads. */
+	snapshot(): Promise<ReadSnapshotBinding>;
 	observe(
 		sql: string,
 		params: BindingParam[],
 		options?: { signal?: AbortSignal },
 	): Promise<ObserveEventsBinding>;
-	/** Plans `sql` and pins its read snapshot; rows arrive through `next()`. */
-	stream(
-		sql: string,
-		params: BindingParam[],
-		options?: QueryStreamBindingOptions,
-	): Promise<QueryStreamBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
@@ -136,12 +160,17 @@ export type LixBinding = {
 	flushTelemetry?(): Promise<void>;
 };
 
-export type LixTransactionBinding = {
+export type LixTransactionBinding = ReaderBinding & {
 	execute(
 		sql: string,
 		params: BindingParam[],
-		options?: ExecuteOptions,
+		options?: BindingExecuteOptions,
 	): Promise<BindingExecuteResult>;
+	executeMany(
+		sql: string,
+		paramSets: BindingParam[][],
+		options?: BindingExecuteOptions,
+	): Promise<{ rowsAffected: number }>;
 	commit(): Promise<{ commit?: CommitSpan | null }>;
 	rollback(): Promise<void>;
 };

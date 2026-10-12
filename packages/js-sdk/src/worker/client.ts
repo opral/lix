@@ -21,6 +21,7 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 	QueryStreamBinding,
+	ReadSnapshotBinding,
 	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
@@ -38,6 +39,7 @@ import {
 	type WorkerNotification,
 	type WorkerOperation,
 	type WorkerResponse,
+	type WorkerStreamOpened,
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
@@ -74,7 +76,8 @@ function workerOperationCategory(
 	if (
 		operation.kind === "close" ||
 		operation.kind === "exportSnapshot.cancel" ||
-		operation.kind === "stream.cancel" ||
+		operation.kind === "stream.close" ||
+		operation.kind === "readSnapshot.close" ||
 		operation.kind === "transaction.commit" ||
 		operation.kind === "transaction.rollback" ||
 		operation.kind === "openSnapshot.finish"
@@ -388,9 +391,21 @@ function wrapTelemetryParentTransaction(
 	const prepareOperation = () =>
 		binding.setTelemetryParent(readTelemetryParent(parentContext));
 	return {
+		query: (sql, params, options) => {
+			prepareOperation();
+			return transaction.query(sql, params, options);
+		},
+		stream: (sql, params, options) => {
+			prepareOperation();
+			return transaction.stream(sql, params, options);
+		},
 		execute: (sql, params, options) => {
 			prepareOperation();
 			return transaction.execute(sql, params, options);
+		},
+		executeMany: (sql, paramSets, options) => {
+			prepareOperation();
+			return transaction.executeMany(sql, paramSets, options);
 		},
 		commit: () => {
 			prepareOperation();
@@ -486,10 +501,27 @@ export function workerBinding(
 			lease.retain();
 			return workerBinding(client, lease, openedSessionId);
 		},
+		query: (sql, params, options) =>
+			request({ kind: "query", sql, params, options }),
+		stream: async (sql, params, options) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>({
+					kind: "stream",
+					sql,
+					params,
+					options,
+				}),
+			),
+		snapshot: async () =>
+			workerReadSnapshotBinding(
+				request,
+				await request<number>({ kind: "readSnapshot.open" }),
+			),
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
-		executeBatch: (statements, options) =>
-			request({ kind: "executeBatch", statements, options }),
+		executeMany: (sql, paramSets, options) =>
+			request({ kind: "executeMany", sql, paramSets, options }),
 		observe: async (sql, params, options) => {
 			const initialParent = client.currentTelemetryParent();
 			const observeId = await request<number>(
@@ -503,15 +535,6 @@ export function workerBinding(
 				initialParent,
 				() => client.currentTelemetryParent(),
 			);
-		},
-		stream: async (sql, params, options) => {
-			const streamId = await request<number>({
-				kind: "stream",
-				sql,
-				params,
-				options,
-			});
-			return workerQueryStreamBinding(request, streamId);
 		},
 		beginTransaction: async () => {
 			const transactionId = await request<number>({
@@ -576,13 +599,23 @@ export function workerBinding(
 	};
 }
 
+/** The open response carries the first page, so the first pull is local. */
 function workerQueryStreamBinding(
 	request: RequestWorker,
-	streamId: number,
+	opened: WorkerStreamOpened,
 ): QueryStreamBinding {
-	let finished = false;
+	const { streamId, columns } = opened;
+	let firstPage: BindingExecuteResult | null | undefined = opened.page;
+	// A first page of null means the worker already ended and released it.
+	let finished = opened.page === null;
 	return {
+		columns,
 		next: async () => {
+			if (firstPage !== undefined) {
+				const page = firstPage;
+				firstPage = undefined;
+				if (page !== null) return page;
+			}
 			if (finished) return undefined;
 			const page = await request<BindingExecuteResult | undefined>({
 				kind: "stream.next",
@@ -592,10 +625,36 @@ function workerQueryStreamBinding(
 			return page;
 		},
 		cancel: async () => {
+			firstPage = undefined;
 			if (finished) return;
 			finished = true;
-			await request({ kind: "stream.cancel", streamId });
+			await request({ kind: "stream.close", streamId });
 		},
+	};
+}
+
+function workerReadSnapshotBinding(
+	request: RequestWorker,
+	readSnapshotId: number,
+): ReadSnapshotBinding {
+	return {
+		query: (sql, params, options) =>
+			request({ kind: "query", sql, params, options, readSnapshotId }),
+		stream: async (sql, params, options) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>({
+					kind: "stream",
+					sql,
+					params,
+					options,
+					readSnapshotId,
+				}),
+			),
+		close: () =>
+			request({ kind: "readSnapshot.close", readSnapshotId }).then(
+				() => undefined,
+			),
 	};
 }
 
@@ -604,6 +663,33 @@ function workerTransactionBinding(
 	transactionId: number,
 ): LixTransactionBinding {
 	return {
+		query: (sql, params, options) =>
+			request({
+				kind: "transaction.query",
+				transactionId,
+				sql,
+				params,
+				options,
+			}),
+		stream: async (sql, params, options) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>({
+					kind: "transaction.stream",
+					transactionId,
+					sql,
+					params,
+					options,
+				}),
+			),
+		executeMany: (sql, paramSets, options) =>
+			request({
+				kind: "transaction.executeMany",
+				transactionId,
+				sql,
+				paramSets,
+				options,
+			}),
 		execute: (sql, params, options) =>
 			request({
 				kind: "transaction.execute",

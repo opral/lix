@@ -1857,7 +1857,7 @@ test("worker teardown disables its session DELETE lane after owner detach fails"
   })).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
 });
 
-test("stream pulls use their own lane and session close cancels open streams", async () => {
+test("streams open with their first page, pull on their own lane, and close with the session", async () => {
 	const responses: WorkerResponse[] = [];
 	let receive!: (message: WorkerInput) => void;
 	const execute = deferred<void>();
@@ -1877,6 +1877,7 @@ test("stream pulls use their own lane and session close cancels open streams", a
 		},
 		async stream() {
 			const stream = {
+				columns: ["n"],
 				next: vi.fn(async () => page),
 				cancel: vi.fn(async () => {}),
 			};
@@ -1905,9 +1906,15 @@ test("stream pulls use their own lane and session close cancels open streams", a
 	receive({
 		id: 2,
 		sessionId: 0,
-		operation: { kind: "stream", sql: "SELECT n", params: [], options: { pageBytes: 64 } },
+		operation: { kind: "stream", sql: "SELECT n", params: [], options: { maxBytes: 64 } },
 	});
-	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({
+			id: 2,
+			ok: true,
+			value: { streamId: 1, columns: ["n"], page },
+		}),
+	);
 
 	// A write occupying the session lane does not hold up a pull.
 	receive({ id: 3, sessionId: 0, operation: { kind: "execute", sql: "UPDATE t", params: [] } });
@@ -1918,8 +1925,14 @@ test("stream pulls use their own lane and session close cancels open streams", a
 	await vi.waitFor(() => expect(responses.some((message) => "ok" in message && message.id === 3)).toBe(true));
 
 	receive({ id: 5, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
-	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: 2 }));
-	receive({ id: 6, sessionId: 0, operation: { kind: "stream.cancel", streamId: 2 } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual({
+			id: 5,
+			ok: true,
+			value: { streamId: 2, columns: ["n"], page },
+		}),
+	);
+	receive({ id: 6, sessionId: 0, operation: { kind: "stream.close", streamId: 2 } });
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 6, ok: true }));
 	expect(streams[1].cancel).toHaveBeenCalledOnce();
 

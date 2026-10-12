@@ -1,14 +1,13 @@
 import type { HttpResponsePolicy } from "../http-transport.js";
 import type {
-	BindingBatchStatement,
+	BindingExecuteOptions,
+	BindingExecuteResult,
 	BindingParam,
+	BindingReadOptions,
 	LixStorageConfig,
-	QueryStreamBindingOptions,
 } from "../binding-types.js";
 import type {
 	CreateBranchOptions,
-	ExecuteOptions,
-	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
 	LixTelemetryParentContext,
@@ -137,20 +136,52 @@ export type WorkerOperation =
 			kind: "execute";
 			sql: string;
 			params: BindingParam[];
-			options?: ExecuteOptions;
+			options?: BindingExecuteOptions;
 	  }
 	| {
-			kind: "executeBatch";
-			statements: BindingBatchStatement[];
-			options?: LixBatchOptions;
+			kind: "executeMany";
+			sql: string;
+			paramSets: BindingParam[][];
+			options?: BindingExecuteOptions;
 	  }
+	| {
+			/** A buffered read of the latest state, or of a read snapshot. */
+			kind: "query";
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
+			readSnapshotId?: number;
+	  }
+	| { kind: "readSnapshot.open" }
+	| { kind: "readSnapshot.close"; readSnapshotId: number }
 	| { kind: "beginTransaction" }
 	| {
 			kind: "transaction.execute";
 			transactionId: number;
 			sql: string;
 			params: BindingParam[];
-			options?: ExecuteOptions;
+			options?: BindingExecuteOptions;
+	  }
+	| {
+			kind: "transaction.executeMany";
+			transactionId: number;
+			sql: string;
+			paramSets: BindingParam[][];
+			options?: BindingExecuteOptions;
+	  }
+	| {
+			kind: "transaction.query";
+			transactionId: number;
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
+	  }
+	| {
+			kind: "transaction.stream";
+			transactionId: number;
+			sql: string;
+			params: BindingParam[];
+			options?: BindingReadOptions;
 	  }
 	| { kind: "transaction.commit"; transactionId: number }
 	| { kind: "transaction.rollback"; transactionId: number }
@@ -177,13 +208,15 @@ export type WorkerOperation =
 	| { kind: "exportSnapshot.next"; exportId: number }
 	| { kind: "exportSnapshot.cancel"; exportId: number }
 	| {
+			/** Opens a stream of the latest state, or of a read snapshot. */
 			kind: "stream";
 			sql: string;
 			params: BindingParam[];
-			options?: QueryStreamBindingOptions;
+			options?: BindingReadOptions;
+			readSnapshotId?: number;
 	  }
 	| { kind: "stream.next"; streamId: number }
-	| { kind: "stream.cancel"; streamId: number }
+	| { kind: "stream.close"; streamId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
 	| { kind: "observe.close"; observeId: number }
@@ -217,6 +250,17 @@ export type WorkerNotification =
 	  };
 
 export type WorkerInput = WorkerRequest | WorkerNotification;
+
+/**
+ * Opening a stream answers with its columns and first page in one round
+ * trip. `page` is null when the result ended within the first page; the
+ * stream is then already closed on the worker.
+ */
+export type WorkerStreamOpened = {
+	streamId: number;
+	columns: string[];
+	page: BindingExecuteResult | null;
+};
 
 export type WorkerConnection = {
 	postMessage(message: WorkerInput): void;

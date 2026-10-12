@@ -1,9 +1,8 @@
 use lix::telemetry::{CallbackTelemetrySink, SpanContext, TelemetrySink, instrument_remote_parent};
 use lix::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
-    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
     OpenProgressSink, OpenReport, OpenScope, ServerOptions,
@@ -110,13 +109,73 @@ pub struct NativeExecuteOptions {
     pub origin_key: Option<String>,
     #[napi(js_name = "maxAutoCommitRetries")]
     pub max_auto_commit_retries: Option<u32>,
+    #[napi(js_name = "maxBytes")]
+    pub max_bytes: Option<f64>,
+}
+
+impl NativeExecuteOptions {
+    fn into_session(
+        options: Option<Self>,
+    ) -> std::result::Result<crate::session::ExecuteOptions, LixError> {
+        let Some(options) = options else {
+            return Ok(crate::session::ExecuteOptions::default());
+        };
+        Ok(crate::session::ExecuteOptions {
+            origin_key: options.origin_key,
+            max_auto_commit_retries: options.max_auto_commit_retries,
+            max_bytes: crate::session::max_bytes_option(options.max_bytes)?,
+            ..Default::default()
+        })
+    }
+}
+
+/// Options of a read: `{ maxBytes, single }`.
+#[napi(object)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeReadOptions {
+    #[napi(js_name = "maxBytes")]
+    pub max_bytes: Option<f64>,
+    pub single: Option<bool>,
+}
+
+impl NativeReadOptions {
+    fn into_session(
+        options: Option<Self>,
+    ) -> std::result::Result<crate::session::ReadOptions, LixError> {
+        let options = options.unwrap_or_default();
+        Ok(crate::session::ReadOptions {
+            max_bytes: crate::session::max_bytes_option(options.max_bytes)?,
+            single: options.single.unwrap_or(false),
+        })
+    }
+
+    fn max_bytes(options: Option<Self>) -> std::result::Result<Option<usize>, LixError> {
+        Ok(Self::into_session(options)?.max_bytes)
+    }
 }
 
 #[napi(object)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeQueryStreamOptions {
-    #[napi(js_name = "pageBytes")]
-    pub page_bytes: Option<u32>,
+pub struct RowsAffectedDto {
+    #[napi(js_name = "rowsAffected")]
+    pub rows_affected: f64,
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the public JavaScript SDK represents row counts as numbers"
+)]
+fn rows_affected_dto(rows_affected: u64) -> RowsAffectedDto {
+    RowsAffectedDto {
+        rows_affected: rows_affected as f64,
+    }
+}
+
+fn params_from_native(params: Option<Vec<LixValue>>) -> std::result::Result<Vec<Value>, LixError> {
+    params
+        .unwrap_or_default()
+        .into_iter()
+        .map(Value::try_from)
+        .collect()
 }
 
 #[napi(object)]
@@ -227,14 +286,6 @@ fn open_phase_name(phase: OpenPhase) -> &'static str {
     }
 }
 
-#[napi(object)]
-#[expect(missing_debug_implementations)]
-pub struct NativeExecuteBatchStatement {
-    pub sql: String,
-    pub params: Option<Vec<LixValue>>,
-    pub label: Option<String>,
-}
-
 #[derive(Clone)]
 struct NativeLixActor {
     commands: Sender<QueuedLixCommand>,
@@ -293,7 +344,7 @@ type NativeResult<T> = std::result::Result<T, LixError>;
 type NativeResolver<T> = Box<dyn FnOnce(Env) -> Result<T> + Send>;
 type NativeDeferred<T> = JsDeferred<T, NativeResolver<T>>;
 type NativeExecuteDeferred = NativeDeferred<ExecuteResult>;
-type NativeExecuteBatchDeferred = NativeDeferred<ExecuteBatchResult>;
+type NativeRowsAffectedDeferred = NativeDeferred<RowsAffectedDto>;
 type NativeCommitDeferred = NativeDeferred<CommitReceipt>;
 type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeLixDeferred = NativeDeferred<NativeLix>;
@@ -324,11 +375,19 @@ enum LixCommand {
         options: crate::session::ExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
-    ExecuteBatch {
-        statements: Vec<RsExecuteBatchStatement>,
+    ExecuteMany {
+        sql: String,
+        param_sets: Vec<Vec<Value>>,
         options: crate::session::ExecuteOptions,
-        deferred: NativeExecuteBatchDeferred,
+        deferred: NativeRowsAffectedDeferred,
     },
+    Query {
+        sql: String,
+        params: Vec<Value>,
+        options: crate::session::ReadOptions,
+        deferred: NativeExecuteDeferred,
+    },
+    ReadSnapshot(NativeDeferred<NativeReadSnapshot>),
     BeginTransaction {
         transaction_id: u64,
         actor: NativeLixActor,
@@ -385,8 +444,29 @@ enum LixCommand {
     QueryStream {
         sql: String,
         params: Vec<Value>,
-        page_bytes: Option<usize>,
+        max_bytes: Option<usize>,
         deferred: NativeDeferred<NativeQueryStream>,
+    },
+    TransactionQuery {
+        transaction_id: u64,
+        sql: String,
+        params: Vec<Value>,
+        options: crate::session::ReadOptions,
+        deferred: NativeExecuteDeferred,
+    },
+    TransactionStream {
+        transaction_id: u64,
+        sql: String,
+        params: Vec<Value>,
+        max_bytes: Option<usize>,
+        deferred: NativeDeferred<NativeQueryStream>,
+    },
+    TransactionExecuteMany {
+        transaction_id: u64,
+        sql: String,
+        param_sets: Vec<Vec<Value>>,
+        options: crate::session::ExecuteOptions,
+        deferred: NativeRowsAffectedDeferred,
     },
     TransactionExecute {
         transaction_id: u64,
@@ -990,7 +1070,17 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             LixCommand::OpenAnotherSession { deferred, .. } => {
                 deferred.reject(to_napi_error(&error))
             }
-            LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::ExecuteMany { deferred, .. }
+            | LixCommand::TransactionExecuteMany { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
+            LixCommand::Query { deferred, .. } | LixCommand::TransactionQuery { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
+            LixCommand::ReadSnapshot(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::TransactionStream { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
+            }
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ReplicaRecoverySources { deferred, .. } => {
                 deferred.reject(to_napi_error(&error))
@@ -1068,13 +1158,34 @@ fn handle_lix_command(
             settle_deferred(deferred, result);
             None
         }
-        LixCommand::ExecuteBatch {
-            statements,
+        LixCommand::ExecuteMany {
+            sql,
+            param_sets,
             options,
             deferred,
         } => {
-            let result = block_on!(state.lix.execute_batch(&statements, options))
-                .and_then(ExecuteBatchResult::try_from);
+            let result =
+                block_on!(state.lix.execute_many(&sql, param_sets, options)).map(rows_affected_dto);
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::Query {
+            sql,
+            params,
+            options,
+            deferred,
+        } => {
+            let result = block_on!(state.lix.query(&sql, &params, options))
+                .and_then(ExecuteResult::try_from);
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::ReadSnapshot(deferred) => {
+            let result = block_on!(state.lix.read_snapshot()).and_then(|snapshot| {
+                NativeReadSnapshot::new(snapshot).map_err(|error| {
+                    LixError::unknown(format!("failed to start snapshot actor: {error}"))
+                })
+            });
             settle_deferred(deferred, result);
             None
         }
@@ -1239,18 +1350,65 @@ fn handle_lix_command(
         LixCommand::QueryStream {
             sql,
             params,
-            page_bytes,
+            max_bytes,
             deferred,
         } => {
             // Opening plans the statement and pins its snapshot on the actor;
             // pulls then run on the stream's own thread, so an open stream
             // never occupies the actor between pages.
             let result =
-                block_on!(state.lix.query_stream(&sql, &params, page_bytes)).and_then(|stream| {
-                    NativeQueryStream::new(stream).map_err(|error| {
-                        LixError::unknown(format!("failed to start query stream actor: {error}"))
-                    })
-                });
+                block_on!(state.lix.stream(&sql, &params, max_bytes)).and_then(start_query_stream);
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::TransactionQuery {
+            transaction_id,
+            sql,
+            params,
+            options,
+            deferred,
+        } => {
+            let result = state.transactions.get_mut(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| {
+                    block_on!(transaction.query(&sql, &params, options))
+                        .and_then(ExecuteResult::try_from)
+                },
+            );
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::TransactionStream {
+            transaction_id,
+            sql,
+            params,
+            max_bytes,
+            deferred,
+        } => {
+            let result = state.transactions.get_mut(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| {
+                    block_on!(transaction.stream(&sql, &params, max_bytes))
+                        .and_then(start_query_stream)
+                },
+            );
+            settle_deferred(deferred, result);
+            None
+        }
+        LixCommand::TransactionExecuteMany {
+            transaction_id,
+            sql,
+            param_sets,
+            options,
+            deferred,
+        } => {
+            let result = state.transactions.get_mut(&transaction_id).map_or_else(
+                || Err(transaction_closed_error()),
+                |transaction| {
+                    block_on!(transaction.execute_many(&sql, param_sets, options))
+                        .map(rows_affected_dto)
+                },
+            );
             settle_deferred(deferred, result);
             None
         }
@@ -1382,7 +1540,17 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::Execute { deferred, .. } | LixCommand::TransactionExecute { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::ExecuteBatch { deferred, .. } => {
+        LixCommand::ExecuteMany { deferred, .. }
+        | LixCommand::TransactionExecuteMany { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::Query { deferred, .. } | LixCommand::TransactionQuery { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::ReadSnapshot(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::TransactionStream { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
         LixCommand::BeginTransaction { deferred, .. } => {
@@ -1548,17 +1716,43 @@ impl NativeLixInner {
         }
     }
 
-    async fn execute_batch(
+    async fn execute_many(
         &self,
-        statements: &[RsExecuteBatchStatement],
+        sql: &str,
+        param_sets: Vec<Vec<Value>>,
         options: crate::session::ExecuteOptions,
-    ) -> std::result::Result<lix::ExecuteBatchResult, LixError> {
+    ) -> std::result::Result<u64, LixError> {
         match self {
             Self::Memory(lix) => {
-                crate::session::SessionOperations::execute_batch(lix, statements, options).await
+                crate::session::SessionOperations::execute_many(lix, sql, param_sets, options).await
             }
             Self::FilesystemStorage(lix, _, _) => {
-                crate::session::SessionOperations::execute_batch(lix, statements, options).await
+                crate::session::SessionOperations::execute_many(lix, sql, param_sets, options).await
+            }
+        }
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: crate::session::ReadOptions,
+    ) -> std::result::Result<RsExecuteResult, LixError> {
+        match self {
+            Self::Memory(lix) => {
+                crate::session::SessionOperations::query(lix, sql, params, options).await
+            }
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::query(lix, sql, params, options).await
+            }
+        }
+    }
+
+    async fn read_snapshot(&self) -> std::result::Result<lix::Snapshot, LixError> {
+        match self {
+            Self::Memory(lix) => crate::session::SessionOperations::read_snapshot(lix).await,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::read_snapshot(lix).await
             }
         }
     }
@@ -1589,18 +1783,18 @@ impl NativeLixInner {
         }
     }
 
-    async fn query_stream(
+    async fn stream(
         &self,
         sql: &str,
         params: &[Value],
-        page_bytes: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> std::result::Result<lix::RowStream, LixError> {
         match self {
             Self::Memory(lix) => {
-                crate::session::SessionOperations::query_stream(lix, sql, params, page_bytes).await
+                crate::session::SessionOperations::stream(lix, sql, params, max_bytes).await
             }
             Self::FilesystemStorage(lix, _, _) => {
-                crate::session::SessionOperations::query_stream(lix, sql, params, page_bytes).await
+                crate::session::SessionOperations::stream(lix, sql, params, max_bytes).await
             }
         }
     }
@@ -1767,6 +1961,70 @@ impl NativeLixInner {
 }
 
 impl NativeLixTransactionInner {
+    async fn query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        options: crate::session::ReadOptions,
+    ) -> std::result::Result<RsExecuteResult, LixError> {
+        match self {
+            Self::Memory(transaction) => {
+                crate::session::TransactionOperations::query(transaction, sql, params, options)
+                    .await
+            }
+            Self::FilesystemStorage(transaction) => {
+                crate::session::TransactionOperations::query(transaction, sql, params, options)
+                    .await
+            }
+        }
+    }
+
+    async fn stream(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        max_bytes: Option<usize>,
+    ) -> std::result::Result<lix::RowStream, LixError> {
+        match self {
+            Self::Memory(transaction) => {
+                crate::session::TransactionOperations::stream(transaction, sql, params, max_bytes)
+                    .await
+            }
+            Self::FilesystemStorage(transaction) => {
+                crate::session::TransactionOperations::stream(transaction, sql, params, max_bytes)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_many(
+        &mut self,
+        sql: &str,
+        param_sets: Vec<Vec<Value>>,
+        options: crate::session::ExecuteOptions,
+    ) -> std::result::Result<u64, LixError> {
+        match self {
+            Self::Memory(transaction) => {
+                crate::session::TransactionOperations::execute_many(
+                    transaction,
+                    sql,
+                    param_sets,
+                    options,
+                )
+                .await
+            }
+            Self::FilesystemStorage(transaction) => {
+                crate::session::TransactionOperations::execute_many(
+                    transaction,
+                    sql,
+                    param_sets,
+                    options,
+                )
+                .await
+            }
+        }
+    }
+
     async fn execute(
         &mut self,
         sql: &str,
@@ -2344,21 +2602,9 @@ impl NativeLix {
         params: Option<Vec<LixValue>>,
         options: Option<NativeExecuteOptions>,
     ) -> Result<Object<'env>> {
-        let params = match params {
-            Some(params) => params
-                .into_iter()
-                .map(Value::try_from)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(env, error))?,
-            None => Vec::new(),
-        };
-        let options = options
-            .map(|options| crate::session::ExecuteOptions {
-                origin_key: options.origin_key,
-                max_auto_commit_retries: options.max_auto_commit_retries,
-                ..Default::default()
-            })
-            .unwrap_or_default();
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeExecuteOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::Execute {
@@ -2370,45 +2616,64 @@ impl NativeLix {
         Ok(promise)
     }
 
-    #[napi(js_name = "executeBatch")]
-    pub fn execute_batch<'env>(
+    /// Runs one statement once per parameter set, atomically.
+    #[napi(js_name = "executeMany")]
+    pub fn execute_many<'env>(
         &self,
         env: &'env Env,
-        statements: Vec<NativeExecuteBatchStatement>,
+        sql: String,
+        param_sets: Vec<Vec<LixValue>>,
         options: Option<NativeExecuteOptions>,
     ) -> Result<Object<'env>> {
-        let statements = statements
+        let param_sets = param_sets
             .into_iter()
-            .map(|statement| {
-                let params = statement
-                    .params
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(Value::try_from)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(RsExecuteBatchStatement {
-                    sql: statement.sql,
-                    params,
-                    label: statement.label,
-                })
-            })
-            .collect::<std::result::Result<Vec<_>, LixError>>()
+            .map(|params| params_from_native(Some(params)))
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| throw_lix_error(env, error))?;
-        let options = options
-            .map(|options| crate::session::ExecuteOptions {
-                origin_key: options.origin_key,
-                max_auto_commit_retries: options.max_auto_commit_retries,
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        let (deferred, promise): (NativeExecuteBatchDeferred, Object<'env>) =
+        let options = NativeExecuteOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeRowsAffectedDeferred, Object<'env>) =
             env.create_deferred()?;
         self.actor
-            .send_with_deferred(deferred, |deferred| LixCommand::ExecuteBatch {
-                statements,
+            .send_with_deferred(deferred, |deferred| LixCommand::ExecuteMany {
+                sql,
+                param_sets,
                 options,
                 deferred,
             });
+        Ok(promise)
+    }
+
+    /// A buffered read of the latest committed state; writes reject.
+    #[napi]
+    pub fn query<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeReadOptions>,
+    ) -> Result<Object<'env>> {
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeReadOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::Query {
+                sql,
+                params,
+                options,
+                deferred,
+            });
+        Ok(promise)
+    }
+
+    /// Pins the current state for several reads.
+    #[napi]
+    pub fn snapshot<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<NativeReadSnapshot>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::ReadSnapshot);
         Ok(promise)
     }
 
@@ -2439,34 +2704,26 @@ impl NativeLix {
         Ok(promise)
     }
 
-    /// Opens a read stream; planning errors reject. Rows arrive through the
-    /// resolved stream's `next()`.
+    /// Opens a read stream. Resolves once the first page has arrived, so
+    /// planning errors reject here.
     #[napi]
     pub fn stream<'env>(
         &self,
         env: &'env Env,
         sql: String,
         params: Option<Vec<LixValue>>,
-        options: Option<NativeQueryStreamOptions>,
+        options: Option<NativeReadOptions>,
     ) -> Result<Object<'env>> {
-        let params = match params {
-            Some(params) => params
-                .into_iter()
-                .map(Value::try_from)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(env, error))?,
-            None => Vec::new(),
-        };
-        let page_bytes = options
-            .and_then(|options| options.page_bytes)
-            .map(|page_bytes| usize::try_from(page_bytes).unwrap_or(usize::MAX));
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let max_bytes =
+            NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
         let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
             env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::QueryStream {
                 sql,
                 params,
-                page_bytes,
+                max_bytes,
                 deferred,
             });
         Ok(promise)
@@ -2976,6 +3233,7 @@ fn close_observe_events(
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "QueryStream")]
 pub struct NativeQueryStream {
+    columns: Vec<String>,
     commands: Sender<QueryStreamCommand>,
     cancelled: Arc<AtomicBool>,
     cancel_signal: watch::Sender<bool>,
@@ -2993,6 +3251,7 @@ enum QueryStreamCommand {
 #[napi]
 impl NativeQueryStream {
     fn new(stream: lix::RowStream) -> Result<Self> {
+        let columns = stream.columns().to_vec();
         let (commands, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (cancel_signal, actor_cancel_signal) = watch::channel(false);
@@ -3013,11 +3272,18 @@ impl NativeQueryStream {
             })
             .map_err(to_napi_error)?;
         Ok(Self {
+            columns,
             commands,
             cancelled,
             cancel_signal,
             completion,
         })
+    }
+
+    /// The result's column names, known once the stream is open.
+    #[napi(getter)]
+    pub fn columns(&self) -> Vec<String> {
+        self.columns.clone()
     }
 
     /// Resolves the next page, or `null` once the stream is exhausted or
@@ -3046,6 +3312,203 @@ impl NativeQueryStream {
         cancel_query_stream(&self.commands, &self.cancelled, &self.cancel_signal);
         Ok(promise)
     }
+}
+
+fn start_query_stream(stream: lix::RowStream) -> std::result::Result<NativeQueryStream, LixError> {
+    NativeQueryStream::new(stream)
+        .map_err(|error| LixError::unknown(format!("failed to start query stream actor: {error}")))
+}
+
+/// A pinned read state. Its reads run on the snapshot's own thread, so they
+/// never occupy the session actor; streams it opens pull on their own threads.
+#[expect(missing_debug_implementations)]
+#[napi(js_name = "ReadSnapshot")]
+pub struct NativeReadSnapshot {
+    commands: Sender<ReadSnapshotCommand>,
+}
+
+enum ReadSnapshotCommand {
+    Query {
+        sql: String,
+        params: Vec<Value>,
+        options: crate::session::ReadOptions,
+        deferred: NativeExecuteDeferred,
+    },
+    Stream {
+        sql: String,
+        params: Vec<Value>,
+        max_bytes: Option<usize>,
+        deferred: NativeDeferred<NativeQueryStream>,
+    },
+    Close(Option<NativeUnitDeferred>),
+}
+
+fn snapshot_closed_error() -> LixError {
+    LixError::new(LixError::CODE_SNAPSHOT_CLOSED, "the snapshot is closed")
+}
+
+#[napi]
+impl NativeReadSnapshot {
+    fn new(snapshot: lix::Snapshot) -> io::Result<Self> {
+        let (commands, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("lix-read-snapshot".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+            .spawn(move || run_read_snapshot_actor(snapshot, receiver))?;
+        Ok(Self { commands })
+    }
+
+    fn send(&self, command: ReadSnapshotCommand) {
+        if let Err(error) = self.commands.send(command) {
+            match error.0 {
+                ReadSnapshotCommand::Query { deferred, .. } => {
+                    settle_deferred(deferred, Err(snapshot_closed_error()));
+                }
+                ReadSnapshotCommand::Stream { deferred, .. } => {
+                    settle_deferred(deferred, Err(snapshot_closed_error()));
+                }
+                ReadSnapshotCommand::Close(deferred) => {
+                    if let Some(deferred) = deferred {
+                        settle_deferred(deferred, Ok(()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[napi]
+    pub fn query<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeReadOptions>,
+    ) -> Result<Object<'env>> {
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeReadOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
+        self.send(ReadSnapshotCommand::Query {
+            sql,
+            params,
+            options,
+            deferred,
+        });
+        Ok(promise)
+    }
+
+    #[napi]
+    pub fn stream<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeReadOptions>,
+    ) -> Result<Object<'env>> {
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let max_bytes =
+            NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
+            env.create_deferred()?;
+        self.send(ReadSnapshotCommand::Stream {
+            sql,
+            params,
+            max_bytes,
+            deferred,
+        });
+        Ok(promise)
+    }
+
+    /// Closes the snapshot: its streams stop, and the promise resolves once
+    /// in-flight reads have released the pinned state.
+    #[napi]
+    pub fn close<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.send(ReadSnapshotCommand::Close(Some(deferred)));
+        Ok(promise)
+    }
+}
+
+impl Drop for NativeReadSnapshot {
+    fn drop(&mut self) {
+        let _ = self.commands.send(ReadSnapshotCommand::Close(None));
+    }
+}
+
+fn run_read_snapshot_actor(snapshot: lix::Snapshot, receiver: mpsc::Receiver<ReadSnapshotCommand>) {
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(error) => {
+            for command in receiver.try_iter() {
+                match command {
+                    ReadSnapshotCommand::Query { deferred, .. } => {
+                        deferred.reject(to_napi_error(&error));
+                    }
+                    ReadSnapshotCommand::Stream { deferred, .. } => {
+                        deferred.reject(to_napi_error(&error));
+                    }
+                    ReadSnapshotCommand::Close(Some(deferred)) => {
+                        settle_deferred(deferred, Ok(()));
+                    }
+                    ReadSnapshotCommand::Close(None) => {}
+                }
+            }
+            return;
+        }
+    };
+    let limited = |query: lix::Query, max_bytes: Option<usize>| match max_bytes {
+        Some(max_bytes) => query.max_bytes(max_bytes),
+        None => query,
+    };
+    while let Ok(command) = receiver.recv() {
+        match command {
+            ReadSnapshotCommand::Query {
+                sql,
+                params,
+                options,
+                deferred,
+            } => {
+                let query = snapshot.query(&sql).params(params);
+                let result = rt
+                    .block_on(crate::session::run_query(query, options))
+                    .and_then(ExecuteResult::try_from);
+                settle_deferred(deferred, result);
+            }
+            ReadSnapshotCommand::Stream {
+                sql,
+                params,
+                max_bytes,
+                deferred,
+            } => {
+                let query = limited(snapshot.query(&sql).params(params), max_bytes);
+                let result = rt.block_on(query.stream()).and_then(start_query_stream);
+                settle_deferred(deferred, result);
+            }
+            ReadSnapshotCommand::Close(deferred) => {
+                let result = rt.block_on(snapshot.close());
+                if let Some(deferred) = deferred {
+                    settle_deferred(deferred, result);
+                }
+                // Later reads on this snapshot reject as closed.
+                for command in receiver.try_iter() {
+                    match command {
+                        ReadSnapshotCommand::Query { deferred, .. } => {
+                            settle_deferred(deferred, Err(snapshot_closed_error()));
+                        }
+                        ReadSnapshotCommand::Stream { deferred, .. } => {
+                            settle_deferred(deferred, Err(snapshot_closed_error()));
+                        }
+                        ReadSnapshotCommand::Close(Some(deferred)) => {
+                            settle_deferred(deferred, Ok(()));
+                        }
+                        ReadSnapshotCommand::Close(None) => {}
+                    }
+                }
+                return;
+            }
+        }
+    }
+    let _ = rt.block_on(snapshot.close());
 }
 
 impl Drop for NativeQueryStream {
@@ -3171,6 +3634,22 @@ impl NativeLixTransaction {
         }
     }
 
+    fn send_transaction<T>(
+        &self,
+        deferred: NativeDeferred<T>,
+        command: impl FnOnce(u64, NativeDeferred<T>) -> LixCommand,
+    ) where
+        T: ToNapiValue + Send + 'static,
+    {
+        if self.closed.load(Ordering::SeqCst) {
+            settle_deferred(deferred, Err(transaction_closed_error()));
+            return;
+        }
+        let transaction_id = self.transaction_id;
+        self.actor
+            .send_with_deferred(deferred, |deferred| command(transaction_id, deferred));
+    }
+
     #[napi]
     pub fn execute<'env>(
         &self,
@@ -3179,35 +3658,99 @@ impl NativeLixTransaction {
         params: Option<Vec<LixValue>>,
         options: Option<NativeExecuteOptions>,
     ) -> Result<Object<'env>> {
-        let params = match params {
-            Some(params) => params
-                .into_iter()
-                .map(Value::try_from)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| throw_lix_error(env, error))?,
-            None => Vec::new(),
-        };
-        let options = options
-            .map(|options| crate::session::ExecuteOptions {
-                origin_key: options.origin_key,
-                max_auto_commit_retries: options.max_auto_commit_retries,
-                ..Default::default()
-            })
-            .unwrap_or_default();
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeExecuteOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
-        if self.closed.load(Ordering::SeqCst) {
-            settle_deferred(deferred, Err(transaction_closed_error()));
-            return Ok(promise);
-        }
-        let transaction_id = self.transaction_id;
-        self.actor
-            .send_with_deferred(deferred, |deferred| LixCommand::TransactionExecute {
+        self.send_transaction(deferred, |transaction_id, deferred| {
+            LixCommand::TransactionExecute {
                 transaction_id,
                 sql,
                 params,
                 options,
                 deferred,
-            });
+            }
+        });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "executeMany")]
+    pub fn execute_many<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        param_sets: Vec<Vec<LixValue>>,
+        options: Option<NativeExecuteOptions>,
+    ) -> Result<Object<'env>> {
+        let param_sets = param_sets
+            .into_iter()
+            .map(|params| params_from_native(Some(params)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeExecuteOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeRowsAffectedDeferred, Object<'env>) =
+            env.create_deferred()?;
+        self.send_transaction(deferred, |transaction_id, deferred| {
+            LixCommand::TransactionExecuteMany {
+                transaction_id,
+                sql,
+                param_sets,
+                options,
+                deferred,
+            }
+        });
+        Ok(promise)
+    }
+
+    /// A buffered read that sees this transaction's writes.
+    #[napi]
+    pub fn query<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeReadOptions>,
+    ) -> Result<Object<'env>> {
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let options = NativeReadOptions::into_session(options)
+            .map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
+        self.send_transaction(deferred, |transaction_id, deferred| {
+            LixCommand::TransactionQuery {
+                transaction_id,
+                sql,
+                params,
+                options,
+                deferred,
+            }
+        });
+        Ok(promise)
+    }
+
+    /// A read stream at this transaction's state when it opens.
+    #[napi]
+    pub fn stream<'env>(
+        &self,
+        env: &'env Env,
+        sql: String,
+        params: Option<Vec<LixValue>>,
+        options: Option<NativeReadOptions>,
+    ) -> Result<Object<'env>> {
+        let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
+        let max_bytes =
+            NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
+        let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
+            env.create_deferred()?;
+        self.send_transaction(deferred, |transaction_id, deferred| {
+            LixCommand::TransactionStream {
+                transaction_id,
+                sql,
+                params,
+                max_bytes,
+                deferred,
+            }
+        });
         Ok(promise)
     }
 
@@ -3927,26 +4470,6 @@ pub fn retry_filesystem_replica_migration_cleanup(
         sync_all_files,
         server: ServerOptions::new(url).with_headers(parse_server_headers(headers)?),
     }))
-}
-
-#[napi(object)]
-pub struct ExecuteBatchResult {
-    pub results: Vec<ExecuteResult>,
-    pub commit: Option<CommitSpan>,
-}
-
-impl TryFrom<lix::ExecuteBatchResult> for ExecuteBatchResult {
-    type Error = LixError;
-    fn try_from(batch: lix::ExecuteBatchResult) -> std::result::Result<Self, Self::Error> {
-        Ok(Self {
-            results: batch
-                .results
-                .into_iter()
-                .map(ExecuteResult::try_from)
-                .collect::<std::result::Result<_, _>>()?,
-            commit: batch.commit.map(CommitSpan::from),
-        })
-    }
 }
 
 #[napi(object)]

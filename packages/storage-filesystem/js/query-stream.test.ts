@@ -39,30 +39,42 @@ async function seed(execute: (sql: string, params: unknown[]) => Promise<unknown
 	}
 }
 
-test("the native binding pulls byte-bounded pages, cancels, and ends at close", async () => {
+test("the native binding pulls pages, cancels, and ends at close", async () => {
 	const binding = await openLixBinding({ kind: "memory" });
 	try {
 		await seed((sql, params) => binding.execute(sql, params as never));
 		const sql = "SELECT id, n FROM native_stream_item ORDER BY id";
-		const buffered = await binding.execute(sql, []);
-		const stream = await binding.stream(sql, [], { pageBytes: 1_024 });
+		const buffered = await binding.query(sql, []);
+		const stream = await binding.stream(sql, []);
+		expect(stream.columns).toEqual(["id", "n"]);
 		const rows: unknown[] = [];
 		let pages = 0;
 		for (let page = await stream.next(); page; page = await stream.next()) {
 			pages++;
-			expect(page.columns).toEqual(buffered.columns);
 			rows.push(...page.rows);
 		}
 		expect(rows).toEqual(buffered.rows);
-		expect(pages).toBeGreaterThan(10);
+		expect(pages).toBeGreaterThan(1);
 		expect(await stream.next()).toBeNull();
 
-		const cancelled = await binding.stream(sql, [], { pageBytes: 256 });
+		const cancelled = await binding.stream(sql, []);
 		expect(await cancelled.next()).toBeTruthy();
 		await cancelled.cancel();
 		expect(await cancelled.next()).toBeNull();
 
-		const open = await binding.stream(sql, [], { pageBytes: 256 });
+		const snapshot = await binding.snapshot();
+		await binding.execute("UPDATE native_stream_item SET n = -2 WHERE n = 4", []);
+		const pinned = await snapshot.query(
+			"SELECT n FROM native_stream_item WHERE id = 'item-00004'",
+			[],
+		);
+		expect(pinned.rows).toEqual([[{ kind: "integer", value: 4 }]]);
+		await snapshot.close();
+		await expect(snapshot.query("SELECT 1", [])).rejects.toMatchObject({
+			code: "LIX_SNAPSHOT_CLOSED",
+		});
+
+		const open = await binding.stream(sql, []);
 		expect(await open.next()).toBeTruthy();
 		// An idle stream never blocks a write on the same handle.
 		await binding.execute("UPDATE native_stream_item SET n = -1 WHERE n = 3", []);
@@ -84,17 +96,21 @@ test("lix.stream reads a filesystem repository through the native runtime", asyn
 			),
 		);
 		const seen: number[] = [];
-		for await (const page of lix.stream(
+		for await (const row of await lix.stream<{ n: number }>(
 			"SELECT n FROM native_stream_item ORDER BY n",
-			[],
-			{ pageBytes: 512, rowMode: "array" },
 		)) {
-			seen.push(...page.rows.map(([n]) => n as number));
+			seen.push(row.n);
 			if (seen.length >= 100) break;
 		}
-		expect(seen.slice(0, 100)).toEqual(Array.from({ length: 100 }, (_, n) => n));
+		expect(seen).toEqual(Array.from({ length: 100 }, (_, n) => n));
 
-		const open = lix.stream("SELECT id FROM native_stream_item");
+		expect(
+			await lix.read((snapshot) =>
+				snapshot.queryOne("SELECT count(*) AS n FROM native_stream_item"),
+			),
+		).toEqual({ n: 800 });
+
+		const open = (await lix.stream("SELECT id FROM native_stream_item")).pages();
 		expect((await open.next()).done).toBe(false);
 		await lix.close();
 		await expect(open.next()).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });

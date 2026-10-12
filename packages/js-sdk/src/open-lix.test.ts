@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
 import {
+	json,
 	openLix,
 	Value,
 	type ExecuteResult,
@@ -748,7 +749,7 @@ test("execute retains declared types for empty and all-null results", async () =
 	await lix.close();
 });
 
-test("object rows use last-column-wins and array mode preserves duplicates", async () => {
+test("duplicate column names throw and dangerous names stay data", async () => {
 	const lix = await openLix();
 	const raw = {
 		columns: [
@@ -762,15 +763,9 @@ test("object rows use last-column-wins and array mode preserves duplicates", asy
 		rowsAffected: 0,
 		notices: [],
 	};
-	const objectResult = wrapExecuteResult(raw, "object");
-	expect(objectResult.columns.map((column) => column.name)).toEqual([
-		"value",
-		"value",
-	]);
-	expect(objectResult.rows).toEqual([{ value: 2 }]);
-
-	const arrayResult = wrapExecuteResult(raw, "array");
-	expect(arrayResult.rows).toEqual([[1, 2]]);
+	expect(() => wrapExecuteResult(raw)).toThrow(
+		expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
+	);
 
 	const dangerous = await lix.execute(
 		'SELECT 3 AS "__proto__", 4 AS "constructor"',
@@ -1027,7 +1022,7 @@ test("undo and redo roundtrip tracked state through the local worker", async () 
 	await lix.close();
 });
 
-test("execute and executeBatch expose registered-row RETURNING postimages", async () => {
+test("execute exposes registered-row RETURNING postimages", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);
 
@@ -1059,19 +1054,19 @@ test("execute and executeBatch expose registered-row RETURNING postimages", asyn
 	expect(get(updated, "id")).toBe(taskId);
 	expect(get(updated, "title")).toBe("Updated through SDK RETURNING");
 
-	const { results: [batched] } = await lix.executeBatch([
-		{
-			sql: "INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
-			params: ["batched-returning-task", "Batched SDK RETURNING", true],
-		},
-	]);
-	expect(batched?.rowsAffected).toBe(1);
-	expect(batched?.columns).toEqual([
+	const tx = await lix.beginTransaction();
+	const staged = await tx.execute(
+		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
+		["tx-returning-task", "Transaction SDK RETURNING", true],
+	);
+	await tx.commit();
+	expect(staged.rowsAffected).toBe(1);
+	expect(staged.columns).toEqual([
 		{ name: "id", type: "text" },
 		{ name: "title", type: "text" },
 	]);
-	expect(get(batched!, "title")).toBe("Batched SDK RETURNING");
-	expect(typeof get(batched!, "id")).toBe("string");
+	expect(get(staged, "title")).toBe("Transaction SDK RETURNING");
+	expect(typeof get(staged, "id")).toBe("string");
 
 	await lix.close();
 });
@@ -1304,7 +1299,7 @@ test("execute originKey stays on source records while history identifies endpoin
 
 	await lix.execute(
 		"INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)",
-		[fileId, "/origin-key.md", new TextEncoder().encode("one\n"), metadata],
+		[fileId, "/origin-key.md", new TextEncoder().encode("one\n"), json(metadata)],
 		{ originKey: "test-origin" },
 	);
 	const inserted = await currentFileChange(lix, fileId);
@@ -1348,34 +1343,21 @@ test("execute originKey stays on source records while history identifies endpoin
 	await lix.close();
 });
 
-test("executeBatch propagates originKey to every write", async () => {
+test("executeMany propagates originKey to every write", async () => {
 	const lix = await openLix();
 	const firstFileId = "01920000-0000-7000-8000-000000000412";
 	const secondFileId = "01920000-0000-7000-8000-000000000413";
 
-	const results = await lix.executeBatch(
+	const results = await lix.executeMany(
+		"INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
 		[
-			{
-				sql: "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-				params: [
-					firstFileId,
-					"/batch-origin-one.md",
-					new TextEncoder().encode("one\n"),
-				],
-			},
-			{
-				sql: "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
-				params: [
-					secondFileId,
-					"/batch-origin-two.md",
-					new TextEncoder().encode("two\n"),
-				],
-			},
+			[firstFileId, "/batch-origin-one.md", new TextEncoder().encode("one\n")],
+			[secondFileId, "/batch-origin-two.md", new TextEncoder().encode("two\n")],
 		],
 		{ originKey: "batch-origin" },
 	);
 
-	expect(results.results.map((result) => result.rowsAffected)).toEqual([1, 1]);
+	expect(results).toEqual({ rowsAffected: 2 });
 	expect(get(await currentFileChange(lix, firstFileId), "origin_key")).toBe(
 		"batch-origin",
 	);
@@ -2456,8 +2438,26 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 	];
 
 	for (const testCase of invalidCases) {
+		const value = testCase.value as unknown;
+		// Objects and arrays bind only through json(), which validates them deeply.
+		const jsonCandidate =
+			typeof value === "object" &&
+			value !== null &&
+			!(value instanceof Date) &&
+			!ArrayBuffer.isView(value);
+		if (jsonCandidate) {
+			await expect(
+				lix.execute("SELECT $1 AS v", [value as never]),
+				testCase.name,
+			).rejects.toMatchObject({
+				code: "LIX_INVALID_PARAM",
+				message: expect.stringMatching(/wrap JSON values with json\(value\)/),
+			});
+		}
 		try {
-			await lix.execute("SELECT $1 AS v", [testCase.value as never]);
+			await lix.execute("SELECT $1 AS v", [
+				jsonCandidate ? json(value as never) : (value as never),
+			]);
 			throw new Error(`expected ${testCase.name} to fail`);
 		} catch (error) {
 			expect(error, testCase.name).toMatchObject({
@@ -2478,15 +2478,15 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 	await lix.close();
 });
 
-test("execute treats LixValue-shaped objects as JSON parameters", async () => {
+test("json() binds LixValue-shaped objects as JSON", async () => {
 	const lix = await openLix();
 
 	const realObject = await lix.execute("SELECT $1 AS v", [
-		{ kind: "real", value: 1.5 },
+		json({ kind: "real", value: 1.5 }),
 	]);
 	expect(get(realObject, "v")).toEqual({ kind: "real", value: 1.5 });
 	const blobObject = await lix.execute("SELECT $1 AS v", [
-		{ kind: "blob", value: "AQID" },
+		json({ kind: "blob", value: "AQID" }),
 	]);
 	expect(get(blobObject, "v")).toEqual({
 		kind: "blob",
@@ -2525,7 +2525,7 @@ test("Value parameters and result rows do not alias inputs", async () => {
 
 	const lix = await openLix();
 	const result = await lix.execute("SELECT $1 AS value", [
-		{ nested: { ok: true } },
+		json({ nested: { ok: true } }),
 	]);
 	const rowValue = result.rows[0]?.value as { nested: { ok: boolean } };
 	rowValue.nested.ok = false;
@@ -2775,22 +2775,22 @@ test("execute rejects invalid explicit Value parameters", async () => {
 	await lix.close();
 });
 
-test("execute treats objects with non-LixValue kind as JSON parameters", async () => {
+test("json() binds objects with a non-LixValue kind as JSON", async () => {
 	const lix = await openLix();
 
 	const result = await lix.execute("SELECT $1 AS value", [
-		{ kind: "task", id: 1 },
+		json({ kind: "task", id: 1 }),
 	]);
 	expect(get(result, "value")).toEqual({ kind: "task", id: 1 });
 
 	await lix.close();
 });
 
-test("execute treats arrays as JSON parameters", async () => {
+test("execute binds JSON through json()", async () => {
 	const lix = await openLix();
 
 	const result = await lix.execute("SELECT $1 AS value", [
-		[1, "x", { ok: true }],
+		json([1, "x", { ok: true }]),
 	]);
 	expect(get(result, "value")).toEqual([1, "x", { ok: true }]);
 
@@ -2948,7 +2948,11 @@ async function workingBaselineCommitId(lix: Lix): Promise<string> {
 	return String(get(result, "working_base_commit_id"));
 }
 
-function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {
+function get(
+	result: { rows: readonly Record<string, unknown>[] },
+	column: string,
+	rowIndex = 0,
+): unknown {
 	return result.rows[rowIndex]?.[column];
 }
 
