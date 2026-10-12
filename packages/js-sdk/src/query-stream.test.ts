@@ -35,7 +35,12 @@ test("stream opens eagerly, then rows and pages share one cursor in order", asyn
 	const pages = [page([1, 2]), page([3]), page([4, 5])];
 	const f = fakeLix(vi.fn(async () => pages.shift() ?? null));
 	const rows = await f.lix.stream("SELECT n FROM t", [], { maxBytes: 64 });
-	expect(f.stream).toHaveBeenCalledWith("SELECT n FROM t", [], { maxBytes: 64 });
+	expect(f.stream).toHaveBeenCalledWith(
+		"SELECT n FROM t",
+		[],
+		{ maxBytes: 64 },
+		expect.any(AbortSignal),
+	);
 	expect(rows.columns).toEqual(["n"]);
 	const pageIterator = rows.pages();
 	expect(await pageIterator.next()).toEqual({ done: false, value: [{ n: 1 }, { n: 2 }] });

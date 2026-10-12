@@ -136,6 +136,79 @@ pub struct NativeReadOptions {
     #[napi(js_name = "maxBytes")]
     pub max_bytes: Option<f64>,
     pub single: Option<bool>,
+    /// Identifies this read for `cancelRequest(token)`.
+    #[napi(js_name = "cancelToken")]
+    pub cancel_token: Option<u32>,
+}
+
+/// A read's cancellation: the flag `cancelRequest(token)` raises. Dropping
+/// it (the read settled, or its command never ran) unregisters the token.
+struct NativeCancelHandle {
+    token: u32,
+    receiver: watch::Receiver<bool>,
+}
+
+impl Drop for NativeCancelHandle {
+    fn drop(&mut self) {
+        if let Ok(mut cancellations) = CANCELLATIONS.lock() {
+            cancellations.remove(&self.token);
+        }
+    }
+}
+
+impl std::fmt::Debug for NativeCancelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeCancelHandle")
+            .field("token", &self.token)
+            .finish()
+    }
+}
+
+type NativeCancel = Option<NativeCancelHandle>;
+
+static CANCELLATIONS: std::sync::LazyLock<Mutex<HashMap<u32, watch::Sender<bool>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registers a read's cancel token. Registration happens on the JS thread,
+/// before the read is queued, so a cancel that follows the call is never lost.
+fn register_cancel(options: &Option<NativeReadOptions>) -> NativeCancel {
+    let token = options.as_ref()?.cancel_token?;
+    let (sender, receiver) = watch::channel(false);
+    if let Ok(mut cancellations) = CANCELLATIONS.lock() {
+        cancellations.insert(token, sender);
+    }
+    Some(NativeCancelHandle { token, receiver })
+}
+
+/// Cancels the read registered with `token`: its future is dropped, which
+/// stops the engine work (reads yield cooperatively). A no-op once the read
+/// has settled.
+#[cfg_attr(test, allow(dead_code))]
+#[napi(js_name = "cancelRequest")]
+pub fn cancel_request(token: u32) {
+    if let Ok(cancellations) = CANCELLATIONS.lock()
+        && let Some(sender) = cancellations.get(&token)
+    {
+        let _ = sender.send(true);
+    }
+}
+
+/// Runs `operation` until it settles or its read is cancelled.
+async fn cancellable<T>(
+    cancel: NativeCancel,
+    operation: impl Future<Output = std::result::Result<T, LixError>>,
+) -> std::result::Result<T, LixError> {
+    let Some(mut cancel) = cancel else {
+        return operation.await;
+    };
+    let cancelled = || LixError::new("LIX_ERROR_CANCELLED", "the operation was cancelled");
+    if *cancel.receiver.borrow() {
+        return Err(cancelled());
+    }
+    tokio::select! {
+        result = operation => result,
+        Ok(_) = cancel.receiver.wait_for(|cancelled| *cancelled) => Err(cancelled()),
+    }
 }
 
 impl NativeReadOptions {
@@ -385,6 +458,7 @@ enum LixCommand {
         sql: String,
         params: Vec<Value>,
         options: crate::session::ReadOptions,
+        cancel: NativeCancel,
         deferred: NativeExecuteDeferred,
     },
     ReadSnapshot(NativeDeferred<NativeReadSnapshot>),
@@ -445,6 +519,7 @@ enum LixCommand {
         sql: String,
         params: Vec<Value>,
         max_bytes: Option<usize>,
+        cancel: NativeCancel,
         deferred: NativeDeferred<NativeQueryStream>,
     },
     TransactionQuery {
@@ -452,6 +527,7 @@ enum LixCommand {
         sql: String,
         params: Vec<Value>,
         options: crate::session::ReadOptions,
+        cancel: NativeCancel,
         deferred: NativeExecuteDeferred,
     },
     TransactionStream {
@@ -459,6 +535,7 @@ enum LixCommand {
         sql: String,
         params: Vec<Value>,
         max_bytes: Option<usize>,
+        cancel: NativeCancel,
         deferred: NativeDeferred<NativeQueryStream>,
     },
     TransactionExecuteMany {
@@ -1173,9 +1250,10 @@ fn handle_lix_command(
             sql,
             params,
             options,
+            cancel,
             deferred,
         } => {
-            let result = block_on!(state.lix.query(&sql, &params, options))
+            let result = block_on!(cancellable(cancel, state.lix.query(&sql, &params, options)))
                 .and_then(ExecuteResult::try_from);
             settle_deferred(deferred, result);
             None
@@ -1351,13 +1429,17 @@ fn handle_lix_command(
             sql,
             params,
             max_bytes,
+            cancel,
             deferred,
         } => {
             // Opening plans the statement and pins its snapshot on the actor;
             // pulls then run on the stream's own thread, so an open stream
             // never occupies the actor between pages.
-            let result =
-                block_on!(state.lix.stream(&sql, &params, max_bytes)).and_then(start_query_stream);
+            let result = block_on!(cancellable(
+                cancel,
+                state.lix.stream(&sql, &params, max_bytes)
+            ))
+            .and_then(start_query_stream);
             settle_deferred(deferred, result);
             None
         }
@@ -1366,13 +1448,17 @@ fn handle_lix_command(
             sql,
             params,
             options,
+            cancel,
             deferred,
         } => {
             let result = state.transactions.get_mut(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
                 |transaction| {
-                    block_on!(transaction.query(&sql, &params, options))
-                        .and_then(ExecuteResult::try_from)
+                    block_on!(cancellable(
+                        cancel,
+                        transaction.query(&sql, &params, options)
+                    ))
+                    .and_then(ExecuteResult::try_from)
                 },
             );
             settle_deferred(deferred, result);
@@ -1383,13 +1469,17 @@ fn handle_lix_command(
             sql,
             params,
             max_bytes,
+            cancel,
             deferred,
         } => {
             let result = state.transactions.get_mut(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
                 |transaction| {
-                    block_on!(transaction.stream(&sql, &params, max_bytes))
-                        .and_then(start_query_stream)
+                    block_on!(cancellable(
+                        cancel,
+                        transaction.stream(&sql, &params, max_bytes)
+                    ))
+                    .and_then(start_query_stream)
                 },
             );
             settle_deferred(deferred, result);
@@ -2654,14 +2744,17 @@ impl NativeLix {
         options: Option<NativeReadOptions>,
     ) -> Result<Object<'env>> {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
-        let options = NativeReadOptions::into_session(options)
+        let session_options = NativeReadOptions::into_session(options)
             .map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
+        let options = session_options;
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::Query {
                 sql,
                 params,
                 options,
+                cancel,
                 deferred,
             });
         Ok(promise)
@@ -2717,6 +2810,7 @@ impl NativeLix {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
         let max_bytes =
             NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
         let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
             env.create_deferred()?;
         self.actor
@@ -2724,6 +2818,7 @@ impl NativeLix {
                 sql,
                 params,
                 max_bytes,
+                cancel,
                 deferred,
             });
         Ok(promise)
@@ -3332,12 +3427,14 @@ enum ReadSnapshotCommand {
         sql: String,
         params: Vec<Value>,
         options: crate::session::ReadOptions,
+        cancel: NativeCancel,
         deferred: NativeExecuteDeferred,
     },
     Stream {
         sql: String,
         params: Vec<Value>,
         max_bytes: Option<usize>,
+        cancel: NativeCancel,
         deferred: NativeDeferred<NativeQueryStream>,
     },
     Close(Option<NativeUnitDeferred>),
@@ -3385,13 +3482,16 @@ impl NativeReadSnapshot {
         options: Option<NativeReadOptions>,
     ) -> Result<Object<'env>> {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
-        let options = NativeReadOptions::into_session(options)
+        let session_options = NativeReadOptions::into_session(options)
             .map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
+        let options = session_options;
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.send(ReadSnapshotCommand::Query {
             sql,
             params,
             options,
+            cancel,
             deferred,
         });
         Ok(promise)
@@ -3408,12 +3508,14 @@ impl NativeReadSnapshot {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
         let max_bytes =
             NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
         let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
             env.create_deferred()?;
         self.send(ReadSnapshotCommand::Stream {
             sql,
             params,
             max_bytes,
+            cancel,
             deferred,
         });
         Ok(promise)
@@ -3466,11 +3568,15 @@ fn run_read_snapshot_actor(snapshot: lix::Snapshot, receiver: mpsc::Receiver<Rea
                 sql,
                 params,
                 options,
+                cancel,
                 deferred,
             } => {
                 let query = snapshot.query(&sql).params(params);
                 let result = rt
-                    .block_on(crate::session::run_query(query, options))
+                    .block_on(cancellable(
+                        cancel,
+                        crate::session::run_query(query, options),
+                    ))
                     .and_then(ExecuteResult::try_from);
                 settle_deferred(deferred, result);
             }
@@ -3478,10 +3584,13 @@ fn run_read_snapshot_actor(snapshot: lix::Snapshot, receiver: mpsc::Receiver<Rea
                 sql,
                 params,
                 max_bytes,
+                cancel,
                 deferred,
             } => {
                 let query = limited(snapshot.query(&sql).params(params), max_bytes);
-                let result = rt.block_on(query.stream()).and_then(start_query_stream);
+                let result = rt
+                    .block_on(cancellable(cancel, query.stream()))
+                    .and_then(start_query_stream);
                 settle_deferred(deferred, result);
             }
             ReadSnapshotCommand::Close(deferred) => {
@@ -3713,8 +3822,10 @@ impl NativeLixTransaction {
         options: Option<NativeReadOptions>,
     ) -> Result<Object<'env>> {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
-        let options = NativeReadOptions::into_session(options)
+        let session_options = NativeReadOptions::into_session(options)
             .map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
+        let options = session_options;
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.send_transaction(deferred, |transaction_id, deferred| {
             LixCommand::TransactionQuery {
@@ -3722,6 +3833,7 @@ impl NativeLixTransaction {
                 sql,
                 params,
                 options,
+                cancel,
                 deferred,
             }
         });
@@ -3740,6 +3852,7 @@ impl NativeLixTransaction {
         let params = params_from_native(params).map_err(|error| throw_lix_error(env, error))?;
         let max_bytes =
             NativeReadOptions::max_bytes(options).map_err(|error| throw_lix_error(env, error))?;
+        let cancel = register_cancel(&options);
         let (deferred, promise): (NativeDeferred<NativeQueryStream>, Object<'env>) =
             env.create_deferred()?;
         self.send_transaction(deferred, |transaction_id, deferred| {
@@ -3748,6 +3861,7 @@ impl NativeLixTransaction {
                 sql,
                 params,
                 max_bytes,
+                cancel,
                 deferred,
             }
         });

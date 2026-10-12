@@ -248,6 +248,10 @@ export class RepositorySession {
 				this.cancelObserverRegistration(message.requestId);
 				return;
 			}
+			if (message.kind === "request.cancel") {
+				this.cancelRead(message.requestId);
+				return;
+			}
 			if ("requestId" in message) {
 				const requestId = this.callbacks.get(message.requestId);
 				if (requestId !== undefined) this.send({ ...message, requestId });
@@ -575,6 +579,33 @@ export class RepositorySession {
 		else if (operation.kind === "stream.close")
 			this.queryStreams.delete(operation.streamId);
 		this.output({ ...message, id: request.id, value });
+	}
+	/** Forwards a read cancel to the owner, or drops a read not sent yet. */
+	private cancelRead(requestId: number): void {
+		const queued = this.queue.findIndex(
+			(message) => "id" in message && message.id === requestId,
+		);
+		if (queued >= 0) {
+			this.queue.splice(queued, 1);
+			this.clearQueueTimer(requestId);
+			this.output({
+				id: requestId,
+				ok: false,
+				error: serializeWorkerError(
+					Object.assign(new Error("The read was cancelled"), {
+						name: "AbortError",
+						code: "LIX_ERROR_CANCELLED",
+					}),
+				),
+			});
+			return;
+		}
+		for (const [wireId, request] of this.requests) {
+			if (request.id === requestId) {
+				this.send({ kind: "request.cancel", requestId: wireId });
+				return;
+			}
+		}
 	}
 	close() {
 		this.stopped = true;

@@ -33,19 +33,23 @@ macro_rules! wasm_session_methods {
                 sql: String,
                 params: JsValue,
                 options: Option<JsValue>,
+                signal: Option<JsValue>,
             ) -> Result<JsValue, JsValue> {
-                let params = crate::wasm::values_from_js(params)?;
-                let options = crate::wasm::read_options_from_js(options)?;
-                let result = self
-                    .instrument_operation(crate::session::SessionOperations::query(
-                        &self.inner,
-                        &sql,
-                        &params,
-                        options,
-                    ))
-                    .await
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                crate::wasm::execute_result_to_js(result)
+                crate::wasm::abortable(signal, async {
+                    let params = crate::wasm::values_from_js(params)?;
+                    let options = crate::wasm::read_options_from_js(options)?;
+                    let result = self
+                        .instrument_operation(crate::session::SessionOperations::query(
+                            &self.inner,
+                            &sql,
+                            &params,
+                            options,
+                        ))
+                        .await
+                        .map_err(crate::wasm::lix_error_to_js)?;
+                    crate::wasm::execute_result_to_js(result)
+                })
+                .await
             }
 
             /// Opens a read stream. Resolves once the first page has arrived,
@@ -56,19 +60,23 @@ macro_rules! wasm_session_methods {
                 sql: String,
                 params: JsValue,
                 options: Option<JsValue>,
+                signal: Option<JsValue>,
             ) -> Result<crate::wasm::WasmQueryStream, JsValue> {
-                let params = crate::wasm::values_from_js(params)?;
-                let max_bytes = crate::wasm::read_max_bytes_from_js(options)?;
-                let stream = self
-                    .instrument_operation(crate::session::SessionOperations::stream(
-                        &self.inner,
-                        &sql,
-                        &params,
-                        max_bytes,
-                    ))
-                    .await
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                Ok(crate::wasm::WasmQueryStream::new(stream))
+                crate::wasm::abortable(signal, async {
+                    let params = crate::wasm::values_from_js(params)?;
+                    let max_bytes = crate::wasm::read_max_bytes_from_js(options)?;
+                    let stream = self
+                        .instrument_operation(crate::session::SessionOperations::stream(
+                            &self.inner,
+                            &sql,
+                            &params,
+                            max_bytes,
+                        ))
+                        .await
+                        .map_err(crate::wasm::lix_error_to_js)?;
+                    Ok(crate::wasm::WasmQueryStream::new(stream))
+                })
+                .await
             }
 
             /// Pins the current state for several reads.

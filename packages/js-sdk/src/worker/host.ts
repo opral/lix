@@ -30,6 +30,7 @@ import {
 	type WorkerSyncFetchRequest,
 	type WorkerSyncFetchResponse,
 	type WorkerSyncServerOptions,
+	isCancellableRead,
 	isSessionCloseRequest,
 } from "./protocol.js";
 import {
@@ -87,6 +88,10 @@ export function startWorkerHost(
 		number,
 		{ binding: QueryStreamBinding; sessionId: number }
 	>();
+	// In-flight reads a `request.cancel` stops, by request id.
+	const readCancellations = new Map<number, AbortController>();
+	/** The cancellation signal of read request `id`, if it is one. */
+	const readSignal = (id: number) => readCancellations.get(id)?.signal;
 	let nextReadSnapshotId = 1;
 	// Read snapshots belong to one session too; closing it closes them.
 	const readSnapshots = new Map<
@@ -303,6 +308,7 @@ export function startWorkerHost(
 									request.sessionId,
 									request.operation,
 									request.telemetryParent,
+									request.id,
 								);
 						if (request.operation.kind === "beginTransaction")
 							transactionSlot?.adopt();
@@ -341,6 +347,8 @@ export function startWorkerHost(
 			handleNotification(message);
 			return;
 		}
+		if (isCancellableRead(message.operation))
+			readCancellations.set(message.id, new AbortController());
 		if (
 			message.operation.kind === "openSnapshot.write" ||
 			message.operation.kind === "openSnapshot.finish"
@@ -474,7 +482,13 @@ export function startWorkerHost(
 				message,
 				`readSnapshot:${readSnapshotId}`,
 				undefined,
-				() => handleReadSnapshotRead(message.sessionId, readSnapshotId, operation),
+				() =>
+					handleReadSnapshotRead(
+						message.sessionId,
+						readSnapshotId,
+						operation,
+						readSignal(message.id),
+					),
 			);
 			return;
 		}
@@ -494,6 +508,7 @@ export function startWorkerHost(
 							operation.sql,
 							operation.params,
 							operation.options,
+							readSignal(message.id),
 						),
 					),
 			);
@@ -633,6 +648,12 @@ export function startWorkerHost(
 				cancelObserverRegistration(message.requestId);
 				break;
 			}
+			case "request.cancel": {
+				readCancellations
+					.get(message.requestId)
+					?.abort(cancelledReadError());
+				break;
+			}
 			case "openSnapshot.cancel": {
 				closeSnapshotInput(message.snapshotId);
 				break;
@@ -770,6 +791,8 @@ export function startWorkerHost(
 				ok: false,
 				error: serializeWorkerError(error),
 			});
+		} finally {
+			readCancellations.delete(request.id);
 		}
 	}
 
@@ -777,6 +800,7 @@ export function startWorkerHost(
 		sessionId: number,
 		operation: WorkerOperation,
 		telemetryParent: WorkerRequest["telemetryParent"],
+		requestId: number,
 	): Promise<unknown> {
 		switch (operation.kind) {
             case "replica.cleanup":
@@ -858,6 +882,7 @@ export function startWorkerHost(
 					operation.sql,
 					operation.params,
 					operation.options,
+					readSignal(requestId),
 				);
 			case "readSnapshot.open": {
 				const binding = await requiredLix(sessionId).snapshot();
@@ -898,6 +923,7 @@ export function startWorkerHost(
 					operation.sql,
 					operation.params,
 					operation.options,
+					readSignal(requestId),
 				);
 			case "transaction.stream":
 				return registerQueryStream(
@@ -906,6 +932,7 @@ export function startWorkerHost(
 						operation.sql,
 						operation.params,
 						operation.options,
+						readSignal(requestId),
 					),
 				);
 			case "transaction.commit": {
@@ -1096,6 +1123,7 @@ export function startWorkerHost(
 		sessionId: number,
 		readSnapshotId: number,
 		operation: Extract<WorkerOperation, { kind: "query" | "stream" }>,
+		signal: AbortSignal | undefined,
 	): Promise<unknown> {
 		const snapshot = readSnapshots.get(readSnapshotId);
 		if (!snapshot || snapshot.sessionId !== sessionId) {
@@ -1104,10 +1132,20 @@ export function startWorkerHost(
 			throw error;
 		}
 		if (operation.kind === "query")
-			return snapshot.binding.query(operation.sql, operation.params, operation.options);
+			return snapshot.binding.query(
+				operation.sql,
+				operation.params,
+				operation.options,
+				signal,
+			);
 		return registerQueryStream(
 			sessionId,
-			await snapshot.binding.stream(operation.sql, operation.params, operation.options),
+			await snapshot.binding.stream(
+				operation.sql,
+				operation.params,
+				operation.options,
+				signal,
+			),
 		);
 	}
 
@@ -1644,6 +1682,13 @@ export function startWorkerHost(
 		}
 		return transaction;
 	}
+}
+
+function cancelledReadError(): Error & { code: string } {
+	const error = new Error("The read was cancelled") as Error & { code: string };
+	error.name = "AbortError";
+	error.code = "LIX_ERROR_CANCELLED";
+	return error;
 }
 
 export function responseFromSyncFetch(

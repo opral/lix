@@ -224,6 +224,8 @@ export type WorkerOperation =
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
+	/** Cancels a read in flight: the engine drops it within a time slice. */
+	| { kind: "request.cancel"; requestId: number }
 	| { kind: "observe.cancel"; requestId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
@@ -250,6 +252,16 @@ export type WorkerNotification =
 	  };
 
 export type WorkerInput = WorkerRequest | WorkerNotification;
+
+/** Reads whose engine work a `request.cancel` notification stops. */
+export function isCancellableRead(operation: WorkerOperation): boolean {
+	return (
+		operation.kind === "query" ||
+		operation.kind === "stream" ||
+		operation.kind === "transaction.query" ||
+		operation.kind === "transaction.stream"
+	);
+}
 
 /**
  * Opening a stream answers with its columns and first page in one round

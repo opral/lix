@@ -119,3 +119,59 @@ test("lix.stream reads a filesystem repository through the native runtime", asyn
 		rmSync(path, { recursive: true, force: true });
 	}
 });
+
+// Minutes of engine work if nothing stops it.
+const LONG_READ = "SELECT count(*) AS n FROM generate_series(1, 100000000000)";
+
+async function within<T>(ms: number, pending: Promise<T>): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			pending,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`not settled within ${ms} ms`)), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+const started = () => new Promise((resolve) => setTimeout(resolve, 200));
+
+test("aborting a native read stops its engine work", async () => {
+	const path = mkdtempSync(join(tmpdir(), "lix-native-cancel-"));
+	const lix = await openLix({ storage: new FilesystemStorage({ path }) });
+	try {
+		const controller = new AbortController();
+		const reading = lix.query(LONG_READ, [], { signal: controller.signal });
+		await started();
+		controller.abort(new Error("stop reading"));
+		await expect(within(3_000, reading)).rejects.toThrow("stop reading");
+		// Reads on one handle run in order: this one only answers promptly if
+		// the aborted read no longer runs.
+		expect(await within(3_000, lix.queryOne("SELECT 1 AS n"))).toEqual({ n: 1 });
+
+		const snapshot = await lix.snapshot();
+		const pinned = snapshot.query(LONG_READ);
+		// Settles while close() is awaited; observed below.
+		pinned.catch(() => undefined);
+		await started();
+		await within(3_000, snapshot.close());
+		await expect(within(3_000, pinned)).rejects.toMatchObject({
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
+		});
+
+		const transaction = new AbortController();
+		const running = lix.transaction((tx) => tx.query(LONG_READ), {
+			signal: transaction.signal,
+		});
+		await started();
+		transaction.abort(new Error("stop transaction"));
+		await expect(within(3_000, running)).rejects.toThrow("stop transaction");
+		expect(await within(3_000, lix.queryOne("SELECT 2 AS n"))).toEqual({ n: 2 });
+	} finally {
+		await lix.close();
+		rmSync(path, { recursive: true, force: true });
+	}
+});

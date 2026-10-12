@@ -76,18 +76,24 @@ export type QueryStreamBinding = {
 	cancel(): void | Promise<void>;
 };
 
-/** Reads of one state: the latest state per call, a snapshot, or a transaction. */
+/**
+ * Reads of one state: the latest state per call, a snapshot, or a
+ * transaction. Aborting `signal` cancels the read in the engine: its work
+ * stops within a time slice and the call rejects with the signal's reason.
+ */
 export type ReaderBinding = {
 	query(
 		sql: string,
 		params: BindingParam[],
 		options?: BindingReadOptions,
+		signal?: AbortSignal,
 	): Promise<BindingExecuteResult>;
 	/** Resolves once the statement is planned and its first page has arrived. */
 	stream(
 		sql: string,
 		params: BindingParam[],
 		options?: BindingReadOptions,
+		signal?: AbortSignal,
 	): Promise<QueryStreamBinding>;
 };
 

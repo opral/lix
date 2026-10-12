@@ -124,11 +124,14 @@ export class Lix implements Reader {
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
 	readonly #queryStreams = new Set<LixRowStream<object>>();
 	readonly #snapshots = new Set<LixSnapshot>();
+	/** Aborts on close(): reads in flight stop in the engine. */
+	readonly #closing = new AbortController();
 	readonly #reader: ReaderContext = {
 		receiver: "lix",
 		run: (operation) => this.#runOperation(operation),
 		binding: () => this.binding,
 		adopt: (stream) => this.#adoptStream(stream),
+		signal: () => this.#closing.signal,
 	};
 	#nextObservationId = 0;
 	#transactionsOpening = 0;
@@ -405,8 +408,11 @@ export class Lix implements Reader {
 		for (let retries = 0; ; retries += 1) {
 			throwIfAborted(signal);
 			const tx = await this.beginTransaction();
+			tx._bindSignal(signal);
 			try {
-				const value = await fn(tx);
+				// Aborting settles at once: reads in flight are cancelled in the
+				// engine, and the transaction is rolled back below.
+				const value = await withAbort(Promise.resolve(fn(tx)), signal);
 				throwIfAborted(signal);
 				const { commit } = await tx.commit();
 				return { value, commit, retries };
@@ -641,9 +647,11 @@ export class Lix implements Reader {
 				error.code = "LIX_INVALID_TRANSACTION_STATE";
 				throw error;
 			}
-			// Flip the public lifecycle gate before the first await. Operations that
-			// already entered the gate are allowed to finish; later calls fail closed.
+			// Flip the public lifecycle gate before the first await. Writes that
+			// already entered the gate are allowed to finish; reads in flight are
+			// cancelled in the engine; later calls fail closed.
 			this.#acceptingOperations = false;
+			this.#closing.abort(closedError());
 			for (const {
 				lifecycle,
 				unregisterToken,
@@ -887,12 +895,20 @@ function annotateTransactionRetries(
 
 export class LixTransaction implements Reader {
 	private finished = false;
+	/** Set by `lix.transaction(fn, { signal })`: aborting cancels reads in flight. */
+	#signal: AbortSignal | undefined;
 	readonly #reader: ReaderContext = {
 		receiver: "lixTransaction",
 		run: (operation) => this.#run(operation),
 		binding: () => this.binding,
 		adopt: () => undefined,
+		signal: () => this.#signal,
 	};
+
+	/** @internal */
+	_bindSignal(signal: AbortSignal | undefined): void {
+		this.#signal = signal;
+	}
 
 	constructor(
 		private readonly binding: LixTransactionBinding,

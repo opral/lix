@@ -45,8 +45,11 @@ test("stream and snapshot reads have no fatal deadline and never report an unkno
 		expect(operationDeadline(operation)).toBeUndefined();
 		expect(lostOperationError(operation, error)).toBe(error);
 	}
-	// A buffered read of the latest state keeps the ordinary deadline.
-	expect(operationDeadline({ kind: "query", sql: "SELECT 1", params: [] })).toBe(60000);
+	// A buffered read of the latest state has no fatal deadline either.
+	expect(operationDeadline({ kind: "query", sql: "SELECT 1", params: [] })).toBeUndefined();
+	expect(
+		operationDeadline({ kind: "transaction.query", transactionId: 1, sql: "SELECT 1", params: [] }),
+	).toBeUndefined();
 	expect(lostOperationError({ kind: "executeMany", sql: "INSERT", paramSets: [] }, error)).toMatchObject({
 		code: "LIX_WRITE_OUTCOME_UNKNOWN",
 	});

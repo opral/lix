@@ -34,6 +34,7 @@ import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
 import {
 	deserializeWorkerError,
 	serializeWorkerError,
+	isCancellableRead,
 	isSessionCloseRequest,
 	type WorkerConnection,
 	type WorkerNotification,
@@ -397,13 +398,13 @@ function wrapTelemetryParentTransaction(
 	const prepareOperation = () =>
 		binding.setTelemetryParent(readTelemetryParent(parentContext));
 	return {
-		query: (sql, params, options) => {
+		query: (sql, params, options, signal) => {
 			prepareOperation();
-			return transaction.query(sql, params, options);
+			return transaction.query(sql, params, options, signal);
 		},
-		stream: (sql, params, options) => {
+		stream: (sql, params, options, signal) => {
 			prepareOperation();
-			return transaction.stream(sql, params, options);
+			return transaction.stream(sql, params, options, signal);
 		},
 		execute: (sql, params, options) => {
 			prepareOperation();
@@ -507,17 +508,21 @@ export function workerBinding(
 			lease.retain();
 			return workerBinding(client, lease, openedSessionId);
 		},
-		query: (sql, params, options) =>
-			request({ kind: "query", sql, params, options }),
-		stream: async (sql, params, options) =>
+		query: (sql, params, options, signal) =>
+			request({ kind: "query", sql, params, options }, undefined, signal),
+		stream: async (sql, params, options, signal) =>
 			workerQueryStreamBinding(
 				request,
-				await request<WorkerStreamOpened>({
-					kind: "stream",
-					sql,
-					params,
-					options,
-				}),
+				await request<WorkerStreamOpened>(
+					{
+						kind: "stream",
+						sql,
+						params,
+						options,
+					},
+					undefined,
+					signal,
+				),
 			),
 		snapshot: async () =>
 			workerReadSnapshotBinding(
@@ -644,18 +649,26 @@ function workerReadSnapshotBinding(
 	readSnapshotId: number,
 ): ReadSnapshotBinding {
 	return {
-		query: (sql, params, options) =>
-			request({ kind: "query", sql, params, options, readSnapshotId }),
-		stream: async (sql, params, options) =>
+		query: (sql, params, options, signal) =>
+			request(
+				{ kind: "query", sql, params, options, readSnapshotId },
+				undefined,
+				signal,
+			),
+		stream: async (sql, params, options, signal) =>
 			workerQueryStreamBinding(
 				request,
-				await request<WorkerStreamOpened>({
-					kind: "stream",
-					sql,
-					params,
-					options,
-					readSnapshotId,
-				}),
+				await request<WorkerStreamOpened>(
+					{
+						kind: "stream",
+						sql,
+						params,
+						options,
+						readSnapshotId,
+					},
+					undefined,
+					signal,
+				),
 			),
 		close: () =>
 			request({ kind: "readSnapshot.close", readSnapshotId }).then(
@@ -669,24 +682,32 @@ function workerTransactionBinding(
 	transactionId: number,
 ): LixTransactionBinding {
 	return {
-		query: (sql, params, options) =>
-			request({
-				kind: "transaction.query",
-				transactionId,
-				sql,
-				params,
-				options,
-			}),
-		stream: async (sql, params, options) =>
-			workerQueryStreamBinding(
-				request,
-				await request<WorkerStreamOpened>({
-					kind: "transaction.stream",
+		query: (sql, params, options, signal) =>
+			request(
+				{
+					kind: "transaction.query",
 					transactionId,
 					sql,
 					params,
 					options,
-				}),
+				},
+				undefined,
+				signal,
+			),
+		stream: async (sql, params, options, signal) =>
+			workerQueryStreamBinding(
+				request,
+				await request<WorkerStreamOpened>(
+					{
+						kind: "transaction.stream",
+						transactionId,
+						sql,
+						params,
+						options,
+					},
+					undefined,
+					signal,
+				),
 			),
 		executeMany: (sql, paramSets, options) =>
 			request({
@@ -830,7 +851,12 @@ export class LixWorkerClient {
 		telemetryParent?: TelemetryParentContext,
 		signal?: AbortSignal,
 	): Promise<T> {
-		if (signal?.aborted) return Promise.reject(observerRegistrationCancelledError());
+		if (signal?.aborted)
+			return Promise.reject(
+				operation.kind === "observe"
+					? observerRegistrationCancelledError()
+					: signal.reason,
+			);
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
@@ -906,6 +932,14 @@ export class LixWorkerClient {
 				};
 				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
 				if (signal.aborted) pendingRequest.abortListener();
+			} else if (this.pending.has(id) && signal && isCancellableRead(operation)) {
+				pendingRequest.abortListener = () => {
+					// The host stops the read in the engine and then settles the
+					// request, so it stays counted until the engine has let go.
+					if (this.pending.has(id))
+						this.notify({ kind: "request.cancel", requestId: id });
+				};
+				signal.addEventListener("abort", pendingRequest.abortListener, { once: true });
 			}
 		});
 	}

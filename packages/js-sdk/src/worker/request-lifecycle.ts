@@ -1,4 +1,4 @@
-import type { WorkerOperation } from "./protocol.js";
+import { isCancellableRead, type WorkerOperation } from "./protocol.js";
 
 // Every new public operation must declare its lost-acknowledgement policy.
 // SQL text is not a safe classifier (CTEs and functions can write). Detached
@@ -58,18 +58,16 @@ export function operationDeadline(
 	operation: WorkerOperation,
 ): number | undefined {
 	if (operation.kind === "observe.next") return undefined;
-	// One page may wait on a sort or aggregate over the whole input before its
-	// first row exists. Streams and snapshot reads have no whole-operation
-	// deadline and are closable (`stream.close`, `readSnapshot.close`), so a
-	// slow page or a slow read of a pinned state must not be fatal.
+	// Reads have no fatal deadline: a slow aggregate or a slow page is not a
+	// hung worker. They are cancellable instead (`request.cancel`,
+	// `stream.close`, `readSnapshot.close`), and the engine yields so the
+	// worker keeps receiving those messages while a read runs.
 	if (
-		operation.kind === "stream" ||
+		isCancellableRead(operation) ||
 		operation.kind === "stream.next" ||
 		operation.kind === "stream.close" ||
-		operation.kind === "transaction.stream" ||
 		operation.kind === "readSnapshot.open" ||
-		operation.kind === "readSnapshot.close" ||
-		(operation.kind === "query" && operation.readSnapshotId !== undefined)
+		operation.kind === "readSnapshot.close"
 	)
 		return undefined;
 	if (operation.kind === "close") return 5_000;

@@ -65,6 +65,7 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_ERROR_NO_ROWS` | Rust `one()` found no row. Use `optional()` when the row may be absent. |
 | `LIX_ERROR_AMBIGUOUS_COLUMN` | A result has two columns with the same name, so rows cannot be keyed by name. Alias the columns. |
 | `LIX_ERROR_SNAPSHOT_CLOSED` | A read used a snapshot after it closed, or the snapshot closed while the read ran. |
+| `LIX_ERROR_CANCELLED` | The caller cancelled a read (JS: aborted its signal, or closed its snapshot or Lix). The engine stopped the work. |
 | `LIX_ERROR_QUERY_STREAM_LOST` | A stream pull named a stream the worker no longer holds (its owner was replaced or it was released). Start a new stream. |
 | `LIX_ERROR_SYNC_TRANSPORT_STALLED` | A hydration demand's transport made no progress for 60 seconds. `details.retryable` is `true`; the read did not observe partial state. |
 | `LIX_UNSUPPORTED_SQL` | SQL syntax is valid, but the feature is intentionally outside the Lix SQL surface. |
@@ -130,6 +131,7 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_ALREADY_INITIALIZED` | [packages/lix/src/engine.rs](../packages/lix/src/engine.rs) |
 | `LIX_ERROR_AMBIGUOUS_COLUMN` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_CACHE_CLEANUP` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
+| `LIX_ERROR_CANCELLED` | [packages/js-bindings/wasm.rs](../packages/js-bindings/wasm.rs) |
 | `LIX_ERROR_CAPACITY` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_CLOSED` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_FILE_NOT_FOUND` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |

@@ -1,0 +1,138 @@
+import { expect, test } from "vitest";
+import { openLix } from "./open-lix.js";
+
+// Minutes of engine work if nothing stops it.
+const LONG_READ = "SELECT count(*) AS n FROM generate_series(1, 4000000000)";
+
+/** Rejects if `pending` has not settled within `ms`. */
+async function within<T>(ms: number, pending: Promise<T>): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`not settled within ${ms} ms`)), ms);
+	});
+	try {
+		return await Promise.race([pending, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+const started = () => new Promise((resolve) => setTimeout(resolve, 200));
+
+/** The worker is free again: a trivial read answers promptly. */
+async function expectResponsive(lix: Awaited<ReturnType<typeof openLix>>) {
+	expect(await within(3_000, lix.queryOne("SELECT 1 AS n"))).toEqual({ n: 1 });
+}
+
+test("aborting an in-flight query stops its engine work", async () => {
+	const lix = await openLix();
+	try {
+		const controller = new AbortController();
+		const reading = lix.query(LONG_READ, [], { signal: controller.signal });
+		await started();
+		controller.abort(new Error("stop reading"));
+		await expect(within(3_000, reading)).rejects.toThrow("stop reading");
+		await expectResponsive(lix);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("aborting an in-flight stream open stops its engine work", async () => {
+	const lix = await openLix();
+	try {
+		const controller = new AbortController();
+		const opening = lix.stream(LONG_READ, [], { signal: controller.signal });
+		await started();
+		controller.abort(new Error("stop streaming"));
+		await expect(within(3_000, opening)).rejects.toThrow("stop streaming");
+		await expectResponsive(lix);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("aborting an in-flight snapshot query stops its engine work", async () => {
+	const lix = await openLix();
+	try {
+		const controller = new AbortController();
+		await lix.read(async (snapshot) => {
+			const reading = snapshot.query(LONG_READ, [], { signal: controller.signal });
+			await started();
+			controller.abort(new Error("stop snapshot read"));
+			await expect(within(3_000, reading)).rejects.toThrow("stop snapshot read");
+			expect(await within(3_000, snapshot.queryOne("SELECT 1 AS n"))).toEqual({ n: 1 });
+		});
+		await expectResponsive(lix);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("aborting read() cancels the snapshot's reads in flight", async () => {
+	const lix = await openLix();
+	try {
+		const controller = new AbortController();
+		const reading = lix.read((snapshot) => snapshot.query(LONG_READ), {
+			signal: controller.signal,
+		});
+		await started();
+		controller.abort(new Error("stop read"));
+		await expect(within(3_000, reading)).rejects.toThrow("stop read");
+		await expectResponsive(lix);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("closing a snapshot during a long read cancels the read", async () => {
+	const lix = await openLix();
+	try {
+		const snapshot = await lix.snapshot();
+		const reading = snapshot.query(LONG_READ);
+		// Settles while close() is awaited; observed below.
+		reading.catch(() => undefined);
+		await started();
+		await within(3_000, snapshot.close());
+		await expect(within(3_000, reading)).rejects.toMatchObject({
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
+		});
+		await expectResponsive(lix);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("closing a Lix during a long read cancels the read", async () => {
+	const lix = await openLix();
+	const reading = lix.query(LONG_READ);
+	reading.catch(() => undefined);
+	await started();
+	await within(5_000, lix.close());
+	await expect(within(3_000, reading)).rejects.toMatchObject({ name: "LixError" });
+});
+
+test("aborting a transaction cancels its read in flight and rolls back", async () => {
+	const lix = await openLix();
+	try {
+		const controller = new AbortController();
+		const running = lix.transaction(
+			async (tx) => {
+				await tx.execute(
+					"INSERT INTO lix_key_value (key, value) VALUES ('cancel-probe', '1')",
+				);
+				await tx.query(LONG_READ);
+			},
+			{ signal: controller.signal },
+		);
+		await started();
+		controller.abort(new Error("stop transaction"));
+		await expect(within(3_000, running)).rejects.toThrow("stop transaction");
+		await expectResponsive(lix);
+		expect(
+			await lix.queryOne("SELECT key FROM lix_key_value WHERE key = 'cancel-probe'"),
+		).toBeUndefined();
+	} finally {
+		await lix.close();
+	}
+});

@@ -206,7 +206,37 @@ export type ReaderContext = {
 	binding(): ReaderBinding;
 	/** Tracks an open stream so the owner can close it. */
 	adopt(stream: LixRowStream<object>): void;
+	/** Aborts when the owner closes (or its transaction is aborted). */
+	signal?(): AbortSignal | undefined;
 };
+
+/** A signal that aborts when any of `signals` aborts, with its reason. */
+export function anySignal(
+	signals: readonly (AbortSignal | undefined)[],
+): AbortSignal | undefined {
+	const present = signals.filter((signal): signal is AbortSignal => !!signal);
+	if (present.length <= 1) return present[0];
+	if (typeof AbortSignal.any === "function") return AbortSignal.any(present);
+	const controller = new AbortController();
+	for (const signal of present) {
+		if (signal.aborted) {
+			controller.abort(signal.reason);
+			break;
+		}
+		signal.addEventListener("abort", () => controller.abort(signal.reason), {
+			once: true,
+		});
+	}
+	return controller.signal;
+}
+
+/** The signal a read passes to the engine: the caller's and the owner's. */
+function readSignal(
+	context: ReaderContext,
+	signal: AbortSignal | undefined,
+): AbortSignal | undefined {
+	return anySignal([signal, context.signal?.()]);
+}
 
 export async function query<TRow extends object>(
 	context: ReaderContext,
@@ -218,9 +248,12 @@ export async function query<TRow extends object>(
 	const native = nativeParams("query", context.receiver, params);
 	const bindingOptions = readOptions("query", context.receiver, options);
 	throwIfAborted(options.signal);
+	// The caller's signal and the owner's (closing the snapshot or Lix, or
+	// aborting the transaction): either cancels the read with its reason.
+	const signal = readSignal(context, options.signal);
 	const result = await withAbort(
-		context.run(() => context.binding().query(sql, native, bindingOptions)),
-		options.signal,
+		context.run(() => context.binding().query(sql, native, bindingOptions, signal)),
+		signal,
 	);
 	return rowsOf(result) as TRow[];
 }
@@ -234,10 +267,15 @@ export async function queryOne<TRow extends object>(
 	assertSql("queryOne", context.receiver, sql);
 	const native = nativeParams("queryOne", context.receiver, params);
 	assertOptions("queryOne", context.receiver, options);
+	// At most two rows are read, so no byte cap applies.
+	const bindingOptions = { single: true };
 	throwIfAborted(options.signal);
+	// The caller's signal and the owner's (closing the snapshot or Lix, or
+	// aborting the transaction): either cancels the read with its reason.
+	const signal = readSignal(context, options.signal);
 	const result = await withAbort(
-		context.run(() => context.binding().query(sql, native, { single: true })),
-		options.signal,
+		context.run(() => context.binding().query(sql, native, bindingOptions, signal)),
+		signal,
 	);
 	return rowsOf(result)[0] as TRow | undefined;
 }
@@ -252,10 +290,15 @@ export async function stream<TRow extends object>(
 	const native = nativeParams("stream", context.receiver, params);
 	const bindingOptions = readOptions("stream", context.receiver, options);
 	throwIfAborted(options.signal);
-	const opening = context.run(() => context.binding().stream(sql, native, bindingOptions));
+	const signal = readSignal(context, options.signal);
+	const opening = context.run(() =>
+		context
+			.binding()
+			.stream(sql, native, bindingOptions, signal),
+	);
 	let binding: QueryStreamBinding;
 	try {
-		binding = await withAbort(opening, options.signal);
+		binding = await withAbort(opening, signal);
 	} catch (error) {
 		// An abort that wins the race must still release the stream.
 		void opening.then(
@@ -447,6 +490,7 @@ const snapshotFinalizer = new FinalizationRegistry<ReadSnapshotBinding>(
 export class LixSnapshot implements Snapshot {
 	#closePromise: Promise<void> | undefined;
 	#closed = false;
+	readonly #closing = new AbortController();
 	readonly #streams = new Set<LixRowStream<object>>();
 	readonly #context: ReaderContext;
 
@@ -464,6 +508,7 @@ export class LixSnapshot implements Snapshot {
 				this.#streams.add(stream);
 				stream.onClose(() => this.#streams.delete(stream));
 			},
+			signal: () => this.#closing.signal,
 		};
 	}
 
@@ -495,6 +540,8 @@ export class LixSnapshot implements Snapshot {
 	close(): Promise<void> {
 		return (this.#closePromise ??= (async () => {
 			this.#closed = true;
+			// Stop reads in flight in the engine, so closing never waits on them.
+			this.#closing.abort(snapshotClosedError());
 			snapshotFinalizer.unregister(this);
 			const streams = [...this.#streams].map((stream) =>
 				stream.fail(snapshotClosedError()),

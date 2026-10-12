@@ -176,7 +176,7 @@ Anything else (plain objects, arrays, `Date`, `undefined`, `NaN`, `Infinity`, `b
 
 Rows are plain objects keyed by column name. A result with two columns of the same name rejects with `LIX_ERROR_AMBIGUOUS_COLUMN`; alias them (`SELECT a.id AS a_id, b.id AS b_id`).
 
-Aborting `signal` rejects the call with the signal's reason.
+Reads have no deadline. Aborting `signal` rejects the call with the signal's reason and cancels the read in the engine: its work stops within a few milliseconds, so the next call on the same Lix runs at once. Closing a snapshot or the Lix cancels the reads running through it the same way.
 
 ### queryOne()
 

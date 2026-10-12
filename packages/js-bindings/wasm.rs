@@ -354,6 +354,52 @@ pub(super) fn read_options_from_js(
     })
 }
 
+/// Runs `operation` until it settles or `signal` (a JS `AbortSignal`) aborts.
+/// Aborting drops the operation's future, which stops the engine work: reads
+/// yield cooperatively, so the drop takes effect within a time slice.
+pub(super) async fn abortable<T>(
+    signal: Option<JsValue>,
+    operation: impl Future<Output = Result<T, JsValue>>,
+) -> Result<T, JsValue> {
+    let Some(signal) = signal.filter(JsValue::is_object) else {
+        return operation.await;
+    };
+    let aborted_error = |signal: &JsValue| {
+        Reflect::get(signal, &"reason".into())
+            .ok()
+            .filter(|reason| !reason.is_undefined())
+            .unwrap_or_else(|| {
+                lix_error_to_js(LixError::new(
+                    "LIX_ERROR_CANCELLED",
+                    "the operation was cancelled",
+                ))
+            })
+    };
+    if Reflect::get(&signal, &"aborted".into())
+        .ok()
+        .and_then(|aborted| aborted.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(aborted_error(&signal));
+    }
+    let (handle, registration) = AbortHandle::new_pair();
+    let listener = Closure::<dyn FnMut()>::new(move || handle.abort());
+    let call = |method: &str| {
+        if let Ok(function) =
+            Reflect::get(&signal, &method.into()).and_then(|value| value.dyn_into::<Function>())
+        {
+            let _ = function.call2(&signal, &"abort".into(), listener.as_ref());
+        }
+    };
+    call("addEventListener");
+    let result = Abortable::new(operation, registration).await;
+    call("removeEventListener");
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(aborted_error(&signal)),
+    }
+}
+
 /// Reads `{ maxBytes }` from a stream's options.
 pub(super) fn read_max_bytes_from_js(options: Option<JsValue>) -> Result<Option<usize>, JsValue> {
     Ok(read_options_from_js(options)?.max_bytes)
@@ -392,13 +438,17 @@ impl WasmReadSnapshot {
         sql: String,
         params: JsValue,
         options: Option<JsValue>,
+        signal: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let params = values_from_js(params)?;
-        let options = read_options_from_js(options)?;
-        let result = crate::session::run_query(self.inner.query(&sql).params(params), options)
-            .await
-            .map_err(lix_error_to_js)?;
-        execute_result_to_js(result)
+        abortable(signal, async {
+            let params = values_from_js(params)?;
+            let options = read_options_from_js(options)?;
+            let result = crate::session::run_query(self.inner.query(&sql).params(params), options)
+                .await
+                .map_err(lix_error_to_js)?;
+            execute_result_to_js(result)
+        })
+        .await
     }
 
     #[wasm_bindgen(js_name = stream)]
@@ -407,16 +457,20 @@ impl WasmReadSnapshot {
         sql: String,
         params: JsValue,
         options: Option<JsValue>,
+        signal: Option<JsValue>,
     ) -> Result<WasmQueryStream, JsValue> {
-        let params = values_from_js(params)?;
-        let max_bytes = read_max_bytes_from_js(options)?;
-        let mut query = self.inner.query(&sql).params(params);
-        if let Some(max_bytes) = max_bytes {
-            query = query.max_bytes(max_bytes);
-        }
-        Ok(WasmQueryStream::new(
-            query.stream().await.map_err(lix_error_to_js)?,
-        ))
+        abortable(signal, async {
+            let params = values_from_js(params)?;
+            let max_bytes = read_max_bytes_from_js(options)?;
+            let mut query = self.inner.query(&sql).params(params);
+            if let Some(max_bytes) = max_bytes {
+                query = query.max_bytes(max_bytes);
+            }
+            Ok(WasmQueryStream::new(
+                query.stream().await.map_err(lix_error_to_js)?,
+            ))
+        })
+        .await
     }
 
     #[wasm_bindgen(js_name = close)]
@@ -1249,14 +1303,22 @@ impl WasmLixTransaction {
         sql: String,
         params: JsValue,
         options: Option<JsValue>,
+        signal: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let params = values_from_js(params)?;
-        let options = read_options_from_js(options)?;
-        let result =
-            crate::session::TransactionOperations::query(&mut self.inner, &sql, &params, options)
-                .await
-                .map_err(lix_error_to_js)?;
-        execute_result_to_js(result)
+        abortable(signal, async {
+            let params = values_from_js(params)?;
+            let options = read_options_from_js(options)?;
+            let result = crate::session::TransactionOperations::query(
+                &mut self.inner,
+                &sql,
+                &params,
+                options,
+            )
+            .await
+            .map_err(lix_error_to_js)?;
+            execute_result_to_js(result)
+        })
+        .await
     }
 
     #[wasm_bindgen(js_name = stream)]
@@ -1265,18 +1327,22 @@ impl WasmLixTransaction {
         sql: String,
         params: JsValue,
         options: Option<JsValue>,
+        signal: Option<JsValue>,
     ) -> Result<WasmQueryStream, JsValue> {
-        let params = values_from_js(params)?;
-        let max_bytes = read_max_bytes_from_js(options)?;
-        let stream = crate::session::TransactionOperations::stream(
-            &mut self.inner,
-            &sql,
-            &params,
-            max_bytes,
-        )
+        abortable(signal, async {
+            let params = values_from_js(params)?;
+            let max_bytes = read_max_bytes_from_js(options)?;
+            let stream = crate::session::TransactionOperations::stream(
+                &mut self.inner,
+                &sql,
+                &params,
+                max_bytes,
+            )
+            .await
+            .map_err(lix_error_to_js)?;
+            Ok(WasmQueryStream::new(stream))
+        })
         .await
-        .map_err(lix_error_to_js)?;
-        Ok(WasmQueryStream::new(stream))
     }
 
     #[wasm_bindgen(js_name = executeMany)]
