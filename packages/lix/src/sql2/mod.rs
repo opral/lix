@@ -6,6 +6,7 @@ mod catalog;
 mod change_materialization;
 mod checkpoint_function;
 mod context;
+mod cooperative;
 mod dialect;
 mod dml;
 mod error;

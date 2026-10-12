@@ -688,7 +688,9 @@ pub(crate) fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn
     let mut scan_counts = HashMap::new();
     collect_statement_scan_counts(&plan, &mut scan_counts);
     let mut caches = HashMap::new();
-    adapt_runtime_plan_inner(plan, &scan_counts, &mut caches)
+    let plan = adapt_runtime_plan_inner(plan, &scan_counts, &mut caches)?;
+    // Last, so every rewrite above still sees the plain leaves it inspects.
+    super::cooperative::wrap_leaves(plan)
 }
 
 fn collect_statement_scan_counts(
@@ -734,10 +736,17 @@ fn adapt_runtime_plan_inner(
         .filter(|key| scan_counts.get(*key).copied().unwrap_or_default() > 1)
         .cloned()
     {
-        let state = caches
-            .entry(key)
-            .or_insert_with(|| Arc::new(StatementScanCacheState::new(Arc::clone(&plan))))
-            .clone();
+        let state = match caches.get(&key) {
+            Some(state) => Arc::clone(state),
+            None => {
+                // The cache's own input yields too; see `wrap_leaves`.
+                let state = Arc::new(StatementScanCacheState::new(
+                    super::cooperative::wrap_leaves(Arc::clone(&plan))?,
+                ));
+                caches.insert(key, Arc::clone(&state));
+                state
+            }
+        };
         return Ok(Arc::new(StatementScanCacheExec::new(state)));
     }
 
@@ -813,7 +822,8 @@ fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Execut
 /// The scan a probe side reads its rows from, if the operators above it in
 /// that side neither rename its columns nor add rows to it.
 ///
-/// DataFusion puts a cooperative-yielding wrapper over every leaf and may put
+/// DataFusion (and Lix's [`super::cooperative::YieldingExec`]) put a
+/// cooperative-yielding wrapper over every leaf, and DataFusion may put
 /// batch coalescing or a residual filter between the join and the scan. All
 /// three pass their input's schema through unchanged, so a join key names the
 /// same scan column through any chain of them, and all three only ever emit a
@@ -836,7 +846,7 @@ fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&SpecScanExec> {
 fn probe_passthrough(plan: &dyn ExecutionPlan) -> bool {
     matches!(
         plan.name(),
-        "CooperativeExec" | "CoalesceBatchesExec" | "FilterExec"
+        "CooperativeExec" | "YieldingExec" | "CoalesceBatchesExec" | "FilterExec"
     )
 }
 

@@ -746,3 +746,69 @@ async fn execute_many_rejects_every_row_returning_statement_and_validates_bindin
     transaction.rollback().await.unwrap();
     assert_eq!(count(&lix).await, 1);
 }
+/// A read over data that is all in memory never waits on I/O, so without
+/// cooperative yielding one poll would run the whole aggregate and nothing
+/// (a cancel, a timeout, the browser's event loop) could interrupt it.
+#[tokio::test]
+async fn a_long_read_yields_so_dropping_it_cancels_promptly() {
+    let lix = seeded(1).await;
+    let started = std::time::Instant::now();
+    let read = lix
+        .query("SELECT count(*) AS n FROM generate_series(1, 4000000000)")
+        .one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), read).await;
+    assert!(outcome.is_err(), "the read must still be running");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the timeout must fire while the read runs, not after: {:?}",
+        started.elapsed()
+    );
+    // Dropping the read released the session: a write proceeds at once.
+    lix.execute("INSERT INTO api_item (id, label) VALUES (700, 'after cancel')")
+        .await
+        .unwrap();
+    assert_eq!(count(&lix).await, 2);
+}
+
+#[tokio::test]
+async fn a_long_snapshot_read_yields_so_dropping_it_cancels_promptly() {
+    let lix = seeded(1).await;
+    let snapshot = lix.snapshot().await.unwrap();
+    let started = std::time::Instant::now();
+    let read = snapshot
+        .query("SELECT count(*) AS n FROM generate_series(1, 4000000000)")
+        .one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), read).await;
+    assert!(outcome.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    snapshot.close().await.unwrap();
+}
+
+
+/// Outside Tokio's cooperative budget (the browser's executor has none), the
+/// engine still yields: no single poll of a long read runs past a few time
+/// slices, so cancels and other work interleave with it.
+#[tokio::test]
+async fn a_long_read_yields_without_an_executor_budget() {
+    let lix = seeded(1).await;
+    let read = lix
+        .query("SELECT count(*) AS n FROM generate_series(1, 4000000000)")
+        .one();
+    let mut read = std::pin::pin!(tokio::task::coop::unconstrained(read));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let started = std::time::Instant::now();
+    let mut longest = std::time::Duration::ZERO;
+    while started.elapsed() < std::time::Duration::from_millis(300) {
+        let poll_started = std::time::Instant::now();
+        let poll = read.as_mut().poll(&mut cx);
+        longest = longest.max(poll_started.elapsed());
+        assert!(poll.is_pending(), "the read cannot finish this soon");
+        // Let other tasks (admission, storage) make progress between polls.
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        longest < std::time::Duration::from_millis(150),
+        "one poll ran for {longest:?}"
+    );
+}
