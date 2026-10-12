@@ -440,6 +440,7 @@ where
         // concurrent read extended the view meanwhile, extend that extension
         // instead of replacing it, so neither read's inputs are lost.
         let mut base = pinned.clone();
+        let mut raced = false;
         loop {
             let Some(read) = crate::transaction::extend_pinned_read_with_hydrated_inputs(
                 &base.storage,
@@ -451,7 +452,11 @@ where
             )
             .await?
             else {
-                return Ok(false);
+                // Nothing left to add. After a race that means a concurrent
+                // read's extension already holds these inputs (two reads
+                // hydrating the same blob manifest), so retry on that view;
+                // on the read's own view it means hydration did not help.
+                return Ok(raced);
             };
             let mut state = self
                 .state
@@ -469,7 +474,10 @@ where
                     };
                     return Ok(true);
                 }
-                SnapshotState::Open(current) => base = current.clone(),
+                SnapshotState::Open(current) => {
+                    base = current.clone();
+                    raced = true;
+                }
                 SnapshotState::Closed => return Err(snapshot_closed()),
             }
         }
