@@ -113,8 +113,11 @@ pub(crate) fn classify_statement(sql: &str) -> Result<StatementClass, LixError> 
             "Lix SQL only supports one statement per call",
         ));
     };
+    // Unsupported statements (SET, CREATE TABLE, a data-modifying CTE)
+    // fail as unsupported, not as writes a read API refuses.
+    let route = super::bind_statement_route(&statement.statement)?;
     Ok(StatementClass {
-        read_only: super::read_only_statement(&statement.statement),
+        read_only: route == super::BoundStatementRoute::Read,
         returns_rows: super::statement_returns_rows(&statement.statement),
     })
 }
@@ -347,6 +350,27 @@ mod tests {
             ]
         );
         assert!(classify_statement("SELECT 1; SELECT 2").is_err());
+        for unsupported in [
+            "WITH d AS (DELETE FROM lix_key_value RETURNING key) SELECT key FROM d",
+            "EXPLAIN SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
+            "EXPLAIN ANALYZE INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')",
+            "SET search_path = public",
+            "CREATE TABLE t (a INT)",
+            "BEGIN",
+        ] {
+            assert_eq!(
+                classify_statement(unsupported).unwrap_err().code,
+                LixError::CODE_UNSUPPORTED_SQL,
+                "{unsupported}"
+            );
+        }
+        assert_eq!(
+            classify_statement("EXPLAIN SELECT 1").unwrap(),
+            StatementClass {
+                read_only: true,
+                returns_rows: true
+            }
+        );
     }
 
     #[test]
