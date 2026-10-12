@@ -15593,41 +15593,6 @@ mod tests {
         }
     }
 
-    struct PackedSegmentBatchRead<R> {
-        inner: R,
-        batch_sizes: Arc<StdMutex<Vec<usize>>>,
-    }
-
-    impl<R: StorageAdapterRead> StorageAdapterRead for PackedSegmentBatchRead<R> {
-        fn snapshot_cache_key(&self) -> Option<u128> {
-            self.inner.snapshot_cache_key()
-        }
-
-        async fn get_many(
-            &self,
-            requests: &[StorageGetManyRequest<'_>],
-        ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
-            for request in requests {
-                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE {
-                    self.batch_sizes
-                        .lock()
-                        .expect("packed segment batch probe should lock")
-                        .push(request.keys.len());
-                }
-            }
-            self.inner.get_many(requests).await
-        }
-
-        async fn begin_scan(
-            &self,
-            space: StorageSpace,
-            range: StorageKeyRange,
-            opts: StorageBeginScanOptions,
-        ) -> Result<StorageScanCursor<'_>, crate::storage_adapter::StorageError> {
-            self.inner.begin_scan(space, range, opts).await
-        }
-    }
-
     #[tokio::test]
     async fn packed_logical_pk_lookup_is_bounded_and_keeps_file_scopes() {
         const BRANCH: &str = "01991b1d-6d8b-7000-8000-000000000071";

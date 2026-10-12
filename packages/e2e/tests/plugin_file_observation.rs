@@ -49,7 +49,7 @@ async fn transaction_reads<S: Storage + Clone + Send + Sync + 'static>(
                 .into_rows(),
         );
     }
-    transaction.rollback().await.unwrap();
+    transaction.commit().await.unwrap();
     results
 }
 
@@ -479,7 +479,7 @@ async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
                 .params(&[Value::Blob(external.clone().into_bytes().into())])
                 .await
                 .expect(
-                    "a mixed snapshot delivers current bytes and must refresh their observation",
+                    "a mixed read transaction delivers current bytes and must refresh their observation",
                 );
             let rows = primary
                 .query("SELECT content FROM lix_file WHERE path='/a.md'")

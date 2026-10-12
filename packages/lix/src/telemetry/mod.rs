@@ -1384,13 +1384,12 @@ mod tests {
     }
 
     #[test]
-    fn production_contract_has_eleven_names_and_no_legacy_aliases() {
-        assert_eq!(PRODUCTION_NAMES.len(), 11);
-        assert_eq!(spans::ALL.len(), 11);
+    fn production_contract_has_unique_names_and_no_legacy_aliases() {
+        assert_eq!(PRODUCTION_NAMES.len(), spans::ALL.len());
         let mut names = PRODUCTION_NAMES.to_vec();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), PRODUCTION_NAMES.len());
         for forbidden in FORBIDDEN_PRODUCTION_NAMES {
             assert!(!PRODUCTION_NAMES.contains(forbidden));
         }

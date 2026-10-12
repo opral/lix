@@ -9757,15 +9757,77 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
+        fn returned_file_path_projection(
+            statement: &mut DataFusionStatement,
+            template: &DataFusionStatement,
+            content_index: usize,
+        ) -> Option<(usize, usize)> {
+            use datafusion::sql::sqlparser::ast::{Ident, SelectItem, SetExpr, Statement};
+            let DataFusionStatement::Statement(template) = template else {
+                return None;
+            };
+            let Statement::Query(template) = template.as_ref() else {
+                return None;
+            };
+            let SetExpr::Select(template) = template.body.as_ref() else {
+                return None;
+            };
+            let SelectItem::ExprWithAlias { expr, .. } = &template.projection[content_index] else {
+                return None;
+            };
+            let DataFusionStatement::Statement(original) = statement else {
+                return None;
+            };
+            let Statement::Query(original) = original.as_mut() else {
+                return None;
+            };
+            let SetExpr::Select(original) = original.body.as_mut() else {
+                return None;
+            };
+            let path_index = original.projection.len();
+            let mut alias = "__lix_returned_file_path".to_owned();
+            while original.projection.iter().any(|item| {
+                matches!(item,
+                SelectItem::ExprWithAlias { alias: existing, .. }
+                    if existing.value.eq_ignore_ascii_case(&alias))
+            }) {
+                alias.push('_');
+            }
+            original.projection.push(SelectItem::ExprWithAlias {
+                expr: expr.clone(),
+                alias: Ident::with_quote('"', alias),
+            });
+            Some((path_index, content_index))
+        }
+
         let read_store = self.opening_read();
         let capture = self.hot_state.capture_foreground_read_interests();
         let hot_state = capture.as_ref().map_or_else(
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
-        let file_view_collector = crate::sql2::plan_read_statement(&statement, &params)
-            .acknowledge_file_views
-            .then(|| self.transaction_file_views.fork_for_read());
+        // Providers may hydrate files before WHERE/LIMIT. Keep their paths
+        // through execution so only returned bytes refresh session observations.
+        let mut statement = statement;
+        let read_plan = crate::sql2::plan_read_statement(&statement, &params);
+        let acknowledgement = read_plan
+            .late_content
+            .as_ref()
+            .filter(|plan| plan.projection.acknowledges_content())
+            .and_then(|plan| {
+                returned_file_path_projection(
+                    &mut statement,
+                    plan.statement.as_ref(),
+                    plan.data_column_index,
+                )
+            });
+        let sql = if acknowledgement.is_some() {
+            statement.to_string()
+        } else {
+            sql
+        };
+        let file_view_collector =
+            acknowledgement.map(|_| self.transaction_file_views.fork_for_read());
 
         if let Some((_, capture)) = &capture {
             crate::session::seed_foreground_filesystem_interest(
@@ -9789,15 +9851,37 @@ where
         .await;
         self.record_sql_reads = previous_recording;
         match result {
-            Ok(result) => {
+            Ok((mut result, resolved_statement)) => {
                 if let Some((_, capture)) = capture {
                     capture.publish_capture()?;
                 }
-                if let Some(file_view_collector) = file_view_collector {
-                    self.transaction_file_views
-                        .apply_mutations(file_view_collector.plugin_file_mutations());
+                if let Some((path_index, content_index)) = acknowledgement {
+                    let mut returned_paths = BTreeSet::new();
+                    for row in &mut result.rows {
+                        let path = row.remove(path_index);
+                        if !matches!(row[content_index], Value::Null)
+                            && let Value::Text(path) = path
+                        {
+                            returned_paths.insert(path.to_string());
+                        }
+                    }
+                    result.columns.remove(path_index);
+                    if !result.column_types.is_empty() {
+                        result.column_types.remove(path_index);
+                    }
+                    if let Some(collector) = file_view_collector {
+                        self.transaction_file_views.apply_mutations(
+                            collector
+                                .plugin_file_mutations()
+                                .into_iter()
+                                .filter(|mutation| {
+                                    matches!(mutation, SessionFileViewMutation::Set { view, .. }
+                                    if returned_paths.contains(&view.path))
+                                }),
+                        );
+                    }
                 }
-                Ok(result)
+                Ok((result, resolved_statement))
             }
             Err(error) => Err(crate::sync::annotate_read_fulfillment_capture(
                 error,
