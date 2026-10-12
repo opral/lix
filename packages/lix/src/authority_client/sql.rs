@@ -3,7 +3,7 @@
 //! sends a write, `execute_many()` never runs a statement that returns rows,
 //! and buffered reads honour the caller's byte cap.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{ClientCore, ProtocolExecuteOptions, ProtocolHttp, ProtocolTransaction};
 use crate::{ExecuteBatchStatement, ExecuteResult, LixError, QueryResult, Value};
@@ -93,8 +93,12 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
     }
 
     /// Stages one statement once per parameter set. The server has no
-    /// statement checkpoint, so a failure after some sets were staged marks
-    /// the transaction rollback-only: its commit rolls back and fails.
+    /// statement checkpoint, so unless the call fails with a definite
+    /// rejection of its first set (nothing staged), a failure, an unknown
+    /// outcome or a cancel (the future dropped mid-request) marks the
+    /// transaction rollback-only: its commit rolls back and fails. This
+    /// matches a local transaction, where a failed `execute_many` stages
+    /// nothing.
     pub async fn execute_many(
         &self,
         sql: &str,
@@ -102,18 +106,38 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
         options: Option<ProtocolExecuteOptions>,
     ) -> Result<u64, LixError> {
         check_execute_many(sql)?;
+        /// Poisons the transaction unless disarmed: dropping the call
+        /// mid-request leaves the server's staged state unknown.
+        struct PoisonOnDrop<'a> {
+            rollback_only: &'a AtomicBool,
+            armed: bool,
+        }
+        impl Drop for PoisonOnDrop<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.rollback_only.store(true, Ordering::Release);
+                }
+            }
+        }
+        let mut poison = PoisonOnDrop {
+            rollback_only: &self.rollback_only,
+            armed: true,
+        };
         let mut rows_affected = 0;
         for (index, params) in param_sets.into_iter().enumerate() {
             match self.execute(sql, &params, options.clone()).await {
                 Ok(result) => rows_affected += result.rows_affected(),
                 Err(error) => {
-                    if index > 0 {
-                        self.rollback_only.store(true, Ordering::Release);
+                    // The server rejected the first set outright: nothing is
+                    // staged and the transaction stays usable.
+                    if index == 0 && super::is_definitive_client_error(&error) {
+                        poison.armed = false;
                     }
                     return Err(error);
                 }
             }
         }
+        poison.armed = false;
         Ok(rows_affected)
     }
 }

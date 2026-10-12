@@ -3909,6 +3909,64 @@ async fn remote_queries_never_write_and_execute_runs_anything() {
     stop_server(server_task).await;
 }
 
+/// A remote transaction matches a local one: a first parameter set the
+/// server rejects stages nothing and leaves the transaction usable, while a
+/// cancelled `execute_many` (outcome unknown) makes it roll back.
+#[tokio::test]
+async fn remote_execute_many_poisons_its_transaction_only_when_staging_is_unknown() {
+    let (authority_storage, authority) = open_authority().await;
+    authority.close().await.expect("close authority setup");
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let remote = open_lix()
+        .with_server(ServerOptions::new(&url))
+        .await
+        .expect("open remote handle");
+    let insert = "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)";
+
+    let transaction = remote.begin_transaction().await.unwrap();
+    transaction
+        .execute_many(
+            insert,
+            [[Value::Null, Value::from("a key must not be null")]],
+        )
+        .await
+        .unwrap_err();
+    transaction
+        .execute_many(insert, [[Value::from("after-rejection"), Value::from("1")]])
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let transaction = remote.begin_transaction().await.unwrap();
+    let cancelled = futures_util::FutureExt::now_or_never(IntoFuture::into_future(
+        transaction.execute_many(insert, [[Value::from("cancelled"), Value::from("1")]]),
+    ));
+    assert!(
+        cancelled.is_none(),
+        "the request cannot finish within one poll"
+    );
+    assert_eq!(
+        transaction.commit().await.unwrap_err().code,
+        LixError::CODE_INVALID_TRANSACTION_STATE
+    );
+    for (key, committed) in [("after-rejection", true), ("cancelled", false)] {
+        assert_eq!(
+            remote
+                .query("SELECT key FROM lix_key_value WHERE key = $1")
+                .bind(key)
+                .optional()
+                .await
+                .unwrap()
+                .is_some(),
+            committed,
+            "{key}"
+        );
+    }
+    remote.close().await.unwrap();
+    stop_server(server_task).await;
+}
+
 #[tokio::test]
 async fn execute_of_a_read_on_a_partial_replica_takes_the_read_path() {
     let (authority_storage, authority) = open_authority().await;
