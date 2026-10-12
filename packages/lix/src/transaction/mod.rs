@@ -4,6 +4,8 @@ mod branch_heads;
 mod commit;
 mod commit_coordinator;
 mod context;
+#[cfg(test)]
+pub(crate) use context::FLUSH_PAUSE;
 mod normalization;
 mod read_set;
 mod schema_resolver;

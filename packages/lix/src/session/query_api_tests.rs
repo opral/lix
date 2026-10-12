@@ -851,3 +851,54 @@ async fn a_failed_execute_many_rewinds_the_deterministic_sequence() {
     }
     assert_eq!(next_uuid_after(true).await, next_uuid_after(false).await);
 }
+
+/// A transaction read that is cancelled while it flushes staged writes
+/// (after it took them from the journal) must not let the transaction commit
+/// without those writes.
+#[tokio::test]
+async fn a_read_cancelled_mid_flush_poisons_its_transaction() {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\
+         \"key\":\"flush_probe\",\"columns\":[{\"name\":\"path\",\"type\":\"text\",\"nullable\":false},\
+         {\"name\":\"value\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"path\"]}' AS JSONB))",
+    )
+    .await
+    .unwrap();
+    lix.execute("INSERT INTO flush_probe (path, value) VALUES ('/a', '1'::jsonb), ('/b', '1'::jsonb)")
+        .await
+        .unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
+    // Exact-key path-value updates are staged through the mutation journal.
+    for path in ["/a", "/b"] {
+        transaction
+            .execute("UPDATE flush_probe SET value = CAST($1 AS JSONB) WHERE path = $2")
+            .params([Value::Integer(2), Value::from(path)])
+            .await
+            .unwrap();
+    }
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *crate::transaction::FLUSH_PAUSE.lock().unwrap() = Some((release.clone(), reached.clone()));
+    let read = transaction
+        .query("SELECT count(*) AS n FROM flush_probe")
+        .one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), read).await;
+    *crate::transaction::FLUSH_PAUSE.lock().unwrap() = None;
+    release.notify_waiters();
+    assert!(outcome.is_err(), "the read must be dropped mid-flush");
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "the read reached the journal flush"
+    );
+    let error = transaction.commit().await.unwrap_err();
+    assert_eq!(error.code, LixError::CODE_INVALID_TRANSACTION_STATE);
+    let values = lix
+        .query("SELECT CAST(value AS TEXT) AS value FROM flush_probe ORDER BY path")
+        .all()
+        .await
+        .unwrap();
+    for row in values.rows() {
+        assert_eq!(row.get::<String>("value").unwrap(), "1");
+    }
+}

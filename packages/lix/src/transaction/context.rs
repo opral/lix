@@ -940,6 +940,22 @@ impl TransactionMutationJournal {
     }
 }
 
+/// Test hook: a flush of a non-empty mutation journal waits here (after it
+/// took the journal) while a pause is installed.
+#[cfg(test)]
+pub(crate) static FLUSH_PAUSE: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicBool>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn flush_pause_for_test() {
+    let pause = FLUSH_PAUSE.lock().unwrap().clone();
+    if let Some((release, reached)) = pause {
+        reached.store(true, std::sync::atomic::Ordering::SeqCst);
+        release.notified().await;
+    }
+}
+
 /// State which must be restored when `RETURNING` evaluation fails after a
 /// write has been staged in an explicit SQL transaction.
 pub(crate) struct SqlStatementCheckpoint {
@@ -9442,10 +9458,16 @@ where
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
+        // The flush takes the journal before it awaits storage. Until it
+        // finishes the transaction is poisoned, so a flush dropped midway (a
+        // cancelled read) leaves a commit that fails instead of one that
+        // silently drops the journal's rows.
+        self.mutation_journal_terminal_error = Some(LixError::new(
+            LixError::CODE_INVALID_TRANSACTION_STATE,
+            "a cancelled operation interrupted staging this transaction's writes; roll it back",
+        ));
         let result = self.flush_mutation_journal_inner(finalize_tail).await;
-        if let Err(error) = &result {
-            self.mutation_journal_terminal_error = Some(error.clone());
-        }
+        self.mutation_journal_terminal_error = result.as_ref().err().cloned();
         result
     }
 
@@ -9456,6 +9478,8 @@ where
         if journal.identity_offsets.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        flush_pause_for_test().await;
         self.ensure_plugin_generation_read_guard().await;
         #[cfg(feature = "storage-benches")]
         let identity_arena_bytes = journal.identity_arena.len();
