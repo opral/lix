@@ -15,8 +15,8 @@
 //!
 //! `LIX_INLANG_PHASES` is a comma-separated subset of
 //! `commit,flat,join,keyset,stream` (default: all). `stream` reads the same
-//! flat and joined shapes through `Lix::query_stream` with
-//! `LIX_INLANG_STREAM_PAGE_BYTES` pages (default 1 MiB). Every read phase
+//! flat and joined shapes through `Lix::query(..).stream()`, which pages by
+//! the engine's row and byte limits. Every read phase
 //! reports `peak_rss_mib`, the process high-water mark reset at phase start
 //! (Linux only), and `peak_heap_mib`, the phase's live-heap high-water mark
 //! above its starting heap. The import frees gigabytes the allocator keeps
