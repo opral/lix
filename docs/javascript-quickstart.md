@@ -32,12 +32,12 @@ await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 
 Every tracked write becomes a commit automatically. You never run a commit command.
 
-`execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.executeBatch()`. Do not concatenate SQL into one script string.
+`execute()` runs one statement. To run several statements atomically, use `lix.transaction()`; to run one statement with many parameter sets, use `lix.executeMany()`. Do not concatenate SQL into one script string.
 
 ## Read history
 
 ```ts
-const history = await lix.execute(
+const history = await lix.query(
   `SELECT diff_type, from_path, to_path, lixcol_to_commit_id, lixcol_position
    FROM lix_history('lix_file')
    WHERE from_path = $1 OR to_path = $1
@@ -45,19 +45,19 @@ const history = await lix.execute(
   ["/hello.txt"],
 );
 
-for (const row of history.rows) {
+for (const row of history) {
   console.log(row.diff_type, row.from_path, row.to_path);
 }
 ```
 
-Position `0` is the head commit. Higher positions walk back through the first-parent chain.
+`query()` reads and never writes; `execute()` runs anything. Position `0` is the head commit. Higher positions walk back through the first-parent chain.
 
 To read the file's bytes at one of those commits, pass its `lixcol_to_commit_id` to `lix_as_of`:
 
 ```ts
-const snapshot = await lix.execute(
+const atCommit = await lix.queryOne(
   "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = $2",
-  [history.rows[0].lixcol_to_commit_id, "/hello.txt"],
+  [history[0].lixcol_to_commit_id as string, "/hello.txt"],
 );
 ```
 

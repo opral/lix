@@ -142,47 +142,116 @@ await lix.prepareOfflineEditing();
 
 For a partial replica, explicitly fetches the bounded immutable graph metadata used to validate and append local writes. Call it while connected before relying on the next local edit offline. It performs no SQL mutation or publication and keeps read-only opens lazy. File contents, plugins, and other operation-specific inputs remain demand-driven, so this does not make arbitrary SQL workloads offline-ready. Other sync modes reject the call.
 
+### query()
+
+```ts
+const rows = await lix.query<TRow>(sql, params?, { maxBytes?, signal? }?);
+```
+
+Reads the latest committed state. `query()` never writes: statements that write reject with `LIX_ERROR_READ_ONLY` (use `execute()`). Reads that call `uuidv7()` or `current_timestamp` are reads. Pass a single statement; multi-statement SQL is rejected.
+
+The result is buffered and all-or-nothing. It is capped at 64 MiB of row data, measured in the engine; a larger result rejects early with `LIX_RESULT_TOO_LARGE` instead of being truncated. Raise the cap with `{ maxBytes }` (`Infinity` opts out), or read large results with [`stream()`](#stream).
+
+```ts
+const files = await lix.query<{ path: string }>(
+  "SELECT path FROM lix_file WHERE path LIKE $1 ORDER BY path",
+  ["/docs/%"],
+);
+```
+
+For a partial replica with on-demand sync, prefetch a view by running its `SELECT` on hover, then run the same `SELECT` when opening it. Resident inputs stay local.
+
+`SqlParam` is `null`, a boolean, a finite number, a string, a `Uint8Array`, or a `Value`. Bind JSON with `json(value)`:
+
+```ts
+import { json } from "@lix-js/sdk";
+
+await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+  "settings",
+  json({ theme: "dark" }),
+]);
+```
+
+Anything else (plain objects, arrays, `Date`, `undefined`, `NaN`, `Infinity`, `bigint`) throws `LIX_INVALID_PARAM` instead of being coerced.
+
+Rows are plain objects keyed by column name. A result with two columns of the same name rejects with `LIX_AMBIGUOUS_COLUMN`; alias them (`SELECT a.id AS a_id, b.id AS b_id`).
+
+Aborting `signal` rejects the call with the signal's reason.
+
+### queryOne()
+
+```ts
+const row = await lix.queryOne<TRow>(sql, params?, { signal? }?);
+```
+
+Reads at most one row: resolves `undefined` when there is none and rejects `LIX_NOT_UNIQUE` when there are more. Not byte-capped.
+
+### stream()
+
+```ts
+const rows = await lix.stream<TRow>(sql, params?, { maxBytes?, signal? }?);
+```
+
+Streams a read with bounded memory. It resolves once the statement is planned and its first page has arrived, so SQL errors reject here; later runtime errors reject a later pull. A stream has no size cap and no deadline, and it never expires while it is being consumed. The statement runs against one state that stays pinned until the stream ends or closes, so writes committed after it opened are not visible in it.
+
+`RowStream<TRow>` iterates rows; `pages()` iterates arrays of rows from the same cursor (the first page is small, later pages hold up to 4096 rows or 1 MiB). `columns` lists the column names.
+
+```ts
+for await (const row of await lix.stream("SELECT id, pattern FROM inlang_variant")) {
+  compile(row);
+}
+
+await using variants = await lix.stream("SELECT id FROM inlang_variant");
+for await (const page of variants.pages()) render(page);
+```
+
+`break`, `return()`, `close()`, `await using`, aborting `signal`, or closing Lix ends the stream and releases its state; `close()` resolves once the engine has stopped. A pull after an abort rejects with the signal's reason, and after `lix.close()` with `LIX_ERROR_CLOSED`, so a truncated read is never mistaken for a complete one. An error is final: later pulls reject with the same error. An open stream does not block writes on the same handle.
+
+Streams never write. A few statements must buffer before their first page: reads of file content (`lix_file.content`), reads inside a transaction, and reads on partial replicas. Those buffers are capped by `maxBytes` (64 MiB by default) and reject with `LIX_RESULT_TOO_LARGE` beyond it. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
+
+### read() and snapshot()
+
+```ts
+const result = await lix.read(async (snapshot) => {
+  const branch = await snapshot.queryOne("SELECT commit_id FROM lix_branch WHERE id = lix_active_branch_id()");
+  const diff = await snapshot.query("SELECT * FROM lix_diff('lix_file')");
+  return { branch, diff };
+}, { signal? }?);
+
+const snapshot = await lix.snapshot();
+try {
+  // snapshot.query(), snapshot.queryOne(), snapshot.stream()
+} finally {
+  await snapshot.close();
+}
+```
+
+A snapshot pins one state: every read through it sees that state, even while other writes commit, and several streams may be open at once. `read(fn)` closes its snapshot when `fn` settles; `snapshot()` returns an owned snapshot for state that outlives one callback (`await using` works too). `close()` closes its streams and resolves once in-flight reads have released the state; later calls reject `LIX_SNAPSHOT_CLOSED`. Remote handles reject snapshots with `LIX_UNSUPPORTED_REMOTE_OPERATION`.
+
 ### execute()
 
 ```ts
-const result = await lix.execute(sql, params?, options?);
+const { rows, rowsAffected, commit } = await lix.execute(sql, params?, options?);
 ```
 
-Executes one PostgreSQL-dialect SQL statement against the active Lix session. Pass a single statement. To run several statements atomically, call `executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate statements into one SQL string or parse a script on the host.
+Runs one PostgreSQL-dialect statement: a write, DDL, or a read. Pass a single statement. To write several statements atomically, use a [transaction](#transaction); to run one statement with many parameter sets, use [`executeMany()`](#executemany). Do not concatenate statements into one SQL string.
 
-For a partial replica with on-demand sync, prefetch a view by executing its SELECT on hover, then execute the same SELECT when opening it. Resident inputs stay local. Use ordinary `execute()` for writes; a read does not promise that all later write validation or commit dependencies are resident.
-
-Cancellable buffered local and partial-replica reads have a 30-second deadline including input hydration, and return at most 64 MiB or 1,000,000 rows per operation. `executeBatch()` shares the result budget across its read statements. Narrow large queries, request file ranges, or read large results with [`stream()`](#stream). Exceeding these bounds reports `LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes are never canceled or replayed by the read deadline.
-
-Parameters:
-
-| Parameter | Type             | Description                                                        |
-| --------- | ---------------- | ------------------------------------------------------------------ |
-| `sql`     | `string`         | One statement from Lix's PostgreSQL-dialect subset.                |
-| `params`  | `SqlParam[]`     | Optional positional parameters addressed as `$1`, `$2`, and so on. |
-| `options` | `ExecuteOptions` | Optional execution options. See below.                             |
-
-`SqlParam` accepts JSON values, `Uint8Array`, or a `Value`:
-
-```ts
-type SqlParam = JsonValue | Uint8Array | Value;
-```
+The result holds the rows the statement returned (a read's result or `RETURNING` rows), buffered under the same 64 MiB cap as `query()` (`maxBytes`). A write whose `RETURNING` rows exceed the cap fails without committing. For reads, `query()` is the idiomatic form and can never write.
 
 `ExecuteOptions`:
 
-| Option           | Type     | Description                                                                                                                                                                                                                                                                       |
-| ---------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `maxAutoCommitRetries` | `number` | Maximum automatic transaction replays after the initial attempt. `0` fails fast; omit to retain default recovery budgets. |
-| `originKey`      | `string` | Optional origin label for the mutation.                                                                                                                                                                                                                                           |
-| `idempotencyKey` | `string` | Stable identity for one logical remote SQL mutation. This is the retry story: supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
-| `rowMode`        | `"object" \| "array"` | Return plain objects by default or positional arrays when duplicate column names must remain separately addressable. |
+| Option                 | Type          | Description |
+| ---------------------- | ------------- | ----------- |
+| `maxAutoCommitRetries` | `number`      | Maximum automatic transaction replays after the initial attempt. `0` fails fast; omit to retain default recovery budgets. |
+| `originKey`            | `string`      | Optional origin label for the mutation. |
+| `idempotencyKey`       | `string`      | Stable identity for one logical remote SQL mutation. Supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
+| `maxBytes`             | `number`      | Byte cap of the returned rows (default 64 MiB); `Infinity` opts out. Not supported on remote handles. |
+| `signal`               | `AbortSignal` | Aborting before the statement is sent prevents it from running. Once it runs, the call settles with its real outcome. |
 
 Result:
 
 ```ts
-type ExecuteResult<TRow = Record<string, unknown>> = {
-  statementIndex?: number;
-  label?: string;
+type ExecuteResult<TRow = Row> = {
   columns: { name: string; type: "null" | "boolean" | "integer" | "real" | "text" | "jsonb" | "row_ref" | "timestamptz" | "blob" }[];
   rows: TRow[];
   rowsAffected: number;
@@ -191,80 +260,28 @@ type ExecuteResult<TRow = Record<string, unknown>> = {
 };
 ```
 
-| Field          | Description                                                                 |
-| -------------- | --------------------------------------------------------------------------- |
-| `columns`      | Column names and SQL value types in result order. Empty for statements that do not return rows. |
-| `rows`         | Enumerable plain objects by default. Property access, destructuring, spread, and JSON serialization work directly. |
-| `rowsAffected` | Number of rows affected by write statements.                                |
-| `notices`      | Non-fatal engine notices with `{ code, message, hint? }`.                   |
-| `commit` | Exact active-branch transition `{ before, after }` for an auto-committed write; `null` for reads. Equal endpoints mean no active-branch movement. Explicit transaction statements omit this field; batch and transaction receipts return it once. |
+| Field          | Description |
+| -------------- | ----------- |
+| `columns`      | Column names and SQL value types in result order. Empty for statements that return no rows. |
+| `rows`         | Plain objects keyed by column name. |
+| `rowsAffected` | Number of rows affected by a write. |
+| `notices`      | Non-fatal engine notices with `{ code, message, hint? }`. |
+| `commit`       | Exact active-branch transition `{ before, after }` for an auto-committed write; `null` for reads. Equal endpoints mean no active-branch movement. Transaction statements omit this field; `commit()` returns it. |
 
-Example:
+### executeMany()
 
 ```ts
-const result = await lix.execute(
-  "SELECT path, content FROM lix_file WHERE path = $1",
-  ["/hello.txt"],
-);
-
-const path = result.rows[0]?.path;
-const content = result.rows[0]?.content as Uint8Array | undefined;
+const { rowsAffected } = await lix.executeMany(sql, paramSets, options?);
 ```
 
-### executeBatch()
+Runs one statement once per parameter set, atomically and in one round trip: every set applies or none does. It reports only the total `rowsAffected`, so a statement that returns rows (a read or `RETURNING`) rejects with `LIX_INVALID_PARAM`; use `execute()` per set inside a transaction when you need the rows. Options are the same as `execute()` without `maxBytes`.
 
 ```ts
-const { results, commit } = await lix.executeBatch(statements, options?);
-```
-
-Executes multiple statements atomically in one call. Returns `{ results, commit }`: one statement-result array and one commit span for the whole transaction. Read-only batches return `commit: null`; individual results have no `commit` field. `statements` is a non-empty array of `{ sql, params?, label? }` objects — one statement per entry, already split by the caller. Lix does not parse a multi-statement script. `options` accepts the same `originKey`, `idempotencyKey`, and `maxAutoCommitRetries` as `execute()`. Results preserve input order and include a zero-based `statementIndex`. A supplied label is echoed unchanged; labels are opaque and may repeat. If a label is omitted, the result has no `label` property.
-
-```ts
-const { results, commit } = await lix.executeBatch([
-  {
-    label: "create",
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/a.txt", bytes],
-  },
-  { sql: "SELECT count(*) AS n FROM lix_file" },
+await lix.executeMany("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+  ["theme", "dark"],
+  ["locale", "de"],
 ]);
-
-console.log(results[0].statementIndex, results[0].label); // 0, "create"
-console.log(results[1].statementIndex, results[1].label); // 1, undefined
-
-const { results: returning } = await lix.executeBatch([
-  {
-    label: "update",
-    sql: "UPDATE task SET done = true WHERE id = $1 RETURNING id, done",
-    params: ["task-1"],
-  },
-]);
-console.log(returning[0].rows[0]?.done);
 ```
-
-### stream()
-
-```ts
-const pages = lix.stream(sql, params?, { pageBytes?, rowMode?, signal? }?);
-```
-
-Streams one read statement page by page. The statement runs once against one storage snapshot that stays pinned until the stream ends, so every page belongs to the same consistent state; writes committed after the stream opened are not visible in it. Unlike `execute()`, a stream is not limited by the 64 MiB / 1,000,000-row read budget or the read deadline, so it suits bulk reads such as loading a whole project.
-
-Each value is `{ columns, rows }` with the same column and row representation as `execute()`. Pages are never empty and hold at most `pageBytes` of row data (default 1 MiB, at most 64 MiB) measured as one value slot per cell plus text, JSON and blob bytes; a single larger row is returned as a page of its own. The statement is planned on the first `next()`, which reports SQL errors.
-
-```ts
-for await (const page of lix.stream(
-  "SELECT id, message_id, pattern FROM inlang_variant",
-  [],
-  { pageBytes: 4 * 1024 * 1024 },
-)) {
-  for (const row of page.rows) compile(row);
-}
-```
-
-Breaking out of the loop, calling `return()`, aborting `signal`, or closing Lix cancels the stream and releases its snapshot. A pending or later pull rejects with the signal's reason after an abort and with `LIX_ERROR_CLOSED` after `close()`, so a truncated read is never mistaken for a complete one. An open stream does not block writes on the same handle; it only holds its snapshot.
-
-Streams are read-only: writes and statements calling `uuidv7()` or `current_timestamp()` reject with `LIX_ERROR_READ_ONLY`. Reads of file content and reads on partial replicas run as one buffered read (with its budget and deadline) and are then delivered page by page. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
 
 ### observe()
 
@@ -300,7 +317,7 @@ The custom `ObserveEvents` export and observation `close()` method are removed.
 const tx = await lix.beginTransaction();
 ```
 
-Starts an independent transaction context on this handle's current branch and account. Execute statements that belong to the transaction through `tx.execute()`; these reads see its staged writes. Ordinary `lix.execute()` reads and `lix.observe()` remain available on the original handle and see committed data. Observers publish relevant updates after commit; rolled-back writes are never published. Changing the original handle's branch does not retarget the transaction. Local transactions retain the caller's previously acknowledged plugin-file view, so plugins can merge stale content against the correct base.
+Starts an independent transaction context on this handle's current branch and account. Run statements that belong to the transaction through `tx.execute()`, `tx.executeMany()` and `tx.query()`; its reads see its staged writes. Ordinary `lix.query()` reads and `lix.observe()` remain available on the original handle and see committed data. Observers publish relevant updates after commit; rolled-back writes are never published. Changing the original handle's branch does not retarget the transaction. Local transactions retain the caller's previously acknowledged plugin-file view, so plugins can merge stale content against the correct base.
 
 Each handle permits one opening or active explicit transaction at a time. Use `openAnotherSession()` for another independent handle when needed.
 
@@ -310,16 +327,16 @@ SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to d
 
 A conflict error's `details` say what overlapped: `reason` is `readSetChanged` or `writeSetChanged` with `overlaps` listing up to eight `{ branchId, schemaKey, fileId, rowPk }` identities (and `overlapCount` the total), `unvalidatedReadChanged` with `source` naming the read that has no row-level validation (including a concurrent schema catalog change), `staleSnapshotNotRebased` when the transaction's writes (for example untracked or global rows) cannot be rebased onto a newer head, or `commitRaced` when another commit won the final atomic publication. `retryable` is `true` in every case. Start a new transaction and rerun its statements against current state, or use `lix.transaction()` to do that automatically.
 
-Rows returned by `RETURNING` inside an explicit transaction are provisional until `commit()` succeeds. Auto-committed `execute()` and `executeBatch()` return canonical `lixcol_change_id` values for direct new-image projections after the commit; `OLD` projections retain the prior ID. Automatic calls can rerun the whole statement or batch after a known failed transaction. Explicit transactions remain caller-controlled.
+Rows returned by `RETURNING` inside an explicit transaction are provisional until `commit()` succeeds. Auto-committed `execute()` returns canonical `lixcol_change_id` values for direct new-image projections after the commit; `OLD` projections retain the prior ID. Automatic calls (`execute()`, `executeMany()`) can rerun the whole statement or parameter-set batch after a known failed transaction. Explicit transactions remain caller-controlled.
 
 Set `maxAutoCommitRetries` to cap these replays across both transaction contention and expired transaction snapshots. The initial attempt does not count; `0` returns the first failure without re-executing the transaction. When omitted, Lix permits up to 16 contention retries and separately bounds expired-snapshot recovery by its existing time budget. An explicit cap cannot extend that expiry budget. This option does not control pure-read recovery, idempotency receipt lookups, or network retries.
 
 ```ts
 await lix.execute(sql, params, { maxAutoCommitRetries: 0 });
-await lix.executeBatch(statements, { maxAutoCommitRetries: 2 });
+await lix.executeMany(sql, paramSets, { maxAutoCommitRetries: 2 });
 ```
 
-Rust callers use `.with_max_auto_commit_retries(0)` on `lix.execute(...)` or `lix.execute_batch(...)`, including remote handles.
+Rust callers use `.with_max_auto_commit_retries(0)` on `lix.execute(...)` or `lix.execute_many(...)`, including remote handles.
 
 Re-execution reevaluates predicates against current state. An update guarded by an expected revision may therefore succeed with **zero affected rows** after a retry; check `rowsAffected` as well as commit success. Retries do not provide general serializable isolation for arbitrary reads or cross-branch dependencies.
 
@@ -364,7 +381,7 @@ const { value, commit, retries } = await lix.transaction(
 
 Runs the callback in an explicit transaction and commits it. If the commit (or a statement) fails with `LIX_TRANSACTION_CONFLICT`, the transaction is rolled back and the callback runs again on a fresh transaction, up to `maxRetries` times (default `3`; `0` never reruns). Any other error rolls the transaction back and rejects immediately. After the last allowed rerun, the conflict rejects with `details.transactionRetryCount` and `details.maxTransactionRetries` added.
 
-Returns `{ value, commit, retries }`: the callback's return value from the attempt that committed, that attempt's `CommitSpan` (or `null` for a read-only transaction), and how many reruns were needed. The callback must not commit or roll back `tx` itself, and side effects outside the transaction must tolerate being repeated.
+Returns `{ value, commit, retries }`: the callback's return value from the attempt that committed, that attempt's `CommitSpan` (or `null` for a read-only transaction), and how many reruns were needed. The callback must not commit or roll back `tx` itself, and side effects outside the transaction must tolerate being repeated. Pass `{ signal }` to cancel: aborting always rolls the transaction back, and the call rejects with the signal's reason.
 
 ### activeBranchId()
 
@@ -525,15 +542,19 @@ Closes the Lix handle and its storage resources.
 
 ## Transaction
 
-Transaction `execute()` returns `StatementResult<TRow>`, defined as `Omit<ExecuteResult<TRow>, "commit">`. The durable receipt arrives only from `commit()`, which returns `CommitReceipt = { commit: CommitSpan | null }`.
+A transaction is a reader too: `query()`, `queryOne()` and `stream()` see its own staged writes. Transaction `execute()` returns `StatementResult<TRow>`, defined as `Omit<ExecuteResult<TRow>, "commit">`. The durable receipt arrives only from `commit()`, which returns `CommitReceipt = { commit: CommitSpan | null }`.
 
 Transactions expose:
 
-| Method                            | Description                                                                   |
-| --------------------------------- | ----------------------------------------------------------------------------- |
-| `execute(sql, params?, options?)` | Execute SQL inside the transaction. Same `ExecuteOptions` as `lix.execute()`. |
-| `commit()`                        | Commit and close the transaction, returning `{ commit }` with its durable span or `null` for a read-only transaction.                      |
-| `rollback()`                      | Roll back the transaction and close the transaction handle.                   |
+| Method                                   | Description |
+| ---------------------------------------- | ----------- |
+| `query(sql, params?, options?)`          | Read the transaction's state, including its staged writes. |
+| `queryOne(sql, params?, options?)`       | At most one row of the transaction's state. |
+| `stream(sql, params?, options?)`         | Stream the transaction's state when the stream opens. The rows are buffered before the first page, under `maxBytes`. |
+| `execute(sql, params?, options?)`        | Run any statement inside the transaction. Same options as `lix.execute()`, except `maxAutoCommitRetries` (transactions never replay). |
+| `executeMany(sql, paramSets, options?)`  | Stage one statement per parameter set; all sets stage or none do. |
+| `commit()`                               | Commit and close the transaction, returning `{ commit }` with its durable span or `null` for a read-only transaction. |
+| `rollback()`                             | Roll back the transaction and close the transaction handle. |
 
 ## Result rows
 
@@ -543,7 +564,7 @@ Transactions expose:
 const row = result.rows[0]!;
 ```
 
-Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. Duplicate output names use the last value in object mode while every descriptor remains in `columns`; pass `{ rowMode: "array" }` to `execute()` or `executeBatch()` when positional duplicates are required.
+Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. A result with duplicate column names rejects with `LIX_AMBIGUOUS_COLUMN`, since an object holds one value per name; alias the columns.
 
 ## Value
 
@@ -568,4 +589,6 @@ Constructors:
 | `Value.jsonb(value)`   | Create a JSONB value.                                                        |
 | `Value.timestamptz(value)` | Create a timestamptz value from an RFC 3339 string.                    |
 | `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                       |
-| `Value.from(raw)`      | Convert a JSON-compatible JS value, `Uint8Array`, or `Value` into a `Value`. |
+| `Value.from(raw)`      | Convert a `SqlParam` (a scalar, `Uint8Array`, or `Value`) into a `Value`. |
+
+`json(value)` is shorthand for `Value.jsonb(value)`: the way to bind a JSON object or array as a parameter.

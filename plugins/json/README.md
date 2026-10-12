@@ -99,13 +99,13 @@ VALUES ('settings-container', 'enabled', 'boolean', 'true'::jsonb, $1);
 ```
 
 Primary-key columns are immutable through SQL `UPDATE`. Rename or move a scalar
-or empty container with an atomic `execute_batch` containing a `DELETE` of its
+or empty container with a transaction containing a `DELETE` of its
 old primary key and an `INSERT` of its new row. Each SQL statement must leave a
-valid tree, including statements inside an atomic batch. For a nonempty
+valid tree, including statements inside a transaction. For a nonempty
 container, save its descendant rows, delete them leaf-first, replace the parent,
 then reinsert descendants parent-first using separate committed `execute` calls.
 The current engine rejects deleting and reinserting the same primary key within
-one `execute_batch`, so this workaround is not atomic. Retain the parent's `container_id` and
+one transaction, so this workaround is not atomic. Retain the parent's `container_id` and
 restore each descendant's original primary key (including array UUIDs), value,
 formatting, and `order_key`. This preserves descendant identities without
 rekeying them, while keeping every intermediate tree valid.

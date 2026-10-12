@@ -92,20 +92,17 @@ Code, documents, design files, and media often live in separate tools from the t
 
 ```ts
 // A script, a document, and an app table change in one transaction.
-await lix.executeBatch([
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/automations/report.js", source],
-  },
-  {
-    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
-    params: ["/docs/handbook.docx", handbook],
-  },
-  {
-    sql: "UPDATE orders SET status = 'shipped' WHERE id = $1",
-    params: [1002],
-  },
-]);
+await lix.transaction(async (tx) => {
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+    "/automations/report.js",
+    source,
+  ]);
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
+    "/docs/handbook.docx",
+    handbook,
+  ]);
+  await tx.execute("UPDATE orders SET status = 'shipped' WHERE id = $1", [1002]);
+});
 ```
 
 ### Give each customer a repository
