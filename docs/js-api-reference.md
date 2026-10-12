@@ -381,7 +381,7 @@ const { value, commit, retries } = await lix.transaction(
 
 Runs the callback in an explicit transaction and commits it. If the commit (or a statement) fails with `LIX_TRANSACTION_CONFLICT`, the transaction is rolled back and the callback runs again on a fresh transaction, up to `maxRetries` times (default `3`; `0` never reruns). Any other error rolls the transaction back and rejects immediately. After the last allowed rerun, the conflict rejects with `details.transactionRetryCount` and `details.maxTransactionRetries` added.
 
-Returns `{ value, commit, retries }`: the callback's return value from the attempt that committed, that attempt's `CommitSpan` (or `null` for a read-only transaction), and how many reruns were needed. The callback must not commit or roll back `tx` itself, and side effects outside the transaction must tolerate being repeated. Pass `{ signal }` to cancel: aborting always rolls the transaction back, and the call rejects with the signal's reason.
+Returns `{ value, commit, retries }`: the callback's return value from the attempt that committed, that attempt's `CommitSpan` (or `null` for a read-only transaction), and how many reruns were needed. The callback must not commit or roll back `tx` itself, and side effects outside the transaction must tolerate being repeated. Pass `{ signal }` to cancel: aborting before the commit starts rolls the transaction back (reads in flight stop in the engine), and the call rejects with the signal's reason. An abort that lands while the commit is in flight does not stop it: the commit completes and the call resolves with its outcome.
 
 ### activeBranchId()
 

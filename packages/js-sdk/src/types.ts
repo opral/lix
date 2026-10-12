@@ -368,7 +368,10 @@ export type TransactionOptions = {
 	 * `LIX_TRANSACTION_CONFLICT`. Defaults to 3; `0` fails on the first conflict.
 	 */
 	maxRetries?: number;
-	/** Aborting rolls the transaction back; the call rejects with the reason. */
+	/**
+	 * Aborting before the commit starts rolls the transaction back and the
+	 * call rejects with the reason; a commit already in flight completes.
+	 */
 	signal?: AbortSignal;
 };
 

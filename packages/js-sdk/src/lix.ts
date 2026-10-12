@@ -381,8 +381,10 @@ export class Lix implements Reader {
 	 * never reruns). Any other error rolls back and rejects immediately.
 	 *
 	 * `fn` must not commit or roll back `tx` itself, and side effects outside
-	 * the transaction must tolerate a rerun. Aborting `signal` always rolls
-	 * back: the call rejects with the signal's reason and never commits.
+	 * the transaction must tolerate a rerun. Aborting `signal` before the
+	 * commit starts rolls back: the call rejects with the signal's reason.
+	 * Once the commit is in flight it completes, and the call resolves with
+	 * its outcome.
 	 */
 	async transaction<T>(
 		fn: (tx: LixTransaction) => Promise<T> | T,
