@@ -1988,7 +1988,7 @@ test("a stream pull waiting behind slow pulls never times out in the queue", asy
 		async () => binding,
 		undefined,
 		false,
-		new WorkerOperationScheduler({ maxIndependentActive: 1, queueWaitMs: 20 }),
+		new WorkerOperationScheduler({ maxPullActive: 1, queueWaitMs: 20 }),
 	);
 	receive({
 		id: 1,
@@ -2007,7 +2007,7 @@ test("a stream pull waiting behind slow pulls never times out in the queue", asy
 			expect(responses).toContainEqual(expect.objectContaining({ id, ok: true })),
 		);
 	}
-	// Stream 1's pull holds the only independent slot; stream 2's pull queues.
+	// Stream 1's pull holds the only pull slot; stream 2's pull queues.
 	receive({ id: 4, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
 	receive({ id: 5, sessionId: 0, operation: { kind: "stream.next", streamId: 2 } });
 	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.queued", id: 5 }));
@@ -2016,4 +2016,69 @@ test("a stream pull waiting behind slow pulls never times out in the queue", asy
 	slow.resolve(page);
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 4, ok: true, value: page }));
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: page }));
+});
+
+test("pulls of open streams never wait behind long reads in the independent pool", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const page = {
+		columns: [{ name: "n", type: "integer" }],
+		rows: [[{ kind: "integer", value: 1 }]],
+		rowsAffected: 0,
+		notices: [],
+	};
+	const longReads = deferred<typeof page>();
+	const binding = {
+		setTelemetryParent() {},
+		close: vi.fn(async () => {}),
+		async snapshot() {
+			return { query: () => longReads.promise, stream: vi.fn(), close: async () => {} };
+		},
+		async stream() {
+			return { columns: ["n"], next: async () => page, cancel: async () => {} };
+		},
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+		undefined,
+		false,
+		new WorkerOperationScheduler({ maxIndependentActive: 1 }),
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "stream", sql: "SELECT n", params: [] } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(expect.objectContaining({ id: 2, ok: true })),
+	);
+	receive({ id: 3, sessionId: 0, operation: { kind: "readSnapshot.open" } });
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(expect.objectContaining({ id: 3, ok: true })),
+	);
+	// A long snapshot read fills the only independent slot.
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "query", sql: "SELECT long", params: [], readSnapshotId: 1 },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 4 }));
+	receive({ id: 5, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 5, ok: true, value: page }));
+	expect(responses.some((message) => "ok" in message && message.id === 4)).toBe(false);
+	longReads.resolve(page);
+	await vi.waitFor(() =>
+		expect(responses).toContainEqual(expect.objectContaining({ id: 4, ok: true })),
+	);
 });

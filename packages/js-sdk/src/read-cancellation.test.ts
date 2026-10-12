@@ -136,3 +136,33 @@ test("aborting a transaction cancels its read in flight and rolls back", async (
 		await lix.close();
 	}
 });
+
+test("an open stream keeps pulling while four long snapshot reads run", async () => {
+	const lix = await openLix();
+	try {
+		const rows = await lix.stream<{ n: number }>(
+			"SELECT value AS n FROM generate_series(1, 20000) ORDER BY value",
+		);
+		const pages = rows.pages();
+		expect((await pages.next()).done).toBe(false);
+		const controller = new AbortController();
+		const longReads = Array.from({ length: 4 }, () =>
+			lix.read((snapshot) => snapshot.query(LONG_READ), { signal: controller.signal }),
+		);
+		for (const read of longReads) read.catch(() => undefined);
+		await started();
+		// Every independent slot runs a long read; the stream still pages.
+		let pulled = 0;
+		for (let i = 0; i < 3; i++) {
+			const next = await within(3_000, pages.next());
+			if (next.done) break;
+			pulled += next.value.length;
+		}
+		expect(pulled).toBeGreaterThan(0);
+		controller.abort(new Error("done"));
+		await Promise.allSettled(longReads);
+		await rows.close();
+	} finally {
+		await lix.close();
+	}
+});

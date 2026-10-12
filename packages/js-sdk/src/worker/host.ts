@@ -220,7 +220,7 @@ export function startWorkerHost(
 		lane: string,
 		sessionId: number | undefined,
 		operation: () => Promise<unknown>,
-		pool: "independent" | "observer" = "independent",
+		pool: "independent" | "pull" | "observer" = "independent",
 	): Promise<void> {
 		let resolveCompletion!: () => void;
 		const completion = new Promise<void>((resolve) => {
@@ -236,10 +236,10 @@ export function startWorkerHost(
 			lane,
 			pool,
 			sessionId,
-			// Independent work (stream pulls and opens, snapshot reads) is
-			// closable or cancellable, so waiting behind other slow reads is
-			// never a reason to fail it.
-			queueWaitMs: pool === "independent" ? null : undefined,
+			// Independent work and pulls (stream opens and pulls, snapshot
+			// reads) are closable or cancellable, so waiting behind other slow
+			// reads is never a reason to fail them.
+			queueWaitMs: pool === "observer" ? undefined : null,
 			onQueued: () => postQueued(request),
 			run: () => {
 				postStarted(request);
@@ -449,6 +449,7 @@ export function startWorkerHost(
 					`stream:${streamId}`,
 					undefined,
 					() => handleQueryStreamNext(streamId),
+					"pull",
 				);
 			} else if (message.operation.kind === "stream.close") {
 				const streamId = message.operation.streamId;
@@ -460,6 +461,7 @@ export function startWorkerHost(
 					`snapshot:${exportId}`,
 					undefined,
 					() => handleSnapshotNext(exportId),
+					"pull",
 				);
 			} else {
 				const exportId = message.operation.exportId;

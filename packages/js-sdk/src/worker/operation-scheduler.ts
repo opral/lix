@@ -1,5 +1,11 @@
 export const WORKER_OPERATION_MAX_ACTIVE = 4;
 export const WORKER_OPERATION_MAX_INDEPENDENT_ACTIVE = 4;
+/**
+ * Pulls of open streams and snapshot exports. They have their own capacity,
+ * so long reads (stream opens, snapshot reads) filling the independent pool
+ * never hold up a page of a stream that is already open.
+ */
+export const WORKER_OPERATION_MAX_PULL_ACTIVE = 32;
 export const WORKER_OPERATION_MAX_OBSERVERS = 32;
 export const WORKER_OPERATION_MAX_OBSERVER_ACTIVE = WORKER_OPERATION_MAX_OBSERVERS;
 export const WORKER_OPERATION_MAX_QUEUED = 128;
@@ -36,7 +42,7 @@ export type ScheduledWorkerOperation = {
 	requestId?: number;
 	scope: WorkerOperationScope;
 	lane: string;
-	pool?: "finite" | "independent" | "observer";
+	pool?: "finite" | "independent" | "pull" | "observer";
 	sessionId?: number;
 	barrier?: boolean;
 	reserveTransactionSlot?: boolean;
@@ -54,6 +60,7 @@ export type ScheduledWorkerOperation = {
 export type WorkerOperationSchedulerLimits = {
 	maxActive: number;
 	maxIndependentActive: number;
+	maxPullActive: number;
 	maxObserverActive: number;
 	maxObserverRegistrations: number;
 	maxQueued: number;
@@ -93,6 +100,7 @@ export class WorkerOperationScheduler {
 	}>();
 	private activeFinite = 0;
 	private activeIndependent = 0;
+	private activePull = 0;
 	private activeObservers = 0;
 	private reservedObserverSlots = 0;
 	private queuedObserverRegistrations = 0;
@@ -105,6 +113,7 @@ export class WorkerOperationScheduler {
 		this.limits = {
 			maxActive: WORKER_OPERATION_MAX_ACTIVE,
 			maxIndependentActive: WORKER_OPERATION_MAX_INDEPENDENT_ACTIVE,
+			maxPullActive: WORKER_OPERATION_MAX_PULL_ACTIVE,
 			maxQueued: WORKER_OPERATION_MAX_QUEUED,
 			maxQueuedPerSession: WORKER_OPERATION_MAX_QUEUED_PER_SESSION,
 			maxQueuedObserverRegistrations:
@@ -331,6 +340,7 @@ export class WorkerOperationScheduler {
 			while (
 				this.activeFinite < this.limits.maxActive ||
 				this.activeIndependent < this.limits.maxIndependentActive ||
+				this.activePull < this.limits.maxPullActive ||
 				this.activeObservers < this.limits.maxObserverActive
 			) {
 				let started = false;
@@ -380,6 +390,7 @@ export class WorkerOperationScheduler {
 			work.observerRegistration.onReserved(slot);
 		}
 		if (work.pool === "independent") this.activeIndependent++;
+		else if (work.pool === "pull") this.activePull++;
 		else if (work.pool === "observer") this.activeObservers++;
 		else this.activeFinite++;
 		this.activeByScope.set(work.scope, (this.activeByScope.get(work.scope) ?? 0) + 1);
@@ -417,6 +428,7 @@ export class WorkerOperationScheduler {
 			if (work.reserveTransactionSlot && !transactionSlotAdopted && work.sessionId !== undefined)
 				this.changeTransactionSlots(work.scope, work.sessionId, -1);
 			if (work.pool === "independent") this.activeIndependent--;
+			else if (work.pool === "pull") this.activePull--;
 			else if (work.pool === "observer") this.activeObservers--;
 			else this.activeFinite--;
 			const scopeActive = (this.activeByScope.get(work.scope) ?? 1) - 1;
@@ -445,6 +457,7 @@ export class WorkerOperationScheduler {
 	private hasPoolCapacity(work: ScheduledWorkerOperation): boolean {
 		if (work.pool === "independent")
 			return this.activeIndependent < this.limits.maxIndependentActive;
+		if (work.pool === "pull") return this.activePull < this.limits.maxPullActive;
 		if (work.pool === "observer")
 			return this.activeObservers < this.limits.maxObserverActive;
 		return this.activeFinite < this.limits.maxActive;
