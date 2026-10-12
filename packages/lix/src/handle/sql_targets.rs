@@ -225,6 +225,11 @@ where
                 .execute_with_options(&sql, &params, options)
                 .await;
         }
+        // A read run through execute() takes the same path as query(): replica
+        // read retries and the partial-replica authority fallback.
+        if self.session.execution_disposition(&sql)? == ExecutionDisposition::CancellableRead {
+            return self.read_latest(&sql, &params).await;
+        }
         self.retry_sync_demands(|| {
             self.session
                 .execute_with_options(&sql, &params, options.clone())

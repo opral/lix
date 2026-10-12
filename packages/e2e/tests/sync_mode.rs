@@ -3908,3 +3908,33 @@ async fn remote_queries_never_write_and_execute_runs_anything() {
     remote.close().await.unwrap();
     stop_server(server_task).await;
 }
+
+#[tokio::test]
+async fn execute_of_a_read_on_a_partial_replica_takes_the_read_path() {
+    let (authority_storage, authority) = open_authority().await;
+    put_value(&authority, "read-path", "value").await;
+    authority.close().await.expect("close authority setup");
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task) = serve(authority_storage, Arc::clone(&probe)).await;
+    let replica_dir = TempDir::new().expect("replica tempdir");
+    let replica = open_replica(replica_dir.path(), &url).await;
+
+    // A partial replica cannot prove a complete change inventory, so this
+    // read is served by the authority fallback.
+    let sql = "SELECT count(*) AS n FROM lix_change";
+    let queried = replica
+        .query(sql)
+        .one()
+        .await
+        .expect("query falls back to the authority")
+        .get::<i64>("n")
+        .unwrap();
+    let executed = replica
+        .execute(sql)
+        .await
+        .expect("execute of a read takes the same read path");
+    assert_eq!(executed.rows()[0].get::<i64>("n").unwrap(), queried);
+    assert!(queried > 0);
+    replica.close().await.unwrap();
+    stop_server(server_task).await;
+}
