@@ -4521,9 +4521,16 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let release_body = Arc::new(Notify::new());
         let body_gate = Arc::clone(&release_body);
-        let app = axum::Router::new().fallback(move || {
+        let app = axum::Router::new().fallback(move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
             let gate = Arc::clone(&body_gate);
             async move {
+                // Startup tombstone recovery lists the catalog independently
+                // of the object bodies whose runtime ownership this test probes.
+                if query.as_deref().is_some_and(|query| query.contains("list-type=2")) {
+                    return http::Response::builder().header("content-type", "application/xml")
+                        .body(Body::from("<ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                        .unwrap();
+                }
                 let stream = futures_util::stream::once(async move {
                     gate.notified().await;
                     Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{}"))
