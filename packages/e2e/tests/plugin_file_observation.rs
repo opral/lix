@@ -31,16 +31,16 @@ async fn install_markdown<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<
         .unwrap();
 }
 
-/// Runs read statements in order against one snapshot.
-async fn snapshot_reads<S: Storage + Clone + Send + Sync + 'static>(
+/// Runs read statements in order in one transaction.
+async fn transaction_reads<S: Storage + Clone + Send + Sync + 'static>(
     lix: &Lix<S>,
     statements: &[(&str, &[Value])],
 ) -> Vec<Vec<lix::Row>> {
-    let snapshot = lix.snapshot().await.unwrap();
+    let transaction = lix.begin_transaction().await.unwrap();
     let mut results = Vec::new();
     for (sql, params) in statements {
         results.push(
-            snapshot
+            transaction
                 .query(sql)
                 .params(*params)
                 .all()
@@ -49,7 +49,7 @@ async fn snapshot_reads<S: Storage + Clone + Send + Sync + 'static>(
                 .into_rows(),
         );
     }
-    snapshot.close().await.unwrap();
+    transaction.rollback().await.unwrap();
     results
 }
 
@@ -469,7 +469,7 @@ async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
                 statements.reverse();
             }
             if coherent {
-                snapshot_reads(&backing, &statements).await;
+                transaction_reads(&backing, &statements).await;
             } else {
                 sequential_reads(&backing, &statements).await;
             }
@@ -556,7 +556,7 @@ async fn mixed_read_batches_do_not_acknowledge_aggregate_file_bytes() {
             statements.reverse();
         }
         if coherent {
-            snapshot_reads(&backing, &statements).await;
+            transaction_reads(&backing, &statements).await;
         } else {
             sequential_reads(&backing, &statements).await;
         }
@@ -606,7 +606,7 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                     statements.reverse();
                 }
                 let results = if coherent {
-                    snapshot_reads(&backing, &statements).await
+                    transaction_reads(&backing, &statements).await
                 } else {
                     sequential_reads(&backing, &statements).await
                 };

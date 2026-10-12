@@ -949,7 +949,9 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         "INSERT INTO lix_key_value (key, value) VALUES ('coherent-write', 'must-not-exist')",
         "SELECT commit_id FROM lix_create_checkpoint(NULL, NULL)",
     ] {
-        let snapshot = replica.snapshot().await.expect("open replica snapshot");
+        let snapshot = lix::internal::open_read_snapshot(&replica)
+            .await
+            .expect("open replica snapshot");
         let error = snapshot
             .query(sql)
             .all()
@@ -963,8 +965,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     // acknowledgments may independently issue finite pulls, so verify local
     // completion with the authority unavailable instead of counting those pulls.
     probe.set_offline(true);
-    let coherent_history = replica
-        .snapshot()
+    let coherent_history = lix::internal::open_read_snapshot(&replica)
         .await
         .expect("open a local snapshot without the authority");
     assert!(
@@ -1003,8 +1004,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         )
         .await
         .expect("open persisted replica without a server");
-    let offline_read = reopened_without_server
-        .snapshot()
+    let offline_read = lix::internal::open_read_snapshot(&reopened_without_server)
         .await
         .expect("open a snapshot without a server")
         .query("SELECT value FROM lix_key_value WHERE key = 'after-abandoned'")
@@ -3807,10 +3807,6 @@ async fn remote_queries_never_write_and_execute_runs_anything() {
     assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     assert_eq!(
         remote.query("SELECT 1").stream().await.unwrap_err().code,
-        "LIX_UNSUPPORTED_REMOTE_OPERATION"
-    );
-    assert_eq!(
-        remote.snapshot().await.unwrap_err().code,
         "LIX_UNSUPPORTED_REMOTE_OPERATION"
     );
     assert!(
