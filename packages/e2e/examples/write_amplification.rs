@@ -205,7 +205,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
 
 /// Applies `updates` row updates in `updates / width` commits.
 ///
-/// One `execute_batch` is one commit, so `width` is exactly the
+/// One `execute_many` is one commit, so `width` is exactly the
 /// number of rows a commit carries. Holding `updates` fixed and varying `width`
 /// separates per-commit fixed cost from per-row marginal cost.
 async fn update<S: BenchStorage>(storage: S, updates: usize, width: usize, distinct: usize) {

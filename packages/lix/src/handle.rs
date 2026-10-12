@@ -248,43 +248,6 @@ impl AuthorityReadSession {
             .await
     }
 
-    async fn execute_batch(
-        &self,
-        server: &ServerOptions,
-        expected_account_id: &str,
-        branch_id: &str,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let mut state = self.state.lock().await;
-        if matches!(*state, AuthorityReadSessionState::Closed) {
-            return Err(LixError::new(
-                LixError::CODE_CLOSED,
-                "cannot execute an authority read from a closed Lix handle",
-            ));
-        }
-        if matches!(*state, AuthorityReadSessionState::Uninitialized) {
-            let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
-            *state = AuthorityReadSessionState::Open(Box::new(client));
-        }
-        let AuthorityReadSessionState::Open(client) = &*state else {
-            unreachable!("closed authority read session was handled above");
-        };
-        if client.active_branch_id().await? != branch_id {
-            client.switch_branch(branch_id).await?;
-        }
-        client
-            .execute_batch(
-                statements,
-                Some(ProtocolExecuteOptions {
-                    origin_key: options.origin_key.clone(),
-                    max_auto_commit_retries: options.max_auto_commit_retries,
-                    ..Default::default()
-                }),
-            )
-            .await
-    }
-
     async fn close(&self) -> Result<(), LixError> {
         let client = {
             let mut state = self.state.lock().await;
@@ -330,40 +293,6 @@ impl AuthorityReadSession {
             .execute(
                 sql,
                 params,
-                Some(ProtocolExecuteOptions {
-                    origin_key: options.origin_key.clone(),
-                    max_auto_commit_retries: options.max_auto_commit_retries,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        let close_result = client.close().await;
-        match (result, close_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    async fn execute_batch(
-        &self,
-        server: &ServerOptions,
-        expected_account_id: &str,
-        branch_id: &str,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let state = self.state.lock().await;
-        if matches!(*state, AuthorityReadSessionState::Closed) {
-            return Err(LixError::new(
-                LixError::CODE_CLOSED,
-                "cannot execute an authority read from a closed Lix handle",
-            ));
-        }
-        let client = open_authority_read_client(server, expected_account_id, branch_id).await?;
-        let result = client
-            .execute_batch(
-                statements,
                 Some(ProtocolExecuteOptions {
                     origin_key: options.origin_key.clone(),
                     max_auto_commit_retries: options.max_auto_commit_retries,
@@ -2229,37 +2158,6 @@ where
             )
             .await
             .map(ExecuteResult::with_authority_notice)
-    }
-
-    async fn execute_authority_read_batch(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        options: &ExecuteOptions,
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
-                "authoritative read requires a configured server",
-            )
-        })?;
-        let expected_account_id = self.active_account_id().to_owned();
-        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
-        let mut result = self
-            .authority_read_session
-            .execute_batch(
-                server,
-                &expected_account_id,
-                &branch_id,
-                statements,
-                options,
-            )
-            .await?;
-        result.results = result
-            .results
-            .into_iter()
-            .map(ExecuteResult::with_authority_notice)
-            .collect();
-        Ok(result)
     }
 
     /// Repository identity stored as `lix_key_value.lix_id`.

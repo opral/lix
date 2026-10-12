@@ -289,42 +289,6 @@ where
     }
 }
 
-#[cfg(test)]
-impl<StorageImpl> Lix<StorageImpl>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    /// Runs a heterogeneous atomic statement batch through the engine's
-    /// batch path (the server protocol's `execute_batch`). Not public API:
-    /// public callers use `execute_many` or a transaction.
-    pub(crate) async fn execute_batch_for_test(
-        &self,
-        statements: &[ExecuteBatchStatement],
-    ) -> Result<crate::ExecuteBatchResult, LixError> {
-        let route = self.session.execute_batch_disposition(statements)?;
-        let local = self
-            .retry_replica_read(route, || {
-                self.retry_sync_demands(|| {
-                    self.session
-                        .execute_batch_with_options(statements, ExecuteOptions::default())
-                })
-            })
-            .await;
-        match local {
-            Err(error)
-                if route == ExecutionDisposition::CancellableRead
-                    && self.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
-                    && self.server.is_some()
-                    && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
-            {
-                self.execute_authority_read_batch(statements, &ExecuteOptions::default())
-                    .await
-            }
-            result => result.map(crate::ExecuteBatchResult::from_results),
-        }
-    }
-}
-
 impl<StorageImpl> SqlTarget for Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,

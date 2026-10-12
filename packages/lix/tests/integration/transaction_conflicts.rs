@@ -943,17 +943,17 @@ async fn complete_set_update_rebases_over_a_disjoint_insert() {
         )])
         .await
         .unwrap();
-    let inserts = (0..ROW_COUNT)
-        .map(|row| lix::ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO journal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".into(),
-            params: vec![
+    lix.execute_many(
+        "INSERT INTO journal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))",
+        (0..ROW_COUNT).map(|row| {
+            [
                 Value::Text(format!("{row:04}")),
                 Value::Text(r#"{"state":"base"}"#.into()),
-            ],
-        })
-        .collect::<Vec<_>>();
-    lix.execute_batch_for_test(&inserts).await.unwrap();
+            ]
+        }),
+    )
+    .await
+    .unwrap();
     let other = lix.open_another_session().await.unwrap();
 
     let tx = lix.begin_transaction().await.unwrap();

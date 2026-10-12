@@ -11,7 +11,7 @@
 //!
 //! * `TYPED_CERTIFIED_INSERT_MIN_ROWS` (`32 * 1024`, in
 //!   `sql2/exec/bound_public_write.rs`) rows,
-//! * in a single `execute_batch` of same-shape parameterized single-row
+//! * in a single `execute_many` of same-shape parameterized single-row
 //!   INSERTs,
 //! * against a **user-registered** row schema.
 //!

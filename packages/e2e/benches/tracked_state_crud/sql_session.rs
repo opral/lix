@@ -261,17 +261,11 @@ enum FixtureShape {
     Olap,
 }
 
-/// How `update_all` writes. The literal workloads once went through the
-/// removed `execute_batch` (one auto-commit batch that auto-parameterized
-/// literal UPDATEs); they now run in one explicit transaction, so their
-/// numbers are not comparable with results recorded before that API change.
-/// `execute_many` (bound parameters) keeps the batch fast path.
+/// How `update_all` writes.
 enum UpdateWorkload {
-    Transaction(Vec<String>),
     /// One literal UPDATE per row, in one transaction.
-    Literal(Vec<String>),
+    Transaction(Vec<String>),
     /// One bound UPDATE with a parameter set per row (`execute_many`).
-    Parameterized(SharedParameterBatch),
     PreparedDml(SharedParameterBatch),
 }
 
@@ -1090,25 +1084,15 @@ where
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all(&self) -> usize {
         let expected_rows = match &self.update_all_workload {
-            UpdateWorkload::Transaction(statements) | UpdateWorkload::Literal(statements) => {
-                statements.len()
-            }
-            UpdateWorkload::Parameterized(rows) => rows.row_count(),
+            UpdateWorkload::Transaction(statements) => statements.len(),
             UpdateWorkload::PreparedDml(rows) => rows.row_count(),
         };
         let affected: u64 = match &self.update_all_workload {
-            UpdateWorkload::Transaction(statements) | UpdateWorkload::Literal(statements) => {
+            UpdateWorkload::Transaction(statements) => {
                 execute_in_transaction(&self.session, statements)
                     .await
                     .expect("execute tracked-state CRUD scalar SQL transaction")
             }
-            UpdateWorkload::Parameterized(parameter_rows) => execute_parameter_batch(
-                &self.session,
-                Arc::from(BOUND_UPDATE_ALL_SQL),
-                parameter_rows.clone(),
-            )
-            .await
-            .expect("execute tracked-state CRUD SQL parameter batch"),
             UpdateWorkload::PreparedDml(parameter_rows) => execute_parameter_batch(
                 &self.session,
                 Arc::from(BOUND_UPDATE_ALL_SQL),
@@ -1671,36 +1655,27 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
     if !matches!(shape, FixtureShape::FullCrud) {
         return UpdateWorkload::Transaction(Vec::new());
     }
-    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API").as_deref() {
-        Ok("literal") => UpdateWorkload::Literal(rows.iter().map(update_row_sql).collect()),
-        Ok("execute_many") => UpdateWorkload::Parameterized(prepared_update_rows(rows)),
-        Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected literal or execute_many"
-        ),
-        Err(_) => {
-            let scalar_rows = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT")
-                .ok()
-                .map(|value| {
-                    value.parse::<usize>().unwrap_or_else(|_| {
-                        panic!(
-                            "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be an integer between 1 and {}, got '{value}'",
-                            rows.len()
-                        )
-                    })
-                });
-            if let Some(scalar_rows) = scalar_rows {
-                assert!(
-                    (1..=rows.len()).contains(&scalar_rows),
-                    "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+    let scalar_rows = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().unwrap_or_else(|_| {
+                panic!(
+                    "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be an integer between 1 and {}, got '{value}'",
                     rows.len()
-                );
-                UpdateWorkload::Transaction(
-                    rows[..scalar_rows].iter().map(update_row_sql).collect(),
                 )
-            } else {
-                UpdateWorkload::PreparedDml(prepared_update_rows(rows))
-            }
-        }
+            })
+        });
+    if let Some(scalar_rows) = scalar_rows {
+        assert!(
+            (1..=rows.len()).contains(&scalar_rows),
+            "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+            rows.len()
+        );
+        UpdateWorkload::Transaction(
+            rows[..scalar_rows].iter().map(update_row_sql).collect(),
+        )
+    } else {
+        UpdateWorkload::PreparedDml(prepared_update_rows(rows))
     }
 }
 

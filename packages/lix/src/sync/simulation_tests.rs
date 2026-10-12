@@ -13,7 +13,7 @@ use crate::engine::Engine;
 use crate::storage::Memory;
 use crate::support::fuzz_seeds;
 use crate::support::simulation_test::engine::{Simulation, SimulationMode, SimulationOptions};
-use crate::{ExecuteBatchStatement, Lix, LixError, Value, open_lix};
+use crate::{Lix, LixError, Value, open_lix};
 
 use super::runtime::{
     fetch_repository_snapshot, hydrate_error_for_test, register_blob_manifests, sync_iteration,
@@ -1303,27 +1303,22 @@ async fn packed_recreate_partial_checkpoint_stays_hot(_sim: Simulation) {
         .await
         .expect("selected row should leave a HOT checkpoint baseline");
     replica.write("remaining", "working").await;
-    let mut packed_rows = vec![ExecuteBatchStatement {
-        label: None,
-        sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
-        params: vec![
-            Value::Text("selected-recreate".to_owned()),
-            Value::Text("recreated".to_owned()),
-        ],
-    }];
-    packed_rows.extend(
-        (packed_rows.len()..PACKED_ROW_COUNT).map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
-            params: vec![
-                Value::Text(format!("packed-filler-{index:03}")),
-                Value::Text("filler".to_owned()),
-            ],
-        }),
-    );
+    let mut packed_rows = vec![[
+        Value::Text("selected-recreate".to_owned()),
+        Value::Text("recreated".to_owned()),
+    ]];
+    packed_rows.extend((packed_rows.len()..PACKED_ROW_COUNT).map(|index| {
+        [
+            Value::Text(format!("packed-filler-{index:03}")),
+            Value::Text("filler".to_owned()),
+        ]
+    }));
     replica
         .lix
-        .execute_batch_for_test(&packed_rows)
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            packed_rows,
+        )
         .await
         .expect("recreate batch should publish a packed current base");
     replica.restart().await;
@@ -1460,19 +1455,18 @@ async fn packed_snapshot_partial_file_checkpoint_stays_payload_local(_sim: Simul
             .expect("post-checkpoint file should commit");
     }
     let mut replica = Replica::bootstrap(AuthorityTransport::connected(authority)).await;
-    let packed_rows = (0..PACKED_ROW_COUNT)
-        .map(|index| ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_owned(),
-            params: vec![
-                Value::Text(format!("packed-row-{index:03}")),
-                Value::Text(format!("value-{index:03}")),
-            ],
-        })
-        .collect::<Vec<_>>();
+    let packed_rows = (0..PACKED_ROW_COUNT).map(|index| {
+        [
+            Value::Text(format!("packed-row-{index:03}")),
+            Value::Text(format!("value-{index:03}")),
+        ]
+    });
     replica
         .lix
-        .execute_batch_for_test(&packed_rows)
+        .execute_many(
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            packed_rows,
+        )
         .await
         .expect("large post-checkpoint batch should publish a packed current base");
     replica

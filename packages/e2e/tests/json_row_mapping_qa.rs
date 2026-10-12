@@ -90,15 +90,18 @@ async fn json_row_mapping_sql_creates_and_renames_nested_container_without_rekey
     // A caller-chosen ID permits ordinary SQL creation; no plugin-specific hash is needed.
     lix.execute("INSERT INTO json_object_member(key,kind,container_id,lixcol_file_id) VALUES('settings','object','settings-container',$1)").params(&[Value::Text(file_id.clone())]).await.unwrap();
     lix.execute("INSERT INTO json_object_member(parent_id,key,kind,scalar_json,lixcol_file_id) VALUES('settings-container','enabled','boolean','true'::jsonb,$1)").params(&[Value::Text(file_id.clone())]).await.unwrap();
-    // Commit each valid tree separately: execute_batch cannot delete and recreate
-    // a descendant primary key in the same batch.
-    for statement in [
-        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_object_member WHERE parent_id='settings-container' AND key='enabled' AND occurrence=0 AND lixcol_file_id=$1".into(), params: vec![Value::Text(file_id.clone())] },
-        ExecuteBatchStatement { label: None, sql: "DELETE FROM json_object_member WHERE parent_id='root' AND key='settings' AND occurrence=0 AND lixcol_file_id=$1".into(), params: vec![Value::Text(file_id.clone())] },
-        ExecuteBatchStatement { label: None, sql: "INSERT INTO json_object_member(key,kind,container_id,lixcol_file_id) VALUES('preferences','object','settings-container',$1)".into(), params: vec![Value::Text(file_id.clone())] },
-        ExecuteBatchStatement { label: None, sql: "INSERT INTO json_object_member(parent_id,key,occurrence,order_key,kind,scalar_json,lixcol_file_id) VALUES('settings-container','enabled',0,'80','boolean','true'::jsonb,$1)".into(), params: vec![Value::Text(file_id.clone())] },
+    // Commit each valid tree separately: deleting and recreating a descendant
+    // primary key cannot share one commit.
+    for sql in [
+        "DELETE FROM json_object_member WHERE parent_id='settings-container' AND key='enabled' AND occurrence=0 AND lixcol_file_id=$1",
+        "DELETE FROM json_object_member WHERE parent_id='root' AND key='settings' AND occurrence=0 AND lixcol_file_id=$1",
+        "INSERT INTO json_object_member(key,kind,container_id,lixcol_file_id) VALUES('preferences','object','settings-container',$1)",
+        "INSERT INTO json_object_member(parent_id,key,occurrence,order_key,kind,scalar_json,lixcol_file_id) VALUES('settings-container','enabled',0,'80','boolean','true'::jsonb,$1)",
     ] {
-        lix.execute(&statement.sql).params(&statement.params).await.unwrap();
+        lix.execute(sql)
+            .params(&[Value::Text(file_id.clone())])
+            .await
+            .unwrap();
     }
     let content = lix
         .query("SELECT content FROM lix_file WHERE id=$1")

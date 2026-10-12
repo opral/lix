@@ -8582,7 +8582,9 @@ mod tests {
             demand.succeed_for_test();
         });
 
-        let statements = [
+        // The server's atomic batch path, which also serves remote
+        // execute_many: a history read and a write in one request.
+        let statements = vec![
             ExecuteBatchStatement {
                 sql: format!(
                     "SELECT COUNT(*) AS versions FROM lix_history('lix_file', '{head}')"
@@ -8591,16 +8593,24 @@ mod tests {
                 label: None,
             },
             ExecuteBatchStatement {
-                sql: "INSERT INTO lix_key_value (key, value) VALUES ('history-hydrated', 'once') RETURNING value".to_string(),
+                sql: "INSERT INTO lix_key_value (key, value) VALUES ('history-hydrated', 'once') \
+                      RETURNING value"
+                    .to_string(),
                 params: Vec::new(),
                 label: None,
             },
         ];
-        let results = replica
-            .execute_batch_for_test(&statements)
+        let idempotency = ExecuteIdempotency::new(None, "history-hydrated".into(), [7; 32])
+            .with_branch(replica.active_branch_id().await.unwrap());
+        let results = Arc::clone(&replica)
+            .execute_batch_with_idempotency_and_options_and_metadata(
+                statements,
+                ExecuteOptions::default(),
+                vec![Default::default(); 2],
+                Some(idempotency),
+            )
             .await
-            .expect("history hydration retries the atomic batch before its local commit")
-            .results;
+            .expect("history hydration retries the atomic batch before its local commit");
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[1].rows()[0].get::<serde_json::Value>("value"),

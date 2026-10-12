@@ -537,10 +537,16 @@ async fn explicit_first_prepared_write_returns_a_receipt() {
     lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('warm-receipt', 'one')")
         .await
         .unwrap();
-    lix.execute_batch_for_test(&[
-        lix::ExecuteBatchStatement { label: None, sql: "INSERT INTO lix_key_value (key, value) VALUES ('batch-warm-receipt', 'one')".into(), params: vec![] },
-        lix::ExecuteBatchStatement { label: None, sql: "UPDATE lix_key_value SET value = 'two' WHERE key = 'batch-warm-receipt' RETURNING key".into(), params: vec![] },
-    ]).await.unwrap();
+    let warm = lix.begin_transaction().await.unwrap();
+    warm.execute("INSERT INTO lix_key_value (key, value) VALUES ('tx-warm-receipt', 'one')")
+        .await
+        .unwrap();
+    warm.execute(
+        "UPDATE lix_key_value SET value = 'two' WHERE key = 'tx-warm-receipt' RETURNING key",
+    )
+    .await
+    .unwrap();
+    warm.commit().await.unwrap();
     for (sql, params) in [
         (
             "INSERT INTO lix_key_value (key, value) VALUES ('prepared-receipt', 'one')",
@@ -631,86 +637,71 @@ async fn repeated_updates_return_the_published_transaction_commit_id() {
     let session = open_lix().await.unwrap();
     register_commit_counter(&session).await;
 
-    for explicit in [false, true] {
-        let inserted = session
-            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)")
-            .await
-            .unwrap();
-        let previous_commit = inserted.commit().unwrap().after().to_string();
-        let sql = "UPDATE commit_counter SET n = n + 1 WHERE id = 'a' \
-                       RETURNING OLD.n AS before_n, NEW.n AS after_n, \
-                       OLD.lixcol_commit_id AS before_commit, \
-                       NEW.lixcol_commit_id AS after_commit, lixcol_commit_id";
-        let (results, commit) = if explicit {
-            let transaction = session.begin_transaction().await.unwrap();
-            let first = transaction.execute(sql).await.unwrap();
-            let second = transaction.execute(sql).await.unwrap();
-            let receipt = transaction.commit().await.unwrap();
-            (vec![first, second], receipt.commit.unwrap())
-        } else {
-            let statement = || lix::ExecuteBatchStatement {
-                sql: sql.into(),
-                params: vec![],
-                label: None,
-            };
-            let batch = session
-                .execute_batch_for_test(&[statement(), statement()])
-                .await
-                .unwrap();
-            (batch.results, batch.commit.unwrap())
-        };
-        assert_eq!(commit.before(), previous_commit);
-        assert_ne!(commit.after(), previous_commit);
-        for (index, result) in results.into_iter().enumerate() {
-            assert_rows_eq(
-                result,
-                vec![vec![
-                    Value::Integer(index as i64),
-                    Value::Integer(index as i64 + 1),
-                    Value::Text(if index == 0 {
-                        previous_commit.clone()
-                    } else {
-                        commit.after().into()
-                    }),
-                    Value::Text(commit.after().into()),
-                    Value::Text(commit.after().into()),
-                ]],
-            );
-        }
-        let head = session
-            .query("SELECT lix_active_branch_commit_id()")
-            .all()
-            .await
-            .unwrap();
-        assert_rows_eq(head.into(), vec![vec![Value::Text(commit.after().into())]]);
-        let persisted = session
-            .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
-            .all()
-            .await
-            .unwrap();
+    let inserted = session
+        .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)")
+        .await
+        .unwrap();
+    let previous_commit = inserted.commit().unwrap().after().to_string();
+    let sql = "UPDATE commit_counter SET n = n + 1 WHERE id = 'a' \
+               RETURNING OLD.n AS before_n, NEW.n AS after_n, \
+               OLD.lixcol_commit_id AS before_commit, \
+               NEW.lixcol_commit_id AS after_commit, lixcol_commit_id";
+    let transaction = session.begin_transaction().await.unwrap();
+    let first = transaction.execute(sql).await.unwrap();
+    let second = transaction.execute(sql).await.unwrap();
+    let receipt = transaction.commit().await.unwrap();
+    let (results, commit) = (vec![first, second], receipt.commit.unwrap());
+    assert_eq!(commit.before(), previous_commit);
+    assert_ne!(commit.after(), previous_commit);
+    for (index, result) in results.into_iter().enumerate() {
         assert_rows_eq(
-            persisted.into(),
-            vec![vec![Value::Integer(2), Value::Text(commit.after().into())]],
-        );
-
-        // A deletion returns the old row's provenance, not its own commit.
-        let deleted = session
-            .execute(
-                "DELETE FROM commit_counter WHERE id = 'a' \
-                 RETURNING OLD.lixcol_commit_id, NEW.lixcol_commit_id, lixcol_commit_id",
-            )
-            .await
-            .unwrap();
-        assert_ne!(deleted.commit().unwrap().after(), commit.after());
-        assert_rows_eq(
-            deleted,
+            result,
             vec![vec![
+                Value::Integer(index as i64),
+                Value::Integer(index as i64 + 1),
+                Value::Text(if index == 0 {
+                    previous_commit.clone()
+                } else {
+                    commit.after().into()
+                }),
                 Value::Text(commit.after().into()),
-                Value::Null,
                 Value::Text(commit.after().into()),
             ]],
         );
     }
+    let head = session
+        .query("SELECT lix_active_branch_commit_id()")
+        .all()
+        .await
+        .unwrap();
+    assert_rows_eq(head.into(), vec![vec![Value::Text(commit.after().into())]]);
+    let persisted = session
+        .query("SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'")
+        .all()
+        .await
+        .unwrap();
+    assert_rows_eq(
+        persisted.into(),
+        vec![vec![Value::Integer(2), Value::Text(commit.after().into())]],
+    );
+
+    // A deletion returns the old row's provenance, not its own commit.
+    let deleted = session
+        .execute(
+            "DELETE FROM commit_counter WHERE id = 'a' \
+             RETURNING OLD.lixcol_commit_id, NEW.lixcol_commit_id, lixcol_commit_id",
+        )
+        .await
+        .unwrap();
+    assert_ne!(deleted.commit().unwrap().after(), commit.after());
+    assert_rows_eq(
+        deleted,
+        vec![vec![
+            Value::Text(commit.after().into()),
+            Value::Null,
+            Value::Text(commit.after().into()),
+        ]],
+    );
 }
 
 async fn register_commit_counter(session: &lix::Lix) {

@@ -1,5 +1,5 @@
 use lix::storage::Storage;
-use lix::{ExecuteBatchStatement, Lix, Memory, Value, open_lix};
+use lix::{Lix, Memory, Value, open_lix};
 use lix_storage_filesystem::FilesystemStorage;
 use std::io::{Cursor, Write};
 

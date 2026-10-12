@@ -7377,7 +7377,7 @@ where
         ],
     )
     .await
-    .expect("execute_batch write semantics");
+    .expect("atomic write semantics");
     assert_eq!(batch.len(), 2);
 
     let rollback_key = format!("{prefix}-rollback");
@@ -8688,7 +8688,7 @@ async fn plugin_deletion_cascades_declared_dependents() {
     lix.close().await.unwrap();
 }
 
-/// Runs writes atomically in one transaction and returns each result.
+/// Runs statements atomically in one transaction and returns each result.
 async fn execute_atomically<S>(
     lix: &Lix<S>,
     statements: &[(String, Vec<Value>)],

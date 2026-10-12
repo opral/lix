@@ -6,7 +6,7 @@ use crate::storage::{
     BeginScanOptions, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite,
     ReadOptions, ScanCursor, Storage, StorageError, StorageRead, StorageSpace, WriteOptions,
 };
-use crate::{ExecuteBatchStatement, Value};
+use crate::{LixError, Value};
 
 #[derive(Clone)]
 struct ExpiringReadStorage {
@@ -352,7 +352,7 @@ async fn filesystem_provider_scan_preserves_expired_read_for_session_retry() {
 }
 
 #[tokio::test]
-async fn working_review_batch_retries_expired_hot_epoch_read() {
+async fn working_review_snapshot_reports_an_expired_hot_epoch_read_as_retryable() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
         .with_storage(storage.clone())
@@ -362,34 +362,46 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
         .params(&[Value::Blob(b"pending review".to_vec().into())])
         .await
         .expect("seed working file");
-    let statements = [
-        ExecuteBatchStatement {
-            label: None,
-            sql: "SELECT working_base_commit_id AS before_commit_id, commit_id AS after_commit_id FROM lix_branch WHERE id = lix_active_branch_id()".to_string(),
-            params: vec![],
-        },
-        ExecuteBatchStatement {
-            label: None,
-            sql: "SELECT id, from_path, to_path FROM lix_diff('lix_file')".to_string(),
-            params: vec![],
-        },
-    ];
     storage
         .remaining_expired_hot_epoch_calls
         .store(1, Ordering::Release);
-    let result = lix
-        .execute_batch_for_test(&statements)
+    // A review reads the branch heads and the diff at one state. A snapshot
+    // cannot move to another state, so an expired pinned read surfaces as a
+    // retryable error and the caller retries with a new snapshot.
+    let heads = "SELECT working_base_commit_id AS before_commit_id, commit_id AS after_commit_id \
+                 FROM lix_branch WHERE id = lix_active_branch_id()";
+    let snapshot = lix.snapshot().await.expect("open the review snapshot");
+    snapshot.query(heads).one().await.unwrap();
+    let error = snapshot
+        .query("SELECT id, from_path, to_path FROM lix_diff('lix_file')")
+        .all()
         .await
-        .expect("review must retry the whole coherent batch after HOT epoch expiration")
-        .results;
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("retryable")),
+        Some(&serde_json::json!(true))
+    );
     assert_eq!(
         storage.expired_calls(),
         1,
         "fault must reach the HOT epoch lookup"
     );
-    assert_eq!(result[1].rows().len(), 1);
+    snapshot.close().await.unwrap();
+
+    let snapshot = lix.snapshot().await.expect("reopen the review snapshot");
+    snapshot.query(heads).one().await.unwrap();
+    let diff = snapshot
+        .query("SELECT id, from_path, to_path FROM lix_diff('lix_file')")
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(diff.rows().len(), 1);
     assert_eq!(
-        result[1].rows()[0].get::<String>("to_path").unwrap(),
+        diff.rows()[0].get::<String>("to_path").unwrap(),
         "/review.md"
     );
 }
@@ -594,7 +606,7 @@ async fn path_update_restarts_wherever_its_snapshot_expires() {
 }
 
 #[tokio::test]
-async fn mutation_batch_restarts_atomically_after_snapshot_expiry() {
+async fn execute_many_restarts_atomically_after_snapshot_expiry() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
         .with_storage(storage.clone())
@@ -602,21 +614,15 @@ async fn mutation_batch_restarts_atomically_after_snapshot_expiry() {
         .expect("open Lix");
 
     storage.expire_next_read_call();
-    let statements = [
-        ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-            params: vec![Value::Text("batch-left".into()), Value::Integer(1)],
-        },
-        ExecuteBatchStatement {
-            label: None,
-            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
-            params: vec![Value::Text("batch-right".into()), Value::Integer(2)],
-        },
-    ];
-    lix.execute_batch_for_test(&statements)
-        .await
-        .expect("the complete mutation batch should restart");
+    lix.execute_many(
+        "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+        [
+            [Value::Text("batch-left".into()), Value::Integer(1)],
+            [Value::Text("batch-right".into()), Value::Integer(2)],
+        ],
+    )
+    .await
+    .expect("the complete execute_many should restart");
 
     for (key, expected) in [("batch-left", 1), ("batch-right", 2)] {
         let result = lix
@@ -630,38 +636,6 @@ async fn mutation_batch_restarts_atomically_after_snapshot_expiry() {
             serde_json::json!(expected)
         );
     }
-    assert_eq!(storage.expired_calls(), 1);
-}
-
-#[tokio::test]
-async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
-    let storage = ExpiringReadStorage::new();
-    let lix = crate::open_lix()
-        .with_storage(storage.clone())
-        .await
-        .expect("open Lix");
-
-    storage.expire_next_read_call();
-    let statements = [
-        ExecuteBatchStatement {
-            label: None,
-            sql: "SELECT 1 AS value".to_string(),
-            params: Vec::new(),
-        },
-        ExecuteBatchStatement {
-            label: None,
-            sql: "SELECT 2 AS value".to_string(),
-            params: Vec::new(),
-        },
-    ];
-    let results = lix
-        .execute_batch_for_test(&statements)
-        .await
-        .expect("the complete read batch should restart")
-        .results;
-
-    assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 1);
-    assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 2);
     assert_eq!(storage.expired_calls(), 1);
 }
 

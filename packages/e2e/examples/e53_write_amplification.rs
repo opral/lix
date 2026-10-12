@@ -50,7 +50,7 @@ async fn main() {
         .next()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(50);
-    // Seeded via execute_batch in ONE commit. PACKED_CURRENT_BASE_MIN_ROWS is a
+    // Seeded via execute_many in ONE commit. PACKED_CURRENT_BASE_MIN_ROWS is a
     // floor on rows staged by a single transaction, so this is the knob that
     // decides whether a packed base exists before the incremental lane starts.
     // 500 is the `untracked_state_crud` chunk size -- deliberately just under
