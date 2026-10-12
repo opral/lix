@@ -2406,6 +2406,7 @@ mod tests {
 
     const LIX_A: &str = "11111111-1111-4111-8111-111111111111";
     const LIX_B: &str = "22222222-2222-4222-8222-222222222222";
+    const LIX_C: &str = "33333333-3333-4333-8333-333333333333";
 
     struct TestCacheRoot(PathBuf);
 
@@ -2750,6 +2751,191 @@ mod tests {
         assert_eq!(gate.starts.load(Ordering::SeqCst), 1);
         assert_eq!(manager.cached_lix_count().await, 1);
         drop(service);
+    }
+
+    /// Models the server-owned S3 connector: SlateDB's dedicated runtime must
+    /// schedule transport work onto the server's Tokio I/O runtime.
+    #[derive(Debug)]
+    struct ServerIoStore {
+        inner: Arc<dyn ObjectStore>,
+        runtime: Handle,
+    }
+
+    impl fmt::Display for ServerIoStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "server-io {}", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ServerIoStore {
+        async fn put_opts(
+            &self,
+            path: &ObjectPath,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let inner = Arc::clone(&self.inner);
+            let path = path.clone();
+            self.runtime
+                .spawn(async move { inner.put_opts(&path, payload, options).await })
+                .await
+                .expect("server I/O task must complete")
+        }
+
+        async fn get_opts(
+            &self,
+            path: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let inner = Arc::clone(&self.inner);
+            let path = path.clone();
+            self.runtime
+                .spawn(async move { inner.get_opts(&path, options).await })
+                .await
+                .expect("server I/O task must complete")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &ObjectPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: futures_util::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[test]
+    fn deletion_keeps_single_worker_lifecycle_transport_responsive() {
+        let (completed, completion) = std::sync::mpsc::channel();
+        let stage = Arc::new(std::sync::Mutex::new(String::from("runtime setup")));
+        let worker_stage = Arc::clone(&stage);
+        let worker = std::thread::spawn(move || {
+            let mark = |stage: String| {
+                eprintln!("single-worker lifecycle: {stage}");
+                *worker_stage.lock().unwrap() = stage;
+            };
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut manager = LixRuntimeManager::new_in_memory(3);
+                Arc::get_mut(&mut manager).unwrap().backend = StorageBackend::Memory {
+                    object_store: Arc::new(ServerIoStore {
+                        inner: Arc::new(InMemory::new()),
+                        runtime: Handle::current(),
+                    }),
+                };
+                mark("provision fixtures".into());
+                let setup = Arc::clone(&manager);
+                let io_runtime = Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    io_runtime.block_on(setup.provision_test_repositories())
+                })
+                .await
+                .unwrap();
+                let app = crate::routes::router(
+                    manager.clone(),
+                    None,
+                    Duration::from_secs(5),
+                    Default::default(),
+                );
+                for id in [LIX_A, LIX_B, LIX_C] {
+                    mark(format!("open {id}"));
+                    open_protocol_session(&app, id).await;
+                    mark(format!("delete {id}"));
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("DELETE")
+                                .uri(format!("/lix/v1/{id}"))
+                                .header(
+                                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                                )
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+                    mark(format!("health after {id}"));
+                    assert_eq!(
+                        app.clone()
+                            .oneshot(
+                                Request::builder()
+                                    .uri("/healthz")
+                                    .body(Body::empty())
+                                    .unwrap()
+                            )
+                            .await
+                            .unwrap()
+                            .status(),
+                        http::StatusCode::OK
+                    );
+                }
+                use lix_sdk::server_protocol::LixLifecycleStore as _;
+                mark("create unrelated repository".into());
+                LifecycleHost(Arc::clone(&manager))
+                    .create("owner".into(), "after-deletion".into(), None)
+                    .await
+                    .expect("unrelated create must progress while deletion tears down storage");
+                mark("shutdown and join deletion cleanup".into());
+                manager.shutdown().await.unwrap();
+                mark("verify durable completion".into());
+                for id in [LIX_A, LIX_B, LIX_C] {
+                    assert!(
+                        manager
+                            .repository_record(id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .deletion_complete
+                    );
+                }
+                completed.send(()).unwrap();
+            });
+        });
+        // This deadline runs outside Tokio: a blocked I/O worker cannot also
+        // prevent the regression test's timeout from detecting starvation.
+        completion.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| {
+            panic!("single I/O worker must serve lifecycle requests and complete deletion cleanup: {error}; stage: {}", stage.lock().unwrap());
+        });
+        worker.join().unwrap();
     }
 
     #[tokio::test]
@@ -5309,17 +5495,34 @@ impl LixRuntimeManager {
             let lifecycle = manager.lifecycle_lock(&task_id).await;
             // Never queue an exclusive writer behind a migration: Tokio's fair
             // RwLock would also block fresh reads of the durable tombstone.
-            let _lease = loop {
+            let lease = loop {
                 if let Ok(lease) = Arc::clone(&lifecycle).try_write_owned() {
                     break lease;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             };
-            if let Err(error) = manager
-                .finish_repository_deletion(&task_id, &tombstone)
-                .await
-            {
-                tracing::error!(lix_id = %task_id, error = %error.message, "deleted repository cleanup failed; tombstone retained for retry");
+            let runtime = Handle::current();
+            let cleanup_manager = Arc::clone(&manager);
+            let cleanup_id = task_id.clone();
+            // SlateDB startup waits synchronously for its manager thread and
+            // its final Drop joins that thread. The manager may still need the
+            // server's S3 I/O runtime, so all teardown belongs on a blocking
+            // worker, not a Tokio network worker. Move the exclusive lease too:
+            // cancelling the waiter cannot release it before cleanup finishes.
+            let cleanup = tokio::task::spawn_blocking(move || {
+                let _lease = lease;
+                runtime
+                    .block_on(cleanup_manager.finish_repository_deletion(&cleanup_id, &tombstone))
+            })
+            .await;
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(lix_id = %task_id, error = %error.message, "deleted repository cleanup failed; tombstone retained for retry")
+                }
+                Err(error) => {
+                    tracing::error!(lix_id = %task_id, %error, "failed to join deleted repository cleanup; tombstone retained for retry")
+                }
             }
         });
         // Registration and the shutdown gate share one state lock. Recovery
@@ -5414,7 +5617,9 @@ impl LixRuntimeManager {
                     }
                 };
                 if let Some(service) = service {
-                    service.close().await.map_err(lifecycle_failure)?;
+                    close_lix_service(service)
+                        .await
+                        .map_err(lifecycle_failure)?;
                 }
             }
             drop(entry);
