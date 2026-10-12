@@ -271,10 +271,8 @@ async fn hydrated_browser_partial_indexes_and_pending_rows_survive_v82_to_v87_up
             .unwrap();
         assert!(
             authority_rows
-                .execute(
-                    "SELECT value FROM lix_key_value WHERE key = 'browser-pending'",
-                    &[]
-                )
+                .query("SELECT value FROM lix_key_value WHERE key = 'browser-pending'")
+                .all()
                 .await
                 .unwrap()
                 .rows()
