@@ -36,7 +36,7 @@ test("query returns rows, never writes, and caps buffered bytes", async () => {
 		).rejects.toMatchObject({ code: "LIX_ERROR_READ_ONLY" });
 		await expect(
 			lix.query("SELECT id, label FROM api_item", [], { maxBytes: 128 }),
-		).rejects.toMatchObject({ code: "LIX_RESULT_TOO_LARGE" });
+		).rejects.toMatchObject({ code: "LIX_ERROR_RESULT_TOO_LARGE" });
 		expect(
 			await lix.query("SELECT id, label FROM api_item", [], { maxBytes: Infinity }),
 		).toHaveLength(50);
@@ -55,7 +55,7 @@ test("queryOne reports absent and ambiguous results", async () => {
 		});
 		expect(await lix.queryOne("SELECT label FROM api_item WHERE id = 99")).toBeUndefined();
 		await expect(lix.queryOne("SELECT label FROM api_item")).rejects.toMatchObject({
-			code: "LIX_NOT_UNIQUE",
+			code: "LIX_ERROR_NOT_UNIQUE",
 		});
 	} finally {
 		await lix.close();
@@ -78,7 +78,7 @@ test("execute runs reads and writes and returns rows plus rowsAffected", async (
 		expect(write.commit).not.toBeNull();
 		await expect(
 			lix.execute("SELECT id, label FROM api_item", [], { maxBytes: 16 }),
-		).rejects.toMatchObject({ code: "LIX_RESULT_TOO_LARGE" });
+		).rejects.toMatchObject({ code: "LIX_ERROR_RESULT_TOO_LARGE" });
 	} finally {
 		await lix.close();
 	}
@@ -140,7 +140,7 @@ test("duplicate result column names throw on object rows", async () => {
 	try {
 		await expect(
 			lix.query("SELECT a.id, b.id FROM api_item a JOIN api_item b ON a.id = b.id"),
-		).rejects.toMatchObject({ code: "LIX_AMBIGUOUS_COLUMN" });
+		).rejects.toMatchObject({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" });
 	} finally {
 		await lix.close();
 	}
@@ -159,10 +159,10 @@ test("a snapshot reads one state across writes and closes its streams", async ()
 		expect((await second.pages().next()).value).toEqual([{ id: 2 }, { id: 1 }, { id: 0 }]);
 		await snapshot.close();
 		await expect(rows.pages().next()).rejects.toMatchObject({
-			code: "LIX_SNAPSHOT_CLOSED",
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
 		});
 		await expect(snapshot.query(count)).rejects.toMatchObject({
-			code: "LIX_SNAPSHOT_CLOSED",
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
 		});
 	} finally {
 		await lix.close();
@@ -186,7 +186,7 @@ test("read() scopes a snapshot to its callback", async () => {
 		});
 		expect(counts).toEqual([3, 3]);
 		await expect(kept!.query("SELECT 1")).rejects.toMatchObject({
-			code: "LIX_SNAPSHOT_CLOSED",
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
 		});
 	} finally {
 		await lix.close();
@@ -301,7 +301,7 @@ test("execute never rejects after its write ran, even with duplicate columns", a
 		expect(result.rowsAffected).toBe(1);
 		expect(result.commit).not.toBeNull();
 		expect(() => result.rows).toThrow(
-			expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
+			expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
 		);
 		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 90")).toEqual({ id: 90 });
 
@@ -311,7 +311,7 @@ test("execute never rejects after its write ran, even with duplicate columns", a
 			);
 			expect(staged.rowsAffected).toBe(1);
 			expect(() => staged.rows).toThrow(
-				expect.objectContaining({ code: "LIX_AMBIGUOUS_COLUMN" }),
+				expect.objectContaining({ code: "LIX_ERROR_AMBIGUOUS_COLUMN" }),
 			);
 		});
 		expect(await lix.queryOne("SELECT id FROM api_item WHERE id = 91")).toEqual({ id: 91 });

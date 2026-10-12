@@ -1100,7 +1100,7 @@ export function startWorkerHost(
 		const snapshot = readSnapshots.get(readSnapshotId);
 		if (!snapshot || snapshot.sessionId !== sessionId) {
 			const error = workerStateError("the snapshot is closed");
-			error.code = "LIX_SNAPSHOT_CLOSED";
+			error.code = "LIX_ERROR_SNAPSHOT_CLOSED";
 			throw error;
 		}
 		if (operation.kind === "query")

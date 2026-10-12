@@ -11,7 +11,7 @@ function ambiguousColumn(column: string): Error {
 		`the result has more than one column named '${column}'`,
 	) as Error & { code: string; hint: string };
 	error.name = "LixError";
-	error.code = "LIX_AMBIGUOUS_COLUMN";
+	error.code = "LIX_ERROR_AMBIGUOUS_COLUMN";
 	error.hint =
 		"Alias the columns so every name is unique, e.g. SELECT a.id AS a_id, b.id AS b_id.";
 	return error;
@@ -30,7 +30,7 @@ function columnNames(columns: readonly (ResultColumn | string)[]): string[] {
 }
 
 /** Decodes native rows into objects keyed by column name. Duplicate column
- * names throw `LIX_AMBIGUOUS_COLUMN`, since an object can hold only one. */
+ * names throw `LIX_ERROR_AMBIGUOUS_COLUMN`, since an object can hold only one. */
 export function rowsOf(result: {
 	columns: readonly (ResultColumn | string)[];
 	rows: NativeLixValue[][];
@@ -51,7 +51,7 @@ export function rowsOf(result: {
 /**
  * Wraps the result of a statement that already ran. It never throws: a write
  * may have committed (or staged, in a transaction) by now. When the result
- * has duplicate column names, reading `rows` throws `LIX_AMBIGUOUS_COLUMN`
+ * has duplicate column names, reading `rows` throws `LIX_ERROR_AMBIGUOUS_COLUMN`
  * while `columns`, `rowsAffected` and `commit` stay readable.
  */
 export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {

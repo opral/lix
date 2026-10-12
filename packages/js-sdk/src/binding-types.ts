@@ -56,7 +56,7 @@ export type BindingParam = NativeLixValue;
 export type BindingReadOptions = {
 	/** Byte cap of a buffered result; `Infinity` opts out, omitted keeps 64 MiB. */
 	maxBytes?: number;
-	/** At most one row (`queryOne`): more reject `LIX_NOT_UNIQUE`; not byte-capped. */
+	/** At most one row (`queryOne`): more reject `LIX_ERROR_NOT_UNIQUE`; not byte-capped. */
 	single?: boolean;
 };
 

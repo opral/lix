@@ -150,7 +150,7 @@ const rows = await lix.query<TRow>(sql, params?, { maxBytes?, signal? }?);
 
 Reads the latest committed state. `query()` never writes: statements that write reject with `LIX_ERROR_READ_ONLY` (use `execute()`). Reads that call `uuidv7()` or `current_timestamp` are reads. Pass a single statement; multi-statement SQL is rejected.
 
-The result is buffered and all-or-nothing. It is capped at 64 MiB of row data, measured in the engine; a larger result rejects early with `LIX_RESULT_TOO_LARGE` instead of being truncated. Raise the cap with `{ maxBytes }` (`Infinity` opts out), or read large results with [`stream()`](#stream).
+The result is buffered and all-or-nothing. It is capped at 64 MiB of row data, measured in the engine; a larger result rejects early with `LIX_ERROR_RESULT_TOO_LARGE` instead of being truncated. Raise the cap with `{ maxBytes }` (`Infinity` opts out), or read large results with [`stream()`](#stream).
 
 ```ts
 const files = await lix.query<{ path: string }>(
@@ -174,7 +174,7 @@ await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 
 Anything else (plain objects, arrays, `Date`, `undefined`, `NaN`, `Infinity`, `bigint`) throws `LIX_INVALID_PARAM` instead of being coerced.
 
-Rows are plain objects keyed by column name. A result with two columns of the same name rejects with `LIX_AMBIGUOUS_COLUMN`; alias them (`SELECT a.id AS a_id, b.id AS b_id`).
+Rows are plain objects keyed by column name. A result with two columns of the same name rejects with `LIX_ERROR_AMBIGUOUS_COLUMN`; alias them (`SELECT a.id AS a_id, b.id AS b_id`).
 
 Aborting `signal` rejects the call with the signal's reason.
 
@@ -184,7 +184,7 @@ Aborting `signal` rejects the call with the signal's reason.
 const row = await lix.queryOne<TRow>(sql, params?, { signal? }?);
 ```
 
-Reads at most one row: resolves `undefined` when there is none and rejects `LIX_NOT_UNIQUE` when there are more. Not byte-capped.
+Reads at most one row: resolves `undefined` when there is none and rejects `LIX_ERROR_NOT_UNIQUE` when there are more. Not byte-capped.
 
 ### stream()
 
@@ -207,7 +207,7 @@ for await (const page of variants.pages()) render(page);
 
 `break`, `return()`, `close()`, `await using`, aborting `signal`, or closing Lix ends the stream and releases its state; `close()` resolves once the engine has stopped. A pull after an abort rejects with the signal's reason, and after `lix.close()` with `LIX_ERROR_CLOSED`, so a truncated read is never mistaken for a complete one. An error is final: later pulls reject with the same error. An open stream does not block writes on the same handle.
 
-Streams never write. A few statements must buffer before their first page: reads of file content (`lix_file.content`), reads inside a transaction, and reads on partial replicas. Those buffers are capped by `maxBytes` (64 MiB by default) and reject with `LIX_RESULT_TOO_LARGE` beyond it. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
+Streams never write. A few statements must buffer before their first page: reads of file content (`lix_file.content`), reads inside a transaction, and reads on partial replicas. Those buffers are capped by `maxBytes` (64 MiB by default) and reject with `LIX_ERROR_RESULT_TOO_LARGE` beyond it. Remote handles reject streams with `LIX_UNSUPPORTED_REMOTE_OPERATION`; page remote reads with keyset queries.
 
 ### read() and snapshot()
 
@@ -226,7 +226,7 @@ try {
 }
 ```
 
-A snapshot pins one state: every read through it sees that state, even while other writes commit, and several streams may be open at once. `read(fn)` closes its snapshot when `fn` settles; `snapshot()` returns an owned snapshot for state that outlives one callback (`await using` works too). `close()` closes its streams and resolves once in-flight reads have released the state; later calls reject `LIX_SNAPSHOT_CLOSED`. Remote handles reject snapshots with `LIX_UNSUPPORTED_REMOTE_OPERATION`.
+A snapshot pins one state: every read through it sees that state, even while other writes commit, and several streams may be open at once. `read(fn)` closes its snapshot when `fn` settles; `snapshot()` returns an owned snapshot for state that outlives one callback (`await using` works too). `close()` closes its streams and resolves once in-flight reads have released the state; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. Remote handles reject snapshots with `LIX_UNSUPPORTED_REMOTE_OPERATION`.
 
 ### execute()
 
@@ -564,7 +564,7 @@ Transactions expose:
 const row = result.rows[0]!;
 ```
 
-Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. A read with duplicate column names rejects with `LIX_AMBIGUOUS_COLUMN`, since an object holds one value per name; alias the columns. `execute()` never fails after its statement ran: for such a result it resolves, and reading `rows` throws `LIX_AMBIGUOUS_COLUMN` while `columns`, `rowsAffected` and `commit` stay readable.
+Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. A read with duplicate column names rejects with `LIX_ERROR_AMBIGUOUS_COLUMN`, since an object holds one value per name; alias the columns. `execute()` never fails after its statement ran: for such a result it resolves, and reading `rows` throws `LIX_ERROR_AMBIGUOUS_COLUMN` while `columns`, `rowsAffected` and `commit` stay readable.
 
 ## Value
 

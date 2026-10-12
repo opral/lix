@@ -183,7 +183,7 @@ export class Lix implements Reader {
 	 * Reads the latest committed state. Reads only: statements that write
 	 * reject with `LIX_ERROR_READ_ONLY`. The result is buffered and capped at
 	 * 64 MiB of row data (`maxBytes`); beyond it the call rejects with
-	 * `LIX_RESULT_TOO_LARGE`. Use `stream()` for large reads.
+	 * `LIX_ERROR_RESULT_TOO_LARGE`. Use `stream()` for large reads.
 	 */
 	query<TRow extends object = Row>(
 		sql: string,
@@ -193,7 +193,7 @@ export class Lix implements Reader {
 		return query<TRow>(this.#reader, sql, params, options);
 	}
 
-	/** At most one row: `undefined` when there is none; rejects `LIX_NOT_UNIQUE` when there are more. */
+	/** At most one row: `undefined` when there is none; rejects `LIX_ERROR_NOT_UNIQUE` when there are more. */
 	queryOne<TRow extends object = Row>(
 		sql: string,
 		params?: readonly SqlParam[],

@@ -341,7 +341,7 @@ export class RepositorySession {
 						return;
 					}
 					throw repositoryError(
-						"LIX_SNAPSHOT_CLOSED",
+						"LIX_ERROR_SNAPSHOT_CLOSED",
 						"Read snapshot belonged to a previous repository owner; open a new snapshot",
 					);
 				}

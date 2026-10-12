@@ -471,7 +471,7 @@ test("read snapshots map to the owner's id and do not survive owner loss", async
 	const stale = f.request({ kind: "query", sql: "SELECT 1", params: [], readSnapshotId });
 	expect(f.result(stale)).toMatchObject({
 		ok: false,
-		error: { code: "LIX_SNAPSHOT_CLOSED" },
+		error: { code: "LIX_ERROR_SNAPSHOT_CLOSED" },
 	});
 	const close = f.request({ kind: "readSnapshot.close", readSnapshotId });
 	expect(f.result(close)).toMatchObject({ ok: true });

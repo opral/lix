@@ -109,7 +109,7 @@ test.each(["abort", "lix-close"])(
 test("duplicate column names reject the stream and release it", async () => {
 	const f = fakeLix(vi.fn(async () => null), ["id", "id"]);
 	await expect(f.lix.stream("SELECT a.id, b.id FROM t")).rejects.toMatchObject({
-		code: "LIX_AMBIGUOUS_COLUMN",
+		code: "LIX_ERROR_AMBIGUOUS_COLUMN",
 	});
 	expect(f.cancel).toHaveBeenCalledOnce();
 	await f.lix.close();
@@ -207,7 +207,7 @@ test("a result over the buffered cap streams completely", async () => {
 		const rows = 200_000;
 		const sql = `SELECT value FROM generate_series(1, ${rows})`;
 		await expect(lix.query(sql, [], { maxBytes: 1024 })).rejects.toMatchObject({
-			code: "LIX_RESULT_TOO_LARGE",
+			code: "LIX_ERROR_RESULT_TOO_LARGE",
 		});
 		let seen = 0;
 		let last = 0;

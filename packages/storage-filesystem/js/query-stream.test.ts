@@ -71,7 +71,7 @@ test("the native binding pulls pages, cancels, and ends at close", async () => {
 		expect(pinned.rows).toEqual([[{ kind: "integer", value: 4 }]]);
 		await snapshot.close();
 		await expect(snapshot.query("SELECT 1", [])).rejects.toMatchObject({
-			code: "LIX_SNAPSHOT_CLOSED",
+			code: "LIX_ERROR_SNAPSHOT_CLOSED",
 		});
 
 		const open = await binding.stream(sql, []);

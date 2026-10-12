@@ -2,7 +2,7 @@
 //!
 //! A buffered read (`query().all()`, `execute()` RETURNING rows) collects its
 //! whole result in memory. The cap turns an accidental huge result into a loud
-//! `LIX_RESULT_TOO_LARGE` error instead of an out-of-memory crash, and the
+//! `LIX_ERROR_RESULT_TOO_LARGE` error instead of an out-of-memory crash, and the
 //! collection aborts as soon as the cap is crossed. Streams are not capped.
 //!
 //! The cap travels with the read as a task-local [`ReadLimits`] so every

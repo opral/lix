@@ -24,7 +24,7 @@ pub(super) const PARTIAL_ADMISSION_CHANGED_CODE: &str = "LIX_PARTIAL_ADMISSION_C
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 /// The sync transport received nothing for a whole stall window. Retryable:
 /// the authority or the network may come back.
-pub(crate) const SYNC_TRANSPORT_STALLED_CODE: &str = "LIX_SYNC_TRANSPORT_STALLED";
+pub(crate) const SYNC_TRANSPORT_STALLED_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT_STALLED";
 const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 16;
 /// Independent sparse heads are safe to fetch concurrently. Keeping the cap
 /// below the HTTP/1 connection fan-out used by browser transports avoids both

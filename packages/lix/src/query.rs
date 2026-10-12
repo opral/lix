@@ -116,7 +116,7 @@ impl Query {
 
     /// Caps the bytes [`Self::all`] may buffer (row and value memory).
     /// Defaults to 64 MiB; `usize::MAX` opts out. A larger result fails with
-    /// `LIX_RESULT_TOO_LARGE` and returns nothing; it is never truncated.
+    /// `LIX_ERROR_RESULT_TOO_LARGE` and returns nothing; it is never truncated.
     /// [`Self::stream`] applies it only to statements it has to buffer;
     /// [`Self::one`] and [`Self::optional`] read at most one row and ignore it.
     pub fn max_bytes(mut self, max_bytes: usize) -> Self {
@@ -149,8 +149,8 @@ impl Query {
         target.query(request).await
     }
 
-    /// Returns the only row. Fails with `LIX_NO_ROWS` when there is none and
-    /// `LIX_NOT_UNIQUE` when there are more. Not byte-capped.
+    /// Returns the only row. Fails with `LIX_ERROR_NO_ROWS` when there is none and
+    /// `LIX_ERROR_NOT_UNIQUE` when there are more. Not byte-capped.
     pub async fn one(self) -> Result<Row, LixError> {
         self.optional().await?.ok_or_else(|| {
             LixError::new(LixError::CODE_NO_ROWS, "query returned no rows")
@@ -159,7 +159,7 @@ impl Query {
     }
 
     /// Returns the row, or `None` when there is none. Fails with
-    /// `LIX_NOT_UNIQUE` when there is more than one. Not byte-capped.
+    /// `LIX_ERROR_NOT_UNIQUE` when there is more than one. Not byte-capped.
     pub async fn optional(self) -> Result<Option<Row>, LixError> {
         let (target, request) = self.request(ReadLimits::single_row());
         let mut rows = target.query(request).await?.into_rows();
@@ -178,7 +178,7 @@ impl Query {
     /// reads of `lix_file.content` (and other plugin-rendered file bytes),
     /// reads inside a transaction, and reads on a partial replica. Those
     /// buffers are capped by [`Self::max_bytes`] (64 MiB by default) and fail
-    /// with `LIX_RESULT_TOO_LARGE` beyond it.
+    /// with `LIX_ERROR_RESULT_TOO_LARGE` beyond it.
     pub async fn stream(self) -> Result<RowStream, LixError> {
         let limits = ReadLimits::bytes(self.max_bytes);
         let (target, request) = self.request(limits);
@@ -391,7 +391,7 @@ impl Snapshot {
     }
 
     /// Closes the snapshot for every clone: its streams stop and later reads
-    /// fail with `LIX_SNAPSHOT_CLOSED`. Resolves once reads that were already
+    /// fail with `LIX_ERROR_SNAPSHOT_CLOSED`. Resolves once reads that were already
     /// running have finished and the pinned state is released. Idempotent.
     pub async fn close(&self) -> Result<(), LixError> {
         self.inner.clone().close().await

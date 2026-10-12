@@ -302,7 +302,7 @@ where
     }
 
     /// Closes the snapshot for every clone: its streams stop and later reads
-    /// fail with `LIX_SNAPSHOT_CLOSED`. Reads already running keep their view
+    /// fail with `LIX_ERROR_SNAPSHOT_CLOSED`. Reads already running keep their view
     /// until they finish.
     fn begin_close(&self) {
         let previous = std::mem::replace(

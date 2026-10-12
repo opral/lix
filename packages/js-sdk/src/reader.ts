@@ -41,7 +41,7 @@ function lixError(code: string, message: string, hint?: string): LixError {
 }
 
 export function snapshotClosedError(): LixError {
-	return lixError("LIX_SNAPSHOT_CLOSED", "the snapshot is closed");
+	return lixError("LIX_ERROR_SNAPSHOT_CLOSED", "the snapshot is closed");
 }
 
 export function closedError(): LixError {
@@ -429,7 +429,7 @@ function assertUniqueColumns(columns: readonly string[]): void {
 	for (const column of columns) {
 		if (seen.has(column)) {
 			throw lixError(
-				"LIX_AMBIGUOUS_COLUMN",
+				"LIX_ERROR_AMBIGUOUS_COLUMN",
 				`the result has more than one column named '${column}'`,
 				"Alias the columns so every name is unique, e.g. SELECT a.id AS a_id, b.id AS b_id.",
 			);
@@ -491,7 +491,7 @@ export class LixSnapshot implements Snapshot {
 		return stream<TRow>(this.#context, sql, params, options);
 	}
 
-	/** Idempotent. Closes its streams; later calls reject `LIX_SNAPSHOT_CLOSED`. */
+	/** Idempotent. Closes its streams; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. */
 	close(): Promise<void> {
 		return (this.#closePromise ??= (async () => {
 			this.#closed = true;

@@ -49,7 +49,7 @@ pub(crate) fn max_bytes_option(value: Option<f64>) -> Result<Option<usize>, LixE
 pub(crate) struct ReadOptions {
     /// Byte cap; `None` keeps the engine default.
     pub(crate) max_bytes: Option<usize>,
-    /// Reads at most one row (`queryOne`): fails with `LIX_NOT_UNIQUE` when
+    /// Reads at most one row (`queryOne`): fails with `LIX_ERROR_NOT_UNIQUE` when
     /// there are more, and is not byte-capped.
     pub(crate) single: bool,
 }

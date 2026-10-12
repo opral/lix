@@ -271,7 +271,7 @@ export type CallOptions = {
 export type QueryOptions = CallOptions & {
 	/**
 	 * Byte cap of the buffered result, measured in the engine (default 64 MiB).
-	 * `Infinity` opts out. Exceeding it rejects with `LIX_RESULT_TOO_LARGE`.
+	 * `Infinity` opts out. Exceeding it rejects with `LIX_ERROR_RESULT_TOO_LARGE`.
 	 */
 	maxBytes?: number;
 };
@@ -395,7 +395,7 @@ export interface Reader {
 		params?: readonly SqlParam[],
 		options?: QueryOptions,
 	): Promise<TRow[]>;
-	/** At most one row: `undefined` if there is none; rejects `LIX_NOT_UNIQUE` if there are more. */
+	/** At most one row: `undefined` if there is none; rejects `LIX_ERROR_NOT_UNIQUE` if there are more. */
 	queryOne<TRow extends object = Row>(
 		sql: string,
 		params?: readonly SqlParam[],
@@ -411,7 +411,7 @@ export interface Reader {
 
 /** A pinned state: every read through it sees the same state. */
 export interface Snapshot extends Reader, AsyncDisposable {
-	/** Closes its streams; later calls reject `LIX_SNAPSHOT_CLOSED`. */
+	/** Closes its streams; later calls reject `LIX_ERROR_SNAPSHOT_CLOSED`. */
 	close(): Promise<void>;
 }
 

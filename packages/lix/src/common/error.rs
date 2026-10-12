@@ -139,7 +139,7 @@ impl LixError {
     pub const CODE_COLUMN_NOT_FOUND: &'static str = "LIX_COLUMN_NOT_FOUND";
 
     /// A row lookup by name matched several result columns.
-    pub const CODE_AMBIGUOUS_COLUMN: &'static str = "LIX_AMBIGUOUS_COLUMN";
+    pub const CODE_AMBIGUOUS_COLUMN: &'static str = "LIX_ERROR_AMBIGUOUS_COLUMN";
 
     /// A SQL write violated a primary-key, unique, NOT NULL, or other
     /// relational constraint.
@@ -150,16 +150,16 @@ impl LixError {
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
     /// A buffered result exceeded its byte cap. Nothing was returned.
-    pub const CODE_RESULT_TOO_LARGE: &'static str = "LIX_RESULT_TOO_LARGE";
+    pub const CODE_RESULT_TOO_LARGE: &'static str = "LIX_ERROR_RESULT_TOO_LARGE";
 
     /// A single-row read matched more than one row.
-    pub const CODE_NOT_UNIQUE: &'static str = "LIX_NOT_UNIQUE";
+    pub const CODE_NOT_UNIQUE: &'static str = "LIX_ERROR_NOT_UNIQUE";
 
     /// A single-row read that requires a row matched none.
-    pub const CODE_NO_ROWS: &'static str = "LIX_NO_ROWS";
+    pub const CODE_NO_ROWS: &'static str = "LIX_ERROR_NO_ROWS";
 
     /// The snapshot was closed; it serves no further reads.
-    pub const CODE_SNAPSHOT_CLOSED: &'static str = "LIX_SNAPSHOT_CLOSED";
+    pub const CODE_SNAPSHOT_CLOSED: &'static str = "LIX_ERROR_SNAPSHOT_CLOSED";
 
     /// A partial replica cannot prove completeness for a global history surface.
     /// Single read statements may be retried against the configured authority.
