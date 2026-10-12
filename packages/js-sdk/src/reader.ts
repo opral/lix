@@ -204,7 +204,10 @@ export type ReaderContext = {
 	run<T>(operation: () => Promise<T>): Promise<T>;
 	/** The binding reads go to, resolved per call. */
 	binding(): ReaderBinding;
-	/** Tracks an open stream so the owner can close it. */
+	/**
+	 * Tracks an open stream so the owner can close it. Throws (after
+	 * releasing the stream) when the owner closed while the stream opened.
+	 */
 	adopt(stream: LixRowStream<object>): void;
 	/** Aborts when the owner closes (or its transaction is aborted). */
 	signal?(): AbortSignal | undefined;
@@ -301,10 +304,7 @@ export async function stream<TRow extends object>(
 		binding = await withAbort(opening, signal);
 	} catch (error) {
 		// An abort that wins the race must still release the stream.
-		void opening.then(
-			(opened) => opened.cancel(),
-			() => undefined,
-		);
+		void opening.then((opened) => opened.cancel()).catch(() => undefined);
 		throw error;
 	}
 	try {
@@ -318,19 +318,64 @@ export async function stream<TRow extends object>(
 	return rows;
 }
 
+/**
+ * The open streams or snapshots of an owner, held weakly: an owner closes
+ * what is still open when it closes, but never keeps an abandoned one alive,
+ * so the abandoned one's finalizer can release its engine state.
+ */
+export class WeakCollection<T extends object> {
+	readonly #refs = new Set<WeakRef<T>>();
+	readonly #registry = new FinalizationRegistry<WeakRef<T>>((ref) =>
+		this.#refs.delete(ref),
+	);
+
+	/** Adds `item`; the returned function removes it. */
+	add(item: T): () => void {
+		const ref = new WeakRef(item);
+		this.#refs.add(ref);
+		this.#registry.register(item, ref, ref);
+		return () => {
+			this.#refs.delete(ref);
+			this.#registry.unregister(ref);
+		};
+	}
+
+	/** Removes and returns every item still alive. */
+	drain(): T[] {
+		const items: T[] = [];
+		for (const ref of this.#refs) {
+			this.#registry.unregister(ref);
+			const item = ref.deref();
+			if (item) items.push(item);
+		}
+		this.#refs.clear();
+		return items;
+	}
+
+	get size(): number {
+		return this.#refs.size;
+	}
+}
+
 // An abandoned, unexhausted stream still pins its read state; release it.
 const streamFinalizer = new FinalizationRegistry<QueryStreamBinding>(
 	(binding) => void Promise.resolve(binding.cancel()).catch(() => undefined),
 );
 
 /**
- * Pulls are serialized: a pull issued while another is pending waits for it,
- * so rows always arrive in order. Closing settles a pending pull at once and
- * releases the engine stream. An error is latched: later pulls reject with it.
+ * One cursor serves `pages()` and the row iterator: a page pull returns the
+ * rest of a page the row iterator started, so mixing them never skips or
+ * repeats rows. Pulls are serialized: a pull issued while another is pending
+ * waits for it, so rows always arrive in order, also under concurrent
+ * `next()` calls. Closing settles a pending pull at once and releases the
+ * engine stream. An error is latched: later pulls reject with it.
  */
 export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	readonly columns: string[];
 	#tail: Promise<unknown> = Promise.resolve();
+	/** The page the row iterator is consuming, and its next row's index. */
+	#rows: TRow[] = [];
+	#index = 0;
 	#done = false;
 	#failure: { error: unknown } | undefined;
 	#closePromise: Promise<void> | undefined;
@@ -339,7 +384,8 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	readonly #endedSignal = new Promise<typeof ENDED>((resolve) => {
 		this.#ended = () => resolve(ENDED);
 	});
-	readonly #abort = () => void this.#closeWith({ error: this.signal?.reason });
+	/** Holds the stream weakly, so a long-lived signal never pins it. */
+	readonly #abort: () => void;
 
 	constructor(
 		private readonly binding: QueryStreamBinding,
@@ -347,6 +393,12 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	) {
 		this.columns = Object.freeze([...binding.columns]) as string[];
 		streamFinalizer.register(this, binding, this);
+		const stream = new WeakRef(this);
+		this.#abort = () => {
+			const alive = stream.deref();
+			if (alive)
+				void alive.#closeWith({ error: signal?.reason }).catch(() => undefined);
+		};
 		if (signal?.aborted) this.#abort();
 		else signal?.addEventListener("abort", this.#abort, { once: true });
 	}
@@ -382,17 +434,12 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 
 	[Symbol.asyncIterator](): AsyncIterator<TRow> {
 		const stream = this;
-		let buffered: TRow[] = [];
-		let index = 0;
 		return {
 			async next(): Promise<IteratorResult<TRow>> {
-				while (index >= buffered.length) {
-					const page = await stream.#nextPage();
-					if (page === undefined) return { done: true, value: undefined };
-					buffered = page;
-					index = 0;
-				}
-				return { done: false, value: buffered[index++]! };
+				const row = await stream.#nextRow();
+				return row === undefined
+					? { done: true, value: undefined }
+					: { done: false, value: row };
 			},
 			async return(): Promise<IteratorResult<TRow>> {
 				await stream.close();
@@ -419,9 +466,33 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	}
 
 	#nextPage(): Promise<TRow[] | undefined> {
-		const pull = this.#tail.then(() => this.#pull());
-		this.#tail = pull.catch(() => undefined);
-		return pull;
+		return this.#serialized(() => {
+			if (this.#index < this.#rows.length) {
+				const rest = this.#rows.slice(this.#index);
+				this.#rows = [];
+				this.#index = 0;
+				return rest;
+			}
+			return this.#pull();
+		});
+	}
+
+	#nextRow(): Promise<TRow | undefined> {
+		return this.#serialized(async () => {
+			while (this.#index >= this.#rows.length) {
+				const page = await this.#pull();
+				if (page === undefined) return undefined;
+				this.#rows = page;
+				this.#index = 0;
+			}
+			return this.#rows[this.#index++];
+		});
+	}
+
+	#serialized<T>(pull: () => T | Promise<T>): Promise<T> {
+		const next = this.#tail.then(pull);
+		this.#tail = next.catch(() => undefined);
+		return next;
 	}
 
 	async #pull(): Promise<TRow[] | undefined> {
@@ -436,7 +507,8 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 			return rowsOf({ ...page, columns: this.columns }) as TRow[];
 		} catch (error) {
 			if (this.#done) return this.#end();
-			await this.#closeWith({ error });
+			// The read's own error wins over a failure to release the stream.
+			await this.#closeWith({ error }).catch(() => undefined);
 			throw error;
 		}
 	}
@@ -448,6 +520,8 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 
 	#closeWith(failure: { error: unknown } | undefined): Promise<void> {
 		if (!this.#done && failure) this.#failure = failure;
+		this.#rows = [];
+		this.#index = 0;
 		this.#finish();
 		return (this.#closePromise ??= Promise.resolve()
 			.then(() => this.binding.cancel())
@@ -491,7 +565,7 @@ export class LixSnapshot implements Snapshot {
 	#closePromise: Promise<void> | undefined;
 	#closed = false;
 	readonly #closing = new AbortController();
-	readonly #streams = new Set<LixRowStream<object>>();
+	readonly #streams = new WeakCollection<LixRowStream<object>>();
 	readonly #context: ReaderContext;
 
 	constructor(
@@ -505,8 +579,11 @@ export class LixSnapshot implements Snapshot {
 				this.#closed ? Promise.reject(snapshotClosedError()) : operation(),
 			binding: () => this.binding,
 			adopt: (stream) => {
-				this.#streams.add(stream);
-				stream.onClose(() => this.#streams.delete(stream));
+				if (this.#closed) {
+					void stream.fail(snapshotClosedError()).catch(() => undefined);
+					throw snapshotClosedError();
+				}
+				stream.onClose(this.#streams.add(stream));
 			},
 			signal: () => this.#closing.signal,
 		};
@@ -543,10 +620,9 @@ export class LixSnapshot implements Snapshot {
 			// Stop reads in flight in the engine, so closing never waits on them.
 			this.#closing.abort(snapshotClosedError());
 			snapshotFinalizer.unregister(this);
-			const streams = [...this.#streams].map((stream) =>
-				stream.fail(snapshotClosedError()),
-			);
-			this.#streams.clear();
+			const streams = this.#streams
+				.drain()
+				.map((stream) => stream.fail(snapshotClosedError()));
 			try {
 				await Promise.allSettled(streams);
 				await this.binding.close();

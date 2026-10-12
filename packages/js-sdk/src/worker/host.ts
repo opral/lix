@@ -236,7 +236,11 @@ export function startWorkerHost(
 			lane,
 			pool,
 			sessionId,
-		onQueued: () => postQueued(request),
+			// Independent work (stream pulls and opens, snapshot reads) is
+			// closable or cancellable, so waiting behind other slow reads is
+			// never a reason to fail it.
+			queueWaitMs: pool === "independent" ? null : undefined,
+			onQueued: () => postQueued(request),
 			run: () => {
 				postStarted(request);
 				return respond(request, operation).finally(resolveCompletion);
@@ -1069,7 +1073,10 @@ export function startWorkerHost(
 		streamId: number,
 	): Promise<unknown> {
 		const stream = queryStreams.get(streamId);
-		if (!stream) return undefined;
+		// A pull only follows a page that was not the last, so an unknown id is
+		// a stream released under the caller (its session or snapshot closed,
+		// or the worker was replaced), never a stream that ended.
+		if (!stream) throw queryStreamLostError();
 		try {
 			const page = await stream.binding.next();
 			if (page == null) queryStreams.delete(streamId);
@@ -1716,6 +1723,15 @@ function workerStateError(message: string): Error & { code?: string } {
 	const error = new Error(message) as Error & { code?: string };
 	error.name = "LixError";
 	error.code = "LIX_ERROR_CLOSED";
+	return error;
+}
+
+function queryStreamLostError(): Error & { code: string } {
+	const error = new Error(
+		"The query stream is no longer open in the worker; start a new stream",
+	) as Error & { code: string };
+	error.name = "LixError";
+	error.code = "LIX_ERROR_QUERY_STREAM_LOST";
 	return error;
 }
 

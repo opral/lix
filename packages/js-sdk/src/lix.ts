@@ -19,6 +19,7 @@ import {
 	throwIfAborted,
 	withAbort,
 	type ReaderContext,
+	WeakCollection,
 } from "./reader.js";
 import { normalizeParam, toNativeValue } from "./value.js";
 import type {
@@ -122,8 +123,8 @@ export class Lix implements Reader {
 	>();
 	readonly #observationDrains = new Set<Promise<void>>();
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
-	readonly #queryStreams = new Set<LixRowStream<object>>();
-	readonly #snapshots = new Set<LixSnapshot>();
+	readonly #queryStreams = new WeakCollection<LixRowStream<object>>();
+	readonly #snapshots = new WeakCollection<LixSnapshot>();
 	/** Aborts on close(): reads in flight stop in the engine. */
 	readonly #closing = new AbortController();
 	readonly #reader: ReaderContext = {
@@ -252,20 +253,16 @@ export class Lix implements Reader {
 		throwIfAborted(options.signal);
 		const opening = this.#runOperation(() => this.binding.snapshot());
 		const binding = await withAbort(opening, options.signal).catch((error: unknown) => {
-			void opening.then(
-				(opened) => opened.close(),
-				() => undefined,
-			);
+			void opening.then((opened) => opened.close()).catch(() => undefined);
 			throw error;
 		});
-		const snapshot: LixSnapshot = new LixSnapshot(binding, () =>
-			this.#snapshots.delete(snapshot),
-		);
+		let forget = () => {};
+		const snapshot = new LixSnapshot(binding, () => forget());
 		if (!this.#acceptingOperations) {
 			await snapshot.close();
 			throw closedError();
 		}
-		this.#snapshots.add(snapshot);
+		forget = this.#snapshots.add(snapshot);
 		return snapshot;
 	}
 
@@ -313,11 +310,10 @@ export class Lix implements Reader {
 
 	#adoptStream(stream: LixRowStream<object>): void {
 		if (!this.#acceptingOperations) {
-			void stream.fail(closedError());
-			return;
+			void stream.fail(closedError()).catch(() => undefined);
+			throw closedError();
 		}
-		this.#queryStreams.add(stream);
-		stream.onClose(() => this.#queryStreams.delete(stream));
+		stream.onClose(this.#queryStreams.add(stream));
 	}
 
 	observe(
@@ -661,12 +657,10 @@ export class Lix implements Reader {
 			}
 			this.#observations.clear();
 			const observationDrains = [...this.#observationDrains];
-			const queryStreams = [...this.#queryStreams].map((stream) =>
-				stream.fail(closedError()),
-			);
-			this.#queryStreams.clear();
-			const snapshots = [...this.#snapshots].map((snapshot) => snapshot.close());
-			this.#snapshots.clear();
+			const queryStreams = this.#queryStreams
+				.drain()
+				.map((stream) => stream.fail(closedError()));
+			const snapshots = this.#snapshots.drain().map((snapshot) => snapshot.close());
 			this.closePromise = (async () => {
 				await Promise.allSettled(observationDrains);
 				await Promise.allSettled(queryStreams);

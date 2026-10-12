@@ -131,6 +131,13 @@ export class RepositorySession {
 			else if (kind === "close") {
 				this.sessions.delete(request.sessionId);
 				this.output({ id: request.id, ok: true });
+			} else if (
+				kind === "stream.close" ||
+				kind === "readSnapshot.close" ||
+				kind === "exportSnapshot.cancel"
+			) {
+				// The lost owner took the released state with it.
+				this.output({ id: request.id, ok: true, value: undefined });
 			} else
 				this.output({
 					id: request.id,
@@ -330,6 +337,10 @@ export class RepositorySession {
 			}
 			if ("exportId" in operation) {
 				const remote = this.exports.get(operation.exportId);
+				if (remote === undefined && operation.kind === "exportSnapshot.cancel") {
+					this.output({ id: message.id, ok: true, value: undefined });
+					return;
+				}
 				if (remote === undefined)
 					throw repositoryError(
 						"LIX_SNAPSHOT_LOST",

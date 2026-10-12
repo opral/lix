@@ -1,3 +1,5 @@
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { expect, test, vi } from "vitest";
 import { Lix } from "./lix.js";
 import { openLix } from "./open-lix.js";
@@ -51,6 +53,37 @@ test("stream opens eagerly, then rows and pages share one cursor in order", asyn
 	await f.lix.close();
 });
 
+test("pages() continues the page the row iterator started", async () => {
+	const pages = [page([1, 2, 3]), page([4, 5])];
+	const f = fakeLix(vi.fn(async () => pages.shift() ?? null));
+	const rows = await f.lix.stream("SELECT n FROM t");
+	const rowIterator = rows[Symbol.asyncIterator]();
+	expect(await rowIterator.next()).toEqual({ done: false, value: { n: 1 } });
+	const pageIterator = rows.pages();
+	expect(await pageIterator.next()).toEqual({ done: false, value: [{ n: 2 }, { n: 3 }] });
+	expect(await rowIterator.next()).toEqual({ done: false, value: { n: 4 } });
+	expect(await pageIterator.next()).toEqual({ done: false, value: [{ n: 5 }] });
+	expect(await rowIterator.next()).toEqual({ done: true, value: undefined });
+	await f.lix.close();
+});
+
+test("concurrent next() calls receive every row once, in order", async () => {
+	const pages = [page([1, 2]), page([3, 4, 5]), page([6])];
+	const f = fakeLix(vi.fn(async () => pages.shift() ?? null));
+	const rows = await f.lix.stream("SELECT n FROM t");
+	const first = rows[Symbol.asyncIterator]();
+	const second = rows[Symbol.asyncIterator]();
+	const results = await Promise.all(
+		Array.from({ length: 8 }, (_, i) => (i % 2 ? first : second).next()),
+	);
+	expect(results).toEqual([
+		...[1, 2, 3, 4, 5, 6].map((n) => ({ done: false, value: { n } })),
+		{ done: true, value: undefined },
+		{ done: true, value: undefined },
+	]);
+	await f.lix.close();
+});
+
 test("break, return() and close() release the binding stream once", async () => {
 	const f = fakeLix(vi.fn(async () => page([1])));
 	const rows = await f.lix.stream("SELECT n FROM t");
@@ -86,6 +119,38 @@ test("an error is latched: later pulls reject with it", async () => {
 	await expect(pages.next()).rejects.toBe(failure);
 	expect(f.cancel).toHaveBeenCalledOnce();
 	await f.lix.close();
+});
+
+test("a failing release never replaces the read's error or goes unhandled", async () => {
+	const failure = Object.assign(new Error("boom"), { code: "LIX_BOOM" });
+	const cancel = vi.fn(async () => {
+		throw new Error("release failed");
+	});
+	const next = vi.fn().mockRejectedValueOnce(failure);
+	const lix = new Lix({
+		stream: async () => ({ columns: ["n"], next, cancel }),
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	const rows = await lix.stream("SELECT n FROM t");
+	await expect(rows.pages().next()).rejects.toBe(failure);
+
+	// Aborting fires a release nobody awaits; its failure must not surface as
+	// an unhandled rejection (vitest fails the run on one).
+	const controller = new AbortController();
+	const next2 = vi.fn(() => new Promise<never>(() => {}));
+	const lix2 = new Lix({
+		stream: async () => ({ columns: ["n"], next: next2, cancel }),
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	const aborted = await lix2.stream("SELECT n FROM t", [], { signal: controller.signal });
+	const pending = aborted.pages().next();
+	controller.abort(new Error("stop"));
+	await expect(pending).rejects.toThrow("stop");
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await lix.close();
+	await lix2.close();
 });
 
 test.each(["abort", "lix-close"])(
@@ -226,3 +291,56 @@ test("a result over the buffered cap streams completely", async () => {
 		await lix.close();
 	}
 }, 120_000);
+
+setFlagsFromString("--expose-gc");
+const collectGarbage = runInNewContext("gc") as () => void;
+
+async function collectUntil(check: () => void): Promise<void> {
+	await vi.waitFor(
+		async () => {
+			collectGarbage();
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			check();
+		},
+		{ timeout: 5_000, interval: 20 },
+	);
+}
+
+test("an abandoned stream is released even while its signal and Lix live", async () => {
+	const f = fakeLix(vi.fn(async () => page([1])));
+	const controller = new AbortController();
+	await (async () => {
+		await f.lix.stream("SELECT n FROM t", [], { signal: controller.signal });
+	})();
+	await collectUntil(() => expect(f.cancel).toHaveBeenCalledOnce());
+	await f.lix.close();
+	expect(f.cancel).toHaveBeenCalledOnce();
+});
+
+test("an abandoned snapshot and its stream are released while the Lix lives", async () => {
+	const streamCancel = vi.fn(async () => {});
+	const snapshotClose = vi.fn(async () => {});
+	const lix = new Lix({
+		snapshot: async () => ({
+			query: vi.fn(),
+			stream: async () => ({
+				columns: ["n"],
+				next: async () => page([1]),
+				cancel: streamCancel,
+			}),
+			close: snapshotClose,
+		}),
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	await (async () => {
+		const snapshot = await lix.snapshot();
+		await snapshot.stream("SELECT n FROM t");
+	})();
+	await collectUntil(() => {
+		expect(streamCancel).toHaveBeenCalledOnce();
+		expect(snapshotClose).toHaveBeenCalledOnce();
+	});
+	await lix.close();
+	expect(snapshotClose).toHaveBeenCalledOnce();
+});

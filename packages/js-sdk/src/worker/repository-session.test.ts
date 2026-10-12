@@ -436,9 +436,13 @@ test("query streams map to the owner's id and do not survive owner loss", async 
 		kind: "stream.next",
 		streamId: 10,
 	});
+	const releasing = f.request({ kind: "stream.close", streamId });
+	await tick();
 	// A pull in flight when the owner dies fails: its snapshot died with it.
+	// A release in flight succeeds: the owner took the state with it.
 	f.session.lost();
 	expect(f.result(pending)).toMatchObject({ ok: false });
+	expect(f.result(releasing)).toMatchObject({ ok: true });
 	f.resume();
 	f.session.connected();
 	await tick();
