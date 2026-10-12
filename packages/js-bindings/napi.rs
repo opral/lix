@@ -3329,7 +3329,7 @@ fn close_observe_events(
 #[napi(js_name = "QueryStream")]
 pub struct NativeQueryStream {
     columns: Vec<String>,
-    commands: Sender<QueryStreamCommand>,
+    commands: GatedSender<QueryStreamCommand>,
     cancelled: Arc<AtomicBool>,
     cancel_signal: watch::Sender<bool>,
     completion: Arc<NativeObserveCompletion>,
@@ -3348,6 +3348,7 @@ impl NativeQueryStream {
     fn new(stream: lix::RowStream) -> Result<Self> {
         let columns = stream.columns().to_vec();
         let (commands, receiver) = mpsc::channel();
+        let (commands, gate) = GatedSender::new(commands);
         let cancelled = Arc::new(AtomicBool::new(false));
         let (cancel_signal, actor_cancel_signal) = watch::channel(false);
         let completion = Arc::new(NativeObserveCompletion::default());
@@ -3360,6 +3361,7 @@ impl NativeQueryStream {
                 run_query_stream_actor(
                     stream,
                     receiver,
+                    gate,
                     actor_cancelled,
                     actor_cancel_signal,
                     actor_completion,
@@ -3390,8 +3392,8 @@ impl NativeQueryStream {
             settle_deferred(deferred, Ok(None));
             return Ok(promise);
         }
-        if let Err(error) = self.commands.send(QueryStreamCommand::Next(deferred)) {
-            let QueryStreamCommand::Next(deferred) = error.0 else {
+        if let Err(command) = self.commands.send(QueryStreamCommand::Next(deferred)) {
+            let QueryStreamCommand::Next(deferred) = command else {
                 unreachable!("next() only sends QueryStreamCommand::Next");
             };
             settle_deferred(deferred, Ok(None));
@@ -3414,12 +3416,65 @@ fn start_query_stream(stream: lix::RowStream) -> std::result::Result<NativeQuery
         .map_err(|error| LixError::unknown(format!("failed to start query stream actor: {error}")))
 }
 
+/// A command channel an actor closes: once closed, a send fails instead of
+/// queueing, and the actor drains everything sent before the close. Sends
+/// and the close share a lock, so no command can land after the drain and
+/// be dropped unanswered.
+struct GatedSender<T> {
+    sender: Sender<T>,
+    closed: Arc<Mutex<bool>>,
+}
+
+impl<T> GatedSender<T> {
+    fn new(sender: Sender<T>) -> (Self, ActorGate) {
+        let closed = Arc::new(Mutex::new(false));
+        (
+            Self {
+                sender,
+                closed: Arc::clone(&closed),
+            },
+            ActorGate { closed },
+        )
+    }
+
+    /// Sends `command`, or hands it back when the actor has closed.
+    fn send(&self, command: T) -> std::result::Result<(), T> {
+        let closed = self
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *closed {
+            return Err(command);
+        }
+        self.sender.send(command).map_err(|error| error.0)
+    }
+}
+
+/// The actor's side of a [`GatedSender`].
+struct ActorGate {
+    closed: Arc<Mutex<bool>>,
+}
+
+impl ActorGate {
+    /// Closes the channel and settles every command already queued.
+    fn close<T>(&self, receiver: &mpsc::Receiver<T>, mut settle: impl FnMut(T)) {
+        let mut closed = self
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *closed = true;
+        for command in receiver.try_iter() {
+            settle(command);
+        }
+    }
+}
+
 /// A pinned read state. Its reads run on the snapshot's own thread, so they
 /// never occupy the session actor; streams it opens pull on their own threads.
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "ReadSnapshot")]
 pub struct NativeReadSnapshot {
-    commands: Sender<ReadSnapshotCommand>,
+    commands: GatedSender<ReadSnapshotCommand>,
 }
 
 enum ReadSnapshotCommand {
@@ -3448,28 +3503,17 @@ fn snapshot_closed_error() -> LixError {
 impl NativeReadSnapshot {
     fn new(snapshot: lix::Snapshot) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel();
+        let (commands, gate) = GatedSender::new(commands);
         thread::Builder::new()
             .name("lix-read-snapshot".to_string())
             .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
-            .spawn(move || run_read_snapshot_actor(snapshot, receiver))?;
+            .spawn(move || run_read_snapshot_actor(snapshot, receiver, gate))?;
         Ok(Self { commands })
     }
 
     fn send(&self, command: ReadSnapshotCommand) {
-        if let Err(error) = self.commands.send(command) {
-            match error.0 {
-                ReadSnapshotCommand::Query { deferred, .. } => {
-                    settle_deferred(deferred, Err(snapshot_closed_error()));
-                }
-                ReadSnapshotCommand::Stream { deferred, .. } => {
-                    settle_deferred(deferred, Err(snapshot_closed_error()));
-                }
-                ReadSnapshotCommand::Close(deferred) => {
-                    if let Some(deferred) = deferred {
-                        settle_deferred(deferred, Ok(()));
-                    }
-                }
-            }
+        if let Err(command) = self.commands.send(command) {
+            settle_closed_snapshot_command(command);
         }
     }
 
@@ -3531,30 +3575,44 @@ impl NativeReadSnapshot {
     }
 }
 
+/// Answers a command that reached a closed snapshot.
+fn settle_closed_snapshot_command(command: ReadSnapshotCommand) {
+    match command {
+        ReadSnapshotCommand::Query { deferred, .. } => {
+            settle_deferred(deferred, Err(snapshot_closed_error()));
+        }
+        ReadSnapshotCommand::Stream { deferred, .. } => {
+            settle_deferred(deferred, Err(snapshot_closed_error()));
+        }
+        ReadSnapshotCommand::Close(Some(deferred)) => settle_deferred(deferred, Ok(())),
+        ReadSnapshotCommand::Close(None) => {}
+    }
+}
+
 impl Drop for NativeReadSnapshot {
     fn drop(&mut self) {
         let _ = self.commands.send(ReadSnapshotCommand::Close(None));
     }
 }
 
-fn run_read_snapshot_actor(snapshot: lix::Snapshot, receiver: mpsc::Receiver<ReadSnapshotCommand>) {
+fn run_read_snapshot_actor(
+    snapshot: lix::Snapshot,
+    receiver: mpsc::Receiver<ReadSnapshotCommand>,
+    gate: ActorGate,
+) {
     let rt = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(error) => {
-            for command in receiver.try_iter() {
-                match command {
-                    ReadSnapshotCommand::Query { deferred, .. } => {
-                        deferred.reject(to_napi_error(&error));
-                    }
-                    ReadSnapshotCommand::Stream { deferred, .. } => {
-                        deferred.reject(to_napi_error(&error));
-                    }
-                    ReadSnapshotCommand::Close(Some(deferred)) => {
-                        settle_deferred(deferred, Ok(()));
-                    }
-                    ReadSnapshotCommand::Close(None) => {}
+            gate.close(&receiver, |command| match command {
+                ReadSnapshotCommand::Query { deferred, .. } => {
+                    deferred.reject(to_napi_error(&error));
                 }
-            }
+                ReadSnapshotCommand::Stream { deferred, .. } => {
+                    deferred.reject(to_napi_error(&error));
+                }
+                ReadSnapshotCommand::Close(Some(deferred)) => settle_deferred(deferred, Ok(())),
+                ReadSnapshotCommand::Close(None) => {}
+            });
             return;
         }
     };
@@ -3598,25 +3656,14 @@ fn run_read_snapshot_actor(snapshot: lix::Snapshot, receiver: mpsc::Receiver<Rea
                 if let Some(deferred) = deferred {
                     settle_deferred(deferred, result);
                 }
-                // Later reads on this snapshot reject as closed.
-                for command in receiver.try_iter() {
-                    match command {
-                        ReadSnapshotCommand::Query { deferred, .. } => {
-                            settle_deferred(deferred, Err(snapshot_closed_error()));
-                        }
-                        ReadSnapshotCommand::Stream { deferred, .. } => {
-                            settle_deferred(deferred, Err(snapshot_closed_error()));
-                        }
-                        ReadSnapshotCommand::Close(Some(deferred)) => {
-                            settle_deferred(deferred, Ok(()));
-                        }
-                        ReadSnapshotCommand::Close(None) => {}
-                    }
-                }
+                // Reads queued meanwhile, and every later one, reject as
+                // closed.
+                gate.close(&receiver, settle_closed_snapshot_command);
                 return;
             }
         }
     }
+    gate.close(&receiver, settle_closed_snapshot_command);
     let _ = rt.block_on(snapshot.close());
 }
 
@@ -3627,7 +3674,7 @@ impl Drop for NativeQueryStream {
 }
 
 fn cancel_query_stream(
-    commands: &Sender<QueryStreamCommand>,
+    commands: &GatedSender<QueryStreamCommand>,
     cancelled: &AtomicBool,
     cancel_signal: &watch::Sender<bool>,
 ) {
@@ -3641,6 +3688,7 @@ fn cancel_query_stream(
 fn run_query_stream_actor(
     stream: lix::RowStream,
     receiver: mpsc::Receiver<QueryStreamCommand>,
+    gate: ActorGate,
     cancelled: Arc<AtomicBool>,
     mut cancel_signal: watch::Receiver<bool>,
     completion: Arc<NativeObserveCompletion>,
@@ -3651,11 +3699,11 @@ fn run_query_stream_actor(
         Err(error) => {
             cancelled.store(true, Ordering::SeqCst);
             drop(stream);
-            for command in receiver.try_iter() {
+            gate.close(&receiver, |command| {
                 if let QueryStreamCommand::Next(deferred) = command {
                     deferred.reject(to_napi_error(&error));
                 }
-            }
+            });
             completion.finish();
             return;
         }
@@ -3699,11 +3747,11 @@ fn run_query_stream_actor(
     }
     cancelled.store(true, Ordering::SeqCst);
     drop(stream);
-    for command in receiver.try_iter() {
+    gate.close(&receiver, |command| {
         if let QueryStreamCommand::Next(deferred) = command {
             settle_deferred(deferred, Ok(None));
         }
-    }
+    });
     completion.finish();
 }
 

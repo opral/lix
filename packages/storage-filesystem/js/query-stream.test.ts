@@ -175,3 +175,29 @@ test("aborting a native read stops its engine work", async () => {
 		rmSync(path, { recursive: true, force: true });
 	}
 });
+
+test("a native snapshot answers every read sent right after close()", async () => {
+	const binding = await openLixBinding({ kind: "memory" });
+	try {
+		for (let attempt = 0; attempt < 40; attempt++) {
+			const snapshot = await binding.snapshot();
+			const closing = snapshot.close();
+			// Sent while the snapshot's actor is closing: each must settle.
+			const reads = [
+				snapshot.query("SELECT 1", []),
+				snapshot.stream("SELECT 1", []),
+			];
+			await within(3_000, closing);
+			for (const read of reads) {
+				await expect(within(3_000, read)).rejects.toMatchObject({
+					code: "LIX_ERROR_SNAPSHOT_CLOSED",
+				});
+			}
+			await expect(within(3_000, snapshot.query("SELECT 1", []))).rejects.toMatchObject({
+				code: "LIX_ERROR_SNAPSHOT_CLOSED",
+			});
+		}
+	} finally {
+		await binding.close();
+	}
+});
