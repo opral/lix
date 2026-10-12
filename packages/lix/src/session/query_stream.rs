@@ -535,8 +535,9 @@ impl futures_core::Stream for RowStream {
             // A `Stream` has no future to tie a pull to: a caller may stop
             // polling (and drop its `next()` future) at any Pending. Hold no
             // session guard across a Pending, so an abandoned pull never
-            // blocks writers or close.
-            Poll::Pending => this.release_pull(),
+            // blocks writers or close. Keep a pending admission wait: it
+            // holds no guard, and it carries the wakeup for this poll.
+            Poll::Pending => this.pull_guard = None,
             Poll::Ready(Some(Err(_))) => this.error_yielded = true,
             Poll::Ready(_) => {}
         }

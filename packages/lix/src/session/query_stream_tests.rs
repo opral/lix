@@ -822,6 +822,43 @@ async fn an_abandoned_stream_poll_releases_its_session_guard() {
     assert!(stream.next().await.unwrap().is_ok());
 }
 
+/// A `Stream` poll that parks on admission (a writer is running) must keep
+/// its wakeup: when the writer finishes, the same `next()` resumes.
+#[tokio::test]
+async fn a_stream_poll_blocked_on_admission_wakes_after_the_writer() {
+    use futures_util::StreamExt;
+    let storage = CountingStorage::default();
+    let lix = seeded(storage.clone()).await;
+    let mut stream = lix
+        .query("SELECT id FROM stream_item UNION ALL SELECT id FROM stream_tag")
+        .page_limits(byte_pages(512))
+        .stream()
+        .await
+        .unwrap();
+    stream.next_page().await.unwrap().expect("first page");
+    // Stall every read, including the writer's: the writer stays in progress.
+    storage.stall_before.store(usize::MAX, Ordering::SeqCst);
+    storage.stalled.store(true, Ordering::SeqCst);
+    let writer = {
+        let lix = lix.clone();
+        tokio::spawn(async move {
+            lix.execute("UPDATE stream_item SET label = 'after' WHERE grp = 1")
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One `next()`, awaited across the writer: it parks on admission.
+    let pull = tokio::spawn(async move {
+        let row = stream.next().await;
+        (row.map(|row| row.is_ok()), stream)
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    storage.stalled.store(false, Ordering::SeqCst);
+    with_timeout("the writer", writer).await.unwrap().unwrap();
+    let (row, _stream) = with_timeout("the parked Stream poll", pull).await.unwrap();
+    assert_eq!(row, Some(true));
+}
+
 #[tokio::test]
 async fn a_stream_error_is_latched() {
     use futures_util::StreamExt;
