@@ -18,7 +18,7 @@ With an already initialized repository, start an independent OPFS provider write
 
 ### Read API bounds
 
-Buffered foreground reads have a 30-second cancellable deadline, including successive typed hydration demands, and a 64 MiB / 1,000,000-row output budget. DataFusion result collection checks every batch before retaining it; native results and aggregate SQL batches are checked before publication. These are result bounds, not a claim that every internal provider allocation is charged. Durable statements and unknown commit outcomes never enter this deadline. The storage expiry retry sub-budget remains three seconds within the deadline.
+Buffered reads have no deadline and no row budget: callers cancel a read by dropping it (JS: aborting its signal), and the engine yields between batches so the cancel takes effect within a time slice. Their output is capped at 64 MiB of result memory by default (`max_bytes`, JS `maxBytes`). DataFusion result collection checks every batch before retaining it; native results and aggregate SQL batches are checked before publication. This is a result bound, not a claim that every internal provider allocation is charged. A hydration demand fails only when its transport stops making progress for 60 seconds (`LIX_ERROR_SYNC_TRANSPORT_STALLED`). The storage expiry retry sub-budget remains three seconds.
 
 ## Measured decision
 

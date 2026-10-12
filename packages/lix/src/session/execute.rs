@@ -1378,7 +1378,7 @@ where
     /// transaction boundaries for each statement.
     ///
     /// `sql` must be a single statement. To run several statements atomically,
-    /// pass an array of statements to [`Self::execute_batch`]. Do not concatenate
+    /// run them in one transaction (`Lix::transaction`). Do not concatenate
     /// statements into one script string.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
@@ -2684,7 +2684,7 @@ where
     ///
     /// Each entry is one statement plus its own parameters. Callers assemble
     /// the array; Lix does not parse a multi-statement script on their behalf.
-    pub async fn execute_batch(
+    pub(crate) async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecuteBatchResult, LixError> {
@@ -4499,8 +4499,8 @@ fn stalled_hydration_as_conflict(error: LixError) -> LixError {
 pub(crate) fn execute_many_returns_rows() -> LixError {
     LixError::new(
         LixError::CODE_INVALID_PARAM,
-        "execute_many() reports only the affected row count and cannot run a statement that \
-         returns rows",
+        "execute_many (JS: executeMany) reports only the affected row count and cannot run a \
+         statement that returns rows",
     )
     .with_hint(
         "Drop RETURNING, read with query(), or run execute() per parameter set inside a \

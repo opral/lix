@@ -82,6 +82,13 @@ where
     /// current when it runs; use [`Self::snapshot`] for several reads at one
     /// state.
     ///
+    /// A read never changes the repository and publishes no commit. One
+    /// exception is bookkeeping, not data: in deterministic mode (the
+    /// `lix_deterministic_mode` testing setting), `uuidv7()` and
+    /// `current_timestamp` advance the persisted deterministic sequence, so
+    /// later values stay unique. Snapshots cannot advance it and reject such
+    /// reads.
+    ///
     /// ```no_run
     /// # async fn example() -> Result<(), lix::LixError> {
     /// let lix = lix::open_lix().await?;

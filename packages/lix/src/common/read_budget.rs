@@ -11,13 +11,14 @@
 //! no deadline: callers cancel a read by dropping it.
 use crate::{LixError, Value};
 
-/// Default cap on the encoded bytes of one buffered result.
+/// Default cap on the memory one buffered result holds (its Arrow batches,
+/// then its row values), not on any wire encoding.
 pub(crate) const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// The limits one buffered read collects under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReadLimits {
-    /// Encoded result bytes; `usize::MAX` opts out.
+    /// Result memory in bytes; `usize::MAX` opts out.
     pub(crate) max_bytes: usize,
     /// Rows the caller accepts (single-row reads); `None` is unlimited.
     pub(crate) max_rows: Option<usize>,
@@ -74,8 +75,9 @@ pub(crate) fn result_too_large(max_bytes: usize) -> LixError {
         ),
     )
     .with_hint(
-        "Use stream() to read large results incrementally, or opt out of the cap \
-         (Rust: .max_bytes(usize::MAX), JS: { maxBytes: Infinity }).",
+        "Raise or remove the cap with max_bytes (Rust: .max_bytes(n) or usize::MAX, JS: \
+         { maxBytes: n } or Infinity). A read can stream() instead to stay bounded; a \
+         write's RETURNING rows are always buffered, so return fewer rows or columns.",
     )
     .with_details(serde_json::json!({ "maxBytes": max_bytes }))
 }

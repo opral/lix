@@ -1083,8 +1083,8 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
             let _ = self.rollback().await;
             return Err(LixError::new(
                 LixError::CODE_INVALID_TRANSACTION_STATE,
-                "an execute_many() in this transaction failed after staging part of its \
-                 parameter sets; the transaction was rolled back",
+                "an execute_many (JS: executeMany) in this transaction failed after staging \
+                 part of its parameter sets; the transaction was rolled back",
             ));
         }
         self.core

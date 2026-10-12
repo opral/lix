@@ -2,7 +2,7 @@
 //!
 //! One obvious way per job:
 //! - small reads: [`Query::all`], [`Query::one`], [`Query::optional`]: buffered
-//!   and capped at 64 MiB of encoded rows by default;
+//!   and capped at 64 MiB of result memory by default;
 //! - large reads: [`Query::stream`]: bounded memory, no cap, never expires;
 //! - writes: `execute(sql)` and `execute_many(sql, param_sets)`;
 //! - several reads at one state: [`crate::Lix::snapshot`].
@@ -240,8 +240,8 @@ impl Execute {
         self
     }
 
-    /// Caps the encoded bytes of the buffered result rows. Defaults to
-    /// 64 MiB; `usize::MAX` opts out.
+    /// Caps the memory of the buffered result rows (`RETURNING` or a read's
+    /// rows). Defaults to 64 MiB; `usize::MAX` opts out.
     pub fn max_bytes(mut self, max_bytes: usize) -> Self {
         self.request.max_bytes = max_bytes;
         self
