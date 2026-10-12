@@ -83,7 +83,9 @@ impl RuntimeReadPlan {
 async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut tables = BTreeSet::new();
     plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
+        if let LogicalPlan::TableScan(scan) = node
+            && super::exec::datafusion::is_detached_scan_source(&scan.source)
+        {
             tables.insert(scan.table_name.clone());
         }
         Ok(TreeNodeRecursion::Continue)
@@ -103,6 +105,10 @@ async fn rebind_detached_read_plan(state: &SessionState, plan: LogicalPlan) -> R
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
+        // Statement-local sources (a recursive CTE's work table) stay as is.
+        if !super::exec::datafusion::is_detached_scan_source(&scan.source) {
+            return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+        }
         scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "cached SQL plan provider '{}' is unavailable",

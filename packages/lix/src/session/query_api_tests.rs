@@ -948,3 +948,23 @@ async fn duplicate_output_columns_are_rejected_before_running_when_keyed_by_name
         .unwrap();
     assert_eq!(result.rows_affected(), 1);
 }
+
+#[tokio::test]
+async fn a_recursive_cte_streams_like_it_reads() {
+    let lix = seeded(0).await;
+    let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) \
+               SELECT n FROM t ORDER BY n";
+    let buffered = lix.query(sql).all().await.unwrap();
+    let mut stream = lix.query(sql).stream().await.unwrap();
+    let mut streamed = Vec::new();
+    while let Some(page) = stream.next_page().await.unwrap() {
+        streamed.extend(page.into_iter().map(|row| row.get::<i64>("n").unwrap()));
+    }
+    let expected = buffered
+        .rows()
+        .iter()
+        .map(|row| row.get::<i64>("n").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(expected, [1, 2, 3, 4, 5]);
+    assert_eq!(streamed, expected);
+}

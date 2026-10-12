@@ -348,11 +348,28 @@ async fn create_logical_plan_in_session_from_parsed(
     }))
 }
 
+/// Whether a scan reads a placeholder the cache detached (to rebind to the
+/// current session's provider) rather than a statement-local source such as
+/// a recursive CTE's work table, which has no catalog entry.
+pub(crate) fn is_detached_scan_source(source: &Arc<dyn datafusion::logical_expr::TableSource>) -> bool {
+    datafusion::datasource::source_as_provider(source).is_ok_and(|provider| provider.is::<EmptyTable>())
+}
+
+fn is_cte_work_table(source: &Arc<dyn datafusion::logical_expr::TableSource>) -> bool {
+    datafusion::datasource::source_as_provider(source).is_ok_and(|provider| {
+        provider.is::<datafusion::datasource::cte_worktable::CteWorkTable>()
+    })
+}
+
 fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
     plan.transform_up(|node| {
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
+        // A recursive CTE's work table belongs to the statement itself.
+        if is_cte_work_table(&scan.source) {
+            return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+        }
         scan.source = provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
         Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
     })
@@ -366,7 +383,9 @@ async fn rebind_cached_read_plan(
 ) -> Result<LogicalPlan, LixError> {
     let mut tables = BTreeSet::new();
     plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
+        if let LogicalPlan::TableScan(scan) = node
+            && is_detached_scan_source(&scan.source)
+        {
             tables.insert(scan.table_name.clone());
         }
         Ok(TreeNodeRecursion::Continue)
@@ -384,6 +403,9 @@ async fn rebind_cached_read_plan(
         let LogicalPlan::TableScan(mut scan) = node else {
             return Ok(Transformed::no(node));
         };
+        if !is_detached_scan_source(&scan.source) {
+            return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+        }
         scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
                 "cached SQL plan provider '{}' is unavailable",
