@@ -2718,7 +2718,13 @@ where
                             format!("join Lix protocol server close: {error}"),
                         )),
                     };
-                server.inner.close_result.send_replace(Some(result));
+                // Release the owned protocol clone before acknowledging close.
+                // A caller can drop its final storage handle as soon as this
+                // notification wakes it; retaining our clone until afterward
+                // would move the storage's final Drop onto this async worker.
+                let close_result = server.inner.close_result.clone();
+                drop(server);
+                close_result.send_replace(Some(result));
             });
         });
         loop {
@@ -15630,6 +15636,41 @@ mod tests {
             .await
             .expect("detached server close should complete");
         assert!(app.server.inner.session_open_gate.is_closing());
+    }
+
+    #[tokio::test]
+    async fn close_acknowledgment_releases_background_protocol_owners() {
+        struct Probe<F>(F);
+        impl<F: Fn() + Send + Sync + 'static> std::task::Wake for Probe<F> {
+            fn wake(self: Arc<Self>) {
+                (self.0)();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                (self.0)();
+            }
+        }
+
+        let app = app().await;
+        let owners_before_close = Arc::strong_count(&app.server.inner);
+        let protocol = Arc::downgrade(&app.server.inner);
+        let owners_at_ack = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed = Arc::clone(&owners_at_ack);
+        // A synchronous waker observes the exact completion-notification point,
+        // rather than racing the task scheduler after close() returns.
+        let waker = std::task::Waker::from(Arc::new(Probe(move || {
+            observed.store(protocol.strong_count(), Ordering::SeqCst);
+        })));
+        let mut context = Context::from_waker(&waker);
+        let mut receiver = app.server.inner.close_result.subscribe();
+        let mut completion = std::pin::pin!(receiver.changed());
+        assert!(Future::poll(completion.as_mut(), &mut context).is_pending());
+
+        app.server.close().await.expect("close server");
+        assert_eq!(
+            owners_at_ack.load(Ordering::SeqCst),
+            owners_before_close,
+            "completion must release every background protocol owner before waking the host"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

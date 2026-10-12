@@ -4,6 +4,7 @@
 import {OpfsBackend} from '../../storage-opfs/dist/direct.js';
 import type {OpfsBackend as Backend} from '../../storage-opfs/js/provider.js';
 import {migrateStorageProvider} from "../dist/migration.js";
+import {compatibility} from "../dist/compatibility.js";
 import type {LixStorageSpace} from '../src/storage-adapter.js';
 const space=(id:number,name:string):LixStorageSpace=>({id,name,valueSemantics:'mutable',valueIntegrity:'backendVerified'});
 const encode=(text:string)=>new TextEncoder().encode(text);
@@ -19,12 +20,12 @@ self.onmessage=async({data})=>{
    const [entry]=await read.getMany([{space:epoch,keys:[encode('active')],options:{projection:'fullValue'}}]);
    if(entry?.kind!=='fullValue')throw new Error('Missing active epoch');
    const fields=new TextDecoder().decode(entry.value).split('|');
-   if(fields[1]!=='active'||fields[4]!=='83')throw new Error('Expected current repository');
+   if(fields[1]!=='active'||Number(fields[4])!==compatibility.storageFormatVersion)throw new Error('Expected the current repository format');
    // Fresh partial stores use legacy physical bank; support A/B if the runtime changes allocation.
    const prefix=fields[2]==='legacy'?0:fields[2]==='a'?0x40000000:fields[2]==='b'?0x80000000:NaN;
    if(!Number.isFinite(prefix))throw new Error(`Unsupported fixture bank ${fields[2]}`);
    const format=data.format??80;
-   if(format!==77&&format!==80)throw new Error('Unsupported test source format');
+   if(format!==77&&format!==80&&format!==86)throw new Error('Unsupported synthetic test source format');
    fields[4]=String(format);
    const write=await db.beginWrite({sessionToken,awaitDurable:true,preconditions:[],batchCapacityHintBytes:1024});
    await write.putMany(epoch,[{key:encode('active'),value:encode(fields.join('|'))}]);

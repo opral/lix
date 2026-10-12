@@ -1,0 +1,19 @@
+{
+  "format": 86,
+  "repositoryId": "01a13167-21e5-7363-972f-8954e44556cf",
+  "branchId": "01a13167-21e5-7363-972f-894797a2bf65",
+  "pendingKey": "browser-pending",
+  "pendingValue": "local-pending",
+  "cachedKey": "published-cached",
+  "cachedValue": "released-cached",
+  "sourceSdk": "@lix-js/sdk@0.19.0",
+  "sourceStorage": "@lix-js/storage-opfs@0.19.0",
+  "records": "opfs-records.bin",
+  "storageSha256": "6ec3aeb48244aba94c827cec099df318b4eb57cf2798249b767819eae83c12cb",
+  "indexRows": 2,
+  "sourceServerRevision": "80583069455a25bddb1259ed424a329abc2c29fb",
+  "recordCount": 100,
+  "sdkTarballSha256": "ee413d34f985538495242cb6d08d3087f73c040a4aee9510aca6a93e208b7090",
+  "storage-opfsTarballSha256": "9dede26863a56033a7bf91b77e4ec58fd79cfb91428a3fb01b266f4a705c9f5f",
+  "hostedRepositoryId": "5c08fe33-0404-4522-a394-f0c30e4d1407"
+}
