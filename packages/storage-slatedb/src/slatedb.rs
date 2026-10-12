@@ -68,6 +68,12 @@ const LENGTH_TAG: u8 = b'L';
 const LAYOUT_COMPLETE_KEY: &[u8] = b"\0lix-physical-layout-complete";
 const LAYOUT_PROGRESS_KEY: &[u8] = b"\0lix-physical-layout-progress";
 const LAYOUT_SOURCE_SEQ_KEY: &[u8] = b"\0lix-physical-layout-source-sequence";
+// Checkpoints amortize remote WAL writes while bounding memory and replay work.
+// One existing value larger than the byte limit is copied alone: legacy values
+// must remain migratable even when they exceed today's normal write budget.
+const MIGRATION_CHECKPOINT_MAX_ROWS: usize = 4096;
+const MIGRATION_CHECKPOINT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MIGRATION_SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const LEGACY_SEGMENT_PREFIX: &[u8] = b"\0lix-legacy-immutable-segment:";
 const IMMUTABLE_VALUE_PATH: &str = "lix-immutable-value-segment-v1";
 const IMMUTABLE_VALUE_CACHE_PATH: &str = "lix-immutable-value-segment-v1";
@@ -5646,7 +5652,15 @@ async fn copy_legacy_physical_rows(
             counts,
         );
     }
-    let mut rows = match snapshot.scan((lower, Bound::<Bytes>::Unbounded)).await {
+    // This is a full sequential copy, not an interactive page read. SlateDB's
+    // default reads just one SST block per object-store request. Read ahead in
+    // bounded chunks without polluting the cache with this one-time scan.
+    let scan_options =
+        SlateDBScanOptions::default().with_read_ahead_bytes(MIGRATION_SCAN_READ_AHEAD_BYTES);
+    let mut rows = match snapshot
+        .scan_with_options((lower, Bound::<Bytes>::Unbounded), &scan_options)
+        .await
+    {
         Ok(rows) => rows,
         Err(error) => {
             if let Some(reporter) = reporter {
@@ -5663,6 +5677,7 @@ async fn copy_legacy_physical_rows(
     let mut batch = WriteBatch::new();
     let mut count = 0usize;
     let mut bytes = 0usize;
+    let mut batch_bytes = 0usize;
     loop {
         let row = match rows.next().await {
             Ok(Some(row)) => row,
@@ -5690,26 +5705,22 @@ async fn copy_legacy_physical_rows(
             }
             return Err(StorageError::InvalidKey);
         }
-        let mut key = Vec::with_capacity(row.key.len() + 1);
-        key.push(VALUE_TAG);
-        key.extend_from_slice(&row.key);
-        let key = Key(Bytes::from(key));
-        batch.put(&key.0, &row.value);
-        if let Ok(locator) = decode_immutable_locator(&row.value) {
-            let mut protected = LEGACY_SEGMENT_PREFIX.to_vec();
-            protected.extend_from_slice(&locator.segment_id.0);
-            // Preserve legacy object reachability even if its copied v3 key is
-            // deleted. The original physical repository is retained in v2.
-            batch.put(protected, Bytes::new());
-        }
-        batch.put(
-            tagged_key(&key, LENGTH_TAG)?.0,
-            encode_value_length(row.value.len()),
-        );
-        batch.put(LAYOUT_PROGRESS_KEY, &row.key);
-        count += 1;
-        bytes = bytes.saturating_add(row.value.len());
-        if count >= 32 || bytes >= 2 * 1024 * 1024 {
+        let locator = decode_immutable_locator(&row.value).ok();
+        let row_bytes = (row.key.len() + 1)
+            .saturating_mul(2)
+            .saturating_add(row.value.len())
+            .saturating_add(9)
+            .saturating_add(if locator.is_some() {
+                LEGACY_SEGMENT_PREFIX.len() + 32
+            } else {
+                0
+            })
+            // Include the cursor overhead conservatively once per source row.
+            .saturating_add(LAYOUT_PROGRESS_KEY.len() + row.key.len());
+        if count != 0
+            && (count >= MIGRATION_CHECKPOINT_MAX_ROWS
+                || batch_bytes.saturating_add(row_bytes) > MIGRATION_CHECKPOINT_MAX_BYTES)
+        {
             observe_open_dependency(
                 reporter,
                 SlateDBOpenPhase::LegacyMigration,
@@ -5749,7 +5760,28 @@ async fn copy_legacy_physical_rows(
             batch = WriteBatch::new();
             count = 0;
             bytes = 0;
+            batch_bytes = 0;
         }
+        let mut key = Vec::with_capacity(row.key.len() + 1);
+        key.push(VALUE_TAG);
+        key.extend_from_slice(&row.key);
+        let key = Key(Bytes::from(key));
+        batch.put_bytes(key.0.clone(), row.value.clone());
+        if let Some(locator) = locator {
+            let mut protected = LEGACY_SEGMENT_PREFIX.to_vec();
+            protected.extend_from_slice(&locator.segment_id.0);
+            // Preserve legacy object reachability even if its copied v3 key is
+            // deleted. The original physical repository is retained in v2.
+            batch.put_bytes(Bytes::from(protected), Bytes::new());
+        }
+        batch.put_bytes(
+            tagged_key(&key, LENGTH_TAG)?.0,
+            encode_value_length(row.value.len()),
+        );
+        batch.put_bytes(Bytes::from_static(LAYOUT_PROGRESS_KEY), row.key.clone());
+        count += 1;
+        bytes = bytes.saturating_add(row.value.len());
+        batch_bytes = batch_bytes.saturating_add(row_bytes);
     }
     if let Some(reporter) = reporter {
         reporter.report(
@@ -6434,7 +6466,7 @@ mod tests {
         .await
         .unwrap();
         let mut batch = WriteBatch::new();
-        for index in 0u32..33 {
+        for index in 0u32..(2 * MIGRATION_CHECKPOINT_MAX_ROWS as u32 + 1) {
             let mut key = SpaceId(93).0.to_be_bytes().to_vec();
             key.extend_from_slice(&index.to_be_bytes());
             batch.put(key, b"ten-bytes!");
@@ -6466,7 +6498,10 @@ mod tests {
             .filter(|event| event.event == SlateDBOpenProgressEvent::CheckpointDurable)
             .map(|event| (event.rows, event.bytes, event.checkpoints))
             .collect::<Vec<_>>();
-        assert_eq!(checkpoints, vec![(32, 320, 1), (33, 330, 2)]);
+        assert_eq!(
+            checkpoints,
+            vec![(4096, 40960, 1), (8192, 81920, 2), (8193, 81930, 3)]
+        );
         let close_finished = events
             .iter()
             .rposition(|event| {
@@ -6479,9 +6514,9 @@ mod tests {
             .position(|event| event.event == SlateDBOpenProgressEvent::Ready)
             .unwrap();
         assert!(close_finished < ready);
-        assert_eq!(events[ready].rows, 33);
-        assert_eq!(events[ready].bytes, 330);
-        assert_eq!(events[ready].checkpoints, 2);
+        assert_eq!(events[ready].rows, 8193);
+        assert_eq!(events[ready].bytes, 81930);
+        assert_eq!(events[ready].checkpoints, 3);
         assert!(!events[ready].resumed);
         drop(events);
         drop(observed);
@@ -6506,8 +6541,277 @@ mod tests {
         while rows.next().await.unwrap().is_some() {
             retained += 1;
         }
-        assert_eq!(retained, 33);
+        assert_eq!(retained, 8193);
         legacy.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_migration_byte_budget_bounds_large_keys_and_values() {
+        for (root, key_len, value_len) in [
+            ("migration-medium-values", 8, 700 * 1024),
+            ("migration-large-keys", 60 * 1024, 1),
+        ] {
+            let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let legacy = Db::builder(
+                join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+                objects.clone(),
+            )
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+            let mut batch = WriteBatch::new();
+            let value = Bytes::from(vec![7; value_len]);
+            for index in 0u32..40 {
+                let mut key = SpaceId(93).0.to_be_bytes().to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                key.resize(key_len, 0);
+                batch.put(key, &value);
+            }
+            legacy
+                .write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let destination = Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects)
+                .with_settings(slatedb_settings())
+                .build()
+                .await
+                .unwrap();
+            let checkpoints = Arc::new(Mutex::new(Vec::new()));
+            let observed = checkpoints.clone();
+            let reporter = SlateDBOpenProgressReporter::new(Arc::new(move |event| {
+                if event.event == SlateDBOpenProgressEvent::CheckpointDurable {
+                    observed.lock().unwrap().push(event.rows);
+                }
+            }));
+            let counts = copy_legacy_physical_rows(&destination, &legacy, Some(&reporter))
+                .await
+                .unwrap();
+            assert_eq!(counts.rows, 40);
+            let per_row_bytes =
+                2 * (key_len + 1) + value_len + 9 + LAYOUT_PROGRESS_KEY.len() + key_len;
+            let rows_per_checkpoint = MIGRATION_CHECKPOINT_MAX_BYTES / per_row_bytes;
+            let expected = (rows_per_checkpoint..40)
+                .step_by(rows_per_checkpoint)
+                .map(|rows| rows as u64)
+                .chain(std::iter::once(40))
+                .collect::<Vec<_>>();
+            assert_eq!(*checkpoints.lock().unwrap(), expected);
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            destination.close().await.unwrap();
+            legacy.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_physical_migration_resumes_an_atomic_durable_prefix() {
+        for fail_checkpoint in [false, true] {
+            let objects = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+            let root = "migration-interrupted-durable-prefix";
+            let legacy = Db::builder(
+                join_db_path(root, LEGACY_SEGMENTED_FORMAT_PATH),
+                objects.clone(),
+            )
+            .with_settings(slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+            let source_rows = 2 * MIGRATION_CHECKPOINT_MAX_ROWS + 1;
+            let old_key = |index: usize| {
+                let mut key = SpaceId(93).0.to_be_bytes().to_vec();
+                key.extend_from_slice(&(index as u32).to_be_bytes());
+                key
+            };
+            let segment_id = Key(Bytes::from(vec![7; 32]));
+            let locator = encode_immutable_locator(&ImmutableValueLocator {
+                segment_id: segment_id.clone(),
+                segment_len: 9,
+                range: 0..9,
+            })
+            .unwrap();
+            let source_value = |index: usize| {
+                if index == 17 {
+                    locator.clone()
+                } else {
+                    Bytes::from_static(b"preserved")
+                }
+            };
+            let mut batch = WriteBatch::new();
+            for index in 0..source_rows {
+                batch.put_bytes(Bytes::from(old_key(index)), source_value(index));
+            }
+            legacy
+                .write_with_options(
+                    batch,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let destination =
+                Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+                    .with_settings(slatedb_settings())
+                    .build()
+                    .await
+                    .unwrap();
+            let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+            let fault_store = objects.clone();
+            let reporter = SlateDBOpenProgressReporter::new(Arc::new(move |event| {
+                if event.event == SlateDBOpenProgressEvent::CheckpointDurable {
+                    if fail_checkpoint {
+                        fault_store.fail_writes();
+                    } else {
+                        abort.abort();
+                    }
+                }
+            }));
+            let interrupted = futures_util::future::Abortable::new(
+                copy_legacy_physical_rows(&destination, &legacy, Some(&reporter)),
+                registration,
+            )
+            .await;
+            if fail_checkpoint {
+                assert!(matches!(interrupted, Ok(Err(StorageError::Io(message)))
+                if message.contains("injected write failure")));
+            } else {
+                assert!(
+                    interrupted.is_err(),
+                    "stop copying after the first durable checkpoint"
+                );
+            }
+            // Closing drains any write already submitted when cancellation occurred.
+            // Reopening observes only the durable prefix, as after process restart.
+            if fail_checkpoint {
+                let _ = destination.close().await;
+                objects.fail_writes.store(false, Ordering::Release);
+            } else {
+                destination.close().await.unwrap();
+            }
+            let destination =
+                Db::builder(join_db_path(root, SEGMENTED_FORMAT_PATH), objects.clone())
+                    .with_settings(slatedb_settings())
+                    .build()
+                    .await
+                    .unwrap();
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let cursor = destination.get(LAYOUT_PROGRESS_KEY).await.unwrap().unwrap();
+            assert_eq!(
+                destination
+                    .get(LAYOUT_SOURCE_SEQ_KEY)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                legacy.snapshot().await.unwrap().seq().to_be_bytes()
+            );
+            let committed_rows = (0..source_rows)
+                .take_while(|index| old_key(*index).as_slice() <= cursor.as_ref())
+                .count();
+            assert!(committed_rows >= MIGRATION_CHECKPOINT_MAX_ROWS);
+            assert!(committed_rows < source_rows);
+            if fail_checkpoint {
+                assert_eq!(committed_rows, MIGRATION_CHECKPOINT_MAX_ROWS);
+            }
+            for index in 0..source_rows {
+                let mut physical = vec![VALUE_TAG];
+                physical.extend_from_slice(&old_key(index));
+                let value_key = Key(Bytes::from(physical));
+                let value = destination.get(&value_key.0).await.unwrap();
+                let length = destination
+                    .get(tagged_key(&value_key, LENGTH_TAG).unwrap().0)
+                    .await
+                    .unwrap();
+                if index < committed_rows {
+                    assert_eq!(value, Some(source_value(index)));
+                    assert_eq!(
+                        decode_value_length(&length.unwrap()).unwrap(),
+                        source_value(index).len()
+                    );
+                } else {
+                    assert!(value.is_none());
+                    assert!(length.is_none());
+                }
+            }
+            let mut protection_key = LEGACY_SEGMENT_PREFIX.to_vec();
+            protection_key.extend_from_slice(&segment_id.0);
+            assert_eq!(
+                destination.get(protection_key).await.unwrap(),
+                Some(Bytes::new())
+            );
+            let resumed = copy_legacy_physical_rows(&destination, &legacy, None)
+                .await
+                .unwrap();
+            assert!(resumed.resumed);
+            assert_eq!(resumed.rows as usize + committed_rows, source_rows);
+            assert_eq!(
+                destination.get(LAYOUT_PROGRESS_KEY).await.unwrap().unwrap(),
+                old_key(source_rows - 1)
+            );
+            for index in committed_rows..source_rows {
+                let mut physical = vec![VALUE_TAG];
+                physical.extend_from_slice(&old_key(index));
+                let value_key = Key(Bytes::from(physical));
+                assert_eq!(
+                    destination.get(&value_key.0).await.unwrap(),
+                    Some(source_value(index))
+                );
+                let length = destination
+                    .get(tagged_key(&value_key, LENGTH_TAG).unwrap().0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    decode_value_length(&length).unwrap(),
+                    source_value(index).len()
+                );
+            }
+            // A changed source must never be silently resumed or published.
+            let mut changed = WriteBatch::new();
+            changed.put(old_key(source_rows), b"new-generation");
+            legacy
+                .write_with_options(
+                    changed,
+                    &SlateDBWriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(copy_legacy_physical_rows(&destination, &legacy, None).await,
+            Err(StorageError::Corruption(message)) if message.contains("generation advanced"))
+            );
+            assert!(
+                destination
+                    .get(LAYOUT_COMPLETE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            destination.close().await.unwrap();
+            legacy.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

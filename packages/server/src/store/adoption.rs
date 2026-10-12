@@ -251,6 +251,7 @@ impl LixRuntimeManager {
         )
         .await?;
         let record = RepositoryRecord {
+            deletion_complete: false,
             state: "live".to_owned(),
             fingerprint: None,
             storage_id: manifest.staged_storage_id.clone(),
