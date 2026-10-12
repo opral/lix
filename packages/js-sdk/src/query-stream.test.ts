@@ -344,3 +344,33 @@ test("an abandoned snapshot and its stream are released while the Lix lives", as
 	await lix.close();
 	expect(snapshotClose).toHaveBeenCalledOnce();
 });
+
+test("an open stream keeps its unreferenced snapshot open", async () => {
+	const snapshotClose = vi.fn(async () => {});
+	const pages = [page([1]), page([2])];
+	const lix = new Lix({
+		snapshot: async () => ({
+			query: vi.fn(),
+			stream: async () => ({
+				columns: ["n"],
+				next: async () => pages.shift() ?? null,
+				cancel: vi.fn(async () => {}),
+			}),
+			close: snapshotClose,
+		}),
+		close: vi.fn(async () => {}),
+		openReport: () => undefined,
+	} as unknown as LixBinding);
+	const rows = await (async () => (await lix.snapshot()).stream<{ n: number }>("SELECT n FROM t"))();
+	for (let i = 0; i < 5; i++) {
+		collectGarbage();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	expect(snapshotClose).not.toHaveBeenCalled();
+	const seen: number[] = [];
+	for await (const row of rows) seen.push(row.n);
+	expect(seen).toEqual([1, 2]);
+	// Once the stream ends, nothing holds the snapshot; the backstop closes it.
+	await collectUntil(() => expect(snapshotClose).toHaveBeenCalledOnce());
+	await lix.close();
+});

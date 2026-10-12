@@ -390,6 +390,7 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	#failure: { error: unknown } | undefined;
 	#closePromise: Promise<void> | undefined;
 	#onClose = new Set<() => void>();
+	#owner: object | undefined;
 	#ended!: () => void;
 	readonly #endedSignal = new Promise<typeof ENDED>((resolve) => {
 		this.#ended = () => resolve(ENDED);
@@ -411,6 +412,15 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 		};
 		if (signal?.aborted) this.#abort();
 		else signal?.addEventListener("abort", this.#abort, { once: true });
+	}
+
+	/**
+	 * @internal Keeps `owner` alive while the stream is open: a snapshot
+	 * that is only reachable through its stream must not be finalized (and
+	 * closed) under it.
+	 */
+	retain(owner: object): void {
+		if (!this.#done) this.#owner = owner;
 	}
 
 	/** @internal Runs `listener` once when the stream ends or closes. */
@@ -541,6 +551,7 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	#finish(): void {
 		if (this.#done) return;
 		this.#done = true;
+		this.#owner = undefined;
 		this.#ended();
 		streamFinalizer.unregister(this);
 		this.signal?.removeEventListener("abort", this.#abort);
@@ -594,6 +605,7 @@ export class LixSnapshot implements Snapshot {
 					throw snapshotClosedError();
 				}
 				stream.onClose(this.#streams.add(stream));
+				stream.retain(this);
 			},
 			signal: () => this.#closing.signal,
 		};
